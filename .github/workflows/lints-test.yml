@@ -21,9 +21,7 @@ jobs:
       python: ${{ steps.filter.outputs.python }}
       docs: ${{ steps.filter.outputs.docs }}
       ui: ${{ steps.filter.outputs.ui }}
-      generated: ${{ steps.filter.outputs.generated }}
       workflow: ${{ steps.filter.outputs.workflow }}
-      any: ${{ steps.filter.outputs.any }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,54 +50,21 @@ jobs:
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo 'os=["ubuntu-24.04"]'                                >> "$GITHUB_OUTPUT"
             echo 'python=["3.12"]'                                    >> "$GITHUB_OUTPUT"
-            echo "scope=pr"                                           >> "$GITHUB_OUTPUT"
           else
             echo 'os=["ubuntu-24.04","macos-15","windows-latest"]'    >> "$GITHUB_OUTPUT"
             echo 'python=["3.10","3.11","3.12"]'                      >> "$GITHUB_OUTPUT"
-            echo "scope=release"                                      >> "$GITHUB_OUTPUT"
           fi
           cat "$GITHUB_OUTPUT"
 
-  rust:
-    name: rust (${{ matrix.os }})
-    needs: [changes, matrix-plan]
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-
-      - name: Run Rust test gate
-        run: mise run test:unit
-
-  rust-bifrost:
-    name: rust bifrost
-    needs: [changes, matrix-plan]
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: ./.github/actions/setup-rust-ci
-        with:
-          rust-cache-key: bifrost
-
-      - name: Run bifrost tests
-        run: mise run test:bifrost
-
-  rust-gates:
-    name: rust gates
+  # Authoritative Rust gate: format, lint, all boundary checks, tests, codegen,
+  # and Python on ubuntu/3.12. This is mise run pre-pr — the same gate as local.
+  # Cross-platform compatibility (macOS/Windows) is handled by the rust-compat job.
+  ci:
+    name: ci
     needs: changes
-    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -133,54 +98,35 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install system tools
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep libcurl4-openssl-dev pkg-config
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Format, lint, and check
-        run: mise run check
+      - name: Run pre-pr gate
+        run: mise run pre-pr
 
-      - name: Boundary checks
-        run: |
-          mise run cardkind:check
-          mise run check:client-tier
-          mise run check:registry-no-server-routes
-          mise run check:registry-tx-coupling
-          mise run check:registry-immutable-spec-hash
-          mise run check:registry-single-table
-          mise run check:pyo3-scope
-          mise run check:mocks-scope
-          mise run check:unwrap-audit
-          mise run check:test-contracts
-          mise run check:wasm
-
-  codegen:
-    name: codegen
-    needs: changes
-    if: needs.changes.outputs.generated == 'true' || needs.changes.outputs.workflow == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
+  # Cross-platform Rust compatibility: tests on macOS and Windows.
+  # Format/lint/boundary checks run only in the ci job above (Linux only).
+  rust-compat:
+    name: rust compat (${{ matrix.os }})
+    needs: [changes, matrix-plan]
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflow == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.matrix-plan.outputs.os) }}
+        exclude:
+          - os: ubuntu-24.04   # covered by the ci job
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up mise
-        uses: jdx/mise-action@v3
-        with:
-          install: true
-          cache: true
+      - uses: ./.github/actions/setup-rust-ci
 
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-          python-version: "3.12"
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check generated contracts
-        run: mise run codegen:check
+      - name: Run Rust test gate
+        run: mise run test:unit
 
   python:
     name: python (${{ matrix.os }} / py${{ matrix.python-version }})
@@ -212,17 +158,6 @@ jobs:
         with:
           install: true
           cache: true
-
-      - name: Setup cmake
-        uses: jwlawson/actions-setup-cmake@v2
-        with:
-          cmake-version: "3.x"
-
-      - name: Install Protocol Buffers Compiler
-        uses: arduino/setup-protoc@v3
-        with:
-          version: "33.2"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install build dependencies (Ubuntu)
         if: runner.os == 'Linux'
@@ -327,7 +262,7 @@ jobs:
 
   ci-complete:
     name: ci complete
-    needs: [changes, matrix-plan, rust, rust-bifrost, rust-gates, codegen, python, docs, ui]
+    needs: [changes, matrix-plan, ci, rust-compat, python, docs, ui]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -337,10 +272,8 @@ jobs:
         run: |
           set -euo pipefail
           for result in \
-            "${{ needs.rust.result }}" \
-            "${{ needs.rust-bifrost.result }}" \
-            "${{ needs.rust-gates.result }}" \
-            "${{ needs.codegen.result }}" \
+            "${{ needs.ci.result }}" \
+            "${{ needs.rust-compat.result }}" \
             "${{ needs.python.result }}" \
             "${{ needs.docs.result }}" \
             "${{ needs.ui.result }}"; do

@@ -1,0 +1,113 @@
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    access_log off;
+    error_log /dev/stderr;
+
+    client_body_temp_path /tmp/client_temp;
+    proxy_temp_path /tmp/proxy_temp_path;
+    fastcgi_temp_path /tmp/fastcgi_temp;
+    uwsgi_temp_path /tmp/uwsgi_temp;
+    scgi_temp_path /tmp/scgi_temp;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
+    server_tokens off;
+
+    client_max_body_size 32M;
+    client_body_buffer_size 128k;
+    proxy_buffering on;
+    proxy_buffer_size 16k;
+    proxy_buffers 8 16k;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_comp_level 6;
+    gzip_types
+        text/plain
+        text/css
+        application/json
+        application/javascript
+        text/xml
+        application/xml
+        application/xml+rss
+        text/javascript
+        application/wasm;
+
+    upstream wyrd_api {
+        server 127.0.0.1:8080 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+    }
+
+    upstream sveltekit {
+        server 127.0.0.1:3000 max_fails=3 fail_timeout=30s;
+        keepalive 32;
+    }
+
+    server {
+        listen ${NGINX_PORT};
+        server_name _;
+
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+
+        location /api/ {
+            proxy_pass http://wyrd_api/api/;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Cookie $http_cookie;
+            proxy_pass_header Set-Cookie;
+            proxy_cache_bypass $http_upgrade;
+            proxy_read_timeout 86400;
+            proxy_send_timeout 86400;
+        }
+
+        location /health {
+            proxy_pass http://wyrd_api/api/v1/health;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Cookie $http_cookie;
+            proxy_pass_header Set-Cookie;
+            access_log off;
+        }
+
+        location / {
+            proxy_pass http://sveltekit;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection 'upgrade';
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Cookie $http_cookie;
+            proxy_pass_header Set-Cookie;
+            proxy_cache_bypass $http_upgrade;
+            proxy_read_timeout 86400;
+            proxy_send_timeout 86400;
+        }
+    }
+}

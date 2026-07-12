@@ -6,8 +6,11 @@
 //!
 //! - `repair` — maintenance sweep workers (slice 01+)
 //! - `projections` — projection matching + read-time rewrite (slice 04)
+//! - `session` — query session / context builder (slice 04)
 //! - `admission` — query admission control (slice 06)
 //! - `async_jobs` — async query worker (slice 07)
 //! - `derivations` — cross-table derivation worker (slice 05b)
 
+pub mod projections;
 pub mod repair;
+pub mod session;

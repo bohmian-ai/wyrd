@@ -12,6 +12,7 @@ use wyrd_sql::TenantConn;
 use crate::SqlError;
 use crate::row_types::olap_catalog::{
     BifrostTableRow, ClaimedPrecommitRow, DeclaredIndexRow, EntityTimeBoundsRow, OlapCommitRow,
+    ProjectionCandidateRow,
 };
 
 // ── vala.bifrost_tables ──────────────────────────────────────────────────────
@@ -781,6 +782,45 @@ pub async fn entity_bounds_for(
     .bind(entity_kind)
     .bind(entity_id)
     .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+// ── vala.olap_projections ────────────────────────────────────────────────────
+
+/// List all projection candidate rows for a given source table (tenant-scoped).
+///
+/// Returns all registered projections whose `source_table_uid` matches the
+/// given table. The serving layer's matcher uses this to find substitutable
+/// projections for a source scan. Filters to non-degraded states so the
+/// matcher only sees candidates that are at least structurally valid.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_by_source(
+    conn: &mut TenantConn<'_>,
+    source_table_uid: &[u8; 16],
+) -> Result<Vec<ProjectionCandidateRow>, SqlError> {
+    sqlx::query_as::<_, ProjectionCandidateRow>(
+        r#"
+        SELECT data_tenant_id,
+               projection_uid,
+               source_table_uid,
+               fqn,
+               projection_kind,
+               projection_state,
+               refresh_epoch,
+               source_refresh_epoch,
+               built_for_snapshot_id,
+               commit_lag,
+               source_schema_fingerprint
+          FROM vala.olap_projections
+         WHERE source_table_uid = $1
+           AND projection_state <> 'degraded'
+        "#,
+    )
+    .bind(source_table_uid.as_slice())
+    .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
 }

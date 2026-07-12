@@ -81,7 +81,10 @@ mod pg_tests {
     }
 
     fn auth_ctx(tenant: DataTenantId) -> AuthContext {
-        let card = CardRef::from_str(CARD).expect("card parses");
+        let mut card = CardRef::from_str(CARD).expect("card parses");
+        // Stamp a UID so stamp_correlation_columns can resolve card_uid from the
+        // per-row card_ref column — requires uid to be present (M-11 fail-closed).
+        card.uid = Some(wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 uid"));
         AuthContext {
             principal: Principal::new(
                 PrincipalId::new(uuid::Uuid::now_v7()),

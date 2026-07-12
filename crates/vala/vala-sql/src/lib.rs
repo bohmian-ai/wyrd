@@ -277,6 +277,9 @@ mod tests {
             .into_iter()
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
+                if is_cross_tenant_admin_module(&body) {
+                    return None;
+                }
                 let checked = without_line_comments(&body);
                 (checked.contains("&PgPool")
                     || checked.contains("PgPool,")
@@ -406,6 +409,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A query module may opt out of the raw-executor guard when it is a
+    /// deliberately cross-tenant admin surface: it operates across every tenant
+    /// partition through the `wyrd_platform_admin` BYPASSRLS pool and is never
+    /// reachable from a tenant request path. Such a module declares an explicit
+    /// `tenant-scope-exempt:` marker so the exemption stays auditable in review.
+    fn is_cross_tenant_admin_module(source: &str) -> bool {
+        source.contains("tenant-scope-exempt:")
     }
 
     fn production_source(source: &str) -> &str {

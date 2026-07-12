@@ -8,7 +8,7 @@ mod pg_tests {
 
     use std::env;
 
-    use sqlx::{PgPool, Postgres, QueryBuilder, Row};
+    use sqlx::{PgConnection, Postgres, QueryBuilder, Row};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::query::{FieldRef, MetadataQuery, QueryFieldErrorDetail, ValueType};
@@ -82,7 +82,12 @@ mod pg_tests {
         }
     }
 
-    async fn setup(pool: &PgPool) {
+    async fn setup(conn: &mut PgConnection) {
+        // TEMP table on a single pinned connection: the restricted RLS app role
+        // cannot create tables in `public`, but it can create session-local temp
+        // tables in `pg_temp`. Because temp tables are session-scoped, setup and
+        // every query in a test must run on the *same* connection — hence each test
+        // acquires one connection from the pool and threads it through.
         sqlx::query(
             "CREATE TEMP TABLE IF NOT EXISTS test_items (
             id      BIGINT PRIMARY KEY,
@@ -91,12 +96,12 @@ mod pg_tests {
             score   BIGINT
         )",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .expect("create temp table");
 
         sqlx::query("TRUNCATE test_items")
-            .execute(pool)
+            .execute(&mut *conn)
             .await
             .expect("truncate");
 
@@ -111,18 +116,18 @@ mod pg_tests {
          (3, '{}',              NULL,        NULL),
          (4, '{\"env\":\"prod\"}', 'active',   NULL)",
         )
-        .execute(pool)
+        .execute(&mut *conn)
         .await
         .expect("insert fixture rows");
     }
 
-    async fn query_ids(pool: &PgPool, input: &str) -> Vec<i64> {
+    async fn query_ids(conn: &mut PgConnection, input: &str) -> Vec<i64> {
         let query = MetadataQuery::parse(input).expect("query parses");
         let mut qb = QueryBuilder::<Postgres>::new("SELECT id FROM test_items WHERE ");
         compile_query(&query, &ItemResolver, &mut qb).expect("query compiles");
         let mut ids: Vec<i64> = qb
             .build()
-            .fetch_all(pool)
+            .fetch_all(&mut *conn)
             .await
             .expect("query executes")
             .into_iter()
@@ -135,9 +140,14 @@ mod pg_tests {
     // JSONB Ne: absent-key rows are included (existing behavior, verify it holds).
     e2e_test!(jsonb_key_absent_ne_includes_absent_rows, {
         let fixture = PgFixture::start().await.expect("fixture");
-        setup(fixture.app_pool()).await;
+        let mut conn = fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("acquire connection");
+        setup(&mut conn).await;
 
-        let ids = query_ids(fixture.app_pool(), "labels.env != \"prod\"").await;
+        let ids = query_ids(&mut conn, "labels.env != \"prod\"").await;
         assert_eq!(
             ids,
             vec![2, 3],
@@ -148,18 +158,28 @@ mod pg_tests {
     // Typed Ne: NULL rows must be included (matches JSONB behavior after fix).
     e2e_test!(typed_ne_is_null_inclusive, {
         let fixture = PgFixture::start().await.expect("fixture");
-        setup(fixture.app_pool()).await;
+        let mut conn = fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("acquire connection");
+        setup(&mut conn).await;
 
-        let ids = query_ids(fixture.app_pool(), "status != \"active\"").await;
+        let ids = query_ids(&mut conn, "status != \"active\"").await;
         assert_eq!(ids, vec![2, 3], "NULL typed column must be included by Ne");
     });
 
     // Typed NotIn: NULL rows must be included (matches JSONB behavior after fix).
     e2e_test!(typed_not_in_is_null_inclusive, {
         let fixture = PgFixture::start().await.expect("fixture");
-        setup(fixture.app_pool()).await;
+        let mut conn = fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("acquire connection");
+        setup(&mut conn).await;
 
-        let ids = query_ids(fixture.app_pool(), "score not in [10]").await;
+        let ids = query_ids(&mut conn, "score not in [10]").await;
         assert_eq!(
             ids,
             vec![2, 3, 4],
@@ -170,18 +190,28 @@ mod pg_tests {
     // Typed In array-bind: only matching non-NULL rows.
     e2e_test!(typed_in_array_bind, {
         let fixture = PgFixture::start().await.expect("fixture");
-        setup(fixture.app_pool()).await;
+        let mut conn = fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("acquire connection");
+        setup(&mut conn).await;
 
-        let ids = query_ids(fixture.app_pool(), "score in [5, 10]").await;
+        let ids = query_ids(&mut conn, "score in [5, 10]").await;
         assert_eq!(ids, vec![1, 2]);
     });
 
     // JSONB regex match.
     e2e_test!(jsonb_regex_match, {
         let fixture = PgFixture::start().await.expect("fixture");
-        setup(fixture.app_pool()).await;
+        let mut conn = fixture
+            .app_pool()
+            .acquire()
+            .await
+            .expect("acquire connection");
+        setup(&mut conn).await;
 
-        let ids = query_ids(fixture.app_pool(), "labels.env =~ \"pro.*\"").await;
+        let ids = query_ids(&mut conn, "labels.env =~ \"pro.*\"").await;
         assert_eq!(ids, vec![1, 4]);
     });
 }

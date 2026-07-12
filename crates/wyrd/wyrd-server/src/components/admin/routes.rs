@@ -47,6 +47,7 @@ use wyrd_sql::{SqlError, TenantConn};
 use crate::audit;
 use crate::auth::pg_resolvers::{binding_write_from_binding, issuer_write_from_trusted};
 use crate::components::auth::Caller;
+use crate::config::DeploymentProfile;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
@@ -302,7 +303,7 @@ async fn create_trusted_issuer(
 
     // The only network call on any admin path, and only at create: discovery
     // resolves jwks_uri. A runtime read must never re-discover.
-    let jwks_uri = discover_jwks_uri(&request.issuer).await?;
+    let jwks_uri = discover_jwks_uri(&request.issuer, state.deployment_profile).await?;
 
     let trusted = TrustedIssuer {
         tenant_id: caller.principal.tenant_id,
@@ -591,7 +592,23 @@ fn is_ssrf_blocked_host(url: &url::Url) -> bool {
 
 /// Resolve the issuer's `jwks_uri` via OIDC discovery. The issuer URL is already
 /// validated by [`IssuerUrl`]; a discovery failure is a `503`.
-async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResponse> {
+///
+/// The SSRF guard (private/loopback/link-local block) applies only in
+/// `Production`. In multi-tenant SaaS a tenant admin is semi-untrusted relative
+/// to the platform network, so a tenant-supplied issuer must not drive a fetch
+/// to an internal address. Self-hosted / enterprise-single-tenant and local
+/// development legitimately run the IdP on a private or loopback address
+/// (`Development` profile), so the block would be a false positive there.
+///
+/// Known follow-up hardening (tracked separately): the guard checks the URL's
+/// literal IP only, so a hostname resolving to a private/metadata IP bypasses it
+/// (DNS-rebinding); a production-grade guard resolves DNS and checks the resolved
+/// address, and blocks the cloud metadata endpoint (`169.254.169.254`) in every
+/// profile.
+async fn discover_jwks_uri(
+    issuer: &IssuerUrl,
+    deployment_profile: DeploymentProfile,
+) -> Result<url::Url, WyrdErrorResponse> {
     let url = url::Url::parse(issuer.as_str()).map_err(|error| {
         WyrdErrorResponse::from(WyrdError::MissingRequiredField {
             message: format!("issuer is not a valid URL: {error}"),
@@ -599,7 +616,7 @@ async fn discover_jwks_uri(issuer: &IssuerUrl) -> Result<url::Url, WyrdErrorResp
         })
     })?;
 
-    if is_ssrf_blocked_host(&url) {
+    if deployment_profile.is_production() && is_ssrf_blocked_host(&url) {
         return Err(WyrdErrorResponse::from(WyrdError::MissingRequiredField {
             message: "issuer resolves to a blocked address range".to_owned(),
             details: serde_json::json!({ "field": "issuer" }),
@@ -805,8 +822,7 @@ mod pg_tests {
                 Vec::<RoleRef>::new(),
                 perms,
             ),
-            request_id: RequestId::parse(&uuid::Uuid::nil().to_string())
-                .expect("nil UUID is a valid request id"),
+            request_id: RequestId::now_v7(),
         }
     }
 
@@ -918,6 +934,32 @@ mod pg_tests {
         .expect_err("a principal without service_accounts:write must be denied");
 
         assert!(matches!(error.0, WyrdError::PermissionDeniedRbac { .. }));
+    }
+
+    #[tokio::test]
+    async fn create_blocks_private_issuer_in_production() {
+        let fixture = PgFixture::start().await.expect("fixture starts");
+        let tenant = fixture.data_tenant_id();
+        let state = test_state(&fixture)
+            .await
+            .with_deployment_profile(DeploymentProfile::Production);
+        // The SSRF guard must reject a loopback issuer under the Production
+        // profile before any network call — no discovery server is stood up.
+        let issuer = IssuerUrl::new("http://127.0.0.1:9/").expect("loopback issuer parses");
+
+        let error = create_trusted_issuer(
+            State(state),
+            writer(tenant),
+            Json(create_issuer_request(issuer, Some(SECRET))),
+        )
+        .await
+        .expect_err("Production must block a private/loopback issuer");
+
+        assert!(matches!(
+            &error.0,
+            WyrdError::MissingRequiredField { message, .. }
+                if message.contains("blocked address range")
+        ));
     }
 
     #[tokio::test]

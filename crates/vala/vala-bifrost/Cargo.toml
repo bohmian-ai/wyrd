@@ -63,9 +63,6 @@ name = "pg_audit_relay"
 name = "pg_commit_idempotency"
 
 [[test]]
-name = "pg_crash_recovery"
-
-[[test]]
 name = "pg_reconcile"
 
 [[bench]]

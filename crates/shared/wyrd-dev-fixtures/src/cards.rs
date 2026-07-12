@@ -57,7 +57,7 @@ pub async fn seed_card_with_spec(
             $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
             $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
         )
-        ON CONFLICT (data_tenant_id, kind, space, name, version) DO NOTHING
+        ON CONFLICT (data_tenant_id, kind, space, name, version) WHERE status <> 'deleted' DO NOTHING
         "#,
     )
     .bind(Uuid::now_v7())

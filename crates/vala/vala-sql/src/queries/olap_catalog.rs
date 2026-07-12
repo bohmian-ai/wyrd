@@ -154,9 +154,9 @@ pub async fn precommit(
     sqlx::query(
         r#"
         INSERT INTO vala.olap_commits
-            (data_tenant_id, table_uid, batch_id, state, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, 'precommit', $3, $4)
-        ON CONFLICT (data_tenant_id, table_uid, batch_id) DO NOTHING
+            (data_tenant_id, table_uid, control_bind, batch_id, state, origin, actor)
+        VALUES (wyrd.current_tenant(), $1, wyrd.current_tenant(), $2, 'precommit', $3, $4)
+        ON CONFLICT (data_tenant_id, table_uid, control_bind, batch_id) DO NOTHING
         "#,
     )
     .bind(table_uid.as_slice())
@@ -287,13 +287,18 @@ pub async fn lookup_idempotent(
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
 ) -> Result<Option<OlapCommitRow>, SqlError> {
+    // Dynamic query is intentional: control_bind == wyrd.current_tenant() under
+    // the TenantConn RLS bind, so filtering by table_uid + control_bind + batch_id
+    // is equivalent to filtering by the widened CommitKey identity.
     sqlx::query_as::<_, OlapCommitRow>(
         r#"
         SELECT data_tenant_id, table_uid, batch_id, snapshot_id,
                state, precommit_at, committed_at, finalized_at,
                error_code, error_detail, origin, actor
           FROM vala.olap_commits
-         WHERE table_uid = $1 AND batch_id = $2
+         WHERE table_uid = $1
+           AND control_bind = wyrd.current_tenant()
+           AND batch_id = $2
         "#,
     )
     .bind(table_uid.as_slice())

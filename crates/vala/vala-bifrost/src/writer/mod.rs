@@ -10,6 +10,7 @@ pub mod commit;
 pub mod coordinator;
 pub mod file_writer;
 pub mod redaction;
+pub mod registry_writers;
 
 /// Caller-supplied context for one 2PC commit.
 ///

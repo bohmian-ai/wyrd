@@ -17,7 +17,7 @@ use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{
     ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
-    spawn_maintenance_scheduler, spawn_storage_sweeper,
+    spawn_audit_seal_worker, spawn_maintenance_scheduler, spawn_storage_sweeper,
 };
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
@@ -382,6 +382,22 @@ impl BoundServer {
                 }
             },
         ));
+
+        // Audit-seal worker (slice 12): seals shipped audit ranges into signed
+        // checkpoints each tick. Spawns only when the audit-seal key and the
+        // platform-admin pool are both configured.
+        if let Some(handle) = spawn_audit_seal_worker(&self.state, shutdown.clone()) {
+            set.spawn(worker_task(
+                TaskId::Worker("audit_seal_worker"),
+                async move {
+                    if let Err(join_error) = handle.await
+                        && join_error.is_panic()
+                    {
+                        std::panic::resume_unwind(join_error.into_panic());
+                    }
+                },
+            ));
+        }
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {

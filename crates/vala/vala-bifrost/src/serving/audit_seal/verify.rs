@@ -7,12 +7,15 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Array, BinaryArray, Int64Array};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::prelude::SessionContext;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use uuid::Uuid;
 use vala_sql::TenantConn;
-use vala_sql::queries::audit_outbox::shipped_outbox_refs;
+use vala_sql::queries::audit_outbox::{
+    AuditEntryHashInput, entry_hash_from_cols, shipped_outbox_refs,
+};
 use vala_sql::queries::audit_seal::list_checkpoints;
 use wyrd_auth_issue::AuditSealKey;
 use wyrd_spec::ids::DataTenantId;
@@ -73,8 +76,8 @@ pub async fn verify_checkpoint_walk(
         return Ok(VerifyOutcome::NoCheckpoints);
     }
 
-    // Load all audit log rows from Iceberg for the tenant.
-    let warehouse_rows = audit_log_rows_by_seq(catalog, tenant_id).await?;
+    // Recompute each entry hash from the Iceberg audit-log *content* columns.
+    let warehouse_rows = recomputed_entry_hashes_by_seq(catalog, tenant_id).await?;
 
     for checkpoint in &checkpoints {
         // Collect rows for this range in seq order.
@@ -148,8 +151,23 @@ pub async fn verify_checkpoint_walk(
     Ok(VerifyOutcome::Clean)
 }
 
-/// Load `(seq, entry_hash)` from the Iceberg `audit_log` for `tenant_id`.
-async fn audit_log_rows_by_seq(
+/// Recompute `(seq, entry_hash)` for every `audit_log` row of `tenant_id` by
+/// re-deriving each entry hash from the row's **content columns** via
+/// [`entry_hash_from_cols`].
+///
+/// This is the crux of tamper detection. The checkpoint signed a range hash
+/// built from the entry hashes; that signature is only meaningful if the
+/// verifier rebinds the range hash to the actual audit *content*. Reading the
+/// stored `entry_hash` column back would let a content edit that leaves that
+/// column untouched pass unnoticed. By recomputing from content, any change to
+/// a content column (e.g. `decision` flipping `deny`→`allow`) changes the
+/// recomputed hash, changes the range hash, and breaks the checkpoint signature.
+///
+/// The encoding mirrors the writer (`append_audit`): `prev_hash`/`entry_hash`
+/// are stored hex, `principal_id` a UUID string, and the enum columns their
+/// canonical lowercase forms — so `entry_hash_from_cols` reproduces the exact
+/// bytes hashed at append time.
+async fn recomputed_entry_hashes_by_seq(
     catalog: &WyrdCatalog,
     tenant_id: DataTenantId,
 ) -> Result<Vec<(i64, Vec<u8>)>, BifrostError> {
@@ -170,7 +188,12 @@ async fn audit_log_rows_by_seq(
     .map_err(|e| BifrostError::Internal(e.to_string()))?;
 
     let df = ctx
-        .sql("SELECT seq, entry_hash FROM audit_log ORDER BY seq")
+        .sql(
+            "SELECT seq, prev_hash, request_id, trace_id, operation, resource, \
+             audit_card_ref, principal_id, principal_kind, auth_method, permission, \
+             decision, result, payload_summary \
+             FROM audit_log ORDER BY seq",
+        )
         .await
         .map_err(|e| BifrostError::Internal(e.to_string()))?;
 
@@ -181,30 +204,81 @@ async fn audit_log_rows_by_seq(
 
     let mut rows = Vec::new();
     for batch in &batches {
-        let seq_col = batch
-            .column_by_name("seq")
-            .ok_or_else(|| BifrostError::Internal("audit_log missing seq column".to_string()))?;
-        let hash_col = batch.column_by_name("entry_hash").ok_or_else(|| {
-            BifrostError::Internal("audit_log missing entry_hash column".to_string())
-        })?;
+        let seq = int_col(batch, "seq")?;
+        let prev_hash = str_col(batch, "prev_hash")?;
+        let request_id = str_col(batch, "request_id")?;
+        let trace_id = str_col(batch, "trace_id")?;
+        let operation = str_col(batch, "operation")?;
+        let resource = str_col(batch, "resource")?;
+        let audit_card_ref = str_col(batch, "audit_card_ref")?;
+        let principal_id = str_col(batch, "principal_id")?;
+        let principal_kind = str_col(batch, "principal_kind")?;
+        let auth_method = str_col(batch, "auth_method")?;
+        let permission = str_col(batch, "permission")?;
+        let decision = str_col(batch, "decision")?;
+        let result = str_col(batch, "result")?;
+        let payload_summary = str_col(batch, "payload_summary")?;
 
-        let seqs = seq_col
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .ok_or_else(|| BifrostError::Internal("seq column is not Int64".to_string()))?;
-        let hashes = hash_col
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| BifrostError::Internal("entry_hash column is not Binary".to_string()))?;
-
-        for i in 0..seqs.len() {
-            if seqs.is_null(i) || hashes.is_null(i) {
+        for i in 0..seq.len() {
+            if seq.is_null(i) {
                 continue;
             }
-            rows.push((seqs.value(i), hashes.value(i).to_vec()));
+            let prev_bytes = hex::decode(prev_hash.value(i))
+                .map_err(|e| BifrostError::Internal(format!("audit_log prev_hash not hex: {e}")))?;
+            let pid = Uuid::parse_str(principal_id.value(i)).map_err(|e| {
+                BifrostError::Internal(format!("audit_log principal_id not a uuid: {e}"))
+            })?;
+            let pid_bytes = *pid.as_bytes();
+
+            let recomputed = entry_hash_from_cols(AuditEntryHashInput {
+                prev_hash: &prev_bytes,
+                seq: seq.value(i),
+                request_id: request_id.value(i),
+                trace_id: opt_str(trace_id, i),
+                operation: operation.value(i),
+                resource: resource.value(i),
+                card_ref: opt_str(audit_card_ref, i),
+                principal_id_bytes: &pid_bytes,
+                principal_kind: principal_kind.value(i),
+                auth_method: auth_method.value(i),
+                permission: permission.value(i),
+                decision: decision.value(i),
+                result: result.value(i),
+                payload_summary: payload_summary.value(i),
+            });
+            rows.push((seq.value(i), recomputed.to_vec()));
         }
     }
     Ok(rows)
+}
+
+/// Downcast a required `Int64` column of `batch`.
+fn int_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a Int64Array, BifrostError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| BifrostError::Internal(format!("audit_log missing {name} column")))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| BifrostError::Internal(format!("audit_log {name} is not Int64")))
+}
+
+/// Downcast a required `Utf8` column of `batch`.
+fn str_col<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, BifrostError> {
+    batch
+        .column_by_name(name)
+        .ok_or_else(|| BifrostError::Internal(format!("audit_log missing {name} column")))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| BifrostError::Internal(format!("audit_log {name} is not Utf8")))
+}
+
+/// Read an optional string cell (`None` when the column is null at `i`).
+fn opt_str(arr: &StringArray, i: usize) -> Option<&str> {
+    if arr.is_null(i) {
+        None
+    } else {
+        Some(arr.value(i))
+    }
 }
 
 /// In-process tamper-detection structural test.

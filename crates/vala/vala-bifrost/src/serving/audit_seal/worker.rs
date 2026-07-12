@@ -5,10 +5,15 @@
 //! most one will commit the checkpoint; the other will find the `ON CONFLICT DO
 //! NOTHING` upsert a no-op and exit cleanly.
 //!
-//! The range hash is computed by hashing the ordered column bytes from the
+//! The range hash is computed by hashing the ordered entry hashes from the
 //! shipped outbox rows, then signed with the dedicated `AuditSealKey`. The
 //! resulting `(seq_lo, seq_hi, range_hash, signature)` is persisted in
 //! `vala.audit_seal_checkpoints`.
+//!
+//! Pruning the sealed+shipped outbox rows is a separate step (a role-scoped
+//! DELETE under the `vala_audit_seal` role) and is not performed here yet;
+//! sealing establishes the tamper-evident checkpoint that lets the pruned
+//! history be re-verified from the Iceberg `audit_log`.
 
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -19,6 +24,9 @@ use wyrd_auth_issue::AuditSealKey;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::error::BifrostError;
+
+/// Tick interval for the audit-seal worker (60 s).
+pub const SEAL_TICK_INTERVAL_SECS: u64 = 60;
 
 /// Outcome of one seal pass.
 #[derive(Debug, Default)]
@@ -33,8 +41,7 @@ pub struct SealOutcome {
     pub skipped: bool,
 }
 
-/// Seal all shipped audit rows for `tenant_id`, then verify the resulting
-/// checkpoint round-trips correctly.
+/// Seal all shipped audit rows for `tenant_id` into one signed checkpoint.
 ///
 /// Steps:
 /// 1. Fetch all shipped outbox `(seq, entry_hash)` pairs.
@@ -50,7 +57,7 @@ pub struct SealOutcome {
 ///
 /// # Errors
 /// Returns [`BifrostError`] when any SQL query or signing operation fails.
-pub async fn seal_then_prune(
+pub async fn seal_shipped_range(
     app_pool: &PgPool,
     key: &AuditSealKey,
     tenant_id: DataTenantId,

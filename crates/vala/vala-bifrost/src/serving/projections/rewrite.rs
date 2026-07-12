@@ -203,6 +203,48 @@ mod tests {
         assert!(rewriter.scan_matches_source(&fake_scan));
     }
 
+    /// Behavior gate (rewrite): the positive substitution path actually
+    /// replaces a matching source `TableScan` with a scan of the projection
+    /// table. This drives `rewrite()` end-to-end (not just the struct fields)
+    /// and asserts the rewritten plan's scan targets the projection FQN.
+    #[test]
+    fn rewrite_substitutes_matching_source_scan_with_projection() {
+        use datafusion::datasource::default_table_source::DefaultTableSource;
+        use datafusion::datasource::empty::EmptyTable;
+
+        let candidate = fresh_lookup_candidate(); // fqn = "vala.proj_lookup"
+        let plan_ctx = base_plan_ctx();
+        let matched = match_projections(&[candidate], &plan_ctx);
+        let rewriter = ProjectionRewriter::new("metrics", &matched[0]);
+
+        let source: std::sync::Arc<dyn datafusion::logical_expr::TableSource> =
+            std::sync::Arc::new(DefaultTableSource::new(std::sync::Arc::new(
+                EmptyTable::new(std::sync::Arc::new(arrow::datatypes::Schema::empty())),
+            )));
+        let projected_schema = std::sync::Arc::new(
+            datafusion::common::DFSchema::try_from(arrow::datatypes::Schema::empty()).unwrap(),
+        );
+        let plan = LogicalPlan::TableScan(TableScan {
+            table_name: TableReference::bare("metrics"),
+            source,
+            projection: None,
+            projected_schema,
+            filters: vec![],
+            fetch: None,
+        });
+
+        let rewritten = rewriter.rewrite(plan).expect("rewrite must succeed");
+
+        let LogicalPlan::TableScan(out) = rewritten else {
+            panic!("rewritten plan must remain a TableScan");
+        };
+        assert_eq!(
+            out.table_name.table(),
+            "vala.proj_lookup",
+            "the matching source scan must be rewritten to target the projection FQN"
+        );
+    }
+
     /// Rewriting a plan with no matching scan returns the plan unchanged.
     #[test]
     fn rewrite_no_match_returns_plan_unchanged() {

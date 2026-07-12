@@ -879,6 +879,86 @@ pub fn spawn_maintenance_scheduler(
     })
 }
 
+/// Spawn the audit-seal worker (slice 12).
+///
+/// On each tick it enumerates every tenant with shipped audit rows and seals
+/// the shipped range into a signed `vala.audit_seal_checkpoints` row. Sealing is
+/// idempotent (`ON CONFLICT DO NOTHING`), so concurrent pods converge on the
+/// same checkpoint; the verifier later recomputes each range hash from the
+/// Iceberg `audit_log` content columns to confirm the signature still holds.
+///
+/// Returns `None` (worker not spawned) when the dedicated audit-seal key is not
+/// configured or the platform-admin pool is unavailable — sealing needs the key
+/// to sign and the operator pool to enumerate tenants.
+#[must_use]
+pub fn spawn_audit_seal_worker(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(key) = state.auth.audit_seal_key.clone() else {
+        tracing::warn!("audit-seal worker skipped: no audit-seal key configured");
+        return None;
+    };
+    let Some(op) = state.postgres.operator_pool() else {
+        tracing::warn!("audit-seal worker skipped: platform admin pool unavailable");
+        return None;
+    };
+    let app_pool = state.postgres.vala_pool().clone();
+    let tick_interval =
+        Duration::from_secs(vala_bifrost::serving::audit_seal::worker::SEAL_TICK_INTERVAL_SECS);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "audit-seal worker: tenant enumeration failed");
+                    continue;
+                }
+            };
+
+            for raw_id in tenant_ids {
+                let Ok(tenant_id) = DataTenantId::try_from(raw_id) else {
+                    continue;
+                };
+                match vala_bifrost::serving::audit_seal::worker::seal_shipped_range(
+                    &app_pool, &key, tenant_id,
+                )
+                .await
+                {
+                    Ok(outcome) if !outcome.skipped => {
+                        tracing::debug!(
+                            tenant_id = %tenant_id,
+                            rows_sealed = outcome.rows_sealed,
+                            seq_lo = ?outcome.seq_lo,
+                            seq_hi = ?outcome.seq_hi,
+                            "audit-seal worker: sealed range"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            tenant_id = %tenant_id,
+                            error = %e,
+                            "audit-seal worker: seal failed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Some(handle)
+}
+
 /// Ensure the recovery pool is present in production deployments.
 ///
 /// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER

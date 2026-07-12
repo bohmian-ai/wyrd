@@ -1,5 +1,8 @@
 //! Shared SQL fragments for version-component pushdown and line locking.
 #![deny(missing_docs)]
+// raw-query grep allowlist: version-line SQL uses QueryBuilder for dynamic bounds
+// and a `pg_advisory_xact_lock` keyed on the tenant; all run on a TenantConn (RLS).
+// Run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::{Postgres, QueryBuilder};
 use wyrd_semver::{SemverTriple, VersionBounds};

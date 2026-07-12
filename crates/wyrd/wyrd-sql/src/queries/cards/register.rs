@@ -1,5 +1,9 @@
 //! Idempotent INSERT path for `wyrd.cards`.
 #![deny(missing_docs)]
+// raw-query grep allowlist: register insert/lookup run on a TenantConn (RLS) and
+// scope every row to `wyrd.current_tenant()`; the INSERT ON CONFLICT targets the
+// partial `cards_identity_unique` index by predicate. Run `mise run sqlx:prepare`
+// to promote to macros.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

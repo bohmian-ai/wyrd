@@ -432,7 +432,7 @@ impl Parser {
         }
         if self.matches(|tok| matches!(tok, Tok::LParen)) {
             let query = self.parse_or(depth + 1)?;
-            self.expect(|tok| matches!(tok, Tok::RParen), ")")?;
+            self.expect_tok(|tok| matches!(tok, Tok::RParen), ")")?;
             return Ok(query);
         }
         self.parse_predicate()
@@ -588,12 +588,12 @@ impl Parser {
     }
 
     fn parse_list(&mut self) -> Result<Vec<Value>, WyrdError> {
-        self.expect(|tok| matches!(tok, Tok::LBracket), "[")?;
+        self.expect_tok(|tok| matches!(tok, Tok::LBracket), "[")?;
         let mut values = vec![self.parse_value()?];
         while self.matches(|tok| matches!(tok, Tok::Comma)) {
             values.push(self.parse_value()?);
         }
-        self.expect(|tok| matches!(tok, Tok::RBracket), "]")?;
+        self.expect_tok(|tok| matches!(tok, Tok::RBracket), "]")?;
         Ok(values)
     }
 
@@ -612,7 +612,7 @@ impl Parser {
         }
     }
 
-    fn expect(
+    fn expect_tok(
         &mut self,
         pred: impl FnOnce(&Tok) -> bool,
         expected: &'static str,

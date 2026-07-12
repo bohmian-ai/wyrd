@@ -39,7 +39,7 @@ pub async fn delete_role(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::builtin_roles::builtin_role_uuid;
 

@@ -13,8 +13,6 @@
 //! [`WyrdClient::connect_grpc`], sharing the same [`AuthMiddleware`] so the HTTP
 //! and gRPC planes authenticate through one token path.
 
-#![cfg(feature = "transport-http")]
-
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -24,7 +22,6 @@ use wyrd_spec::error::WyrdError;
 use crate::auth::AuthMiddleware;
 use crate::config::ClientConfig;
 use crate::error::WyrdClientError;
-#[cfg(feature = "transport-grpc")]
 use crate::transport::config::GrpcConfig;
 use crate::transport::http::{ArrowResponse, HttpTransport};
 
@@ -41,7 +38,6 @@ pub struct WyrdClient {
     auth: Arc<AuthMiddleware>,
     http: HttpTransport,
     /// Held for lazy [`WyrdClient::connect_grpc`]; only the gRPC plane reads it.
-    #[cfg(feature = "transport-grpc")]
     grpc_config: GrpcConfig,
 }
 
@@ -78,7 +74,6 @@ impl WyrdClient {
         Ok(Self {
             auth,
             http,
-            #[cfg(feature = "transport-grpc")]
             grpc_config: config.grpc,
         })
     }
@@ -169,7 +164,6 @@ impl WyrdClient {
     /// # Errors
     /// Returns [`WyrdClientError::TransportDown`] when the endpoint URI is
     /// invalid or the dial fails on all attempts.
-    #[cfg(feature = "transport-grpc")]
     pub async fn connect_grpc(
         &self,
     ) -> Result<crate::transport::grpc::GrpcConnection, WyrdClientError> {

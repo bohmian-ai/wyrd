@@ -1,0 +1,51 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::openai_chat_response()"
+---
+{
+  "id": "chatcmpl_123",
+  "object": "chat.completion",
+  "created": 1740000000,
+  "model": "gpt-4o",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"answer\":\"hello\"}",
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "lookup",
+              "arguments": "{\"q\":\"hello\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls",
+      "logprobs": {
+        "content": [],
+        "refusal": []
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 10,
+    "completion_tokens": 5,
+    "total_tokens": 15,
+    "prompt_tokens_details": {
+      "audio_tokens": 0,
+      "cached_tokens": 4
+    },
+    "completion_tokens_details": {
+      "accepted_prediction_tokens": 0,
+      "audio_tokens": 0,
+      "reasoning_tokens": 3,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "system_fingerprint": null,
+  "service_tier": null
+}

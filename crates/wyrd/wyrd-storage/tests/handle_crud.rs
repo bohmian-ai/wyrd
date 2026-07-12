@@ -21,6 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use wyrd_spec::DataTenantId;
+use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::error::StorageError;
 use wyrd_storage::factory::{azure, gcs, s3};
 use wyrd_storage::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config, StorageSettings};
@@ -114,8 +115,9 @@ async fn run_handle_crud(handle: &StorageHandle) {
 fn s3_emu_handle() -> StorageHandle {
     let bucket = env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test");
     let endpoint = env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000");
-    let signer =
-        BackendSigner::S3(s3::build_emulator_signer(&bucket, &endpoint).expect("s3 emu signer"));
+    let signer = BackendSigner::Cloud(Box::new(CloudSigner::S3(
+        s3::build_emulator_signer(&bucket, &endpoint).expect("s3 emu signer"),
+    )));
     let config = BackendConfig::S3(S3Config {
         bucket,
         region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
@@ -128,8 +130,9 @@ fn s3_emu_handle() -> StorageHandle {
 fn gcs_emu_handle() -> StorageHandle {
     let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
     let host = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
-    let signer =
-        BackendSigner::Gcs(gcs::build_emulator_signer(&bucket, &host).expect("gcs emu signer"));
+    let signer = BackendSigner::Cloud(Box::new(CloudSigner::Gcs(
+        gcs::build_emulator_signer(&bucket, &host).expect("gcs emu signer"),
+    )));
     let config = BackendConfig::Gcs(GcsConfig {
         bucket,
         endpoint_url: Some(host),
@@ -140,9 +143,9 @@ fn gcs_emu_handle() -> StorageHandle {
 fn azure_emu_handle() -> StorageHandle {
     let container = env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test");
     let base = env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000");
-    let signer = BackendSigner::Azure(
+    let signer = BackendSigner::Cloud(Box::new(CloudSigner::Azure(
         azure::build_emulator_signer(&container, &base).expect("azure emu signer"),
-    );
+    )));
     let config = BackendConfig::Azure(AzureConfig {
         account: "devstoreaccount1".to_owned(),
         container,

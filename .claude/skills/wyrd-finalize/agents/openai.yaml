@@ -1,4 +1,0 @@
-interface:
-  display_name: "Wyrd Finalize"
-  short_description: "Final Wyrd workflow gate."
-  default_prompt: "Use $wyrd-finalize to verify a completed Wyrd feature against its spec, review artifacts, final gates, and user/agent journey tests."

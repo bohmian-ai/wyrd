@@ -5,13 +5,10 @@
 //! shared [`AuthMiddleware`]. It names no typed gRPC service — the
 //! kind-specific sink builds its client from [`GrpcConnection::channel`].
 
-#[cfg(feature = "transport-grpc")]
 use std::{sync::Arc, time::Duration};
 
-#[cfg(feature = "transport-grpc")]
 use wyrd_tonic::tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
-#[cfg(feature = "transport-grpc")]
 use crate::{auth::AuthMiddleware, error::WyrdClientError, transport::config::GrpcConfig};
 
 /// Generic, service-agnostic authed gRPC connection.
@@ -23,7 +20,6 @@ use crate::{auth::AuthMiddleware, error::WyrdClientError, transport::config::Grp
 ///
 /// `Channel` is a clone-cheap tonic handle to the underlying HTTP/2
 /// connection. Cloning `GrpcConnection` does **not** redial.
-#[cfg(feature = "transport-grpc")]
 #[derive(Clone)]
 pub struct GrpcConnection {
     channel: Channel,
@@ -31,7 +27,6 @@ pub struct GrpcConnection {
     max_message_bytes: usize,
 }
 
-#[cfg(feature = "transport-grpc")]
 impl std::fmt::Debug for GrpcConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GrpcConnection")
@@ -41,7 +36,6 @@ impl std::fmt::Debug for GrpcConnection {
     }
 }
 
-#[cfg(feature = "transport-grpc")]
 impl GrpcConnection {
     /// Dial the endpoint configured in `config`, applying keepalive and
     /// max-message limits, and return a connected [`GrpcConnection`].
@@ -134,7 +128,6 @@ impl GrpcConnection {
 ///
 /// Kept separate so the retry loop in [`GrpcConnection::connect`] can reuse
 /// it without repeating validation logic.
-#[cfg(feature = "transport-grpc")]
 fn build_endpoint(config: &GrpcConfig) -> Result<Endpoint, WyrdClientError> {
     let endpoint = Endpoint::from_shared(config.endpoint.clone()).map_err(|err| {
         WyrdClientError::TransportDown {

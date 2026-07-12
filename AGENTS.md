@@ -11,16 +11,17 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 ## 1. First Pass Before Editing
 
 1. Read this file (AGENTS.md).
-2. Read `architecture/wyrd-design.md`; it is the active design authority and
+2. Follow all agent rules listed in `architecture/agent-rules.md`.
+3. Read `architecture/wyrd-design.md`; it is the active design authority and
    wins over generated artifacts, older planning files, and implementation
    drift.
-3. Read `architecture/wyrd-doctrine.mdx` before changing
+4. Read `architecture/wyrd-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
-4. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-5. Inspect the nearest existing Wyrd implementation and tests.
-6. Check `mise.toml` for the canonical verification command.
-7. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+5. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+6. Inspect the nearest existing Wyrd implementation and tests.
+7. Check `mise.toml` for the canonical verification command.
+8. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
@@ -48,11 +49,13 @@ Locked cross-cutting decisions that any contributor must honor:
 - Core durable logic is Rust-only server logic. Contracts live on the API wire
   through typed schemas, HTTP/MCP payloads, generated docs, and stable error
   codes so any language can implement a Wyrd client.
-- Python and Rust are first-class client languages. They may receive richer
-  SDK ergonomics, local authoring helpers, OTEL integration, agent workflow
-  integration, and test tooling when useful, but those features must not move
-  server-owned durable behavior out of the server or make the product
-  language-exclusive.
+- Rust, Python, and TypeScript are first-class client languages. Wyrd ships
+  idiomatic SDKs, generated types, examples, and user-journey coverage for all
+  three. Go is a planned client language, but it is not first-class until its
+  SDK and the same contract and journey gates ship. These SDKs may add local
+  authoring helpers, OTEL integration, agent workflow integration, and test
+  tooling, but they must not move server-owned durable behavior out of the
+  server or create language-specific durable contracts.
 - Wyrd must work both self-hosted and as a cloud SaaS product. SaaS and
   enterprise deployments require full tenant separation for identity, authz,
   storage, registry, policy, audit, observability, evaluation, and generated
@@ -93,7 +96,13 @@ Locked cross-cutting decisions that any contributor must honor:
   it is a test-tier crate and is never enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
-- Vala and Skald do not depend on each other directly.
+- Skald owns reusable agent primitives. Vala may depend on Skald to implement
+  reusable agent evaluation, including offline evaluation independent of
+  `wyrd-server`. Skald does not depend on Vala. `wyrd-server` consumes the Vala
+  evaluation engine but does not own evaluation-engine logic.
+- Crate ownership includes dependency cost. Do not move a specialized dependency
+  into a foundational or broadly consumed crate merely to centralize
+  configuration. Keep it in the narrowest crate that owns the behavior.
 - MCP is first-class; read tools are always available, write tools require
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
@@ -111,13 +120,17 @@ Locked cross-cutting decisions that any contributor must honor:
   OLAP, and background data-plane behavior. Python-visible Vala client
   behavior lives in `vala-sdk` behind its optional `python` feature.
 - `crates/wyrd/*`: server, CLI, MCP, application integration, UI host.
+- `crates/bindings/*`: thin native bindings and package roots for first-class
+  SDKs that need them, including the TypeScript/Node surface. Shared client
+  behavior stays in client-tier Rust crates; bindings do not reimplement HTTP,
+  validation, registry, storage, or lifecycle logic.
 - `python/py-wyrd`: PyO3 module root, Python package exports, generated stubs,
   Python-facing tests, and submodule aggregation.
 
 When behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 durable server behavior in Rust-owned server/service crates, and expose the
-necessary API through language-agnostic wire contracts plus first-class Rust
-and Python client surfaces where appropriate.
+necessary API through language-agnostic wire contracts plus first-class Rust,
+Python, and TypeScript client surfaces where appropriate.
 
 ## 4. Rust Core Rules
 
@@ -145,8 +158,10 @@ and Python client surfaces where appropriate.
   input, database, storage, or external-service behavior in non-test code.
 - Use `expect()` only for true invariants, with a message naming the invariant.
 - Do not add wildcard dependency versions or per-crate profile blocks.
-- All cargo invocations use `--all-features` unless gating a specific feature
-  surface.
+- Lints, format checks, and workspace type-checks use `--all-features` so every
+  code path is verified. Test and build tasks declare only the minimal feature
+  set they need — `--all-features` in a test task forces the heavy cone to
+  recompile at a different feature-union and defeats artifact reuse.
 
 ## 5. Abstraction Rules
 
@@ -222,9 +237,10 @@ then run codegen.
 - Server code owns durable behavior, side effects, tenancy checks, registry
   writes, storage orchestration, policy decisions, audit records, and generated
   relationship/status state.
-- Client code, including first-class Rust and Python SDKs, may own ergonomic
-  authoring helpers, local save/load, local validation messages, tracing hooks,
-  and runtime integrations, but it must not become the durable source of truth.
+- Client code, including first-class Rust, Python, and TypeScript SDKs, may own
+  ergonomic authoring helpers, local save/load, local validation messages,
+  tracing hooks, and runtime integrations, but it must not become the durable
+  source of truth.
 - Public request/response bodies are typed structs.
 - Wire types derive schema support where required by the feature gate.
 - Public handlers return structured Wyrd errors via the `WyrdError` derive.
@@ -266,10 +282,11 @@ missing higher one.
    the **negative** flows a real caller hits (under-privileged token →
    rejection, non-SELECT or oversized query → floor rejection, write to an
    unregistered table, replayed batch → no double-write). Cover every
-   user-facing surface the capability ships — Python and Rust SDK, and the
-   MCP/HTTP path when the capability is agent-facing. Journeys run in a gated
-   lane (`integration` pytest marker; Rust `e2e`/`#[ignore]`) so the fast lane
-   stays credential- and server-free.
+   user-facing surface the capability ships — Rust, Python, and TypeScript SDKs,
+   and the MCP/HTTP path when the capability is agent-facing. Journeys run in a
+   gated lane (`integration` pytest marker; Rust `e2e`/`#[ignore]`; the
+   repository TypeScript integration task) so the fast lane stays credential-
+   and server-free.
 2. **Integration tests — supporting.** Exercise one subsystem against its real
    dependency (a handler against Postgres, the ingest service against the
    writer) without standing up the full client→server journey. Use them to pin
@@ -302,8 +319,8 @@ mise run py:lints      # if Python files changed
 Then run the narrowest `mise` test/check tasks that cover the touched surface:
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
-  (`test:wyrd-spec`, `test:wyrd-server`, `test:sql`, `test:storage:matrix`,
-  etc.). Whole-crate tests should use `mise` when a task exists because some
+  (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
+  `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
   environment variables that the mise task sets up. Use raw `cargo test` only
   when no relevant mise task exists or when narrowing to a single pure unit
@@ -336,7 +353,7 @@ While working on a specific area:
 # Rust only
 # Whole-crate tests should use a crate-specific mise task when one exists.
 # Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
-mise exec -- cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -394,6 +411,12 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - `wyrd-sql` is the durable Postgres layer.
 - `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
 - Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly.
+- Wyrd is open source and independently publishable. It contains no private
+  enterprise licensing keys, feature gates, startup hooks, or product contracts.
+  A future private `wyrd-enterprise` repository may depend on and extend public
+  Wyrd crates; Wyrd never depends on that private repository. "Enterprise cloud"
+  describes a deployment topology and tenant-isolation requirement, not an
+  in-tree commercial edition.
 - KEEP IT SIMPLE STUPID: when reviewing and implementing, avoid over-engineering and adding unnecessary complexity, YAGNI, and follow a modular design that solves the problem at hand without adding extra layers, abstractions, or future-proofing that isn't justified by current needs. There should be one obvious way to do something, and it should be the way we do it.
 - Follow industry and Rust community best practices. Provide recommendations when appropriate.
 
@@ -404,10 +427,6 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - All code must be directly testable.
 - Functions and classes follow the single responsibility principle. If a function does two things, split it.
 - Follow existing code style and patterns. Do not introduce new paradigms unless there is a compelling reason. Consistency over cleverness.
-
-## 17. Agent and Subagent Rules
-
-- Verify your work in-session. Do not create background shells for `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `mise run`, `npm run`, `pytest`, or any test/lint/build command. This will create delays and issues in rust-based projects. Run necessary commands within the active session.
 
 ## 18. CodeGraph
 

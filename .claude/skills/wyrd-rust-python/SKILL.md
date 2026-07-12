@@ -112,6 +112,12 @@ If behavior crosses boundaries, put the durable contract in `wyrd-spec`, keep
 runtime implementation in the owning crate, and expose only the necessary API
 through server/Python/client layers.
 
+Skald owns reusable agent primitives. Vala may depend on Skald to implement a
+reusable agent evaluation engine that runs online or offline without
+`wyrd-server`; Skald must remain independent of Vala. Crate ownership includes
+dependency cost: keep specialized dependencies in the narrowest behavioral
+owner instead of moving them into broadly consumed crates to centralize config.
+
 ## Platform Posture
 
 - Wyrd follows a language-agnostic client/server model. The server owns durable

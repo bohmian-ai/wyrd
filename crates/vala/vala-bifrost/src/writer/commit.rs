@@ -34,8 +34,15 @@ const WRITER_LEASE_SECS: i64 = 30;
 
 /// Fault-injection points for test-only commit path overrides.
 ///
-/// Gated to test and bench builds; must never be reachable in production.
-#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+/// Gated to test and bench builds; must never be reachable in production. The
+/// crate's own `pg_tests` crash-recovery suite reaches it via `cfg(test)`; the
+/// `bench-bin` arm keeps it available to bench binaries (a separate crate that
+/// cannot see `cfg(test)` items).
+///
+/// TODO(vala-bifrost): fault injection is currently exercised only by the inline
+/// `pg_tests` crash-recovery suite. Wire it into the write-path benches when
+/// fault-latency benchmarking lands.
+#[cfg(any(test, feature = "bench-bin"))]
 #[derive(Clone, Debug)]
 pub enum Lease {
     Expired,
@@ -43,7 +50,7 @@ pub enum Lease {
     Normal,
 }
 
-#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[cfg(any(test, feature = "bench-bin"))]
 #[derive(Clone, Debug)]
 pub enum FaultPoint {
     /// Insert precommit row + lease, optionally expire the lease, then fail
@@ -133,7 +140,7 @@ pub async fn run_commit(
     }
 }
 
-#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[cfg(any(test, feature = "bench-bin"))]
 async fn expire_writer_lease(
     pool: &PgPool,
     table_uid: &TableUid,
@@ -448,14 +455,28 @@ async fn write_batches(
     let mut writer = UnpartitionedWriter::new(data_file_builder);
 
     for batch in batches {
-        let cast_columns: Vec<arrow::array::ArrayRef> = batch
-            .columns()
+        // Align by field name, not position: `stamp_system_columns` appends only
+        // the system columns and cannot know a table's per-policy correlation
+        // columns (`run_id`, `card_uid`, `principal_id`), so the stamped batch is a
+        // subset of the physical schema. Match each physical field by name; cast
+        // present columns to the Iceberg-derived type, and fill an absent nullable
+        // column (the server-resolved-or-null correlation columns) with a typed
+        // NULL array. An absent non-nullable column is a programmer error.
+        let nrows = batch.num_rows();
+        let cast_columns: Vec<arrow::array::ArrayRef> = typed_schema
+            .fields()
             .iter()
-            .zip(typed_schema.fields().iter())
-            .map(|(col, field)| {
-                arrow::compute::cast(col, field.data_type()).map_err(|e| {
+            .map(|field| match batch.column_by_name(field.name()) {
+                Some(col) => arrow::compute::cast(col, field.data_type()).map_err(|e| {
                     BifrostError::Internal(format!("cast column {}: {e}", field.name()))
-                })
+                }),
+                None if field.is_nullable() => {
+                    Ok(arrow::array::new_null_array(field.data_type(), nrows))
+                }
+                None => Err(BifrostError::Internal(format!(
+                    "physical column {} absent from stamped batch and not nullable",
+                    field.name()
+                ))),
             })
             .collect::<Result<_, _>>()?;
         let typed = RecordBatch::try_new(typed_schema.clone(), cast_columns)
@@ -499,7 +520,7 @@ async fn commit_to_iceberg(
 
 // ── Test/bench fault injection ───────────────────────────────────────────────
 
-#[cfg(any(test, feature = "testing", feature = "bench-bin"))]
+#[cfg(any(test, feature = "bench-bin"))]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_commit_with_fault(
     pool: &PgPool,
@@ -621,3 +642,6 @@ pub async fn run_commit_with_fault(
         }
     }
 }
+
+#[cfg(test)]
+mod pg_tests;

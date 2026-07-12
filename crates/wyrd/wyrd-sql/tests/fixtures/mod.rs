@@ -6,7 +6,7 @@ pub mod per_kind;
 pub mod scenarios;
 
 use sqlx::PgPool;
-
+use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::permission::PermissionSet;
 use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
@@ -18,17 +18,20 @@ use wyrd_sql::TenantConn;
 pub struct TestEnv {
     pub pool: PgPool,
     pub app_pool: PgPool,
+    _fixture: PgFixture,
 }
 
 impl TestEnv {
     pub async fn new() -> Self {
-        let db = wyrd_sql::testing::shared()
+        let fixture = PgFixture::start()
             .await
             .expect("shared test DB must be configured for e2e tests");
-        db.reset().await.expect("shared test DB reset succeeds");
+        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let app_pool = fixture.app_pool().clone();
         Self {
-            pool: db.migrator.clone(),
-            app_pool: db.app.clone(),
+            pool,
+            app_pool,
+            _fixture: fixture,
         }
     }
 

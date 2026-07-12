@@ -214,3 +214,282 @@ fn sample_chunk_means(values: &[f64], chunk_size: usize) -> Result<Vec<f64>, Dri
         .map(|chunk| chunk.iter().sum::<f64>() / chunk.len() as f64)
         .collect())
 }
+
+#[cfg(test)]
+mod spc_fit {
+    //! Unit tests for `fit_spc_baseline`.
+
+    use std::sync::Arc;
+
+    use crate::{DriftFitError, fit_spc_baseline};
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
+    use wyrd_spec::ids::FeatureName;
+
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn spc_profile(sample_size: u32) -> SpcProfile {
+        SpcProfile {
+            sample_size,
+            weco_rule: SpcWecoRule::default(),
+            alert_threshold: SpcAlertThreshold::Zone4,
+        }
+    }
+
+    #[test]
+    fn fit_adaptive_chunk_size_small_data() {
+        let values: Vec<f64> = (0..500).map(|value| (value as f64).sin()).collect();
+        let batch = numeric_batch("x", values);
+        let profile = spc_profile(0);
+        let fname = feature("x");
+
+        let baseline =
+            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
+
+        assert_eq!(baseline.chunk_size, 25);
+        let fitted = baseline.features.get(&fname).expect("feature");
+        assert!(fitted.three_lcl < fitted.center && fitted.center < fitted.three_ucl);
+    }
+
+    #[test]
+    fn fit_explicit_chunk_size() {
+        let values: Vec<f64> = (0..1_000).map(|value| (value as f64) * 0.1).collect();
+        let batch = numeric_batch("x", values);
+        let profile = spc_profile(50);
+        let fname = feature("x");
+
+        let baseline = fit_spc_baseline(&batch, &profile, &[fname]).expect("baseline");
+
+        assert_eq!(baseline.chunk_size, 50);
+    }
+
+    #[test]
+    fn fit_from_int_column() {
+        let values: Vec<i64> = (0..500).collect();
+        let batch = int_batch("x", values);
+        let profile = spc_profile(0);
+        let fname = feature("x");
+
+        let baseline =
+            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
+
+        let fitted = baseline.features.get(&fname).expect("feature");
+        assert!(fitted.center > 0.0);
+    }
+
+    #[test]
+    fn fit_includes_trailing_partial_chunk_for_center() {
+        let batch = numeric_batch("x", vec![0.0, 2.0, 2.0, 4.0, 100.0, 104.0]);
+        let profile = spc_profile(4);
+        let fname = feature("x");
+
+        let baseline =
+            fit_spc_baseline(&batch, &profile, std::slice::from_ref(&fname)).expect("baseline");
+
+        let fitted = baseline.features.get(&fname).expect("feature");
+        assert!((fitted.center - 52.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejects_non_numeric_column() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec!["a", "b", "c"]))],
+        )
+        .expect("record batch");
+        let profile = spc_profile(0);
+        let fname = feature("name");
+
+        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
+
+        assert!(matches!(err, DriftFitError::FeatureNotNumeric { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_column() {
+        let batch = numeric_batch("x", Vec::new());
+        let profile = spc_profile(0);
+        let fname = feature("x");
+
+        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
+
+        assert!(matches!(err, DriftFitError::FeatureEmpty { .. }));
+    }
+
+    #[test]
+    fn rejects_insufficient_chunks() {
+        let values: Vec<f64> = (0..25).map(|value| value as f64).collect();
+        let batch = numeric_batch("x", values);
+        let profile = spc_profile(25);
+        let fname = feature("x");
+
+        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
+
+        assert!(matches!(
+            err,
+            DriftFitError::InsufficientSamplesForChunk { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_feature() {
+        let batch = numeric_batch("x", (0..500).map(|value| value as f64).collect());
+        let profile = spc_profile(0);
+        let fname = feature("not_x");
+
+        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
+
+        assert!(matches!(err, DriftFitError::FeatureMissing { .. }));
+    }
+
+    #[test]
+    fn rejects_non_finite_values() {
+        let batch = numeric_batch("x", vec![1.0, f64::NAN, 3.0]);
+        let profile = spc_profile(2);
+        let fname = feature("x");
+
+        let err = fit_spc_baseline(&batch, &profile, &[fname]).expect_err("fit error");
+
+        assert!(matches!(err, DriftFitError::NonFiniteValuesInColumn { .. }));
+    }
+}
+
+#[cfg(test)]
+mod spc_score {
+    //! End-to-end tests for SPC scoring.
+
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::{DriftScoreError, DriftVerdict, fit_spc_baseline, score_spc};
+    use wyrd_spec::card::drift::{SpcAlertThreshold, SpcProfile, SpcWecoRule};
+    use wyrd_spec::ids::FeatureName;
+
+    fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new(name, DataType::Float64, true)]);
+        let array = Float64Array::from(values);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .expect("test batch should be valid")
+    }
+
+    fn string_batch(name: &str, values: Vec<&str>) -> RecordBatch {
+        let schema = Schema::new(vec![Field::new(name, DataType::Utf8, true)]);
+        let array = StringArray::from(values);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(array)])
+            .expect("test batch should be valid")
+    }
+
+    fn profile_default() -> SpcProfile {
+        SpcProfile {
+            sample_size: 0,
+            weco_rule: SpcWecoRule::default(),
+            alert_threshold: SpcAlertThreshold::Zone4,
+        }
+    }
+
+    #[test]
+    fn spc_in_control_target_no_drift() {
+        let baseline_batch = numeric_batch("x", vec![0.0; 500]);
+        let target = numeric_batch("x", vec![0.0; 500]);
+        let profile = profile_default();
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
+        assert_eq!(report.verdict, DriftVerdict::NoDrift);
+    }
+
+    #[test]
+    fn spc_out_of_bounds_target_drift_zone4() {
+        let baseline_values: Vec<f64> = (0..500).map(|idx| ((idx as f64) * 0.01).sin()).collect();
+        let baseline_batch = numeric_batch("x", baseline_values);
+        let target = numeric_batch("x", vec![100.0; 200]);
+        let profile = profile_default();
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
+        assert_eq!(report.verdict, DriftVerdict::Drift);
+    }
+
+    #[test]
+    fn spc_drift_with_zone1_threshold_detects_run() {
+        let baseline_values: Vec<f64> = (0..500).map(|idx| ((idx as f64) * 0.1).sin()).collect();
+        let baseline_batch = numeric_batch("x", baseline_values);
+        let target = numeric_batch("x", vec![0.05; 200]);
+        let profile = SpcProfile {
+            sample_size: 0,
+            weco_rule: SpcWecoRule::default(),
+            alert_threshold: SpcAlertThreshold::Zone1,
+        };
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let report = score_spc(&baseline, &target, &profile).expect("SPC score should pass");
+        assert_eq!(report.verdict, DriftVerdict::Drift);
+    }
+
+    #[test]
+    fn spc_target_smaller_than_chunk_size_errors() {
+        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
+        let target = numeric_batch("x", vec![1.0, 2.0, 3.0]);
+        let profile = profile_default();
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let err = score_spc(&baseline, &target, &profile).expect_err("target should be too small");
+        assert!(matches!(err, DriftScoreError::TargetTooSmall { .. }));
+    }
+
+    #[test]
+    fn spc_missing_feature_in_target() {
+        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
+        let target = numeric_batch("y", vec![1.0; 100]);
+        let profile = profile_default();
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let err =
+            score_spc(&baseline, &target, &profile).expect_err("target feature should be absent");
+        assert!(matches!(
+            err,
+            DriftScoreError::FeatureMissingInTarget { .. }
+        ));
+    }
+
+    #[test]
+    fn spc_non_numeric_target_errors() {
+        let baseline_batch = numeric_batch("x", (0..500).map(|idx| idx as f64).collect());
+        let target = string_batch("x", vec!["1", "2", "3"]);
+        let profile = profile_default();
+        let feature = FeatureName::new("x").expect("valid feature name");
+        let baseline =
+            fit_spc_baseline(&baseline_batch, &profile, &[feature]).expect("SPC fit should pass");
+        let err =
+            score_spc(&baseline, &target, &profile).expect_err("target feature is not numeric");
+        assert!(matches!(err, DriftScoreError::FeatureTypeMismatch { .. }));
+    }
+}

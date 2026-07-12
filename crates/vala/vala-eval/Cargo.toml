@@ -12,17 +12,6 @@ description = "In-memory eval engine: DAG-stage execution, operator runtime, sco
 [lib]
 path = "src/lib.rs"
 
-[features]
-default = []
-orchestrator = [
-    "dep:skald-agent",
-    "dep:skald-prompt",
-    "dep:skald-runtime",
-    "tokio/sync",
-    "tokio/time",
-    "tokio/macros",
-]
-
 [dependencies]
 arrow = { workspace = true }
 async-trait = { workspace = true }
@@ -34,9 +23,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
-skald-agent = { workspace = true, optional = true }
-skald-prompt = { workspace = true, optional = true }
-skald-runtime = { workspace = true, optional = true }
+skald-agent = { workspace = true }
+skald-prompt = { workspace = true }
+skald-runtime = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "macros"] }
 tracing = { workspace = true }

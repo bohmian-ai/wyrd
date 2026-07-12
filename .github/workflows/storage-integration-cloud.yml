@@ -56,6 +56,12 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -71,7 +77,6 @@ jobs:
 
   gcs-cloud:
     name: GCS real-cloud
-    needs: s3-cloud
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -79,6 +84,12 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Authenticate to GCP (workload identity)
         uses: google-github-actions/auth@v2
@@ -93,7 +104,6 @@ jobs:
 
   azure-cloud:
     name: Azure real-cloud
-    needs: gcs-cloud
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -101,6 +111,12 @@ jobs:
 
       - name: Set up mise
         uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
 
       - name: Authenticate to Azure (OIDC)
         uses: azure/login@v2

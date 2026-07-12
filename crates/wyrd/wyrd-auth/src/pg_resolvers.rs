@@ -441,7 +441,7 @@ pub fn binding_write_from_binding(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;

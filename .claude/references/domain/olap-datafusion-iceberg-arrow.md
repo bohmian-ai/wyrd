@@ -21,9 +21,11 @@ implementation feasibility, or verification strength.
 - The Vala warehouse engine owns Iceberg catalog adaptation, schema conversion,
   write coordination, DataFusion provider/session integration, batch building,
   query diagnostics, and benchmarks.
-- `wyrd-storage` owns object-store construction. Warehouse plans should reuse
-  Wyrd storage handles instead of constructing S3, GCS, Azure, or local object
-  stores inside the OLAP engine except in tests.
+- `wyrd-storage` owns artifact/blob storage and shared backend configuration.
+  `vala-bifrost` owns Iceberg-specific `StorageFactory`, catalog-property, and
+  warehouse-URI adaptation. Warehouse plans should reuse `BackendConfig` and
+  avoid direct cloud SDK clients without moving the Iceberg dependency cone
+  into broadly consumed storage crates.
 - DataFusion owns query planning/execution. Wyrd/Vala owns tenant enforcement,
   table/catalog boundaries, pruning metadata, admission, freshness, diagnostics,
   public query contracts, and stable Wyrd errors.

@@ -25,6 +25,7 @@ pub struct PgFixture {
     vala: ValaPostgres,
     platform_admin_pool: PgPool,
     catalog_dsn: SecretString,
+    migrator_dsn: SecretString,
     data_tenant_id: DataTenantId,
     tenant_slug: String,
     _test_db: TestDatabase,
@@ -141,13 +142,91 @@ impl PgFixture {
         &self.tenant_slug
     }
 
+    /// Open a pool connected as the `vala_recovery` role against the fixture database.
+    ///
+    /// Reads `VALA_RECOVERY_PASSWORD` from the environment. Callers that test
+    /// Bifrost crash-recovery paths need this pool to simulate the recovery role.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when `VALA_RECOVERY_PASSWORD` is unset or the
+    /// pool cannot connect.
+    pub async fn recovery_pool(&self) -> Result<PgPool, FixtureError> {
+        let password =
+            std::env::var(vala_sql::postgres::VALA_RECOVERY_PASSWORD_ENV).map_err(|_| {
+                SqlError::InvariantViolation {
+                    detail: "VALA_RECOVERY_PASSWORD must be set to connect recovery pool in tests"
+                        .to_owned(),
+                }
+            })?;
+        let dsns = self._test_db.resolved_dsns()?;
+        Ok(vala_sql::postgres::connect_recovery_pool(&dsns, SecretString::from(password)).await?)
+    }
+
+    /// Build the iceberg catalog URI for this fixture's database.
+    ///
+    /// The iceberg-catalog-sql crate builds its own pool from this URI; it does
+    /// not accept a shared pool handle. The URI sets `role=wyrd_catalog` and
+    /// `search_path=iceberg_catalog` as PostgreSQL session options so that tables
+    /// created by the catalog crate are owned by `wyrd_catalog`, matching the
+    /// `ALTER DEFAULT PRIVILEGES FOR ROLE wyrd_catalog` boundary in the migration.
+    #[must_use]
+    pub fn catalog_uri(&self) -> String {
+        let base = self.catalog_dsn.expose_secret();
+        let sep = if base.contains('?') { "&" } else { "?" };
+        format!("{base}{sep}options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog")
+    }
+
+    /// Seed an additional active tenant row with a caller-supplied isolation key.
+    ///
+    /// Use this when a test needs a tenant with a **specific** [`DataTenantId`]
+    /// (e.g., the nil UUID sentinel, or a UUID carried across a serialized
+    /// payload). For tests that only need a second distinct tenant, prefer
+    /// [`seed_additional_tenant`][Self::seed_additional_tenant], which generates a
+    /// fresh UUIDv7.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the tenant insert fails.
+    pub async fn seed_additional_tenant_with_uuid(
+        &self,
+        data_tenant_id: DataTenantId,
+        slug: &str,
+    ) -> Result<(), SqlError> {
+        seed_tenant(&self.platform_admin_pool, data_tenant_id, slug).await
+    }
+
+    /// Open a pool connected as the `wyrd_migrator` (table-owner) role.
+    ///
+    /// Use this pool in test assertions that need to read across all tenants
+    /// without RLS — for example, inspecting `vala.olap_commits` or
+    /// `vala.olap_recovery_events` after a multi-tenant write. The
+    /// `wyrd_migrator` role is the table owner and bypasses all row-level
+    /// security, making it the lowest-friction read path for raw assertion
+    /// queries.
+    ///
+    /// A new pool is created on each call; cache it in a local if you need
+    /// it more than once per test.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when the pool cannot connect.
+    pub async fn superuser_pool(&self) -> Result<PgPool, FixtureError> {
+        build_pool(
+            self.migrator_dsn.expose_secret(),
+            PoolConfig::migrator_defaults(),
+        )
+        .await
+        .map_err(SqlError::Connect)
+        .map_err(FixtureError::Sql)
+    }
+
     async fn start_seeded(
         data_tenant_id: DataTenantId,
         tenant_slug: String,
     ) -> Result<Self, FixtureError> {
         let test_db = TestDatabase::create().await?;
         let handles = test_db.connect_handles().await?;
-        let catalog_dsn = test_db.resolved_dsns()?.catalog_app;
+        let resolved = test_db.resolved_dsns()?;
+        let catalog_dsn = resolved.catalog_app;
+        let migrator_dsn = resolved.migrator;
         seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
@@ -155,6 +234,7 @@ impl PgFixture {
             wyrd: handles.wyrd,
             vala: handles.vala,
             catalog_dsn,
+            migrator_dsn,
             data_tenant_id,
             tenant_slug,
             _test_db: test_db,
@@ -359,7 +439,7 @@ async fn seed_tenant(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use super::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_sql::tenant_conn::CURRENT_TENANT_GUC;

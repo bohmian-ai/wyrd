@@ -1,81 +1,63 @@
 ---
 name: review
-description: Repo-local Wyrd doctrine review. Use when reviewing Wyrd code, docs, contracts, internal APIs, external APIs, SDK surfaces, generated schemas, CLI, MCP, UI, or diffs that must align with the core doctrine.
+description: Repo-local Wyrd architecture and contract review. Use when reviewing Wyrd code, docs, plans, APIs, SDKs, schemas, CLI, MCP, UI, storage, Vala, Skald, or diffs that must preserve Wyrd doctrine and ownership boundaries.
 ---
 
-# Wyrd Doctrine Review
+# Wyrd Architecture and Contract Review
 
-Use this skill when reviewing changes in the Wyrd code repository for alignment
-with the core doctrine.
+Review Wyrd changes for doctrine, ownership, and cross-surface contract integrity.
 
-## First Pass
+## Required authority
 
-1. Read `AGENTS.md`.
-2. Read `docs/src/content/docs/concepts/doctrine.svxx`.
-3. If available, compare against the canonical planning source:
-   `/Users/stevenforrester/Documents/GitHub/wyrd-plan/architecture/v1/00-foundations/core-doctrine.md`.
-4. Read the changed files and nearest contracts, tests, schemas, docs, or
-   generated sources that define the same surface.
-5. If invoked by `review-and-plan`, use the provided review packet and write
-   the report to the provided output path. If no output path is provided, write
-   the findings in the normal response.
+Read completely:
 
-## Review Criteria
+1. `AGENTS.md`
+2. `architecture/agent-rules.md`
+3. `architecture/wyrd-design.md`
+4. `architecture/wyrd-doctrine.mdx`
+5. Changed files and the nearest implementation, tests, schemas, generated artifacts, and public surfaces
 
-Check whether the change preserves the doctrine across implementation and user
-surfaces:
+`architecture/wyrd-design.md` wins over generated artifacts, predecessor repositories, and implementation drift. The implementation plan is the primary source of change intent. Read its goals, invariants, dependency decisions, and non-goals before judging the diff. When the plan conflicts with active design authority, report an authority conflict and explain both sides; do not silently prefer the code or prescribe a reversal from one rule alone. Do not treat `wyrd-plan` as active authority.
 
-- Wyrd remains the AI layer for human and agentic work, not an application
-  runtime, training framework, workflow engine, or cloud platform.
-- Wyrd keeps a language-agnostic client/server model. Rust server code owns
-  durable behavior and core logic; clients project API-wire contracts instead
-  of becoming alternate sources of truth.
-- Contracts remain on the wire through typed schemas, HTTP/MCP payloads,
-  generated docs, and stable errors so any language can implement a client.
-- Rust and Python may receive first-class SDK ergonomics, OTEL hooks, agent
-  workflow integrations, local helpers, and tests, but those features must not
-  move server-owned durable behavior into client packages or make Wyrd
-  language-exclusive.
-- Self-hosted and cloud SaaS paths preserve tenant separation for identity,
-  authz, registry, storage, policy, audit, observability, evaluation, and
-  generated artifacts.
-- Wyrd remains agent-first and headless. MCP, CLI, HTTP, schemas, errors, and
-  machine-readable docs are primary surfaces; the developer UI is supported but
-  must not be the only way to perform a workflow.
-- New concepts fit the small ontology first: `Card`, `Spec`, `Run`, or
-  `Observation`. New nouns are justified only when those shapes cannot express
-  the concept honestly.
-- Card kinds specialize `Card`; they do not introduce separate top-level
-  ontologies, envelopes, registration paths, tables, schemas, routes, or SDK
-  object models.
-- Foundations stay shared: envelope, metadata, `CardRef`, relationships,
-  status, and version are not redefined by individual crates or surfaces.
-- Services operate on foundations instead of one-off shapes only a single
-  service understands.
-- External and internal surfaces keep the same declarative contract. Python
-  SDK, HTTP, CLI, MCP, UI, docs, generated schemas, and tests may add
-  ergonomics, but must not rename fields, invent alternate payloads, expose
-  server-internal state, or hide durable behavior behind runtime-only objects.
-- Durable specs contain serializable declared intent, not live runtime state,
-  handles, clients, thread state, hidden registries, or provider response blobs.
-- User code runs implementations. Wyrd records, validates, versions, links,
-  observes, governs, installs, and exposes declared shape.
-- Predecessor names appear only in migration or audit context, never as Wyrd
-  public vocabulary, route prefixes, package names, compatibility aliases, or
-  user-facing API concepts.
+When invoked by `review-and-plan`, use its shared packet and required output path. Do not gather a second diff or create a new review ID.
 
-## Finding Format
+## Review
 
-Report only issues that create doctrine drift or make the next implementation
-agent likely to encode the wrong contract. Order by severity.
+Report only concrete drift that could encode the wrong contract or user workflow.
 
-For each finding include:
+Check:
 
-- `Severity`: Critical, Major, or Minor.
-- `Location`: file and line when available.
-- `Issue`: the doctrine violation or ambiguity.
-- `Doctrine`: the specific doctrine rule being violated.
-- `Fix`: the concrete code, API shape, docs wording, or test correction needed.
+- 16 native Card kinds plus `External`; no `Tool`, `Skill`, or `SubAgent` Card kinds;
+- one shared Card envelope, foundations, `CardRef`, relationships, and status model;
+- server-owned durable behavior and language-agnostic wire contracts;
+- Rust, Python, and TypeScript surface parity where first-class behavior ships;
+- `wyrd-spec` remains foundational, IO-free, async-free, and PyO3-free;
+- approved Python owner crates own Python-visible behavior behind optional features;
+- `python/py-wyrd` remains a thin aggregator;
+- client-tier crates do not acquire server/data-plane dependencies;
+- Skald remains independent of Vala; Vala may depend on Skald to implement the
+  reusable agent evaluation engine used by offline consumers and `wyrd-server`;
+- `wyrd-server` remains the only HTTP/gRPC serving surface;
+- tenant isolation, permissions, stable errors, and audit context cross durable paths;
+- MCP, CLI, HTTP, schemas, docs, and SDKs expose the same nouns and lifecycle;
+- user/agent-facing capabilities ship real client → server → client journeys;
+- no predecessor vocabulary, compatibility aliases, or stale design authority is introduced.
 
-If there are no issues, say the reviewed changes align with the core doctrine
-and note any remaining uncertainty.
+Before reporting an architecture or ownership finding, evaluate the proposed
+alternative. State its dependency and compilation impact, how it preserves the
+plan's user workflow, and why it is materially better. Classify disagreements as
+implementation defects, stale authority, or design questions. A written-rule
+violation alone is not a finding.
+
+## Findings
+
+For each CRITICAL, MAJOR, or MINOR finding include:
+
+- **Location**
+- **Issue**
+- **Doctrine**
+- **Why it matters**
+- **Evidence**
+- **Fix or verification gate**
+
+Consolidate shared root causes. If no issue clears the bar, state that the change aligns with current Wyrd authority. Do not modify source files.

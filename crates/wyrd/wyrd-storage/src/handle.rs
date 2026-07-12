@@ -77,21 +77,8 @@ impl StorageHandle {
             BackendSigner::Local(local) => BackendConfig::Local {
                 root: local.root().to_path_buf(),
             },
-            BackendSigner::S3(s3) => BackendConfig::S3(crate::settings::S3Config {
-                bucket: s3.bucket().to_owned(),
-                region: None,
-                endpoint_url: None,
-                force_path_style: false,
-            }),
-            BackendSigner::Gcs(gcs) => BackendConfig::Gcs(crate::settings::GcsConfig {
-                bucket: gcs.bucket().to_owned(),
-                endpoint_url: None,
-            }),
-            BackendSigner::Azure(azure) => BackendConfig::Azure(crate::settings::AzureConfig {
-                account: azure.account().to_owned(),
-                container: azure.container().to_owned(),
-                endpoint_url: None,
-            }),
+            #[cfg(feature = "cloud")]
+            BackendSigner::Cloud(cloud) => cloud.backend_config(),
         };
         let operator = crate::factory::build_operator(&backend_config)
             .expect("operator construction is infallible for the test/local-harness constructor");
@@ -228,30 +215,6 @@ impl StorageHandle {
         self.public_base_url.as_deref()
     }
 
-    /// Return an Iceberg `StorageFactory` and its companion property map derived
-    /// from the active backend configuration.
-    ///
-    /// The factory is an `OpenDalResolvingStorageFactory` that auto-detects the
-    /// URL scheme and reads credentials from the ambient environment (IRSA,
-    /// workload identity, instance profile). The property map carries any
-    /// backend-specific hints (endpoint, region, account) that the Iceberg catalog
-    /// should embed in table metadata.
-    ///
-    /// # Errors
-    /// Returns `StorageError` when backend configuration is invalid.
-    #[cfg(feature = "iceberg")]
-    pub fn iceberg_storage_factory(&self) -> crate::factory::iceberg_factory::IcebergStorageResult {
-        crate::factory::iceberg_factory::iceberg_storage_factory(&self.backend_config)
-    }
-
-    /// Derive the Iceberg warehouse base URI from the active backend
-    /// configuration. The catalog appends `{namespace}/{name}` itself.
-    #[cfg(feature = "iceberg")]
-    #[must_use]
-    pub fn warehouse_uri(&self) -> String {
-        crate::factory::iceberg_factory::warehouse_uri(&self.backend_config)
-    }
-
     /// Probe the storage backend for liveness.
     ///
     /// For the local backend, attempts a `stat` of the configured storage root
@@ -384,6 +347,7 @@ mod tests {
         StorageHandle::new(signer)
     }
 
+    #[cfg(feature = "emulator")]
     #[test]
     fn from_signer_builds_cloud_handles_without_probing() {
         let gcs = crate::factory::gcs::build_emulator_signer(
@@ -391,7 +355,10 @@ mod tests {
             "http://localhost:4443",
         )
         .expect("gcs emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Gcs(gcs), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(
+            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Gcs(gcs))),
+            8 * 1024 * 1024,
+        );
         assert_eq!(handle.backend(), StorageBackendKind::Gcs);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
 
@@ -400,7 +367,10 @@ mod tests {
             "http://127.0.0.1:10000",
         )
         .expect("azure emulator signer");
-        let handle = StorageHandle::from_signer(BackendSigner::Azure(azure), 8 * 1024 * 1024);
+        let handle = StorageHandle::from_signer(
+            BackendSigner::Cloud(Box::new(crate::cloud::CloudSigner::Azure(azure))),
+            8 * 1024 * 1024,
+        );
         assert_eq!(handle.backend(), StorageBackendKind::Azure);
         assert_eq!(handle.multipart_threshold_bytes(), 8 * 1024 * 1024);
     }
@@ -423,5 +393,63 @@ mod tests {
             matches!(result, Err(StorageHealthError::LocalRoot(_))),
             "expected LocalRoot error, got {result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod from_settings_tests {
+    use crate::{BackendSigner, StorageHandle};
+    use std::sync::Arc;
+
+    const ENV_KEYS: &[&str] = &[
+        "WYRD_STORAGE_BACKEND",
+        "WYRD_STORAGE_REQUIRE_ENCRYPTION",
+        "WYRD_STORAGE_PRESIGN_TTL_SECS",
+        "WYRD_STORAGE_PART_SIZE_BYTES",
+        "WYRD_STORAGE_LOCAL_ROOT",
+        "WYRD_PUBLIC_BASE_URL",
+    ];
+
+    #[tokio::test]
+    async fn builds_local_handle_from_settings() {
+        let (handle, _root) = Box::pin(local_handle()).await;
+
+        assert!(matches!(handle.signer(), BackendSigner::Local(_)));
+        assert_eq!(
+            handle.backend(),
+            wyrd_spec::storage::StorageBackendKind::Local
+        );
+        assert_eq!(handle.presign_ttl_secs(), 600);
+        assert_eq!(handle.default_part_size_bytes(), 16 * 1024 * 1024);
+        assert_eq!(handle.public_base_url(), Some("https://wyrd.test"));
+    }
+
+    async fn local_handle() -> (Arc<StorageHandle>, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let vars = vec![
+            ("WYRD_STORAGE_BACKEND", Some("local".to_owned())),
+            (
+                "WYRD_STORAGE_LOCAL_ROOT",
+                Some(root.path().display().to_string()),
+            ),
+            ("WYRD_PUBLIC_BASE_URL", Some("https://wyrd.test".to_owned())),
+        ];
+        let provided = vars.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let mut all = ENV_KEYS
+            .iter()
+            .filter(|key| !provided.contains(key))
+            .map(|key| (*key, None))
+            .collect::<Vec<(&'static str, Option<String>)>>();
+        all.extend(vars);
+
+        let handle = Box::pin(temp_env::async_with_vars(all, async {
+            let settings = crate::settings::from_env().expect("settings parse");
+            StorageHandle::from_settings(settings)
+                .await
+                .expect("local handle")
+        }))
+        .await;
+
+        (handle, root)
     }
 }

@@ -42,17 +42,12 @@ async fn shared() -> &'static SharedCatalog {
             .await
             .expect("local storage handle");
 
-            let (factory, props) = storage
-                .iceberg_storage_factory()
-                .expect("iceberg storage factory");
             let catalog_dsn = fixture.catalog_dsn();
             let catalog = WyrdCatalog::new(
                 catalog_dsn.expose_secret(),
-                storage.warehouse_uri(),
+                storage.backend_config(),
                 Arc::new(fixture.app_pool().clone()),
                 None,
-                factory,
-                props,
             )
             .await
             .expect("catalog builds against embedded postgres");

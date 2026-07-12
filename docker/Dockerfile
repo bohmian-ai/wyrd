@@ -3,16 +3,11 @@ ARG RUST_VERSION=1.87.0
 
 FROM rust:${RUST_VERSION}-slim AS builder
 WORKDIR /build
-ARG WYRD_FLAVOR=oss
 COPY . .
 RUN --mount=type=cache,target=/build/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     set -eux; \
-    if [ "$WYRD_FLAVOR" = "enterprise" ]; then \
-        cargo build --release --locked -p wyrd-server --features enterprise; \
-    else \
-        cargo build --release --locked -p wyrd-server; \
-    fi; \
+    cargo build --release --locked -p wyrd-server --features cloud; \
     cp target/release/wyrd-server /build/wyrd-server
 
 FROM debian:bookworm-slim AS runtime

@@ -34,7 +34,7 @@ toml = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
-vala-eval = { workspace = true, features = ["orchestrator"] }
+vala-eval = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-error-derive = { workspace = true }

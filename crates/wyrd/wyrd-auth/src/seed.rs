@@ -47,7 +47,7 @@ pub async fn seed_builtin_roles_for_tenant(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::collections::BTreeSet;
 
     use sqlx::Row;

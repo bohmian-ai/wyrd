@@ -36,13 +36,3 @@ pub fn inspect_header(value: Option<&str>) -> RequestIdPropagation {
         },
     }
 }
-
-/// Axum/Tower middleware shell for request ID propagation.
-///
-/// Returns an identity layer so server crates can type-check the layer slot.
-/// Real propagation behavior is implemented at the HTTP boundary, not here.
-#[cfg(feature = "behavior")]
-#[must_use]
-pub fn middleware() -> tower::layer::util::Identity {
-    tower::layer::util::Identity::new()
-}

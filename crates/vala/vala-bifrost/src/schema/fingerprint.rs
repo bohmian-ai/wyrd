@@ -73,11 +73,14 @@ mod tests {
             Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
         ]);
         let fp_user = fingerprint_user_fields(&physical);
-        let all_fields: Vec<Field> = physical.fields().iter().map(|f| f.as_ref().clone()).collect();
+        let all_fields: Vec<Field> = physical
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         let fp_all = fingerprint_fields(&all_fields);
         assert_ne!(
-            fp_user,
-            fp_all,
+            fp_user, fp_all,
             "fingerprint_user_fields must strip run_id; fingerprint_fields must include it"
         );
     }

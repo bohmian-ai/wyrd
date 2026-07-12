@@ -53,7 +53,7 @@ fn missing_request_id() -> WyrdError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use axum::extract::FromRequestParts;
     use axum::http::Request;
     use std::sync::Arc;

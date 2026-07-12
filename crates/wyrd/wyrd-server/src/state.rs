@@ -225,7 +225,7 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::sync::Arc;
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};

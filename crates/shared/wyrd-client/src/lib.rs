@@ -13,7 +13,6 @@ pub mod config;
 pub mod error;
 pub mod transport;
 
-#[cfg(feature = "transport-http")]
 pub use client::WyrdClient;
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`

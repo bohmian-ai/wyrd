@@ -19,10 +19,12 @@ use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::TableWriterHandle;
 use crate::writer::coordinator::spawn_commit_coordinator;
+use wyrd_storage::settings::BackendConfig;
 
 pub mod iceberg_sql;
 pub mod namespaces;
 pub mod partition_spec;
+pub mod storage;
 mod wire;
 
 #[allow(dead_code)]
@@ -53,13 +55,12 @@ impl WyrdCatalog {
     /// never used for recovery.
     pub async fn new(
         catalog_uri: &str,
-        warehouse: impl Into<String>,
+        backend: &BackendConfig,
         pool: Arc<PgPool>,
         recovery_pool: Option<Arc<PgPool>>,
-        storage_factory: Arc<dyn iceberg::io::StorageFactory>,
-        storage_props: HashMap<String, String>,
     ) -> Result<Self, BifrostError> {
-        let warehouse = warehouse.into();
+        let (storage_factory, storage_props) = storage::iceberg_storage_factory(backend);
+        let warehouse = storage::warehouse_uri(backend);
         let catalog = iceberg_sql::build_catalog(
             catalog_uri,
             &warehouse,

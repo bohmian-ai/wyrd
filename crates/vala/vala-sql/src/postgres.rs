@@ -77,7 +77,6 @@ impl ValaPostgres {
     /// elsewhere. Used only by DB-free unit tests; production and DB-backed tests
     /// use `connect_from_dsns` / `connect_after_wyrd`. Gated behind
     /// `testing` / `cfg(test)`.
-    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn from_pools(pool: PgPool, recovery_pool: Option<PgPool>) -> Self {
         Self {

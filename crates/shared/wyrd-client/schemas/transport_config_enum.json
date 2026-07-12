@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TransportConfig",
-  "description": "Wyrd client transport selection.\n\ngRPC is the default. Variants for queue transports (Kafka, RabbitMQ, Redis) are intentionally absent in this phase.\n\nWire shape: `{\"transport\": \"grpc\", \"params\": { ... }}`.\n\n# Feature gating\n\n`is_enabled()` is feature-aware natively. `Grpc` is gated on `cfg!(feature = \"transport-grpc\")`, `Http` on `cfg!(feature = \"transport-http\")`, and `Mock` is always available.",
+  "description": "Wyrd client transport selection.\n\ngRPC is the default. Variants for queue transports (Kafka, RabbitMQ, Redis) are intentionally absent in this phase.\n\nWire shape: `{\"transport\": \"grpc\", \"params\": { ... }}`.",
   "oneOf": [
     {
-      "description": "gRPC transport (tonic). The default transport. Gated on `transport-grpc`.",
+      "description": "gRPC transport (tonic). The default transport.",
       "type": "object",
       "required": [
         "params",
@@ -23,7 +23,7 @@
       }
     },
     {
-      "description": "HTTP transport (reqwest). Secondary path for gRPC-restricted environments. Gated on `transport-http`.",
+      "description": "HTTP transport (reqwest). Secondary path for gRPC-restricted environments.",
       "type": "object",
       "required": [
         "params",
@@ -42,7 +42,7 @@
       }
     },
     {
-      "description": "In-memory loopback transport for tests. Always available; no feature gate.",
+      "description": "In-memory loopback transport for tests. Always available.",
       "type": "object",
       "required": [
         "params",

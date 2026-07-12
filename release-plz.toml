@@ -1,0 +1,21 @@
+[workspace]
+dependencies_update = true
+changelog_update = true
+pr_labels = ["release"]
+semver_check = true
+publish_timeout = "10m"
+git_tag_enable = false
+git_release_enable = false
+publish = false
+repo_url = "https://github.com/wyrd-ai/wyrd"
+publish_no_verify = true
+
+# Opt-in crates for crates.io publishing.
+# Add a crate here when it has a stable public API intended for external use.
+# wyrd-enterprise and downstream crates depend on these.
+# Server-tier crates (wyrd-server, wyrd-sql, wyrd-storage, wyrd-testing,
+# wyrd-auth, wyrd-tonic, wyrd-config) stay publish = false permanently.
+
+[[package]]
+name = "wyrd-spec"
+publish = true

@@ -8,7 +8,6 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [dependencies]
-chrono = { workspace = true }
 jsonwebtoken = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 reqwest = { workspace = true }

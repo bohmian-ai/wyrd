@@ -1,10 +1,11 @@
 //! Closed backend signer dispatch.
+//!
+//! Cloud backends (S3, GCS, Azure) live behind a single `Cloud` variant that is
+//! compiled only under the `cloud` feature; see [`crate::cloud`]. Builds without
+//! `cloud` carry only the local filesystem signer and drop the cloud SDKs.
 
-use crate::azure::AzureSigner;
 use crate::error::StorageError;
-use crate::gcs::GcsSigner;
 use crate::local::LocalSigner;
-use crate::s3::S3Signer;
 use crate::tenant_path::ValidatedPath;
 use std::time::Duration;
 use wyrd_spec::storage::{S3CompletedPart, StorageBackendKind, UploadPlan, WireProtocol};
@@ -14,12 +15,9 @@ use wyrd_spec::storage::{S3CompletedPart, StorageBackendKind, UploadPlan, WirePr
 pub enum BackendSigner {
     /// Local filesystem signer.
     Local(LocalSigner),
-    /// AWS S3 signer.
-    S3(S3Signer),
-    /// Google Cloud Storage signer.
-    Gcs(GcsSigner),
-    /// Azure Blob Storage signer.
-    Azure(AzureSigner),
+    /// Cloud backend signer (S3, GCS, or Azure).
+    #[cfg(feature = "cloud")]
+    Cloud(Box<crate::cloud::CloudSigner>),
 }
 
 impl BackendSigner {
@@ -28,9 +26,8 @@ impl BackendSigner {
     pub fn kind(&self) -> StorageBackendKind {
         match self {
             Self::Local(_) => StorageBackendKind::Local,
-            Self::S3(_) => StorageBackendKind::S3,
-            Self::Gcs(_) => StorageBackendKind::Gcs,
-            Self::Azure(_) => StorageBackendKind::Azure,
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.kind(),
         }
     }
 
@@ -47,9 +44,8 @@ impl BackendSigner {
     ) -> Result<UploadPlan, StorageError> {
         match self {
             Self::Local(signer) => signer.presign_single_put(path, size_bytes, ttl).await,
-            Self::S3(signer) => signer.presign_single_put(path, size_bytes, ttl).await,
-            Self::Gcs(signer) => signer.presign_single_put(path, size_bytes, ttl).await,
-            Self::Azure(signer) => signer.presign_single_put(path, size_bytes, ttl).await,
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.presign_single_put(path, size_bytes, ttl).await,
         }
     }
 
@@ -71,18 +67,9 @@ impl BackendSigner {
                     .init_multipart(path, part_count, part_size_bytes, ttl)
                     .await
             }
-            Self::S3(signer) => {
-                signer
-                    .init_multipart(path, part_count, part_size_bytes, ttl)
-                    .await
-            }
-            Self::Gcs(signer) => {
-                signer
-                    .init_multipart(path, part_count, part_size_bytes, ttl)
-                    .await
-            }
-            Self::Azure(signer) => {
-                signer
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => {
+                cloud
                     .init_multipart(path, part_count, part_size_bytes, ttl)
                     .await
             }
@@ -94,6 +81,7 @@ impl BackendSigner {
     /// # Errors
     /// Returns [`StorageError::BackendCapabilityMismatch`] for backends that do
     /// not use per-part presigning.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn presign_part(
         &self,
         path: &ValidatedPath,
@@ -102,17 +90,16 @@ impl BackendSigner {
         ttl: Duration,
     ) -> Result<String, StorageError> {
         match self {
-            Self::S3(signer) => {
-                signer
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => {
+                cloud
                     .presign_part(path, backend_upload_id, part_number, ttl)
                     .await
             }
-            Self::Local(_) | Self::Gcs(_) | Self::Azure(_) => {
-                Err(StorageError::BackendCapabilityMismatch {
-                    signer: self.kind(),
-                    op: "presign_part",
-                })
-            }
+            Self::Local(_) => Err(StorageError::BackendCapabilityMismatch {
+                signer: self.kind(),
+                op: "presign_part",
+            }),
         }
     }
 
@@ -121,6 +108,7 @@ impl BackendSigner {
     /// # Errors
     /// Returns a backend error when finalization fails or the payload does not
     /// match the active backend.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn complete_server_side(
         &self,
         path: &ValidatedPath,
@@ -128,32 +116,15 @@ impl BackendSigner {
         complete: CompletePayload,
     ) -> Result<(), StorageError> {
         match (self, complete) {
-            (
-                Self::S3(signer),
-                CompletePayload::S3 {
-                    parts,
-                    expected_sha256,
-                },
-            ) => {
-                let upload_id =
-                    backend_upload_id.ok_or(StorageError::BackendCapabilityMismatch {
-                        signer: StorageBackendKind::S3,
-                        op: "complete_server_side",
-                    })?;
-                signer
-                    .complete_multipart(path, upload_id, &parts, &expected_sha256)
-                    .await
-            }
-            (Self::Azure(signer), CompletePayload::Azure { block_count }) => {
-                signer.complete_blocklist_server(path, block_count).await
-            }
             (Self::Local(signer), CompletePayload::Local) => {
                 signer.finalize_temp_object(path).await
             }
-            (Self::Gcs(_), _) => Err(StorageError::BackendCapabilityMismatch {
-                signer: StorageBackendKind::Gcs,
-                op: "complete_server_side",
-            }),
+            #[cfg(feature = "cloud")]
+            (Self::Cloud(cloud), payload) => {
+                cloud
+                    .complete_server_side(path, backend_upload_id, payload)
+                    .await
+            }
             (signer, payload) => {
                 tracing::error!(
                     backend = %signer.kind(),
@@ -174,6 +145,7 @@ impl BackendSigner {
     /// Returns a backend error when abort fails. GCS returns a capability
     /// mismatch because its resumable session URI is bearer-equivalent and is
     /// not persisted server-side.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn abort_multipart(
         &self,
         path: &ValidatedPath,
@@ -181,12 +153,8 @@ impl BackendSigner {
     ) -> Result<(), StorageError> {
         match self {
             Self::Local(_) => Ok(()),
-            Self::S3(signer) => signer.abort_multipart(path, backend_upload_id).await,
-            Self::Azure(signer) => signer.abort_multipart(path).await,
-            Self::Gcs(_) => Err(StorageError::BackendCapabilityMismatch {
-                signer: StorageBackendKind::Gcs,
-                op: "abort_multipart",
-            }),
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.abort_multipart(path, backend_upload_id).await,
         }
     }
 
@@ -201,9 +169,8 @@ impl BackendSigner {
     ) -> Result<String, StorageError> {
         match self {
             Self::Local(signer) => signer.presign_get(path, ttl).await,
-            Self::S3(signer) => signer.presign_get(path, ttl).await,
-            Self::Gcs(signer) => signer.presign_get(path, ttl).await,
-            Self::Azure(signer) => signer.presign_get(path, ttl).await,
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.presign_get(path, ttl).await,
         }
     }
 
@@ -217,9 +184,8 @@ impl BackendSigner {
     ) -> Result<HeadInfo, StorageError> {
         match self {
             Self::Local(signer) => signer.head(path).await,
-            Self::S3(signer) => signer.head(path).await,
-            Self::Gcs(signer) => signer.head(path).await,
-            Self::Azure(signer) => signer.head(path).await,
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.head_for_verification(path).await,
         }
     }
 
@@ -236,9 +202,8 @@ impl BackendSigner {
     ) -> Result<UploadPlan, StorageError> {
         match self {
             Self::Local(signer) => signer.remint_plan(path, input, ttl).await,
-            Self::S3(signer) => signer.remint_plan(path, input, ttl).await,
-            Self::Gcs(signer) => signer.remint_plan(path, input, ttl).await,
-            Self::Azure(signer) => signer.remint_plan(path, input, ttl).await,
+            #[cfg(feature = "cloud")]
+            Self::Cloud(cloud) => cloud.remint_plan(path, input, ttl).await,
         }
     }
 }
@@ -274,7 +239,7 @@ pub enum CompletePayload {
 }
 
 impl CompletePayload {
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::SinglePut => "single_put",
             Self::S3 { .. } => "s3",

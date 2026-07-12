@@ -41,7 +41,7 @@ impl FromRequestParts<AppState> for AuthenticatedPrincipal {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use axum::extract::FromRequestParts;
     use axum::http::Request;
     use axum::http::request::Parts;

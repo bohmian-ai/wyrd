@@ -461,7 +461,7 @@ fn truncate_batches(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use super::*;
     use std::time::Duration;
 

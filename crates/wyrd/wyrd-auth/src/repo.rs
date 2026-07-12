@@ -22,7 +22,7 @@ pub async fn lookup_user_email(
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::PrincipalId;
     use wyrd_spec::DataTenantId;

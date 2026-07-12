@@ -861,16 +861,11 @@ async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<StorageHandle>,
 ) -> Result<Arc<WyrdCatalog>, WyrdTestError> {
-    let (factory, props) = storage
-        .iceberg_storage_factory()
-        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
     let catalog = WyrdCatalog::new(
         fixture.catalog_dsn().expose_secret(),
-        storage.warehouse_uri(),
+        storage.backend_config(),
         Arc::new(fixture.app_pool().clone()),
         None,
-        factory,
-        props,
     )
     .await
     .map_err(|error| WyrdTestError::Start(error.to_string()))?;
@@ -885,7 +880,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use secrecy::SecretString;
     use wyrd_auth_check::AuthzCheckRequest;
     use wyrd_auth_verify::{AccessTokenClaims, verify_eddsa};

@@ -14,7 +14,8 @@ Downstream artifacts are brought up to this version in a sync pass.
 
 ## Table of contents
 
-- [Doctrine](#doctrine) — 18 design principles
+- [Doctrine](#doctrine) — 20 design principles
+- [Client model](#client-model) — language-agnostic protocol and first-class SDKs
 - [Kind catalog](#kind-catalog) — 16 native kinds + External
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
   - [Data](#data) · [Model](#model) · [Artifact](#artifact) · [Experiment](#experiment)
@@ -195,6 +196,25 @@ Downstream artifacts are brought up to this version in a sync pass.
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
     §11 for the tier definitions and gates.
+
+## Client model
+
+Wyrd is language-agnostic at the protocol boundary. The server owns durable
+behavior, and its typed wire contracts are the source of truth. Any language
+can implement a client by following those contracts; no SDK owns a separate
+registry, lifecycle, validation, or storage model.
+
+Rust, Python, and TypeScript are Wyrd's first-class client languages. Wyrd
+maintains idiomatic SDKs, generated types, examples, and client → server →
+client journeys for all three. Surface ergonomics may differ, but durable
+nouns, fields, errors, permissions, side effects, and lifecycle semantics do
+not. Go is planned. It becomes first-class only when its SDK and the same
+contract and journey gates ship.
+
+The public protocol remains open to every language. HTTP, MCP, generated
+schemas, stable errors, and machine-readable documentation are sufficient to
+implement a complete client without depending on Rust, Python, or TypeScript
+internals.
 
 ---
 
@@ -1669,6 +1689,10 @@ and does not affect the protocol contract above.
   table (migration `20260601000001_auth.sql`), its `GovernanceTokenRow` row mirror
   and query slot, the `migration_pg.rs` table assertion, and `Scope::TokenIssue`
   (`token:issue`).
-- The `wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
-  enterprise governance-tier gate (policy + audit), not a token.
+- Wyrd is open source and independently publishable. It contains no enterprise
+  licensing keys, feature gates, startup hooks, or private-product contracts.
+  A future private `wyrd-enterprise` repository may depend on and extend public
+  Wyrd crates; Wyrd never depends on that private repository. Enterprise
+  deployment language in this document describes topology, tenant isolation,
+  and operational requirements rather than an in-tree commercial edition.
 - No `WYRD_GOV_TOKEN` env var. No `wyrd gov-token` CLI.

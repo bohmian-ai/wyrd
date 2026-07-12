@@ -105,7 +105,7 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdErrorResponse {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::collections::{BTreeSet, HashMap};
     use std::sync::Arc;
     use std::time::Duration as StdDuration;

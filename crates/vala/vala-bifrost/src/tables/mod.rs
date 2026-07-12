@@ -103,7 +103,7 @@ pub struct EntityBoundsMapping {
 /// columns, sort keys, declared indexes, and (optionally) entity bounds mapping.
 /// The `register_all` boot path pins each table to its `schema_fingerprint()`.
 ///
-/// # Implementing DomainTable
+/// # Implementing `DomainTable`
 ///
 /// 1. **Field ordering is fingerprint-identity-significant.** Do not reorder fields
 ///    in `arrow_fields()` — any reorder changes `schema_fingerprint()` and causes boot

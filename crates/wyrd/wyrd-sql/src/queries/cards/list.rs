@@ -1,5 +1,9 @@
 //! Composable, keyset-paginated collection query for `wyrd.cards`.
 #![deny(missing_docs)]
+// raw-query grep allowlist: list/lookup uses QueryBuilder for dynamic filters and
+// column projection. Every statement runs on a TenantConn (RLS) and filters
+// `data_tenant_id = wyrd.current_tenant()`; run `mise run sqlx:prepare` to promote
+// static shapes to macros.
 
 use chrono::{DateTime, Utc};
 use sqlx::{Postgres, QueryBuilder};

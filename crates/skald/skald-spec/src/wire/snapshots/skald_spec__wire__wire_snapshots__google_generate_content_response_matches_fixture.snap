@@ -1,0 +1,47 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::google_response(skald_spec::wire::google_generate::GoogleFinishReason::Stop)"
+---
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "{\"answer\":\"hello\"}"
+          },
+          {
+            "function_call": {
+              "name": "lookup",
+              "args": {
+                "q": "hello"
+              }
+            }
+          }
+        ]
+      },
+      "finish_reason": "STOP",
+      "index": 0,
+      "safety_ratings": [
+        {
+          "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+          "probability": "NEGLIGIBLE",
+          "blocked": false
+        }
+      ],
+      "citation_metadata": null,
+      "grounding_metadata": null,
+      "avg_logprobs": null
+    }
+  ],
+  "usage_metadata": {
+    "prompt_token_count": 8,
+    "candidates_token_count": 5,
+    "total_token_count": 13,
+    "cached_content_token_count": 2,
+    "thoughts_token_count": 1
+  },
+  "model_version": "gemini-2.5-pro",
+  "prompt_feedback": null
+}

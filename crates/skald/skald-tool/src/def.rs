@@ -247,3 +247,199 @@ fn is_name_start(value: char) -> bool {
 fn is_name_continue(value: char) -> bool {
     value.is_ascii_alphanumeric() || value == '_'
 }
+
+#[cfg(test)]
+mod agent_tool_trait {
+    use std::sync::Arc;
+
+    use crate::{AgentTool, ToolDef, ToolError};
+    use serde_json::json;
+
+    #[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+    struct Hit {
+        url: String,
+        score: f64,
+    }
+
+    #[tokio::test]
+    async fn tooldef_function_constructs_with_derived_schemas() {
+        let tool = ToolDef::function("hello", "greets the user", |s: String| {
+            Ok::<_, ToolError>(format!("hi {s}"))
+        });
+
+        let expected_in =
+            serde_json::to_value(schemars::schema_for!(String)).expect("schema serializes");
+        let expected_out =
+            serde_json::to_value(schemars::schema_for!(String)).expect("schema serializes");
+
+        assert_eq!(tool.input_schema(), expected_in);
+        assert_eq!(tool.output_schema(), expected_out);
+    }
+
+    #[tokio::test]
+    async fn tooldef_invoke_round_trips_json() {
+        let tool = ToolDef::function("hello", "greets the user", |s: String| {
+            Ok::<_, ToolError>(format!("hi {s}"))
+        });
+
+        let out = tool.invoke(json!("steven")).await.unwrap();
+
+        assert_eq!(out, json!("hi steven"));
+    }
+
+    #[tokio::test]
+    async fn tooldef_invoke_rejects_mismatched_input() {
+        let tool = ToolDef::function("hello", "greets the user", |s: String| {
+            Ok::<_, ToolError>(format!("hi {s}"))
+        });
+
+        let err = tool.invoke(json!(42)).await.unwrap_err();
+
+        assert!(matches!(err, ToolError::InvalidInput(_)));
+        assert_eq!(err.code(), "SKALD_TOOL_422_INPUT");
+    }
+
+    #[tokio::test]
+    async fn tooldef_invoke_wraps_closure_error_as_invocation() {
+        let tool = ToolDef::function::<_, String, String>("boomy", "always fails", |_s: String| {
+            Err::<String, _>(ToolError::Invocation {
+                detail: "boom".into(),
+                cause: None,
+            })
+        });
+
+        let err = tool.invoke(json!("anything")).await.unwrap_err();
+
+        assert!(matches!(&err, ToolError::Invocation { detail, .. } if detail == "boom"));
+        assert_eq!(err.code(), "SKALD_TOOL_500_CALL");
+    }
+
+    #[test]
+    fn agent_tool_is_object_safe() {
+        let tool = ToolDef::function("hello", "", |s: String| Ok::<_, ToolError>(s));
+        let _: Arc<dyn AgentTool> = Arc::new(tool);
+    }
+
+    #[test]
+    fn agent_tool_name_and_description_are_owned_strings() {
+        let tool = ToolDef::function(
+            String::from("dynamic_name"),
+            String::from("dyn desc"),
+            |s: String| Ok::<_, ToolError>(s),
+        );
+
+        assert_eq!(tool.name(), "dynamic_name");
+        assert_eq!(tool.description(), "dyn desc");
+    }
+
+    #[test]
+    fn tooldef_input_schema_is_serde_json_value() {
+        let tool = ToolDef::function("hello", "greets the user", |s: String| {
+            Ok::<_, ToolError>(format!("hi {s}"))
+        });
+
+        let schema = tool.input_schema();
+
+        assert!(schema.is_object());
+        assert_eq!(schema.get("type").and_then(|v| v.as_str()), Some("string"));
+    }
+
+    #[tokio::test]
+    async fn tooldef_output_schema_for_struct_with_jsonschema_derive() {
+        let tool = ToolDef::function("search", "returns a Hit", |q: String| {
+            Ok::<_, ToolError>(Hit {
+                url: format!("https://example.com/{q}"),
+                score: 0.5,
+            })
+        });
+
+        let schema = tool.output_schema();
+        let props = schema.get("properties").expect("schema has properties");
+        assert!(
+            props.get("url").is_some(),
+            "expected url field in output schema"
+        );
+        assert!(
+            props.get("score").is_some(),
+            "expected score field in output schema"
+        );
+
+        let out = tool.invoke(json!("rust")).await.unwrap();
+        assert!(out.get("url").is_some());
+        assert!(out.get("score").is_some());
+    }
+}
+
+#[cfg(test)]
+mod tool_def_validate {
+    use crate::{SkaldToolError, ToolDef};
+    use serde_json::json;
+
+    #[test]
+    fn valid_tool_def_passes() {
+        let tool = ToolDef::new(
+            "lookup_weather",
+            "Look up the weather forecast.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "city": { "type": "string" }
+                },
+                "required": ["city"],
+                "additionalProperties": false
+            }),
+        )
+        .expect("valid tool declaration");
+
+        assert_eq!(tool.name, "lookup_weather");
+    }
+
+    #[test]
+    fn invalid_name_rejected() {
+        let error = ToolDef::new(
+            "weather-lookup",
+            "Look up the weather forecast.",
+            json!({ "type": "object" }),
+        )
+        .expect_err("invalid name is rejected");
+
+        assert_invalid_schema(error);
+    }
+
+    #[test]
+    fn invalid_meta_schema_rejected() {
+        let error = ToolDef::new(
+            "lookup_weather",
+            "Look up the weather forecast.",
+            json!({ "type": 7 }),
+        )
+        .expect_err("invalid schema type is rejected");
+
+        assert_invalid_schema(error);
+    }
+
+    #[test]
+    fn empty_description_rejected() {
+        let error = ToolDef::new("lookup_weather", "  ", json!({ "type": "object" }))
+            .expect_err("empty description is rejected");
+
+        assert_invalid_schema(error);
+    }
+
+    #[test]
+    fn parameters_schema_must_be_object() {
+        let error = ToolDef::new(
+            "lookup_weather",
+            "Look up the weather forecast.",
+            json!(true),
+        )
+        .expect_err("non-object schema is rejected");
+
+        assert_invalid_schema(error);
+    }
+
+    fn assert_invalid_schema(error: SkaldToolError) {
+        assert_eq!(error.code(), "SKALD_TOOL_400_INVALID_SCHEMA");
+        assert!(matches!(error, SkaldToolError::InvalidSchema { .. }));
+    }
+}

@@ -56,7 +56,7 @@ fn internal_error(error: impl std::fmt::Display) -> WyrdError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use uuid::Uuid;
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;

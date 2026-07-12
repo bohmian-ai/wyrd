@@ -12,17 +12,12 @@ description = "Server-tier SQL migrations for Vala observability storage."
 [lib]
 path = "src/lib.rs"
 
-[features]
-diagnostics = []
-testing = ["dep:tokio", "wyrd-sql/testing"]
-
 [dependencies]
 sha2 = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["sync", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
@@ -31,8 +26,25 @@ wyrd-sql = { path = "../../wyrd/wyrd-sql", version = "0.0.1" }
 [dev-dependencies]
 secrecy = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wyrd-semver = { workspace = true }
-# Self-reference activates `testing` feature for integration tests in `tests/`
-# (cfg(test) does not apply to the lib when building integration test binaries).
-vala-sql = { path = ".", features = ["testing"] }
-wyrd-sql = { workspace = true, features = ["testing"] }
+wyrd-sql = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+
+[[test]]
+name = "pg_audit_outbox"
+
+[[test]]
+name = "pg_drift_alerts"
+
+[[test]]
+name = "pg_migration"
+
+[[test]]
+name = "pg_olap_query_jobs"
+
+[[test]]
+name = "pg_olap_recovery"
+
+[[test]]
+name = "pg_schema_usage"

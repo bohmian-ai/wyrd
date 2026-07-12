@@ -13,17 +13,17 @@ path = "src/lib.rs"
 
 [features]
 default = []
-testing = ["vala-sql/testing"]
-bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile", "dep:serde_json", "vala-sql/testing"]
+bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile", "dep:serde_json"]
 
 [dependencies]
 wyrd-spec    = { workspace = true }
-wyrd-storage = { workspace = true, features = ["iceberg"] }
+wyrd-storage = { workspace = true }
 vala-sql     = { path = "../vala-sql", version = "0.0.1" }
 
-iceberg             = { workspace = true }
-iceberg-catalog-sql = { workspace = true }
-iceberg-datafusion  = { workspace = true }
+iceberg                 = { workspace = true }
+iceberg-catalog-sql     = { workspace = true }
+iceberg-datafusion      = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 
 datafusion = { workspace = true }
 arrow      = { workspace = true }
@@ -37,7 +37,6 @@ tracing    = { workspace = true }
 thiserror  = { workspace = true }
 dashmap    = { workspace = true }
 async-trait = { workspace = true }
-url        = { workspace = true }
 uuid       = { workspace = true, features = ["v7"] }
 serde      = { workspace = true, features = ["derive"] }
 sha2       = { workspace = true }
@@ -52,13 +51,19 @@ tempfile   = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Self-reference activates `testing` feature for integration tests in `tests/`
-# (cfg(test) does not apply to the lib when building integration test binaries).
-vala-bifrost = { path = ".", features = ["testing"] }
 tempfile   = { workspace = true }
 serde_json = { workspace = true }
-vala-sql   = { path = "../vala-sql", version = "0.0.1", features = ["testing"] }
+vala-sql   = { path = "../vala-sql", version = "0.0.1" }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
+
+[[test]]
+name = "pg_audit_relay"
+
+[[test]]
+name = "pg_commit_idempotency"
+
+[[test]]
+name = "pg_reconcile"
 
 [[bench]]
 name = "write_throughput"

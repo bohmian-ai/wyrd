@@ -108,7 +108,6 @@ pub fn from_problem_json(body: &serde_json::Value) -> WyrdError {
 ///
 /// Falls back to [`WyrdError::Internal`] when the status carries no
 /// `ErrorInfo`.
-#[cfg(feature = "transport-grpc")]
 pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
     use wyrd_tonic::tonic_types::StatusExt as _;
 
@@ -251,7 +250,6 @@ mod tests {
         let _n = WyrdClientError::NoCredentials;
     }
 
-    #[cfg(feature = "transport-grpc")]
     mod grpc_convergence {
         use std::collections::HashMap;
 

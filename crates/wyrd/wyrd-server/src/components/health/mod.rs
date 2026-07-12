@@ -345,6 +345,11 @@ mod tests {
         let snap = failing_snapshot();
         assert!(!snap.all_ok());
     }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::*;
 
     #[tokio::test]
     async fn readiness_loop_exits_on_cancel() {

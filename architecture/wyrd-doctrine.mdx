@@ -36,7 +36,7 @@ Wyrd is built around declared intent.
 | Card kinds | Domain specializations of `Card`; the kind changes the spec, not the ontology. |
 | Foundations | Envelope, metadata, `CardRef`, relationship, status, and version. |
 | Services | Registry, storage, lineage, policy, install, audit, observability, evaluation, drift, and runtime. |
-| Surfaces | HTTP, Language SDK, CLI, UI, MCP, IDE integrations, and generated docs. |
+| Surfaces | HTTP, first-class Rust/Python/TypeScript SDKs, CLI, UI, MCP, IDE integrations, and generated docs. |
 
 Do not skip layers. A service operates on Wyrd foundations. A surface exposes a
 service. A card kind specializes `Card`. Runtime details stay behind the
@@ -154,14 +154,21 @@ relationships, audit records, or status updates through service-owned paths.
 
 ## Public surfaces
 
-
 The SDK, HTTP API, CLI, IDE integrations, UI, generated schemas, and MCP
 tools all project the same card contract. A surface may add ergonomic
 shortcuts, but it does not invent new shapes, rename durable fields, or expose
 server-internal state. All contracts live on the API wire, making Wyrd language-agnostic.
 
-What a user declares in Python should be recognizable in the HTTP payload, the
-stored card, the generated schema, and the MCP tool input.
+Rust, Python, and TypeScript are first-class SDK languages. Each SDK provides
+idiomatic authoring and client ergonomics over the same server contract, with
+generated types, examples, and user-journey coverage. Go is planned, but it is
+not first-class until those same SDK and verification surfaces ship.
+
+The public protocol remains open to every language. A client needs only the
+HTTP and MCP contracts, generated schemas, machine-readable documentation, and
+stable errors. What a user declares in Rust, Python, or TypeScript remains
+recognizable in the HTTP payload, the stored card, the generated schema, and
+the MCP tool input.
 
 ## What to reject
 

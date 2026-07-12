@@ -12,7 +12,7 @@
     "tokens": "node brand/gen-theme.mjs"
   },
   "devDependencies": {
-    "@sveltejs/adapter-auto": "latest",
+    "@sveltejs/adapter-node": "latest",
     "@sveltejs/kit": "latest",
     "@sveltejs/vite-plugin-svelte": "latest",
     "@tailwindcss/vite": "latest",

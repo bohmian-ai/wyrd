@@ -8,7 +8,6 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost::catalog::namespaces::BifrostNamespace;
 use vala_bifrost::types::TableScope;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_storage::factory::iceberg_factory::iceberg_storage_factory;
 use wyrd_storage::settings::BackendConfig;
 
 /// Stable warehouse root for benches — persists across runs so the Iceberg catalog
@@ -31,30 +30,33 @@ impl BenchFixture {
         rt.block_on(async {
             let bench_dir = std::path::PathBuf::from(BENCH_WAREHOUSE_DIR);
             std::fs::create_dir_all(&bench_dir).expect("create bench warehouse dir");
-            let warehouse = format!("file://{}", bench_dir.display());
 
             let pool = Arc::new(
                 sqlx::PgPool::connect(&db_url)
                     .await
                     .expect("connect to bench db"),
             );
-            vala_sql::testing::migrate_for_test(&pool)
-                .await
-                .expect("migrate bench db");
-
-            let catalog_uri = vala_sql::testing::catalog_uri(&pool);
+            let catalog_uri = {
+                let sep = if db_url.contains('?') { "&" } else { "?" };
+                format!(
+                    "{db_url}{sep}options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog",
+                )
+            };
             let backend = BackendConfig::Local { root: bench_dir };
-            let (factory, props) = iceberg_storage_factory(&backend).expect("storage factory");
-
-            let catalog =
-                WyrdCatalog::new(&catalog_uri, &warehouse, pool.clone(), None, factory, props)
-                    .await
-                    .expect("WyrdCatalog::new");
+            let catalog = WyrdCatalog::new(&catalog_uri, &backend, pool.clone(), None)
+                .await
+                .expect("WyrdCatalog::new");
 
             let tenant = DataTenantId::new_v7();
-            vala_sql::testing::seed_tenant(&pool, tenant.as_uuid())
-                .await
-                .expect("seed bench tenant");
+            sqlx::query(
+                "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status) \
+                 VALUES ($1, $2, $2, 'active') ON CONFLICT (data_tenant_id) DO NOTHING",
+            )
+            .bind(tenant.as_uuid())
+            .bind(format!("test-{}", tenant.as_uuid().simple()))
+            .execute(&*pool)
+            .await
+            .expect("seed bench tenant");
 
             Self { catalog, tenant }
         })

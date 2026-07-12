@@ -176,3 +176,95 @@ pub struct LockedComponent {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, NonSecretValue>,
 }
+
+#[cfg(test)]
+mod runtime_tests {
+    use crate::card::common::NonSecretValue;
+    use crate::card::service::{
+        ServiceRuntime, ServiceRuntimeKind, ServiceRuntimeMode, ServiceRuntimePolicy, ServiceSpec,
+    };
+    use crate::envelope::{Card, Spec};
+    use crate::format;
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn legacy_service_spec_without_runtime_round_trips_without_runtime_key() {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/legacy-service-spec-without-runtime.json"
+        ));
+        let decoded: ServiceSpec = serde_json::from_str(fixture).unwrap();
+        assert_eq!(decoded.runtime, None);
+
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        assert_eq!(encoded, fixture.trim());
+    }
+
+    #[test]
+    fn service_runtime_fixture_round_trips() {
+        let decoded: Card = format::yaml::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/service-with-runtime-policy.yaml"
+        )))
+        .unwrap();
+        let Spec::Service(spec) = &decoded.spec else {
+            panic!("expected Service spec");
+        };
+        let runtime = spec.runtime.as_ref().expect("runtime");
+        assert_eq!(runtime.kind, ServiceRuntimeKind::Agent);
+        assert_eq!(runtime.mode, Some(ServiceRuntimeMode::InProcess));
+        assert_eq!(runtime.strict, Some(true));
+        assert!(runtime.policy.as_ref().unwrap().runtime_hooks);
+
+        let encoded = format::yaml::to_string(&decoded).unwrap();
+        let reparsed: Card = format::yaml::from_str(&encoded).unwrap();
+        assert_eq!(reparsed, decoded);
+    }
+
+    fn runtime_strategy() -> impl Strategy<Value = ServiceRuntime> {
+        let kind = prop::sample::select(vec![
+            ServiceRuntimeKind::Api,
+            ServiceRuntimeKind::Mcp,
+            ServiceRuntimeKind::Agent,
+            ServiceRuntimeKind::Workflow,
+        ]);
+        let framework = prop::option::of("[a-z][a-z0-9_-]{0,12}".prop_map(String::from));
+        let mode = prop::option::of(Just(ServiceRuntimeMode::InProcess));
+        let strict = prop::option::of(any::<bool>());
+        let policy = prop::option::of(
+            any::<bool>().prop_map(|runtime_hooks| ServiceRuntimePolicy { runtime_hooks }),
+        );
+        let config = prop_oneof![
+            Just(BTreeMap::new()),
+            Just(BTreeMap::from([(
+                "max_concurrent_invocations".to_string(),
+                NonSecretValue::Number(4.0),
+            )])),
+            Just(BTreeMap::from([(
+                "queue".to_string(),
+                NonSecretValue::Str("default".to_string()),
+            )])),
+        ];
+
+        (kind, framework, mode, strict, policy, config).prop_map(
+            |(kind, framework, mode, strict, policy, config)| ServiceRuntime {
+                kind,
+                framework,
+                mode,
+                strict,
+                config,
+                policy,
+            },
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn service_runtime_round_trips(runtime in runtime_strategy()) {
+            let encoded = serde_json::to_string(&runtime).unwrap();
+            let decoded: ServiceRuntime = serde_json::from_str(&encoded).unwrap();
+            prop_assert_eq!(decoded, runtime);
+        }
+    }
+}

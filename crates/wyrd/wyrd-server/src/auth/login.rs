@@ -217,7 +217,7 @@ fn sql_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use super::resolve_login_tenant;
     use axum::http::{HeaderMap, HeaderValue, header};
     use std::sync::Arc;

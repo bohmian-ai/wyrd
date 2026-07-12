@@ -1,0 +1,61 @@
+name: Setup Rust CI
+description: >-
+  Shared CI bring-up for Rust jobs: free disk space, install mise, cache the
+  cargo build, and select the GNU BFD linker on Linux. Assumes the repo is
+  already checked out.
+
+inputs:
+  free-disk:
+    description: Run the free-disk-space step (Linux only).
+    default: "true"
+  docker-images:
+    description: Let free-disk-space remove preinstalled Docker images. Set false when the job needs Docker (emulators, OIDC providers).
+    default: "true"
+  tool-cache:
+    description: Let free-disk-space remove the hosted-tool cache.
+    default: "true"
+  rust-cache-key:
+    description: Optional extra key passed to Swatinem/rust-cache to isolate a cache slot.
+    default: ""
+  bfd-linker:
+    description: Force the GNU BFD linker on Linux (workaround for lld issues).
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      if: inputs.free-disk == 'true' && runner.os == 'Linux'
+      uses: jlumbroso/free-disk-space@main
+      with:
+        tool-cache: ${{ inputs.tool-cache }}
+        android: true
+        dotnet: true
+        haskell: true
+        large-packages: true
+        docker-images: ${{ inputs.docker-images }}
+        swap-storage: true
+
+    - name: Set up mise
+      uses: jdx/mise-action@v3
+      with:
+        install: true
+        cache: true
+
+    - name: Cache Rust
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.rust-cache-key }}
+
+    - name: Use GNU BFD linker on Linux
+      if: inputs.bfd-linker == 'true' && runner.os == 'Linux'
+      shell: bash
+      run: |
+        command -v cc
+        command -v ld.bfd
+        rustflags="${RUSTFLAGS:-}"
+        rustflags="${rustflags:+$rustflags }-C linker-features=-lld -C link-arg=-fuse-ld=bfd"
+        {
+          echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=cc"
+          echo "RUSTFLAGS=$rustflags"
+        } >> "$GITHUB_ENV"

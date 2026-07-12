@@ -8,9 +8,6 @@
 //!
 //! ## Engine boundary
 //!
-//! - The engine's default features never link `skald-agent`. The Skald-backed
-//!   `JudgeInvoker` lives behind an opt-in `orchestrator` feature in the
-//!   `orchestrator/` submodule of this crate.
 //! - The engine never binds dynamic-language runtimes. There is no
 //!   language-binding feature on this crate.
 //! - The engine never touches IO directly. `TraceSource::fetch` is the only
@@ -50,7 +47,6 @@ pub mod error;
 pub mod executor;
 pub mod judge;
 pub mod operators;
-#[cfg(feature = "orchestrator")]
 pub mod orchestrator;
 pub mod results;
 pub mod scenario;

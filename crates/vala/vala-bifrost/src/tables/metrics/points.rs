@@ -1,8 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{
-    boolean, float64, int32, ts_us_utc, uint32, uint64, utf8, utf8_view,
-};
+use crate::tables::fields::{boolean, float64, int32, ts_us_utc, uint32, uint64, utf8, utf8_view};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };

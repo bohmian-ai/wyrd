@@ -14,29 +14,19 @@
 //! forwarding seam already exists ([`AuthMiddleware::request_id`] accepts an
 //! inbound id) for a future relay caller; the helpers pass `None` today.
 
-#[cfg(feature = "transport-http")]
 use std::sync::Arc;
-#[cfg(feature = "transport-http")]
 use std::time::Duration;
 
-#[cfg(feature = "transport-http")]
 use serde::Serialize;
-#[cfg(feature = "transport-http")]
 use serde::de::DeserializeOwned;
-#[cfg(feature = "transport-http")]
 use uuid::Uuid;
-#[cfg(feature = "transport-http")]
 use wyrd_spec::error::WyrdError;
 
-#[cfg(feature = "transport-http")]
 use crate::auth::{AuthError, AuthMiddleware};
-#[cfg(feature = "transport-http")]
 use crate::error::{WyrdClientError, from_problem_json};
-#[cfg(feature = "transport-http")]
 use crate::transport::config::HttpConfig;
 
 /// Response from a raw Arrow IPC request.
-#[cfg(feature = "transport-http")]
 pub struct ArrowResponse {
     /// Raw Arrow IPC stream bytes.
     pub frames: Vec<u8>,
@@ -46,18 +36,13 @@ pub struct ArrowResponse {
     pub row_count: Option<u64>,
 }
 
-#[cfg(feature = "transport-http")]
 const HEADER_REQUEST_ID: &str = "wyrd-request-id";
-#[cfg(feature = "transport-http")]
 const HEADER_IDEMPOTENCY_KEY: &str = "Idempotency-Key";
-#[cfg(feature = "transport-http")]
 const HEADER_SCHEMA_FINGERPRINT: &str = "X-Wyrd-Schema-Fingerprint";
-#[cfg(feature = "transport-http")]
 const HEADER_ROW_COUNT: &str = "X-Wyrd-Row-Count";
 /// Wyrd access-token header. The server authenticates data-plane requests from
 /// this header only; the application's own `Authorization` header is reserved
 /// for the embedding app and is never read or written by Wyrd.
-#[cfg(feature = "transport-http")]
 const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 
 /// Async `reqwest` HTTP transport for Wyrd read and admin paths.
@@ -66,7 +51,6 @@ const HEADER_WYRD_ACCESS_TOKEN: &str = "x-wyrd-access-token";
 /// gzip) and a shared [`AuthMiddleware`] (D3: same `Arc` as gRPC). Each
 /// request helper resolves the bearer via [`AuthMiddleware::bearer`], attaches
 /// `wyrd-request-id`, and applies the retry policy before returning.
-#[cfg(feature = "transport-http")]
 #[derive(Clone)]
 pub struct HttpTransport {
     client: reqwest::Client,
@@ -74,7 +58,6 @@ pub struct HttpTransport {
     base_url: String,
 }
 
-#[cfg(feature = "transport-http")]
 impl std::fmt::Debug for HttpTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpTransport")
@@ -83,7 +66,6 @@ impl std::fmt::Debug for HttpTransport {
     }
 }
 
-#[cfg(feature = "transport-http")]
 impl HttpTransport {
     /// Build a transport from config and a shared auth middleware.
     ///
@@ -368,7 +350,6 @@ impl HttpTransport {
 }
 
 /// Serialize an optional body to JSON bytes.
-#[cfg(feature = "transport-http")]
 fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Vec<u8>>, WyrdError> {
     body.map(serde_json::to_vec)
         .transpose()
@@ -379,7 +360,6 @@ fn serialize_body<S: Serialize>(body: Option<&S>) -> Result<Option<Vec<u8>>, Wyr
 }
 
 /// Map a body-read error to [`WyrdError::Internal`].
-#[cfg(feature = "transport-http")]
 fn body_read_err(err: reqwest::Error) -> WyrdError {
     WyrdError::Internal {
         message: format!("transport error reading response body: {err}"),
@@ -391,7 +371,6 @@ fn body_read_err(err: reqwest::Error) -> WyrdError {
 ///
 /// Server-reported auth failures pass through; client-local auth failures
 /// (transport down during token exchange) become [`WyrdError::Internal`].
-#[cfg(feature = "transport-http")]
 fn auth_to_wyrd(err: AuthError) -> WyrdError {
     match err {
         AuthError::Server(wyrd) => wyrd,
@@ -403,7 +382,6 @@ fn auth_to_wyrd(err: AuthError) -> WyrdError {
 }
 
 /// Extract a response header value as a `&str`.
-#[cfg(feature = "transport-http")]
 fn header_str<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
     resp.headers().get(name)?.to_str().ok()
 }

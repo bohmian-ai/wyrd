@@ -316,7 +316,7 @@ fn set_secret_permissions(_path: &std::path::Path) -> Result<(), WyrdCliError> {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::os::unix::fs::PermissionsExt;
 
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -365,7 +365,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD"]
     async fn dev_bootstrap_seeds_principal_key_audit_and_writes_credentials_toml() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let data_tenant_id = fixture.data_tenant_id();
@@ -409,7 +408,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD"]
     async fn dev_bootstrap_written_file_is_mode_0600() {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let data_tenant_id = fixture.data_tenant_id();

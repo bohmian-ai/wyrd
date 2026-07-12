@@ -1,0 +1,75 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+assertion_line: 15
+expression: "common::openai_responses_request()"
+---
+{
+  "model": "gpt-4o",
+  "input": [
+    {
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Hi {{name}}"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "lookup",
+      "arguments": "{\"q\":\"x\"}"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "call_1",
+      "output": "ok"
+    },
+    {
+      "type": "reasoning",
+      "summary": "short",
+      "encrypted_content": "abc"
+    },
+    {
+      "type": "input_file",
+      "file_id": "file_1"
+    },
+    {
+      "type": "input_image",
+      "image_url": "https://example.com/image.png",
+      "detail": "low"
+    }
+  ],
+  "instructions": "Answer tersely.",
+  "text": {
+    "format": {
+      "type": "json_schema",
+      "name": "answer",
+      "schema": {
+        "type": "object"
+      },
+      "strict": true
+    }
+  },
+  "tools": [
+    {
+      "type": "function",
+      "name": "lookup",
+      "parameters": {
+        "type": "object"
+      },
+      "strict": true
+    }
+  ],
+  "tool_choice": {
+    "type": "function",
+    "name": "lookup"
+  },
+  "previous_response_id": "resp_prev",
+  "reasoning": {
+    "effort": "low",
+    "summary": "auto"
+  }
+}

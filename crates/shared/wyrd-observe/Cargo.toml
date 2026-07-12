@@ -30,11 +30,10 @@ async-trait = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
-tracing = { workspace = true }
 opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true, features = ["rt-tokio"] }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

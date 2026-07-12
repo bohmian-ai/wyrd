@@ -664,7 +664,7 @@ impl From<DelegateError> for WyrdError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::collections::BTreeSet;
     use std::collections::HashMap;
     use std::sync::Arc;

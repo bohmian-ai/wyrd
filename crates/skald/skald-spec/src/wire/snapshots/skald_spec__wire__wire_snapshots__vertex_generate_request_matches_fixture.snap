@@ -1,0 +1,71 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+assertion_line: 54
+expression: "common::vertex_generate_request()"
+---
+{
+  "contents": [
+    {
+      "role": "user",
+      "parts": [
+        {
+          "text": "Hello {{name}}"
+        },
+        {
+          "inline_data": {
+            "mime_type": "image/png",
+            "data": "abcd"
+          }
+        },
+        {
+          "file_data": {
+            "mime_type": "image/png",
+            "file_uri": "gs://bucket/image.png"
+          }
+        },
+        {
+          "function_call": {
+            "name": "lookup",
+            "args": {
+              "q": "hello"
+            }
+          }
+        },
+        {
+          "function_response": {
+            "name": "lookup",
+            "response": {
+              "ok": true
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "function_declarations": [
+        {
+          "name": "lookup",
+          "parameters": {
+            "type": "object"
+          }
+        }
+      ]
+    }
+  ],
+  "generation_config": {
+    "temperature": 0.1,
+    "max_output_tokens": 64,
+    "response_mime_type": "application/json",
+    "response_schema": {
+      "type": "object"
+    }
+  },
+  "safety_settings": [
+    {
+      "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+      "threshold": "BLOCK_MEDIUM_AND_ABOVE"
+    }
+  ]
+}

@@ -1,4 +1,4 @@
-//! Server-hosted eval orchestrator gated by `feature = "orchestrator"`.
+//! Server-hosted eval orchestrator.
 //!
 //! This module owns the turn state machine, server-simulated user support, the
 //! Skald-backed judge adapter, and scoring hand-off.

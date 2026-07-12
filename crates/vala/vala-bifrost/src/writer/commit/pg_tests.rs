@@ -19,7 +19,11 @@ mod recovery {
     use crate::catalog::iceberg_sql;
     use crate::catalog::namespaces::BifrostNamespace;
     use crate::types::{TableScope, TableUid};
-    use crate::writer::commit::{FaultPoint, Lease, run_commit_with_fault};
+    use crate::writer::CommitKey;
+    use crate::writer::commit::{
+        FaultPoint, Lease, append_snapshot, commit_group_to_iceberg, run_commit_with_fault,
+        write_batches,
+    };
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -424,6 +428,155 @@ mod recovery {
             aborted, 1,
             "cold-start recovery must map identity from bifrost_tables join and abort"
         );
+    }
+
+    /// A group commit lands its Iceberg snapshot but crashes before finalize: the
+    /// snapshot carries `wyrd_commit_keys` (the `{data_tenant_id, batch_id}` pair),
+    /// NOT `wyrd_batch_id`. Recovery must roll the key forward by matching the pair.
+    ///
+    /// Red on the pre-02.3 tree: recovery matched only `wyrd_batch_id`, so it would
+    /// abort a genuinely committed group snapshot.
+    #[tokio::test]
+    async fn group_commit_recovers_unfinalized_key() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+
+        // Precommit row for {h.tenant, batch_id}, left unfinalized (NULL lease →
+        // eligible for recovery) — simulates a crash before finalize.
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &batch_id,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Real group append: writes Parquet + commits a snapshot stamping
+        // wyrd_commit_keys=[{h.tenant, batch_id}] and no wyrd_batch_id.
+        let files = write_batches(&table, vec![stamped_batch(7, batch_id)])
+            .await
+            .unwrap();
+        let (snapshot_id, _updated) = commit_group_to_iceberg(
+            &sql_catalog,
+            &table,
+            files,
+            &[CommitKey::new(h.tenant, batch_id)],
+        )
+        .await
+        .unwrap();
+
+        // Restart → recovery claims the orphaned row and rolls it forward.
+        let _recovered = rebuild_catalog(&h).await;
+
+        let (state, row_sid): (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, snapshot_id FROM vala.olap_commits \
+             WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(batch_id.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "committed",
+            "pair match in wyrd_commit_keys must roll the group key forward"
+        );
+        assert_eq!(
+            row_sid,
+            Some(snapshot_id),
+            "recovered row carries the snapshot_id found via wyrd_commit_keys"
+        );
+
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_found'",
+        )
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(found, 1, "one snapshot_found audit row");
+    }
+
+    /// M02 recovery discrimination: a snapshot stamps BOTH the legacy
+    /// `wyrd_batch_id` AND a `wyrd_commit_keys` entry for a DIFFERENT data tenant
+    /// that shares this row's `batch_id`. Recovery for THIS tenant's row must NOT
+    /// match the other tenant's snapshot — the pair is authoritative — so it aborts.
+    ///
+    /// Red on the pre-02.3 tree: recovery matched `wyrd_batch_id` alone and would
+    /// wrongly finalize this row committed against the other tenant's snapshot.
+    #[tokio::test]
+    async fn recovery_by_commitkey_not_batch_id() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        // A different data tenant that shares the same batch_id in the snapshot.
+        let other_tenant = DataTenantId::new_v7();
+
+        // Precommit row for THIS tenant {h.tenant, batch_id}, left unfinalized.
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &batch_id,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Real snapshot stamping BOTH the legacy wyrd_batch_id (would trip a
+        // batch_id-only match) AND wyrd_commit_keys for the OTHER tenant only.
+        let files = write_batches(&table, vec![stamped_batch(5, batch_id)])
+            .await
+            .unwrap();
+        let other_hex = other_tenant.as_uuid().simple();
+        let batch_hex = uuid::Uuid::from_bytes(batch_id).simple();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "wyrd_commit_keys".to_string(),
+            format!(r#"[{{"data_tenant_id":"{other_hex}","batch_id":"{batch_hex}"}}]"#),
+        );
+        props.insert("wyrd_batch_id".to_string(), batch_hex.to_string());
+        let _ = append_snapshot(&sql_catalog, &table, files, props)
+            .await
+            .unwrap();
+
+        // Restart → recovery. This tenant's pair is absent from wyrd_commit_keys.
+        let _recovered = rebuild_catalog(&h).await;
+
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(batch_id.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "aborted",
+            "batch_id alone must not match another tenant's commit key"
+        );
+
+        let absent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_absent'",
+        )
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(absent, 1, "one snapshot_absent audit row");
     }
 
     /// Same cold-start identity mapping, but for a `SystemShared` table bound to

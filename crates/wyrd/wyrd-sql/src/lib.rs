@@ -19,8 +19,6 @@ pub mod queries;
 pub mod query;
 pub mod row_types;
 pub mod tenant_conn;
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 
 pub use error::SqlError;
 pub use pool::PoolConfig;

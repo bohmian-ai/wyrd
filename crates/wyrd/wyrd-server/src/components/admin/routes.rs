@@ -735,7 +735,7 @@ fn internal_error(error: impl std::fmt::Display) -> WyrdErrorResponse {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;

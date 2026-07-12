@@ -9,7 +9,6 @@ authors = { workspace = true }
 
 [features]
 embedded-postgres = ["dep:pg-embed", "dep:rand", "dep:urlencoding"]
-testing = ["dep:tokio"]
 
 [dependencies]
 chrono = { workspace = true }
@@ -19,7 +18,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["sync", "macros", "rt-multi-thread"] }
 tracing = { workspace = true }
 ulid = { workspace = true }
 url = { workspace = true }
@@ -43,4 +41,15 @@ optional = true
 [dev-dependencies]
 paste = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "uuid", "json"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 url = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+
+[[test]]
+name = "pg_cards"
+
+[[test]]
+name = "pg_migration"
+
+[[test]]
+name = "pg_query_compile"

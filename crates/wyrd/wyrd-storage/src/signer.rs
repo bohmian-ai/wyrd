@@ -81,6 +81,7 @@ impl BackendSigner {
     /// # Errors
     /// Returns [`StorageError::BackendCapabilityMismatch`] for backends that do
     /// not use per-part presigning.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn presign_part(
         &self,
         path: &ValidatedPath,
@@ -107,6 +108,7 @@ impl BackendSigner {
     /// # Errors
     /// Returns a backend error when finalization fails or the payload does not
     /// match the active backend.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn complete_server_side(
         &self,
         path: &ValidatedPath,
@@ -143,6 +145,7 @@ impl BackendSigner {
     /// Returns a backend error when abort fails. GCS returns a capability
     /// mismatch because its resumable session URI is bearer-equivalent and is
     /// not persisted server-side.
+    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
     pub async fn abort_multipart(
         &self,
         path: &ValidatedPath,

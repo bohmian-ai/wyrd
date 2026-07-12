@@ -10,6 +10,7 @@
 #
 #   mise run test:unit   All Rust tests except Bifrost and real-cloud storage.
 #   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
+#   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
 #   cargo test -p <crate> <name> --all-features    Iterate on one crate/test.
@@ -106,24 +107,85 @@ hide = true
 description = "Seed the shared cargo target dir by compiling the workspace before dispatching a wave. All executors share one CARGO_TARGET_DIR, so warming once builds the heavy deps (DataFusion/Arrow/Iceberg) a single time; each executor then reuses them instead of cold-building in parallel and racing on cargo's build lock."
 run = "cargo build --workspace --all-features --all-targets"
 
-[tasks."test:rust:workspace"]
+[tasks."test:wyrd"]
 hide = true
-description = "Run workspace Rust unit tests (no DB required)"
+description = "Run wyrd family tests (unit tests only — pg_tests skipped without docker): wyrd, wyrd-auth, wyrd-cards, wyrd-cli, wyrd-config, wyrd-interfaces, wyrd-mcp, wyrd-server, wyrd-sql, wyrd-storage, wyrd-testing, wyrd-tonic, wyrd-spec"
 run = """
-cargo test --locked --workspace --exclude py-wyrd --exclude wyrd-auth --exclude wyrd-server --exclude vala-bifrost --exclude vala-sql --exclude vala-core --exclude wyrd-client --exclude wyrd-dev-fixtures --exclude wyrd-sql --exclude wyrd-storage --exclude wyrd-testing
-cargo test --locked -p wyrd-client --lib
-cargo test --locked -p wyrd-client --test transport
-cargo test --locked -p vala-core
-cargo test --locked -p vala-sql --lib
-cargo test --locked -p wyrd-sql --lib
-# wyrd-storage runs whole-package here: emulator tests self-skip on unset WYRD_STORAGE_INTEGRATION_*,
-# and the Postgres-backed sweeper suite is #[ignore]'d (runs via test:sql --include-ignored).
-cargo test --locked -p wyrd-storage --all-features
+cargo test --locked \
+  -p wyrd \
+  -p wyrd-auth \
+  -p wyrd-cards \
+  -p wyrd-cli \
+  -p wyrd-config \
+  -p wyrd-interfaces \
+  -p wyrd-mcp \
+  -p wyrd-server \
+  -p wyrd-sql \
+  -p wyrd-storage \
+  -p wyrd-testing \
+  -p wyrd-tonic \
+  -p wyrd-spec \
+  -- --skip pg_tests
+"""
+
+[tasks."test:skald"]
+hide = true
+description = "Run skald family tests (no DB required): skald-agent, skald-cache, skald-prompt, skald-providers, skald-runtime, skald-spec, skald-tool, skald-workflow"
+run = """
+cargo test --locked \
+  -p skald-agent \
+  -p skald-cache \
+  -p skald-prompt \
+  -p skald-providers \
+  -p skald-runtime \
+  -p skald-spec \
+  -p skald-tool \
+  -p skald-workflow \
+  -- --skip pg_tests
+"""
+
+[tasks."test:vala"]
+hide = true
+description = "Run vala family tests (unit tests only — pg_tests skipped without docker): vala-bifrost, vala-core, vala-drift, vala-eval, vala-ingest, vala-sdk, vala-sql"
+run = """
+cargo test --locked \
+  -p vala-bifrost \
+  -p vala-core \
+  -p vala-drift \
+  -p vala-eval \
+  -p vala-ingest \
+  -p vala-sdk \
+  -p vala-sql \
+  -- --skip pg_tests
+"""
+
+[tasks."test:shared"]
+hide = true
+description = "Run shared family tests (unit tests only — pg_tests skipped without docker): wyrd-auth-check, wyrd-auth-issue, wyrd-auth-oidc, wyrd-auth-verify, wyrd-client, wyrd-crypt, wyrd-dev-fixtures, wyrd-error-derive, wyrd-observe, wyrd-queue, wyrd-runtime, wyrd-semver, wyrd-telemetry, wyrd-test-contract-macros, wyrd-utils, wyrd-version"
+run = """
+cargo test --locked \
+  -p wyrd-auth-check \
+  -p wyrd-auth-issue \
+  -p wyrd-auth-oidc \
+  -p wyrd-auth-verify \
+  -p wyrd-client \
+  -p wyrd-crypt \
+  -p wyrd-dev-fixtures \
+  -p wyrd-error-derive \
+  -p wyrd-observe \
+  -p wyrd-queue \
+  -p wyrd-runtime \
+  -p wyrd-semver \
+  -p wyrd-telemetry \
+  -p wyrd-test-contract-macros \
+  -p wyrd-utils \
+  -p wyrd-version \
+  -- --skip pg_tests
 """
 
 [tasks."test:bifrost"]
 description = """Run vala-bifrost integration tests against local Postgres.
-Runs serially because each test resets shared database state at test start.
+Runs serially to avoid races between per-test isolated databases.
 Also verifies table schema fingerprint stability — see `fingerprint_drift` tests in `crates/vala/vala-bifrost/src/tables/mod.rs`.
 """
 depends = ["setup:postgres"]
@@ -131,52 +193,31 @@ env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:5543
 run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
 [tasks."test:unit"]
-description = """Aggregate Rust test gate: workspace + storage emulator matrix + sql + registry-e2e.
+description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
 contention; add test:bifrost to pre-pr or run it directly to include it locally.
 Only real-credential cloud storage tests (test:storage:{s3,gcs,azure}:cloud) are gated to
 storage-integration-cloud.yml; emulator-backed storage tests run here because they are just
 docker containers, same difficulty as Postgres.
 """
-depends = ["test:rust:workspace", "test:storage:matrix", "test:sql", "test:wyrd-auth", "test:wyrd-server", "test:registry-e2e"]
-
-[tasks."test:wyrd-spec"]
-hide = true
-description = "Run wyrd-spec Rust tests"
-run = "cargo test -p wyrd-spec --all-features"
+depends = ["test:wyrd", "test:skald", "test:vala", "test:shared", "test:storage:matrix", "test:sql", "test:e2e"]
 
 [tasks."test:wyrd-spec:doc"]
 hide = true
 description = "Run wyrd-spec Rust doc tests"
 run = "cargo test --locked --doc --all-features -p wyrd-spec"
 
-[tasks."test:wyrd-error-derive"]
+[tasks."test:e2e"]
 hide = true
-description = "Run wyrd-error-derive tests"
-run = "cargo test -p wyrd-error-derive --all-features"
-
-[tasks."test:wyrd-server"]
-hide = true
-description = """Run wyrd-server Rust tests against the local Postgres database."""
-depends = ["setup:postgres"]
+description = "Run server-level e2e tests requiring Postgres: wyrd-auth, wyrd-server, wyrd-testing, and wyrd-client e2e fixtures"
+depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
-cargo test --locked -p wyrd-server --all-features -- --test-threads=1
+cargo test --locked -p wyrd-auth -- --test-threads=1
+cargo test --locked -p wyrd-server -- --test-threads=1
 cargo test --locked -p wyrd-testing -- --test-threads=1
 cargo test --locked -p wyrd-client --test auth_e2e_against_fixture --test discovery_against_fixture -- --test-threads=1
 """
-
-[tasks."test:wyrd-auth"]
-hide = true
-description = """Run wyrd-auth Rust tests against the local Postgres database."""
-depends = ["setup:postgres"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p wyrd-auth --all-features -- --test-threads=1"
-
-[tasks."test:wyrd-mcp"]
-hide = true
-description = "Run wyrd-mcp tests (MCP contract-artifact record types + projection). Narrow gate; no docker."
-run = "cargo test -p wyrd-mcp --all-features"
 
 [tasks."identity:e2e"]
 hide = true
@@ -374,14 +415,8 @@ hide = true
 description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
 depends = ["storage:up", "setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test -p wyrd-server --all-features --test storage_e2e -- --nocapture --test-threads=1"
+run = "cargo test -p wyrd-server --features storage-emulator --test storage_e2e -- --nocapture --test-threads=1"
 
-[tasks."test:registry-e2e"]
-hide = true
-description = "Cards registration end-to-end against a real Postgres"
-depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p wyrd-sql --features testing --test cards_e2e -- --include-ignored --test-threads=1"
 
 [tasks."test:storage:s3:cloud"]
 hide = true
@@ -390,7 +425,7 @@ depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud s3_cloud_handle_crud -- --nocapture
-cargo test -p wyrd-server --all-features --test storage_e2e s3_multipart_e2e_cloud -- --nocapture
+cargo test -p wyrd-server --features storage-emulator --test storage_e2e s3_multipart_e2e_cloud -- --nocapture
 """
 
 [tasks."test:storage:gcs:cloud"]
@@ -400,7 +435,7 @@ depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud gcs_cloud_handle_crud -- --nocapture
-cargo test -p wyrd-server --all-features --test storage_e2e gcs_multipart_e2e_cloud -- --nocapture
+cargo test -p wyrd-server --features storage-emulator --test storage_e2e gcs_multipart_e2e_cloud -- --nocapture
 """
 
 [tasks."test:storage:azure:cloud"]
@@ -410,7 +445,7 @@ depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
 cargo test -p wyrd-storage --all-features --test handle_crud azure_cloud_handle_crud -- --nocapture
-cargo test -p wyrd-server --all-features --test storage_e2e azure_multipart_e2e_cloud -- --nocapture
+cargo test -p wyrd-server --features storage-emulator --test storage_e2e azure_multipart_e2e_cloud -- --nocapture
 """
 
 [tasks."test:storage:cloud:matrix"]
@@ -478,6 +513,11 @@ description = "Single wyrd.cards table; no per-kind shadow tables"
 run = """
 if rg -n 'CREATE TABLE wyrd\\.cards_[a-z]' crates/wyrd/wyrd-sql/migrations/; then exit 1; fi
 """
+
+[tasks."check:test-coverage"]
+hide = true
+description = "Assert every workspace crate (except py-wyrd and wyrd-rust-examples) is assigned to exactly one family test lane in mise.toml"
+run = "bash scripts/checks/test-coverage.sh"
 
 [tasks."check:design-sync"]
 hide = true
@@ -663,7 +703,7 @@ run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
-run = "cargo build -p skald-workflow --examples --all-features"
+run = "cargo build -p skald-workflow --examples --features otel"
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"
@@ -772,11 +812,10 @@ wait $SERVER_PID $UI_PID
 """
 
 [tasks.check]
-description = "Phase 0 gate: fmt --check + clippy + cargo check (workspace, all features)"
+description = "Phase 0 gate: fmt --check + clippy (clippy --all-targets already type-checks)"
 run = """
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
-cargo check --locked --workspace --all-features
 """
 
 [tasks."codegen:regen"]
@@ -889,7 +928,8 @@ depends = [
   "check:no-legacy-server-vocab",
   "check:no-tonic-outside-wyrd-tonic",
   "check:from-pools-allowlist",
-  "check:fixtures-no-server"]
+  "check:fixtures-no-server",
+  "check:test-coverage"]
 
 [tasks."setup:db-roles"]
 hide = true
@@ -928,20 +968,20 @@ wyrd_platform_admin BYPASSRLS) are present before applying DDL.
 """
 depends = ["setup:postgres"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture"
+run = "cargo test --locked -p wyrd-sql --test pg_migration -- migrations_apply_and_are_idempotent --nocapture"
 
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, and Vala SQL suites.
+Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
 """
 depends = ["dev:pg:nuke", "setup:postgres"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
-cargo test --locked -p wyrd-sql --all-features -- --nocapture --test-threads=1
-cargo test --locked -p wyrd-dev-fixtures --all-features -- --test-threads=1
-cargo test --locked -p vala-sql --all-features -- --test-threads=1
-cargo test --locked -p wyrd-storage --all-features --test sweeper -- --include-ignored --test-threads=1
+cargo test --locked -p wyrd-sql -- --nocapture --test-threads=1
+cargo test --locked -p wyrd-dev-fixtures -- --test-threads=1
+cargo test --locked -p vala-sql -- --test-threads=1
+cargo test --locked -p wyrd-storage --test sweeper -- --test-threads=1
 """
 
 [tasks."db:migrate:all"]
@@ -950,8 +990,8 @@ description = "Manual Wyrd + Vala migration smoke test against local docker-comp
 depends = ["setup:postgres"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
-cargo test --locked -p wyrd-sql --all-features --test migration_pg -- migrations_apply_and_are_idempotent --nocapture
-cargo test --locked -p vala-sql --all-features --test migration_pg -- vala_migrations_apply_and_are_idempotent --nocapture
+cargo test --locked -p wyrd-sql --test pg_migration -- migrations_apply_and_are_idempotent --nocapture
+cargo test --locked -p vala-sql --test pg_migration -- vala_migrations_apply_and_are_idempotent --nocapture
 """
 
 [tasks."check:security-schema-drift"]

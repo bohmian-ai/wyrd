@@ -38,6 +38,7 @@ async fn local_signer_round_trips_single_put_contract() {
     assert!(required_headers.is_empty());
 }
 
+#[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
 #[tokio::test]
 async fn backend_dispatch_remints_and_finalizes_local_uploads() {
     let root = tempfile::tempdir().expect("temp dir");

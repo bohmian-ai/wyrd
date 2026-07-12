@@ -283,7 +283,7 @@ fn scope_member_summary(members: &[String]) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use wyrd_auth_issue::IssueError;
     use wyrd_dev_fixtures::cards::seed_backing_card;
     use wyrd_dev_fixtures::pg::PgFixture;

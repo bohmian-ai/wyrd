@@ -151,8 +151,10 @@ Python, and TypeScript client surfaces where appropriate.
   input, database, storage, or external-service behavior in non-test code.
 - Use `expect()` only for true invariants, with a message naming the invariant.
 - Do not add wildcard dependency versions or per-crate profile blocks.
-- All cargo invocations use `--all-features` unless gating a specific feature
-  surface.
+- Lints, format checks, and workspace type-checks use `--all-features` so every
+  code path is verified. Test and build tasks declare only the minimal feature
+  set they need — `--all-features` in a test task forces the heavy cone to
+  recompile at a different feature-union and defeats artifact reuse.
 
 ## 5. Abstraction Rules
 
@@ -310,8 +312,8 @@ mise run py:lints      # if Python files changed
 Then run the narrowest `mise` test/check tasks that cover the touched surface:
 
 - Rust crate change: prefer the nearest crate-specific `mise run ...` task
-  (`test:wyrd-spec`, `test:wyrd-server`, `test:sql`, `test:storage:matrix`,
-  etc.). Whole-crate tests should use `mise` when a task exists because some
+  (`test:wyrd`, `test:skald`, `test:vala`, `test:shared`, `test:sql`,
+  `test:storage:matrix`, etc.). Whole-crate tests should use `mise` when a task exists because some
   crates need external dependencies, migrations, generated artifacts, or
   environment variables that the mise task sets up. Use raw `cargo test` only
   when no relevant mise task exists or when narrowing to a single pure unit
@@ -344,7 +346,7 @@ While working on a specific area:
 # Rust only
 # Whole-crate tests should use a crate-specific mise task when one exists.
 # Raw cargo is acceptable for a narrow pure unit test that needs no repo setup.
-mise exec -- cargo test --locked -p <crate> <test_name> --all-features -- --nocapture --test-threads=1
+mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
 mise run test:sql      # runs all SQL-backed integration tests across wyrd-sql, wyrd-dev-fixtures, and vala-sql
 mise run test:unit     # all Rust tests including SQL and storage emulators
 
@@ -412,10 +414,6 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - All code must be directly testable.
 - Functions and classes follow the single responsibility principle. If a function does two things, split it.
 - Follow existing code style and patterns. Do not introduce new paradigms unless there is a compelling reason. Consistency over cleverness.
-
-## 17. Agent and Subagent Rules
-
-- Verify your work in-session. Do not create background shells for `cargo build`, `cargo test`, `cargo clippy`, `cargo check`, `mise run`, `npm run`, `pytest`, or any test/lint/build command. This will create delays and issues in rust-based projects. Run necessary commands within the active session.
 
 ## 18. CodeGraph
 

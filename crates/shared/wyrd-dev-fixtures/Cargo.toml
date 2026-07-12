@@ -18,9 +18,7 @@ pg = [
     "dep:url",
     "dep:uuid",
     "dep:vala-sql",
-    "vala-sql/testing",
     "dep:wyrd-sql",
-    "wyrd-sql/testing",
     "dep:wyrd-spec",
 ]
 

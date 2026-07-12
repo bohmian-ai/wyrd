@@ -7,6 +7,7 @@ use crate::signer::BackendSigner;
 /// Cloud-specific checks (e.g. the S3 incomplete-multipart lifecycle rule) live
 /// in [`crate::cloud`] and run only when the crate is built with the `cloud`
 /// feature. Local-only builds have no preflight work.
+#[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
 pub async fn run(signer: &BackendSigner) {
     #[cfg(feature = "cloud")]
     if let BackendSigner::Cloud(cloud) = signer {

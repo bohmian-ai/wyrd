@@ -216,7 +216,7 @@ fn sql_error(error: impl Into<SqlError>) -> WyrdError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use super::{LoginStateEntry, PgLoginStateStore};
     use secrecy::{ExposeSecret, SecretString};
     use std::time::Duration;

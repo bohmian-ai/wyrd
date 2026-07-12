@@ -93,7 +93,6 @@ fn saturating_config() -> QueueConfig {
 /// Happy-path: insert via Bifrost handle + observe path, no drops, real server
 /// credentials validate the scope construction path.
 #[tokio::test]
-#[ignore = "requires live WyrdTestServer — run with --ignored --test-threads=1"]
 async fn observe_and_bifrost_roundtrip() {
     let srv = WyrdTestServer::start_bound()
         .await
@@ -142,7 +141,6 @@ async fn observe_and_bifrost_roundtrip() {
 /// Backpressure + drain: a saturated queue propagates WYRD_CLIENT_429_QUEUE_FULL
 /// from the insert path; observe swallows and counts.
 #[tokio::test]
-#[ignore = "requires live WyrdTestServer — run with --ignored --test-threads=1"]
 async fn backpressure_and_drain_no_silent_drops() {
     let srv = WyrdTestServer::start_bound()
         .await

@@ -294,7 +294,7 @@ fn map_principal_kind(entry: IssuerTokenPolicy) -> IssuerTokenPolicy {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use secrecy::{ExposeSecret, SecretString};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

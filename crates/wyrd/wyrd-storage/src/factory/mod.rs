@@ -4,9 +4,6 @@
 pub mod azure;
 #[cfg(feature = "cloud")]
 pub mod gcs;
-/// Iceberg `StorageFactory` builder wired to the active backend configuration.
-#[cfg(feature = "iceberg")]
-pub mod iceberg_factory;
 pub mod local;
 #[cfg(feature = "cloud")]
 pub mod s3;
@@ -84,9 +81,18 @@ pub fn build_operator(backend: &BackendConfig) -> Result<Operator, StorageError>
         BackendConfig::Local { root } => {
             finish_op(local::fs_service(root), StorageBackendKind::Local)
         }
+        #[cfg(feature = "cloud")]
         BackendConfig::S3(c) => finish_op(s3::s3_service(c), StorageBackendKind::S3),
+        #[cfg(feature = "cloud")]
         BackendConfig::Gcs(c) => finish_op(gcs::gcs_service(c), StorageBackendKind::Gcs),
+        #[cfg(feature = "cloud")]
         BackendConfig::Azure(c) => finish_op(azure::azblob_service(c), StorageBackendKind::Azure),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::S3(_) => Err(cloud_disabled(backend)),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::Gcs(_) => Err(cloud_disabled(backend)),
+        #[cfg(not(feature = "cloud"))]
+        BackendConfig::Azure(_) => Err(cloud_disabled(backend)),
     }
 }
 

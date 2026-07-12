@@ -8,7 +8,7 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [features]
-testing = ["wyrd-sql/testing", "vala-sql/testing"]
+storage-emulator = ["wyrd-storage/emulator"]
 
 [[bin]]
 name = "wyrd-server"
@@ -63,12 +63,12 @@ tower_governor = { workspace = true }
 http-body-util = "0.1"
 wyrd-spec = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-storage = { workspace = true, features = ["iceberg"] }
+wyrd-storage = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }
 reqwest = { workspace = true }
-wyrd-storage = { workspace = true, features = ["emulator"] }
+wyrd-storage = { workspace = true }
 temp-env = { workspace = true }
 tempfile = { workspace = true }
 tokio-stream = "0.1"
@@ -80,5 +80,30 @@ wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
 wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
 wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
-wyrd-sql = { path = "../wyrd-sql", version = "0.0.1", features = ["testing"] }
-vala-sql = { path = "../../vala/vala-sql", version = "0.0.1", features = ["testing"] }
+wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
+vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+
+[[test]]
+name = "pg_grpc_smoke"
+
+[[test]]
+name = "pg_grpc_ingest_smoke"
+
+[[test]]
+name = "pg_authz_check_route"
+
+[[test]]
+name = "pg_router_smoke"
+
+[[test]]
+name = "pg_merge_http_protected"
+
+[[test]]
+name = "pg_bootstrap_key"
+
+[[test]]
+name = "pg_eval_v1_protocol"
+
+[[test]]
+name = "storage_e2e"
+required-features = ["storage-emulator"]

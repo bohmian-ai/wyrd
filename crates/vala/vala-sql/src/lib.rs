@@ -15,8 +15,6 @@ use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 pub mod postgres;
 pub mod queries;
 pub mod row_types;
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 
 pub use postgres::ValaPostgres;
 pub use wyrd_sql::{TenantConn, error::SqlError};

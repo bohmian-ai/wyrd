@@ -186,14 +186,11 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     let recovery_pool = build_pool(dsns.recovery.expose_secret(), PoolConfig::default())
         .await
         .map_err(ServerBootError::PoolConnect)?;
-    let (storage_factory, storage_props) = storage.iceberg_storage_factory()?;
     let bifrost = WyrdCatalog::new(
         dsns.catalog_app.expose_secret(),
-        storage.warehouse_uri(),
+        storage.backend_config(),
         Arc::new(postgres.app_pool().clone()),
         Some(Arc::new(recovery_pool)),
-        storage_factory,
-        storage_props,
     )
     .await?;
 

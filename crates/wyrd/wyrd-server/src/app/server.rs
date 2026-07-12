@@ -435,7 +435,10 @@ mod tests {
 
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let postgres = Arc::new(ServerPostgres::lazy_for_tests(app_pool.clone()));
+        let postgres = Arc::new(ServerPostgres::from_parts(
+            wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+        ));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let kid = Kid::new("k1").expect("kid is valid");

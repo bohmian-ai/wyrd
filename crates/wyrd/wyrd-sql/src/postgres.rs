@@ -60,7 +60,6 @@ impl WyrdPostgres {
     /// only for DB-free unit tests that construct lazy pools and never issue a
     /// query. Gated behind `testing` / `cfg(test)` so it cannot be reached from a
     /// production build.
-    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn from_pools(app: PgPool, platform_admin: Option<PgPool>) -> Self {
         Self {

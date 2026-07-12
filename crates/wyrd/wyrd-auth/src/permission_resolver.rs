@@ -71,7 +71,7 @@ fn permissions_from_row(row: &RoleRow) -> Result<Vec<Permission>, ResolveError> 
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::sync::Arc;
 
     use serde_json::json;

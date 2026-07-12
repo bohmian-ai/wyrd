@@ -215,30 +215,6 @@ impl StorageHandle {
         self.public_base_url.as_deref()
     }
 
-    /// Return an Iceberg `StorageFactory` and its companion property map derived
-    /// from the active backend configuration.
-    ///
-    /// The factory is an `OpenDalResolvingStorageFactory` that auto-detects the
-    /// URL scheme and reads credentials from the ambient environment (IRSA,
-    /// workload identity, instance profile). The property map carries any
-    /// backend-specific hints (endpoint, region, account) that the Iceberg catalog
-    /// should embed in table metadata.
-    ///
-    /// # Errors
-    /// Returns `StorageError` when backend configuration is invalid.
-    #[cfg(feature = "iceberg")]
-    pub fn iceberg_storage_factory(&self) -> crate::factory::iceberg_factory::IcebergStorageResult {
-        crate::factory::iceberg_factory::iceberg_storage_factory(&self.backend_config)
-    }
-
-    /// Derive the Iceberg warehouse base URI from the active backend
-    /// configuration. The catalog appends `{namespace}/{name}` itself.
-    #[cfg(feature = "iceberg")]
-    #[must_use]
-    pub fn warehouse_uri(&self) -> String {
-        crate::factory::iceberg_factory::warehouse_uri(&self.backend_config)
-    }
-
     /// Probe the storage backend for liveness.
     ///
     /// For the local backend, attempts a `stat` of the configured storage root

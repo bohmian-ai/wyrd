@@ -358,7 +358,7 @@ fn bad_refresh_token_format() -> WyrdError {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::sync::Arc;
 
     use chrono::{Duration, Utc};

@@ -27,7 +27,7 @@ uuid = { workspace = true, features = ["v7"] }
 [dev-dependencies]
 wyrd-tonic = { workspace = true, features = ["server"] }
 vala-bifrost = { workspace = true }
-vala-sql = { workspace = true, features = ["testing"] }
+vala-sql = { workspace = true }
 wyrd-storage = { workspace = true }
 arrow = { workspace = true, features = ["ipc"] }
 wyrd-runtime = { workspace = true }
@@ -36,3 +36,4 @@ tokio = { workspace = true, features = ["full"] }
 uuid = { workspace = true, features = ["v7"] }
 tempfile = { workspace = true }
 sqlx = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }

@@ -23,11 +23,8 @@ cloud = [
     "dep:azure_storage_blobs",
 ]
 emulator = ["cloud"]
-iceberg = ["dep:iceberg-storage-opendal", "dep:iceberg"]
 
 [dependencies]
-iceberg              = { workspace = true, optional = true }
-iceberg-storage-opendal = { workspace = true, optional = true }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
@@ -59,6 +56,14 @@ tempfile = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 wyrd-dev-fixtures = { path = "../../shared/wyrd-dev-fixtures", version = "0.0.1", features = ["pg"] }
 wyrd-testing = { path = "../wyrd-testing", version = "0.0.1" }
+
+[[test]]
+name = "backend_contracts"
+required-features = ["cloud"]
+
+[[test]]
+name = "integration_rustfs"
+required-features = ["emulator"]
 
 [[test]]
 name = "integration_gcs"

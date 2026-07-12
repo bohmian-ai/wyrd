@@ -1,21 +1,27 @@
+//! Iceberg `StorageFactory` and warehouse-URI derivation for the active backend.
+//!
+//! Both are pure functions of [`BackendConfig`] and are consumed only by
+//! [`super::WyrdCatalog::new`]. They live here — with the iceberg cone — rather
+//! than in `wyrd-storage`, which owns artifact blob storage, not the Iceberg
+//! warehouse concept.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use iceberg::io::StorageFactory;
 use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
+use wyrd_storage::settings::BackendConfig;
 
-use crate::error::StorageError;
-use crate::settings::BackendConfig;
-
-/// Iceberg storage factory and catalog properties returned by backend constructors.
-pub type IcebergStorageResult =
-    Result<(Arc<dyn StorageFactory>, HashMap<String, String>), StorageError>;
-
-/// Build an Iceberg `StorageFactory` and extra catalog properties for the active backend.
+/// Build an Iceberg `StorageFactory` and extra catalog properties for `backend`.
 ///
-/// # Errors
-/// Returns a `StorageError` if the factory cannot be constructed.
-pub fn iceberg_storage_factory(backend: &BackendConfig) -> IcebergStorageResult {
+/// The factory is an `OpenDalResolvingStorageFactory` that auto-detects the URL
+/// scheme and reads credentials from the ambient environment (IRSA, workload
+/// identity, instance profile). The property map carries any backend-specific
+/// hints (endpoint, region, account) that the Iceberg catalog embeds in table
+/// metadata.
+pub fn iceberg_storage_factory(
+    backend: &BackendConfig,
+) -> (Arc<dyn StorageFactory>, HashMap<String, String>) {
     let factory = Arc::new(OpenDalResolvingStorageFactory::new()) as Arc<dyn StorageFactory>;
     let mut props = HashMap::new();
 
@@ -42,7 +48,7 @@ pub fn iceberg_storage_factory(backend: &BackendConfig) -> IcebergStorageResult 
         }
     }
 
-    Ok((factory, props))
+    (factory, props)
 }
 
 /// Derive the Iceberg warehouse base URI from the active backend configuration.
@@ -55,7 +61,6 @@ pub fn iceberg_storage_factory(backend: &BackendConfig) -> IcebergStorageResult 
 /// - `S3` → `s3://{bucket}`
 /// - `Gcs` → `gs://{bucket}`
 /// - `Azure` → `abfss://{container}@{account}.dfs.core.windows.net`
-#[must_use]
 pub fn warehouse_uri(backend: &BackendConfig) -> String {
     match backend {
         BackendConfig::Local { root } => format!("file://{}", root.display()),
@@ -70,8 +75,8 @@ pub fn warehouse_uri(backend: &BackendConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::warehouse_uri;
-    use crate::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config};
     use std::path::PathBuf;
+    use wyrd_storage::settings::{AzureConfig, BackendConfig, GcsConfig, S3Config};
 
     #[test]
     fn local_warehouse_uri_is_file_scheme() {

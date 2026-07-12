@@ -84,7 +84,7 @@ impl AuthzAuditWriter for NoopAuthzAuditWriter {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use wyrd_auth_check::{AuthzCheckContext, AuthzCheckRequest};
     use wyrd_auth_verify::VerifiedToken;
     use wyrd_runtime::{

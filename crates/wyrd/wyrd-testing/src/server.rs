@@ -1473,16 +1473,11 @@ async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,
 ) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {
-    let (factory, props) = storage
-        .iceberg_storage_factory()
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     let catalog = WyrdCatalog::new(
         fixture.catalog_dsn().expose_secret(),
-        storage.warehouse_uri(),
+        storage.backend_config(),
         Arc::new(fixture.app_pool().clone()),
         None,
-        factory,
-        props,
     )
     .await
     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -1493,5 +1488,18 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
     matches!(
         error,
         sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
+    )
+}
+
+/// Build a [`ServerPostgres`] from an already-started [`PgFixture`].
+///
+/// Clones the fixture's real, migration-ready `WyrdPostgres` and `ValaPostgres`
+/// handles. Use this wherever a test needs an [`AppState`] backed by a real
+/// fixture database rather than a lazy no-op pool.
+#[must_use]
+pub fn server_postgres_from_fixture(fixture: &PgFixture) -> ServerPostgres {
+    ServerPostgres::from_parts(
+        fixture.wyrd_postgres().clone(),
+        fixture.vala_postgres().clone(),
     )
 }

@@ -343,7 +343,7 @@ fn bad_subject_token_format() -> WyrdErrorResponse {
 }
 
 #[cfg(test)]
-mod tests {
+mod pg_tests {
     use std::sync::Arc;
 
     use axum::Json;

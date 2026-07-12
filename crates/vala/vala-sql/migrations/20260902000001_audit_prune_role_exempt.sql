@@ -9,7 +9,7 @@
 -- audit_seal_checkpoints
 -- ──────────────────────────────────────���──────────────────���───────────────────
 
-CREATE TABLE IF NOT EXISTS vala.audit_seal_checkpoints (
+CREATE TABLE vala.audit_seal_checkpoints (
     data_tenant_id  UUID        NOT NULL,
     seq_lo          BIGINT      NOT NULL,
     seq_hi          BIGINT      NOT NULL,

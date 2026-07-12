@@ -10,7 +10,7 @@
 //! loss it returns `false` so the caller can cancel its in-flight operation.
 
 use sqlx::types::Uuid;
-use vala_sql::SqlError;
+use vala_sql::{OperatorPool, SqlError};
 
 /// Handle for renewing a named maintenance lease.
 #[derive(Debug, Clone)]
@@ -43,9 +43,9 @@ impl LeaseHeartbeat {
     /// # Errors
     /// Returns [`SqlError`] when the database query fails (distinct from
     /// ownership loss: a query error does not confirm or deny ownership).
-    pub async fn renew(&self, pool: &sqlx::PgPool, lease_secs: i64) -> Result<bool, SqlError> {
+    pub async fn renew(&self, op: &OperatorPool, lease_secs: i64) -> Result<bool, SqlError> {
         vala_sql::queries::maintenance_leases::renew_lease_fenced(
-            pool,
+            op,
             &self.lease_key,
             self.owner,
             self.fencing_token,

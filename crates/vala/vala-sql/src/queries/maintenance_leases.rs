@@ -6,20 +6,15 @@
 //! extends the lease only when the caller still owns it — if another pod claimed
 //! the lease the UPDATE matches zero rows and returns `false` (ownership lost).
 //!
-//! Lease rows live in `vala.maintenance_leases` (introduced by migration
-//! `20260802000000_maintenance_leases`; created by slice 08a). Until that
-//! migration lands, the fenced-renew logic is self-contained and testable
-//! against a mock pool — no schema dependency here.
-//!
-//! Per the vala-sql guard: this module takes a bare `&sqlx::PgPool` rather than
-//! `&TenantConn` because the maintenance lease table is a cross-tenant
-//! control-plane surface, not a tenant-scoped data table. The pool passed here
-//! must be the `vala_recovery` or equivalent cross-tenant pool.
-// tenant-scope-exempt: maintenance lease operations are cross-tenant control-plane; they use the recovery pool (BYPASSRLS) and are never called on a tenant request path.
+//! Lease rows live in `vala.maintenance_leases` (created by migration
+//! `20260906000001_maintenance_leases`). The table is a cross-tenant
+//! control-plane surface with no tenant column and no RLS, so these functions
+//! take `&OperatorPool` (the `wyrd_platform_admin` BYPASSRLS pool) rather than a
+//! tenant-scoped `TenantConn`.
 
 use sqlx::types::Uuid;
 
-use crate::SqlError;
+use crate::{OperatorPool, SqlError};
 
 /// Extend a named maintenance lease by `lease_secs` seconds, fenced by
 /// `(owner, fencing_token)`.
@@ -40,14 +35,14 @@ use crate::SqlError;
 /// **distinct** from ownership loss: the caller should treat it as a transient
 /// fault and retry.
 pub async fn renew_lease_fenced(
-    pool: &sqlx::PgPool,
+    op: &OperatorPool,
     lease_key: &str,
     owner: Uuid,
     fencing_token: i64,
     lease_secs: i64,
 ) -> Result<bool, SqlError> {
     // Dynamic query is intentional: maintenance leases are a cross-tenant
-    // control-plane table accessed via the recovery pool (BYPASSRLS).
+    // control-plane table accessed via the operator pool (BYPASSRLS).
     let result = sqlx::query(
         r#"
         UPDATE vala.maintenance_leases
@@ -63,7 +58,7 @@ pub async fn renew_lease_fenced(
     .bind(owner)
     .bind(fencing_token)
     .bind(lease_secs)
-    .execute(pool)
+    .execute(op.pool())
     .await
     .map_err(SqlError::from)?;
 
@@ -72,20 +67,21 @@ pub async fn renew_lease_fenced(
 
 /// Try to acquire a maintenance lease, returning the fencing token on success.
 ///
-/// Uses `INSERT … ON CONFLICT DO NOTHING` so only one caller wins the race.
-/// Returns `Some(fencing_token)` when the insert succeeded (this caller now
-/// holds the lease). Returns `None` when another caller already holds it.
+/// Uses `INSERT … ON CONFLICT` so only one caller wins the race: a brand-new
+/// lease key inserts, and an existing but expired lease is taken over. Returns
+/// `Some(fencing_token)` when this caller now holds the lease, `None` when
+/// another caller still holds a live lease.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the database query fails.
 pub async fn try_acquire_lease(
-    pool: &sqlx::PgPool,
+    op: &OperatorPool,
     lease_key: &str,
     owner: Uuid,
     lease_secs: i64,
 ) -> Result<Option<i64>, SqlError> {
     // Dynamic query is intentional: maintenance leases are a cross-tenant
-    // control-plane table accessed via the recovery pool (BYPASSRLS).
+    // control-plane table accessed via the operator pool (BYPASSRLS).
     let token: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO vala.maintenance_leases
@@ -105,63 +101,9 @@ pub async fn try_acquire_lease(
     .bind(lease_key)
     .bind(owner)
     .bind(lease_secs)
-    .fetch_optional(pool)
+    .fetch_optional(op.pool())
     .await
     .map_err(SqlError::from)?;
 
     Ok(token)
-}
-
-#[cfg(test)]
-mod renew {
-    use super::*;
-
-    /// Fenced renew is conditioned on all three predicates:
-    /// lease_key, owner, and fencing_token. Verify the predicate shape is
-    /// structurally correct by asserting the function signature is consistent
-    /// with the SQL query contract.
-    ///
-    /// Real end-to-end fencing behavior is tested in vala-sql integration tests
-    /// via the pg-fixture suite (`mise run test:sql`).
-    #[test]
-    fn renew_lease_fenced_signature_is_correct() {
-        // Compile-time check: the function must accept the four parameters
-        // and return the correct type. This test fails to compile if the
-        // signature drifts.
-        fn _check_signature(
-            pool: &sqlx::PgPool,
-            lease_key: &str,
-            owner: Uuid,
-            fencing_token: i64,
-            lease_secs: i64,
-        ) -> impl std::future::Future<Output = Result<bool, SqlError>> {
-            renew_lease_fenced(pool, lease_key, owner, fencing_token, lease_secs)
-        }
-        // If we reach here, the signature is correct.
-        let _ = _check_signature;
-    }
-
-    /// Fencing token contract: a renewal with mismatched token returns false
-    /// (ownership lost) rather than silently extending the wrong worker's lease.
-    ///
-    /// This behaviour is enforced by the `fencing_token = $3` predicate in the
-    /// UPDATE. The integration tests in `mise run test:sql` verify this against
-    /// a real Postgres instance.
-    #[test]
-    fn renew_returns_false_on_ownership_loss() {
-        // Structural test: assert the function returns a `bool` (not ()) so
-        // the caller can detect ownership loss. The real ownership-loss path
-        // requires a live Postgres instance and is covered in the integration
-        // suite.
-        fn _returns_bool(
-            pool: &sqlx::PgPool,
-            lease_key: &str,
-            owner: Uuid,
-            fencing_token: i64,
-            lease_secs: i64,
-        ) -> impl std::future::Future<Output = Result<bool, SqlError>> {
-            renew_lease_fenced(pool, lease_key, owner, fencing_token, lease_secs)
-        }
-        let _ = _returns_bool;
-    }
 }

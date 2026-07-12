@@ -843,6 +843,42 @@ pub async fn spawn_audit_reconciler(
     Ok(Some(handle))
 }
 
+/// Spawn the maintenance scheduler (slice 01).
+///
+/// On each 60-second tick it collects the maintenance health report and runs
+/// the commit-recovery sweep when a recovery pool is available. The sweep is
+/// idempotent and fencing-token guarded, so two pods running it concurrently
+/// cannot double-finalize a precommit. Other maintenance concerns (snapshot
+/// expiry, compaction, orphan GC, index build, projection health) report
+/// `pending` until their owning slices wire them into `scheduler::tick`.
+///
+/// Always spawns: `scheduler::tick` no-ops the recovery sweep when the recovery
+/// pool is absent (dev/test), so the health tick still runs. Production requires
+/// the recovery pool via [`check_recovery_pool`], enforced separately at boot.
+#[must_use]
+pub fn spawn_maintenance_scheduler(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let vala = state.postgres.vala().clone();
+    let catalog = Arc::clone(&state.bifrost);
+    let tick_interval =
+        Duration::from_secs(vala_bifrost::serving::repair::scheduler::TICK_INTERVAL_SECS);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+            vala_bifrost::serving::repair::scheduler::tick(&vala, &catalog).await;
+        }
+    })
+}
+
 /// Ensure the recovery pool is present in production deployments.
 ///
 /// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER

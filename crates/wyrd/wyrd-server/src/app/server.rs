@@ -16,7 +16,8 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{
-    ServerBootError, spawn_audit_reconciler, spawn_audit_relay, spawn_storage_sweeper,
+    ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
+    spawn_maintenance_scheduler, spawn_storage_sweeper,
 };
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
@@ -301,6 +302,10 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error or if the process-
     /// global metrics recorder fails to install.
     pub async fn run(mut self) -> Result<(), BootExit> {
+        // Fail-fast (slice 01): a production deployment without the recovery pool
+        // cannot resolve stale precommits and would leak them indefinitely.
+        check_recovery_pool(&self.state).map_err(|e| BootExit::Other(Box::new(e)))?;
+
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -363,6 +368,20 @@ impl BoundServer {
                 },
             ));
         }
+
+        // Maintenance scheduler (slice 01): drives the commit-recovery sweep and
+        // maintenance-health tick every 60s.
+        let scheduler_handle = spawn_maintenance_scheduler(&self.state, shutdown.clone());
+        set.spawn(worker_task(
+            TaskId::Worker("maintenance_scheduler"),
+            async move {
+                if let Err(join_error) = scheduler_handle.await
+                    && join_error.is_panic()
+                {
+                    std::panic::resume_unwind(join_error.into_panic());
+                }
+            },
+        ));
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {

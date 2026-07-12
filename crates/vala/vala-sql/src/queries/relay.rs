@@ -7,7 +7,6 @@
 //! pool uses `wyrd_platform_admin`, which has BYPASSRLS and is never exposed to
 //! tenant request paths).
 // raw-query grep allowlist: relay queries are cross-tenant BYPASSRLS; run `mise run sqlx:prepare` to promote to macros.
-// tenant-scope-exempt: cross-tenant audit relay uses the wyrd_platform_admin BYPASSRLS pool and is never called on a tenant request path.
 
 use crate::OperatorPool;
 use crate::SqlError;

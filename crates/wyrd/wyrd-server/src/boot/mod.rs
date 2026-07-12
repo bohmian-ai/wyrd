@@ -150,6 +150,19 @@ pub enum ServerBootError {
         /// Detail about why the reconciler could not be started.
         detail: String,
     },
+    /// `WYRD_VALA_500_RECOVERY_POOL_REQUIRED`: production boot requires a
+    /// `vala_recovery` pool for the commit-recovery sweep. A server that cannot
+    /// recover stale precommits risks permanent data loss and must not boot.
+    ///
+    /// Set `WYRD_RECOVERY_DSN` (or configure the `recovery` DSN slot) to
+    /// provision the `vala_recovery` SECURITY DEFINER pool before starting in
+    /// production.
+    #[error(
+        "WYRD_VALA_500_RECOVERY_POOL_REQUIRED: production deployment requires a \
+         recovery pool (vala_recovery DSN) for the commit-recovery sweep, \
+         but none is configured"
+    )]
+    RecoveryPoolRequired,
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -812,6 +825,36 @@ pub async fn spawn_audit_reconciler(
     Ok(Some(handle))
 }
 
+/// Ensure the recovery pool is present in production deployments.
+///
+/// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER
+/// pool to claim and resolve stale precommits across all tenants. Without it
+/// unresolved precommits accumulate indefinitely, risking permanent data loss.
+///
+/// **Fail-closed in production.** If `ValaPostgres::recovery_pool()` returns
+/// `None` and the deployment profile is production, boot returns
+/// [`ServerBootError::RecoveryPoolRequired`]. In development / staging, a
+/// missing recovery pool logs a warning and returns `Ok(())`.
+///
+/// # Errors
+/// Returns [`ServerBootError::RecoveryPoolRequired`] when the recovery pool is
+/// absent in a production deployment.
+pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
+    let is_production = state.deployment_profile == DeploymentProfile::Production;
+
+    if state.bifrost.recovery_pool().is_none() {
+        if is_production {
+            return Err(ServerBootError::RecoveryPoolRequired);
+        }
+        tracing::warn!(
+            "recovery pool (vala_recovery DSN) is not configured — \
+             commit-recovery sweep is disabled (dev/test only)"
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1033,66 @@ mod pg_tests {
         assert_eq!(
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local
+        );
+    }
+}
+
+/// Slice 01 behavior-test gate: `boot::recovery_pool_required`.
+///
+/// `check_recovery_pool` is a pure sync function; these tests drive it against
+/// an `AppState` built from the process-wide persistent Postgres fixture
+/// (`make_test_state` in `pg_tests` uses the same `test_support::test_catalog`
+/// path, which initializes the shared catalog on the persistent runtime).
+///
+/// Gate: `mise exec -- cargo test --locked -p wyrd-server --all-features boot::recovery_pool_required -- --nocapture`
+#[cfg(test)]
+mod recovery_pool_required {
+    use super::*;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
+
+    use crate::postgres::ServerPostgres;
+
+    async fn make_state() -> AppState {
+        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
+        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), Some(admin_pool));
+        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
+        let root = tempdir().expect("temp dir");
+        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        AppState::new(postgres, storage, crate::test_support::test_catalog().await)
+    }
+
+    /// Production boot without a recovery pool must fail with `RecoveryPoolRequired`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fails_in_production() {
+        let state = make_state().await;
+        assert!(
+            state.bifrost.recovery_pool().is_none(),
+            "test catalog must have no recovery pool"
+        );
+        let prod = state.with_deployment_profile(DeploymentProfile::Production);
+        let result = check_recovery_pool(&prod);
+        assert!(
+            matches!(result, Err(ServerBootError::RecoveryPoolRequired)),
+            "expected RecoveryPoolRequired in production without recovery pool, got {result:?}"
+        );
+    }
+
+    /// In development profile a missing recovery pool returns `Ok(())`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_ok_in_development() {
+        let state = make_state().await;
+        assert!(state.bifrost.recovery_pool().is_none());
+        assert_eq!(state.deployment_profile, DeploymentProfile::Development);
+        let result = check_recovery_pool(&state);
+        assert!(
+            result.is_ok(),
+            "missing recovery pool must not fail in development, got {result:?}"
         );
     }
 }

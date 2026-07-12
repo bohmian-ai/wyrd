@@ -685,6 +685,16 @@ impl WyrdCatalog {
         Ok(())
     }
 
+    /// Borrow the optional recovery pool (`vala_recovery` SECURITY DEFINER).
+    ///
+    /// Returns `None` when no recovery pool was provisioned. Production boot
+    /// that requires the commit-recovery sweep must fail hard when this is
+    /// `None` (see `wyrd-server` `ServerBootError::RecoveryPoolRequired`).
+    #[must_use]
+    pub fn recovery_pool(&self) -> Option<&PgPool> {
+        self.recovery_pool.as_deref()
+    }
+
     /// Best-effort startup recovery pass.
     ///
     /// Claims stale `precommit` rows (lease absent/expired) via the SECURITY

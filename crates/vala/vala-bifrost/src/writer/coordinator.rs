@@ -16,7 +16,7 @@
 //!
 //! **Backpressure** (Q5): the coordinator channel is bounded.  When it is full
 //! the caller receives [`BifrostError::IngestBusy`] immediately — never a
-//! silent drop, never a partial_success.
+//! silent drop, never a `partial_success`.
 //!
 //! **Cross-pod serialization** (Q7): Iceberg catalog CAS + `WRITER_INSTANCE`
 //! fence + `CommitKey{control_bind, batch_id}` dedup.  **No writer election.**
@@ -118,20 +118,24 @@ fn now_micros() -> i64 {
 // ── Group-commit coordinator (shared per-physical-table) ─────────────────────
 
 /// Command sent to the group-commit actor.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum CoordinatorCmd {
     /// Buffer a batch for the given tenant; ack is deferred to commit-durable.
+    #[allow(dead_code)]
     Write {
         tenant: DataTenantId,
         batch: RecordBatch,
-        ctx: BifrostWriteContext,
+        ctx: Box<BifrostWriteContext>,
         reply: oneshot::Sender<Result<i64, BifrostError>>,
     },
     /// Flush all buffered batches immediately (for testing).
     #[cfg(test)]
+    #[allow(dead_code)]
     ForceFlush(oneshot::Sender<Result<Vec<(DataTenantId, i64)>, BifrostError>>),
 }
 
 /// One pending write awaiting the commit-durable ack.
+#[allow(dead_code)]
 struct PendingEntry {
     tenant: DataTenantId,
     ctx: BifrostWriteContext,
@@ -167,7 +171,7 @@ impl GroupCommitHandle {
             .try_send(CoordinatorCmd::Write {
                 tenant,
                 batch,
-                ctx,
+                ctx: Box::new(ctx),
                 reply: tx,
             })
             .map_err(|_| BifrostError::IngestBusy(self.table_fqn.clone()))?;
@@ -182,6 +186,7 @@ impl GroupCommitHandle {
 }
 
 /// The shared per-physical-table group-commit actor.
+#[allow(dead_code)]
 struct GroupCommitActor {
     receiver: mpsc::Receiver<CoordinatorCmd>,
     table: Table,
@@ -199,6 +204,7 @@ struct GroupCommitActor {
     pending: Vec<PendingEntry>,
 }
 
+#[allow(dead_code)]
 impl GroupCommitActor {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -248,7 +254,7 @@ impl GroupCommitActor {
                         }
                         Some(CoordinatorCmd::Write { tenant, batch, ctx, reply }) => {
                             self.buffer.push(tenant, batch);
-                            self.pending.push(PendingEntry { tenant, ctx, reply });
+                            self.pending.push(PendingEntry { tenant, ctx: *ctx, reply });
 
                             if self.buffer.total_rows() >= self.flush_policy.max_rows
                                 || self.buffer.total_bytes() >= self.flush_policy.max_buffered_bytes
@@ -295,7 +301,7 @@ impl GroupCommitActor {
 
     /// Drain the buffer and run one group-commit cycle.
     ///
-    /// Per tenant: stamp system columns → apply redaction → run_commit (2PC).
+    /// Per tenant: stamp system columns → apply redaction → `run_commit` (2PC).
     /// All commits succeed or the first failure returns an error and restores
     /// the buffer.
     async fn do_group_commit(&mut self) -> Result<Vec<(DataTenantId, i64)>, BifrostError> {
@@ -319,22 +325,19 @@ impl GroupCommitActor {
                 .find(|p| p.tenant == *tenant)
                 .map(|p| &p.ctx);
 
-            let (batch_id, origin, actor, audit) = match entry_ctx {
-                Some(ctx) => {
-                    let audit = if ctx.origin == AUDIT_RELAY_ORIGIN {
-                        None
-                    } else {
-                        Some(ingest_audit_event(
-                            ctx,
-                            &self.table.identifier().to_string(),
-                        ))
-                    };
-                    (ctx.batch_id, ctx.origin.clone(), ctx.actor.clone(), audit)
-                }
-                None => {
-                    let sys = BifrostWriteContext::system();
-                    (sys.batch_id, sys.origin, sys.actor, None)
-                }
+            let (batch_id, origin, actor, audit) = if let Some(ctx) = entry_ctx {
+                let audit = if ctx.origin == AUDIT_RELAY_ORIGIN {
+                    None
+                } else {
+                    Some(ingest_audit_event(
+                        ctx,
+                        &self.table.identifier().to_string(),
+                    ))
+                };
+                (ctx.batch_id, ctx.origin.clone(), ctx.actor.clone(), audit)
+            } else {
+                let sys = BifrostWriteContext::system();
+                (sys.batch_id, sys.origin, sys.actor, None)
             };
 
             let stamped: Vec<RecordBatch> = batches
@@ -407,6 +410,7 @@ impl GroupCommitActor {
 /// Returns a [`GroupCommitHandle`] the ingest orchestrator uses to send writes.
 /// One coordinator is spawned per physical table via [`WriterRegistry`].
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 pub(crate) fn spawn_group_commit_coordinator(
     table: Table,
     catalog: Arc<SqlCatalog>,
@@ -672,7 +676,7 @@ mod tests {
 
         let totals: std::collections::HashMap<DataTenantId, usize> = groups
             .iter()
-            .map(|(t, batches)| (*t, batches.iter().map(|b| b.num_rows()).sum()))
+            .map(|(t, batches)| (*t, batches.iter().map(RecordBatch::num_rows).sum()))
             .collect();
 
         assert_eq!(totals[&t1], 13);
@@ -684,7 +688,7 @@ mod tests {
     fn flush_policy_row_trigger() {
         let policy = FlushPolicy {
             max_rows: 100,
-            max_interval: Duration::from_secs(60),
+            max_interval: Duration::from_mins(1),
             max_buffered_bytes: 128 * 1024 * 1024,
         };
 
@@ -708,7 +712,7 @@ mod tests {
         let groups = buf.drain_by_tenant();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].0, t);
-        let row_counts: Vec<usize> = groups[0].1.iter().map(|b| b.num_rows()).collect();
+        let row_counts: Vec<usize> = groups[0].1.iter().map(RecordBatch::num_rows).collect();
         assert_eq!(row_counts, vec![1, 2, 3, 4, 5]);
     }
 }

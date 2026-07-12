@@ -6,7 +6,7 @@
 //! candidates that are eligible for read-time substitution.
 //!
 //! Freshness rules (from §9 slice-04 contract):
-//! - **LookupSet**: exact freshness — `refresh_epoch == source_refresh_epoch`
+//! - **`LookupSet`**: exact freshness — `refresh_epoch == source_refresh_epoch`
 //!   AND `built_for_snapshot_id == current_source_snapshot_id`.
 //! - **Rollup / MV**: bounded staleness — `commit_lag <= max_allowed_lag` (the
 //!   per-deployment staleness knob). Never a numeric snapshot-id comparison.
@@ -16,7 +16,7 @@
 //! source-vs-source comparison only — the projection output schema is not
 //! checked here.
 //!
-//! This module is **IO-free**: no Postgres, no Tokio, no DataFusion. All
+//! This module is **IO-free**: no Postgres, no Tokio, no `DataFusion`. All
 //! inputs are plain values; callers load them before calling.
 
 use crate::types::SchemaFingerprint;
@@ -28,7 +28,7 @@ pub enum ProjectionKind {
     Rollup,
     /// Materialized View: bounded-staleness via commit-lag knob.
     Mv,
-    /// LookupSet index: exact freshness (epoch + snapshot-id identity match).
+    /// `LookupSet` index: exact freshness (epoch + snapshot-id identity match).
     LookupSet,
 }
 
@@ -102,11 +102,11 @@ pub struct MatchedProjection {
 /// Returns only candidates that satisfy:
 /// 1. F14 source-schema-fingerprint guard (source-vs-source only).
 /// 2. Kind-specific freshness rule:
-///    - LookupSet: exact epoch match + snapshot-id identity match.
+///    - `LookupSet`: exact epoch match + snapshot-id identity match.
 ///    - Rollup/MV: `commit_lag <= max_rollup_commit_lag`.
 ///
 /// Candidates that have never been refreshed (`built_for_snapshot_id = None`
-/// for LookupSet; any kind with a zero/default epoch before first refresh)
+/// for `LookupSet`; any kind with a zero/default epoch before first refresh)
 /// are rejected.
 ///
 /// This function is pure and IO-free.
@@ -306,7 +306,7 @@ mod tests {
 
     // ── substitutes a scan onto a fresh projection (behavior gate) ────────────
 
-    /// Behavior gate: a fresh LookupSet is substituted; a stale one is rejected.
+    /// Behavior gate: a fresh `LookupSet` is substituted; a stale one is rejected.
     /// This is the primary gate named in the build ledger.
     #[test]
     fn substitutes_scan_onto_fresh_projection_rejects_stale() {

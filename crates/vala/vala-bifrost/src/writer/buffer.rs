@@ -42,7 +42,7 @@ impl TenantAppendBuffer {
     pub fn push(&mut self, tenant: DataTenantId, batch: RecordBatch) {
         self.total_rows += batch.num_rows();
         self.total_bytes += batch_byte_estimate(&batch);
-        let queue = self.queues.entry(tenant).or_insert_with(VecDeque::new);
+        let queue = self.queues.entry(tenant).or_default();
         if queue.is_empty() {
             // First batch for this tenant in this flush window — add to rotation.
             self.order.retain(|t| *t != tenant);

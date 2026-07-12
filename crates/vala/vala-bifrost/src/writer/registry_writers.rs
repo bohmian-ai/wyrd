@@ -27,7 +27,7 @@ use crate::types::TableUid;
 use crate::writer::coordinator::GroupCommitHandle;
 
 /// Duration after which an idle coordinator is retired.
-pub const IDLE_RETIRE_DURATION: Duration = Duration::from_secs(5 * 60);
+pub const IDLE_RETIRE_DURATION: Duration = Duration::from_mins(5);
 
 /// A live handle to the group-commit coordinator for one physical table.
 struct LiveHandle {

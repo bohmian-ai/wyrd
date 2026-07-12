@@ -1,6 +1,6 @@
 //! Read-time plan rewriter: substitutes source-table scans with projection scans.
 //!
-//! [`ProjectionRewriter`] rewrites a DataFusion [`LogicalPlan`] by replacing a
+//! [`ProjectionRewriter`] rewrites a `DataFusion` [`LogicalPlan`] by replacing a
 //! `TableScan` of the source table with a `TableScan` of a chosen projection
 //! table. The caller is responsible for selecting a single [`MatchedProjection`]
 //! from the output of [`super::matcher::match_projections`]; this module
@@ -10,7 +10,7 @@
 //! trusts that the provided `chosen` projection passed all checks. It does NOT
 //! re-validate freshness.
 //!
-//! DataFusion plan rewriting uses [`TreeNode::transform`], which descends the
+//! `DataFusion` plan rewriting uses [`TreeNode::transform`], which descends the
 //! plan bottom-up. We replace `TableScan` nodes whose table name matches the
 //! source FQN with a new scan of the projection table, preserving all other
 //! plan nodes (filters, aggregations, projections). If no scan matches, the
@@ -22,7 +22,7 @@ use datafusion::logical_expr::LogicalPlan;
 
 use super::matcher::MatchedProjection;
 
-/// Rewrites a DataFusion logical plan to substitute a source-table scan with
+/// Rewrites a `DataFusion` logical plan to substitute a source-table scan with
 /// a projection-table scan.
 #[derive(Debug)]
 pub struct ProjectionRewriter {
@@ -49,7 +49,7 @@ impl ProjectionRewriter {
     /// the original plan unchanged.
     ///
     /// # Errors
-    /// Returns a DataFusion [`DfResult`] error if plan transformation fails
+    /// Returns a `DataFusion` [`DfResult`] error if plan transformation fails
     /// (e.g. an internal tree-node inconsistency).
     pub fn rewrite(&self, plan: LogicalPlan) -> DfResult<LogicalPlan> {
         let rewritten = plan.transform(|node| {
@@ -144,7 +144,7 @@ mod tests {
 
     /// Behavior gate (rewrite): a fresh projection changes the scan table name.
     ///
-    /// We construct the rewriter directly (without a full DataFusion plan
+    /// We construct the rewriter directly (without a full `DataFusion` plan
     /// round-trip) and verify the projection FQN is correctly carried.
     #[test]
     fn rewriter_substitution_uses_projection_fqn() {
@@ -172,7 +172,7 @@ mod tests {
         );
     }
 
-    /// `scan_matches_source` returns true for a bare name that equals source_fqn.
+    /// `scan_matches_source` returns true for a bare name that equals `source_fqn`.
     #[test]
     fn scan_matches_bare_source_name() {
         use datafusion::datasource::default_table_source::DefaultTableSource;

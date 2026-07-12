@@ -668,7 +668,7 @@ mod oversized_stream {
 /// This test does NOT drive a live database; it verifies the error taxonomy
 /// without a commit path (pure unit test).
 #[cfg(test)]
-mod orchestrator {
+mod tests {
     use crate::error::IngestError;
     use vala_bifrost::BifrostError;
 

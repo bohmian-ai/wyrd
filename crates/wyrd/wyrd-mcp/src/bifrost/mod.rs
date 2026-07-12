@@ -348,6 +348,9 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::PageSnapshotExpired,
         BifrostError::QueryForbidden,
         BifrostError::PayloadForbidden,
+        BifrostError::IngestBusy {
+            table: String::new(),
+        },
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -380,7 +383,8 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::PageTokenInvalid
             | BifrostError::PageSnapshotExpired
             | BifrostError::QueryForbidden
-            | BifrostError::PayloadForbidden => {}
+            | BifrostError::PayloadForbidden
+            | BifrostError::IngestBusy { .. } => {}
         }
     }
 

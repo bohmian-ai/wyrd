@@ -1,7 +1,7 @@
 //! Projection matching and read-time plan rewriting (slice 04).
 //!
 //! - [`matcher`] — IO-free freshness + fingerprint matching.
-//! - [`rewrite`] — DataFusion logical-plan rewriter.
+//! - [`rewrite`] — `DataFusion` logical-plan rewriter.
 //!
 //! The query context builder in [`super::session`] loads projections via
 //! `vala_sql::queries::olap_catalog::list_by_source`, converts each row to

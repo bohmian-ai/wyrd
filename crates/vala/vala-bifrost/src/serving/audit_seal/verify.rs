@@ -53,7 +53,7 @@ pub enum VerifyOutcome {
 /// If any step fails, returns [`VerifyOutcome::Tampered`].
 ///
 /// # Errors
-/// Returns [`BifrostError`] on SQL or DataFusion scan failures.
+/// Returns [`BifrostError`] on SQL or `DataFusion` scan failures.
 pub async fn verify_checkpoint_walk(
     app_pool: &PgPool,
     catalog: &WyrdCatalog,
@@ -230,14 +230,14 @@ fn tampered_range_hash_is_detected() {
     key.verify(&honest_hash, &sig)
         .expect("honest range verifies");
 
-    let tampered_hashes: Vec<Vec<u8>> = vec![vec![0x11; 32], vec![0xff; 32], vec![0x33; 32]];
-    let mut tampered_hasher = Sha256::new();
-    tampered_hasher.update(1i64.to_be_bytes());
-    tampered_hasher.update(3i64.to_be_bytes());
-    for h in &tampered_hashes {
-        tampered_hasher.update(h);
+    let bad_entries: Vec<Vec<u8>> = vec![vec![0x11; 32], vec![0xff; 32], vec![0x33; 32]];
+    let mut bad_hasher = Sha256::new();
+    bad_hasher.update(1i64.to_be_bytes());
+    bad_hasher.update(3i64.to_be_bytes());
+    for h in &bad_entries {
+        bad_hasher.update(h);
     }
-    let tampered_hash: [u8; 32] = tampered_hasher.finalize().into();
+    let tampered_hash: [u8; 32] = bad_hasher.finalize().into();
     assert!(
         key.verify(&tampered_hash, &sig).is_err(),
         "tampered range hash must not verify with honest signature"

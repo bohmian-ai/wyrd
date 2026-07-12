@@ -44,6 +44,10 @@ pub struct SealOutcome {
 ///
 /// Returns [`SealOutcome`] describing what was sealed.
 ///
+/// # Panics
+/// Panics if `refs` is somehow non-empty but `.first()` or `.last()` returns `None`
+/// — an invariant that cannot occur when `refs.is_empty()` is checked above.
+///
 /// # Errors
 /// Returns [`BifrostError`] when any SQL query or signing operation fails.
 pub async fn seal_then_prune(

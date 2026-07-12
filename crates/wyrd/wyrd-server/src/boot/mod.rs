@@ -841,10 +841,20 @@ pub async fn spawn_audit_reconciler(
 /// Returns [`ServerBootError::RecoveryPoolRequired`] when the recovery pool is
 /// absent in a production deployment.
 pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
-    let is_production = state.deployment_profile == DeploymentProfile::Production;
+    check_recovery_pool_inner(
+        state.bifrost.recovery_pool().is_some(),
+        &state.deployment_profile,
+    )
+}
 
-    if state.bifrost.recovery_pool().is_none() {
-        if is_production {
+/// Inner logic for [`check_recovery_pool`], accepting just the two values it needs.
+/// Extracted so the behavior can be unit-tested without constructing `AppState`.
+fn check_recovery_pool_inner(
+    has_recovery_pool: bool,
+    profile: &DeploymentProfile,
+) -> Result<(), ServerBootError> {
+    if !has_recovery_pool {
+        if profile.is_production() {
             return Err(ServerBootError::RecoveryPoolRequired);
         }
         tracing::warn!(
@@ -852,7 +862,6 @@ pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
              commit-recovery sweep is disabled (dev/test only)"
         );
     }
-
     Ok(())
 }
 
@@ -1040,44 +1049,18 @@ mod pg_tests {
 
 /// Slice 01 behavior-test gate: `boot::recovery_pool_required`.
 ///
-/// `check_recovery_pool` is a pure sync function; these tests drive it against
-/// an `AppState` built from the process-wide persistent Postgres fixture
-/// (`make_test_state` in `pg_tests` uses the same `test_support::test_catalog`
-/// path, which initializes the shared catalog on the persistent runtime).
+/// `check_recovery_pool_inner` is a pure sync function: no Postgres, no
+/// `AppState`. Tests drive it with the two boolean/enum inputs it needs.
 ///
 /// Gate: `mise exec -- cargo test --locked -p wyrd-server --all-features boot::recovery_pool_required -- --nocapture`
 #[cfg(test)]
 mod recovery_pool_required {
     use super::*;
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-    use std::sync::Arc;
-    use tempfile::tempdir;
-    use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
-
-    use crate::postgres::ServerPostgres;
-
-    async fn make_state() -> AppState {
-        let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
-        let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), Some(admin_pool));
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
-        let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
-        let root = tempdir().expect("temp dir");
-        let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
-        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
-        AppState::new(postgres, storage, crate::test_support::test_catalog().await)
-    }
 
     /// Production boot without a recovery pool must fail with `RecoveryPoolRequired`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn fails_in_production() {
-        let state = make_state().await;
-        assert!(
-            state.bifrost.recovery_pool().is_none(),
-            "test catalog must have no recovery pool"
-        );
-        let prod = state.with_deployment_profile(DeploymentProfile::Production);
-        let result = check_recovery_pool(&prod);
+    #[test]
+    fn fails_in_production() {
+        let result = check_recovery_pool_inner(false, &DeploymentProfile::Production);
         assert!(
             matches!(result, Err(ServerBootError::RecoveryPoolRequired)),
             "expected RecoveryPoolRequired in production without recovery pool, got {result:?}"
@@ -1085,15 +1068,22 @@ mod recovery_pool_required {
     }
 
     /// In development profile a missing recovery pool returns `Ok(())`.
-    #[tokio::test(flavor = "current_thread")]
-    async fn missing_ok_in_development() {
-        let state = make_state().await;
-        assert!(state.bifrost.recovery_pool().is_none());
-        assert_eq!(state.deployment_profile, DeploymentProfile::Development);
-        let result = check_recovery_pool(&state);
+    #[test]
+    fn missing_ok_in_development() {
+        let result = check_recovery_pool_inner(false, &DeploymentProfile::Development);
         assert!(
             result.is_ok(),
             "missing recovery pool must not fail in development, got {result:?}"
+        );
+    }
+
+    /// With a recovery pool present the check always succeeds regardless of profile.
+    #[test]
+    fn present_ok_in_production() {
+        let result = check_recovery_pool_inner(true, &DeploymentProfile::Production);
+        assert!(
+            result.is_ok(),
+            "a present recovery pool must not fail in production, got {result:?}"
         );
     }
 }

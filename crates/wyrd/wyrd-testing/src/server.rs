@@ -1114,6 +1114,7 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
+                audit_seal_key: None,
             },
         );
         state.authz.permission_check = Arc::new(RbacCheck);

@@ -1,7 +1,7 @@
 //! Query session builder for the Bifrost serving layer (slice 04).
 //!
 //! [`build_query_context`] constructs a [`QueryCtx`] that carries:
-//! - A DataFusion [`SessionContext`] with the tenant predicate rule wired in.
+//! - A `DataFusion` [`SessionContext`] with the tenant predicate rule wired in.
 //! - All loaded [`ProjectionCandidate`]s for a given source table.
 //!
 //! This is the single builder used by the sync path, async path, and admission
@@ -27,7 +27,7 @@ use crate::types::SchemaFingerprint;
 /// Constructed by [`build_query_context`] and consumed by the query executor
 /// (slice 07), the admission classifier (slice 06), and the sync handler.
 pub struct QueryCtx {
-    /// DataFusion session context with tenant predicate rule.
+    /// `DataFusion` session context with tenant predicate rule.
     pub session: datafusion::prelude::SessionContext,
     /// Projection candidates for the source table (may be empty).
     pub projection_candidates: Vec<ProjectionCandidate>,
@@ -39,7 +39,7 @@ pub struct QueryCtx {
 ///
 /// Loads projection candidates from `vala.olap_projections` via
 /// [`list_by_source`], converts each row to a [`ProjectionCandidate`],
-/// and wires a DataFusion session context with the tenant predicate rule.
+/// and wires a `DataFusion` session context with the tenant predicate rule.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the projection load query fails.

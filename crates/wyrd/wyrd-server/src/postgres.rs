@@ -5,7 +5,7 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
-use wyrd_sql::{SqlError, TenantConn, WyrdPostgres};
+use wyrd_sql::{OperatorPool, SqlError, TenantConn, WyrdPostgres};
 
 /// Errors raised while making server Postgres handles ready.
 #[derive(Debug, thiserror::Error)]
@@ -99,5 +99,15 @@ impl ServerPostgres {
     #[must_use]
     pub fn vala_pool(&self) -> &PgPool {
         self.vala.pool()
+    }
+
+    /// Build an `OperatorPool` from the Wyrd platform-admin pool.
+    ///
+    /// Returns `None` when no cross-tenant role is configured. Production boot
+    /// that requires cross-tenant maintenance must fail fast when this is `None`.
+    /// Delegates to `WyrdPostgres::operator_pool`.
+    #[must_use]
+    pub fn operator_pool(&self) -> Option<OperatorPool> {
+        self.wyrd().operator_pool()
     }
 }

@@ -679,7 +679,7 @@ pub async fn spawn_audit_reconciler(
         return Ok(None);
     }
 
-    let Some(admin_pool) = state.postgres.platform_admin_pool().cloned() else {
+    let Some(op) = state.postgres.operator_pool() else {
         if is_production {
             return Err(ServerBootError::AuditReconcilerRequired {
                 detail: "platform admin pool is unavailable".to_owned(),
@@ -703,14 +703,13 @@ pub async fn spawn_audit_reconciler(
                 break;
             }
 
-            let tenant_ids =
-                match vala_sql::queries::relay::list_audit_tenant_ids(&admin_pool).await {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
-                        continue;
-                    }
-                };
+            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
+                    continue;
+                }
+            };
 
             let mut all_clean = true;
             for raw_id in tenant_ids {

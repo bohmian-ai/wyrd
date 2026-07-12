@@ -11,6 +11,7 @@ use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
 
 pub mod dsn;
 pub mod error;
+pub mod operator_pool;
 pub mod pool;
 pub mod postgres;
 #[cfg(feature = "embedded-postgres")]
@@ -21,6 +22,7 @@ pub mod row_types;
 pub mod tenant_conn;
 
 pub use error::SqlError;
+pub use operator_pool::OperatorPool;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
 pub use row_types::cards::{

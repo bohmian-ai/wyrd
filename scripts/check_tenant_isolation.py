@@ -400,7 +400,7 @@ def public_async_fns(code: str) -> list[tuple[str, str]]:
 
 
 def has_platform_executor(code: str) -> bool:
-    return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_", code) is not None
+    return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_|&\s*OperatorPool\b", code) is not None
 
 
 def has_raw_query_marker(body: str) -> bool:

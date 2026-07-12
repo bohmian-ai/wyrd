@@ -816,6 +816,74 @@ pub async fn spawn_audit_reconciler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn implicit_tenant() -> DataTenantId {
+        "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
+            .parse()
+            .expect("static tenant id is valid")
+    }
+
+    fn sample_binding_entry() -> WorkloadBindingEntry {
+        WorkloadBindingEntry {
+            issuer: "https://idp.example.com".to_owned(),
+            subject: "system:serviceaccount:default/my-sa".to_owned(),
+            audience: Some("my-audience".to_owned()),
+            // Lowercase mirrors the canonical config example; the boot parse is
+            // case-insensitive against the kind wire name.
+            kind: "service".to_owned(),
+            name: "my-model".to_owned(),
+            space: "prod".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn workload_binding_binds_resolved_implicit_tenant() {
+        let tenant = implicit_tenant();
+        let bindings =
+            build_workload_bindings(&[sample_binding_entry()], tenant).expect("bindings build");
+
+        assert_eq!(bindings.len(), 1);
+        // F4: every binding carries the resolved implicit tenant, never a sentinel.
+        assert_eq!(bindings[0].tenant_id, tenant);
+        assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
+    }
+
+    #[test]
+    fn workload_binding_rejects_non_service_or_agent_kind() {
+        let tenant = implicit_tenant();
+        let mut entry = sample_binding_entry();
+        entry.kind = "model".to_owned();
+
+        let error = build_workload_bindings(&[entry], tenant)
+            .expect_err("a model-kind binding must be rejected at boot");
+
+        assert!(
+            matches!(error, ServerBootError::InvalidWorkloadBinding { .. }),
+            "expected InvalidWorkloadBinding, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn real_authz_audit_writer_is_not_stub() {
+        use crate::components::auth::audit_writer::{
+            AuthzAuditWriter, NoopAuthzAuditWriter, RealAuthzAuditWriter,
+        };
+
+        assert!(
+            NoopAuthzAuditWriter.is_stub_default(),
+            "noop writer must be a stub"
+        );
+        assert!(
+            !RealAuthzAuditWriter.is_stub_default(),
+            "RealAuthzAuditWriter must not be a stub"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -907,22 +975,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn real_authz_audit_writer_is_not_stub() {
-        use crate::components::auth::audit_writer::{
-            AuthzAuditWriter, NoopAuthzAuditWriter, RealAuthzAuditWriter,
-        };
-
-        assert!(
-            NoopAuthzAuditWriter.is_stub_default(),
-            "noop writer must be a stub"
-        );
-        assert!(
-            !RealAuthzAuditWriter.is_stub_default(),
-            "RealAuthzAuditWriter must not be a stub"
-        );
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn app_state_retains_only_runtime_pools() {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -939,53 +991,6 @@ mod tests {
         assert_eq!(
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local
-        );
-    }
-
-    fn implicit_tenant() -> DataTenantId {
-        "01890f28-7c4a-7000-98e7-4f4a3c2d1b01"
-            .parse()
-            .expect("static tenant id is valid")
-    }
-
-    fn sample_binding_entry() -> WorkloadBindingEntry {
-        WorkloadBindingEntry {
-            issuer: "https://idp.example.com".to_owned(),
-            subject: "system:serviceaccount:default/my-sa".to_owned(),
-            audience: Some("my-audience".to_owned()),
-            // Lowercase mirrors the canonical config example; the boot parse is
-            // case-insensitive against the kind wire name.
-            kind: "service".to_owned(),
-            name: "my-model".to_owned(),
-            space: "prod".to_owned(),
-            version: "1.0.0".to_owned(),
-        }
-    }
-
-    #[test]
-    fn workload_binding_binds_resolved_implicit_tenant() {
-        let tenant = implicit_tenant();
-        let bindings =
-            build_workload_bindings(&[sample_binding_entry()], tenant).expect("bindings build");
-
-        assert_eq!(bindings.len(), 1);
-        // F4: every binding carries the resolved implicit tenant, never a sentinel.
-        assert_eq!(bindings[0].tenant_id, tenant);
-        assert_ne!(bindings[0].tenant_id, DataTenantId::SYSTEM_OWNER);
-    }
-
-    #[test]
-    fn workload_binding_rejects_non_service_or_agent_kind() {
-        let tenant = implicit_tenant();
-        let mut entry = sample_binding_entry();
-        entry.kind = "model".to_owned();
-
-        let error = build_workload_bindings(&[entry], tenant)
-            .expect_err("a model-kind binding must be rejected at boot");
-
-        assert!(
-            matches!(error, ServerBootError::InvalidWorkloadBinding { .. }),
-            "expected InvalidWorkloadBinding, got {error:?}"
         );
     }
 }

@@ -19,6 +19,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use super::audit_verify::audit_verify;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
@@ -71,6 +72,7 @@ pub fn admin_router() -> Router<AppState> {
                 .delete(delete_workload_binding_route),
         )
         .route("/admin/audit/integrity", get(audit_integrity))
+        .route("/admin/audit/verify", post(audit_verify))
 }
 
 /// Per-tenant integrity report returned by `GET /v1/admin/audit/integrity`.

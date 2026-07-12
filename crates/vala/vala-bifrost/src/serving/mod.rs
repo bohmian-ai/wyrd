@@ -11,6 +11,7 @@
 //! - `async_jobs` — async query worker (slice 07)
 //! - `derivations` — cross-table derivation worker (slice 05b)
 
+pub mod audit_seal;
 pub mod projections;
 pub mod repair;
 pub mod session;

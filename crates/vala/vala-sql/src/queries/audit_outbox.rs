@@ -241,6 +241,66 @@ fn result_str(result: AuditResult) -> &'static str {
     }
 }
 
+/// Column values needed to recompute the SHA256 entry hash.
+///
+/// Used by the audit-seal verifier to recompute hashes from the Iceberg
+/// `audit_log` table and cross-check them against seal checkpoints. The
+/// canonical encoding is identical to the private `entry_hash` function.
+pub struct AuditEntryHashInput<'a> {
+    /// Entry hash of `seq - 1` (all-zeros for seq=1).
+    pub prev_hash: &'a [u8],
+    /// Monotonically increasing row sequence number.
+    pub seq: i64,
+    /// Unique request correlation id.
+    pub request_id: &'a str,
+    /// Optional trace id for distributed tracing.
+    pub trace_id: Option<&'a str>,
+    /// The operation name (e.g. `cards.create`).
+    pub operation: &'a str,
+    /// The resource path acted upon.
+    pub resource: &'a str,
+    /// Optional `CardRef` string for card-scoped operations.
+    pub card_ref: Option<&'a str>,
+    /// Raw 16-byte principal UUID.
+    pub principal_id_bytes: &'a [u8; 16],
+    /// The principal kind string (e.g. `user`, `service`).
+    pub principal_kind: &'a str,
+    /// The authentication method used.
+    pub auth_method: &'a str,
+    /// The permission that was checked.
+    pub permission: &'a str,
+    /// The policy decision string (`allow` / `deny`).
+    pub decision: &'a str,
+    /// The operation result string (`success` / `failure`).
+    pub result: &'a str,
+    /// Short human-readable summary of the payload.
+    pub payload_summary: &'a str,
+}
+
+/// Recompute the SHA256 entry hash from the raw stored column bytes.
+///
+/// The canonical encoding is identical to the private `entry_hash` function
+/// so this is the public re-check entry point used by the seal verifier.
+#[must_use]
+pub fn entry_hash_from_cols(input: AuditEntryHashInput<'_>) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(input.prev_hash);
+    buf.extend_from_slice(&input.seq.to_be_bytes());
+    push_str(&mut buf, input.request_id);
+    push_opt(&mut buf, input.trace_id);
+    push_str(&mut buf, input.operation);
+    push_str(&mut buf, input.resource);
+    push_opt(&mut buf, input.card_ref);
+    buf.extend_from_slice(input.principal_id_bytes);
+    push_str(&mut buf, input.principal_kind);
+    push_str(&mut buf, input.auth_method);
+    push_str(&mut buf, input.permission);
+    push_str(&mut buf, input.decision);
+    push_str(&mut buf, input.result);
+    push_str(&mut buf, input.payload_summary);
+    Sha256::digest(&buf).into()
+}
+
 /// A gap detected between consecutive `seq` values for a tenant.
 #[derive(Debug, Clone)]
 pub struct SeqGap {

@@ -9765,6 +9765,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vala-sql",
+ "wyrd-auth-issue",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-storage",

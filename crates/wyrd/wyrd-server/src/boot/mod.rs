@@ -364,6 +364,7 @@ async fn install_auth(
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
+        audit_seal_key: None, // loaded separately from WYRD_AUDIT_SEAL_KEY (slice 12)
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
     }))
 }

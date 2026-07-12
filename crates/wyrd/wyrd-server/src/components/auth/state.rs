@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use wyrd_auth_check::{PolicyHook, StubAllowPolicyHook};
-use wyrd_auth_issue::IssuingKey;
+use wyrd_auth_issue::{AuditSealKey, IssuingKey};
 use wyrd_crypt::SecretKey;
 use wyrd_runtime::{PermissionCheck, RbacCheck};
 
@@ -27,6 +27,9 @@ pub struct ServerAuth {
     pub workload_binding_resolver: Option<Arc<PgWorkloadBindingResolver>>,
     /// Symmetric key used to seal client secrets at rest. Required when trusted issuers carry secrets.
     pub sealing_key: Option<Arc<SecretKey>>,
+    /// Dedicated Ed25519 audit-seal key. Not the JWT issuing key.
+    /// Loaded from `WYRD_AUDIT_SEAL_KEY`. Required for audit sealing and verification.
+    pub audit_seal_key: Option<Arc<AuditSealKey>>,
     /// TTL and delegation settings for token exchange responses.
     pub token_exchange_settings: TokenExchangeSettings,
 }

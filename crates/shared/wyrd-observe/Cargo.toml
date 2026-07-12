@@ -36,4 +36,4 @@ pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["raw_value"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

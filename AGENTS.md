@@ -11,16 +11,17 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 ## 1. First Pass Before Editing
 
 1. Read this file (AGENTS.md).
-2. Read `architecture/wyrd-design.md`; it is the active design authority and
+2. Follow all agent rules listed in `architecture/agent-rules.md`.
+3. Read `architecture/wyrd-design.md`; it is the active design authority and
    wins over generated artifacts, older planning files, and implementation
    drift.
-3. Read `architecture/wyrd-doctrine.mdx` before changing
+4. Read `architecture/wyrd-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
-4. Identify the owning crate or Python package (see §3 Ownership Boundaries).
-5. Inspect the nearest existing Wyrd implementation and tests.
-6. Check `mise.toml` for the canonical verification command.
-7. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
+5. Identify the owning crate or Python package (see §3 Ownership Boundaries).
+6. Inspect the nearest existing Wyrd implementation and tests.
+7. Check `mise.toml` for the canonical verification command.
+8. Check `Cargo.toml`, crate manifests, `pyproject.toml`, and lockfiles before
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong

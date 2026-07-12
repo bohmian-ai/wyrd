@@ -372,3 +372,427 @@ fn bin_id(index: usize) -> Result<i32, DriftFitError> {
         message: format!("bin index {index} exceeds i32 range"),
     })
 }
+
+#[cfg(test)]
+mod psi_fit {
+    use std::sync::Arc;
+
+    use crate::DriftFitError;
+    use crate::psi::{BinType, fit_psi_baseline};
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile, PsiThreshold};
+    use wyrd_spec::ids::FeatureName;
+
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    fn fixed_profile(binning_strategy: PsiBinningStrategy) -> PsiProfile {
+        profile_with_categorical(binning_strategy, Vec::new())
+    }
+
+    fn profile_with_categorical(
+        binning_strategy: PsiBinningStrategy,
+        categorical_features: Vec<FeatureName>,
+    ) -> PsiProfile {
+        PsiProfile {
+            binning_strategy,
+            categorical_features,
+            threshold: PsiThreshold::Fixed { value: 0.25 },
+        }
+    }
+
+    fn numeric_batch(name: &str, values: Vec<Option<f64>>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    #[test]
+    fn equal_width_numeric_fit_computes_bin_proportions() {
+        let values = (0..100).map(|value| Some(value as f64)).collect();
+        let batch = numeric_batch("score", values);
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 10 });
+        let baseline = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect("baseline");
+        let fitted = baseline.features.get(&feature("score")).expect("feature");
+
+        assert_eq!(fitted.bin_type, BinType::Numeric);
+        assert_eq!(fitted.total_count, 100);
+        assert_eq!(fitted.bins.len(), 10);
+        assert_eq!(fitted.bins[0].lower, Some(f64::NEG_INFINITY));
+        assert!((fitted.bins[0].upper.expect("upper") - 9.9).abs() < 1e-6);
+        assert_eq!(fitted.bins[9].upper, Some(f64::INFINITY));
+        for bin in &fitted.bins {
+            assert!((bin.proportion - 0.1).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn all_equal_numeric_fit_uses_single_infinite_bin() {
+        let batch = numeric_batch("score", vec![Some(5.0); 12]);
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 10 });
+        let baseline = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect("baseline");
+        let fitted = baseline.features.get(&feature("score")).expect("feature");
+
+        assert_eq!(fitted.bins.len(), 1);
+        assert_eq!(fitted.bins[0].lower, Some(f64::NEG_INFINITY));
+        assert_eq!(fitted.bins[0].upper, Some(f64::INFINITY));
+        assert_eq!(fitted.bins[0].proportion, 1.0);
+    }
+
+    #[test]
+    fn categorical_fit_sorts_bins_and_computes_proportions() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("kind", DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("beta"),
+                Some("alpha"),
+                None,
+                Some("alpha"),
+                Some("gamma"),
+            ]))],
+        )
+        .expect("record batch");
+        let profile = profile_with_categorical(
+            PsiBinningStrategy::EqualWidth { n_bins: 10 },
+            vec![feature("kind")],
+        );
+        let baseline = fit_psi_baseline(&batch, &profile, &[feature("kind")]).expect("baseline");
+        let fitted = baseline.features.get(&feature("kind")).expect("feature");
+
+        assert_eq!(fitted.bin_type, BinType::Categorical);
+        assert_eq!(fitted.total_count, 4);
+        let values: Vec<&str> = fitted
+            .bins
+            .iter()
+            .map(|bin| bin.categorical_value.as_deref().expect("category"))
+            .collect();
+        assert_eq!(values, vec!["alpha", "beta", "gamma"]);
+        assert!((fitted.bins[0].proportion - 0.5).abs() < 1e-12);
+        assert!((fitted.bins[1].proportion - 0.25).abs() < 1e-12);
+        assert!((fitted.bins[2].proportion - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn integer_numeric_fit_casts_to_float_values() {
+        let batch = int_batch("score", (0..100).collect());
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 5 });
+        let baseline = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect("baseline");
+        let fitted = baseline.features.get(&feature("score")).expect("feature");
+
+        assert_eq!(fitted.bin_type, BinType::Numeric);
+        assert_eq!(fitted.bins.len(), 5);
+        assert_eq!(fitted.total_count, 100);
+    }
+
+    #[test]
+    fn missing_feature_returns_typed_error() {
+        let batch = numeric_batch("score", vec![Some(1.0), Some(2.0)]);
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 2 });
+        let err = fit_psi_baseline(&batch, &profile, &[feature("missing")]).expect_err("fit error");
+
+        assert!(matches!(
+            err,
+            DriftFitError::FeatureMissing { feature } if feature == "missing"
+        ));
+    }
+
+    #[test]
+    fn string_feature_not_declared_categorical_returns_numeric_error() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("kind", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["alpha", "beta"]))],
+        )
+        .expect("record batch");
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 2 });
+        let err = fit_psi_baseline(&batch, &profile, &[feature("kind")]).expect_err("fit error");
+
+        assert!(matches!(
+            err,
+            DriftFitError::FeatureNotNumeric { feature, .. } if feature == "kind"
+        ));
+    }
+
+    #[test]
+    fn empty_numeric_column_returns_typed_error() {
+        let batch = numeric_batch("score", Vec::new());
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 2 });
+        let err = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect_err("fit error");
+
+        assert!(matches!(
+            err,
+            DriftFitError::FeatureEmpty { feature } if feature == "score"
+        ));
+    }
+
+    #[test]
+    fn numeric_fit_rejects_non_finite_values() {
+        let batch = numeric_batch("score", vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
+        let profile = fixed_profile(PsiBinningStrategy::EqualWidth { n_bins: 3 });
+        let err = fit_psi_baseline(&batch, &profile, &[feature("score")]).expect_err("fit error");
+
+        assert!(matches!(
+            err,
+            DriftFitError::NonFiniteValuesInColumn { feature } if feature == "score"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod psi_score {
+    use std::sync::Arc;
+
+    use crate::{DriftScoreError, DriftVerdict, fit_psi_baseline, score_psi};
+    use arrow::array::{Float64Array, Int64Array, StringArray};
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+    use wyrd_spec::card::drift::{PsiBinningStrategy, PsiProfile, PsiThreshold};
+    use wyrd_spec::ids::FeatureName;
+
+    fn feature(name: &str) -> FeatureName {
+        FeatureName::new(name).expect("valid feature name")
+    }
+
+    fn numeric_batch(name: &str, values: Vec<f64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Float64, true)])),
+            vec![Arc::new(Float64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn int_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn cat_batch(name: &str, values: Vec<&str>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, true)])),
+            vec![Arc::new(StringArray::from(values))],
+        )
+        .expect("record batch")
+    }
+
+    fn psi_profile_default() -> PsiProfile {
+        PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
+            categorical_features: Vec::new(),
+            threshold: PsiThreshold::ChiSquare { alpha: 0.05 },
+        }
+    }
+
+    #[test]
+    fn psi_identical_distributions_no_drift() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let profile = psi_profile_default();
+        let fname = feature("x");
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+            .expect("baseline");
+
+        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+
+        assert_eq!(report.verdict, DriftVerdict::NoDrift);
+        let feature_report = report.features.get(&fname).expect("feature report");
+        assert!(feature_report.score < 0.01);
+        assert!(feature_report.threshold.is_finite());
+    }
+
+    #[test]
+    fn psi_shifted_distribution_drift() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = numeric_batch("x", (1000..2000).map(|value| value as f64).collect());
+        let profile = psi_profile_default();
+        let fname = feature("x");
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
+
+        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+
+        assert_eq!(report.verdict, DriftVerdict::Drift);
+    }
+
+    #[test]
+    fn psi_target_too_small_is_inconclusive_with_nan_score_and_threshold() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = numeric_batch("x", (0..50).map(|value| value as f64).collect());
+        let profile = psi_profile_default();
+        let fname = feature("x");
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+            .expect("baseline");
+
+        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+
+        assert_eq!(report.verdict, DriftVerdict::Inconclusive);
+        let feature_report = report.features.get(&fname).expect("feature report");
+        assert_eq!(feature_report.verdict, DriftVerdict::Inconclusive);
+        assert!(feature_report.score.is_nan());
+        assert!(feature_report.threshold.is_nan());
+    }
+
+    #[test]
+    fn psi_missing_target_feature_errors() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = numeric_batch("not_x", vec![1.0, 2.0, 3.0]);
+        let profile = psi_profile_default();
+        let fname = feature("x");
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
+
+        let err = score_psi(&baseline, &target_batch, &profile).expect_err("score error");
+
+        assert!(matches!(
+            err,
+            DriftScoreError::FeatureMissingInTarget { feature } if feature == "x"
+        ));
+    }
+
+    #[test]
+    fn psi_categorical_drift() {
+        let baseline_batch = cat_batch(
+            "city",
+            std::iter::repeat_n("sea", 500)
+                .chain(std::iter::repeat_n("pdx", 500))
+                .collect(),
+        );
+        let target_batch = cat_batch(
+            "city",
+            std::iter::repeat_n("sea", 100)
+                .chain(std::iter::repeat_n("pdx", 900))
+                .collect(),
+        );
+        let fname = feature("city");
+        let profile = PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 2 },
+            categorical_features: vec![fname.clone()],
+            threshold: PsiThreshold::Fixed { value: 0.1 },
+        };
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
+
+        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+
+        assert_eq!(report.verdict, DriftVerdict::Drift);
+    }
+
+    #[test]
+    fn psi_new_categorical_values_count_in_denominator_only() {
+        let baseline_batch = cat_batch(
+            "city",
+            std::iter::repeat_n("sea", 500)
+                .chain(std::iter::repeat_n("pdx", 500))
+                .collect(),
+        );
+        let target_batch = cat_batch(
+            "city",
+            std::iter::repeat_n("sea", 500)
+                .chain(std::iter::repeat_n("pdx", 400))
+                .chain(std::iter::repeat_n("new", 100))
+                .collect(),
+        );
+        let fname = feature("city");
+        let profile = PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 2 },
+            categorical_features: vec![fname.clone()],
+            threshold: PsiThreshold::Fixed { value: 100.0 },
+        };
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, std::slice::from_ref(&fname))
+            .expect("baseline");
+
+        let report = score_psi(&baseline, &target_batch, &profile).expect("report");
+
+        let feature_report = report.features.get(&fname).expect("feature report");
+        // Inline PSI formula with epsilon=1e-10 for the two-bin case: baseline=[0.5,0.5], target=[0.5,0.4]
+        const EPS: f64 = 1e-10;
+        let expected: f64 = [(0.5_f64, 0.5_f64), (0.5, 0.4)]
+            .iter()
+            .map(|(p, q)| {
+                let pe = p + EPS;
+                let qe = q + EPS;
+                (pe - qe) * (pe / qe).ln()
+            })
+            .sum();
+        assert!((feature_report.score - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn psi_fixed_threshold_is_used() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = numeric_batch("x", (500..1500).map(|value| value as f64).collect());
+        let fname = feature("x");
+        let profile_low = PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
+            categorical_features: Vec::new(),
+            threshold: PsiThreshold::Fixed { value: 0.0001 },
+        };
+        let baseline = fit_psi_baseline(&baseline_batch, &profile_low, &[fname]).expect("baseline");
+
+        let report_low = score_psi(&baseline, &target_batch, &profile_low).expect("report");
+
+        assert_eq!(report_low.verdict, DriftVerdict::Drift);
+
+        let profile_high = PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 10 },
+            categorical_features: Vec::new(),
+            threshold: PsiThreshold::Fixed { value: 100.0 },
+        };
+
+        let report_high = score_psi(&baseline, &target_batch, &profile_high).expect("report");
+
+        assert_eq!(report_high.verdict, DriftVerdict::NoDrift);
+    }
+
+    #[test]
+    fn psi_numeric_target_type_mismatch_errors() {
+        let baseline_batch = numeric_batch("x", (0..1000).map(|value| value as f64).collect());
+        let target_batch = cat_batch("x", vec!["1", "2", "3"]);
+        let profile = psi_profile_default();
+        let fname = feature("x");
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
+
+        let err = score_psi(&baseline, &target_batch, &profile).expect_err("score error");
+
+        assert!(matches!(
+            err,
+            DriftScoreError::FeatureTypeMismatch { feature } if feature == "x"
+        ));
+    }
+
+    #[test]
+    fn psi_categorical_target_type_mismatch_errors() {
+        let baseline_batch = cat_batch(
+            "city",
+            std::iter::repeat_n("sea", 500)
+                .chain(std::iter::repeat_n("pdx", 500))
+                .collect(),
+        );
+        let target_batch = int_batch("city", (0..1000).collect());
+        let fname = feature("city");
+        let profile = PsiProfile {
+            binning_strategy: PsiBinningStrategy::EqualWidth { n_bins: 2 },
+            categorical_features: vec![fname.clone()],
+            threshold: PsiThreshold::Fixed { value: 0.1 },
+        };
+        let baseline = fit_psi_baseline(&baseline_batch, &profile, &[fname]).expect("baseline");
+
+        let err = score_psi(&baseline, &target_batch, &profile).expect_err("score error");
+
+        assert!(matches!(
+            err,
+            DriftScoreError::FeatureTypeMismatch { feature } if feature == "city"
+        ));
+    }
+}

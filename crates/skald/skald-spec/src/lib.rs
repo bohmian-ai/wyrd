@@ -203,7 +203,9 @@ pub(crate) mod common {
         }))
     }
 
-    pub(crate) fn anthropic_response(stop_reason: AnthropicStopReason) -> AnthropicMessagesResponse {
+    pub(crate) fn anthropic_response(
+        stop_reason: AnthropicStopReason,
+    ) -> AnthropicMessagesResponse {
         AnthropicMessagesResponse {
             id: "msg_123".to_string(),
             r#type: "message".to_string(),
@@ -255,7 +257,9 @@ pub(crate) mod common {
         }))
     }
 
-    pub(crate) fn google_response(finish_reason: GoogleFinishReason) -> GoogleGenerateContentResponse {
+    pub(crate) fn google_response(
+        finish_reason: GoogleFinishReason,
+    ) -> GoogleGenerateContentResponse {
         GoogleGenerateContentResponse {
             candidates: vec![GoogleCandidate {
                 content: GoogleContent {

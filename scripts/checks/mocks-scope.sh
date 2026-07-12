@@ -3,7 +3,13 @@
 if rg -n 'mockall|wiremock|mockito' crates \
   --glob '!crates/shared/wyrd-testing/**' \
   --glob '!crates/skald/skald-providers/Cargo.toml' \
-  --glob '!crates/skald/skald-providers/tests/**' \
+  --glob '!crates/skald/skald-providers/src/lib.rs' \
+  --glob '!crates/skald/skald-providers/src/raw.rs' \
+  --glob '!crates/skald/skald-providers/src/auth/google_oauth.rs' \
+  --glob '!crates/skald/skald-providers/src/clients/anthropic.rs' \
+  --glob '!crates/skald/skald-providers/src/clients/google.rs' \
+  --glob '!crates/skald/skald-providers/src/clients/openai.rs' \
+  --glob '!crates/skald/skald-providers/src/clients/vertex.rs' \
   --glob '!crates/wyrd/wyrd-cli/Cargo.toml' \
   --glob '!crates/wyrd/wyrd-cli/tests/**' \
   --glob '!crates/shared/wyrd-auth-oidc/Cargo.toml' \

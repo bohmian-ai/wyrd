@@ -123,7 +123,7 @@ fn redact_object(map: &mut Map<String, Value>, blocked_lower: &[String]) {
 }
 
 #[cfg(test)]
-mod redaction {
+mod redaction_tests {
     use serde_json::value::RawValue;
 
     use crate::{REDACTED_PLACEHOLDER, RedactionPolicy};

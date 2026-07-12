@@ -340,7 +340,7 @@ cargo test --locked --doc --all-features \
 [tasks."cardkind:check"]
 hide = true
 description = "Verify CardKind native count and External serde shape"
-run = "cargo test -p wyrd-spec --test cards kind:: --features server"
+run = "cargo test -p wyrd-spec --lib --features server card::kind_tests"
 
 [tasks."check:client-tier"]
 hide = true

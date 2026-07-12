@@ -131,7 +131,7 @@ mod fixtures {
 }
 
 #[cfg(test)]
-mod registry {
+mod registry_tests {
     use std::sync::Arc;
     use std::thread;
 

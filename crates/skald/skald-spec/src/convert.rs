@@ -530,11 +530,9 @@ mod conversion {
         let converted: crate::wire::anthropic_messages::AnthropicMessage =
             common::openai_message().convert().unwrap();
         assert_eq!(converted.role, "assistant");
-        assert!(
-            converted.content.iter().any(
-                |block| matches!(block, AnthropicContentBlock::Text { text, .. } if text == "hello")
-            )
-        );
+        assert!(converted.content.iter().any(
+            |block| matches!(block, AnthropicContentBlock::Text { text, .. } if text == "hello")
+        ));
         assert!(converted.content.iter().any(
             |block| matches!(block, AnthropicContentBlock::ToolUse { name, .. } if name == "lookup")
         ));

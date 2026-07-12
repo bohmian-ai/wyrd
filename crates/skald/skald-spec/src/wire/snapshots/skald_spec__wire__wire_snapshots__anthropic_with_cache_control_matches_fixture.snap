@@ -1,0 +1,14 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::anthropic_request().system"
+---
+[
+  {
+    "type": "text",
+    "text": "System {{topic}}",
+    "cache_control": {
+      "type": "ephemeral",
+      "ttl": "5m"
+    }
+  }
+]

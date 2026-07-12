@@ -1,0 +1,63 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+assertion_line: 25
+expression: "common::anthropic_request()"
+---
+{
+  "model": "claude-opus-4-1",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello {{name}}"
+        },
+        {
+          "type": "image",
+          "source": {
+            "type": "url",
+            "url": "https://example.com/image.png"
+          }
+        },
+        {
+          "type": "document",
+          "source": {
+            "type": "text",
+            "media_type": "text/plain",
+            "data": "doc"
+          }
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "tool_1",
+          "content": "done"
+        }
+      ]
+    }
+  ],
+  "system": [
+    {
+      "type": "text",
+      "text": "System {{topic}}",
+      "cache_control": {
+        "type": "ephemeral",
+        "ttl": "5m"
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "lookup",
+      "description": "Lookup",
+      "input_schema": {
+        "type": "object"
+      }
+    }
+  ],
+  "max_tokens": 256,
+  "thinking": {
+    "type": "enabled",
+    "budget_tokens": 128
+  }
+}

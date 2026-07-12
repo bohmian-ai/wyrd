@@ -156,7 +156,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod merge {
+mod merge_tests {
     use std::collections::BTreeMap;
 
     use wyrd_spec::envelope::{CardKind, Metadata};

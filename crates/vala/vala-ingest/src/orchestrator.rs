@@ -418,3 +418,245 @@ pub async fn run_ingest<S: FrameSource>(
 
     Ok(collected.rows)
 }
+
+/// The card-scope anti-forgery gate (no DB required): `validate_card_scope`
+/// authorizes every per-row `card_ref` against the principal's scope.
+#[cfg(test)]
+mod card_scope {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use arrow::array::{RecordBatch, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use wyrd_runtime::{Permission, PermissionSet, Principal, PrincipalId, PrincipalKind};
+    use wyrd_spec::DataTenantId;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
+
+    use crate::error::IngestError;
+    use crate::orchestrator::validate_card_scope;
+
+    const IN_SCOPE: &str = "prod/Service/billing@1.0.0";
+    const OUT_OF_SCOPE: &str = "prod/Service/shipping@1.0.0";
+
+    fn card(canonical: &str) -> CardRef {
+        CardRef::from_str(canonical).expect("canonical card ref parses")
+    }
+
+    fn principal_with_scope(cards: &[&str]) -> Principal {
+        let card_ref = card(IN_SCOPE);
+        let card_ref_scope =
+            CardRefScope::from_root_and_members(&card_ref, cards.iter().map(|c| card(c)));
+        Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref,
+                card_ref_scope,
+            },
+            DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        )
+    }
+
+    fn batch_with_card_refs(values: Vec<Option<&str>>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "card_ref",
+            DataType::Utf8,
+            true,
+        )]));
+        let column = Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>;
+        RecordBatch::try_new(schema, vec![column]).expect("batch builds")
+    }
+
+    fn batch_without_card_ref() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+        let column = Arc::new(arrow::array::Int64Array::from(vec![1_i64, 2]))
+            as Arc<dyn arrow::array::Array>;
+        RecordBatch::try_new(schema, vec![column]).expect("batch builds")
+    }
+
+    #[test]
+    fn card_scope_accepts_all_in_scope_rows() {
+        let principal = principal_with_scope(&[IN_SCOPE]);
+        let batch = batch_with_card_refs(vec![Some(IN_SCOPE), Some(IN_SCOPE)]);
+
+        validate_card_scope(&[batch], &principal).expect("all in-scope cards pass");
+    }
+
+    #[test]
+    fn card_scope_rejects_out_of_scope_card() {
+        let principal = principal_with_scope(&[IN_SCOPE]);
+        let batch = batch_with_card_refs(vec![Some(IN_SCOPE), Some(OUT_OF_SCOPE)]);
+
+        let err = validate_card_scope(&[batch], &principal).expect_err("out-of-scope card rejects");
+        assert!(matches!(err, IngestError::CardScopeDenied { .. }));
+        assert_eq!(err.wyrd_code(), "WYRD_VALA_403_BIFROST_CARD_SCOPE");
+    }
+
+    #[test]
+    fn card_scope_rejects_null_card() {
+        let principal = principal_with_scope(&[IN_SCOPE]);
+        let batch = batch_with_card_refs(vec![Some(IN_SCOPE), None]);
+
+        let err = validate_card_scope(&[batch], &principal).expect_err("null card rejects");
+        assert!(matches!(err, IngestError::CardScopeDenied { .. }));
+    }
+
+    #[test]
+    fn card_scope_rejects_absent_column() {
+        let principal = principal_with_scope(&[IN_SCOPE]);
+
+        let err = validate_card_scope(&[batch_without_card_ref()], &principal)
+            .expect_err("absent rejects");
+        assert!(matches!(err, IngestError::CardScopeDenied { .. }));
+    }
+
+    #[test]
+    fn card_scope_rejects_unparseable_card() {
+        let principal = principal_with_scope(&[IN_SCOPE]);
+        let batch = batch_with_card_refs(vec![Some("not-a-card-ref")]);
+
+        let err = validate_card_scope(&[batch], &principal).expect_err("garbage rejects");
+        assert!(matches!(err, IngestError::CardScopeDenied { .. }));
+    }
+
+    #[test]
+    fn card_scope_empty_user_principal_cannot_write() {
+        // A User principal has an empty card scope, so no supplied card is in scope.
+        let user = Principal::new(
+            PrincipalId::new(uuid::Uuid::now_v7()),
+            PrincipalKind::User,
+            DataTenantId::new_v7(),
+            Vec::new(),
+            PermissionSet::from_iter([Permission::bifrost_record_write()]),
+        );
+        let batch = batch_with_card_refs(vec![Some(IN_SCOPE)]);
+
+        let err = validate_card_scope(&[batch], &user).expect_err("empty scope rejects all");
+        assert!(matches!(err, IngestError::CardScopeDenied { .. }));
+    }
+}
+
+/// Aggregate stream bounds reject before any commit (no DB required): the
+/// bounds are enforced entirely inside `collect_frames`, so an oversized/idle
+/// stream aborts before the writer is ever opened.
+#[cfg(test)]
+mod oversized_stream {
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    use wyrd_tonic::tonic::Status;
+
+    use crate::InsertBatchRequest;
+    use crate::error::IngestError;
+    use crate::limits::IngestLimits;
+    use crate::orchestrator::{FrameSource, collect_frames};
+
+    /// In-memory frame source for driving `collect_frames` without a transport.
+    struct VecSource {
+        frames: VecDeque<Result<InsertBatchRequest, Status>>,
+    }
+
+    impl VecSource {
+        fn new(frames: Vec<Result<InsertBatchRequest, Status>>) -> Self {
+            Self {
+                frames: frames.into(),
+            }
+        }
+    }
+
+    impl FrameSource for VecSource {
+        async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
+            match self.frames.pop_front() {
+                Some(Ok(frame)) => Ok(Some(frame)),
+                Some(Err(status)) => Err(status),
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// A frame source whose first read never completes, to trip the idle deadline.
+    struct SlowSource;
+
+    impl FrameSource for SlowSource {
+        async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(None)
+        }
+    }
+
+    fn frame(bytes: usize) -> InsertBatchRequest {
+        InsertBatchRequest {
+            table: "vala.bifrost.events".to_owned(),
+            arrow_ipc: vec![0u8; bytes],
+            wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_byte_cap_rejects_before_decode() {
+        let limits = IngestLimits {
+            max_stream_bytes: 16,
+            ..IngestLimits::default()
+        };
+        // 100 bytes of non-Arrow payload: the byte cap trips before the decoder runs.
+        let source = VecSource::new(vec![Ok(frame(100))]);
+
+        let err = collect_frames(source, &limits)
+            .await
+            .expect_err("byte cap trips");
+        assert!(
+            matches!(err, IngestError::BatchTooLarge { .. }),
+            "expected BatchTooLarge, got {err:?}"
+        );
+        assert_eq!(err.wyrd_code(), "WYRD_VALA_413_INGEST_OVERSIZED");
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_frame_cap_rejects() {
+        let limits = IngestLimits {
+            max_stream_frames: 0,
+            ..IngestLimits::default()
+        };
+        let source = VecSource::new(vec![Ok(frame(4))]);
+
+        let err = collect_frames(source, &limits)
+            .await
+            .expect_err("frame cap trips");
+        assert!(
+            matches!(err, IngestError::StreamProtocolViolation(_)),
+            "expected StreamProtocolViolation, got {err:?}"
+        );
+        assert_eq!(err.wyrd_code(), "WYRD_VALA_400_INGEST_PROTO");
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_idle_deadline_rejects() {
+        let limits = IngestLimits {
+            idle_deadline: Duration::from_millis(20),
+            ..IngestLimits::default()
+        };
+
+        let err = collect_frames(SlowSource, &limits)
+            .await
+            .expect_err("idle deadline trips");
+        assert!(
+            matches!(err, IngestError::StreamIdle),
+            "expected StreamIdle, got {err:?}"
+        );
+        assert_eq!(err.wyrd_code(), "WYRD_VALA_408_INGEST_IDLE_TIMEOUT");
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_client_abort_rejects() {
+        let source = VecSource::new(vec![Err(Status::cancelled("client went away"))]);
+
+        let err = collect_frames(source, &IngestLimits::default())
+            .await
+            .expect_err("client abort surfaces");
+        assert!(
+            matches!(err, IngestError::StreamProtocolViolation(_)),
+            "expected StreamProtocolViolation, got {err:?}"
+        );
+    }
+}

@@ -1,0 +1,17 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::vertex_predict_request()"
+---
+{
+  "instances": [
+    {
+      "content": "embed this",
+      "task_type": "RETRIEVAL_QUERY",
+      "title": "query"
+    }
+  ],
+  "parameters": {
+    "auto_truncate": true,
+    "output_dimensionality": 3
+  }
+}

@@ -362,7 +362,7 @@ fn google_finish_reason(reason: &GoogleFinishReason) -> FinishReason {
 }
 
 #[cfg(test)]
-mod adapter {
+mod adapter_tests {
     use serde_json::json;
 
     use crate::common;

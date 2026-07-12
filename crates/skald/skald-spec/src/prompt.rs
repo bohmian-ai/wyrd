@@ -1138,9 +1138,13 @@ mod prompt_media {
             panic!("media placeholder should force native parts");
         };
         assert!(matches!(parts[0], OpenAiContentPart::Text { ref text } if text == "before "));
-        assert!(matches!(parts[1], OpenAiContentPart::Text { ref text } if text == "${media:logo}"));
+        assert!(
+            matches!(parts[1], OpenAiContentPart::Text { ref text } if text == "${media:logo}")
+        );
         assert!(matches!(parts[2], OpenAiContentPart::Text { ref text } if text == " after "));
-        assert!(matches!(parts[3], OpenAiContentPart::Text { ref text } if text == "${media:logo}"));
+        assert!(
+            matches!(parts[3], OpenAiContentPart::Text { ref text } if text == "${media:logo}")
+        );
     }
 
     #[test]

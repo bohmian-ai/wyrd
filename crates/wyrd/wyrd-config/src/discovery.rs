@@ -40,7 +40,7 @@ pub(crate) fn find_wyrd_toml(start: &Path) -> Result<Option<PathBuf>, WyrdConfig
 
 #[cfg(test)]
 #[allow(unsafe_code)]
-mod discovery {
+mod discovery_tests {
     use std::fs;
 
     use tempfile::TempDir;

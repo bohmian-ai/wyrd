@@ -1,0 +1,41 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::openai_responses_response()"
+---
+{
+  "id": "resp_123",
+  "object": "response",
+  "model": "gpt-4o",
+  "status": "completed",
+  "created_at": 1740000001,
+  "output": [
+    {
+      "type": "message",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "{\"answer\":\"hello\"}"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "call_1",
+      "name": "lookup",
+      "arguments": "{\"q\":\"hello\"}"
+    }
+  ],
+  "usage": {
+    "input_tokens": 9,
+    "output_tokens": 6,
+    "total_tokens": 15,
+    "input_tokens_details": {
+      "cached_tokens": 2
+    },
+    "output_tokens_details": {
+      "reasoning_tokens": 1
+    }
+  },
+  "previous_response_id": null
+}

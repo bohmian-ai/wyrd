@@ -105,7 +105,7 @@ impl SamplingPolicy {
 }
 
 #[cfg(test)]
-mod sampling {
+mod sampling_tests {
     use std::num::NonZeroU32;
 
     use crate::{RunId, SamplingPolicy};

@@ -342,7 +342,7 @@ async fn tick(ticker: &mut Option<Interval>) {
 }
 
 #[cfg(test)]
-mod producer {
+mod producer_tests {
     //! Producer proof: manual/size/timer flush, stable `batch_id`s, `fail_next`
     //! re-buffer (no loss), metrics accounting, and one-batch mixed correlation.
 

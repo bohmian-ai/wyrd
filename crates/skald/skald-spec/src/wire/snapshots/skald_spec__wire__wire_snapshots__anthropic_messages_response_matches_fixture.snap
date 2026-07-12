@@ -1,0 +1,32 @@
+---
+source: crates/skald/skald-spec/src/wire/mod.rs
+expression: "common::anthropic_response(skald_spec::wire::anthropic_messages::AnthropicStopReason::EndTurn)"
+---
+{
+  "id": "msg_123",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-opus-4-1",
+  "content": [
+    {
+      "type": "text",
+      "text": "hello"
+    },
+    {
+      "type": "tool_use",
+      "id": "tool_1",
+      "name": "lookup",
+      "input": {
+        "q": "hello"
+      }
+    }
+  ],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 11,
+    "output_tokens": 7,
+    "cache_creation_input_tokens": 3,
+    "cache_read_input_tokens": 4
+  }
+}

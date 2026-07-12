@@ -421,7 +421,7 @@ fn google_settings(
 }
 
 #[cfg(test)]
-mod builder {
+mod builder_tests {
     use serde_json::json;
 
     use crate::messages::{

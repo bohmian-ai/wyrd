@@ -343,3 +343,397 @@ fn elapsed_ms(start: chrono::DateTime<chrono::Utc>) -> u64 {
     let diff = Utc::now().signed_duration_since(start);
     diff.num_milliseconds().max(0) as u64
 }
+
+#[cfg(test)]
+mod scenario_execution {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::scenario::{RecordWithMedia, ScenarioExecutionInputs, execute_scenario};
+    use crate::store::TaskRegistry;
+    use crate::tasks::{
+        AgentTaskExecutor, AssertionTaskExecutor, EvalMediaBinding, JudgeTaskExecutor,
+        MediaBindings, TraceTaskExecutor,
+    };
+    use crate::{Executors, InMemoryTraceSource, MockJudgeInvoker};
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::vala::eval::{
+        AssertionTask, ComparisonOperator, EvalScenario, EvalSpec, EvalTask, LlmJudgeTask,
+        RecordId, RunId, ScenarioId, ScenarioTask, TaskId,
+    };
+    use wyrd_spec::vala::ids::TraceId;
+
+    fn tid(value: &str) -> TaskId {
+        TaskId::new(value).expect("static task id is valid")
+    }
+
+    fn sid(value: &str) -> ScenarioId {
+        ScenarioId::new(value).expect("static scenario id is valid")
+    }
+
+    fn judge_card_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Prompt,
+            name: CardName::new("scenario-judge").expect("static card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("default").expect("valid space"),
+            uid: None,
+        }
+    }
+
+    fn assertion_task() -> EvalTask {
+        EvalTask::Assertion(AssertionTask {
+            id: tid("assert_score"),
+            context_path: Some(
+                wyrd_spec::vala::eval::JsonPath::new("$.score").expect("static JSONPath is valid"),
+            ),
+            item_context_path: None,
+            operator: ComparisonOperator::Equals,
+            expected: json!(true),
+            depends_on: Vec::new(),
+            condition: None,
+        })
+    }
+
+    fn judge_task() -> EvalTask {
+        EvalTask::LlmJudge(LlmJudgeTask {
+            id: tid("judge_response"),
+            judge_ref: judge_card_ref(),
+            context_path: None,
+            expected: json!({"passed": true}),
+            operator: ComparisonOperator::Equals,
+            depends_on: Vec::new(),
+            max_retries: 0,
+            condition: None,
+        })
+    }
+
+    fn spec_of(tasks: Vec<EvalTask>) -> EvalSpec {
+        let mut map = BTreeMap::new();
+        for task in tasks {
+            map.insert(task.id().clone(), task);
+        }
+        EvalSpec {
+            subject_ref: None,
+            dataset: None,
+            tasks: map,
+            workflow: None,
+            sampling: None,
+            pass_gate: None,
+            context_capture: None,
+        }
+    }
+
+    fn scenario() -> EvalScenario {
+        EvalScenario {
+            id: sid("happy_path"),
+            initial_query: "Say hello".to_owned(),
+            expected_outcome: Some("friendly greeting".to_owned()),
+            predefined_turns: Vec::new(),
+            simulated_user_persona: None,
+            termination_signal: None,
+            max_turns: 8,
+            tasks: vec![ScenarioTask {
+                id: tid("contains_hello"),
+                operator: ComparisonOperator::Contains,
+                expected: json!("hello"),
+                condition: None,
+            }],
+        }
+    }
+
+    fn executors(mock: Arc<MockJudgeInvoker>) -> Executors {
+        Executors {
+            assertion: Arc::new(AssertionTaskExecutor::new()),
+            judge: Arc::new(JudgeTaskExecutor::new(mock)),
+            trace: Arc::new(TraceTaskExecutor::new(
+                Arc::new(InMemoryTraceSource::new()),
+                Duration::from_millis(250),
+            )),
+            agent: Arc::new(AgentTaskExecutor::new()),
+        }
+    }
+
+    fn media() -> MediaBindings {
+        let mut media = MediaBindings::new();
+        media.insert(EvalMediaBinding {
+            id: "screenshot".to_owned(),
+            payload: json!({"kind": "image", "uri": "file:///tmp/screenshot.png"}),
+        });
+        media
+    }
+
+    fn record(id: u128, trace_hex: &str, context: Value) -> RecordWithMedia {
+        RecordWithMedia {
+            record_id: RecordId(Uuid::from_u128(id)),
+            trace_id: Some(TraceId::from_hex(trace_hex).expect("static trace id is valid")),
+            context,
+            media: media(),
+            required_media: vec!["screenshot".to_owned()],
+        }
+    }
+
+    #[tokio::test]
+    async fn one_pass_emits_mechanic_and_passenger_results() {
+        let spec = spec_of(vec![assertion_task(), judge_task()]);
+        let plan = spec.execution_plan().expect("test spec has valid DAG");
+        let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
+        let mock =
+            MockJudgeInvoker::new([Ok(json!({"passed": true})), Ok(json!({"passed": true}))]);
+        let executors = executors(Arc::clone(&mock));
+        let scenario = scenario();
+        let records = vec![
+            record(
+                1,
+                "00000000000000000000000000000001",
+                json!({"score": true, "response": "first"}),
+            ),
+            record(
+                2,
+                "00000000000000000000000000000002",
+                json!({"score": true, "response": "second"}),
+            ),
+        ];
+        let final_response = json!("hello from the agent");
+
+        let results = execute_scenario(ScenarioExecutionInputs {
+            scenario: &scenario,
+            plan: &plan,
+            registry: &registry,
+            executors: &executors,
+            records: &records,
+            final_response: &final_response,
+            run_id: RunId::from_string("run-scenario".to_owned()),
+        })
+        .await
+        .expect("scenario executes");
+
+        assert_eq!(results.scenario_id, sid("happy_path"));
+        assert_eq!(results.mechanic.len(), 4);
+        assert!(results.mechanic.iter().all(|result| result.result.passed));
+        assert_eq!(results.passenger.len(), 1);
+        assert!(results.passenger[0].passed);
+        assert_eq!(results.passenger[0].actual, Some(final_response.clone()));
+
+        let calls = mock.calls().await;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[0].1["media"]["screenshot"]["payload"]["uri"],
+            json!("file:///tmp/screenshot.png")
+        );
+        assert_eq!(
+            calls[1].1["media"]["screenshot"]["payload"]["uri"],
+            json!("file:///tmp/screenshot.png")
+        );
+    }
+
+    #[tokio::test]
+    async fn passenger_pass_runs_even_when_no_records() {
+        let spec = spec_of(vec![assertion_task(), judge_task()]);
+        let plan = spec.execution_plan().expect("test spec has valid DAG");
+        let registry = TaskRegistry::from_plan(&plan, spec.tasks.clone()).expect("registry builds");
+        let mock = MockJudgeInvoker::new([]);
+        let executors = executors(Arc::clone(&mock));
+        let scenario = scenario();
+        let final_response = json!("hello after a crash");
+
+        let results = execute_scenario(ScenarioExecutionInputs {
+            scenario: &scenario,
+            plan: &plan,
+            registry: &registry,
+            executors: &executors,
+            records: &[],
+            final_response: &final_response,
+            run_id: RunId::from_string("run-no-records".to_owned()),
+        })
+        .await
+        .expect("scenario executes");
+
+        assert!(results.mechanic.is_empty());
+        assert_eq!(results.passenger.len(), 1);
+        assert!(results.passenger[0].passed);
+        assert_eq!(results.passenger[0].actual, Some(final_response));
+        assert_eq!(mock.calls().await.len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod scenario_loader {
+    use std::path::{Path, PathBuf};
+
+    use crate::{EvalPlanError, load_scenario_collection};
+    use serde_json::json;
+    use tempfile::TempDir;
+    use wyrd_spec::vala::eval::{
+        ComparisonOperator, EvalScenario, ScenarioId, ScenarioTask, TaskId,
+    };
+
+    fn sid(value: &str) -> ScenarioId {
+        ScenarioId::new(value).expect("static scenario id is valid")
+    }
+
+    fn tid(value: &str) -> TaskId {
+        TaskId::new(value).expect("static task id is valid")
+    }
+
+    fn scenario(id: &str) -> EvalScenario {
+        EvalScenario {
+            id: sid(id),
+            initial_query: format!("question for {id}"),
+            expected_outcome: Some("answer".to_owned()),
+            predefined_turns: Vec::new(),
+            simulated_user_persona: None,
+            termination_signal: None,
+            max_turns: 8,
+            tasks: vec![ScenarioTask {
+                id: tid("contains_answer"),
+                operator: ComparisonOperator::Contains,
+                expected: json!("answer"),
+                condition: None,
+            }],
+        }
+    }
+
+    fn invalid_scenario(id: &str) -> EvalScenario {
+        EvalScenario {
+            initial_query: String::new(),
+            ..scenario(id)
+        }
+    }
+
+    fn write_file(dir: &TempDir, name: &str, body: &str) -> PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).expect("test fixture writes");
+        path
+    }
+
+    fn load(path: &Path) -> Result<crate::EvalScenarioCollection, EvalPlanError> {
+        load_scenario_collection(path)
+    }
+
+    #[test]
+    fn loads_json_collection() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let body = serde_json::to_string(&vec![scenario("alpha")]).expect("scenario serializes");
+        let path = write_file(&dir, "scenarios.json", &body);
+
+        let collection = load(&path).expect("json collection loads");
+
+        assert_eq!(collection.scenarios.len(), 1);
+        assert_eq!(collection.scenarios[0].id, sid("alpha"));
+    }
+
+    #[test]
+    fn loads_yaml_collection() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let body = serde_yaml::to_string(&vec![scenario("alpha")]).expect("scenario serializes");
+        let path = write_file(&dir, "scenarios.yaml", &body);
+
+        let collection = load(&path).expect("yaml collection loads");
+
+        assert_eq!(collection.scenarios.len(), 1);
+        assert_eq!(collection.scenarios[0].id, sid("alpha"));
+    }
+
+    #[test]
+    fn loads_jsonl_collection() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let first = serde_json::to_string(&scenario("alpha")).expect("scenario serializes");
+        let second = serde_json::to_string(&scenario("beta")).expect("scenario serializes");
+        let path = write_file(&dir, "scenarios.jsonl", &format!("{first}\n\n{second}\n"));
+
+        let collection = load(&path).expect("jsonl collection loads");
+
+        assert_eq!(collection.scenarios.len(), 2);
+        assert_eq!(collection.scenarios[0].id, sid("alpha"));
+        assert_eq!(collection.scenarios[1].id, sid("beta"));
+    }
+
+    #[test]
+    fn missing_file_errors_typed() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let path = dir.path().join("missing.json");
+
+        let error = load(&path).expect_err("missing file fails");
+
+        assert!(matches!(error, EvalPlanError::ScenarioFileMissing { .. }));
+    }
+
+    #[test]
+    fn malformed_json_errors_typed() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let path = write_file(&dir, "scenarios.json", "{");
+
+        let error = load(&path).expect_err("malformed json fails");
+
+        assert!(matches!(
+            error,
+            EvalPlanError::ScenarioFileUnreadable { line: None, .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_jsonl_carries_line_number() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let first = serde_json::to_string(&scenario("alpha")).expect("scenario serializes");
+        let path = write_file(&dir, "scenarios.jsonl", &format!("{first}\n{{\n"));
+
+        let error = load(&path).expect_err("malformed jsonl fails");
+
+        assert!(matches!(
+            error,
+            EvalPlanError::ScenarioFileUnreadable { line: Some(2), .. }
+        ));
+    }
+
+    #[test]
+    fn unknown_extension_errors_typed() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let path = write_file(&dir, "scenarios.txt", "[]");
+
+        let error = load(&path).expect_err("unknown extension fails");
+
+        assert!(matches!(
+            error,
+            EvalPlanError::ScenarioFileExtUnsupported { .. }
+        ));
+    }
+
+    #[test]
+    fn duplicate_scenario_id_errors_typed_before_generic_validator() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let body =
+            serde_json::to_string(&vec![invalid_scenario("alpha"), invalid_scenario("alpha")])
+                .expect("scenario serializes");
+        let path = write_file(&dir, "scenarios.json", &body);
+
+        let error = load(&path).expect_err("duplicate id fails first");
+
+        assert!(matches!(
+            error,
+            EvalPlanError::ScenarioCollectionDuplicateId {
+                ref scenario_id,
+                ..
+            } if scenario_id == "alpha"
+        ));
+    }
+
+    #[test]
+    fn empty_collection_errors_typed() {
+        let dir = TempDir::new().expect("temp dir creates");
+        let path = write_file(&dir, "scenarios.json", "[]");
+
+        let error = load(&path).expect_err("empty collection fails");
+
+        assert!(matches!(
+            error,
+            EvalPlanError::ScenarioCollectionEmpty { .. }
+        ));
+    }
+}

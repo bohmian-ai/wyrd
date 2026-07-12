@@ -3085,3 +3085,601 @@ mod wyrd_cfg_tests {
         assert!(!back.remediation().is_empty());
     }
 }
+
+#[cfg(test)]
+mod error_eval_tests {
+    use std::collections::HashSet;
+
+    use crate::error::WyrdError;
+
+    fn eval_errors() -> Vec<WyrdError> {
+        vec![
+            WyrdError::EvalRunNotFound {
+                message: "eval run abc not found".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::EvalMissingLease {
+                message: "missing lease token on protected eval-run route".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::EvalInvalidLease {
+                message: "lease token does not match the lease issued for run abc".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::EvalSubmissionMismatch {
+                message: "submission rejected: wrong turn".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::EvalRunFailed {
+                message: "eval run failed: internal engine error".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::EvalTooManyRuns {
+                message: "too many concurrent eval runs; retry after an existing run completes"
+                    .to_owned(),
+                details: serde_json::json!({}),
+            },
+        ]
+    }
+
+    #[test]
+    fn eval_error_codes_are_non_empty_and_have_wyrd_eval_prefix() {
+        for err in eval_errors() {
+            let problem = err.as_problem_json();
+            let code = problem["code"].as_str().expect("code is a string");
+            assert!(
+                code.starts_with("WYRD_EVAL_"),
+                "expected WYRD_EVAL_ prefix, got: {code}"
+            );
+            assert!(!code.is_empty(), "code must be non-empty");
+            let status = problem["status"].as_u64().expect("status is a number");
+            assert!(status >= 400, "expected error status, got {status}");
+            assert!(
+                problem["title"].as_str().is_some_and(|t| !t.is_empty()),
+                "title must be non-empty for {code}"
+            );
+            assert!(
+                problem["remediation"]
+                    .as_str()
+                    .is_some_and(|r| !r.is_empty()),
+                "remediation must be non-empty for {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_error_codes_are_unique() {
+        let codes: Vec<&'static str> = eval_errors().iter().map(|e| e.code()).collect();
+        let unique: HashSet<&str> = codes.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "duplicate eval error code detected"
+        );
+    }
+
+    #[test]
+    fn eval_run_not_found_is_404() {
+        let err = WyrdError::EvalRunNotFound {
+            message: "not found".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_404_RUN_NOT_FOUND");
+        assert_eq!(err.status(), 404);
+    }
+
+    #[test]
+    fn eval_missing_lease_is_401() {
+        let err = WyrdError::EvalMissingLease {
+            message: "no lease".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_401_MISSING_LEASE");
+        assert_eq!(err.status(), 401);
+    }
+
+    #[test]
+    fn eval_invalid_lease_is_403() {
+        let err = WyrdError::EvalInvalidLease {
+            message: "bad lease".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_403_INVALID_LEASE");
+        assert_eq!(err.status(), 403);
+    }
+
+    #[test]
+    fn eval_submission_mismatch_is_409() {
+        let err = WyrdError::EvalSubmissionMismatch {
+            message: "mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_409_SUBMISSION_MISMATCH");
+        assert_eq!(err.status(), 409);
+    }
+
+    #[test]
+    fn eval_run_failed_is_500() {
+        let err = WyrdError::EvalRunFailed {
+            message: "engine died".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_500_RUN_FAILED");
+        assert_eq!(err.status(), 500);
+    }
+
+    #[test]
+    fn eval_too_many_runs_is_429() {
+        let err = WyrdError::EvalTooManyRuns {
+            message: "cap reached".to_owned(),
+            details: serde_json::json!({}),
+        };
+        assert_eq!(err.code(), "WYRD_EVAL_429_TOO_MANY_RUNS");
+        assert_eq!(err.status(), 429);
+    }
+
+    #[test]
+    fn dropped_eval_codes_are_absent_from_wyrd_spec() {
+        let all_codes: Vec<&str> = eval_errors().iter().map(|e| e.code()).collect();
+        assert!(
+            !all_codes.contains(&"WYRD_EVAL_401_API_KEY_INVALID"),
+            "WYRD_EVAL_401_API_KEY_INVALID must not be present in WyrdError"
+        );
+        assert!(
+            !all_codes.contains(&"WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED"),
+            "WYRD_EVAL_500_RESULTS_PERSISTENCE_FAILED must not be present in WyrdError"
+        );
+    }
+
+    #[test]
+    fn eval_remediation_strings_use_v1_not_api_v1() {
+        for err in eval_errors() {
+            let remediation = err.remediation();
+            assert!(
+                !remediation.contains("/api/v1"),
+                "remediation for {} must not contain /api/v1, got: {remediation}",
+                err.code()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod error_registry_tests {
+    use crate::error::WyrdError;
+
+    fn registry_errors() -> Vec<WyrdError> {
+        vec![
+            WyrdError::RegistryInvalidCardSpec {
+                message: "unknown kind".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryInvalidVersionBlock {
+                message: "service cards require a pin version".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistrySpecTooLarge {
+                message: "spec exceeds 256 KiB".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryVersionRequired {
+                message: "metadata.version is required".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryListLimitOutOfRange {
+                message: "limit out of range".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryCardRefUidNotResolvableHere {
+                message: "uid not resolvable here".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryRequirementNotResolvableHere {
+                message: "requirement version not accepted here".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryCardNotFound {
+                message: "card not found".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryVersionConflict {
+                message: "version conflict".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistrySpecDrift {
+                message: "spec changed for immutable version".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryUnavailable {
+                message: "registry unavailable".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::PrincipalOrphaned {
+                message: "backing card deleted".to_owned(),
+                details: serde_json::json!({}),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_registry_variant_has_problem_json_round_trip() {
+        for err in registry_errors() {
+            let problem = err.as_problem_json();
+            let code = problem["code"].as_str().expect("code is a string");
+            assert!(
+                code.starts_with("WYRD_REG_") || code.starts_with("WYRD_AUTH_"),
+                "unexpected code prefix: {code}"
+            );
+            assert!(problem["status"].as_u64().unwrap() >= 400);
+            assert!(problem["title"].as_str().is_some());
+        }
+    }
+
+    #[test]
+    fn registry_unavailable_status_is_503() {
+        let err = WyrdError::RegistryUnavailable {
+            message: "transient".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = err.as_problem_json();
+        assert_eq!(problem["status"], 503);
+        assert_eq!(problem["code"], "WYRD_REG_503_REGISTRY_UNAVAILABLE");
+    }
+
+    #[test]
+    fn spec_drift_status_is_409() {
+        let err = WyrdError::RegistrySpecDrift {
+            message: "drift".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = err.as_problem_json();
+        assert_eq!(problem["status"], 409);
+        assert_eq!(problem["code"], "WYRD_REG_409_SPEC_DRIFT");
+    }
+
+    #[test]
+    fn registry_card_not_found_status_is_404() {
+        let err = WyrdError::RegistryCardNotFound {
+            message: "not found".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = err.as_problem_json();
+        assert_eq!(problem["status"], 404);
+        assert_eq!(problem["code"], "WYRD_REG_404_CARD_NOT_FOUND");
+    }
+
+    #[test]
+    fn registry_400_variants_all_return_status_400() {
+        let cases = vec![
+            WyrdError::RegistryInvalidCardSpec {
+                message: "bad spec".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryInvalidVersionBlock {
+                message: "bad version".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistrySpecTooLarge {
+                message: "too large".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryVersionRequired {
+                message: "version required".to_owned(),
+                details: serde_json::json!({}),
+            },
+            WyrdError::RegistryListLimitOutOfRange {
+                message: "limit out of range".to_owned(),
+                details: serde_json::json!({}),
+            },
+        ];
+        for err in cases {
+            let problem = err.as_problem_json();
+            assert_eq!(
+                problem["status"], 400,
+                "expected status 400 for {}",
+                problem["code"]
+            );
+        }
+    }
+
+    #[test]
+    fn registry_version_conflict_status_is_500() {
+        let err = WyrdError::RegistryVersionConflict {
+            message: "uid mismatch".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = err.as_problem_json();
+        assert_eq!(problem["status"], 500);
+        assert_eq!(problem["code"], "WYRD_REG_500_VERSION_CONFLICT");
+    }
+
+    #[test]
+    fn principal_orphaned_status_matches_embedded_code() {
+        let err = WyrdError::PrincipalOrphaned {
+            message: "card deleted".to_owned(),
+            details: serde_json::json!({}),
+        };
+        let problem = err.as_problem_json();
+        let code = problem["code"].as_str().expect("code is a string");
+        let status = problem["status"].as_u64().expect("status is a number");
+        let code_status: u64 = code
+            .split('_')
+            .find(|s| s.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+            .expect("code must embed a numeric status");
+        assert_eq!(code_status, status);
+    }
+}
+
+#[cfg(test)]
+mod error_storage_tests {
+    use std::collections::HashSet;
+
+    use crate::error::WyrdError;
+    use crate::error::storage::WyrdStorageError;
+
+    #[test]
+    fn storage_error_codes_statuses_and_titles_are_stable() {
+        let cases = storage_errors()
+            .into_iter()
+            .map(|error| (error.code(), error.status(), error.title()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            cases,
+            vec![
+                (
+                    "WYRD_STORAGE_400_TENANT_PATH_MISMATCH",
+                    400,
+                    "Tenant path validation rejected upload init",
+                ),
+                (
+                    "WYRD_STORAGE_400_ARTIFACT_TOO_LARGE",
+                    400,
+                    "Artifact size exceeds backend capacity",
+                ),
+                (
+                    "WYRD_STORAGE_400_SHA256_INVALID",
+                    400,
+                    "Invalid SHA-256 in upload init",
+                ),
+                (
+                    "WYRD_STORAGE_400_SIZE_INVALID",
+                    400,
+                    "Invalid expected_size_bytes",
+                ),
+                (
+                    "WYRD_STORAGE_400_SHA256_MISMATCH",
+                    400,
+                    "Stored object SHA-256 does not match expected_sha256",
+                ),
+                (
+                    "WYRD_STORAGE_400_SIZE_MISMATCH",
+                    400,
+                    "Stored object byte length does not match expected_size_bytes",
+                ),
+                (
+                    "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+                    400,
+                    "Upload id not recognised",
+                ),
+                (
+                    "WYRD_STORAGE_400_INVALID_URI",
+                    400,
+                    "Source URI failed to parse",
+                ),
+                (
+                    "WYRD_STORAGE_400_TENANT_PREFIX_INVALID",
+                    400,
+                    "Source URI tenant prefix is not a UUIDv7",
+                ),
+                (
+                    "WYRD_STORAGE_403_UPLOAD_FOREIGN_TENANT",
+                    403,
+                    "Upload belongs to a different tenant",
+                ),
+                (
+                    "WYRD_STORAGE_404_OBJECT_NOT_FOUND",
+                    404,
+                    "Object not found in backend",
+                ),
+                (
+                    "WYRD_STORAGE_404_UPLOAD_NOT_FOUND",
+                    404,
+                    "Upload id not found",
+                ),
+                (
+                    "WYRD_STORAGE_409_UPLOAD_NOT_PENDING",
+                    409,
+                    "Cannot complete or abort a terminal upload",
+                ),
+                (
+                    "WYRD_STORAGE_409_ENCRYPTION_MISSING",
+                    409,
+                    "Server-side encryption verification failed",
+                ),
+                (
+                    "WYRD_STORAGE_412_PRECONDITION",
+                    412,
+                    "Object changed during download",
+                ),
+                (
+                    "WYRD_STORAGE_416_RANGE_NOT_SATISFIABLE",
+                    416,
+                    "Source changed mid-download",
+                ),
+                (
+                    "WYRD_STORAGE_500_BACKEND",
+                    500,
+                    "Backend storage operation failed",
+                ),
+                (
+                    "WYRD_STORAGE_500_CONFIG_INVALID",
+                    500,
+                    "Storage settings invalid",
+                ),
+                (
+                    "WYRD_STORAGE_500_CREDENTIAL_CHAIN",
+                    500,
+                    "Backend credential chain failed",
+                ),
+                (
+                    "WYRD_STORAGE_500_LIFECYCLE_MISSING",
+                    500,
+                    "S3 lifecycle missing required rule",
+                ),
+                (
+                    "WYRD_STORAGE_503_PRESIGN_EXPIRED",
+                    503,
+                    "Presigned URL expired",
+                ),
+                (
+                    "WYRD_STORAGE_503_BACKEND_UNAVAILABLE",
+                    503,
+                    "Backend transiently unavailable",
+                ),
+            ]
+        );
+
+        let unique = cases
+            .iter()
+            .map(|(code, _, _)| *code)
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), cases.len(), "duplicate storage error code");
+    }
+
+    #[test]
+    fn storage_error_lifts_into_problem_json_without_losing_code() {
+        let error: WyrdError = WyrdStorageError::ObjectNotFound {
+            storage_path: "tenant/cards/card/model.bin".to_owned(),
+        }
+        .into();
+
+        let problem = error.as_problem_json();
+
+        assert_eq!(error.code(), "WYRD_STORAGE_404_OBJECT_NOT_FOUND");
+        assert_eq!(error.status(), 404);
+        assert_eq!(problem["code"], "WYRD_STORAGE_404_OBJECT_NOT_FOUND");
+        assert_eq!(problem["status"], 404);
+        assert_eq!(problem["title"], "Object not found in backend");
+        assert_eq!(
+            problem["detail"],
+            "object not found at tenant/cards/card/model.bin"
+        );
+        assert_eq!(
+            problem["details"]["variant"], "object_not_found",
+            "storage details retain the storage enum discriminant"
+        );
+    }
+
+    fn storage_errors() -> Vec<WyrdStorageError> {
+        vec![
+            WyrdStorageError::TenantPathMismatch { detail: "x".into() },
+            WyrdStorageError::ArtifactTooLarge {
+                actual: 2,
+                limit: 1,
+            },
+            WyrdStorageError::Sha256Invalid { detail: "x".into() },
+            WyrdStorageError::SizeInvalid(0),
+            WyrdStorageError::Sha256Mismatch {
+                expected: "a".into(),
+                actual: "b".into(),
+            },
+            WyrdStorageError::SizeMismatch {
+                expected: 1,
+                actual: 2,
+            },
+            WyrdStorageError::InvalidUploadId { reason: "x".into() },
+            WyrdStorageError::InvalidUri { detail: "x".into() },
+            WyrdStorageError::TenantPrefixInvalid { detail: "x".into() },
+            WyrdStorageError::TenantPathForeign,
+            WyrdStorageError::ObjectNotFound {
+                storage_path: "x".into(),
+            },
+            WyrdStorageError::UploadNotFound,
+            WyrdStorageError::UploadNotPending,
+            WyrdStorageError::EncryptionMissing,
+            WyrdStorageError::PreconditionFailed,
+            WyrdStorageError::RangeNotSatisfiable,
+            WyrdStorageError::Backend { detail: "x".into() },
+            WyrdStorageError::ConfigInvalid { detail: "x".into() },
+            WyrdStorageError::CredentialChain {
+                backend: "s3".into(),
+            },
+            WyrdStorageError::LifecycleMissing,
+            WyrdStorageError::PresignExpired { detail: "x".into() },
+            WyrdStorageError::BackendUnavailable { status: 503 },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod error_vala_tests {
+    use crate::error::WyrdError;
+    use crate::vala::error::BifrostError;
+
+    #[test]
+    fn bifrost_error_delegates_code_and_status_into_wyrd_error() {
+        let cases = vec![
+            (
+                BifrostError::FingerprintMismatch {
+                    table: "tenant.events".to_owned(),
+                },
+                "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+                409u16,
+            ),
+            (
+                BifrostError::QueryInvalidSql {
+                    detail: "not a SELECT".to_owned(),
+                },
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+                400,
+            ),
+            (
+                BifrostError::QueryResultTooLarge,
+                "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
+                413,
+            ),
+            (
+                BifrostError::QueryTimeout,
+                "WYRD_VALA_504_QUERY_TIMEOUT",
+                504,
+            ),
+        ];
+
+        for (wire, code, status) in cases {
+            let wire_code = wire.code();
+            let wire_status = wire.status();
+            let wire_title = wire.title();
+
+            let error: WyrdError = wire.into();
+
+            assert_eq!(error.code(), code);
+            assert_eq!(error.status(), status);
+            assert_eq!(error.code(), wire_code, "delegate forwards wire code");
+            assert_eq!(error.status(), wire_status, "delegate forwards wire status");
+            assert_eq!(error.title(), wire_title, "delegate forwards wire title");
+        }
+    }
+
+    #[test]
+    fn bifrost_error_lifts_into_problem_json_without_losing_code() {
+        let error: WyrdError = BifrostError::FingerprintMismatch {
+            table: "tenant.events".to_owned(),
+        }
+        .into();
+
+        let problem = error.as_problem_json();
+
+        assert_eq!(
+            problem["code"],
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
+        );
+        assert_eq!(problem["status"], 409);
+        assert_eq!(problem["title"], "Schema fingerprint mismatch");
+        assert_eq!(
+            problem["details"]["variant"], "fingerprint_mismatch",
+            "vala details retain the wire enum discriminant"
+        );
+    }
+}

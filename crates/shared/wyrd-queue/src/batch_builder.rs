@@ -372,7 +372,7 @@ fn parse_fraction_micros(frac: &str) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod batch_builder {
+mod batch_builder_tests {
     //! `BatchBuilder` proof: user cols + `card_ref`/`run_id`, reserved/type-mismatch
     //! rejection, and Arrow IPC round-trip.
 

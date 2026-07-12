@@ -313,7 +313,7 @@ fn data_type_to_arrow(spec: &DataTypeSpec) -> DataType {
 }
 
 #[cfg(test)]
-mod schema {
+mod schema_tests {
     //! `schema_to_fieldspec` mapping-table proof: JSON-Schema and Arrow → C2 `FieldSpec`.
 
     use crate::schema::{

@@ -1,0 +1,470 @@
+name: release
+
+# push to main = dry-run builds (catches drift before a real release)
+# release published = build + publish all artifacts
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+
+permissions:
+  contents: write   # gh release upload, release-plz
+
+env:
+  RUSTFLAGS: "-C debuginfo=0"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  CARGO_TERM_COLOR: always
+  PYTHON_VERSION: "3.12"
+  MISE_LOCKED: "true"
+
+jobs:
+  # ── Python SDK ─────────────────────────────────────────────────────────────
+
+  build-sdist:
+    name: python sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          ignore-nothing-to-cache: true
+
+      - run: pip install "twine>=6.1.0" "packaging>=24.2"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          maturin-version: 1.8.3
+          rust-toolchain: stable
+          working-directory: python/py-wyrd
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi_sdist
+          path: python/py-wyrd/dist
+          retention-days: 1
+
+  build-linux:
+    name: python - ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            docker-options: "-e CI"
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            docker-options: "-e CI"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          ignore-nothing-to-cache: true
+
+      - run: pip install "twine>=6.1.0" "packaging>=24.2"
+
+      - run: echo "OPENSSL_DIR=/usr" >> $GITHUB_ENV
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          args: --release --out dist
+          rust-toolchain: stable
+          docker-options: ${{ matrix.docker-options }}
+          working-directory: python/py-wyrd
+          # manylinux containers don't have mise; install build deps manually.
+          # wyrd only needs openssl headers + protoc (no cmake, no kafka deps).
+          before-script-linux: |
+            if command -v yum &> /dev/null; then
+              yum update -y && yum install -y perl-core openssl openssl-devel pkgconfig libatomic curl-devel
+              if [[ ! -d "/usr/lib64" ]]; then
+                ln -s /usr/lib/libatomic.so.1 /usr/lib/libatomic.so
+              fi
+            else
+              apt update -y && apt-get install -y libssl-dev openssl pkg-config unzip
+            fi
+            ARCH=$(uname -m)
+            if [[ "$ARCH" == "x86_64" ]]; then PROTOC_ARCH="linux-x86_64"
+            elif [[ "$ARCH" == "aarch64" ]]; then PROTOC_ARCH="linux-aarch_64"
+            else echo "Unsupported: $ARCH"; exit 1; fi
+            curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v33.2/protoc-33.2-${PROTOC_ARCH}.zip"
+            unzip "protoc-33.2-${PROTOC_ARCH}.zip" -d /usr/local
+            rm "protoc-33.2-${PROTOC_ARCH}.zip"
+            chmod +x /usr/local/bin/protoc && protoc --version
+
+      - run: twine check --strict python/py-wyrd/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi_linux_${{ matrix.target }}
+          path: python/py-wyrd/dist
+          retention-days: 1
+
+  build-macos:
+    name: python - ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          ignore-nothing-to-cache: true
+
+      - run: pip install "twine>=6.1.0" "packaging>=24.2"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: brew install libomp curl openssl pkg-config
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          rust-toolchain: stable
+          working-directory: python/py-wyrd
+
+      - run: twine check --strict python/py-wyrd/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi_macos_${{ matrix.target }}
+          path: python/py-wyrd/dist
+          retention-days: 1
+
+  build-windows:
+    name: python - windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          ignore-nothing-to-cache: true
+
+      - run: pip install "twine>=6.1.0" "packaging>=24.2"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "33.2"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist
+          rust-toolchain: stable
+          working-directory: python/py-wyrd
+
+      - run: twine check --strict python/py-wyrd/dist/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pypi_windows_x86_64
+          path: python/py-wyrd/dist
+          retention-days: 1
+
+  inspect-wheels:
+    name: inspect wheels
+    needs: [build-sdist, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pypi_*
+          merge-multiple: true
+          path: dist
+      - run: ls -lh dist/ && echo "$(ls dist | wc -l) files"
+
+  test-wheels:
+    name: smoke - ${{ matrix.os }}
+    needs: [build-sdist, build-linux, build-macos, build-windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos, windows]
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pypi_${{ matrix.os }}_*
+          merge-multiple: true
+          path: dist
+
+      - name: Install and smoke-test
+        shell: bash
+        run: |
+          pip install wyrd --no-deps --no-index --force-reinstall --find-links dist
+          python -c "import wyrd; print(wyrd.__version__)"
+
+  publish-pypi:
+    name: publish python
+    if: github.event_name == 'release'
+    needs: [test-wheels]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify version matches release tag
+        working-directory: python/py-wyrd
+        run: |
+          VERSION=$(cargo pkgid | cut -d '#' -f2)
+          echo "crate version: v$VERSION  tag: ${{ github.ref_name }}"
+          test "v$VERSION" = "${{ github.ref_name }}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - run: pip install "twine>=6.1.0" "packaging>=24.2"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pypi_*
+          merge-multiple: true
+          path: dist
+
+      - run: twine check --strict dist/*
+
+      - run: twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+
+  # ── Server binary + Docker ─────────────────────────────────────────────────
+
+  build-ui:
+    name: ui build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Build UI
+        run: |
+          pnpm --dir crates/wyrd/wyrd-server/wyrd-ui install --frozen-lockfile
+          pnpm --dir crates/wyrd/wyrd-server/wyrd-ui build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wyrd-ui-build
+          path: crates/wyrd/wyrd-server/wyrd-ui/build
+          retention-days: 1
+
+  build-server:
+    name: server - ${{ matrix.target_name }}
+    needs: [build-ui]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            target_name: x86_64-linux
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            target_name: aarch64-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wyrd-ui-build
+          path: crates/wyrd/wyrd-server/wyrd-ui/build
+
+      - name: Build server
+        run: cargo build -p wyrd-server --release --locked --features cloud
+
+      - name: Package binary + UI
+        run: |
+          mkdir -p release/ui
+          cp target/release/wyrd-server release/
+          chmod +x release/wyrd-server
+          cp -r crates/wyrd/wyrd-server/wyrd-ui/build release/ui/build
+          cp crates/wyrd/wyrd-server/wyrd-ui/package.json release/ui/package.json
+          tar -czf wyrd-server-${{ matrix.target_name }}.tar.gz -C release .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wyrd-server-${{ matrix.target_name }}
+          path: wyrd-server-${{ matrix.target_name }}.tar.gz
+          retention-days: 1
+
+  publish-docker:
+    name: docker - ${{ matrix.image }} - ${{ matrix.arch }}
+    if: github.event_name == 'release'
+    needs: [build-server]
+    runs-on: ubuntu-24.04
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: ubuntu
+            arch: amd64
+            artifact: wyrd-server-x86_64-linux
+          - image: ubuntu
+            arch: arm64
+            artifact: wyrd-server-aarch64-linux
+          - image: debian
+            arch: amd64
+            artifact: wyrd-server-x86_64-linux
+          - image: debian
+            arch: arm64
+            artifact: wyrd-server-aarch64-linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'arm64'
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ./artifacts
+
+      - name: Extract server artifact
+        run: |
+          mkdir -p binary
+          tar -xzf ./artifacts/${{ matrix.artifact }}.tar.gz -C binary
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/official/${{ matrix.image }}/Dockerfile
+          push: true
+          platforms: linux/${{ matrix.arch }}
+          build-args: WYRD_SERVER_BINARY=./binary
+          tags: |
+            wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-${{ github.event.release.tag_name }}
+            wyrdai/wyrd:${{ matrix.image }}-${{ matrix.arch }}-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-binaries:
+    name: publish binaries
+    if: github.event_name == 'release'
+    needs: [build-server]
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wyrd-server-*
+          path: dist
+
+      - name: Generate checksums
+        run: |
+          find dist -type f | while read f; do
+            sha256sum "$f" | awk -v name="$(basename "$f")" '{print $1, name}' >> checksums.txt
+          done
+          cat checksums.txt
+
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          find dist -type f | while read f; do
+            gh release upload ${{ github.event.release.tag_name }} "$f" --clobber
+          done
+          gh release upload ${{ github.event.release.tag_name }} checksums.txt --clobber
+
+  # ── Rust crates ────────────────────────────────────────────────────────────
+
+  publish-crates:
+    name: publish rust crates
+    if: github.event_name == 'release'
+    needs: [test-wheels, build-server]
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev pkg-config
+
+      - uses: jdx/mise-action@v3
+        with:
+          install: true
+          cache: true
+
+      - name: Publish crates via release-plz
+        uses: MarcoIeni/release-plz-action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}

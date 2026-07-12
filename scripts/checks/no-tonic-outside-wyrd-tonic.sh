@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-# Reject tonic-family dep declarations outside wyrd-tonic + workspace pins.
+# WHY THIS FILE EXISTS: tonic, prost, and companion crates must be versioned
+# exactly once in the workspace. Multiple declarations at different versions
+# cause linker errors, duplicate generated types, and gRPC codec mismatches
+# where a message type from one prost version is silently incompatible with
+# the codec registered from another. wyrd-tonic is the single re-export
+# boundary; all other crates import gRPC types through it so version changes
+# are a one-line workspace edit rather than a multi-crate update.
+#
+# WHAT IT CHECKS:
+#   1. tonic/prost dep declarations appear only in wyrd-tonic and Cargo.toml
+#   2. No renamed-dep workaround (package = "tonic") bypasses the rule
+#   3. Source imports use wyrd-tonic re-exports, not tonic:: directly
+#   4. Workspace pin entries for all four tonic-family crates are present
+#   5. wyrd-server depends on wyrd-tonic with the "server" feature
 set -e
 
 # 1. Manifest declarations must only appear in wyrd-tonic and workspace root

@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
-# Foundation invariants: wyrd-spec server-tier-free; shared shells pyo3+sqlx-free;
-# Skald keeps only locked Wyrd foundation edges.
+# WHY THIS FILE EXISTS: client-tier crates (wyrd-spec, wyrd-client, wyrd-mcp,
+# skald-prompt) are used in lightweight Python wheels, the CLI, and external
+# clients. If they silently pull in server-tier deps (sqlx, axum, datafusion,
+# cloud SDKs, PyO3), every downstream user pays the compile cost and risks
+# linking the server runtime into environments that should stay minimal.
+# This check catches those leaks before merge by walking the real dep tree.
+#
+# WHAT IT CHECKS:
+#   - wyrd-spec: no server-tier or async-runtime deps at --no-default-features
+#   - wyrd-auth-verify: no PyO3, no sqlx
+#   - wyrd-client: no DB, cloud SDK, object-store, or engine deps
+#   - wyrd-mcp: no sqlx, datafusion, vala-*, or axum
+#   - skald-prompt: no network runtime or engine deps; stays the Skald/Wyrd boundary
+#   - skald engine crates: no Wyrd/Vala deps outside the locked foundation set
 set -eu
 
 forbidden_spec=$(cargo tree -p wyrd-spec --no-default-features -e normal | \

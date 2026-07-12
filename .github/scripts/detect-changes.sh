@@ -36,7 +36,7 @@ set_output generated '^(mise\.toml|Cargo\.toml|Cargo\.lock|crates/wyrd-spec/|cra
 # storage/identity gate their own heavy emulator + OIDC e2e workflows. Both boot
 # the server, so a wyrd-server change re-runs both; docs/UI/python-only PRs skip.
 set_output storage '^(mise\.toml|Cargo\.lock|crates/wyrd/wyrd-storage/|crates/wyrd/wyrd-server/|crates/wyrd/wyrd-sql/|crates/wyrd/wyrd-client/src/artifacts/|crates/wyrd-spec/src/storage/|\.github/workflows/storage-integration|\.github/scripts/detect-changes\.sh)'
-set_output identity '^(mise\.toml|Cargo\.lock|crates/shared/wyrd-auth|crates/wyrd/wyrd-auth/|crates/wyrd/wyrd-server/|crates/wyrd-spec/src/security|\.github/workflows/identity-e2e\.yml|\.github/scripts/detect-changes\.sh)'
+set_output identity '^(mise\.toml|Cargo\.lock|docker-compose\.yml|tests/fixtures/identity/|crates/shared/wyrd-auth|crates/shared/wyrd-client/|crates/wyrd/wyrd-auth/|crates/wyrd/wyrd-server/|crates/wyrd/wyrd-testing/|crates/wyrd-spec/src/security|\.github/workflows/identity-e2e\.yml|\.github/scripts/detect-changes\.sh)'
 set_output workflow '^(\.github/workflows/|\.github/scripts/)'
 
 if [[ -s "$changed_files" ]]; then

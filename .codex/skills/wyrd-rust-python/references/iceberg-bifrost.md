@@ -21,9 +21,12 @@ output. Verify exact crate APIs and resolved dependency versions from local
 - `vala-bifrost` owns the warehouse engine: Iceberg catalog adapter, schema
   conversion, writer, commit coordination, DataFusion `TableProvider`,
   `SessionContext` factory, batch builder, and benchmarks.
-- `wyrd-storage` owns object-store construction. Vala engine code consumes
-  `Arc<dyn ObjectStore>` from the storage handle; it does not construct S3,
-  GCS, Azure, or local object-store clients except in local tests.
+- `wyrd-storage` owns artifact/blob storage, shared `BackendConfig`, signing,
+  health checks, and its OpenDAL operator. `vala-bifrost` owns Iceberg-specific
+  storage adaptation: `StorageFactory`, catalog properties, warehouse URI
+  derivation, and Iceberg/DataFusion integration. Vala may translate the shared
+  `BackendConfig` into Iceberg-specific configuration without moving the
+  Iceberg dependency cone into `wyrd-storage`.
 - Python-visible warehouse behavior belongs in the owning Vala crate behind a
   `python` feature. `python/py-wyrd` only registers the module and package
   exports.
@@ -57,6 +60,9 @@ output. Verify exact crate APIs and resolved dependency versions from local
 - Validate resolved versions with `cargo tree`, especially around
   `object_store`, Arrow, Parquet, and DataFusion. A docs.rs crate version may
   depend on a different DataFusion minor than the Wyrd plan intends.
+- Before moving Iceberg, DataFusion, cloud SDK, SQL, or provider dependencies
+  across crates, inspect reverse dependencies and enabled feature cones. Prefer
+  the narrowest crate that owns the behavior.
 - Do not keep `deltalake`, `_delta_log`, or Delta-specific transaction logic in
   new Vala warehouse implementation. Delta references are predecessor evidence
   only unless a later locked decision says otherwise.

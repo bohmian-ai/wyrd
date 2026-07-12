@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-# Reject legacy server vocabulary and orphan-rule violations.
+# WHY THIS FILE EXISTS: server architectural conventions — how routes are
+# mounted, how auth headers flow, how errors serialize, how middleware logs —
+# are easy to violate accidentally and hard to audit in review. A scattered
+# route prefix breaks the router contract silently. A second IntoResponse impl
+# produces inconsistent HTTP error bodies depending on import resolution. An
+# orphan From<WyrdError> for tonic::Status blocks the single authorized
+# conversion path. Auth headers consumed in the wrong layer bypass the
+# middleware stack. These aren't caught by the compiler; they're caught here.
+#
+# WHAT IT CHECKS: named anti-patterns across wyrd-server and wyrd-auth source —
+# route prefix discipline, auth header layering, JWT claim encoding, error
+# serialization uniqueness, Rust orphan-rule compliance, and middleware logging
+# hygiene. Predecessor vocabulary is also excluded to prevent migration drift
+# from re-entering active code.
 set -e
 
 # 1. Route prefix lock: /api/v1 may only appear in the router mount points, not scattered handlers

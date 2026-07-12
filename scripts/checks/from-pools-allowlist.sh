@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Fail if from_pools is called outside the 19 allowlisted sites
-# (2 definition files, 9 production wiring files, 8 test sites).
+# WHY THIS FILE EXISTS: from_pools hands out a raw PgPool that bypasses
+# per-tenant connection isolation. Every authorized call site has been audited
+# to ensure it holds a validated tenant context before touching the pool. An
+# unauthorized call site — even a well-intentioned helper — can silently
+# process one tenant's data under another's context, which is a data-isolation
+# violation. The allowlist is the enforcement boundary; adding a site requires
+# an explicit audit, not just a passing test.
+#
+# WHAT IT CHECKS: from_pools (both method and associated-function call forms)
+# does not appear outside the 2 definition files, 9 production wiring sites,
+# and 8 test sites listed in the glob exclusions below.
 set -e
 # from_pools may only be called from the sites below.
 # 2 definition files: wyrd-sql/src/postgres.rs, vala-sql/src/postgres.rs

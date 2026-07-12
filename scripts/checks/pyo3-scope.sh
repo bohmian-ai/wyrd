@@ -1,5 +1,19 @@
 #!/usr/bin/env bash
-# Assert PyO3 stays out of pure contracts and Python-free shared crates.
+# WHY THIS FILE EXISTS: PyO3 links against libpython at compile time. If it
+# leaks into wyrd-spec or non-approved shared crates, every consumer —
+# including the Rust-only server, CLI, and Skald engine — transitively links
+# libpython, making cross-compilation (musl, WASM) harder and adding a runtime
+# dependency on the Python interpreter in environments that should be Python-
+# free. The python feature gate is the containment boundary; these checks
+# enforce that nothing bypasses it by importing PyO3 from an unapproved crate.
+#
+# WHAT IT CHECKS:
+#   - wyrd-spec: zero PyO3 references (no python feature allowed)
+#   - shared crates except wyrd-utils and wyrd-observe: zero PyO3 references
+#   - Skald engine crates: PyO3 only in the explicitly allowlisted files
+#   - each approved Skald crate: python feature defined, PyO3 declared optional
+#   - wyrd-utils: python feature defined, PyO3 optional, helpers cfg-gated
+#   - wyrd-utils default build: PyO3 does not appear in the dep tree
 set -eu
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then

@@ -1689,6 +1689,10 @@ and does not affect the protocol contract above.
   table (migration `20260601000001_auth.sql`), its `GovernanceTokenRow` row mirror
   and query slot, the `migration_pg.rs` table assertion, and `Scope::TokenIssue`
   (`token:issue`).
-- The `wyrd-enterprise` `LicenseFeature::Governance` flag is retained as the
-  enterprise governance-tier gate (policy + audit), not a token.
+- Wyrd is open source and independently publishable. It contains no enterprise
+  licensing keys, feature gates, startup hooks, or private-product contracts.
+  A future private `wyrd-enterprise` repository may depend on and extend public
+  Wyrd crates; Wyrd never depends on that private repository. Enterprise
+  deployment language in this document describes topology, tenant isolation,
+  and operational requirements rather than an in-tree commercial edition.
 - No `WYRD_GOV_TOKEN` env var. No `wyrd gov-token` CLI.

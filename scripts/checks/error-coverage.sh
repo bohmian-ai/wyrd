@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# Assert emitted Skald error codes are mapped and SQL errors have coverage.
+# WHY THIS FILE EXISTS: stable error codes are a public contract — operators
+# and clients match on them in alerts, runbooks, and retry logic. An emitted
+# code with no map entry surfaces as an opaque unknown to every consumer. An
+# untested code mapping can regress silently: the code ships, the mapping
+# breaks, and nobody knows until a production alert fires with an unrecognized
+# code. This script keeps emitted codes and their observable mappings in sync.
+#
+# WHAT IT CHECKS: every error code emitted in source has a corresponding entry
+# in the observable error map; every mapped code has test coverage.
 set -eu
 
 emitted=$(mktemp)

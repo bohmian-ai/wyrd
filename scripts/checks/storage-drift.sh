@@ -1,5 +1,17 @@
 #!/usr/bin/env bash
-# Assert storage foundation guardrails against paths that exist in this workspace.
+# WHY THIS FILE EXISTS: storage sits at a security and multi-tenancy boundary.
+# Violations there typically compile cleanly and only surface as data leaks,
+# credential exposure, or tenant isolation failures at runtime. The type system
+# cannot catch: a bearer token written to a SQL column, a raw PgPool handed to
+# a tenant-scoped query, cloud SDK symbols imported by a client that should
+# work without cloud credentials, or in-memory state shared across requests.
+# Static pattern matching catches these before they reach production.
+#
+# WHAT IT CHECKS: patterns that violate storage security or architectural
+# invariants — credential persistence, tenant isolation bypass, language
+# binding leakage, cloud-neutral client boundary, cross-request state,
+# protocol dispatch correctness, identity surface uniqueness, and error
+# propagation discipline.
 set -eu
 
 rg_optional() {

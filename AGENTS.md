@@ -96,7 +96,13 @@ Locked cross-cutting decisions that any contributor must honor:
   it is a test-tier crate and is never enabled on production Python wheels.
 - Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
   `deltalake`.
-- Vala and Skald do not depend on each other directly.
+- Skald owns reusable agent primitives. Vala may depend on Skald to implement
+  reusable agent evaluation, including offline evaluation independent of
+  `wyrd-server`. Skald does not depend on Vala. `wyrd-server` consumes the Vala
+  evaluation engine but does not own evaluation-engine logic.
+- Crate ownership includes dependency cost. Do not move a specialized dependency
+  into a foundational or broadly consumed crate merely to centralize
+  configuration. Keep it in the narrowest crate that owns the behavior.
 - MCP is first-class; read tools are always available, write tools require
   explicit scopes.
 - Audit is foundational across CLI, UI, MCP, Python SDK, `wyrd-server`, and
@@ -405,6 +411,12 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - `wyrd-sql` is the durable Postgres layer.
 - `wyrd-storage` is the durable storage layer that provides storage functionality for wyrd and vala.
 - Deployment: Wyrd is meant to be deployed as self-hosted, cloud SaaS (single-server multi-tenant), and enterprise cloud (single-server single-tenant). Plan work and implementation accordingly.
+- Wyrd is open source and independently publishable. It contains no private
+  enterprise licensing keys, feature gates, startup hooks, or product contracts.
+  A future private `wyrd-enterprise` repository may depend on and extend public
+  Wyrd crates; Wyrd never depends on that private repository. "Enterprise cloud"
+  describes a deployment topology and tenant-isolation requirement, not an
+  in-tree commercial edition.
 - KEEP IT SIMPLE STUPID: when reviewing and implementing, avoid over-engineering and adding unnecessary complexity, YAGNI, and follow a modular design that solves the problem at hand without adding extra layers, abstractions, or future-proofing that isn't justified by current needs. There should be one obvious way to do something, and it should be the way we do it.
 - Follow industry and Rust community best practices. Provide recommendations when appropriate.
 

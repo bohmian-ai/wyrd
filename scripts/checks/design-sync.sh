@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Assert ValaQueryService and all four payload-read permissions are accepted in
-# wyrd-design.md before the vala_query seam exists in code.
+# WHY THIS FILE EXISTS: wyrd-design.md is the active design authority. When
+# a seam reaches code before its design entry is written, the implementation
+# becomes the de-facto spec — future contributors can't tell whether a behavior
+# was intentional or accidental, and the design doc loses its authority. This
+# script enforces that named seams in the design are present before (or at the
+# same time as) the code that implements them.
+#
+# WHAT IT CHECKS: symbols required by the current set of tracked seams appear
+# in wyrd-design.md. When the corresponding code exists, the design entry is
+# mandatory; when the code is absent the check still runs so design can be
+# written ahead of implementation.
 set -eu
 DESIGN=architecture/wyrd-design.md
 fail=0

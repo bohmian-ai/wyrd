@@ -8,7 +8,8 @@ repository = { workspace = true }
 authors = { workspace = true }
 
 [features]
-storage-emulator = ["wyrd-storage/emulator"]
+cloud = ["wyrd-storage/cloud"]
+storage-emulator = ["cloud", "wyrd-storage/emulator"]
 
 [[bin]]
 name = "wyrd-server"

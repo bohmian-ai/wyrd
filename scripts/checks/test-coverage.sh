@@ -1,65 +1,20 @@
 #!/usr/bin/env bash
-# Assert the four family test lanes (test:wyrd/skald/vala/shared) form an
-# exact, non-overlapping partition of the workspace. Every workspace member
-# except py-wyrd and wyrd-rust-examples must appear in exactly one lane.
-# Adding a crate without updating a lane fails CI.
+# WHY THIS FILE EXISTS: the four family test lanes (test:wyrd/skald/vala/shared)
+# are the unit of CI parallelism — each runs independently and their combined
+# pass is the Rust test gate. If a new crate is added to the workspace but not
+# assigned to a lane, its tests are silently skipped. If a crate is listed in
+# a lane but removed from the workspace, the lane invocation fails with an
+# unknown-package error that's hard to diagnose. Both are caught here before merge.
+# Package lists live in scripts/test-families.sh as the single source of truth.
+#
+# WHAT IT CHECKS:
+#   - no crate appears in more than one family lane (dedup)
+#   - every workspace crate except py-wyrd and wyrd-rust-examples is in a lane
+#   - no lane references a crate absent from the workspace (stale entries)
 set -eu
 
-FAMILY_WYRD=(
-  wyrd
-  wyrd-auth
-  wyrd-cards
-  wyrd-cli
-  wyrd-config
-  wyrd-interfaces
-  wyrd-mcp
-  wyrd-server
-  wyrd-sql
-  wyrd-storage
-  wyrd-testing
-  wyrd-tonic
-  wyrd-spec
-)
-
-FAMILY_SKALD=(
-  skald-agent
-  skald-cache
-  skald-prompt
-  skald-providers
-  skald-runtime
-  skald-spec
-  skald-tool
-  skald-workflow
-)
-
-FAMILY_VALA=(
-  vala-bifrost
-  vala-core
-  vala-drift
-  vala-eval
-  vala-ingest
-  vala-sdk
-  vala-sql
-)
-
-FAMILY_SHARED=(
-  wyrd-auth-check
-  wyrd-auth-issue
-  wyrd-auth-oidc
-  wyrd-auth-verify
-  wyrd-client
-  wyrd-crypt
-  wyrd-dev-fixtures
-  wyrd-error-derive
-  wyrd-observe
-  wyrd-queue
-  wyrd-runtime
-  wyrd-semver
-  wyrd-telemetry
-  wyrd-test-contract-macros
-  wyrd-utils
-  wyrd-version
-)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "$REPO_ROOT/scripts/test-families.sh"
 
 combined=$(printf '%s\n' \
   "${FAMILY_WYRD[@]}" \
@@ -83,16 +38,17 @@ print('\n'.join(sorted(p['name'] for p in data['packages'])))
 
 missing=$(comm -23 <(echo "$workspace_members") <(echo "$combined"))
 if [ -n "$missing" ]; then
-  echo "FAIL: workspace crates with no family lane — add to test:wyrd/skald/vala/shared in mise.toml:"
+  echo "FAIL: workspace crates with no family lane — add to scripts/test-families.sh:"
   echo "$missing"
   exit 1
 fi
 
 phantom=$(comm -23 <(echo "$combined") <(echo "$workspace_members"))
 if [ -n "$phantom" ]; then
-  echo "FAIL: family lane references crates absent from the workspace (stale entry in mise.toml):"
+  echo "FAIL: family lane references crates absent from the workspace (stale entry in scripts/test-families.sh):"
   echo "$phantom"
   exit 1
 fi
 
-echo "OK: all 44 workspace crates are assigned to exactly one family lane."
+total=$(echo "$combined" | wc -l | tr -d ' ')
+echo "OK: all $total workspace crates are assigned to exactly one family lane."

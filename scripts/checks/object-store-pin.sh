@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
-# Assert single versions of object_store/datafusion/arrow/parquet across the
-# iceberg cone (stage1+).
+# WHY THIS FILE EXISTS: DataFusion, Arrow, and object_store are tightly
+# version-coupled. If multiple versions resolve in the dep graph, a
+# TableProvider registered against one Arrow schema type cannot be handed to
+# a RecordBatch consumer expecting a type from a different version — the
+# compiler accepts it but the runtime panics or silently drops batches.
+# object_store is pinned to 0.13.* because the iceberg-rust crate bakes in
+# that version's API; a minor bump changes the trait surface and breaks
+# object-store integration silently at runtime, not at compile time.
+#
+# WHAT IT CHECKS: object_store, datafusion, arrow, and parquet each resolve
+# to exactly one version across --all-features; object_store is on 0.13.*.
 set -e
 fail=0
 for dep in object_store datafusion arrow parquet; do

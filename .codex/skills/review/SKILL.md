@@ -17,7 +17,7 @@ Read completely:
 4. `architecture/wyrd-doctrine.mdx`
 5. Changed files and the nearest implementation, tests, schemas, generated artifacts, and public surfaces
 
-`architecture/wyrd-design.md` wins over generated artifacts, older plans, predecessor repositories, and implementation drift. Do not treat `wyrd-plan` as active authority.
+`architecture/wyrd-design.md` wins over generated artifacts, predecessor repositories, and implementation drift. The implementation plan is the primary source of change intent. Read its goals, invariants, dependency decisions, and non-goals before judging the diff. When the plan conflicts with active design authority, report an authority conflict and explain both sides; do not silently prefer the code or prescribe a reversal from one rule alone. Do not treat `wyrd-plan` as active authority.
 
 When invoked by `review-and-plan`, use its shared packet and required output path. Do not gather a second diff or create a new review ID.
 
@@ -35,12 +35,19 @@ Check:
 - approved Python owner crates own Python-visible behavior behind optional features;
 - `python/py-wyrd` remains a thin aggregator;
 - client-tier crates do not acquire server/data-plane dependencies;
-- Vala and Skald do not depend on each other;
+- Skald remains independent of Vala; Vala may depend on Skald to implement the
+  reusable agent evaluation engine used by offline consumers and `wyrd-server`;
 - `wyrd-server` remains the only HTTP/gRPC serving surface;
 - tenant isolation, permissions, stable errors, and audit context cross durable paths;
 - MCP, CLI, HTTP, schemas, docs, and SDKs expose the same nouns and lifecycle;
 - user/agent-facing capabilities ship real client → server → client journeys;
 - no predecessor vocabulary, compatibility aliases, or stale design authority is introduced.
+
+Before reporting an architecture or ownership finding, evaluate the proposed
+alternative. State its dependency and compilation impact, how it preserves the
+plan's user workflow, and why it is materially better. Classify disagreements as
+implementation defects, stale authority, or design questions. A written-rule
+violation alone is not a finding.
 
 ## Findings
 

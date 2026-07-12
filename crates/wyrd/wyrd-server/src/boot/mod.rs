@@ -357,6 +357,8 @@ async fn install_auth(
         }
     };
 
+    let audit_seal_key = build_audit_seal_key(config)?;
+
     Ok(state.with_auth(ServerAuth {
         allow_preview: config.auth.allow_preview,
         issuing_key: Some(issuing_key),
@@ -364,7 +366,7 @@ async fn install_auth(
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
-        audit_seal_key: None, // loaded separately from WYRD_AUDIT_SEAL_KEY (slice 12)
+        audit_seal_key,
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
     }))
 }
@@ -439,6 +441,21 @@ fn build_sealing_key(
         ))
     })?;
     Ok(Some(Arc::new(SecretKey::from_bytes(key))))
+}
+
+/// Load and parse the dedicated Ed25519 audit-seal key from config.
+///
+/// Returns `None` when `WYRD_AUDIT_SEAL_KEY_FILE`/`WYRD_AUDIT_SEAL_KEY_PEM`
+/// are absent. Returns `Err` when the PEM is present but invalid.
+fn build_audit_seal_key(
+    config: &crate::config::WyrdServerConfig,
+) -> Result<Option<Arc<wyrd_auth_issue::AuditSealKey>>, ServerBootError> {
+    let Some(pem) = config.auth.audit_seal_key.as_ref() else {
+        return Ok(None);
+    };
+    let key = wyrd_auth_issue::AuditSealKey::from_pkcs8_pem(pem.expose_secret())
+        .map_err(|e| ServerBootError::SigningKey(format!("WYRD_AUDIT_SEAL_KEY is invalid: {e}")))?;
+    Ok(Some(Arc::new(key)))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all

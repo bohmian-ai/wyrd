@@ -281,8 +281,15 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
         let model_col = col_str(batch, "request_model");
         let prov_col = col_str(batch, "provider_name");
         let start_col = col_ts(batch, "start_time");
-        let in_tok_col = col_u32(batch, "usage_input_tokens");
-        let out_tok_col = col_u32(batch, "usage_output_tokens");
+        // The declared physical type of `usage_*_tokens` is uint32, but the
+        // Iceberg read path widens unsigned ints to Int64 on the way back, so a
+        // strict UInt32Array downcast returns `None` and the token counts read
+        // back null. Accept either physical type: prefer the widened Int64
+        // column, fall back to a native uint32 column.
+        let in_tok_i64 = col_i64(batch, "usage_input_tokens");
+        let in_tok_u32 = col_u32(batch, "usage_input_tokens");
+        let out_tok_i64 = col_i64(batch, "usage_output_tokens");
+        let out_tok_u32 = col_u32(batch, "usage_output_tokens");
         let prompt_col = col_str_view(batch, "input_messages");
         let completion_col = col_str_view(batch, "output_messages");
 
@@ -295,12 +302,22 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                input_tokens: in_tok_col
+                input_tokens: in_tok_i64
                     .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as i64),
-                output_tokens: out_tok_col
+                    .map(|a| a.value(i))
+                    .or_else(|| {
+                        in_tok_u32
+                            .filter(|a| !a.is_null(i))
+                            .map(|a| i64::from(a.value(i)))
+                    }),
+                output_tokens: out_tok_i64
                     .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as i64),
+                    .map(|a| a.value(i))
+                    .or_else(|| {
+                        out_tok_u32
+                            .filter(|a| !a.is_null(i))
+                            .map(|a| i64::from(a.value(i)))
+                    }),
                 cost_usd: None, // Stage N placeholder — no physical column in genai.messages yet
                 prompt: get_str_view(prompt_col, i).map(|s| s.to_owned()),
                 completion: get_str_view(completion_col, i).map(|s| s.to_owned()),

@@ -126,7 +126,6 @@ impl AuditRelay {
                 shipment.tenant,
             )
             .await?;
-        writer.write(batch).await?;
         let ctx = BifrostWriteContext {
             batch_id: shipment.batch_id,
             origin: AUDIT_RELAY_ORIGIN.to_owned(),
@@ -134,7 +133,9 @@ impl AuditRelay {
             request_id: RequestId::now_v7(),
             card_ref: None,
         };
-        writer.flush(ctx).await?;
+        // One shipment = one commit unit under `shipment.batch_id`; `commit_one`
+        // closes the writer so the coordinator drains and commits immediately.
+        writer.commit_one(shipment.tenant, vec![batch], ctx).await?;
         Ok(())
     }
 

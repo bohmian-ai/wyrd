@@ -141,8 +141,9 @@ mod pg_tests {
             .unwrap();
 
         // SystemShared registration is the engine's privileged path — owner is
-        // SYSTEM_OWNER (seeded by the vala migration). A and B are NOT FK'd to
-        // platform.tenants; they only ever appear in the stamped data_tenant_id.
+        // SYSTEM_OWNER (seeded by the vala migration). Under M02 each SystemShared
+        // write binds its OWN data tenant into `olap_commits.data_tenant_id`, so A
+        // and B must be real platform tenants (the `data_tenant_id` FK).
         catalog
             .create_table(
                 NS,
@@ -158,6 +159,14 @@ mod pg_tests {
 
         let a = DataTenantId::new_v7();
         let b = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(a, &format!("a-{}", a.as_uuid().simple()))
+            .await
+            .unwrap();
+        fixture
+            .seed_additional_tenant_with_uuid(b, &format!("b-{}", b.as_uuid().simple()))
+            .await
+            .unwrap();
         write_rows(&catalog, a, &["a1", "a2", "a3"]).await;
         write_rows(&catalog, b, &["b1", "b2"]).await;
 
@@ -197,9 +206,12 @@ mod pg_tests {
             .writer(NS, TABLE, TableScope::SystemShared, tenant)
             .await
             .unwrap();
-        writer.write(batch).await.unwrap();
         writer
-            .flush(vala_bifrost::writer::BifrostWriteContext::system())
+            .commit_one(
+                tenant,
+                vec![batch],
+                vala_bifrost::writer::BifrostWriteContext::system(),
+            )
             .await
             .unwrap();
     }

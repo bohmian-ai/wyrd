@@ -93,15 +93,20 @@ pub struct CommitGroup {
 }
 
 /// Outcome of a [`run_group_commit`] flush: the one shared snapshot id (or `None`
-/// when every key replayed and no append happened), the fresh keys now durable,
-/// and the idempotent replay hits.
+/// when every key replayed and no append happened), the post-append table the
+/// caller must adopt, the fresh keys now durable, and the idempotent replay hits.
 pub struct GroupCommitOutcome {
     /// `None` when EVERY key replayed (no append happened).
     pub snapshot_id: Option<i64>,
-    /// Fresh keys now durable.
+    /// The post-append [`Table`] the caller must adopt for its NEXT commit so the
+    /// following `fast_append` CAS builds on the snapshot this flush produced.
+    /// `None` when no append happened (all replayed / every fresh fence lost).
+    pub updated_table: Option<Table>,
+    /// Fresh keys now durable (all share `snapshot_id`).
     pub committed: Vec<CommitKey>,
-    /// Idempotent replay hits.
-    pub replayed: Vec<CommitKey>,
+    /// Idempotent replay hits, each paired with the snapshot it originally
+    /// committed to (so the caller can ack a re-submit with its real snapshot).
+    pub replayed: Vec<(CommitKey, i64)>,
 }
 
 /// Execute one 2PC commit of `batches` under `batch_id` for `table`.
@@ -215,7 +220,7 @@ pub async fn run_group_commit(
 ) -> Result<GroupCommitOutcome, BifrostError> {
     let table_fqn = table.identifier().to_string();
 
-    let mut replayed: Vec<CommitKey> = Vec::new();
+    let mut replayed: Vec<(CommitKey, i64)> = Vec::new();
     // Fresh groups kept together with their claimed fence.
     let mut fresh: Vec<(CommitGroup, Uuid, i64)> = Vec::new();
 
@@ -239,7 +244,7 @@ pub async fn run_group_commit(
         .await?;
 
         match phase1 {
-            Phase1::Replay { snapshot_id: _ } => replayed.push(group.key),
+            Phase1::Replay { snapshot_id } => replayed.push((group.key, snapshot_id)),
             Phase1::Fresh {
                 owner,
                 fencing_token,
@@ -251,6 +256,7 @@ pub async fn run_group_commit(
     if fresh.is_empty() {
         return Ok(GroupCommitOutcome {
             snapshot_id: None,
+            updated_table: None,
             committed: Vec::new(),
             replayed,
         });
@@ -288,6 +294,7 @@ pub async fn run_group_commit(
     if survivors.is_empty() {
         return Ok(GroupCommitOutcome {
             snapshot_id: None,
+            updated_table: None,
             committed: Vec::new(),
             replayed,
         });
@@ -302,7 +309,7 @@ pub async fn run_group_commit(
 
     // 4. ONE Iceberg append for the whole group, stamping wyrd_commit_keys.
     let fresh_keys: Vec<CommitKey> = survivors.iter().map(|(g, _, _)| g.key).collect();
-    let (snapshot_id, _updated_table) =
+    let (snapshot_id, updated_table) =
         commit_group_to_iceberg(catalog, table, all_files, &fresh_keys).await?;
 
     // 5. Finalize: one tenant-scoped txn per surviving group.
@@ -360,6 +367,7 @@ pub async fn run_group_commit(
 
     Ok(GroupCommitOutcome {
         snapshot_id: Some(snapshot_id),
+        updated_table: Some(updated_table),
         committed,
         replayed,
     })

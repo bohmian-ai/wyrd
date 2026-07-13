@@ -43,9 +43,13 @@ fn bench_write_throughput(c: &mut Criterion) {
                         .await
                         .expect("open bench writer");
                     writer
-                        .write(batch.clone())
+                        .commit_one(
+                            fixture.tenant,
+                            vec![batch.clone()],
+                            vala_bifrost::writer::BifrostWriteContext::system(),
+                        )
                         .await
-                        .expect("write bench batch");
+                        .expect("commit bench batch");
                 });
             },
         );

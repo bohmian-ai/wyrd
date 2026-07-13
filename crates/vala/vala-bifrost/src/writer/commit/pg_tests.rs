@@ -1451,3 +1451,554 @@ mod group_commit {
         );
     }
 }
+
+/// Coordinator gates: drive the live [`spawn_group_commit_coordinator`] handle
+/// (the actor behind `WyrdCatalog::writer`) through real Postgres + Iceberg and
+/// assert the group-commit contract — one `fast_append` amortizes N tenants,
+/// each write keeps its own `batch_id`, chunks split at `max_commit_keys`,
+/// shutdown drains the buffer, and the reply is held until the covering commit.
+#[cfg(test)]
+mod coordinator {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use iceberg_catalog_sql::SqlCatalog;
+    use sqlx::PgPool;
+    use tempfile::TempDir;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_storage::settings::BackendConfig;
+
+    use crate::catalog::WyrdCatalog;
+    use crate::catalog::iceberg_sql;
+    use crate::catalog::namespaces::BifrostNamespace;
+    use crate::registry::Registry;
+    use crate::tables::PayloadClass;
+    use crate::types::{TableScope, TableUid};
+    use crate::writer::BifrostWriteContext;
+    use crate::writer::coordinator::{
+        FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator,
+    };
+
+    const NS: BifrostNamespace = BifrostNamespace::Bifrost;
+
+    struct Harness {
+        _tmp: TempDir,
+        catalog_uri: String,
+        backend: BackendConfig,
+        pool: Arc<PgPool>,
+        migrator: Arc<PgPool>,
+        fixture: PgFixture,
+    }
+
+    async fn base_harness() -> Harness {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = Arc::new(fixture.app_pool().clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BackendConfig::Local {
+            root: tmp.path().to_path_buf(),
+        };
+        let catalog_uri = fixture.catalog_uri();
+        let migrator = Arc::new(fixture.superuser_pool().await.expect("superuser pool"));
+        Harness {
+            _tmp: tmp,
+            catalog_uri,
+            backend,
+            pool,
+            migrator,
+            fixture,
+        }
+    }
+
+    async fn build_catalog(h: &Harness) -> WyrdCatalog {
+        WyrdCatalog::new(&h.catalog_uri, &h.backend, h.pool.clone(), None)
+            .await
+            .unwrap()
+    }
+
+    async fn load_table(h: &Harness, table: &str) -> iceberg::table::Table {
+        use iceberg::Catalog as _;
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        let catalog = iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap();
+        let ident = iceberg::TableIdent::new(NS.to_namespace_ident(), table.to_string());
+        catalog.load_table(&ident).await.unwrap()
+    }
+
+    async fn load_sql_catalog(h: &Harness) -> SqlCatalog {
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap()
+    }
+
+    fn user_batch(n: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))],
+        )
+        .unwrap()
+    }
+
+    fn ctx(batch_id: [u8; 16]) -> BifrostWriteContext {
+        let mut c = BifrostWriteContext::system();
+        c.batch_id = batch_id;
+        c
+    }
+
+    fn snapshot_count(table: &iceberg::table::Table) -> usize {
+        table.metadata().snapshots().count()
+    }
+
+    /// A no-auto-flush policy: only a dropped handle (shutdown) or an explicit
+    /// timer/threshold override flushes. `max_commit_keys` overridable per test.
+    fn manual_policy(max_commit_keys: usize) -> FlushPolicy {
+        FlushPolicy {
+            max_rows: usize::MAX,
+            max_interval: Duration::from_hours(1),
+            max_buffered_bytes: usize::MAX,
+            max_commit_keys,
+        }
+    }
+
+    async fn seed(h: &Harness, tenant: DataTenantId) {
+        h.fixture
+            .seed_additional_tenant_with_uuid(tenant, &format!("t-{}", tenant.as_uuid().simple()))
+            .await
+            .unwrap();
+    }
+
+    async fn register_table(
+        h: &Harness,
+        table: &str,
+        scope: TableScope,
+        owner: DataTenantId,
+    ) -> TableUid {
+        let catalog = build_catalog(h).await;
+        catalog
+            .create_table(
+                NS,
+                table,
+                vec![Field::new("val", DataType::Int64, false)],
+                scope,
+                owner,
+                &[],
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn spawn(
+        h: &Harness,
+        table: iceberg::table::Table,
+        sql_catalog: SqlCatalog,
+        table_uid: TableUid,
+        fqn: &str,
+        scope: TableScope,
+        policy: FlushPolicy,
+    ) -> GroupCommitHandle {
+        spawn_group_commit_coordinator(
+            table,
+            Arc::new(sql_catalog),
+            h.pool.clone(),
+            table_uid,
+            fqn.to_string(),
+            scope,
+            Arc::new(Registry::new(h.pool.clone())),
+            PayloadClass::Standard,
+            &[],
+            policy,
+        )
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct CommitRow {
+        state: String,
+        data_tenant_id: uuid::Uuid,
+        batch_id: Vec<u8>,
+        snapshot_id: Option<i64>,
+    }
+
+    async fn commit_rows(h: &Harness, table_uid: TableUid) -> Vec<CommitRow> {
+        sqlx::query_as::<_, CommitRow>(
+            "SELECT state, data_tenant_id, batch_id, snapshot_id \
+             FROM vala.olap_commits WHERE table_uid = $1 ORDER BY data_tenant_id, batch_id",
+        )
+        .bind(table_uid.as_bytes().as_slice())
+        .fetch_all(&*h.migrator)
+        .await
+        .unwrap()
+    }
+
+    /// N tenants writing one physical (`SystemShared`) table, flushed together,
+    /// amortize into exactly ONE Iceberg snapshot — not N. The row-count threshold
+    /// fires the single covering flush; every tenant's reply carries that one
+    /// snapshot id.
+    #[tokio::test]
+    async fn amortization_across_tenants() {
+        const TABLE: &str = "coord_amort";
+        let h = base_harness().await;
+        let tenants = [
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+        ];
+        for t in &tenants {
+            seed(&h, *t).await;
+        }
+        let table_uid = register_table(
+            &h,
+            TABLE,
+            TableScope::SystemShared,
+            DataTenantId::SYSTEM_OWNER,
+        )
+        .await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        // Flush exactly when all three one-row writes are buffered.
+        let policy = FlushPolicy {
+            max_rows: 3,
+            ..manual_policy(128)
+        };
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::SystemShared,
+            policy,
+        );
+
+        let mut rxs = Vec::new();
+        for t in &tenants {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            let rx = handle
+                .send_write(*t, vec![user_batch(1)], ctx(batch_id))
+                .expect("enqueued");
+            rxs.push(rx);
+        }
+        let mut snaps = Vec::new();
+        for rx in rxs {
+            snaps.push(rx.await.expect("actor replied").expect("commit ok"));
+        }
+        // Every tenant acked the SAME single snapshot.
+        assert!(
+            snaps.iter().all(|s| *s == snaps[0]),
+            "all tenants share one snapshot"
+        );
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 1,
+            "N tenants amortize into exactly ONE fast_append"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 3, "one commit row per tenant");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+        assert!(
+            rows.iter().all(|r| r.snapshot_id == Some(snaps[0])),
+            "all rows share the group snapshot"
+        );
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().map(|r| r.data_tenant_id).collect();
+        assert_eq!(distinct.len(), 3, "each row bound to its own data tenant");
+        drop(handle);
+    }
+
+    /// A `SystemShared` flush covering two tenants stamps each tenant's commit row
+    /// with ITS OWN `data_tenant_id` — the writes are not collapsed onto one bind.
+    #[tokio::test]
+    async fn per_row_tenant_stamp() {
+        const TABLE: &str = "coord_stamp";
+        let h = base_harness().await;
+        let ta = DataTenantId::new_v7();
+        let tb = DataTenantId::new_v7();
+        seed(&h, ta).await;
+        seed(&h, tb).await;
+        let table_uid = register_table(
+            &h,
+            TABLE,
+            TableScope::SystemShared,
+            DataTenantId::SYSTEM_OWNER,
+        )
+        .await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::SystemShared,
+            manual_policy(128),
+        );
+
+        let rx_a = handle
+            .send_write(
+                ta,
+                vec![user_batch(2)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue a");
+        let rx_b = handle
+            .send_write(
+                tb,
+                vec![user_batch(2)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue b");
+        drop(handle); // shutdown → drain → one covering commit
+        rx_a.await.expect("reply a").expect("commit a");
+        rx_b.await.expect("reply b").expect("commit b");
+
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 2, "two commit rows");
+        let binds: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().map(|r| r.data_tenant_id).collect();
+        assert!(
+            binds.contains(&ta.as_uuid()),
+            "tenant a stamped on its own row"
+        );
+        assert!(
+            binds.contains(&tb.as_uuid()),
+            "tenant b stamped on its own row"
+        );
+        assert_eq!(binds.len(), 2, "tenants not collapsed onto one bind");
+    }
+
+    /// Dropping the sole handle (shutdown) with a non-empty buffer drains and
+    /// commits the buffered writes — no data is lost — and each reply resolves.
+    #[tokio::test]
+    async fn drain_on_shutdown_commits_buffer() {
+        const TABLE: &str = "coord_drain";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(128),
+        );
+
+        let rx1 = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue 1");
+        let rx2 = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue 2");
+        // No threshold/timer would ever fire — only shutdown drains.
+        drop(handle);
+        let s1 = rx1.await.expect("reply 1").expect("commit 1");
+        let s2 = rx2.await.expect("reply 2").expect("commit 2");
+        assert_eq!(s1, s2, "both buffered writes rode one covering commit");
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 1,
+            "buffer committed on shutdown"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 2, "both buffered writes are durable");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+    }
+
+    /// A single flush of more than `max_commit_keys` write units splits into
+    /// multiple group commits — one Iceberg snapshot per chunk — instead of one
+    /// unbounded `fast_append`.
+    #[tokio::test]
+    async fn flush_chunks_at_max_commit_keys() {
+        const TABLE: &str = "coord_chunk";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        // 5 keys, chunk size 2 → ceil(5/2) = 3 group commits.
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(2),
+        );
+
+        let mut rxs = Vec::new();
+        for _ in 0..5 {
+            let rx = handle
+                .send_write(
+                    tenant,
+                    vec![user_batch(1)],
+                    ctx(*uuid::Uuid::now_v7().as_bytes()),
+                )
+                .expect("enqueue");
+            rxs.push(rx);
+        }
+        drop(handle);
+        for rx in rxs {
+            rx.await.expect("reply").expect("commit");
+        }
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 3,
+            "5 keys at chunk size 2 produce 3 snapshots"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 5, "all five keys committed");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+    }
+
+    /// A timer flush commits each buffered write as its OWN key: three writes with
+    /// three distinct `batch_id`s produce three distinct commit rows — the writes
+    /// are NOT collapsed under one `batch_id`.
+    #[tokio::test]
+    async fn timer_flush_preserves_per_batch_context() {
+        const TABLE: &str = "coord_timer";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        // Short timer fires the flush; the await below waits for it.
+        let policy = FlushPolicy {
+            max_interval: Duration::from_millis(150),
+            ..manual_policy(128)
+        };
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            policy,
+        );
+
+        let mut batch_ids = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..3 {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            batch_ids.push(batch_id);
+            rxs.push(
+                handle
+                    .send_write(tenant, vec![user_batch(1)], ctx(batch_id))
+                    .expect("enqueue"),
+            );
+        }
+        let mut snaps = Vec::new();
+        for rx in rxs {
+            snaps.push(rx.await.expect("timer reply").expect("commit"));
+        }
+        assert!(
+            snaps.iter().all(|s| *s == snaps[0]),
+            "one timer flush, one snapshot"
+        );
+
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(
+            rows.len(),
+            3,
+            "each write kept its own batch_id → three rows"
+        );
+        let distinct: std::collections::HashSet<Vec<u8>> =
+            rows.iter().map(|r| r.batch_id.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three distinct batch_ids, not collapsed to one"
+        );
+        for batch_id in &batch_ids {
+            assert!(
+                distinct.contains(batch_id.as_slice()),
+                "batch_id {} present as its own row",
+                uuid::Uuid::from_bytes(*batch_id)
+            );
+        }
+        drop(handle);
+    }
+
+    /// The reply is held until the covering commit: before any flush the receiver
+    /// has no value AND no `olap_commits` row exists; only after shutdown-drain
+    /// does the reply resolve with a durable snapshot.
+    #[tokio::test]
+    async fn reply_held_until_covering_commit() {
+        const TABLE: &str = "coord_hold";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(128),
+        );
+
+        let mut rx = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue");
+        // Give the actor a moment to process the buffered write (no flush trigger).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "reply is held before any commit");
+        assert!(
+            commit_rows(&h, table_uid).await.is_empty(),
+            "no precommit/commit row before a flush"
+        );
+
+        drop(handle); // shutdown → drain → commit
+        let sid = rx.await.expect("reply after commit").expect("commit ok");
+        assert!(sid > 0, "reply carries the covering snapshot id");
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 1, "the held write is now durable");
+        assert_eq!(rows[0].state, "committed");
+    }
+}

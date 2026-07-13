@@ -399,13 +399,6 @@ pub async fn run_ingest<S: FrameSource>(
         .await
         .map_err(IngestError::from_engine)?;
 
-    for batch in stamped {
-        writer
-            .write(batch)
-            .await
-            .map_err(IngestError::from_engine)?;
-    }
-
     let ctx = BifrostWriteContext {
         batch_id: collected.batch_id,
         origin: "ingest".to_owned(),
@@ -414,7 +407,12 @@ pub async fn run_ingest<S: FrameSource>(
         // Writer-identity card for C5 audit attribution (constant per commit).
         card_ref: auth.principal.card_ref().cloned(),
     };
-    let _snapshot = writer.flush(ctx).await.map_err(IngestError::from_engine)?;
+    // All stamped batches are one commit unit under `collected.batch_id`;
+    // `commit_one` closes the writer so the coordinator drains and commits.
+    let _snapshot = writer
+        .commit_one(auth.tenant, stamped, ctx)
+        .await
+        .map_err(IngestError::from_engine)?;
 
     Ok(collected.rows)
 }

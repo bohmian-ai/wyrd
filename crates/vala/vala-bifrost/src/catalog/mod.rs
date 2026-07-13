@@ -17,8 +17,7 @@ use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::system_columns::with_system_columns;
 use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
-use crate::writer::TableWriterHandle;
-use crate::writer::coordinator::spawn_commit_coordinator;
+use crate::writer::coordinator::{FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator};
 use wyrd_storage::settings::BackendConfig;
 
 pub mod iceberg_sql;
@@ -348,7 +347,7 @@ impl WyrdCatalog {
         name: &str,
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<TableWriterHandle, BifrostError> {
+    ) -> Result<GroupCommitHandle, BifrostError> {
         let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
         let table = self.catalog.load_table(&table_ident).await?;
         let fqn = format!("{}.{}", ns.as_str(), name);
@@ -363,18 +362,17 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_commit_coordinator(
+        let handle = spawn_group_commit_coordinator(
             table,
             self.catalog.clone(),
             self.pool.clone(),
             table_uid,
             fqn,
             scope,
-            tenant,
             Arc::clone(&self.registry),
             PayloadClass::Standard,
             &[],
-            None,
+            FlushPolicy::default(),
         );
 
         Ok(handle)
@@ -382,14 +380,13 @@ impl WyrdCatalog {
 
     /// Open a write handle for a pre-declared domain table `T`.
     ///
-    /// Carries the table's `PayloadClass`, `SENSITIVE_PAYLOAD_COLUMNS`, and
-    /// `entity_bounds_mapping` into the coordinator so redaction and best-effort
-    /// entity-time-bounds upserts fire automatically on each commit.
+    /// Carries the table's `PayloadClass` and `SENSITIVE_PAYLOAD_COLUMNS` into the
+    /// coordinator so redaction fires automatically on each commit.
     pub async fn typed_writer<T: DomainTable>(
         &self,
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<TableWriterHandle, BifrostError> {
+    ) -> Result<GroupCommitHandle, BifrostError> {
         let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
             BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
         })?;
@@ -407,18 +404,17 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_commit_coordinator(
+        let handle = spawn_group_commit_coordinator(
             table,
             self.catalog.clone(),
             self.pool.clone(),
             table_uid,
             fqn,
             scope,
-            tenant,
             Arc::clone(&self.registry),
             T::PAYLOAD_CLASS,
             T::SENSITIVE_PAYLOAD_COLUMNS,
-            T::entity_bounds_mapping(),
+            FlushPolicy::default(),
         );
 
         Ok(handle)

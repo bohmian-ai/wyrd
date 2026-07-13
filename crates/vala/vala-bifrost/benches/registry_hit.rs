@@ -72,13 +72,13 @@ fn bench_registry(c: &mut Criterion) {
 
     rt.block_on(async {
         writer_handle
-            .write(batch)
+            .commit_one(
+                fixture.tenant,
+                vec![batch],
+                vala_bifrost::writer::BifrostWriteContext::system(),
+            )
             .await
-            .expect("write invalidation batch");
-        writer_handle
-            .flush(vala_bifrost::writer::BifrostWriteContext::system())
-            .await
-            .expect("flush to bump epoch");
+            .expect("commit invalidation batch");
     });
 
     group.bench_function("miss_iceberg_reload", |b| {

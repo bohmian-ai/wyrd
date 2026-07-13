@@ -61,21 +61,23 @@ pub fn spawn_genai_derivation_worker(
             }
         };
 
-        let mut listener = loop {
-            match PgListener::connect_with(&pool).await {
-                Ok(mut listener) => match listener.listen("vala_commits").await {
-                    Ok(()) => break listener,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "genai derivation worker: commit listener setup failed, retrying");
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "genai derivation worker: commit listener connection failed, retrying");
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(mut listener) => match listener.listen("vala_commits").await {
+                Ok(()) => Some(listener),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "genai derivation worker: commit listener setup failed; using fallback only"
+                    );
+                    None
                 }
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "genai derivation worker: commit listener connection failed; using fallback only"
+                );
+                None
             }
         };
 
@@ -88,28 +90,46 @@ pub fn spawn_genai_derivation_worker(
         };
 
         loop {
-            tokio::select! {
-                () = shutdown.cancelled() => break,
-                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
-                    if let Err(e) = rt.run_tick().await {
-                        tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+            if let Some(active_listener) = listener.as_mut() {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
+                        if let Err(e) = rt.run_tick().await {
+                            tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+                        }
+                    }
+                    notification = active_listener.recv() => {
+                        match notification {
+                            Ok(notification) => {
+                                let Ok(CommitEvent::SpanCommitted { table_uid, .. }) =
+                                    serde_json::from_str::<CommitEvent>(notification.payload())
+                                else {
+                                    continue;
+                                };
+                                if table_uid != rt.uids.source {
+                                    continue;
+                                }
+                                if let Err(e) = rt.run_tick().await {
+                                    tracing::error!(error = %e, "genai derivation worker: notification tick failed");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "genai derivation worker: commit listener receive failed; using fallback only"
+                                );
+                                listener = None;
+                            }
+                        }
                     }
                 }
-                notification = listener.recv() => {
-                    let Ok(notification) = notification else {
-                        tracing::warn!("genai derivation worker: commit listener receive failed");
-                        continue;
-                    };
-                    let Ok(CommitEvent::SpanCommitted { table_uid, .. }) =
-                        serde_json::from_str::<CommitEvent>(notification.payload())
-                    else {
-                        continue;
-                    };
-                    if table_uid != rt.uids.source {
-                        continue;
-                    }
-                    if let Err(e) = rt.run_tick().await {
-                        tracing::error!(error = %e, "genai derivation worker: notification tick failed");
+            } else {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
+                        if let Err(e) = rt.run_tick().await {
+                            tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+                        }
                     }
                 }
             }

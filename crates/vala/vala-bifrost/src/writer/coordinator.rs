@@ -61,7 +61,7 @@ async fn emit_commit_events(
     notifier: &dyn CommitNotifier,
     table_uid: [u8; 16],
     committed: &[CommitKey],
-    table_fqn: &str,
+    _replayed: &[(CommitKey, i64)],
 ) {
     for key in committed {
         let event = CommitEvent::SpanCommitted {
@@ -69,9 +69,7 @@ async fn emit_commit_events(
             tenant: key.tenant,
             batch_id: key.batch_id,
         };
-        if let Err(error) = notifier.notify(event).await {
-            tracing::warn!(error = %error, table = %table_fqn, "commit notification failed");
-        }
+        notifier.notify(event).await;
     }
 }
 
@@ -264,7 +262,7 @@ struct GroupCommitActor {
     table_uid: TableUid,
     scope: TableScope,
     registry: Arc<Registry>,
-    commit_notifier: Arc<dyn CommitNotifier>,
+    notifier: Arc<dyn CommitNotifier>,
     payload_class: PayloadClass,
     sensitive_columns: &'static [&'static str],
     flush_policy: FlushPolicy,
@@ -442,10 +440,10 @@ impl GroupCommitActor {
                     self.invalidate_registry(&outcome.committed).await;
                 }
                 emit_commit_events(
-                    self.commit_notifier.as_ref(),
+                    self.notifier.as_ref(),
                     self.table_uid.0,
                     &outcome.committed,
-                    table_fqn,
+                    &outcome.replayed,
                 )
                 .await;
                 // key → covering snapshot: fresh keys share outcome.snapshot_id;
@@ -559,7 +557,7 @@ pub(crate) fn spawn_group_commit_coordinator_with_notifier(
         table_uid,
         scope,
         registry,
-        commit_notifier,
+        notifier: commit_notifier,
         payload_class,
         sensitive_columns,
         flush_policy,
@@ -584,9 +582,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use super::FlushPolicy;
-    use crate::error::BifrostError;
-    use crate::writer::{CommitEvent, CommitKey, CommitNotifier};
+    use super::{CommitEvent, CommitKey, CommitNotifier, FlushPolicy, emit_commit_events};
 
     #[derive(Clone, Default)]
     struct SpyNotifier {
@@ -595,12 +591,11 @@ mod tests {
 
     #[async_trait]
     impl CommitNotifier for SpyNotifier {
-        async fn notify(&self, event: CommitEvent) -> Result<(), BifrostError> {
+        async fn notify(&self, event: CommitEvent) {
             self.events
                 .lock()
                 .expect("spy mutex is not poisoned")
                 .push(event);
-            Ok(())
         }
     }
 
@@ -614,13 +609,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_notifier_emits_fresh_keys_once_and_replays_none() {
+    async fn notify_fires_once_per_committed_key() {
         let notifier = SpyNotifier::default();
         let table_uid = [7; 16];
         let key = CommitKey::new(wyrd_spec::ids::DataTenantId::new_v7(), [9; 16]);
 
-        super::emit_commit_events(&notifier, table_uid, &[key], "vala.traces.spans").await;
-        super::emit_commit_events(&notifier, table_uid, &[], "vala.traces.spans").await;
+        emit_commit_events(&notifier, table_uid, &[key], &[]).await;
+        emit_commit_events(&notifier, table_uid, &[], &[(key, 42)]).await;
 
         let events = notifier.events.lock().expect("spy mutex is not poisoned");
         assert_eq!(events.len(), 1);
@@ -631,6 +626,137 @@ mod tests {
                 tenant: key.tenant,
                 batch_id: key.batch_id,
             }
+        );
+    }
+}
+
+#[cfg(test)]
+mod pg_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use sqlx::postgres::PgListener;
+    use tempfile::tempdir;
+    use tokio::time::timeout;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_storage::settings::BackendConfig;
+
+    use super::{BifrostWriteContext, CommitEvent, TableScope};
+    use crate::catalog::WyrdCatalog;
+    use crate::catalog::namespaces::BifrostNamespace;
+
+    fn batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("coordinator test batch schema is valid")
+    }
+
+    fn context(tenant: DataTenantId, batch_id: [u8; 16]) -> BifrostWriteContext {
+        BifrostWriteContext {
+            batch_id,
+            origin: "coordinator-test".to_owned(),
+            actor: tenant.to_string(),
+            request_id: RequestId::now_v7(),
+            card_ref: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn coordinator_notifies_fresh_finalize_and_not_replay() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = Arc::new(fixture.app_pool().clone());
+        let storage = tempdir().expect("storage tempdir");
+        let backend = BackendConfig::Local {
+            root: storage.path().to_path_buf(),
+        };
+        let catalog = Arc::new(
+            WyrdCatalog::new(&fixture.catalog_uri(), &backend, pool.clone(), None)
+                .await
+                .expect("catalog"),
+        );
+        let tenant = fixture.data_tenant_id();
+        let table_name = "coordinator_notify";
+        let table_uid = catalog
+            .create_table(
+                BifrostNamespace::Bifrost,
+                table_name,
+                vec![Field::new("value", DataType::Int64, false)],
+                TableScope::TenantOwned,
+                tenant,
+                &[],
+                None,
+            )
+            .await
+            .expect("test table");
+
+        let mut listener = PgListener::connect_with(pool.as_ref())
+            .await
+            .expect("listener connection");
+        listener
+            .listen("vala_commits")
+            .await
+            .expect("listener setup");
+
+        let batch_id = [0x42; 16];
+        let writer = catalog
+            .writer(
+                BifrostNamespace::Bifrost,
+                table_name,
+                TableScope::TenantOwned,
+                tenant,
+            )
+            .await
+            .expect("writer");
+        writer
+            .commit_one(tenant, vec![batch()], context(tenant, batch_id))
+            .await
+            .expect("fresh commit");
+
+        let notification = timeout(Duration::from_secs(5), listener.recv())
+            .await
+            .expect("fresh notification arrives")
+            .expect("listener receives fresh notification");
+        let event: CommitEvent =
+            serde_json::from_str(notification.payload()).expect("notification decodes");
+        assert_eq!(
+            event,
+            CommitEvent::SpanCommitted {
+                table_uid: *table_uid.as_bytes(),
+                tenant,
+                batch_id,
+            }
+        );
+
+        let replay_writer = catalog
+            .writer(
+                BifrostNamespace::Bifrost,
+                table_name,
+                TableScope::TenantOwned,
+                tenant,
+            )
+            .await
+            .expect("replay writer");
+        replay_writer
+            .commit_one(tenant, vec![batch()], context(tenant, batch_id))
+            .await
+            .expect("replay commit");
+
+        assert!(
+            timeout(Duration::from_millis(250), listener.recv())
+                .await
+                .is_err(),
+            "replayed key must not emit a notification"
         );
     }
 }

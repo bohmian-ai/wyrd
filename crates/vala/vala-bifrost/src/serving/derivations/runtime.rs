@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
+use arrow::compute::concat_batches;
 use datafusion::common::TableReference;
 use datafusion::prelude::{col, lit};
 use datafusion::scalar::ScalarValue;
@@ -207,7 +209,7 @@ impl DerivationRuntime {
             .typed_writer::<MemoryTable>(TableScope::SystemShared, tenant)
             .await?;
 
-        let last_batch_id = self
+        let batch_result = self
             .process_batches(
                 tenant,
                 &unprocessed,
@@ -216,9 +218,21 @@ impl DerivationRuntime {
                 &tool_calls_handle,
                 &memory_handle,
             )
-            .await?;
+            .await;
 
-        // ── 7. Advance watermark to last processed batch ──────────────────
+        // ── 7. Extract the last fully-completed batch and any failure ─────
+        //
+        // `process_batches` returns the last batch_id that was FULLY written
+        // (all targets) plus any error that stopped the loop. We advance the
+        // watermark to the last successful batch even when an error occurred —
+        // that is safe because those batches completed. Then, if an error
+        // occurred, mark the derivation failed and propagate.
+        let (last_batch_id, batch_err) = match batch_result {
+            Ok(last) => (last, None),
+            Err((last, err)) => (last, Some(err)),
+        };
+
+        // ── 8. Advance watermark to last FULLY-completed batch ────────────
         if let Some(wm) = last_batch_id {
             let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
                 .await
@@ -233,9 +247,46 @@ impl DerivationRuntime {
             conn.commit().await.map_err(BifrostError::Sql)?;
         }
 
+        // ── 9. On failure: persist failed state, then surface the error ───
+        if let Some(err) = batch_err {
+            // Best-effort: if marking failed itself errors we still propagate
+            // the original batch error so the caller sees a real failure.
+            if let Ok(mut conn) = vala_sql::TenantConn::acquire(&self.pool, tenant).await {
+                let _ = vala_sql::queries::olap_derivations::mark_failed(
+                    &mut conn,
+                    &derivation_uid_bytes,
+                )
+                .await;
+                let _ = conn.commit().await;
+            }
+            tracing::error!(
+                tenant = %tenant,
+                error = %err,
+                "derivation: target write failed; derivation marked failed, watermark not advanced past failed batch"
+            );
+            return Err(err);
+        }
+
         Ok(())
     }
 
+    /// Process all unprocessed source batches for `tenant`.
+    ///
+    /// Returns `Ok(last_completed_batch_id)` when every batch was fully written.
+    /// Returns `Err((last_completed_batch_id, error))` when a target write fails:
+    /// `last_completed_batch_id` is the last batch that completed successfully
+    /// (all targets written, or an empty scan — both count as fully processed),
+    /// and the loop stops at the first failure so no batches after the failed one
+    /// are marked as complete.
+    ///
+    /// Fix 1 (fail-closed): a source position advances ONLY after every required
+    /// target write for that batch returns `Ok`. On failure the last fully-
+    /// completed batch id is returned so partial progress is preserved.
+    ///
+    /// Fix 2 (no chunk loss): DataFusion may split one logical source batch across
+    /// multiple physical `RecordBatch` chunks. We concatenate them into a single
+    /// batch before calling `derive`, so one deterministic `derived_batch_id` per
+    /// (source batch, target) covers all rows.
     async fn process_batches(
         &self,
         tenant: DataTenantId,
@@ -244,57 +295,96 @@ impl DerivationRuntime {
         embeddings_handle: &crate::writer::coordinator::GroupCommitHandle,
         tool_calls_handle: &crate::writer::coordinator::GroupCommitHandle,
         memory_handle: &crate::writer::coordinator::GroupCommitHandle,
-    ) -> Result<Option<[u8; 16]>, BifrostError> {
-        let mut last_batch_id = None;
+    ) -> Result<Option<[u8; 16]>, (Option<[u8; 16]>, BifrostError)> {
+        let mut last_completed: Option<[u8; 16]> = None;
+
         for batch in batches {
-            let batch_id: [u8; 16] = batch.batch_id.as_slice().try_into().map_err(|_| {
-                BifrostError::Internal("source batch_id length mismatch".to_string())
-            })?;
-            let source_records = self.scan_source_batch(tenant, &batch_id).await?;
-            for source_record in &source_records {
-                for db in self
-                    .derivation
-                    .derive(source_record, batch_id)
-                    .map_err(|e| BifrostError::Internal(format!("genai derivation failed: {e}")))?
-                {
-                    let target_uid = target_uid_for(db.target_name, &self.uids);
-                    let ctx = BifrostWriteContext {
-                        batch_id: GenAiFromSpans::derived_batch_id(
-                            &target_uid,
-                            &self.uids.source,
-                            &batch_id,
-                        ),
-                        origin: "derivation:genai".to_owned(),
-                        actor: "system".to_owned(),
-                        request_id: wyrd_spec::request_id::RequestId::now_v7(),
-                        card_ref: None,
-                    };
-                    let handle = match db.target_name {
-                        MessagesTable::NAME => messages_handle,
-                        EmbeddingsTable::NAME => embeddings_handle,
-                        ToolCallsTable::NAME => tool_calls_handle,
-                        MemoryTable::NAME => memory_handle,
-                        other => {
-                            tracing::warn!(
-                                target = other,
-                                "derivation: unknown target table — skipped"
-                            );
-                            continue;
-                        }
-                    };
-                    if let Err(error) = handle.write(tenant, vec![db.batch], ctx).await {
-                        tracing::error!(
-                            target = db.target_name,
-                            tenant = %tenant,
-                            error = %error,
-                            "derivation: target write failed"
-                        );
-                    }
-                }
+            let batch_id: [u8; 16] = batch
+                .batch_id
+                .as_slice()
+                .try_into()
+                .map_err(|_| {
+                    (
+                        last_completed,
+                        BifrostError::Internal("source batch_id length mismatch".to_string()),
+                    )
+                })?;
+
+            // ── Scan: collect all physical chunks for this source batch ───
+            let chunks = self
+                .scan_source_batch(tenant, &batch_id)
+                .await
+                .map_err(|e| (last_completed, e))?;
+
+            // ── Concatenate chunks into one logical batch (Fix 2) ─────────
+            // An empty scan (0 chunks, or chunks with 0 rows total) means this
+            // source batch produced no derived rows. Advance the watermark across
+            // it — it was fully "processed" — but skip writing any target commit.
+            let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+            if total_rows == 0 {
+                last_completed = Some(batch_id);
+                continue;
             }
-            last_batch_id = Some(batch_id);
+
+            // `concat_batches` requires a schema; all chunks share the source schema.
+            let schema = chunks[0].schema();
+            let source_batch = concat_batches(&schema, &chunks).map_err(|e| {
+                (
+                    last_completed,
+                    BifrostError::Internal(format!("concat source chunks failed: {e}")),
+                )
+            })?;
+
+            // ── Derive: exactly one call per source batch (Fix 2) ─────────
+            let derived = self
+                .derivation
+                .derive(&source_batch, batch_id)
+                .map_err(|e| {
+                    (
+                        last_completed,
+                        BifrostError::Internal(format!("genai derivation failed: {e}")),
+                    )
+                })?;
+
+            // ── Write each target; fail-closed on any error (Fix 1) ───────
+            for db in derived {
+                let target_uid = target_uid_for(db.target_name, &self.uids);
+                let ctx = BifrostWriteContext {
+                    batch_id: GenAiFromSpans::derived_batch_id(
+                        &target_uid,
+                        &self.uids.source,
+                        &batch_id,
+                    ),
+                    origin: "derivation:genai".to_owned(),
+                    actor: "system".to_owned(),
+                    request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                    card_ref: None,
+                };
+                let handle = match db.target_name {
+                    MessagesTable::NAME => messages_handle,
+                    EmbeddingsTable::NAME => embeddings_handle,
+                    ToolCallsTable::NAME => tool_calls_handle,
+                    MemoryTable::NAME => memory_handle,
+                    other => {
+                        tracing::warn!(
+                            target = other,
+                            "derivation: unknown target table — skipped"
+                        );
+                        continue;
+                    }
+                };
+                // Fail-closed: propagate the error rather than logging+continuing.
+                handle
+                    .write(tenant, vec![db.batch], ctx)
+                    .await
+                    .map_err(|e| (last_completed, e))?;
+            }
+
+            // All targets for this batch written — advance the completed cursor.
+            last_completed = Some(batch_id);
         }
-        Ok(last_batch_id)
+
+        Ok(last_completed)
     }
 
     /// Scan `traces.spans` for one `wyrd_batch_id` and one tenant.
@@ -306,7 +396,7 @@ impl DerivationRuntime {
         &self,
         tenant: DataTenantId,
         batch_id: &[u8; 16],
-    ) -> Result<Vec<arrow::array::RecordBatch>, BifrostError> {
+    ) -> Result<Vec<RecordBatch>, BifrostError> {
         let provider = match self
             .catalog
             .provider(BifrostNamespace::Traces, SpansTable::NAME, tenant)

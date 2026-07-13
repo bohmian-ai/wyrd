@@ -55,6 +55,30 @@ use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::state::AppState;
 
+/// The OTLP signal type handled by a specific export endpoint.
+///
+/// Used to derive the physical Bifrost table name for per-signal error messages
+/// so that `WriterBusy` / `WriterClosed` responses name the correct table
+/// (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) rather
+/// than always reporting the traces table.
+#[derive(Clone, Copy, Debug)]
+enum OtlpSignal {
+    Traces,
+    Metrics,
+    Logs,
+}
+
+impl OtlpSignal {
+    /// The fully-qualified Bifrost table name for this signal.
+    fn table(self) -> &'static str {
+        match self {
+            Self::Traces => "vala.traces.spans",
+            Self::Metrics => "vala.metrics.points",
+            Self::Logs => "vala.logs.records",
+        }
+    }
+}
+
 /// OTLP protobuf request/response content type.
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
 /// OTLP protobuf-JSON request/response content type.
@@ -178,13 +202,13 @@ async fn export_traces(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportTraceServiceRequest =
-        decode_request(encoding, &body).map_err(ingest_error_to_response)?;
+    let request: ExportTraceServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let auth = caller_auth_context(&caller);
 
     let outcome = vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request)
         .await
-        .map_err(ingest_error_to_response)?;
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
     tracing::Span::current().record("accepted_spans", outcome.accepted_spans);
     tracing::Span::current().record("rejected_spans", outcome.rejected_spans);
@@ -214,13 +238,13 @@ async fn export_metrics(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportMetricsServiceRequest =
-        decode_request(encoding, &body).map_err(ingest_error_to_response)?;
+    let request: ExportMetricsServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
     let auth = caller_auth_context(&caller);
 
     let outcome = vala_ingest::ingest_resource_metrics(&state.bifrost, &auth, request)
         .await
-        .map_err(ingest_error_to_response)?;
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
     tracing::Span::current().record("accepted_points", outcome.accepted_points);
     tracing::Span::current().record("rejected_points", outcome.rejected_points);
@@ -250,13 +274,13 @@ async fn export_logs(
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     tracing::Span::current().record("encoding", tracing::field::debug(encoding));
-    let request: ExportLogsServiceRequest =
-        decode_request(encoding, &body).map_err(ingest_error_to_response)?;
+    let request: ExportLogsServiceRequest = decode_request(encoding, &body)
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
     let auth = caller_auth_context(&caller);
 
     let outcome = vala_ingest::ingest_resource_logs(&state.bifrost, &auth, request)
         .await
-        .map_err(ingest_error_to_response)?;
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 
     tracing::Span::current().record("accepted_records", outcome.accepted_records);
     tracing::Span::current().record("rejected_records", outcome.rejected_records);
@@ -280,26 +304,30 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
     }
 }
 
-/// Map an [`IngestError`] onto its HTTP response.
+/// Map an [`IngestError`] onto its HTTP response for the given OTLP signal.
 ///
 /// Backpressure ([`IngestError::WriterBusy`]) becomes a retryable `503`, matching
 /// the OTLP/HTTP throttling contract (the gRPC edge maps the same condition to
-/// retryable `UNAVAILABLE`). Every other ingest error renders its stable
-/// `WYRD_VALA_*` [`WyrdError`] problem+json.
-fn ingest_error_to_response(error: IngestError) -> WyrdErrorResponse {
+/// retryable `UNAVAILABLE`). The `signal` parameter provides the per-endpoint
+/// physical table name so error messages name the correct target table rather
+/// than always reporting the traces table. Every other ingest error renders its
+/// stable `WYRD_VALA_*` [`WyrdError`] problem+json.
+fn ingest_error_to_response(error: IngestError, signal: OtlpSignal) -> WyrdErrorResponse {
     if matches!(error, IngestError::WriterBusy) {
         return WyrdErrorResponse::from(WyrdError::from(BifrostError::WriterUnavailable {
-            table: "vala.traces.spans".to_owned(),
+            table: signal.table().to_owned(),
         }));
     }
-    WyrdErrorResponse::from(ingest_error_to_wyrd(error))
+    WyrdErrorResponse::from(ingest_error_to_wyrd(error, signal))
 }
 
 /// Map a non-backpressure [`IngestError`] onto its stable [`WyrdError`].
 ///
 /// Preserves the `WYRD_VALA_*` / `WYRD_PERMISSION_*` code and HTTP status the
-/// gRPC path already publishes for each condition.
-fn ingest_error_to_wyrd(error: IngestError) -> WyrdError {
+/// gRPC path already publishes for each condition. The `signal` parameter
+/// provides the per-endpoint physical table name for writer-availability and
+/// decode errors so each OTLP endpoint reports its own table in error messages.
+fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
     match error {
         IngestError::Unauthenticated(message) => WyrdError::Unauthenticated {
             message,
@@ -326,14 +354,21 @@ fn ingest_error_to_wyrd(error: IngestError) -> WyrdError {
             WyrdError::from(BifrostError::FingerprintMismatch { table })
         }
         IngestError::WriterClosed => WyrdError::from(BifrostError::WriterUnavailable {
-            table: "vala.traces.spans".to_owned(),
+            table: signal.table().to_owned(),
         }),
+        // A malformed OTLP request body (bad protobuf or invalid JSON) is a
+        // permanent client-side error. Map to the dedicated OTLP-request-validation
+        // code (HTTP 400) — NOT to QueryInvalidSql, which is reserved for SQL query
+        // validation failures and would give the client a nonsense remediation.
         IngestError::StreamProtocolViolation(detail) | IngestError::Decode(detail) => {
-            WyrdError::from(BifrostError::QueryInvalidSql { detail })
+            WyrdError::from(BifrostError::OtlpRequestMalformed {
+                table: signal.table().to_owned(),
+                detail,
+            })
         }
         // Backpressure is handled by ingest_error_to_response before this point.
-        IngestError::WriterBusy => WyrdError::from(BifrostError::IngestBusy {
-            table: "vala.traces.spans".to_owned(),
+        IngestError::WriterBusy => WyrdError::from(BifrostError::WriterUnavailable {
+            table: signal.table().to_owned(),
         }),
         other => WyrdError::from(BifrostError::Internal {
             detail: other.to_string(),
@@ -343,9 +378,10 @@ fn ingest_error_to_wyrd(error: IngestError) -> WyrdError {
 
 #[cfg(test)]
 mod tests {
-    use super::{OtlpEncoding, ingest_error_to_response};
+    use super::{OtlpEncoding, OtlpSignal, ingest_error_to_response, ingest_error_to_wyrd};
     use axum::http::{HeaderMap, StatusCode, header};
     use vala_ingest::IngestError;
+    use wyrd_spec::vala::error::BifrostError;
 
     fn headers_with(content_type: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -401,7 +437,7 @@ mod tests {
     // collector's unit test for `WriterBusy → UNAVAILABLE`).
     #[test]
     fn writer_busy_maps_to_503() {
-        let response = ingest_error_to_response(IngestError::WriterBusy);
+        let response = ingest_error_to_response(IngestError::WriterBusy, OtlpSignal::Traces);
         let status = axum::response::IntoResponse::into_response(response).status();
         assert_eq!(
             status,
@@ -411,11 +447,106 @@ mod tests {
     }
 
     #[test]
+    fn writer_busy_table_name_is_per_signal() {
+        // WriterClosed must report the correct physical table for each OTLP signal.
+        for (signal, expected_table) in [
+            (OtlpSignal::Traces, "vala.traces.spans"),
+            (OtlpSignal::Metrics, "vala.metrics.points"),
+            (OtlpSignal::Logs, "vala.logs.records"),
+        ] {
+            let wyrd_err = ingest_error_to_wyrd(IngestError::WriterClosed, signal);
+            match wyrd_err {
+                wyrd_spec::error::WyrdError::Vala {
+                    error: BifrostError::WriterUnavailable { table },
+                } => {
+                    assert_eq!(table, expected_table, "signal {signal:?} must name its own table");
+                }
+                other => panic!("expected WriterUnavailable, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn table_not_found_maps_to_404() {
-        let response = ingest_error_to_response(IngestError::TableNotFound {
-            table: "vala.traces.spans".to_owned(),
-        });
+        let response = ingest_error_to_response(
+            IngestError::TableNotFound {
+                table: "vala.traces.spans".to_owned(),
+            },
+            OtlpSignal::Traces,
+        );
         let status = axum::response::IntoResponse::into_response(response).status();
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn decode_error_maps_to_400_not_sql_error() {
+        // A malformed OTLP body must map to WYRD_VALA_400_OTLP_REQUEST_MALFORMED
+        // (HTTP 400), NOT to QueryInvalidSql. OTLP clients must not receive a
+        // "invalid SQL query" remediation when they sent a bad protobuf payload.
+        for (variant, label) in [
+            (
+                IngestError::Decode("OTLP protobuf decode failed: eof".to_owned()),
+                "Decode",
+            ),
+            (
+                IngestError::StreamProtocolViolation("mismatched batch_id".to_owned()),
+                "StreamProtocolViolation",
+            ),
+        ] {
+            let wyrd_err = ingest_error_to_wyrd(variant, OtlpSignal::Traces);
+            match &wyrd_err {
+                wyrd_spec::error::WyrdError::Vala {
+                    error: BifrostError::OtlpRequestMalformed { table, .. },
+                } => {
+                    assert_eq!(table, "vala.traces.spans", "{label}: must name the traces table");
+                }
+                other => panic!("{label}: expected OtlpRequestMalformed, got {other:?}"),
+            }
+            // Confirm HTTP 400 via the WyrdError status accessor.
+            assert_eq!(
+                wyrd_err.status(),
+                400,
+                "{label}: malformed OTLP body must be HTTP 400"
+            );
+            // Confirm the code is NOT the SQL code.
+            assert_ne!(
+                wyrd_err.code(),
+                "WYRD_VALA_400_QUERY_INVALID_SQL",
+                "{label}: must not return the SQL error code for an OTLP decode failure"
+            );
+            assert_eq!(
+                wyrd_err.code(),
+                "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+                "{label}: must return the OTLP-specific 400 code"
+            );
+        }
+    }
+
+    #[test]
+    fn metrics_decode_error_names_metrics_table() {
+        let wyrd_err =
+            ingest_error_to_wyrd(IngestError::Decode("bad bytes".to_owned()), OtlpSignal::Metrics);
+        match wyrd_err {
+            wyrd_spec::error::WyrdError::Vala {
+                error: BifrostError::OtlpRequestMalformed { table, .. },
+            } => {
+                assert_eq!(table, "vala.metrics.points");
+            }
+            other => panic!("expected OtlpRequestMalformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn logs_decode_error_names_logs_table() {
+        let wyrd_err =
+            ingest_error_to_wyrd(IngestError::Decode("bad bytes".to_owned()), OtlpSignal::Logs);
+        match wyrd_err {
+            wyrd_spec::error::WyrdError::Vala {
+                error: BifrostError::OtlpRequestMalformed { table, .. },
+            } => {
+                assert_eq!(table, "vala.logs.records");
+            }
+            other => panic!("expected OtlpRequestMalformed, got {other:?}"),
+        }
     }
 }

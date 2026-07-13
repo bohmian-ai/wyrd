@@ -21,11 +21,14 @@ use crate::error::BifrostError;
 use crate::tables::genai::{DomainDerivation, GenAiFromSpans};
 use crate::writer::CommitEvent;
 
-/// Repair-worker poll cadence for the background genai derivation worker.
+/// Fallback poll cadence for the background genai derivation worker.
 ///
-/// The inline path (OTLP collector → derive on arrival) is the primary write
-/// path. This tick only fires for crash recovery: spans committed but genai
-/// rows not yet written because the server restarted between the two writes.
+/// The derivation worker is now the ONLY derivation path. It is driven
+/// primarily by PostgreSQL `NOTIFY` wakeups on the `vala_commits` channel,
+/// emitted immediately after each committed source span batch. This periodic
+/// tick is the fallback for missed notifications (listener disconnected, server
+/// restarted before a `NOTIFY` was processed) and crash recovery (spans
+/// committed but genai rows not yet derived because the server restarted).
 /// 60 s gives bounded lag without hammering Iceberg scans in steady state.
 pub const FALLBACK_CADENCE_SECS: u64 = 60;
 

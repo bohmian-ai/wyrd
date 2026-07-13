@@ -301,6 +301,36 @@ pub async fn select_derivation_candidates(
     .map_err(SqlError::from)
 }
 
+/// Flip a derivation into the `failed` health state.
+///
+/// Called when a target write fails and the derivation tick cannot complete.
+/// Sets `derivation_state = 'failed'` and stamps `updated_at`. The watermark
+/// is NOT advanced — the next tick will retry from the same position. Returns
+/// `true` when a row was updated, `false` when the derivation row does not
+/// exist for the current tenant.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn mark_failed(
+    conn: &mut TenantConn<'_>,
+    derivation_uid: &[u8; 16],
+) -> Result<bool, SqlError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE vala.olap_derivations
+           SET derivation_state = 'failed',
+               updated_at       = now()
+         WHERE derivation_uid   = $1
+        "#,
+    )
+    .bind(derivation_uid.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(result.rows_affected() > 0)
+}
+
 /// Return the pinned watermark for a derivation: the position from which the
 /// worker should read next.
 ///

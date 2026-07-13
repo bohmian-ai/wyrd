@@ -3,6 +3,12 @@
 //! The source commit is made while no derivation worker is running, so its
 //! `NOTIFY` is missed. A fresh worker then recovers the source through its
 //! fallback tick, which runs in virtual time here so the journey stays fast.
+//!
+//! Source-first lifecycle assertions:
+//! - The source span commits successfully with no worker present.
+//! - The derivation worker (started after) recovers on the first fallback tick.
+//! - A second fallback tick (replay) produces no duplicate target rows — the
+//!   derived_batch_id dedup at the coordinator level is idempotent.
 
 mod pg_tests {
     use std::time::Duration;
@@ -76,55 +82,7 @@ mod pg_tests {
         }
     }
 
-    #[tokio::test]
-    async fn genai_derivation_recovers_missed_notify_after_restart() {
-        let srv = WyrdTestServer::start_in_process()
-            .await
-            .expect("in-process server");
-
-        let jwt = match srv
-            .bootstrap_user("genai-recovery-writer", &["admin"])
-            .await
-            .expect("bootstrap user")
-        {
-            Bootstrap::User { jwt, .. } => jwt,
-            other => panic!("expected user bootstrap, got {other:?}"),
-        };
-
-        // No worker is started by start_in_process. The export commits the
-        // source span and publishes NOTIFY while no listener exists.
-        let export = Request::builder()
-            .method("POST")
-            .uri("/v1/traces")
-            .header("content-type", "application/x-protobuf")
-            .body(Body::from(export_request().encode_to_vec()))
-            .expect("export request");
-        let response = srv
-            .oneshot_authenticated(&jwt, export)
-            .await
-            .expect("OTLP export request");
-        assert_eq!(response.status(), 200, "source commit must succeed");
-
-        tokio::time::pause();
-        let shutdown = CancellationToken::new();
-        let worker = vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
-            srv.state().bifrost.clone(),
-            srv.app_pool(),
-            srv.state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool for derivation worker"),
-            shutdown.clone(),
-        );
-
-        // Let the restarted worker finish table/listener setup, then elapse a
-        // full fallback cadence. The missed NOTIFY cannot trigger this path.
-        for _ in 0..=61 {
-            tokio::time::advance(Duration::from_secs(1)).await;
-            tokio::task::yield_now().await;
-        }
-        tokio::time::resume();
-
+    async fn query_genai(srv: &WyrdTestServer, jwt: &str) -> serde_json::Value {
         let query = Request::builder()
             .method("POST")
             .uri("/v1/genai/query")
@@ -145,7 +103,7 @@ mod pg_tests {
             ))
             .expect("query request");
         let response = srv
-            .oneshot_authenticated(&jwt, query)
+            .oneshot_authenticated(jwt, query)
             .await
             .expect("genai query request");
         let status = response.status();
@@ -153,13 +111,100 @@ mod pg_tests {
             .await
             .expect("genai query body");
         assert_eq!(status, 200, "genai query must succeed: {body:?}");
-        let value: serde_json::Value =
-            serde_json::from_slice(&body).expect("genai query response JSON");
+        serde_json::from_slice(&body).expect("genai query response JSON")
+    }
+
+    #[tokio::test]
+    async fn genai_derivation_recovers_missed_notify_after_restart() {
+        let srv = WyrdTestServer::start_in_process()
+            .await
+            .expect("in-process server");
+
+        let jwt = match srv
+            .bootstrap_user("genai-recovery-writer", &["admin"])
+            .await
+            .expect("bootstrap user")
+        {
+            Bootstrap::User { jwt, .. } => jwt,
+            other => panic!("expected user bootstrap, got {other:?}"),
+        };
+
+        // ── Source-first: commit the span with NO worker running ──────────
+        // The NOTIFY is missed. The collector must NOT inline-derive — after the
+        // export succeeds the target table must still be empty.
+        let export = Request::builder()
+            .method("POST")
+            .uri("/v1/traces")
+            .header("content-type", "application/x-protobuf")
+            .body(Body::from(export_request().encode_to_vec()))
+            .expect("export request");
+        let response = srv
+            .oneshot_authenticated(&jwt, export)
+            .await
+            .expect("OTLP export request");
+        assert_eq!(response.status(), 200, "source commit must succeed");
+
+        // ── No inline derivation: target table must be empty now ──────────
+        {
+            let value = query_genai(&srv, &jwt).await;
+            let rows = value["rows"].as_array().expect("rows array");
+            assert!(
+                rows.is_empty(),
+                "target table must be empty before worker runs (no inline derivation): {value}"
+            );
+        }
+
+        // ── Start worker in virtual time; advance past one fallback cadence ─
+        tokio::time::pause();
+        let shutdown = CancellationToken::new();
+        let worker = vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
+            srv.state().bifrost.clone(),
+            srv.app_pool(),
+            srv.state()
+                .postgres
+                .operator_pool()
+                .expect("operator pool for derivation worker"),
+            shutdown.clone(),
+        );
+
+        // Let the restarted worker finish table/listener setup, then elapse a
+        // full fallback cadence. The missed NOTIFY cannot trigger this path.
+        for _ in 0..=61 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        // ── Recovery: worker tick must materialise the missed source batch ─
+        let value = query_genai(&srv, &jwt).await;
+        let rows = value["rows"].as_array().expect("rows array");
         assert!(
-            value["rows"]
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|row| row["model"] == "recovery-model")),
+            rows.iter().any(|row| row["model"] == "recovery-model"),
             "fallback recovery must materialize the missed GenAI source commit: {value}"
+        );
+        let count_after_first_tick = rows
+            .iter()
+            .filter(|row| row["model"] == "recovery-model")
+            .count();
+
+        // ── Replay: advance another full cadence; watermark advanced so the
+        //    worker must NOT produce duplicate rows. ──────────────────────────
+        tokio::time::pause();
+        for _ in 0..=61 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+
+        let value2 = query_genai(&srv, &jwt).await;
+        let rows2 = value2["rows"].as_array().expect("rows array after replay");
+        let count_after_replay = rows2
+            .iter()
+            .filter(|row| row["model"] == "recovery-model")
+            .count();
+        assert_eq!(
+            count_after_first_tick, count_after_replay,
+            "replay tick must not produce duplicate rows: before={count_after_first_tick} after={count_after_replay}"
         );
 
         shutdown.cancel();

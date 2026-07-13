@@ -302,8 +302,7 @@ fn ingest_error_to_wyrd(error: IngestError) -> WyrdError {
         IngestError::SystemTableWriteDenied { table } => {
             WyrdError::from(BifrostError::CardScopeDenied { card_ref: table })
         }
-        IngestError::CardScopeDenied { card_ref }
-        | IngestError::CardUnresolved { card_ref } => {
+        IngestError::CardScopeDenied { card_ref } | IngestError::CardUnresolved { card_ref } => {
             WyrdError::from(BifrostError::CardScopeDenied { card_ref })
         }
         IngestError::TableNotFound { table } => {

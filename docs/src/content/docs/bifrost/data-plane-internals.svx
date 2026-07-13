@@ -1,0 +1,197 @@
+---
+title: Data plane internals
+description: How Bifrost commits writes, recovers from writer failures, seals the audit chain, and enforces privilege separation across its three database pools.
+pillar: wyrd
+group: Bifrost
+order: 8
+---
+
+# Data plane internals
+
+This document covers the parts of Bifrost that are invisible to a normal caller but matter for operational correctness, security review, and incident investigation: the group-commit write path, the precommit recovery FSM, the audit sealing pipeline, and the database privilege model.
+
+The write surface is described in [Writing data](./writing-data). This document is the internals view.
+
+## Write path
+
+Every write enters as an Arrow `RecordBatch` through `BifrostIngestService` and ends as an Iceberg snapshot on object storage. The path has four stages.
+
+```
+[SDK / gRPC client]
+        │ Arrow IPC stream (one batch per write unit)
+        ▼
+[BifrostIngestService]
+        │ schema fingerprint check (rejects mismatch → 400)
+        │ system column stamp (data_tenant_id, wyrd_ingested_at, …)
+        │ redaction (zero sensitive fields if tenant policy requires)
+        ▼
+[GroupCommitHandle.send_write()]  ← returns a oneshot receiver
+        │ bounded mpsc channel (backpressure → IngestBusy 429)
+        ▼
+[GroupCommitActor]  ← one actor per physical Iceberg table
+        │ buffers writes from multiple tenants
+        │ flushes when any trigger fires:
+        │   • row count ≥ 50 000
+        │   • wall time ≥ 1 s (MissedTickBehavior::Delay)
+        │   • buffered bytes ≥ 128 MiB
+        │   • channel closed (actor draining)
+        ▼
+[run_group_commit()]
+        │ Postgres: INSERT INTO vala.olap_commits (state='precommit')
+        │ Iceberg: fast_append (one call per chunk of ≤ 128 commit keys)
+        │   └─ stamps snapshot property wyrd_commit_keys =
+        │        [{data_tenant_id, batch_id}, …]
+        │ Postgres: UPDATE olap_commits SET state='committed'
+        │ audit outbox: append hash-chained row per ingest operation
+        ▼
+[oneshot reply → caller]  ← snapshot_id on success
+```
+
+The `wyrd_commit_keys` snapshot property is the authoritative record of which `{data_tenant_id, batch_id}` pairs landed in which Iceberg snapshot. The recovery sweep reads this to determine whether a precommit actually made it to object storage.
+
+On `SystemShared` tables (for example, `vala.system.audit_log`), multiple tenants write to the same physical Iceberg table. The `wyrd_commit_keys` set in each snapshot can carry commit keys from several tenants. The `data_tenant_id` column enforces read-time isolation through the `TenantPredicateRule` DataFusion analyzer.
+
+## The `olap_commits` state machine
+
+Every write unit has a row in `vala.olap_commits` tracking its lifecycle. The FSM has four states.
+
+```
+                writer crash between precommit
+                and fast_append → row stays here
+                        │
+  write starts          ▼
+  ──────────► precommit ──── fast_append succeeds ──► committed (terminal)
+                  │
+                  ├── recovery oracle: snapshot absent ──► aborted  (terminal)
+                  │
+                  └── recovery oracle: Iceberg error  ──► (stays precommit,
+                                                            recovery_attempts++)
+                                                            → stuck after 5
+```
+
+`committed` and `aborted` are terminal states. A row in `precommit` with an expired writer lease (or no lease at all) is eligible for the recovery sweep. `failed` is a legacy state that predates the recovery sweep and is not produced by the current write path.
+
+`recovery_attempts` increments each time the recovery sweep processes the row and encounters an oracle error. At 5 attempts the row emits a `recovery_stuck` tracing event and the sweep stops touching it. A human must inspect and manually resolve stuck rows.
+
+## Recovery sweep
+
+Writer pods can crash between recording `state='precommit'` and landing the Iceberg `fast_append`. The recovery sweep resolves these orphan rows every 60 seconds.
+
+```
+Tokio interval (60 s, MissedTickBehavior::Delay)
+        │
+        ▼
+claim_stale_precommits(owner, limit)
+        │ SECURITY DEFINER, owned by vala_recovery_owner (BYPASSRLS)
+        │ called on the recovery pool (vala_recovery role)
+        │ atomically:
+        │   SELECT … FOR UPDATE SKIP LOCKED
+        │   UPDATE SET recovery_fencing_token = nextval(recovery_fencing_seq)
+        │            , recovery_owner = $owner
+        │   RETURNING …, recovery_attempts
+        │
+        ▼ Vec<ClaimedRow>
+        │
+        ├─ recovery_attempts ≥ 5 → log recovery_stuck, skip row
+        │
+        └─ oracle_check(row):
+                │ BifrostNamespace::split_fqn(row.fqn)
+                │   → (namespace, table_name)
+                │ WyrdCatalog.get(ns, table_name, scope.control_bind(tenant))
+                │   → Iceberg table metadata (all snapshots)
+                │ decide_recovery(table, data_tenant_id, batch_id):
+                │   scan every snapshot's wyrd_commit_keys
+                │   → Committed(snapshot_id) if pair found
+                │   → Aborted              if pair absent from all snapshots
+                │
+                ├─ Committed(snapshot_id)
+                │       └─ finalize_recovered_committed(table_uid, batch_id,
+                │                                       snapshot_id, token)
+                │              WHERE recovery_fencing_token = token  ← CAS
+                │
+                ├─ Aborted
+                │       └─ finalize_recovered_aborted(table_uid, batch_id,
+                │                                     token, reason)
+                │              WHERE recovery_fencing_token = token  ← CAS
+                │
+                └─ error
+                        └─ mark_recovery_scan_failed(…, token, error)
+                               audit INSERT first, then clear token
+                               so row becomes re-claimable next tick
+```
+
+The `recovery_fencing_token` is a monotonically increasing integer from `vala.recovery_fencing_seq`. Two concurrent sweep instances cannot both finalize the same row: the first one to call `finalize_recovered_committed` sets `state='committed'` via `WHERE recovery_fencing_token = token`; the second finds no matching row and returns without writing.
+
+The audit INSERT inside each finalization routine is also scoped by `recovery_fencing_token`. On `SystemShared` tables, two tenants can share the same `(table_uid, batch_id)` combination. Without the token scope, the audit read would return both tenants' rows and insert duplicate recovery events for the wrong tenant. The token is globally unique per claimed row, so scoping by it reads exactly one row.
+
+## Audit sealing
+
+Every write operation appends a row to the hash-chained audit outbox in Postgres. The audit relay ships those rows to the `vala.system.audit_log` Iceberg table. The seal worker then signs the shipped history so it cannot be modified retroactively without detection.
+
+```
+[vala.audit_outbox (Postgres)]
+        │ hash chain: entry_hash = SHA-256(prev_hash ‖ seq ‖ content_fields)
+        ▼
+[AuditRelay.tick()]
+        │ reads unshipped rows, appends to Iceberg audit_log table
+        │ marks rows shipped, records seq and entry_hash
+        ▼
+[seal_shipped_range() — 60 s interval]
+        │ latest_sealed_seq_hi()   → last checkpoint's seq_hi (0 if none)
+        │ shipped_outbox_refs_after(seq_hi)  → unsealed tail only
+        │ compute_range_hash(seq_lo, seq_hi, [entry_hash_0, …])
+        │   SHA-256( seq_lo ‖ seq_hi ‖ entry_hash_0 ‖ … ‖ entry_hash_n )
+        │ AuditSealKey.sign(range_hash)   → Ed25519 signature
+        │ UPSERT vala.audit_seal_checkpoints (seq_lo, seq_hi, hash, sig)
+        ▼
+[verify_checkpoint_walk()]
+        │ reads audit_seal_checkpoints ordered by seq_lo
+        │ for each checkpoint:
+        │   recompute every entry_hash from warehouse content columns
+        │     (NOT the stored entry_hash column — that column is untrusted)
+        │   recompute range_hash from recomputed hashes
+        │   AuditSealKey.verify(range_hash, signature)
+        │
+        ├─ all checkpoints verify, no shipped rows beyond last checkpoint
+        │       → VerifyOutcome::Clean
+        │
+        ├─ recomputed hash ≠ signed hash for a checkpoint
+        │       → VerifyOutcome::Tampered { seq_lo, seq_hi }
+        │
+        └─ shipped rows exist beyond the last checkpoint
+                → VerifyOutcome::Gap
+```
+
+The verifier deliberately ignores the `entry_hash` column stored in the Iceberg table. An attacker who can write to object storage could modify both a row's content and its stored `entry_hash` column simultaneously. Recomputing hashes from the content columns themselves makes that attack detectable: the recomputed hash will diverge from what the seal key signed.
+
+`VerifyOutcome::Gap` does not mean tampering. It means rows were shipped after the last seal pass ran. The seal worker runs every 60 seconds; a gap is normal between seal ticks.
+
+## Database privilege model
+
+Bifrost uses three database pools, each connecting as a different Postgres role with different privilege levels.
+
+| Pool | Connecting role | RLS | Purpose |
+|---|---|---|---|
+| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | All tenant data reads and writes from the server |
+| Recovery pool | `vala_recovery` | Not BYPASSRLS | Recovery sweep: calls SECURITY DEFINER routines only |
+| Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (maintenance leases) |
+
+A few things worth being explicit about for audit purposes.
+
+`vala_recovery` is NOT BYPASSRLS. The recovery pool executes `vala.claim_stale_precommits`, `vala.finalize_recovered_committed`, `vala.finalize_recovered_aborted`, and `vala.mark_recovery_scan_failed` as SQL calls. Those functions are owned by `vala_recovery_owner`, which is BYPASSRLS, and are declared `SECURITY DEFINER`. The functions execute under `vala_recovery_owner`'s privileges; the connection itself connects as `vala_recovery`. If anyone attempts a direct `SELECT` or `UPDATE` on `vala.olap_commits` from the recovery pool outside of these SECURITY DEFINER routines, the RLS policy (`wyrd.current_tenant()`) will reject the query. There is no `SET app.current_tenant` in effect on the recovery pool.
+
+The `OperatorPool` (`wyrd_platform_admin`, BYPASSRLS) is the sole path to tables that are intentionally cross-tenant by design. `vala.maintenance_leases` is the only such table currently. All other `vala.*` tables are RLS-enforced. The `check:tenant-isolation` CI script enforces this: any new query module against a non-RLS table that is not in `VALA_NON_RLS_CONTROL_TABLES` and not using `OperatorPool` will fail the check.
+
+The app pool enforces tenant isolation via a Postgres RLS policy on every table. The policy calls `wyrd.current_tenant()`, which reads `current_setting('app.current_tenant')`. `TenantConn::acquire` sets this parameter at connection acquisition; any query on an `wyrd_app` connection without a tenant bound will fail the policy check.
+
+## Failure modes
+
+**`IngestBusy` (429)**: the group-commit actor's inbound channel is full. This is a backpressure signal, not a data loss event. The write was never recorded in `olap_commits`. Callers should retry with exponential backoff.
+
+**Writer crash after precommit, before fast_append**: the row stays in `precommit`. The recovery sweep will claim it within 60 seconds (plus the lease expiry window) and run the oracle check. If the `fast_append` never happened, `decide_recovery` finds no matching snapshot and marks the row `aborted`. The caller's idempotent retry (same `batch_id`) will then succeed as a new write.
+
+**Writer crash after fast_append, before `committed` update**: the recovery sweep runs `decide_recovery`, finds the `{data_tenant_id, batch_id}` pair in a snapshot's `wyrd_commit_keys`, and calls `finalize_recovered_committed`. The data is already in Iceberg; recovery just updates the FSM to reflect that.
+
+**Oracle error during recovery**: the row stays in `precommit`, the error is recorded in `recovery_last_error`, and `recovery_attempts` increments. At 5 attempts the row emits `recovery_stuck`. The data is still in its last known state; no data has been modified by the failed oracle call.
+
+**Seal worker not running**: shipped rows accumulate as a gap. `verify_checkpoint_walk` returns `VerifyOutcome::Gap`. No data is lost or corrupted; only the signed coverage window is smaller than expected.

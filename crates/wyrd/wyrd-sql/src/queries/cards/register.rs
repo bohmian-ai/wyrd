@@ -7,7 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use ulid::Ulid;
 use uuid::Uuid;
 
 use wyrd_runtime::principal::{Principal, PrincipalId};
@@ -18,16 +17,14 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::request_id::RequestId;
 
-use crate::queries::cards::audit::record_card_registration_audit;
+use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
 use crate::queries::cards::auth_projection::{
     lookup_existing_principal_id, upsert_service_account_from_card,
 };
 use crate::queries::cards::version_resolve::{Resolution, resolve_version};
 use crate::queries::cards::version_sql::lock_version_line;
-use crate::row_types::cards::{
-    CardRegistrationOperation, CardRegistrationOutcome, NewAuditCardRegistrationRow,
-};
 use crate::tenant_conn::TenantConn;
+use wyrd_spec::vala::audit_detail::{CardRegistrationOperation, CardRegistrationOutcome};
 
 /// Maximum canonical-JSON byte size for a single `Spec`.
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
@@ -485,12 +482,7 @@ async fn handle_conflict(
     })
 }
 
-/// Build and write the audit row for a registration event.
-///
-/// Thin wrapper that assembles a [`NewAuditCardRegistrationRow`] from the
-/// parts available at the call site and delegates to
-/// [`record_card_registration_audit`]. Always writes a `Register` operation
-/// row; `Update` and `Delete` audit rows are written by other callers.
+/// Build and write the typed audit event for a registration event.
 async fn record_registration_audit(
     conn: &mut TenantConn<'_>,
     req: &RegisterCardRequest<'_>,
@@ -500,18 +492,15 @@ async fn record_registration_audit(
 ) -> Result<(), WyrdError> {
     record_card_registration_audit(
         conn,
-        NewAuditCardRegistrationRow {
-            audit_id: Uuid::from_bytes(Ulid::new().to_bytes()),
-            data_tenant_id: conn.data_tenant_id().as_uuid(),
+        CardRegistrationAuditInput {
             card_uid,
-            kind: req.card.kind.clone(),
+            card_kind: req.card.kind.clone(),
             operation: CardRegistrationOperation::Register,
             outcome: Some(outcome),
-            actor_principal_id: req.actor.id,
-            actor_kind: req.actor.kind.clone(),
+            actor: req.actor,
             before_spec_hash: None,
             after_spec_hash: Some(spec_hash),
-            request_id: req.request_id.map(RequestId::as_str),
+            request_id: req.request_id,
         },
     )
     .await

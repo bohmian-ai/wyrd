@@ -82,6 +82,18 @@ impl TestEnv {
             PermissionSet::new(),
         )
     }
+
+    pub async fn set_card_audit_insert_enabled(&self, enabled: bool) {
+        let statement = if enabled {
+            "GRANT INSERT ON vala.audit_outbox TO wyrd_app"
+        } else {
+            "REVOKE INSERT ON vala.audit_outbox FROM wyrd_app"
+        };
+        sqlx::query(statement)
+            .execute(&self.pool)
+            .await
+            .expect("set card audit insert privilege");
+    }
 }
 
 pub fn fixture_card(kind: CardKind, space: &str, name: &str, version: &str) -> Card {

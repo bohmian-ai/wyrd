@@ -1,4 +1,4 @@
-//! Row mirrors for `wyrd.cards` and `wyrd.audit_card_registration`.
+//! Row mirrors for `wyrd.cards`.
 #![deny(missing_docs)]
 
 use chrono::{DateTime, Utc};
@@ -7,7 +7,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 use wyrd_semver::VersionBlock;
 
-use wyrd_runtime::principal::{PrincipalId, PrincipalKind};
+use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::metadata::{Annotations, Labels};
@@ -192,121 +192,6 @@ impl CardStatus {
     }
 }
 
-/// `wyrd.audit_card_registration` read row.
-#[derive(Debug, Clone, FromRow, Serialize)]
-pub struct AuditCardRegistrationRow {
-    /// ULID-as-UUID audit identifier (PK).
-    pub audit_id: Uuid,
-    /// Tenant isolation key.
-    pub data_tenant_id: Uuid,
-    /// Card UID this audit row references.
-    pub card_uid: Uuid,
-    /// Card kind wire string at the time of the operation.
-    pub kind: String,
-    /// Operation literal (`"register"`, `"update"`, `"delete"`).
-    pub operation: String,
-    /// Outcome literal for registration rows.
-    pub outcome: Option<String>,
-    /// Acting principal UUID.
-    pub actor_principal_id: Uuid,
-    /// Principal kind discriminator (`"user"`, `"service"`, `"agent"`).
-    pub actor_kind: String,
-    /// Spec hash before the operation (null on register).
-    pub before_spec_hash: Option<String>,
-    /// Spec hash after the operation (null on delete).
-    pub after_spec_hash: Option<String>,
-    /// Request correlation ULID-text from the request context.
-    pub request_id: Option<String>,
-    /// Operation timestamp.
-    pub occurred_at: DateTime<Utc>,
-}
-
-/// Borrowed insert payload for the audit writer.
-pub struct NewAuditCardRegistrationRow<'a> {
-    /// Pre-minted ULID-as-UUID audit identifier.
-    pub audit_id: Uuid,
-    /// Tenant isolation key.
-    pub data_tenant_id: Uuid,
-    /// Card UID this audit row references.
-    pub card_uid: &'a CardUid,
-    /// Card kind discriminator.
-    pub kind: CardKind,
-    /// Operation discriminator.
-    pub operation: CardRegistrationOperation,
-    /// Outcome discriminator for registration rows.
-    pub outcome: Option<CardRegistrationOutcome>,
-    /// Acting principal id.
-    pub actor_principal_id: PrincipalId,
-    /// Acting principal kind (User / Service / Agent).
-    pub actor_kind: PrincipalKind,
-    /// Spec hash before the operation (null on register).
-    pub before_spec_hash: Option<&'a str>,
-    /// Spec hash after the operation (null on delete).
-    pub after_spec_hash: Option<&'a str>,
-    /// Request correlation ULID-text from the request context.
-    pub request_id: Option<&'a str>,
-}
-
-/// `wyrd.audit_card_registration.operation` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CardRegistrationOperation {
-    /// First write of a (kind, space, name, version) tuple.
-    Register,
-    /// In-place update of a previously registered card.
-    Update,
-    /// Tombstone or hard delete of a previously registered card.
-    Delete,
-}
-
-impl CardRegistrationOperation {
-    /// Return the DB CHECK literal for this operation.
-    #[must_use]
-    pub fn as_db_str(&self) -> &'static str {
-        match self {
-            Self::Register => "register",
-            Self::Update => "update",
-            Self::Delete => "delete",
-        }
-    }
-}
-
-/// `wyrd.audit_card_registration.outcome` enum.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CardRegistrationOutcome {
-    /// A new row was inserted.
-    Created,
-    /// Existing pinned row matched on spec hash; no card write occurred.
-    IdempotentNoop,
-    /// Auto/scope registration matched the latest-in-line spec hash.
-    Deduplicated,
-}
-
-impl CardRegistrationOutcome {
-    /// Return the DB CHECK literal for this outcome.
-    #[must_use]
-    pub fn as_db_str(&self) -> &'static str {
-        match self {
-            Self::Created => "created",
-            Self::IdempotentNoop => "idempotent_noop",
-            Self::Deduplicated => "deduplicated",
-        }
-    }
-}
-
-/// Project a [`PrincipalKind`] to its DB discriminator literal.
-///
-/// The audit row stores only the bare discriminator; the card_ref payload
-/// carried by Service/Agent variants is not needed at write time.
-pub(crate) fn actor_kind_db_str(kind: &PrincipalKind) -> &'static str {
-    match kind {
-        PrincipalKind::User => "user",
-        PrincipalKind::Service { .. } => "service",
-        PrincipalKind::Agent { .. } => "agent",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,25 +207,5 @@ mod tests {
             assert_eq!(CardStatus::from_db_str(literal).unwrap(), variant);
         }
         assert!(CardStatus::from_db_str("unknown").is_err());
-    }
-
-    #[test]
-    fn operation_db_literals_match_check_constraint() {
-        assert_eq!(CardRegistrationOperation::Register.as_db_str(), "register");
-        assert_eq!(CardRegistrationOperation::Update.as_db_str(), "update");
-        assert_eq!(CardRegistrationOperation::Delete.as_db_str(), "delete");
-    }
-
-    #[test]
-    fn outcome_db_literals_match_check_constraint() {
-        assert_eq!(CardRegistrationOutcome::Created.as_db_str(), "created");
-        assert_eq!(
-            CardRegistrationOutcome::IdempotentNoop.as_db_str(),
-            "idempotent_noop"
-        );
-        assert_eq!(
-            CardRegistrationOutcome::Deduplicated.as_db_str(),
-            "deduplicated"
-        );
     }
 }

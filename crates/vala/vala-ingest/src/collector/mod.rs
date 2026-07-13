@@ -20,11 +20,17 @@ pub mod map;
 
 use std::sync::Arc;
 
+use arrow::array::{Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field};
+use vala_bifrost::tables::genai::{
+    DomainDerivation, EmbeddingsTable, GenAiFromSpans, MemoryTable, MessagesTable, ToolCallsTable,
+};
 use vala_bifrost::tables::logs::RecordsTable;
 use vala_bifrost::tables::metrics::PointsTable;
 use vala_bifrost::tables::traces::SpansTable;
 use vala_bifrost::writer::BifrostWriteContext;
 use vala_bifrost::{TableScope, WyrdCatalog};
+use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::{Permission, PermissionCheck, RbacCheck};
@@ -138,6 +144,7 @@ pub async fn ingest_resource_spans(
 
     let batch = spans_to_record_batch(&records).map_err(IngestError::Decode)?;
     let accepted_spans = records.len() as i64;
+    let span_batch_id = *uuid::Uuid::now_v7().as_bytes();
 
     // traces.spans is SystemShared: bind SYSTEM_OWNER for the registration /
     // commit rows, stamp the data tenant into data_tenant_id. typed_writer
@@ -148,8 +155,18 @@ pub async fn ingest_resource_spans(
         .await
         .map_err(IngestError::from_engine)?;
 
+    let source_uid = writer.table_uid;
+
+    // Inline genai derivation: derive from the pre-commit span batch (attributes
+    // not yet redacted). Stamp the tenant column so the projector can partition
+    // rows by tenant without touching system-column machinery.
+    let tenanted = stamp_tenant_column(&batch, auth.tenant);
+    if let Ok(derived) = GenAiFromSpans.derive(&tenanted, span_batch_id) {
+        write_derived_inline(catalog, derived, source_uid, span_batch_id, auth).await;
+    }
+
     let ctx = BifrostWriteContext {
-        batch_id: *uuid::Uuid::now_v7().as_bytes(),
+        batch_id: span_batch_id,
         origin: OTLP_ORIGIN.to_owned(),
         actor: auth.principal.id.to_string(),
         request_id: auth.request_id.clone(),
@@ -166,6 +183,85 @@ pub async fn ingest_resource_spans(
         rejected_spans,
         rejection_message,
     })
+}
+
+/// Add a `data_tenant_id` Utf8 column (all rows = `tenant`) to a span batch so
+/// the genai projector can read it without going through the coordinator's
+/// system-column machinery. The original `batch` (without the column) is still
+/// passed to the coordinator for the span commit.
+fn stamp_tenant_column(batch: &RecordBatch, tenant: wyrd_spec::ids::DataTenantId) -> RecordBatch {
+    let n = batch.num_rows();
+    let tenant_str = tenant.to_string();
+    let col = Arc::new(StringArray::from(vec![tenant_str.as_str(); n])) as Arc<dyn Array>;
+    let mut fields: Vec<arrow::datatypes::FieldRef> = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new(DATA_TENANT_ID, DataType::Utf8, false)));
+    let mut columns = batch.columns().to_vec();
+    columns.push(col);
+    RecordBatch::try_new(Arc::new(arrow::datatypes::Schema::new(fields)), columns)
+        .expect("stamp_tenant_column: new column on a valid batch must succeed")
+}
+
+/// Write each [`DerivedBatch`] to its target table through a one-shot coordinator.
+/// Best-effort: failures are logged but do not block the span commit. The repair
+/// worker catches any crash gap on its next tick.
+async fn write_derived_inline(
+    catalog: &WyrdCatalog,
+    derived: Vec<vala_bifrost::tables::genai::DerivedBatch>,
+    source_uid: [u8; 16],
+    source_batch_id: [u8; 16],
+    auth: &crate::auth::AuthContext,
+) {
+    for d in derived {
+        let handle_result = match d.target_name {
+            "messages" => {
+                catalog
+                    .typed_writer::<MessagesTable>(TableScope::SystemShared, d.data_tenant_id)
+                    .await
+            }
+            "embeddings" => {
+                catalog
+                    .typed_writer::<EmbeddingsTable>(TableScope::SystemShared, d.data_tenant_id)
+                    .await
+            }
+            "tool_calls" => {
+                catalog
+                    .typed_writer::<ToolCallsTable>(TableScope::SystemShared, d.data_tenant_id)
+                    .await
+            }
+            "memory" => {
+                catalog
+                    .typed_writer::<MemoryTable>(TableScope::SystemShared, d.data_tenant_id)
+                    .await
+            }
+            other => {
+                tracing::warn!(target = %other, "inline genai derive: unknown target table, skipping");
+                continue;
+            }
+        };
+        let handle = match handle_result {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(error = %e, target = %d.target_name, "inline genai derive: target writer unavailable, repair worker will retry");
+                continue;
+            }
+        };
+        // Deterministic batch id: same formula as the repair worker — dedup is free.
+        let derived_batch_id =
+            GenAiFromSpans::derived_batch_id(&handle.table_uid, &source_uid, &source_batch_id);
+        let ctx = BifrostWriteContext {
+            batch_id: derived_batch_id,
+            origin: "genai_derive".to_owned(),
+            actor: auth.principal.id.to_string(),
+            request_id: auth.request_id.clone(),
+            card_ref: auth.principal.card_ref().cloned(),
+        };
+        if let Err(e) = handle
+            .commit_one(d.data_tenant_id, vec![d.batch], ctx)
+            .await
+        {
+            tracing::warn!(error = %e, target = %d.target_name, "inline genai derive: write failed, repair worker will retry");
+        }
+    }
 }
 
 /// Result of one accepted OTLP export: how many spans committed and how many the

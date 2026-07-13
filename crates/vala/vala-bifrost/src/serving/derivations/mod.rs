@@ -19,11 +19,13 @@ use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
 use crate::tables::genai::{DomainDerivation, GenAiFromSpans};
 
-/// How often the worker wakes without a NOTIFY trigger.
+/// Repair-worker poll cadence for the background genai derivation worker.
 ///
-/// Set low enough that tests do not time out waiting for the fallback tick,
-/// but high enough that production idle CPU stays negligible.
-pub const FALLBACK_CADENCE_SECS: u64 = 10;
+/// The inline path (OTLP collector → derive on arrival) is the primary write
+/// path. This tick only fires for crash recovery: spans committed but genai
+/// rows not yet written because the server restarted between the two writes.
+/// 60 s gives bounded lag without hammering Iceberg scans in steady state.
+pub const FALLBACK_CADENCE_SECS: u64 = 60;
 
 /// Spawn the genai derivation worker.
 ///

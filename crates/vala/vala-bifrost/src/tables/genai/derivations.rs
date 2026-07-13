@@ -379,8 +379,11 @@ fn attr_json(attrs: &Attrs, key: &str) -> Option<String> {
     })
 }
 
-/// A projected `genai.messages` row (only the columns the derivation fills; the
-/// coordinator null-fills the rest of the physical schema by field name).
+/// A projected `genai.messages` row.
+///
+/// Covers every column in `MessagesTable` that the OTLP projector can fill
+/// from `gen_ai.*` / `openai.*` attributes. Columns not populated here are
+/// all nullable; the coordinator fills them with NULL via name-based alignment.
 struct MessageRow {
     base: SpanBase,
     provider_name: String,
@@ -389,8 +392,25 @@ struct MessageRow {
     response_model: Option<String>,
     conversation_id: Option<String>,
     response_id: Option<String>,
+    response_finish_reasons: Option<String>,
+    response_time_to_first_chunk_seconds: Option<f64>,
+    request_temperature: Option<f64>,
+    request_top_p: Option<f64>,
+    request_top_k: Option<i64>,
+    request_max_tokens: Option<i64>,
+    request_frequency_penalty: Option<f64>,
+    request_presence_penalty: Option<f64>,
+    request_seed: Option<i64>,
+    request_choice_count: Option<i64>,
+    request_stop_sequences: Option<String>,
+    request_stream: Option<bool>,
+    request_encoding_formats: Option<String>,
     usage_input_tokens: Option<i64>,
     usage_output_tokens: Option<i64>,
+    usage_cache_creation_input_tokens: Option<i64>,
+    usage_cache_read_input_tokens: Option<i64>,
+    usage_reasoning_output_tokens: Option<i64>,
+    output_type: Option<String>,
     request_reasoning_level: Option<String>,
     conversation_compacted: Option<bool>,
     input_messages: Option<String>,
@@ -400,6 +420,7 @@ struct MessageRow {
     openai_request_service_tier: Option<String>,
     openai_response_service_tier: Option<String>,
     openai_response_system_fingerprint: Option<String>,
+    error_type: Option<String>,
 }
 
 impl MessageRow {
@@ -412,8 +433,37 @@ impl MessageRow {
             response_model: attr_str(attrs, "gen_ai.response.model"),
             conversation_id: attr_str(attrs, "gen_ai.conversation.id"),
             response_id: attr_str(attrs, "gen_ai.response.id"),
+            response_finish_reasons: attr_json(attrs, "gen_ai.response.finish_reasons"),
+            response_time_to_first_chunk_seconds: attr_f64(
+                attrs,
+                "gen_ai.response.time_to_first_chunk",
+            ),
+            request_temperature: attr_f64(attrs, "gen_ai.request.temperature"),
+            request_top_p: attr_f64(attrs, "gen_ai.request.top_p"),
+            request_top_k: attr_i64(attrs, "gen_ai.request.top_k"),
+            request_max_tokens: attr_i64(attrs, "gen_ai.request.max_tokens"),
+            request_frequency_penalty: attr_f64(attrs, "gen_ai.request.frequency_penalty"),
+            request_presence_penalty: attr_f64(attrs, "gen_ai.request.presence_penalty"),
+            request_seed: attr_i64(attrs, "gen_ai.request.seed"),
+            request_choice_count: attr_i64(attrs, "gen_ai.request.choice_count"),
+            request_stop_sequences: attr_json(attrs, "gen_ai.request.stop_sequences"),
+            request_stream: attr_bool(attrs, "gen_ai.request.stream"),
+            request_encoding_formats: attr_json(attrs, "gen_ai.request.encoding_formats"),
             usage_input_tokens: attr_i64(attrs, "gen_ai.usage.input_tokens"),
             usage_output_tokens: attr_i64(attrs, "gen_ai.usage.output_tokens"),
+            usage_cache_creation_input_tokens: attr_i64(
+                attrs,
+                "gen_ai.usage.cache_creation_input_tokens",
+            ),
+            usage_cache_read_input_tokens: attr_i64(
+                attrs,
+                "gen_ai.usage.cache_read_input_tokens",
+            ),
+            usage_reasoning_output_tokens: attr_i64(
+                attrs,
+                "gen_ai.usage.reasoning_output_tokens",
+            ),
+            output_type: attr_str(attrs, "gen_ai.output.type"),
             request_reasoning_level: attr_str(attrs, "gen_ai.request.reasoning.level"),
             conversation_compacted: attr_bool(attrs, "gen_ai.conversation.compacted"),
             input_messages: attr_json(attrs, "gen_ai.input.messages"),
@@ -426,6 +476,7 @@ impl MessageRow {
                 attrs,
                 "openai.response.system_fingerprint",
             ),
+            error_type: attr_str(attrs, "error.type"),
         }
     }
 
@@ -445,8 +496,25 @@ impl MessageRow {
             fields::utf8("response_model", true),
             fields::utf8("conversation_id", true),
             fields::utf8("response_id", true),
+            fields::utf8_view("response_finish_reasons", true),
+            fields::float64("response_time_to_first_chunk_seconds", true),
+            fields::float64("request_temperature", true),
+            fields::float64("request_top_p", true),
+            fields::int64("request_top_k", true),
+            fields::int64("request_max_tokens", true),
+            fields::float64("request_frequency_penalty", true),
+            fields::float64("request_presence_penalty", true),
+            fields::int64("request_seed", true),
+            fields::int64("request_choice_count", true),
+            fields::utf8_view("request_stop_sequences", true),
+            fields::boolean("request_stream", true),
+            fields::utf8_view("request_encoding_formats", true),
             fields::int64("usage_input_tokens", true),
             fields::int64("usage_output_tokens", true),
+            fields::int64("usage_cache_creation_input_tokens", true),
+            fields::int64("usage_cache_read_input_tokens", true),
+            fields::int64("usage_reasoning_output_tokens", true),
+            fields::utf8("output_type", true),
             fields::utf8("request_reasoning_level", true),
             fields::boolean("conversation_compacted", true),
             fields::utf8_view("input_messages", true),
@@ -456,6 +524,7 @@ impl MessageRow {
             fields::utf8("openai_request_service_tier", true),
             fields::utf8("openai_response_service_tier", true),
             fields::utf8("openai_response_system_fingerprint", true),
+            fields::utf8("error_type", true),
         ]))
     }
 
@@ -476,23 +545,49 @@ impl MessageRow {
         let response_model = str_col(rows.iter().map(|r| r.response_model.clone()));
         let conversation_id = str_col(rows.iter().map(|r| r.conversation_id.clone()));
         let response_id = str_col(rows.iter().map(|r| r.response_id.clone()));
+        let response_finish_reasons =
+            str_view_col(rows.iter().map(|r| r.response_finish_reasons.clone()));
+        let response_time_to_first_chunk_seconds =
+            f64_col(rows.iter().map(|r| r.response_time_to_first_chunk_seconds));
+        let request_temperature = f64_col(rows.iter().map(|r| r.request_temperature));
+        let request_top_p = f64_col(rows.iter().map(|r| r.request_top_p));
+        let request_top_k = i64_col(rows.iter().map(|r| r.request_top_k));
+        let request_max_tokens = i64_col(rows.iter().map(|r| r.request_max_tokens));
+        let request_frequency_penalty =
+            f64_col(rows.iter().map(|r| r.request_frequency_penalty));
+        let request_presence_penalty =
+            f64_col(rows.iter().map(|r| r.request_presence_penalty));
+        let request_seed = i64_col(rows.iter().map(|r| r.request_seed));
+        let request_choice_count = i64_col(rows.iter().map(|r| r.request_choice_count));
+        let request_stop_sequences =
+            str_view_col(rows.iter().map(|r| r.request_stop_sequences.clone()));
+        let request_stream = bool_col(rows.iter().map(|r| r.request_stream));
+        let request_encoding_formats =
+            str_view_col(rows.iter().map(|r| r.request_encoding_formats.clone()));
         let usage_input_tokens = i64_col(rows.iter().map(|r| r.usage_input_tokens));
         let usage_output_tokens = i64_col(rows.iter().map(|r| r.usage_output_tokens));
+        let usage_cache_creation_input_tokens =
+            i64_col(rows.iter().map(|r| r.usage_cache_creation_input_tokens));
+        let usage_cache_read_input_tokens =
+            i64_col(rows.iter().map(|r| r.usage_cache_read_input_tokens));
+        let usage_reasoning_output_tokens =
+            i64_col(rows.iter().map(|r| r.usage_reasoning_output_tokens));
+        let output_type = str_col(rows.iter().map(|r| r.output_type.clone()));
         let request_reasoning_level =
             str_col(rows.iter().map(|r| r.request_reasoning_level.clone()));
         let conversation_compacted = bool_col(rows.iter().map(|r| r.conversation_compacted));
         let input_messages = str_view_col(rows.iter().map(|r| r.input_messages.clone()));
         let output_messages = str_view_col(rows.iter().map(|r| r.output_messages.clone()));
-        let system_instructions = str_view_col(rows.iter().map(|r| r.system_instructions.clone()));
+        let system_instructions =
+            str_view_col(rows.iter().map(|r| r.system_instructions.clone()));
         let openai_api_type = str_col(rows.iter().map(|r| r.openai_api_type.clone()));
         let openai_request_service_tier =
             str_col(rows.iter().map(|r| r.openai_request_service_tier.clone()));
         let openai_response_service_tier =
             str_col(rows.iter().map(|r| r.openai_response_service_tier.clone()));
-        let openai_response_system_fingerprint = str_col(
-            rows.iter()
-                .map(|r| r.openai_response_system_fingerprint.clone()),
-        );
+        let openai_response_system_fingerprint =
+            str_col(rows.iter().map(|r| r.openai_response_system_fingerprint.clone()));
+        let error_type = str_col(rows.iter().map(|r| r.error_type.clone()));
 
         RecordBatch::try_new(
             Self::schema(),
@@ -511,8 +606,25 @@ impl MessageRow {
                 response_model,
                 conversation_id,
                 response_id,
+                response_finish_reasons,
+                response_time_to_first_chunk_seconds,
+                request_temperature,
+                request_top_p,
+                request_top_k,
+                request_max_tokens,
+                request_frequency_penalty,
+                request_presence_penalty,
+                request_seed,
+                request_choice_count,
+                request_stop_sequences,
+                request_stream,
+                request_encoding_formats,
                 usage_input_tokens,
                 usage_output_tokens,
+                usage_cache_creation_input_tokens,
+                usage_cache_read_input_tokens,
+                usage_reasoning_output_tokens,
+                output_type,
                 request_reasoning_level,
                 conversation_compacted,
                 input_messages,
@@ -522,6 +634,7 @@ impl MessageRow {
                 openai_request_service_tier,
                 openai_response_service_tier,
                 openai_response_system_fingerprint,
+                error_type,
             ],
         )
         .map_err(|e| BifrostError::Internal(format!("build genai.messages batch: {e}")))

@@ -167,7 +167,7 @@ where
 #[tracing::instrument(
     name = "otlp.http.trace.export",
     skip_all,
-    fields(tenant = %caller.data_tenant_id, encoding = ?OtlpEncoding::from_headers(&headers), accepted_spans, rejected_spans)
+    fields(tenant, encoding, accepted_spans, rejected_spans)
 )]
 async fn export_traces(
     State(state): State<AppState>,
@@ -175,16 +175,16 @@ async fn export_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WyrdErrorResponse> {
+    tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
+    tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let request: ExportTraceServiceRequest =
         decode_request(encoding, &body).map_err(ingest_error_to_response)?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request).await;
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(error) => return Ok(ingest_error_to_response(error)),
-    };
+    let outcome = vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request)
+        .await
+        .map_err(ingest_error_to_response)?;
 
     tracing::Span::current().record("accepted_spans", outcome.accepted_spans);
     tracing::Span::current().record("rejected_spans", outcome.rejected_spans);
@@ -197,16 +197,13 @@ async fn export_traces(
 
 /// `POST /v1/metrics` — the Content-Type decode branch is live; the metrics
 /// ingest service is not yet implemented, so a decoded request maps to `501`.
-#[tracing::instrument(
-    name = "otlp.http.metrics.export",
-    skip_all,
-    fields(tenant = %caller.data_tenant_id, encoding = ?OtlpEncoding::from_headers(&headers))
-)]
+#[tracing::instrument(name = "otlp.http.metrics.export", skip_all, fields(tenant))]
 async fn export_metrics(
     caller: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WyrdErrorResponse> {
+    tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     let request: ExportMetricsServiceRequest =
         decode_request(encoding, &body).map_err(ingest_error_to_response)?;
@@ -216,16 +213,13 @@ async fn export_metrics(
 
 /// `POST /v1/logs` — the Content-Type decode branch is live; the logs ingest
 /// service is not yet implemented, so a decoded request maps to `501`.
-#[tracing::instrument(
-    name = "otlp.http.logs.export",
-    skip_all,
-    fields(tenant = %caller.data_tenant_id, encoding = ?OtlpEncoding::from_headers(&headers))
-)]
+#[tracing::instrument(name = "otlp.http.logs.export", skip_all, fields(tenant))]
 async fn export_logs(
     caller: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WyrdErrorResponse> {
+    tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
     let request: ExportLogsServiceRequest =
         decode_request(encoding, &body).map_err(ingest_error_to_response)?;

@@ -6,19 +6,21 @@ use crate::tables::{
 };
 use wyrd_spec::vala::system_columns::WYRD_EVENT_TIME;
 
-pub struct EmbeddingsTable;
+pub struct MemoryTable;
 
-impl DomainTable for EmbeddingsTable {
+impl DomainTable for MemoryTable {
     const NAMESPACE: &'static str = "genai";
-    const NAME: &'static str = "embeddings";
+    const NAME: &'static str = "memory";
     const CORRELATION_POLICY: CorrelationPolicy = CorrelationPolicy::Observation;
     const PAYLOAD_CLASS: PayloadClass = PayloadClass::Sensitive;
-    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] = &["retrieval_query_text"];
+    const SENSITIVE_PAYLOAD_COLUMNS: &'static [&'static str] =
+        &["memory_query_text", "memory_records"];
 
     fn arrow_fields() -> Vec<Field> {
         vec![
             fixed_binary("trace_id", 16, false),
             fixed_binary("span_id", 8, false),
+            fixed_binary("parent_span_id", 8, true),
             ts_us_utc("start_time", false),
             ts_us_utc("end_time", false),
             int64("duration_ms", false),
@@ -26,15 +28,12 @@ impl DomainTable for EmbeddingsTable {
             utf8("service_name", false),
             utf8("provider_name", false),
             utf8("operation_name", false),
-            utf8("request_model", false),
-            utf8("response_model", true),
-            int64("embeddings_dimension_count", true),
-            utf8("data_source_id", true),
-            int64("usage_input_tokens", true),
-            int64("usage_output_tokens", true),
-            int64("retrieval_top_k", true),
+            utf8("memory_store_id", true),
+            utf8("memory_record_id", true),
+            int64("memory_record_count", true),
+            utf8("memory_query_text", true),
+            utf8_view("memory_records", true),
             utf8("error_type", true),
-            utf8("retrieval_query_text", true),
             utf8_view("extra", true),
         ]
     }
@@ -47,7 +46,7 @@ impl DomainTable for EmbeddingsTable {
                 nulls_first: false,
             },
             SortKey {
-                column: "data_source_id".into(),
+                column: "memory_store_id".into(),
                 ascending: true,
                 nulls_first: true,
             },
@@ -56,8 +55,8 @@ impl DomainTable for EmbeddingsTable {
 
     fn declared_indexes() -> Vec<DeclaredIndex> {
         vec![DeclaredIndex {
-            name: "embeddings_data_source_bloom".into(),
-            columns: vec!["data_source_id".into()],
+            name: "memory_store_id_bloom".into(),
+            columns: vec!["memory_store_id".into()],
             kind: IndexKind::BloomFilter,
         }]
     }

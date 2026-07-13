@@ -233,7 +233,7 @@ mod pg_tests {
             });
 
             // Warehouse row: honest stored entry_hash, tampered `decision`.
-            let batch = audit_log_row_batch(AuditRowCols {
+            let batch = audit_log_row_batch(&AuditRowCols {
                 seq,
                 entry_hash_hex: &hex::encode(honest_hash),
                 prev_hash_hex: &hex::encode(prev_hash),
@@ -317,10 +317,10 @@ mod pg_tests {
             payload_summary: &'a str,
         }
 
-        /// Build the 16 content-column Arrow batch for one audit_log row. Mirrors
+        /// Build the 16 content-column Arrow batch for one `audit_log` row. Mirrors
         /// the relay's `build_audit_log_batch`; the writer stamps the 4 Bifrost
         /// system columns at flush. `trace_id`/`audit_card_ref` are null.
-        fn audit_log_row_batch(c: AuditRowCols<'_>) -> RecordBatch {
+        fn audit_log_row_batch(c: &AuditRowCols<'_>) -> RecordBatch {
             let fields = vec![
                 Field::new("seq", DataType::Int64, false),
                 Field::new("entry_hash", DataType::Utf8, false),

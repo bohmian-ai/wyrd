@@ -35,6 +35,10 @@ impl DomainTable for ToolCallsTable {
             utf8("tool_description", true),
             utf8_view("tool_call_arguments", true),
             utf8_view("tool_call_result", true),
+            utf8("mcp_session_id", true),
+            utf8("mcp_method_name", true),
+            utf8("mcp_protocol_version", true),
+            utf8("mcp_resource_uri", true),
             utf8("error_type", true),
             utf8_view("extra", true),
         ]

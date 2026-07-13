@@ -44,6 +44,13 @@
         "null"
       ]
     },
+    "conversation_compacted": {
+      "description": "`gen_ai.conversation.compacted` - whether the conversation history was compacted before this call.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
     "conversation_id": {
       "description": "`gen_ai.conversation.id` - stable conversation identifier across turns.",
       "type": [
@@ -102,15 +109,90 @@
     "input_messages": {
       "description": "`gen_ai.input.messages` - full input message history. This field is opt-in and redactable at producer or ingest boundaries."
     },
-    "openai_api_type": {
-      "description": "`gen_ai.openai.api.type`.",
+    "mcp_method_name": {
+      "description": "`mcp.method.name`.",
       "type": [
         "string",
         "null"
       ]
     },
-    "openai_service_tier": {
-      "description": "`gen_ai.openai.service_tier`.",
+    "mcp_protocol_version": {
+      "description": "`mcp.protocol.version`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_resource_uri": {
+      "description": "`mcp.resource.uri`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "mcp_session_id": {
+      "description": "`mcp.session.id`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "memory_query_text": {
+      "description": "`gen_ai.memory.query.text` - memory query text.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "memory_record_count": {
+      "description": "`gen_ai.memory.record.count` - number of memory records touched.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
+    },
+    "memory_record_id": {
+      "description": "`gen_ai.memory.record.id` - memory record identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "memory_records": {
+      "description": "`gen_ai.memory.records` - memory records payload. Opt-in and redactable at producer or ingest boundaries."
+    },
+    "memory_store_id": {
+      "description": "`gen_ai.memory.store.id` - memory store identifier.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "openai_api_type": {
+      "description": "`openai.api.type`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "openai_request_service_tier": {
+      "description": "`openai.request.service_tier`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "openai_response_service_tier": {
+      "description": "`openai.response.service_tier`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "openai_response_system_fingerprint": {
+      "description": "`openai.response.system_fingerprint`.",
       "type": [
         "string",
         "null"
@@ -143,6 +225,13 @@
     },
     "prompt_name": {
       "description": "`gen_ai.prompt.name`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "prompt_version": {
+      "description": "`gen_ai.prompt.version` - version of the prompt used for this call.",
       "type": [
         "string",
         "null"
@@ -197,6 +286,13 @@
         "null"
       ],
       "format": "double"
+    },
+    "request_reasoning_level": {
+      "description": "`gen_ai.request.reasoning.level` - requested reasoning effort level.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "request_seed": {
       "description": "`gen_ai.request.seed`.",
@@ -293,6 +389,15 @@
         "string",
         "null"
       ]
+    },
+    "retrieval_top_k": {
+      "description": "`gen_ai.retrieval.top_k` - retrieval top-k count.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0.0
     },
     "server_address": {
       "description": "`server.address` - provider endpoint host. This is a general OTel semantic-convention key, without a `gen_ai.` prefix.",

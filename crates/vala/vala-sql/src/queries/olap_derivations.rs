@@ -17,8 +17,61 @@
 use sqlx::types::Uuid;
 use wyrd_sql::TenantConn;
 
-use crate::SqlError;
 use crate::row_types::olap_derivations::{DerivationFreshnessRow, DerivationRow};
+use crate::{OperatorPool, SqlError};
+
+/// One committed source-commit position: the opaque 16-byte `batch_id` in the
+/// order it landed on the source table. Ordering is by `(committed_at, batch_id)`
+/// so a stable, total order exists even when two commits share a wall-clock
+/// timestamp; `batch_id` is UUIDv7 (time-ordered) so the tiebreak still respects
+/// commit order.
+#[derive(Debug, Clone)]
+pub struct CommittedSourceBatch {
+    /// Opaque 16-byte source commit position.
+    pub batch_id: Vec<u8>,
+}
+
+/// Enumerate every `committed` source commit position for `source_table_uid`,
+/// across ALL tenants, in commit order.
+///
+/// Uses the operator pool (BYPASSRLS `wyrd_platform_admin`) because a source
+/// table is `SystemShared`: its `vala.olap_commits` rows carry per-tenant
+/// `data_tenant_id` values, and the derivation must consume the whole
+/// cross-tenant commit stream (it re-partitions the derived rows back onto each
+/// source row's own tenant at write time). This mirrors the audit relay's
+/// cross-tenant enumeration and is never called on a tenant request path.
+///
+/// This is the commit-identity delta mechanism: the derivation worker maps
+/// "commits since watermark" onto this ordered ledger by opaque `batch_id`,
+/// never by numeric snapshot-id comparison.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_committed_source_batches(
+    op: &OperatorPool,
+    source_table_uid: &[u8; 16],
+) -> Result<Vec<CommittedSourceBatch>, SqlError> {
+    // Dynamic query is intentional: this reads the SystemShared source table's
+    // commit ledger across every tenant via the operator pool (BYPASSRLS).
+    sqlx::query_as::<_, (Vec<u8>,)>(
+        r#"
+        SELECT batch_id
+          FROM vala.olap_commits
+         WHERE table_uid = $1
+           AND state = 'committed'
+         ORDER BY committed_at, batch_id
+        "#,
+    )
+    .bind(source_table_uid.as_slice())
+    .fetch_all(op.pool())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(batch_id,)| CommittedSourceBatch { batch_id })
+            .collect()
+    })
+}
 
 /// Register a derivation idempotently.
 ///

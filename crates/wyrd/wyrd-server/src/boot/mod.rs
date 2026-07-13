@@ -206,8 +206,14 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
         Some(Arc::new(recovery_pool)),
     )
     .await?;
+    let bifrost = Arc::new(bifrost);
 
-    Ok(AppState::new(postgres, storage, Arc::new(bifrost)))
+    // Provision the pre-declared OLAP domain tables (traces.spans, genai.*, ...)
+    // so the ingest and query paths have their physical Iceberg tables. Idempotent
+    // and append-only — a no-op after first boot; fails closed on schema drift.
+    vala_bifrost::tables::register_all(&bifrost).await?;
+
+    Ok(AppState::new(postgres, storage, bifrost))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.

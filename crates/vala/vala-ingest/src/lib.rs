@@ -17,7 +17,7 @@ pub mod orchestrator;
 pub mod service;
 
 pub use auth::{AuthContext, IngestAuthInterceptor, ingest_auth_interceptor};
-pub use collector::OtlpTraceService;
+pub use collector::{IngestOutcome, OtlpTraceService, ingest_resource_spans};
 pub use error::IngestError;
 pub use limits::{IngestLimits, StreamSemaphores};
 pub use service::BifrostIngestGrpc;

@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, uint64, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, uint32, utf8, utf8_view};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
     SortKey,
@@ -27,7 +27,7 @@ impl DomainTable for SpansTable {
             utf8("kind", false),
             ts_us_utc("start_time", false),
             ts_us_utc("end_time", false),
-            uint64("duration_ms", false),
+            int64("duration_ms", false),
             utf8("status", false),
             utf8_view("attributes", true),
             uint32("dropped_attributes_count", false),

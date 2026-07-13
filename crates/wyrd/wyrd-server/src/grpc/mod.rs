@@ -43,10 +43,7 @@ where
         state.bifrost.clone(),
         ingest_auth_interceptor(verifier.clone()),
     );
-    let otlp = OtlpTraceService::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier),
-    );
+    let otlp = OtlpTraceService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier));
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router

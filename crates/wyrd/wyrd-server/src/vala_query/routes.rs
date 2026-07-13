@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    Array, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt32Array,
 };
 use axum::Json;
 use axum::Router;
@@ -91,10 +91,10 @@ fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt32Array> {
         .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
 }
 
-fn col_u64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt64Array> {
+fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
     batch
         .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
 }
 
 fn col_f64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Float64Array> {
@@ -161,7 +161,7 @@ fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>
         let name_col = col_str(batch, "name");
         let kind_col = col_str(batch, "kind");
         let start_col = col_ts(batch, "start_time");
-        let dur_col = col_u64(batch, "duration_ms");
+        let dur_col = col_i64(batch, "duration_ms");
         let status_col = col_str(batch, "status");
         let attr_col = col_str_view(batch, "attributes");
 

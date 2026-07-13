@@ -386,4 +386,19 @@ pub enum BifrostError {
         /// Fully-qualified table name whose writer buffer is saturated.
         table: String,
     },
+
+    /// An OTLP signal was accepted by the transport but its ingest service body
+    /// is not yet implemented (currently the `/v1/metrics` and `/v1/logs` OTLP
+    /// signals — the metrics/logs write path lands separately).
+    #[error("OTLP signal ingest not implemented: {signal}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_501_INGEST_UNIMPLEMENTED",
+        status = 501,
+        title = "OTLP signal ingest not implemented",
+        remediation = "This OTLP signal endpoint is registered but its ingest service is not yet implemented. Export traces to /v1/traces."
+    )]
+    IngestUnimplemented {
+        /// The OTLP signal whose ingest service is not implemented (e.g. `metrics`, `logs`).
+        signal: String,
+    },
 }

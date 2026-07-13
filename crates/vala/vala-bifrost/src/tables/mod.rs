@@ -433,8 +433,8 @@ mod fingerprint_drift {
     }
 
     const TRACES_SPANS: [u8; 32] = [
-        237, 8, 179, 234, 40, 191, 48, 132, 0, 89, 247, 165, 172, 47, 182, 120, 91, 48, 68, 189,
-        59, 14, 244, 35, 112, 61, 60, 74, 164, 145, 38, 63,
+        117, 123, 6, 179, 56, 96, 0, 186, 121, 79, 11, 80, 39, 98, 14, 107, 69, 100, 183, 245, 234,
+        210, 43, 64, 31, 239, 198, 172, 171, 145, 83, 133,
     ];
     const TRACES_EVENTS: [u8; 32] = [
         226, 118, 169, 168, 66, 138, 130, 223, 181, 82, 231, 97, 58, 210, 210, 130, 117, 35, 71,
@@ -445,20 +445,20 @@ mod fingerprint_drift {
         254, 215, 103, 109, 128, 107, 244, 28, 77, 199, 241, 93,
     ];
     const GENAI_MESSAGES: [u8; 32] = [
-        51, 46, 154, 71, 211, 230, 132, 40, 16, 247, 249, 53, 171, 185, 211, 135, 21, 172, 198,
-        147, 105, 21, 102, 114, 53, 94, 227, 244, 119, 242, 34, 131,
+        22, 133, 9, 26, 108, 130, 74, 66, 122, 87, 141, 128, 174, 1, 111, 181, 118, 116, 51, 246,
+        136, 124, 145, 107, 76, 194, 124, 216, 171, 194, 143, 165,
     ];
     const GENAI_EMBEDDINGS: [u8; 32] = [
-        26, 4, 11, 206, 198, 75, 19, 151, 88, 125, 70, 248, 205, 201, 171, 2, 64, 244, 14, 106,
-        180, 152, 169, 160, 132, 236, 62, 246, 38, 174, 15, 72,
+        192, 166, 113, 74, 15, 236, 18, 125, 198, 210, 200, 212, 239, 120, 173, 13, 113, 104, 237,
+        186, 199, 234, 52, 186, 213, 246, 121, 219, 79, 0, 195, 34,
     ];
     const GENAI_TOOL_CALLS: [u8; 32] = [
-        173, 3, 14, 244, 10, 62, 130, 153, 234, 64, 42, 243, 65, 122, 9, 134, 144, 174, 119, 186,
-        49, 252, 178, 203, 137, 6, 65, 123, 79, 242, 191, 50,
+        196, 132, 24, 39, 148, 234, 92, 116, 231, 24, 79, 50, 252, 26, 199, 86, 77, 141, 206, 195,
+        254, 68, 227, 57, 147, 24, 195, 16, 195, 146, 48, 169,
     ];
     const METRICS_POINTS: [u8; 32] = [
-        226, 207, 30, 177, 15, 157, 226, 205, 120, 104, 240, 69, 49, 156, 93, 10, 155, 171, 47, 56,
-        143, 26, 82, 181, 68, 22, 163, 133, 71, 140, 255, 250,
+        148, 86, 36, 185, 229, 163, 186, 129, 219, 113, 27, 66, 152, 156, 153, 174, 169, 6, 11,
+        192, 176, 50, 56, 214, 66, 127, 186, 36, 143, 88, 81, 167,
     ];
     const LOGS_RECORDS: [u8; 32] = [
         51, 247, 38, 148, 208, 151, 64, 71, 131, 104, 39, 145, 187, 244, 21, 20, 73, 92, 27, 1,
@@ -554,7 +554,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("attributes", DataType::Utf8View, true),
             Field::new("dropped_attributes_count", DataType::UInt32, false),
@@ -654,7 +654,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
@@ -726,7 +726,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
@@ -774,7 +774,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
@@ -825,14 +825,14 @@ mod fingerprint_drift {
             Field::new("is_monotonic", DataType::Boolean, true),
             Field::new("flags", DataType::UInt32, true),
             Field::new("value", DataType::Float64, true),
-            Field::new("count", DataType::UInt64, true),
+            Field::new("count", DataType::Int64, true),
             Field::new("sum", DataType::Float64, true),
             Field::new("min", DataType::Float64, true),
             Field::new("max", DataType::Float64, true),
             Field::new("bucket_counts", DataType::Utf8View, true),
             Field::new("explicit_bounds", DataType::Utf8View, true),
             Field::new("scale", DataType::Int32, true),
-            Field::new("zero_count", DataType::UInt64, true),
+            Field::new("zero_count", DataType::Int64, true),
             Field::new("zero_threshold", DataType::Float64, true),
             Field::new("positive_buckets", DataType::Utf8View, true),
             Field::new("negative_buckets", DataType::Utf8View, true),

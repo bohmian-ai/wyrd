@@ -64,9 +64,9 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpTra
 
     /// Decode → write core, reusable by Task C's HTTP OTLP path.
     ///
-    /// Authorizes the record-write capability, flattens the spans, writes the
-    /// accepted rows through the live coordinator as one commit unit, and
-    /// reports the per-span rejection count.
+    /// Delegates to the transport-agnostic [`ingest_resource_spans`] free
+    /// function against this service's catalog, so the OTLP/gRPC edge and the
+    /// OTLP/HTTP handler share one decode→RBAC→commit core.
     ///
     /// # Errors
     /// Returns an [`IngestError`] for auth/RBAC/engine failures (including
@@ -77,58 +77,80 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpTra
         auth: &AuthContext,
         request: ExportTraceServiceRequest,
     ) -> Result<IngestOutcome, IngestError> {
-        // Gate: record-write capability. Tenant isolation is the data partition,
-        // stamped server-side; this is the coarse operation gate.
-        RbacCheck
-            .check(&auth.principal, &Permission::bifrost_record_write())
-            .into_result()
-            .map_err(IngestError::from_rbac)?;
+        ingest_resource_spans(&self.catalog, auth, request).await
+    }
+}
 
-        let MappedSpans { records, rejected } = map_resource_spans(&request.resource_spans);
-        let rejected_spans = rejected.len() as i64;
-        let rejection_message = rejected.first().map(|first| first.reason.clone());
+/// Transport-agnostic OTLP trace decode→write core.
+///
+/// Authorizes the record-write capability, flattens the spans, writes the
+/// accepted rows through the live coordinator on `traces.spans` as one commit
+/// unit, and reports the per-span rejection count. Both the OTLP/gRPC collector
+/// [`OtlpTraceService::export`] and Task C's OTLP/HTTP handler call this, so the
+/// RBAC + map + commit logic lives in exactly one place and is independent of
+/// the verifier generics `R`/`I`.
+///
+/// The `auth` is always token-derived ([`AuthContext::tenant`] is never taken
+/// from the wire), so both transports preserve tenant isolation identically.
+///
+/// # Errors
+/// Returns an [`IngestError`] for auth/RBAC/engine failures (including
+/// [`IngestError::WriterBusy`] on backpressure). Per-span decode failures do not
+/// error here — they surface in [`IngestOutcome::rejected_spans`].
+pub async fn ingest_resource_spans(
+    catalog: &WyrdCatalog,
+    auth: &AuthContext,
+    request: ExportTraceServiceRequest,
+) -> Result<IngestOutcome, IngestError> {
+    // Gate: record-write capability. Tenant isolation is the data partition,
+    // stamped server-side; this is the coarse operation gate.
+    RbacCheck
+        .check(&auth.principal, &Permission::bifrost_record_write())
+        .into_result()
+        .map_err(IngestError::from_rbac)?;
 
-        if records.is_empty() {
-            return Ok(IngestOutcome {
-                accepted_spans: 0,
-                rejected_spans,
-                rejection_message,
-            });
-        }
+    let MappedSpans { records, rejected } = map_resource_spans(&request.resource_spans);
+    let rejected_spans = rejected.len() as i64;
+    let rejection_message = rejected.first().map(|first| first.reason.clone());
 
-        let batch =
-            spans_to_record_batch(&records).map_err(IngestError::Decode)?;
-        let accepted_spans = records.len() as i64;
-
-        // traces.spans is SystemShared: bind SYSTEM_OWNER for the registration /
-        // commit rows, stamp the data tenant into data_tenant_id. typed_writer
-        // carries the table's Sensitive payload class so the coordinator redacts
-        // the `attributes` column at flush.
-        let writer = self
-            .catalog
-            .typed_writer::<SpansTable>(TableScope::SystemShared, auth.tenant)
-            .await
-            .map_err(IngestError::from_engine)?;
-
-        let ctx = BifrostWriteContext {
-            batch_id: *uuid::Uuid::now_v7().as_bytes(),
-            origin: OTLP_ORIGIN.to_owned(),
-            actor: auth.principal.id.to_string(),
-            request_id: auth.request_id.clone(),
-            card_ref: auth.principal.card_ref().cloned(),
-        };
-
-        writer
-            .commit_one(auth.tenant, vec![batch], ctx)
-            .await
-            .map_err(IngestError::from_engine)?;
-
-        Ok(IngestOutcome {
-            accepted_spans,
+    if records.is_empty() {
+        return Ok(IngestOutcome {
+            accepted_spans: 0,
             rejected_spans,
             rejection_message,
-        })
+        });
     }
+
+    let batch = spans_to_record_batch(&records).map_err(IngestError::Decode)?;
+    let accepted_spans = records.len() as i64;
+
+    // traces.spans is SystemShared: bind SYSTEM_OWNER for the registration /
+    // commit rows, stamp the data tenant into data_tenant_id. typed_writer
+    // carries the table's Sensitive payload class so the coordinator redacts
+    // the `attributes` column at flush.
+    let writer = catalog
+        .typed_writer::<SpansTable>(TableScope::SystemShared, auth.tenant)
+        .await
+        .map_err(IngestError::from_engine)?;
+
+    let ctx = BifrostWriteContext {
+        batch_id: *uuid::Uuid::now_v7().as_bytes(),
+        origin: OTLP_ORIGIN.to_owned(),
+        actor: auth.principal.id.to_string(),
+        request_id: auth.request_id.clone(),
+        card_ref: auth.principal.card_ref().cloned(),
+    };
+
+    writer
+        .commit_one(auth.tenant, vec![batch], ctx)
+        .await
+        .map_err(IngestError::from_engine)?;
+
+    Ok(IngestOutcome {
+        accepted_spans,
+        rejected_spans,
+        rejection_message,
+    })
 }
 
 /// Result of one accepted OTLP export: how many spans committed and how many the
@@ -145,8 +167,11 @@ pub struct IngestOutcome {
 
 impl IngestOutcome {
     /// Render the OTLP `partial_success` field, or `None` on a full success.
+    ///
+    /// Shared by both OTLP transports so the `rejected_spans` / `error_message`
+    /// contract is identical on gRPC and HTTP.
     #[must_use]
-    fn partial_success(&self) -> Option<ExportTracePartialSuccess> {
+    pub fn partial_success(&self) -> Option<ExportTracePartialSuccess> {
         if self.rejected_spans == 0 {
             return None;
         }

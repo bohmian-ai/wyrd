@@ -20,18 +20,18 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    ArrayRef, FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, StringViewArray,
+    TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use chrono::{DateTime, Utc};
 use vala_bifrost::tables::traces::SpansTable;
 use vala_bifrost::tables::{CorrelationPolicy, DomainTable};
+use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::system_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
 };
-use wyrd_spec::vala::ids::{SpanId, TraceId};
 
 use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
 use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -43,6 +43,12 @@ const SERVICE_NAME: &str = "service.name";
 const SERVICE_NAMESPACE: &str = "service.namespace";
 const SERVICE_VERSION: &str = "service.version";
 const SERVICE_INSTANCE_ID: &str = "service.instance.id";
+
+/// Fallback instrumentation-scope name for spans exported without a scope, or
+/// with an empty scope name. OTLP makes the scope optional on the wire, but the
+/// [`InstrumentationScope`] contract requires a non-empty name, so an unnamed
+/// scope is normalized to this stable sentinel rather than dropped.
+const UNKNOWN_SCOPE_NAME: &str = "unknown_service";
 
 /// A span the receiver could not accept, with the reason it was dropped.
 #[derive(Debug)]
@@ -210,7 +216,9 @@ fn span_status_from_otlp(status: Option<&wyrd_tonic::otlp::trace::v1::Status>) -
 }
 
 fn resource_from_otlp(resource: Option<&OtlpResource>) -> Resource {
-    let mut attributes = resource.map(|r| attributes_to_map(&r.attributes)).unwrap_or_default();
+    let mut attributes = resource
+        .map(|r| attributes_to_map(&r.attributes))
+        .unwrap_or_default();
     let service_name = take_string(&mut attributes, SERVICE_NAME).unwrap_or_default();
     Resource {
         service_name,
@@ -225,13 +233,22 @@ fn scope_from_otlp(
     scope: Option<&wyrd_tonic::otlp::common::v1::InstrumentationScope>,
 ) -> InstrumentationScope {
     match scope {
-        Some(scope) => InstrumentationScope {
+        Some(scope) if !scope.name.is_empty() => InstrumentationScope {
             name: scope.name.clone(),
             version: (!scope.version.is_empty()).then(|| scope.version.clone()),
             attributes: attributes_to_map(&scope.attributes),
         },
+        // Absent scope, or scope with an empty name: OTLP allows both, but the
+        // record contract requires a non-empty name, so normalize to the
+        // unknown-scope sentinel and keep any version/attributes the exporter
+        // did send.
+        Some(scope) => InstrumentationScope {
+            name: UNKNOWN_SCOPE_NAME.to_owned(),
+            version: (!scope.version.is_empty()).then(|| scope.version.clone()),
+            attributes: attributes_to_map(&scope.attributes),
+        },
         None => InstrumentationScope {
-            name: String::new(),
+            name: UNKNOWN_SCOPE_NAME.to_owned(),
             version: None,
             attributes: serde_json::Map::new(),
         },
@@ -316,10 +333,17 @@ fn status_str(status: &SpanStatus) -> &'static str {
 /// `data_tenant_id`); this schema must not include them.
 fn spans_write_schema() -> SchemaRef {
     let mut fields = SpansTable::arrow_fields();
-    debug_assert_eq!(SpansTable::CORRELATION_POLICY, CorrelationPolicy::Observation);
+    debug_assert_eq!(
+        SpansTable::CORRELATION_POLICY,
+        CorrelationPolicy::Observation
+    );
     fields.push(Field::new(RUN_ID, arrow::datatypes::DataType::Utf8, true));
     fields.push(Field::new(CARD_UID, arrow::datatypes::DataType::Utf8, true));
-    fields.push(Field::new(PRINCIPAL_ID, arrow::datatypes::DataType::Utf8, true));
+    fields.push(Field::new(
+        PRINCIPAL_ID,
+        arrow::datatypes::DataType::Utf8,
+        true,
+    ));
     SchemaRef::new(Schema::new(fields))
 }
 
@@ -334,32 +358,42 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
 
     let trace_id = fixed16(records.iter().map(|r| Some(*r.trace_id.as_bytes())))?;
     let span_id = fixed8(records.iter().map(|r| Some(*r.span_id.as_bytes())))?;
-    let parent_span_id =
-        fixed8(records.iter().map(|r| r.parent_span_id.map(|id| *id.as_bytes())))?;
+    let parent_span_id = fixed8(
+        records
+            .iter()
+            .map(|r| r.parent_span_id.map(|id| *id.as_bytes())),
+    )?;
 
-    let flags = Arc::new(UInt32Array::from_iter_values(records.iter().map(|r| r.flags))) as ArrayRef;
+    let flags = Arc::new(UInt32Array::from_iter_values(
+        records.iter().map(|r| r.flags),
+    )) as ArrayRef;
     let trace_state = Arc::new(StringArray::from_iter(
         records.iter().map(|r| Some(r.trace_state.clone())),
     )) as ArrayRef;
-    let name =
-        Arc::new(StringArray::from_iter_values(records.iter().map(|r| r.name.clone()))) as ArrayRef;
+    let name = Arc::new(StringArray::from_iter_values(
+        records.iter().map(|r| r.name.clone()),
+    )) as ArrayRef;
     let kind = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| kind_str(r.kind)),
     )) as ArrayRef;
 
     let start_time = Arc::new(
-        TimestampMicrosecondArray::from_iter_values(
-            records.iter().map(|r| micros(r.start_time)),
-        )
-        .with_timezone("UTC".to_string()),
+        TimestampMicrosecondArray::from_iter_values(records.iter().map(|r| micros(r.start_time)))
+            .with_timezone("UTC".to_string()),
     ) as ArrayRef;
     let end_time = Arc::new(
         TimestampMicrosecondArray::from_iter_values(records.iter().map(|r| micros(r.end_time)))
             .with_timezone("UTC".to_string()),
     ) as ArrayRef;
 
-    let duration_ms =
-        Arc::new(UInt64Array::from_iter_values(records.iter().map(|r| r.duration_ms))) as ArrayRef;
+    // Iceberg has no unsigned integer type; `duration_ms` is a signed Int64
+    // physical column (SpanRecord carries it as u64). A span duration never
+    // exceeds i64::MAX in practice, so saturate on the impossible overflow.
+    let duration_ms = Arc::new(Int64Array::from_iter_values(
+        records
+            .iter()
+            .map(|r| i64::try_from(r.duration_ms).unwrap_or(i64::MAX)),
+    )) as ArrayRef;
     let status = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| status_str(&r.status)),
     )) as ArrayRef;
@@ -427,9 +461,7 @@ fn attrs_json(attributes: &serde_json::Map<String, serde_json::Value>) -> String
     serde_json::Value::Object(attributes.clone()).to_string()
 }
 
-fn fixed16(
-    values: impl Iterator<Item = Option<[u8; 16]>>,
-) -> Result<ArrayRef, String> {
+fn fixed16(values: impl Iterator<Item = Option<[u8; 16]>>) -> Result<ArrayRef, String> {
     let mut builder = FixedSizeBinaryBuilder::new(16);
     for value in values {
         match value {
@@ -483,7 +515,10 @@ mod tests {
             start_time_unix_nano: 1_000_000_000,
             end_time_unix_nano: 1_002_000_000,
             attributes: vec![
-                kv("http.method", any_value::Value::StringValue("GET".to_owned())),
+                kv(
+                    "http.method",
+                    any_value::Value::StringValue("GET".to_owned()),
+                ),
                 kv("http.status_code", any_value::Value::IntValue(200)),
             ],
             dropped_attributes_count: 3,
@@ -524,7 +559,10 @@ mod tests {
                     "service.version",
                     any_value::Value::StringValue("2.1.0".to_owned()),
                 ),
-                kv("host.name", any_value::Value::StringValue("node-a".to_owned())),
+                kv(
+                    "host.name",
+                    any_value::Value::StringValue("node-a".to_owned()),
+                ),
             ],
             dropped_attributes_count: 0,
         }
@@ -546,8 +584,14 @@ mod tests {
         let record = map_span(&sample_span(), &resource, &scope).expect("span maps");
 
         // Ids carried through byte-for-byte.
-        assert_eq!(record.trace_id.as_bytes(), &(1u8..=16).collect::<Vec<_>>()[..]);
-        assert_eq!(record.span_id.as_bytes(), &(1u8..=8).collect::<Vec<_>>()[..]);
+        assert_eq!(
+            record.trace_id.as_bytes(),
+            &(1u8..=16).collect::<Vec<_>>()[..]
+        );
+        assert_eq!(
+            record.span_id.as_bytes(),
+            &(1u8..=8).collect::<Vec<_>>()[..]
+        );
         assert_eq!(
             record.parent_span_id.expect("parent present").as_bytes(),
             &(9u8..=16).collect::<Vec<_>>()[..]
@@ -599,6 +643,36 @@ mod tests {
             record.links[0].trace_id.as_bytes(),
             &(17u8..=32).collect::<Vec<_>>()[..]
         );
+    }
+
+    #[test]
+    fn missing_scope_maps_to_unknown_scope_name() {
+        // OTLP allows an absent scope; the record contract requires a non-empty
+        // name, so an unnamed scope must normalize to the sentinel and still
+        // validate (rather than being dropped as a rejection).
+        let resource = resource_from_otlp(Some(&sample_resource()));
+        let scope = scope_from_otlp(None);
+        assert_eq!(scope.name, UNKNOWN_SCOPE_NAME);
+
+        let record = map_span(&sample_span(), &resource, &scope).expect("span maps");
+        assert_eq!(record.scope.name, UNKNOWN_SCOPE_NAME);
+
+        let request = vec![ResourceSpans {
+            resource: Some(sample_resource()),
+            scope_spans: vec![ScopeSpans {
+                scope: None,
+                spans: vec![sample_span()],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }];
+        let mapped = map_resource_spans(&request);
+        assert_eq!(
+            mapped.records.len(),
+            1,
+            "unnamed-scope span must be accepted"
+        );
+        assert!(mapped.rejected.is_empty());
     }
 
     #[test]
@@ -671,7 +745,10 @@ mod tests {
             .downcast_ref::<StringViewArray>()
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(attrs.value(0)).expect("json");
-        assert_eq!(parsed.get("http.method").and_then(|v| v.as_str()), Some("GET"));
+        assert_eq!(
+            parsed.get("http.method").and_then(|v| v.as_str()),
+            Some("GET")
+        );
 
         // correlation columns are null for OTLP spans.
         let run_id = batch

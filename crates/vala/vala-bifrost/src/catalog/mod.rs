@@ -560,15 +560,25 @@ impl WyrdCatalog {
     }
 
     /// Check whether a loaded physical schema matches the declared schema for `T`.
+    ///
+    /// The physical schema is read back from Iceberg, so declared Arrow types that
+    /// Iceberg does not store natively (e.g. `UInt32` → `Int64`) round-trip to a
+    /// different Arrow type than declared. Comparing the raw declared schema would
+    /// therefore report drift on every re-boot of a healthy table. To stay
+    /// idempotent, normalize the declared schema through the same
+    /// arrow → iceberg → arrow round-trip `create_domain_table` performs, then
+    /// compare that expected physical shape against the actual physical schema.
     pub fn physical_matches_declared<T: DomainTable>(&self, physical: &SchemaRef) -> bool {
-        let declared = T::schema();
+        let Some(expected) = expected_physical_schema::<T>() else {
+            return false;
+        };
         // Compare field names and types (order-sensitive).
-        physical.fields().len() == declared.fields().len()
+        physical.fields().len() == expected.fields().len()
             && physical
                 .fields()
                 .iter()
-                .zip(declared.fields().iter())
-                .all(|(p, d)| p.name() == d.name() && p.data_type() == d.data_type())
+                .zip(expected.fields().iter())
+                .all(|(p, e)| p.name() == e.name() && p.data_type() == e.data_type())
     }
 
     /// Compute the fingerprint of a physical schema over user fields only.
@@ -819,6 +829,23 @@ impl WyrdCatalog {
 /// FQN format: `{ns.as_str()}.{table_name}`, where `ns.as_str()` may contain
 /// dots (e.g. "vala.bifrost"). Match the known namespace prefix to extract the
 /// table name — avoids relying on the buggy `split_part('.', N)` in the SQL.
+/// The Arrow schema a healthy Iceberg table for `T` reads back as.
+///
+/// `create_domain_table` writes `arrow_schema_to_schema_auto_assign_ids(T::schema())`;
+/// `iceberg_physical_schema` reads back `schema_to_arrow_schema(current_schema())`.
+/// Applying that same arrow → iceberg → arrow round-trip to the declared schema
+/// yields the exact physical shape to compare against, so a re-boot of a healthy
+/// table matches instead of reporting spurious `PhysicalDrift` on Iceberg type
+/// normalizations (e.g. `UInt32` → `Int64`). Returns `None` only if the declared
+/// schema cannot map into Iceberg at all, which is a real, non-idempotency failure.
+fn expected_physical_schema<T: DomainTable>() -> Option<SchemaRef> {
+    let declared = T::schema();
+    let iceberg_schema =
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(declared.as_ref()).ok()?;
+    let roundtripped = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).ok()?;
+    Some(Arc::new(roundtripped))
+}
+
 fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
     let namespaces = BifrostNamespace::ALL;
     for ns in namespaces {

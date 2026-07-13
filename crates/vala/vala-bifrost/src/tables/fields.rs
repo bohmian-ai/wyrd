@@ -37,10 +37,6 @@ pub fn uint32(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::UInt32, nullable)
 }
 
-pub fn uint64(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::UInt64, nullable)
-}
-
 pub fn float64(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Float64, nullable)
 }

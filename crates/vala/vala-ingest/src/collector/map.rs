@@ -599,7 +599,14 @@ fn map_metric(
             aggregation_temporality,
         }) => {
             for point in data_points {
-                push_histogram_point(metric, resource, scope, point, *aggregation_temporality, out);
+                push_histogram_point(
+                    metric,
+                    resource,
+                    scope,
+                    point,
+                    *aggregation_temporality,
+                    out,
+                );
             }
         }
         metric::Data::ExponentialHistogram(ExponentialHistogram {
@@ -968,9 +975,16 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
     let sum = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.sum))) as ArrayRef;
     let min = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.min))) as ArrayRef;
     let max = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.max))) as ArrayRef;
-    let bucket_counts = json_view_col(records.iter().map(|r| r.bucket_counts.as_ref().map(json_of)));
-    let explicit_bounds =
-        json_view_col(records.iter().map(|r| r.explicit_bounds.as_ref().map(json_of)));
+    let bucket_counts = json_view_col(
+        records
+            .iter()
+            .map(|r| r.bucket_counts.as_ref().map(json_of)),
+    );
+    let explicit_bounds = json_view_col(
+        records
+            .iter()
+            .map(|r| r.explicit_bounds.as_ref().map(json_of)),
+    );
     let scale = Arc::new(Int32Array::from_iter(records.iter().map(|r| r.scale))) as ArrayRef;
     let zero_count = Arc::new(Int64Array::from_iter(
         records.iter().map(|r| r.zero_count.map(u64_to_i64)),
@@ -1007,7 +1021,9 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
         records.iter().map(|r| r.resource.service_name.clone()),
     )) as ArrayRef;
     let scope_name = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.scope.as_ref().map(|s| s.name.clone())),
+        records
+            .iter()
+            .map(|r| r.scope.as_ref().map(|s| s.name.clone())),
     )) as ArrayRef;
     let scope_version = Arc::new(StringArray::from_iter(
         records
@@ -1188,9 +1204,7 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
     let time = ts_micros_col(records.iter().map(|r| r.time));
     let observed_time = ts_micros_col(records.iter().map(|r| Some(r.observed_time)));
     let severity_number = Arc::new(UInt32Array::from_iter(
-        records
-            .iter()
-            .map(|r| r.severity_number.map(u32::from)),
+        records.iter().map(|r| r.severity_number.map(u32::from)),
     )) as ArrayRef;
     let severity_text = Arc::new(StringArray::from_iter(
         records.iter().map(|r| r.severity_text.clone()),
@@ -1214,13 +1228,14 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
     let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
         records.iter().map(|r| r.dropped_attributes_count),
     )) as ArrayRef;
-    let service_name = Arc::new(StringArray::from_iter(
+    let service_name =
+        Arc::new(StringArray::from_iter(records.iter().map(|r| {
+            r.resource.as_ref().map(|res| res.service_name.clone())
+        }))) as ArrayRef;
+    let scope_name = Arc::new(StringArray::from_iter(
         records
             .iter()
-            .map(|r| r.resource.as_ref().map(|res| res.service_name.clone())),
-    )) as ArrayRef;
-    let scope_name = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.scope.as_ref().map(|s| s.name.clone())),
+            .map(|r| r.scope.as_ref().map(|s| s.name.clone())),
     )) as ArrayRef;
     let scope_version = Arc::new(StringArray::from_iter(
         records
@@ -1571,7 +1586,10 @@ mod tests {
 
     fn number_point(value: f64) -> NumberDataPoint {
         NumberDataPoint {
-            attributes: vec![kv("k8s.pod", any_value::Value::StringValue("p-1".to_owned()))],
+            attributes: vec![kv(
+                "k8s.pod",
+                any_value::Value::StringValue("p-1".to_owned()),
+            )],
             start_time_unix_nano: 1_000_000_000,
             time_unix_nano: 1_002_000_000,
             exemplars: vec![OtlpExemplar {
@@ -1617,7 +1635,11 @@ mod tests {
         }];
 
         let mapped = map_resource_metrics(&request);
-        assert!(mapped.rejected.is_empty(), "no rejections: {:?}", mapped.rejected);
+        assert!(
+            mapped.rejected.is_empty(),
+            "no rejections: {:?}",
+            mapped.rejected
+        );
         assert_eq!(mapped.records.len(), 1);
         let record = &mapped.records[0];
 
@@ -1811,7 +1833,11 @@ mod tests {
             schema_url: String::new(),
         }];
         let mapped = map_resource_metrics(&request);
-        assert!(mapped.rejected.is_empty(), "no rejections: {:?}", mapped.rejected);
+        assert!(
+            mapped.rejected.is_empty(),
+            "no rejections: {:?}",
+            mapped.rejected
+        );
         assert_eq!(mapped.records.len(), 3);
         // Scope absent → None (not the unknown-scope sentinel).
         assert!(mapped.records[0].scope.is_none());
@@ -1912,7 +1938,11 @@ mod tests {
         }];
 
         let mapped = map_resource_logs(&request);
-        assert!(mapped.rejected.is_empty(), "no rejections: {:?}", mapped.rejected);
+        assert!(
+            mapped.rejected.is_empty(),
+            "no rejections: {:?}",
+            mapped.rejected
+        );
         assert_eq!(mapped.records.len(), 1);
         let record = &mapped.records[0];
 

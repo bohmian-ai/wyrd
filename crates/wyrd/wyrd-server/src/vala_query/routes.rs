@@ -397,7 +397,9 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
     let mut rows = Vec::new();
     for batch in batches {
         let ts_col = col_ts(batch, "observed_time");
-        let sev_num_col = col_u32(batch, "severity_number");
+        // Iceberg has no unsigned integer type: the UInt32 `severity_number` write
+        // column is stored and read back as Int64.
+        let sev_num_col = col_i64(batch, "severity_number");
         let sev_txt_col = col_str(batch, "severity_text");
         let trace_col = col_bin16(batch, "trace_id");
         let span_col = batch

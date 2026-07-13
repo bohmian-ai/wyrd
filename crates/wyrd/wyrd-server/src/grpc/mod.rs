@@ -46,8 +46,10 @@ where
         state.bifrost.clone(),
         ingest_auth_interceptor(verifier.clone()),
     );
-    let traces =
-        OtlpTraceService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier.clone()));
+    let traces = OtlpTraceService::new(
+        state.bifrost.clone(),
+        ingest_auth_interceptor(verifier.clone()),
+    );
     let metrics = OtlpMetricsService::new(
         state.bifrost.clone(),
         ingest_auth_interceptor(verifier.clone()),

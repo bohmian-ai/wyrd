@@ -26,11 +26,11 @@
 //! `require_authenticated` layer on the `/v1` group; the [`Caller`] extractor
 //! then yields the token-derived tenant/principal (never wire-derived).
 //!
-//! `/v1/metrics` and `/v1/logs` share the Content-Type decode branch but their
-//! ingest service bodies are not yet implemented — the decoded request is handed
-//! to [`metrics_ingest_unimplemented`] / [`logs_ingest_unimplemented`], which
-//! return a `501` [`BifrostError::IngestUnimplemented`]. Those seams are what a
-//! later metrics/logs ingest change replaces with real write cores.
+//! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
+//! Content-Type decode, the shared decode→write core
+//! ([`vala_ingest::ingest_resource_metrics`] / [`vala_ingest::ingest_resource_logs`]),
+//! then a response encoded in the request's encoding with `partial_success` for
+//! per-item rejections.
 
 use axum::body::Bytes;
 use axum::extract::State;
@@ -105,9 +105,9 @@ impl OtlpEncoding {
 
 /// Standalone OTLP/HTTP router for the `/v1` group.
 ///
-/// Registers all three OTLP signal endpoints. `/v1/traces` is fully wired to the
-/// shared trace decode→write core; `/v1/metrics` and `/v1/logs` share the
-/// Content-Type decode branch but return `501` until their ingest services land.
+/// Registers all three OTLP signal endpoints. Each is wired to its shared
+/// decode→write core (`traces`/`metrics`/`logs`) with identical Content-Type
+/// handling and `partial_success` semantics.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/traces", post(export_traces))
@@ -195,62 +195,76 @@ async fn export_traces(
     Ok(encode_response(encoding, &response))
 }
 
-/// `POST /v1/metrics` — the Content-Type decode branch is live; the metrics
-/// ingest service is not yet implemented, so a decoded request maps to `501`.
-#[tracing::instrument(name = "otlp.http.metrics.export", skip_all, fields(tenant))]
+/// `POST /v1/metrics` — decode an OTLP metrics export and write it through the
+/// shared decode→write core.
+///
+/// Accepts protobuf and protobuf-JSON, replies in the request's encoding, and
+/// surfaces per-point rejections as OTLP `partial_success`.
+#[tracing::instrument(
+    name = "otlp.http.metrics.export",
+    skip_all,
+    fields(tenant, encoding, accepted_points, rejected_points)
+)]
 async fn export_metrics(
+    State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WyrdErrorResponse> {
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
+    tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let request: ExportMetricsServiceRequest =
         decode_request(encoding, &body).map_err(ingest_error_to_response)?;
-    let response: ExportMetricsServiceResponse = metrics_ingest_unimplemented(request)?;
+    let auth = caller_auth_context(&caller);
+
+    let outcome = vala_ingest::ingest_resource_metrics(&state.bifrost, &auth, request)
+        .await
+        .map_err(ingest_error_to_response)?;
+
+    tracing::Span::current().record("accepted_points", outcome.accepted_points);
+    tracing::Span::current().record("rejected_points", outcome.rejected_points);
+
+    let response = ExportMetricsServiceResponse {
+        partial_success: outcome.partial_success(),
+    };
     Ok(encode_response(encoding, &response))
 }
 
-/// `POST /v1/logs` — the Content-Type decode branch is live; the logs ingest
-/// service is not yet implemented, so a decoded request maps to `501`.
-#[tracing::instrument(name = "otlp.http.logs.export", skip_all, fields(tenant))]
+/// `POST /v1/logs` — decode an OTLP logs export and write it through the shared
+/// decode→write core.
+///
+/// Accepts protobuf and protobuf-JSON, replies in the request's encoding, and
+/// surfaces per-record rejections as OTLP `partial_success`.
+#[tracing::instrument(
+    name = "otlp.http.logs.export",
+    skip_all,
+    fields(tenant, encoding, accepted_records, rejected_records)
+)]
 async fn export_logs(
+    State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, WyrdErrorResponse> {
     tracing::Span::current().record("tenant", tracing::field::display(caller.data_tenant_id));
     let encoding = OtlpEncoding::from_headers(&headers);
+    tracing::Span::current().record("encoding", tracing::field::debug(encoding));
     let request: ExportLogsServiceRequest =
         decode_request(encoding, &body).map_err(ingest_error_to_response)?;
-    let response: ExportLogsServiceResponse = logs_ingest_unimplemented(request)?;
+    let auth = caller_auth_context(&caller);
+
+    let outcome = vala_ingest::ingest_resource_logs(&state.bifrost, &auth, request)
+        .await
+        .map_err(ingest_error_to_response)?;
+
+    tracing::Span::current().record("accepted_records", outcome.accepted_records);
+    tracing::Span::current().record("rejected_records", outcome.rejected_records);
+
+    let response = ExportLogsServiceResponse {
+        partial_success: outcome.partial_success(),
+    };
     Ok(encode_response(encoding, &response))
-}
-
-/// Metrics ingest write core seam. Returns a `501` until the metrics ingest
-/// service is implemented; a later change replaces this body with the real
-/// decode→write core (mirroring [`vala_ingest::ingest_resource_spans`]).
-fn metrics_ingest_unimplemented(
-    _request: ExportMetricsServiceRequest,
-) -> Result<ExportMetricsServiceResponse, WyrdErrorResponse> {
-    Err(ingest_unimplemented("metrics"))
-}
-
-/// Logs ingest write core seam. Returns a `501` until the logs ingest service is
-/// implemented; a later change replaces this body with the real decode→write
-/// core (mirroring [`vala_ingest::ingest_resource_spans`]).
-fn logs_ingest_unimplemented(
-    _request: ExportLogsServiceRequest,
-) -> Result<ExportLogsServiceResponse, WyrdErrorResponse> {
-    Err(ingest_unimplemented("logs"))
-}
-
-/// Build the `501` response for an OTLP signal whose ingest service is not yet
-/// implemented.
-fn ingest_unimplemented(signal: &str) -> WyrdErrorResponse {
-    WyrdErrorResponse::from(WyrdError::from(BifrostError::IngestUnimplemented {
-        signal: signal.to_owned(),
-    }))
 }
 
 /// Build the token-derived [`AuthContext`] for the shared ingest core.

@@ -405,6 +405,18 @@ A change is not done until:
 Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
 Code in this repo lands one session at a time, via dialogue-locked decisions.
 
+### Codex agent skill bindings
+
+- The plan orchestrator reads this file, `architecture/wyrd-design.md`,
+  `architecture/wyrd-doctrine.mdx`, and the applicable repo-local skill before
+  decomposing work.
+- Wyrd Rust, Python, server, CLI, MCP, storage, Vala, and contract implementors
+  must receive `.codex/skills/wyrd-rust-python/SKILL.md` in their task packet.
+- Wyrd UI implementors additionally receive
+  `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
+- The complete integration review runs the global `review-and-plan` skill; its
+  repo-specific review binding is `.codex/skills/review/SKILL.md`.
+
 ## 15. Implementation Rules
 
 - `wyrd-spec` is foundational but it not a dumping grounds for all contracts. If it's not spec-related, it doesn't go in `wyrd-spec`. Find another place for it.

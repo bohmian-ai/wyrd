@@ -163,6 +163,9 @@ struct PendingWrite {
 pub struct GroupCommitHandle {
     pub(crate) sender: Arc<mpsc::Sender<CoordinatorCmd>>,
     pub(crate) table_fqn: String,
+    /// Physical table UID — stable for the handle's lifetime. Used by the
+    /// derivation runtime to compute deterministic exactly-once keys.
+    pub table_uid: [u8; 16],
 }
 
 impl GroupCommitHandle {
@@ -506,6 +509,7 @@ pub(crate) fn spawn_group_commit_coordinator(
     GroupCommitHandle {
         sender: Arc::new(sender),
         table_fqn,
+        table_uid: table_uid.0,
     }
 }
 

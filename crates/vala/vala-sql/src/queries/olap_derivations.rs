@@ -31,6 +31,65 @@ pub struct CommittedSourceBatch {
     pub batch_id: Vec<u8>,
 }
 
+/// Enumerate distinct tenant IDs that have at least one `committed` batch for
+/// `source_table_uid`.
+///
+/// Uses the operator pool (BYPASSRLS) so the derivation worker can discover
+/// which tenants need a derivation pass without a per-tenant connection.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_source_commit_tenants(
+    op: &OperatorPool,
+    source_table_uid: &[u8; 16],
+) -> Result<Vec<Uuid>, SqlError> {
+    sqlx::query_as::<_, (Uuid,)>(
+        r#"
+        SELECT DISTINCT data_tenant_id
+          FROM vala.olap_commits
+         WHERE table_uid = $1
+           AND state = 'committed'
+        "#,
+    )
+    .bind(source_table_uid.as_slice())
+    .fetch_all(op.pool())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Per-tenant enumeration of `committed` source batch IDs in commit order.
+///
+/// Uses the caller's [`TenantConn`] so RLS confines the result to the current
+/// tenant. The derivation worker calls this after discovering the tenant via
+/// [`list_source_commit_tenants`] to build the ordered delta it must consume.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_tenant_committed_batches(
+    conn: &mut TenantConn<'_>,
+    source_table_uid: &[u8; 16],
+) -> Result<Vec<CommittedSourceBatch>, SqlError> {
+    sqlx::query_as::<_, (Vec<u8>,)>(
+        r#"
+        SELECT batch_id
+          FROM vala.olap_commits
+         WHERE table_uid = $1
+           AND state = 'committed'
+         ORDER BY committed_at, batch_id
+        "#,
+    )
+    .bind(source_table_uid.as_slice())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(batch_id,)| CommittedSourceBatch { batch_id })
+            .collect()
+    })
+}
+
 /// Enumerate every `committed` source commit position for `source_table_uid`,
 /// across ALL tenants, in commit order.
 ///

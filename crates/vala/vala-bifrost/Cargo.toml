@@ -34,6 +34,7 @@ sqlx         = { workspace = true }
 sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
 
 tokio      = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true }
 tracing    = { workspace = true }
 thiserror  = { workspace = true }
 dashmap    = { workspace = true }

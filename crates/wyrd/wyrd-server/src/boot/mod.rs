@@ -965,6 +965,29 @@ pub fn spawn_audit_seal_worker(
     Some(handle)
 }
 
+/// Spawn the genai derivation worker (slice 05b).
+///
+/// Periodically projects committed `gen_ai.*` span attributes from
+/// `traces.spans` into the `genai.*` fact tables, watermarked in
+/// `vala.olap_derivations`. Returns `None` when the operator pool
+/// (BYPASSRLS) is unavailable — cross-tenant tenant enumeration requires it.
+#[must_use]
+pub fn spawn_genai_derivation_worker(
+    state: &crate::state::AppState,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(op) = state.postgres.operator_pool() else {
+        tracing::warn!("genai derivation worker skipped: operator pool unavailable");
+        return None;
+    };
+    let catalog = Arc::clone(&state.bifrost);
+    let pool = state.postgres.vala_pool().clone();
+
+    Some(vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
+        catalog, pool, op, shutdown,
+    ))
+}
+
 /// Ensure the recovery pool is present in production deployments.
 ///
 /// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER

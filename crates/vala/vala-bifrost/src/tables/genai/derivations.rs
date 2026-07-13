@@ -26,8 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Int64Array, RecordBatch,
-    StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Float64Array, Int64Array,
+    RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{Schema, SchemaRef};
 use uuid::Uuid;

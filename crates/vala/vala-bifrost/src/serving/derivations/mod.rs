@@ -13,11 +13,13 @@ mod runtime;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
 use crate::tables::genai::{DomainDerivation, GenAiFromSpans};
+use crate::writer::CommitEvent;
 
 /// Repair-worker poll cadence for the background genai derivation worker.
 ///
@@ -31,8 +33,8 @@ pub const FALLBACK_CADENCE_SECS: u64 = 60;
 ///
 /// Returns `None` when the operator pool (BYPASSRLS) is unavailable — cross-
 /// tenant tenant enumeration requires it. Otherwise spawns a tokio task that
-/// runs [`DerivationRuntime::run_tick`] on each `FALLBACK_CADENCE` tick
-/// (replacing the NOTIFY-based wake path that lands in Task G).
+/// runs [`DerivationRuntime::run_tick`] on commit notifications and each
+/// `FALLBACK_CADENCE` tick for crash recovery.
 ///
 /// The worker logs per-tenant errors but never panics: a single-tenant failure
 /// does not block other tenants or shut down the worker.
@@ -54,8 +56,26 @@ pub fn spawn_genai_derivation_worker(
                 }
             }
             tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+            }
+        };
+
+        let mut listener = loop {
+            match PgListener::connect_with(&pool).await {
+                Ok(mut listener) => match listener.listen("vala_commits").await {
+                    Ok(()) => break listener,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "genai derivation worker: commit listener setup failed, retrying");
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, "genai derivation worker: commit listener connection failed, retrying");
+                }
+            }
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
             }
         };
 
@@ -69,15 +89,32 @@ pub fn spawn_genai_derivation_worker(
 
         loop {
             tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+                () = shutdown.cancelled() => break,
+                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
+                    if let Err(e) = rt.run_tick().await {
+                        tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+                    }
+                }
+                notification = listener.recv() => {
+                    let Ok(notification) = notification else {
+                        tracing::warn!("genai derivation worker: commit listener receive failed");
+                        continue;
+                    };
+                    let Ok(CommitEvent::SpanCommitted { table_uid, .. }) =
+                        serde_json::from_str::<CommitEvent>(notification.payload())
+                    else {
+                        continue;
+                    };
+                    if table_uid != rt.uids.source {
+                        continue;
+                    }
+                    if let Err(e) = rt.run_tick().await {
+                        tracing::error!(error = %e, "genai derivation worker: notification tick failed");
+                    }
+                }
             }
             if shutdown.is_cancelled() {
                 break;
-            }
-
-            if let Err(e) = rt.run_tick().await {
-                tracing::error!(error = %e, "genai derivation worker: tick failed");
             }
         }
     })

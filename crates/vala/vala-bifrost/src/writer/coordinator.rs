@@ -48,7 +48,7 @@ use crate::types::{TableScope, TableUid};
 use crate::writer::buffer::{TenantAppendBuffer, batch_byte_estimate};
 use crate::writer::commit::{CommitGroup, run_group_commit};
 use crate::writer::redaction::RedactionClassifier;
-use crate::writer::{BifrostWriteContext, CommitKey};
+use crate::writer::{BifrostWriteContext, CommitEvent, CommitKey, CommitNotifier};
 
 /// The audit-outbox `origin` for the relay's own write. This origin MUST NOT
 /// append an audit row (M-11: the relay must not self-feed the audit spine).
@@ -56,6 +56,24 @@ pub(crate) const AUDIT_RELAY_ORIGIN: &str = "audit-relay";
 
 /// The reply channel one write awaits: the covering group commit's snapshot id.
 type CommitReply = oneshot::Sender<Result<i64, BifrostError>>;
+
+async fn emit_commit_events(
+    notifier: &dyn CommitNotifier,
+    table_uid: [u8; 16],
+    committed: &[CommitKey],
+    table_fqn: &str,
+) {
+    for key in committed {
+        let event = CommitEvent::SpanCommitted {
+            table_uid,
+            tenant: key.tenant,
+            batch_id: key.batch_id,
+        };
+        if let Err(error) = notifier.notify(event).await {
+            tracing::warn!(error = %error, table = %table_fqn, "commit notification failed");
+        }
+    }
+}
 
 /// Flush policy knobs for the group-commit coordinator.
 ///
@@ -246,6 +264,7 @@ struct GroupCommitActor {
     table_uid: TableUid,
     scope: TableScope,
     registry: Arc<Registry>,
+    commit_notifier: Arc<dyn CommitNotifier>,
     payload_class: PayloadClass,
     sensitive_columns: &'static [&'static str],
     flush_policy: FlushPolicy,
@@ -422,6 +441,13 @@ impl GroupCommitActor {
                     self.table = table;
                     self.invalidate_registry(&outcome.committed).await;
                 }
+                emit_commit_events(
+                    self.commit_notifier.as_ref(),
+                    self.table_uid.0,
+                    &outcome.committed,
+                    table_fqn,
+                )
+                .await;
                 // key → covering snapshot: fresh keys share outcome.snapshot_id;
                 // replayed keys keep the snapshot they originally committed to.
                 let mut snaps: HashMap<CommitKey, i64> = HashMap::new();
@@ -471,10 +497,12 @@ impl GroupCommitActor {
     }
 }
 
-/// Spawn the per-physical-table group-commit coordinator.
+/// Spawn the per-physical-table group-commit coordinator with a no-op notifier.
 ///
-/// Returns a [`GroupCommitHandle`] the caller uses to submit writes. The actor
-/// owns the loaded [`Table`] and advances its snapshot as flushes commit.
+/// This retains the crate-internal constructor used by existing focused
+/// commit tests. Production catalog writers use
+/// [`spawn_group_commit_coordinator_with_notifier`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_group_commit_coordinator(
     table: Table,
@@ -484,6 +512,39 @@ pub(crate) fn spawn_group_commit_coordinator(
     table_fqn: String,
     scope: TableScope,
     registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
+    flush_policy: FlushPolicy,
+) -> GroupCommitHandle {
+    spawn_group_commit_coordinator_with_notifier(
+        table,
+        catalog,
+        pool,
+        table_uid,
+        table_fqn,
+        scope,
+        registry,
+        Arc::new(crate::writer::NoOpCommitNotifier),
+        payload_class,
+        sensitive_columns,
+        flush_policy,
+    )
+}
+
+/// Spawn the per-physical-table group-commit coordinator with a commit notifier.
+///
+/// Returns a [`GroupCommitHandle`] the caller uses to submit writes. The actor
+/// owns the loaded [`Table`] and advances its snapshot as flushes commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_group_commit_coordinator_with_notifier(
+    table: Table,
+    catalog: Arc<SqlCatalog>,
+    pool: Arc<PgPool>,
+    table_uid: TableUid,
+    table_fqn: String,
+    scope: TableScope,
+    registry: Arc<Registry>,
+    commit_notifier: Arc<dyn CommitNotifier>,
     payload_class: PayloadClass,
     sensitive_columns: &'static [&'static str],
     flush_policy: FlushPolicy,
@@ -498,6 +559,7 @@ pub(crate) fn spawn_group_commit_coordinator(
         table_uid,
         scope,
         registry,
+        commit_notifier,
         payload_class,
         sensitive_columns,
         flush_policy,
@@ -517,9 +579,30 @@ pub(crate) fn spawn_group_commit_coordinator(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use async_trait::async_trait;
+
     use super::FlushPolicy;
+    use crate::error::BifrostError;
+    use crate::writer::{CommitEvent, CommitKey, CommitNotifier};
+
+    #[derive(Clone, Default)]
+    struct SpyNotifier {
+        events: Arc<Mutex<Vec<CommitEvent>>>,
+    }
+
+    #[async_trait]
+    impl CommitNotifier for SpyNotifier {
+        async fn notify(&self, event: CommitEvent) -> Result<(), BifrostError> {
+            self.events
+                .lock()
+                .expect("spy mutex is not poisoned")
+                .push(event);
+            Ok(())
+        }
+    }
 
     #[test]
     fn flush_policy_defaults_match_contract() {
@@ -528,5 +611,26 @@ mod tests {
         assert_eq!(policy.max_interval, Duration::from_secs(1));
         assert_eq!(policy.max_buffered_bytes, 128 * 1024 * 1024);
         assert_eq!(policy.max_commit_keys, 128);
+    }
+
+    #[tokio::test]
+    async fn commit_notifier_emits_fresh_keys_once_and_replays_none() {
+        let notifier = SpyNotifier::default();
+        let table_uid = [7; 16];
+        let key = CommitKey::new(wyrd_spec::ids::DataTenantId::new_v7(), [9; 16]);
+
+        super::emit_commit_events(&notifier, table_uid, &[key], "vala.traces.spans").await;
+        super::emit_commit_events(&notifier, table_uid, &[], "vala.traces.spans").await;
+
+        let events = notifier.events.lock().expect("spy mutex is not poisoned");
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            CommitEvent::SpanCommitted {
+                table_uid,
+                tenant: key.tenant,
+                batch_id: key.batch_id,
+            }
+        );
     }
 }

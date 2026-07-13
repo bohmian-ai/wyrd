@@ -18,8 +18,8 @@
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use vala_sql::TenantConn;
-use vala_sql::queries::audit_outbox::shipped_outbox_refs;
-use vala_sql::queries::audit_seal::upsert_checkpoint;
+use vala_sql::queries::audit_outbox::shipped_outbox_refs_after;
+use vala_sql::queries::audit_seal::{latest_sealed_seq_hi, upsert_checkpoint};
 use wyrd_auth_issue::AuditSealKey;
 use wyrd_spec::ids::DataTenantId;
 
@@ -41,13 +41,19 @@ pub struct SealOutcome {
     pub skipped: bool,
 }
 
-/// Seal all shipped audit rows for `tenant_id` into one signed checkpoint.
+/// Seal the unsealed tail of shipped audit rows for `tenant_id` into one signed
+/// checkpoint.
 ///
 /// Steps:
-/// 1. Fetch all shipped outbox `(seq, entry_hash)` pairs.
+/// 1. Read the highest already-sealed `seq_hi` and fetch only the shipped
+///    outbox `(seq, entry_hash)` pairs past it — the tail `(seq_hi, current]`.
 /// 2. Compute `range_hash = SHA256(seq_lo BE || seq_hi BE || concat(entry_hashes in seq order))`.
 /// 3. Sign `range_hash` with `key`.
 /// 4. Persist the checkpoint via idempotent upsert.
+///
+/// Sealing only the tail keeps checkpoints contiguous and non-overlapping —
+/// repeated ticks do not re-seal `[1, N]` and accrue overlapping rows while
+/// pruning is deferred.
 ///
 /// Returns [`SealOutcome`] describing what was sealed.
 ///
@@ -66,7 +72,15 @@ pub async fn seal_shipped_range(
         .await
         .map_err(BifrostError::Sql)?;
 
-    let refs = shipped_outbox_refs(&mut conn)
+    // Seal only past the last checkpoint. `None` (no checkpoints yet) means the
+    // whole shipped history is the tail, so use 0 as the exclusive lower bound
+    // (outbox seq starts at 1).
+    let after_seq = latest_sealed_seq_hi(&mut conn)
+        .await
+        .map_err(BifrostError::Sql)?
+        .unwrap_or(0);
+
+    let refs = shipped_outbox_refs_after(&mut conn, after_seq)
         .await
         .map_err(BifrostError::Sql)?;
     conn.commit().await.map_err(BifrostError::Sql)?;

@@ -253,6 +253,10 @@ impl GroupCommitActor {
     async fn run(mut self) {
         let interval_dur = self.flush_policy.max_interval;
         let mut timer = interval_at(Instant::now() + interval_dur, interval_dur);
+        // A slow flush must not make the timer fire back-to-back to "catch up"
+        // (the default `Burst` behavior); delay the next tick a full interval
+        // past completion instead. Matches the repo's Delay/Skip convention.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {

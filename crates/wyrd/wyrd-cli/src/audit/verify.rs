@@ -1,4 +1,6 @@
-//! `wyrd audit verify` — POST /v1/admin/audit/verify for a tenant.
+//! `wyrd audit verify` — POST /v1/admin/audit/verify for the caller's own
+//! tenant (the tenant bound to the access token). Cross-tenant verification is
+//! not exposed on the CLI in this release.
 //!
 //! Exits with code 0 on `clean` or `no_checkpoints`, exits non-zero (1) on
 //! `tampered` or `gap`.

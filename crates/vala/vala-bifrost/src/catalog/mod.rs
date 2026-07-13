@@ -866,7 +866,7 @@ fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
 }
 
 /// Recovery-oracle verdict for one claimed stale precommit row.
-enum RecoveryDecision {
+pub(crate) enum RecoveryDecision {
     /// A snapshot durably carries this row's commit identity — roll forward and
     /// finalize `committed` against the discovered `snapshot_id`.
     Committed(i64),
@@ -893,7 +893,7 @@ enum RecoveryDecision {
 /// Both hex values are UUID simple-hex, so the pair match is an exact,
 /// escaping-free substring test against the JSON array — no JSON parser is pulled
 /// into the production library build.
-fn decide_recovery(
+pub(crate) fn decide_recovery(
     table: &iceberg::table::Table,
     data_tenant_id: sqlx::types::Uuid,
     batch_id: &[u8; 16],

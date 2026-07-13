@@ -416,6 +416,38 @@ pub async fn shipped_outbox_refs(
     })
 }
 
+/// Return (seq, entry_hash) for shipped outbox rows with `seq > after_seq`, in
+/// seq order. The seal worker uses this to seal only the unsealed tail past the
+/// last checkpoint, so repeated ticks produce contiguous, non-overlapping
+/// checkpoints instead of re-sealing the whole `[1, N]` range each pass.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn shipped_outbox_refs_after(
+    conn: &mut TenantConn<'_>,
+    after_seq: i64,
+) -> Result<Vec<ShippedOutboxRef>, SqlError> {
+    sqlx::query_as::<_, (i64, Vec<u8>)>(
+        r#"
+        SELECT seq, entry_hash
+          FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND shipped = true
+           AND seq > $1
+         ORDER BY seq
+        "#,
+    )
+    .bind(after_seq)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
+            .collect()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -685,6 +685,96 @@ mod recovery {
         assert_eq!(events, 0, "disabled recovery must write no audit rows");
     }
 
+    /// LIVE recovery sweep (`commit_recovery::tick`) — the crux of the CRITICAL
+    /// fix. A stale precommit whose `{data_tenant_id, batch_id}` pair is ABSENT
+    /// from every snapshot, on a table that DOES carry a later unrelated
+    /// snapshot, must resolve `aborted`, never `committed`.
+    ///
+    /// Red before the fix: the sweep's oracle returned the table's
+    /// `current_snapshot_id()` for any registered table without checking pair
+    /// membership, so it wrongly finalized a crashed-before-append batch
+    /// `committed` against the unrelated snapshot — a silent lost write once the
+    /// client's idempotent retry dedups against the false commit.
+    #[tokio::test]
+    async fn live_sweep_aborts_precommit_absent_from_snapshots() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        // Mint an UNRELATED committed snapshot carrying a DIFFERENT batch's pair,
+        // so the table's current_snapshot_id() is Some(..) — the exact condition
+        // that tricked the old oracle into finalizing committed.
+        let other_batch = *uuid::Uuid::now_v7().as_bytes();
+        let files = write_batches(&table, vec![stamped_batch(5, other_batch)])
+            .await
+            .unwrap();
+        let tenant_hex = h.tenant.as_uuid().simple();
+        let other_batch_hex = uuid::Uuid::from_bytes(other_batch).simple();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "wyrd_commit_keys".to_string(),
+            format!(r#"[{{"data_tenant_id":"{tenant_hex}","batch_id":"{other_batch_hex}"}}]"#),
+        );
+        append_snapshot(&sql_catalog, &table, files, props)
+            .await
+            .unwrap();
+
+        // Orphaned precommit for a DIFFERENT batch, absent from every snapshot,
+        // with a NULL lease so the sweep claims it.
+        let orphan_batch = *uuid::Uuid::now_v7().as_bytes();
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &orphan_batch,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Oracle catalog with NO recovery pool → its startup scan is skipped, so
+        // the ONLY thing that resolves the orphan is the live sweep called below.
+        let catalog = WyrdCatalog::new(&h.catalog_uri, &h.backend, h.pool.clone(), None)
+            .await
+            .unwrap();
+        let vala = vala_sql::postgres::ValaPostgres::from_pools(
+            (*h.pool).clone(),
+            Some((*h.recovery_pool).clone()),
+        );
+
+        let outcome = crate::serving::repair::commit_recovery::tick(&vala, &catalog, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.claimed, 1, "the orphan precommit is claimed");
+        assert_eq!(
+            outcome.resolved_committed, 0,
+            "a batch absent from all snapshots must NOT be finalized committed \
+             against the unrelated snapshot"
+        );
+        assert_eq!(
+            outcome.resolved_aborted, 1,
+            "pair-membership oracle must abort the never-appended batch"
+        );
+
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(orphan_batch.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "aborted",
+            "durable FSM state is aborted, not committed"
+        );
+    }
+
     // The `scan_failed` oracle branch — a transient catalog/object-store failure
     // must leave the row 'precommit', increment `recovery_attempts`, write a
     // `scan_failed` audit row, and stay re-claimable — is covered deterministically

@@ -19,7 +19,11 @@ mod recovery {
     use crate::catalog::iceberg_sql;
     use crate::catalog::namespaces::BifrostNamespace;
     use crate::types::{TableScope, TableUid};
-    use crate::writer::commit::{FaultPoint, Lease, run_commit_with_fault};
+    use crate::writer::CommitKey;
+    use crate::writer::commit::{
+        FaultPoint, Lease, append_snapshot, commit_group_to_iceberg, run_commit_with_fault,
+        write_batches,
+    };
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
@@ -426,6 +430,155 @@ mod recovery {
         );
     }
 
+    /// A group commit lands its Iceberg snapshot but crashes before finalize: the
+    /// snapshot carries `wyrd_commit_keys` (the `{data_tenant_id, batch_id}` pair),
+    /// NOT `wyrd_batch_id`. Recovery must roll the key forward by matching the pair.
+    ///
+    /// Red on the pre-02.3 tree: recovery matched only `wyrd_batch_id`, so it would
+    /// abort a genuinely committed group snapshot.
+    #[tokio::test]
+    async fn group_commit_recovers_unfinalized_key() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+
+        // Precommit row for {h.tenant, batch_id}, left unfinalized (NULL lease →
+        // eligible for recovery) — simulates a crash before finalize.
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &batch_id,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Real group append: writes Parquet + commits a snapshot stamping
+        // wyrd_commit_keys=[{h.tenant, batch_id}] and no wyrd_batch_id.
+        let files = write_batches(&table, vec![stamped_batch(7, batch_id)])
+            .await
+            .unwrap();
+        let (snapshot_id, _updated) = commit_group_to_iceberg(
+            &sql_catalog,
+            &table,
+            files,
+            &[CommitKey::new(h.tenant, batch_id)],
+        )
+        .await
+        .unwrap();
+
+        // Restart → recovery claims the orphaned row and rolls it forward.
+        let _recovered = rebuild_catalog(&h).await;
+
+        let (state, row_sid): (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, snapshot_id FROM vala.olap_commits \
+             WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(batch_id.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "committed",
+            "pair match in wyrd_commit_keys must roll the group key forward"
+        );
+        assert_eq!(
+            row_sid,
+            Some(snapshot_id),
+            "recovered row carries the snapshot_id found via wyrd_commit_keys"
+        );
+
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_found'",
+        )
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(found, 1, "one snapshot_found audit row");
+    }
+
+    /// M02 recovery discrimination: a snapshot stamps BOTH the legacy
+    /// `wyrd_batch_id` AND a `wyrd_commit_keys` entry for a DIFFERENT data tenant
+    /// that shares this row's `batch_id`. Recovery for THIS tenant's row must NOT
+    /// match the other tenant's snapshot — the pair is authoritative — so it aborts.
+    ///
+    /// Red on the pre-02.3 tree: recovery matched `wyrd_batch_id` alone and would
+    /// wrongly finalize this row committed against the other tenant's snapshot.
+    #[tokio::test]
+    async fn recovery_by_commitkey_not_batch_id() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        // A different data tenant that shares the same batch_id in the snapshot.
+        let other_tenant = DataTenantId::new_v7();
+
+        // Precommit row for THIS tenant {h.tenant, batch_id}, left unfinalized.
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &batch_id,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Real snapshot stamping BOTH the legacy wyrd_batch_id (would trip a
+        // batch_id-only match) AND wyrd_commit_keys for the OTHER tenant only.
+        let files = write_batches(&table, vec![stamped_batch(5, batch_id)])
+            .await
+            .unwrap();
+        let other_hex = other_tenant.as_uuid().simple();
+        let batch_hex = uuid::Uuid::from_bytes(batch_id).simple();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "wyrd_commit_keys".to_string(),
+            format!(r#"[{{"data_tenant_id":"{other_hex}","batch_id":"{batch_hex}"}}]"#),
+        );
+        props.insert("wyrd_batch_id".to_string(), batch_hex.to_string());
+        let _ = append_snapshot(&sql_catalog, &table, files, props)
+            .await
+            .unwrap();
+
+        // Restart → recovery. This tenant's pair is absent from wyrd_commit_keys.
+        let _recovered = rebuild_catalog(&h).await;
+
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(batch_id.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "aborted",
+            "batch_id alone must not match another tenant's commit key"
+        );
+
+        let absent: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.olap_recovery_events WHERE oracle_result = 'snapshot_absent'",
+        )
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(absent, 1, "one snapshot_absent audit row");
+    }
+
     /// Same cold-start identity mapping, but for a `SystemShared` table bound to
     /// `SYSTEM_OWNER`. A scope-specific bug in the RLS bind for system tables would
     /// pass `cold_start_maps_table_identity` and fail silently here.
@@ -530,6 +683,96 @@ mod recovery {
             .await
             .unwrap();
         assert_eq!(events, 0, "disabled recovery must write no audit rows");
+    }
+
+    /// LIVE recovery sweep (`commit_recovery::tick`) — the crux of the CRITICAL
+    /// fix. A stale precommit whose `{data_tenant_id, batch_id}` pair is ABSENT
+    /// from every snapshot, on a table that DOES carry a later unrelated
+    /// snapshot, must resolve `aborted`, never `committed`.
+    ///
+    /// Red before the fix: the sweep's oracle returned the table's
+    /// `current_snapshot_id()` for any registered table without checking pair
+    /// membership, so it wrongly finalized a crashed-before-append batch
+    /// `committed` against the unrelated snapshot — a silent lost write once the
+    /// client's idempotent retry dedups against the false commit.
+    #[tokio::test]
+    async fn live_sweep_aborts_precommit_absent_from_snapshots() {
+        let h = setup().await;
+        let table = load_table(&h).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        // Mint an UNRELATED committed snapshot carrying a DIFFERENT batch's pair,
+        // so the table's current_snapshot_id() is Some(..) — the exact condition
+        // that tricked the old oracle into finalizing committed.
+        let other_batch = *uuid::Uuid::now_v7().as_bytes();
+        let files = write_batches(&table, vec![stamped_batch(5, other_batch)])
+            .await
+            .unwrap();
+        let tenant_hex = h.tenant.as_uuid().simple();
+        let other_batch_hex = uuid::Uuid::from_bytes(other_batch).simple();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            "wyrd_commit_keys".to_string(),
+            format!(r#"[{{"data_tenant_id":"{tenant_hex}","batch_id":"{other_batch_hex}"}}]"#),
+        );
+        append_snapshot(&sql_catalog, &table, files, props)
+            .await
+            .unwrap();
+
+        // Orphaned precommit for a DIFFERENT batch, absent from every snapshot,
+        // with a NULL lease so the sweep claims it.
+        let orphan_batch = *uuid::Uuid::now_v7().as_bytes();
+        let mut conn = vala_sql::TenantConn::acquire(&h.pool, h.tenant)
+            .await
+            .unwrap();
+        vala_sql::queries::olap_catalog::precommit(
+            &mut conn,
+            h.table_uid.as_bytes(),
+            &orphan_batch,
+            "system",
+            "system",
+        )
+        .await
+        .unwrap();
+        conn.commit().await.unwrap();
+
+        // Oracle catalog with NO recovery pool → its startup scan is skipped, so
+        // the ONLY thing that resolves the orphan is the live sweep called below.
+        let catalog = WyrdCatalog::new(&h.catalog_uri, &h.backend, h.pool.clone(), None)
+            .await
+            .unwrap();
+        let vala = vala_sql::postgres::ValaPostgres::from_pools(
+            (*h.pool).clone(),
+            Some((*h.recovery_pool).clone()),
+        );
+
+        let outcome = crate::serving::repair::commit_recovery::tick(&vala, &catalog, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.claimed, 1, "the orphan precommit is claimed");
+        assert_eq!(
+            outcome.resolved_committed, 0,
+            "a batch absent from all snapshots must NOT be finalized committed \
+             against the unrelated snapshot"
+        );
+        assert_eq!(
+            outcome.resolved_aborted, 1,
+            "pair-membership oracle must abort the never-appended batch"
+        );
+
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind(h.table_uid.as_bytes().as_slice())
+        .bind(orphan_batch.as_slice())
+        .fetch_one(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(
+            state, "aborted",
+            "durable FSM state is aborted, not committed"
+        );
     }
 
     // The `scan_failed` oracle branch — a transient catalog/object-store failure
@@ -921,5 +1164,931 @@ mod recovery {
         .await
         .unwrap();
         assert_eq!(decisions, 1, "recovery_decision abort row must be present");
+    }
+}
+
+/// Group-commit gates: N per-tenant precommit txns → ONE Iceberg `fast_append` →
+/// N per-tenant finalize txns, driven through `run_group_commit`.
+///
+/// In the Postgres lane (`pg_tests`) — needs a real Postgres + Iceberg warehouse.
+#[cfg(test)]
+mod group_commit {
+    use std::sync::Arc;
+
+    use crate::batch_builder::stamp_system_columns;
+    use crate::catalog::WyrdCatalog;
+    use crate::catalog::iceberg_sql;
+    use crate::catalog::namespaces::BifrostNamespace;
+    use crate::types::{TableScope, TableUid};
+    use crate::writer::BifrostWriteContext;
+    use crate::writer::CommitKey;
+    use crate::writer::commit::{CommitGroup, run_group_commit};
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use sqlx::PgPool;
+    use tempfile::TempDir;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_storage::settings::BackendConfig;
+
+    const NS: BifrostNamespace = BifrostNamespace::Bifrost;
+
+    struct Harness {
+        _tmp: TempDir,
+        catalog_uri: String,
+        backend: BackendConfig,
+        pool: Arc<PgPool>,
+        migrator: Arc<PgPool>,
+        fixture: PgFixture,
+    }
+
+    async fn base_harness() -> Harness {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = Arc::new(fixture.app_pool().clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BackendConfig::Local {
+            root: tmp.path().to_path_buf(),
+        };
+        let catalog_uri = fixture.catalog_uri();
+        let migrator = Arc::new(fixture.superuser_pool().await.expect("superuser pool"));
+        Harness {
+            _tmp: tmp,
+            catalog_uri,
+            backend,
+            pool,
+            migrator,
+            fixture,
+        }
+    }
+
+    async fn build_catalog(h: &Harness) -> WyrdCatalog {
+        WyrdCatalog::new(&h.catalog_uri, &h.backend, h.pool.clone(), None)
+            .await
+            .unwrap()
+    }
+
+    async fn load_table(h: &Harness, table: &str) -> iceberg::table::Table {
+        use iceberg::Catalog as _;
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        let catalog = iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap();
+        let ident = iceberg::TableIdent::new(NS.to_namespace_ident(), table.to_string());
+        catalog.load_table(&ident).await.unwrap()
+    }
+
+    async fn load_sql_catalog(h: &Harness) -> iceberg_catalog_sql::SqlCatalog {
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap()
+    }
+
+    /// User batch: `val` + the three server-resolved-or-null correlation columns.
+    fn user_batch(n: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("val", DataType::Int64, false),
+            Field::new("run_id", DataType::Utf8, true),
+            Field::new("card_uid", DataType::Utf8, true),
+            Field::new("principal_id", DataType::Utf8, true),
+        ]));
+        let vals: Vec<i64> = (0..n).collect();
+        let nrows = vals.len();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vals)),
+                Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+                Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+                Arc::new(StringArray::from(vec![None::<&str>; nrows])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn stamped(n: i64, batch_id: [u8; 16], tenant: Option<DataTenantId>) -> RecordBatch {
+        let user = user_batch(n);
+        let now_us = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_micros()),
+        )
+        .unwrap_or(i64::MAX);
+        stamp_system_columns(&user, now_us, batch_id, tenant).unwrap()
+    }
+
+    fn ctx(batch_id: [u8; 16]) -> BifrostWriteContext {
+        let mut c = BifrostWriteContext::system();
+        c.batch_id = batch_id;
+        c
+    }
+
+    /// Count snapshots on the current-branch history whose summary carries
+    /// `wyrd_commit_keys`, and return the current snapshot's `wyrd_commit_keys` value.
+    fn commit_keys_of_current(table: &iceberg::table::Table) -> Option<String> {
+        let meta = table.metadata();
+        let sid = meta.current_snapshot_id()?;
+        let snap = meta.snapshot_by_id(sid)?;
+        snap.summary()
+            .additional_properties
+            .get("wyrd_commit_keys")
+            .cloned()
+    }
+
+    fn snapshot_count(table: &iceberg::table::Table) -> usize {
+        table.metadata().snapshots().count()
+    }
+
+    /// N≥3 distinct-`batch_id` groups (single tenant, `TenantOwned`) → ONE snapshot,
+    /// all committed, all sharing the same `snapshot_id`.
+    #[tokio::test]
+    async fn group_commit_one_snapshot_many_batches() {
+        const N: usize = 3;
+        const TABLE: &str = "group_many";
+
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        h.fixture
+            .seed_additional_tenant_with_uuid(tenant, &format!("t-{}", tenant.as_uuid().simple()))
+            .await
+            .unwrap();
+
+        let catalog = build_catalog(&h).await;
+        let table_uid: TableUid = catalog
+            .create_table(
+                NS,
+                TABLE,
+                vec![Field::new("val", DataType::Int64, false)],
+                TableScope::TenantOwned,
+                tenant,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        drop(catalog);
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        let mut batch_ids: Vec<[u8; 16]> = Vec::new();
+        let mut groups: Vec<CommitGroup> = Vec::new();
+        for i in 0..N {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            batch_ids.push(batch_id);
+            groups.push(CommitGroup {
+                key: CommitKey::new(tenant, batch_id),
+                ctx: ctx(batch_id),
+                batches: vec![stamped(i64::try_from(i).unwrap() + 1, batch_id, None)],
+                audit: None,
+            });
+        }
+
+        let outcome = run_group_commit(
+            &h.pool,
+            &sql_catalog,
+            &table,
+            &table_uid,
+            TableScope::TenantOwned,
+            groups,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.snapshot_id.is_some(), "one snapshot committed");
+        assert_eq!(outcome.committed.len(), N, "all N keys committed");
+        assert!(outcome.replayed.is_empty(), "nothing replayed");
+        let sid = outcome.snapshot_id.unwrap();
+
+        // All N olap_commits rows are committed and share the same snapshot_id.
+        let rows: Vec<(String, Option<i64>)> =
+            sqlx::query_as("SELECT state, snapshot_id FROM vala.olap_commits WHERE table_uid = $1")
+                .bind(table_uid.as_bytes().as_slice())
+                .fetch_all(&*h.migrator)
+                .await
+                .unwrap();
+        assert_eq!(rows.len(), N, "one row per batch");
+        for (state, row_sid) in &rows {
+            assert_eq!(state, "committed", "every row committed");
+            assert_eq!(*row_sid, Some(sid), "all rows share the group snapshot_id");
+        }
+
+        // Exactly ONE new Iceberg snapshot, and it carries all N keys.
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 1,
+            "exactly one new snapshot from the group commit"
+        );
+        let keys_json = commit_keys_of_current(&after).expect("wyrd_commit_keys present");
+        let parsed: serde_json::Value = serde_json::from_str(&keys_json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), N, "snapshot lists all N commit keys");
+        let listed: std::collections::HashSet<String> = arr
+            .iter()
+            .map(|o| o["batch_id"].as_str().unwrap().to_string())
+            .collect();
+        for batch_id in &batch_ids {
+            let hex = uuid::Uuid::from_bytes(*batch_id).simple().to_string();
+            assert!(listed.contains(&hex), "batch_id {hex} listed in summary");
+        }
+    }
+
+    /// `SystemShared` table, two tenants, SAME `batch_id` → two distinct
+    /// `CommitKey`s, both committed, no dedup collision. Re-run is fully idempotent.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn same_batch_id_two_tenants_no_collision() {
+        const TABLE: &str = "group_shared";
+
+        let h = base_harness().await;
+        let tenant_a = DataTenantId::new_v7();
+        let tenant_b = DataTenantId::new_v7();
+        h.fixture
+            .seed_additional_tenant_with_uuid(
+                tenant_a,
+                &format!("a-{}", tenant_a.as_uuid().simple()),
+            )
+            .await
+            .unwrap();
+        h.fixture
+            .seed_additional_tenant_with_uuid(
+                tenant_b,
+                &format!("b-{}", tenant_b.as_uuid().simple()),
+            )
+            .await
+            .unwrap();
+
+        let catalog = build_catalog(&h).await;
+        let table_uid: TableUid = catalog
+            .create_table(
+                NS,
+                TABLE,
+                vec![Field::new("val", DataType::Int64, false)],
+                TableScope::SystemShared,
+                DataTenantId::SYSTEM_OWNER,
+                &[],
+                None,
+            )
+            .await
+            .unwrap();
+        drop(catalog);
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+
+        // SAME batch_id for both tenants.
+        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+        let groups = vec![
+            CommitGroup {
+                key: CommitKey::new(tenant_a, batch_id),
+                ctx: ctx(batch_id),
+                batches: vec![stamped(2, batch_id, Some(tenant_a))],
+                audit: None,
+            },
+            CommitGroup {
+                key: CommitKey::new(tenant_b, batch_id),
+                ctx: ctx(batch_id),
+                batches: vec![stamped(3, batch_id, Some(tenant_b))],
+                audit: None,
+            },
+        ];
+
+        let outcome = run_group_commit(
+            &h.pool,
+            &sql_catalog,
+            &table,
+            &table_uid,
+            TableScope::SystemShared,
+            groups,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.committed.len(), 2, "both keys committed");
+        assert!(outcome.replayed.is_empty(), "nothing replayed on first run");
+
+        // Two committed rows, same batch_id, different data_tenant_id.
+        let rows: Vec<(String, uuid::Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT state, data_tenant_id, batch_id FROM vala.olap_commits \
+             WHERE table_uid = $1 ORDER BY data_tenant_id",
+        )
+        .bind(table_uid.as_bytes().as_slice())
+        .fetch_all(&*h.migrator)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "two distinct commit rows");
+        for (state, _, row_batch) in &rows {
+            assert_eq!(state, "committed");
+            assert_eq!(row_batch.as_slice(), batch_id.as_slice(), "same batch_id");
+        }
+        let mut tenants: Vec<uuid::Uuid> = rows.iter().map(|(_, t, _)| *t).collect();
+        tenants.dedup();
+        assert_eq!(tenants.len(), 2, "two distinct data_tenant_id values");
+
+        // One snapshot; wyrd_commit_keys has both {data_tenant_id, batch_id} pairs
+        // with distinct data_tenant_id (the M02 discriminator).
+        let after = load_table(&h, TABLE).await;
+        let keys_json = commit_keys_of_current(&after).expect("wyrd_commit_keys present");
+        let parsed: serde_json::Value = serde_json::from_str(&keys_json).unwrap();
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "two commit keys in the snapshot");
+        let binds: std::collections::HashSet<String> = arr
+            .iter()
+            .map(|o| o["data_tenant_id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(binds.len(), 2, "distinct data_tenant_id per tenant");
+        assert!(binds.contains(&tenant_a.as_uuid().simple().to_string()));
+        assert!(binds.contains(&tenant_b.as_uuid().simple().to_string()));
+
+        // Idempotent re-run: same two groups → both replay, no new snapshot.
+        let before_replay = snapshot_count(&after);
+        let groups2 = vec![
+            CommitGroup {
+                key: CommitKey::new(tenant_a, batch_id),
+                ctx: ctx(batch_id),
+                batches: vec![stamped(2, batch_id, Some(tenant_a))],
+                audit: None,
+            },
+            CommitGroup {
+                key: CommitKey::new(tenant_b, batch_id),
+                ctx: ctx(batch_id),
+                batches: vec![stamped(3, batch_id, Some(tenant_b))],
+                audit: None,
+            },
+        ];
+        let replay = run_group_commit(
+            &h.pool,
+            &sql_catalog,
+            &after,
+            &table_uid,
+            TableScope::SystemShared,
+            groups2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.replayed.len(), 2, "both keys replay");
+        assert!(replay.committed.is_empty(), "nothing freshly committed");
+        assert!(replay.snapshot_id.is_none(), "no append on full replay");
+        let after2 = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after2),
+            before_replay,
+            "idempotent re-run adds no Iceberg snapshot"
+        );
+    }
+}
+
+/// Coordinator gates: drive the live [`spawn_group_commit_coordinator`] handle
+/// (the actor behind `WyrdCatalog::writer`) through real Postgres + Iceberg and
+/// assert the group-commit contract — one `fast_append` amortizes N tenants,
+/// each write keeps its own `batch_id`, chunks split at `max_commit_keys`,
+/// shutdown drains the buffer, and the reply is held until the covering commit.
+#[cfg(test)]
+mod coordinator {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use arrow::array::{Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use iceberg_catalog_sql::SqlCatalog;
+    use sqlx::PgPool;
+    use tempfile::TempDir;
+    use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_storage::settings::BackendConfig;
+
+    use crate::catalog::WyrdCatalog;
+    use crate::catalog::iceberg_sql;
+    use crate::catalog::namespaces::BifrostNamespace;
+    use crate::registry::Registry;
+    use crate::tables::PayloadClass;
+    use crate::types::{TableScope, TableUid};
+    use crate::writer::BifrostWriteContext;
+    use crate::writer::coordinator::{
+        FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator,
+    };
+
+    const NS: BifrostNamespace = BifrostNamespace::Bifrost;
+
+    struct Harness {
+        _tmp: TempDir,
+        catalog_uri: String,
+        backend: BackendConfig,
+        pool: Arc<PgPool>,
+        migrator: Arc<PgPool>,
+        fixture: PgFixture,
+    }
+
+    async fn base_harness() -> Harness {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = Arc::new(fixture.app_pool().clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = BackendConfig::Local {
+            root: tmp.path().to_path_buf(),
+        };
+        let catalog_uri = fixture.catalog_uri();
+        let migrator = Arc::new(fixture.superuser_pool().await.expect("superuser pool"));
+        Harness {
+            _tmp: tmp,
+            catalog_uri,
+            backend,
+            pool,
+            migrator,
+            fixture,
+        }
+    }
+
+    async fn build_catalog(h: &Harness) -> WyrdCatalog {
+        WyrdCatalog::new(&h.catalog_uri, &h.backend, h.pool.clone(), None)
+            .await
+            .unwrap()
+    }
+
+    async fn load_table(h: &Harness, table: &str) -> iceberg::table::Table {
+        use iceberg::Catalog as _;
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        let catalog = iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap();
+        let ident = iceberg::TableIdent::new(NS.to_namespace_ident(), table.to_string());
+        catalog.load_table(&ident).await.unwrap()
+    }
+
+    async fn load_sql_catalog(h: &Harness) -> SqlCatalog {
+        let (factory, props) = crate::catalog::storage::iceberg_storage_factory(&h.backend);
+        let warehouse = crate::catalog::storage::warehouse_uri(&h.backend);
+        iceberg_sql::build_catalog(&h.catalog_uri, &warehouse, factory, props)
+            .await
+            .unwrap()
+    }
+
+    fn user_batch(n: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from((0..n).collect::<Vec<_>>()))],
+        )
+        .unwrap()
+    }
+
+    fn ctx(batch_id: [u8; 16]) -> BifrostWriteContext {
+        let mut c = BifrostWriteContext::system();
+        c.batch_id = batch_id;
+        c
+    }
+
+    fn snapshot_count(table: &iceberg::table::Table) -> usize {
+        table.metadata().snapshots().count()
+    }
+
+    /// A no-auto-flush policy: only a dropped handle (shutdown) or an explicit
+    /// timer/threshold override flushes. `max_commit_keys` overridable per test.
+    fn manual_policy(max_commit_keys: usize) -> FlushPolicy {
+        FlushPolicy {
+            max_rows: usize::MAX,
+            max_interval: Duration::from_hours(1),
+            max_buffered_bytes: usize::MAX,
+            max_commit_keys,
+        }
+    }
+
+    async fn seed(h: &Harness, tenant: DataTenantId) {
+        h.fixture
+            .seed_additional_tenant_with_uuid(tenant, &format!("t-{}", tenant.as_uuid().simple()))
+            .await
+            .unwrap();
+    }
+
+    async fn register_table(
+        h: &Harness,
+        table: &str,
+        scope: TableScope,
+        owner: DataTenantId,
+    ) -> TableUid {
+        let catalog = build_catalog(h).await;
+        catalog
+            .create_table(
+                NS,
+                table,
+                vec![Field::new("val", DataType::Int64, false)],
+                scope,
+                owner,
+                &[],
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    fn spawn(
+        h: &Harness,
+        table: iceberg::table::Table,
+        sql_catalog: SqlCatalog,
+        table_uid: TableUid,
+        fqn: &str,
+        scope: TableScope,
+        policy: FlushPolicy,
+    ) -> GroupCommitHandle {
+        spawn_group_commit_coordinator(
+            table,
+            Arc::new(sql_catalog),
+            h.pool.clone(),
+            table_uid,
+            fqn.to_string(),
+            scope,
+            Arc::new(Registry::new(h.pool.clone())),
+            PayloadClass::Standard,
+            &[],
+            policy,
+        )
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct CommitRow {
+        state: String,
+        data_tenant_id: uuid::Uuid,
+        batch_id: Vec<u8>,
+        snapshot_id: Option<i64>,
+    }
+
+    async fn commit_rows(h: &Harness, table_uid: TableUid) -> Vec<CommitRow> {
+        sqlx::query_as::<_, CommitRow>(
+            "SELECT state, data_tenant_id, batch_id, snapshot_id \
+             FROM vala.olap_commits WHERE table_uid = $1 ORDER BY data_tenant_id, batch_id",
+        )
+        .bind(table_uid.as_bytes().as_slice())
+        .fetch_all(&*h.migrator)
+        .await
+        .unwrap()
+    }
+
+    /// N tenants writing one physical (`SystemShared`) table, flushed together,
+    /// amortize into exactly ONE Iceberg snapshot — not N. The row-count threshold
+    /// fires the single covering flush; every tenant's reply carries that one
+    /// snapshot id.
+    #[tokio::test]
+    async fn amortization_across_tenants() {
+        const TABLE: &str = "coord_amort";
+        let h = base_harness().await;
+        let tenants = [
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+            DataTenantId::new_v7(),
+        ];
+        for t in &tenants {
+            seed(&h, *t).await;
+        }
+        let table_uid = register_table(
+            &h,
+            TABLE,
+            TableScope::SystemShared,
+            DataTenantId::SYSTEM_OWNER,
+        )
+        .await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        // Flush exactly when all three one-row writes are buffered.
+        let policy = FlushPolicy {
+            max_rows: 3,
+            ..manual_policy(128)
+        };
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::SystemShared,
+            policy,
+        );
+
+        let mut rxs = Vec::new();
+        for t in &tenants {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            let rx = handle
+                .send_write(*t, vec![user_batch(1)], ctx(batch_id))
+                .expect("enqueued");
+            rxs.push(rx);
+        }
+        let mut snaps = Vec::new();
+        for rx in rxs {
+            snaps.push(rx.await.expect("actor replied").expect("commit ok"));
+        }
+        // Every tenant acked the SAME single snapshot.
+        assert!(
+            snaps.iter().all(|s| *s == snaps[0]),
+            "all tenants share one snapshot"
+        );
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 1,
+            "N tenants amortize into exactly ONE fast_append"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 3, "one commit row per tenant");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+        assert!(
+            rows.iter().all(|r| r.snapshot_id == Some(snaps[0])),
+            "all rows share the group snapshot"
+        );
+        let distinct: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().map(|r| r.data_tenant_id).collect();
+        assert_eq!(distinct.len(), 3, "each row bound to its own data tenant");
+        drop(handle);
+    }
+
+    /// A `SystemShared` flush covering two tenants stamps each tenant's commit row
+    /// with ITS OWN `data_tenant_id` — the writes are not collapsed onto one bind.
+    #[tokio::test]
+    async fn per_row_tenant_stamp() {
+        const TABLE: &str = "coord_stamp";
+        let h = base_harness().await;
+        let ta = DataTenantId::new_v7();
+        let tb = DataTenantId::new_v7();
+        seed(&h, ta).await;
+        seed(&h, tb).await;
+        let table_uid = register_table(
+            &h,
+            TABLE,
+            TableScope::SystemShared,
+            DataTenantId::SYSTEM_OWNER,
+        )
+        .await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::SystemShared,
+            manual_policy(128),
+        );
+
+        let rx_a = handle
+            .send_write(
+                ta,
+                vec![user_batch(2)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue a");
+        let rx_b = handle
+            .send_write(
+                tb,
+                vec![user_batch(2)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue b");
+        drop(handle); // shutdown → drain → one covering commit
+        rx_a.await.expect("reply a").expect("commit a");
+        rx_b.await.expect("reply b").expect("commit b");
+
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 2, "two commit rows");
+        let binds: std::collections::HashSet<uuid::Uuid> =
+            rows.iter().map(|r| r.data_tenant_id).collect();
+        assert!(
+            binds.contains(&ta.as_uuid()),
+            "tenant a stamped on its own row"
+        );
+        assert!(
+            binds.contains(&tb.as_uuid()),
+            "tenant b stamped on its own row"
+        );
+        assert_eq!(binds.len(), 2, "tenants not collapsed onto one bind");
+    }
+
+    /// Dropping the sole handle (shutdown) with a non-empty buffer drains and
+    /// commits the buffered writes — no data is lost — and each reply resolves.
+    #[tokio::test]
+    async fn drain_on_shutdown_commits_buffer() {
+        const TABLE: &str = "coord_drain";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(128),
+        );
+
+        let rx1 = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue 1");
+        let rx2 = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue 2");
+        // No threshold/timer would ever fire — only shutdown drains.
+        drop(handle);
+        let s1 = rx1.await.expect("reply 1").expect("commit 1");
+        let s2 = rx2.await.expect("reply 2").expect("commit 2");
+        assert_eq!(s1, s2, "both buffered writes rode one covering commit");
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 1,
+            "buffer committed on shutdown"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 2, "both buffered writes are durable");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+    }
+
+    /// A single flush of more than `max_commit_keys` write units splits into
+    /// multiple group commits — one Iceberg snapshot per chunk — instead of one
+    /// unbounded `fast_append`.
+    #[tokio::test]
+    async fn flush_chunks_at_max_commit_keys() {
+        const TABLE: &str = "coord_chunk";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let before = snapshot_count(&table);
+        let sql_catalog = load_sql_catalog(&h).await;
+        // 5 keys, chunk size 2 → ceil(5/2) = 3 group commits.
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(2),
+        );
+
+        let mut rxs = Vec::new();
+        for _ in 0..5 {
+            let rx = handle
+                .send_write(
+                    tenant,
+                    vec![user_batch(1)],
+                    ctx(*uuid::Uuid::now_v7().as_bytes()),
+                )
+                .expect("enqueue");
+            rxs.push(rx);
+        }
+        drop(handle);
+        for rx in rxs {
+            rx.await.expect("reply").expect("commit");
+        }
+
+        let after = load_table(&h, TABLE).await;
+        assert_eq!(
+            snapshot_count(&after),
+            before + 3,
+            "5 keys at chunk size 2 produce 3 snapshots"
+        );
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 5, "all five keys committed");
+        assert!(rows.iter().all(|r| r.state == "committed"));
+    }
+
+    /// A timer flush commits each buffered write as its OWN key: three writes with
+    /// three distinct `batch_id`s produce three distinct commit rows — the writes
+    /// are NOT collapsed under one `batch_id`.
+    #[tokio::test]
+    async fn timer_flush_preserves_per_batch_context() {
+        const TABLE: &str = "coord_timer";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        // Short timer fires the flush; the await below waits for it.
+        let policy = FlushPolicy {
+            max_interval: Duration::from_millis(150),
+            ..manual_policy(128)
+        };
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            policy,
+        );
+
+        let mut batch_ids = Vec::new();
+        let mut rxs = Vec::new();
+        for _ in 0..3 {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            batch_ids.push(batch_id);
+            rxs.push(
+                handle
+                    .send_write(tenant, vec![user_batch(1)], ctx(batch_id))
+                    .expect("enqueue"),
+            );
+        }
+        let mut snaps = Vec::new();
+        for rx in rxs {
+            snaps.push(rx.await.expect("timer reply").expect("commit"));
+        }
+        assert!(
+            snaps.iter().all(|s| *s == snaps[0]),
+            "one timer flush, one snapshot"
+        );
+
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(
+            rows.len(),
+            3,
+            "each write kept its own batch_id → three rows"
+        );
+        let distinct: std::collections::HashSet<Vec<u8>> =
+            rows.iter().map(|r| r.batch_id.clone()).collect();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "three distinct batch_ids, not collapsed to one"
+        );
+        for batch_id in &batch_ids {
+            assert!(
+                distinct.contains(batch_id.as_slice()),
+                "batch_id {} present as its own row",
+                uuid::Uuid::from_bytes(*batch_id)
+            );
+        }
+        drop(handle);
+    }
+
+    /// The reply is held until the covering commit: before any flush the receiver
+    /// has no value AND no `olap_commits` row exists; only after shutdown-drain
+    /// does the reply resolve with a durable snapshot.
+    #[tokio::test]
+    async fn reply_held_until_covering_commit() {
+        const TABLE: &str = "coord_hold";
+        let h = base_harness().await;
+        let tenant = DataTenantId::new_v7();
+        seed(&h, tenant).await;
+        let table_uid = register_table(&h, TABLE, TableScope::TenantOwned, tenant).await;
+
+        let table = load_table(&h, TABLE).await;
+        let sql_catalog = load_sql_catalog(&h).await;
+        let handle = spawn(
+            &h,
+            table,
+            sql_catalog,
+            table_uid,
+            TABLE,
+            TableScope::TenantOwned,
+            manual_policy(128),
+        );
+
+        let mut rx = handle
+            .send_write(
+                tenant,
+                vec![user_batch(1)],
+                ctx(*uuid::Uuid::now_v7().as_bytes()),
+            )
+            .expect("enqueue");
+        // Give the actor a moment to process the buffered write (no flush trigger).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "reply is held before any commit");
+        assert!(
+            commit_rows(&h, table_uid).await.is_empty(),
+            "no precommit/commit row before a flush"
+        );
+
+        drop(handle); // shutdown → drain → commit
+        let sid = rx.await.expect("reply after commit").expect("commit ok");
+        assert!(sid > 0, "reply carries the covering snapshot id");
+        let rows = commit_rows(&h, table_uid).await;
+        assert_eq!(rows.len(), 1, "the held write is now durable");
+        assert_eq!(rows[0].state, "committed");
     }
 }

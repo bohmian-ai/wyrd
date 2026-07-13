@@ -12,6 +12,7 @@ use wyrd_sql::TenantConn;
 use crate::SqlError;
 use crate::row_types::olap_catalog::{
     BifrostTableRow, ClaimedPrecommitRow, DeclaredIndexRow, EntityTimeBoundsRow, OlapCommitRow,
+    ProjectionCandidateRow,
 };
 
 // ── vala.bifrost_tables ──────────────────────────────────────────────────────
@@ -153,12 +154,57 @@ pub async fn precommit(
     sqlx::query(
         r#"
         INSERT INTO vala.olap_commits
-            (data_tenant_id, table_uid, batch_id, state, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, 'precommit', $3, $4)
-        ON CONFLICT (data_tenant_id, table_uid, batch_id) DO NOTHING
+            (data_tenant_id, table_uid, control_bind, batch_id, state, origin, actor)
+        VALUES (wyrd.current_tenant(), $1, wyrd.current_tenant(), $2, 'precommit', $3, $4)
+        ON CONFLICT (data_tenant_id, table_uid, control_bind, batch_id) DO NOTHING
         "#,
     )
     .bind(table_uid.as_slice())
+    .bind(batch_id.as_slice())
+    .bind(origin)
+    .bind(actor)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(())
+}
+
+/// Insert a fresh `precommit` anchor with an explicit `control_bind` registration
+/// anchor (the M02 group-commit path).
+///
+/// `data_tenant_id` is `wyrd.current_tenant()` — the RLS-bound DATA tenant, which is
+/// the dedup discriminator. `control_bind` is supplied by the caller as
+/// `scope.control_bind(tenant)`: `SYSTEM_OWNER` for a `SystemShared` table (its
+/// single `vala.bifrost_tables` registration key, and the composite FK anchor), the
+/// data tenant for a `TenantOwned` table. Two tenants presenting the same `batch_id`
+/// on a shared table therefore land on distinct
+/// `(data_tenant_id, table_uid, control_bind, batch_id)` rows instead of colliding.
+///
+/// Unlike [`precommit`] (which sets `control_bind = wyrd.current_tenant()` and is
+/// kept for the legacy single-key path + SQL-contract tests), this lets the bound
+/// data tenant differ from the registration anchor. Both converge once the legacy
+/// path is deleted (stage-5/02.4).
+///
+/// # Errors
+/// Returns [`SqlError`] when the insert fails.
+pub async fn precommit_with_bind(
+    conn: &mut TenantConn<'_>,
+    table_uid: &[u8; 16],
+    control_bind: Uuid,
+    batch_id: &[u8; 16],
+    origin: &str,
+    actor: &str,
+) -> Result<(), SqlError> {
+    sqlx::query(
+        r#"
+        INSERT INTO vala.olap_commits
+            (data_tenant_id, table_uid, control_bind, batch_id, state, origin, actor)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, 'precommit', $4, $5)
+        ON CONFLICT (data_tenant_id, table_uid, control_bind, batch_id) DO NOTHING
+        "#,
+    )
+    .bind(table_uid.as_slice())
+    .bind(control_bind)
     .bind(batch_id.as_slice())
     .bind(origin)
     .bind(actor)
@@ -286,13 +332,21 @@ pub async fn lookup_idempotent(
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
 ) -> Result<Option<OlapCommitRow>, SqlError> {
+    // RLS already scopes visible rows to data_tenant_id = wyrd.current_tenant(), and
+    // for a given (data_tenant_id, table_uid) the table's scope fixes a single
+    // control_bind, so (table_uid, batch_id) under the RLS bind is the whole CommitKey
+    // identity. Do NOT filter on control_bind = wyrd.current_tenant(): on the M02
+    // group-commit path a SystemShared row's control_bind is the SYSTEM_OWNER
+    // registration anchor, not the bound data tenant, so that filter would hide the
+    // row and break idempotent replay.
     sqlx::query_as::<_, OlapCommitRow>(
         r#"
         SELECT data_tenant_id, table_uid, batch_id, snapshot_id,
                state, precommit_at, committed_at, finalized_at,
                error_code, error_detail, origin, actor
           FROM vala.olap_commits
-         WHERE table_uid = $1 AND batch_id = $2
+         WHERE table_uid = $1
+           AND batch_id = $2
         "#,
     )
     .bind(table_uid.as_slice())
@@ -781,6 +835,45 @@ pub async fn entity_bounds_for(
     .bind(entity_kind)
     .bind(entity_id)
     .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
+// ── vala.olap_projections ────────────────────────────────────────────────────
+
+/// List all projection candidate rows for a given source table (tenant-scoped).
+///
+/// Returns all registered projections whose `source_table_uid` matches the
+/// given table. The serving layer's matcher uses this to find substitutable
+/// projections for a source scan. Filters to non-degraded states so the
+/// matcher only sees candidates that are at least structurally valid.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn list_by_source(
+    conn: &mut TenantConn<'_>,
+    source_table_uid: &[u8; 16],
+) -> Result<Vec<ProjectionCandidateRow>, SqlError> {
+    sqlx::query_as::<_, ProjectionCandidateRow>(
+        r#"
+        SELECT data_tenant_id,
+               projection_uid,
+               source_table_uid,
+               fqn,
+               projection_kind,
+               projection_state,
+               refresh_epoch,
+               source_refresh_epoch,
+               built_for_snapshot_id,
+               commit_lag,
+               source_schema_fingerprint
+          FROM vala.olap_projections
+         WHERE source_table_uid = $1
+           AND projection_state <> 'degraded'
+        "#,
+    )
+    .bind(source_table_uid.as_slice())
+    .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
 }

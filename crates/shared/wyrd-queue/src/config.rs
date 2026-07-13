@@ -26,7 +26,7 @@ impl Default for QueueConfig {
         Self {
             channel_capacity: 1024,
             staging_capacity: 4096,
-            flush_max_rows: 512,
+            flush_max_rows: 50_000,
             flush_interval_ms: 1000,
             flush_timeout_ms: 30_000,
             max_message_bytes: 4 * 1024 * 1024,

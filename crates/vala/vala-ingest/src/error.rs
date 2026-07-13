@@ -89,6 +89,12 @@ pub enum IngestError {
     /// The writer coordinator stopped before the commit completed.
     #[error("ingest writer closed")]
     WriterClosed,
+    /// The per-physical-table coordinator's local buffer is full.
+    ///
+    /// Local backpressure only (Q5) — no rows from this request were written.
+    /// Callers must back off and retry the full request.
+    #[error("ingest writer busy — local buffer full")]
+    WriterBusy,
     /// Arrow IPC decode failed.
     #[error("ingest arrow decode failed: {0}")]
     Decode(String),
@@ -117,6 +123,7 @@ impl IngestError {
             Self::StreamIdle => "WYRD_VALA_408_INGEST_IDLE_TIMEOUT",
             Self::TooManyStreams => "WYRD_VALA_429_INGEST_TOO_MANY_STREAMS",
             Self::WriterClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
+            Self::WriterBusy => "WYRD_VALA_429_INGEST_BUSY",
             Self::Internal(_) => "WYRD_VALA_500_INGEST_INTERNAL",
         }
     }
@@ -134,9 +141,10 @@ impl IngestError {
             Self::PrincipalUnresolved => Code::Unauthenticated,
             Self::TableNotFound { .. } => Code::NotFound,
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
-            Self::BatchTooLarge { .. } | Self::TooManyRows { .. } | Self::TooManyStreams => {
-                Code::ResourceExhausted
-            }
+            Self::BatchTooLarge { .. }
+            | Self::TooManyRows { .. }
+            | Self::TooManyStreams
+            | Self::WriterBusy => Code::ResourceExhausted,
             Self::StreamIdle => Code::DeadlineExceeded,
             Self::WriterClosed => Code::Aborted,
             Self::Internal(_) => Code::Internal,
@@ -171,6 +179,7 @@ impl IngestError {
     pub fn from_engine(error: BifrostError) -> Self {
         match error {
             BifrostError::WriterUnavailable(_) => Self::WriterClosed,
+            BifrostError::IngestBusy(_) => Self::WriterBusy,
             BifrostError::TableNotFound(table) => Self::TableNotFound { table },
             BifrostError::FingerprintMismatch(table) => Self::SchemaMismatch { table },
             BifrostError::ReservedColumn(column) => Self::StreamProtocolViolation(format!(

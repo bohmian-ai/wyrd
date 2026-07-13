@@ -56,3 +56,4 @@ The `POST /v1/observations/query` endpoint accepts raw SQL against the same Iceb
 - [Writing data](./writing-data) — `vala-sdk` producer, batching, governance
 - [Reading data](./reading-data) — typed methods, pagination, permissions, generic SQL
 - [SLOs](./slos) — performance targets
+- [Data plane internals](./data-plane-internals) — write path, recovery FSM, audit sealing, database privilege model

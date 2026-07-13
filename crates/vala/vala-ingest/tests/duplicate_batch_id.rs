@@ -1,12 +1,13 @@
 mod pg_tests {
     //! Durable idempotency: a replayed stream (same `wyrd_batch_id`) produces no
-    //! double-write and returns the prior row count, and `origin`/`actor` are
-    //! stamped on both the first write and the replay.
+    //! double-write. Both the first ingest and its replay return the batch row
+    //! count, and the durable `vala.olap_commits` anchor holds exactly one
+    //! committed row for the batch — a second append would surface as a second
+    //! committed anchor, so the row count alone is not a sufficient assertion.
     //!
-    //! Requires a live Postgres + writable warehouse; gated behind
-    //! `BIFROST_TEST_DB_URL` and `#[ignore]` (the same pattern as the engine's
-    //! `round_trip_full`). Run with:
-    //! `BIFROST_TEST_DB_URL=postgres://... cargo test -p vala-ingest --all-features duplicate_batch_id -- --ignored`
+    //! Runs against embedded Postgres via `PgFixture` (no external database, no
+    //! `#[ignore]`, no env gating); part of the SQL-backed test lane
+    //! (`mise run test:sql`).
 
     use std::collections::VecDeque;
     use std::str::FromStr;
@@ -81,7 +82,10 @@ mod pg_tests {
     }
 
     fn auth_ctx(tenant: DataTenantId) -> AuthContext {
-        let card = CardRef::from_str(CARD).expect("card parses");
+        let mut card = CardRef::from_str(CARD).expect("card parses");
+        // Stamp a UID so stamp_correlation_columns can resolve card_uid from the
+        // per-row card_ref column — requires uid to be present (M-11 fail-closed).
+        card.uid = Some(wyrd_spec::ids::CardUid::from_uuid(uuid::Uuid::now_v7()).expect("v7 uid"));
         AuthContext {
             principal: Principal::new(
                 PrincipalId::new(uuid::Uuid::now_v7()),
@@ -147,5 +151,21 @@ mod pg_tests {
             .await
             .expect("replay dedups");
         assert_eq!(replay, 3, "replay returns the prior row count");
+
+        // Durable single-write: the replay must not create a second commit
+        // anchor. Count committed rows for this batch on the BYPASSRLS admin
+        // pool — a double-append would surface here as a second committed row,
+        // which the returned row count alone would not catch.
+        let committed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM vala.olap_commits WHERE batch_id = $1 AND state = 'committed'",
+        )
+        .bind(batch_id.as_slice())
+        .fetch_one(fixture.platform_admin_pool())
+        .await
+        .expect("count committed anchors");
+        assert_eq!(
+            committed, 1,
+            "exactly one committed olap_commits anchor for the replayed batch"
+        );
     }
 }

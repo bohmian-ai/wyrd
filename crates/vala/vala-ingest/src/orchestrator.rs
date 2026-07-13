@@ -399,13 +399,6 @@ pub async fn run_ingest<S: FrameSource>(
         .await
         .map_err(IngestError::from_engine)?;
 
-    for batch in stamped {
-        writer
-            .write(batch)
-            .await
-            .map_err(IngestError::from_engine)?;
-    }
-
     let ctx = BifrostWriteContext {
         batch_id: collected.batch_id,
         origin: "ingest".to_owned(),
@@ -414,7 +407,12 @@ pub async fn run_ingest<S: FrameSource>(
         // Writer-identity card for C5 audit attribution (constant per commit).
         card_ref: auth.principal.card_ref().cloned(),
     };
-    let _snapshot = writer.flush(ctx).await.map_err(IngestError::from_engine)?;
+    // All stamped batches are one commit unit under `collected.batch_id`;
+    // `commit_one` closes the writer so the coordinator drains and commits.
+    let _snapshot = writer
+        .commit_one(auth.tenant, stamped, ctx)
+        .await
+        .map_err(IngestError::from_engine)?;
 
     Ok(collected.rows)
 }
@@ -658,5 +656,48 @@ mod oversized_stream {
             matches!(err, IngestError::StreamProtocolViolation(_)),
             "expected StreamProtocolViolation, got {err:?}"
         );
+    }
+}
+
+/// Orchestrator gate: the ingest path maps `BifrostError::IngestBusy` (local
+/// buffer backpressure, Q5) to `IngestError::WriterBusy`
+/// (`WYRD_VALA_429_INGEST_BUSY`).  No partial_success; no silent drop.
+///
+/// This test does NOT drive a live database; it verifies the error taxonomy
+/// without a commit path (pure unit test).
+#[cfg(test)]
+mod tests {
+    use crate::error::IngestError;
+    use vala_bifrost::BifrostError;
+
+    #[test]
+    fn from_engine_maps_ingest_busy_to_writer_busy() {
+        let engine_err = BifrostError::IngestBusy("test.events".to_string());
+        let ingest_err = IngestError::from_engine(engine_err);
+        assert!(
+            matches!(ingest_err, IngestError::WriterBusy),
+            "expected WriterBusy, got {ingest_err:?}"
+        );
+        assert_eq!(ingest_err.wyrd_code(), "WYRD_VALA_429_INGEST_BUSY");
+    }
+
+    #[test]
+    fn writer_busy_grpc_code_is_resource_exhausted() {
+        use wyrd_tonic::tonic::Code;
+        let err = IngestError::WriterBusy;
+        assert_eq!(err.grpc_code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn writer_busy_ack_deferred_contract() {
+        // The ack-after-commit contract (Q1) is enforced by the coordinator
+        // actor: the reply channel is only written AFTER run_commit returns.
+        // We verify the IngestError taxonomy is correct and that WriterBusy
+        // exposes the stable code (no partial_success path in the taxonomy).
+        let err = IngestError::WriterBusy;
+        assert_eq!(err.wyrd_code(), "WYRD_VALA_429_INGEST_BUSY");
+        // The error maps to ResourceExhausted (429) — not to partial_success (not 200).
+        let status = err.into_status();
+        assert_eq!(status.code(), wyrd_tonic::tonic::Code::ResourceExhausted);
     }
 }

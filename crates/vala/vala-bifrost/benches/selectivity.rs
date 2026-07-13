@@ -64,11 +64,14 @@ fn bench_selectivity(c: &mut Criterion) {
                 )
                 .await
                 .expect("open bench writer");
-            writer.write(batch).await.expect("write bench batch");
             writer
-                .flush(vala_bifrost::writer::BifrostWriteContext::system())
+                .commit_one(
+                    fixture.tenant,
+                    vec![batch],
+                    vala_bifrost::writer::BifrostWriteContext::system(),
+                )
                 .await
-                .expect("flush bench writer");
+                .expect("commit bench batch");
         }
     });
 

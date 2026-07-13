@@ -5,6 +5,7 @@ use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
 
 use crate::dsn::ResolvedDsns;
+use crate::operator_pool::OperatorPool;
 use crate::pool::{PoolConfig, build_pool};
 use crate::{SqlError, TenantConn};
 
@@ -78,6 +79,15 @@ impl WyrdPostgres {
     #[must_use]
     pub fn platform_admin_pool(&self) -> Option<&PgPool> {
         self.platform_admin.as_ref()
+    }
+
+    /// Build an `OperatorPool` from the optional platform-admin pool.
+    ///
+    /// Returns `None` when no cross-tenant role is configured. Production boot
+    /// that requires cross-tenant maintenance must fail fast when this is `None`.
+    #[must_use]
+    pub fn operator_pool(&self) -> Option<OperatorPool> {
+        self.platform_admin.clone().map(OperatorPool::from)
     }
 
     /// Open a tenant-scoped transaction on the app pool.

@@ -150,6 +150,19 @@ pub enum ServerBootError {
         /// Detail about why the reconciler could not be started.
         detail: String,
     },
+    /// `WYRD_VALA_500_RECOVERY_POOL_REQUIRED`: production boot requires a
+    /// `vala_recovery` pool for the commit-recovery sweep. A server that cannot
+    /// recover stale precommits risks permanent data loss and must not boot.
+    ///
+    /// Set `WYRD_RECOVERY_DSN` (or configure the `recovery` DSN slot) to
+    /// provision the `vala_recovery` SECURITY DEFINER pool before starting in
+    /// production.
+    #[error(
+        "WYRD_VALA_500_RECOVERY_POOL_REQUIRED: production deployment requires a \
+         recovery pool (vala_recovery DSN) for the commit-recovery sweep, \
+         but none is configured"
+    )]
+    RecoveryPoolRequired,
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -344,6 +357,8 @@ async fn install_auth(
         }
     };
 
+    let audit_seal_key = build_audit_seal_key(config)?;
+
     Ok(state.with_auth(ServerAuth {
         allow_preview: config.auth.allow_preview,
         issuing_key: Some(issuing_key),
@@ -351,6 +366,7 @@ async fn install_auth(
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
+        audit_seal_key,
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
     }))
 }
@@ -425,6 +441,21 @@ fn build_sealing_key(
         ))
     })?;
     Ok(Some(Arc::new(SecretKey::from_bytes(key))))
+}
+
+/// Load and parse the dedicated Ed25519 audit-seal key from config.
+///
+/// Returns `None` when `WYRD_AUDIT_SEAL_KEY_FILE`/`WYRD_AUDIT_SEAL_KEY_PEM`
+/// are absent. Returns `Err` when the PEM is present but invalid.
+fn build_audit_seal_key(
+    config: &crate::config::WyrdServerConfig,
+) -> Result<Option<Arc<wyrd_auth_issue::AuditSealKey>>, ServerBootError> {
+    let Some(pem) = config.auth.audit_seal_key.as_ref() else {
+        return Ok(None);
+    };
+    let key = wyrd_auth_issue::AuditSealKey::from_pkcs8_pem(pem.expose_secret())
+        .map_err(|e| ServerBootError::SigningKey(format!("WYRD_AUDIT_SEAL_KEY is invalid: {e}")))?;
+    Ok(Some(Arc::new(key)))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all
@@ -679,7 +710,7 @@ pub async fn spawn_audit_reconciler(
         return Ok(None);
     }
 
-    let Some(admin_pool) = state.postgres.platform_admin_pool().cloned() else {
+    let Some(op) = state.postgres.operator_pool() else {
         if is_production {
             return Err(ServerBootError::AuditReconcilerRequired {
                 detail: "platform admin pool is unavailable".to_owned(),
@@ -703,14 +734,13 @@ pub async fn spawn_audit_reconciler(
                 break;
             }
 
-            let tenant_ids =
-                match vala_sql::queries::relay::list_audit_tenant_ids(&admin_pool).await {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
-                        continue;
-                    }
-                };
+            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
+                    continue;
+                }
+            };
 
             let mut all_clean = true;
             for raw_id in tenant_ids {
@@ -811,6 +841,161 @@ pub async fn spawn_audit_reconciler(
     });
 
     Ok(Some(handle))
+}
+
+/// Spawn the maintenance scheduler (slice 01).
+///
+/// On each 60-second tick it collects the maintenance health report and runs
+/// the commit-recovery sweep when a recovery pool is available. The sweep is
+/// idempotent and fencing-token guarded, so two pods running it concurrently
+/// cannot double-finalize a precommit. Other maintenance concerns (snapshot
+/// expiry, compaction, orphan GC, index build, projection health) report
+/// `pending` until their owning slices wire them into `scheduler::tick`.
+///
+/// Always spawns: `scheduler::tick` no-ops the recovery sweep when the recovery
+/// pool is absent (dev/test), so the health tick still runs. Production requires
+/// the recovery pool via [`check_recovery_pool`], enforced separately at boot.
+#[must_use]
+pub fn spawn_maintenance_scheduler(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let vala = state.postgres.vala().clone();
+    let catalog = Arc::clone(&state.bifrost);
+    let tick_interval =
+        Duration::from_secs(vala_bifrost::serving::repair::scheduler::TICK_INTERVAL_SECS);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+            vala_bifrost::serving::repair::scheduler::tick(&vala, &catalog).await;
+        }
+    })
+}
+
+/// Spawn the audit-seal worker (slice 12).
+///
+/// On each tick it enumerates every tenant with shipped audit rows and seals
+/// the shipped range into a signed `vala.audit_seal_checkpoints` row. Sealing is
+/// idempotent (`ON CONFLICT DO NOTHING`), so concurrent pods converge on the
+/// same checkpoint; the verifier later recomputes each range hash from the
+/// Iceberg `audit_log` content columns to confirm the signature still holds.
+///
+/// Returns `None` (worker not spawned) when the dedicated audit-seal key is not
+/// configured or the platform-admin pool is unavailable — sealing needs the key
+/// to sign and the operator pool to enumerate tenants.
+#[must_use]
+pub fn spawn_audit_seal_worker(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(key) = state.auth.audit_seal_key.clone() else {
+        tracing::warn!("audit-seal worker skipped: no audit-seal key configured");
+        return None;
+    };
+    let Some(op) = state.postgres.operator_pool() else {
+        tracing::warn!("audit-seal worker skipped: platform admin pool unavailable");
+        return None;
+    };
+    let app_pool = state.postgres.vala_pool().clone();
+    let tick_interval =
+        Duration::from_secs(vala_bifrost::serving::audit_seal::worker::SEAL_TICK_INTERVAL_SECS);
+
+    let handle = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(tick_interval) => {}
+            }
+            if shutdown.is_cancelled() {
+                break;
+            }
+
+            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    tracing::error!(error = %e, "audit-seal worker: tenant enumeration failed");
+                    continue;
+                }
+            };
+
+            for raw_id in tenant_ids {
+                let Ok(tenant_id) = DataTenantId::try_from(raw_id) else {
+                    continue;
+                };
+                match vala_bifrost::serving::audit_seal::worker::seal_shipped_range(
+                    &app_pool, &key, tenant_id,
+                )
+                .await
+                {
+                    Ok(outcome) if !outcome.skipped => {
+                        tracing::debug!(
+                            tenant_id = %tenant_id,
+                            rows_sealed = outcome.rows_sealed,
+                            seq_lo = ?outcome.seq_lo,
+                            seq_hi = ?outcome.seq_hi,
+                            "audit-seal worker: sealed range"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(
+                            tenant_id = %tenant_id,
+                            error = %e,
+                            "audit-seal worker: seal failed"
+                        );
+                    }
+                }
+            }
+        }
+    });
+
+    Some(handle)
+}
+
+/// Ensure the recovery pool is present in production deployments.
+///
+/// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER
+/// pool to claim and resolve stale precommits across all tenants. Without it
+/// unresolved precommits accumulate indefinitely, risking permanent data loss.
+///
+/// **Fail-closed in production.** If `ValaPostgres::recovery_pool()` returns
+/// `None` and the deployment profile is production, boot returns
+/// [`ServerBootError::RecoveryPoolRequired`]. In development / staging, a
+/// missing recovery pool logs a warning and returns `Ok(())`.
+///
+/// # Errors
+/// Returns [`ServerBootError::RecoveryPoolRequired`] when the recovery pool is
+/// absent in a production deployment.
+pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
+    check_recovery_pool_inner(
+        state.bifrost.recovery_pool().is_some(),
+        &state.deployment_profile,
+    )
+}
+
+/// Inner logic for [`check_recovery_pool`], accepting just the two values it needs.
+/// Extracted so the behavior can be unit-tested without constructing `AppState`.
+fn check_recovery_pool_inner(
+    has_recovery_pool: bool,
+    profile: &DeploymentProfile,
+) -> Result<(), ServerBootError> {
+    if !has_recovery_pool {
+        if profile.is_production() {
+            return Err(ServerBootError::RecoveryPoolRequired);
+        }
+        tracing::warn!(
+            "recovery pool (vala_recovery DSN) is not configured — \
+             commit-recovery sweep is disabled (dev/test only)"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -991,6 +1176,47 @@ mod pg_tests {
         assert_eq!(
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local
+        );
+    }
+}
+
+/// Slice 01 behavior-test gate: `boot::recovery_pool_required`.
+///
+/// `check_recovery_pool_inner` is a pure sync function: no Postgres, no
+/// `AppState`. Tests drive it with the two boolean/enum inputs it needs.
+///
+/// Gate: `mise exec -- cargo test --locked -p wyrd-server --all-features boot::recovery_pool_required -- --nocapture`
+#[cfg(test)]
+mod recovery_pool_required {
+    use super::*;
+
+    /// Production boot without a recovery pool must fail with `RecoveryPoolRequired`.
+    #[test]
+    fn fails_in_production() {
+        let result = check_recovery_pool_inner(false, &DeploymentProfile::Production);
+        assert!(
+            matches!(result, Err(ServerBootError::RecoveryPoolRequired)),
+            "expected RecoveryPoolRequired in production without recovery pool, got {result:?}"
+        );
+    }
+
+    /// In development profile a missing recovery pool returns `Ok(())`.
+    #[test]
+    fn missing_ok_in_development() {
+        let result = check_recovery_pool_inner(false, &DeploymentProfile::Development);
+        assert!(
+            result.is_ok(),
+            "missing recovery pool must not fail in development, got {result:?}"
+        );
+    }
+
+    /// With a recovery pool present the check always succeeds regardless of profile.
+    #[test]
+    fn present_ok_in_production() {
+        let result = check_recovery_pool_inner(true, &DeploymentProfile::Production);
+        assert!(
+            result.is_ok(),
+            "a present recovery pool must not fail in production, got {result:?}"
         );
     }
 }

@@ -12,6 +12,7 @@ pub mod reconcile;
 pub mod registry;
 pub mod relay;
 pub mod schema;
+pub mod serving;
 pub mod session;
 pub mod tables;
 pub mod types;

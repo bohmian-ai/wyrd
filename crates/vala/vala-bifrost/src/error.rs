@@ -84,6 +84,13 @@ pub enum BifrostError {
 
     #[error("internal bifrost failure: {0}")]
     Internal(String),
+
+    /// The per-physical-table coordinator's local buffer is full.
+    ///
+    /// Local backpressure only — no rows from this request were written.
+    /// Callers must back off and retry the full request (Q5).
+    #[error("ingest writer busy for table: {0}")]
+    IngestBusy(String),
 }
 
 impl BifrostError {
@@ -142,6 +149,7 @@ impl BifrostError {
                 }
             }
             Self::AuditUnavailable(detail) => Pub::AuditUnavailable { detail },
+            Self::IngestBusy(table) => Pub::IngestBusy { table },
             Self::RedactionFailed(detail) | Self::Internal(detail) => Pub::Internal { detail },
         }
     }

@@ -168,9 +168,12 @@ mod pg_tests {
         )
         .unwrap();
 
-        writer.write(batch).await.unwrap();
         let snapshot_id = writer
-            .flush(vala_bifrost::writer::BifrostWriteContext::system())
+            .commit_one(
+                tenant,
+                vec![batch],
+                vala_bifrost::writer::BifrostWriteContext::system(),
+            )
             .await
             .unwrap();
         assert!(

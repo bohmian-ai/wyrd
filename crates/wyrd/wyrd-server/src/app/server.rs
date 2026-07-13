@@ -16,7 +16,8 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{
-    ServerBootError, spawn_audit_reconciler, spawn_audit_relay, spawn_storage_sweeper,
+    ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
+    spawn_audit_seal_worker, spawn_maintenance_scheduler, spawn_storage_sweeper,
 };
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
@@ -301,6 +302,10 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error or if the process-
     /// global metrics recorder fails to install.
     pub async fn run(mut self) -> Result<(), BootExit> {
+        // Fail-fast (slice 01): a production deployment without the recovery pool
+        // cannot resolve stale precommits and would leak them indefinitely.
+        check_recovery_pool(&self.state).map_err(|e| BootExit::Other(Box::new(e)))?;
+
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -354,6 +359,36 @@ impl BoundServer {
         {
             set.spawn(worker_task(
                 TaskId::Worker("audit_reconciler"),
+                async move {
+                    if let Err(join_error) = handle.await
+                        && join_error.is_panic()
+                    {
+                        std::panic::resume_unwind(join_error.into_panic());
+                    }
+                },
+            ));
+        }
+
+        // Maintenance scheduler (slice 01): drives the commit-recovery sweep and
+        // maintenance-health tick every 60s.
+        let scheduler_handle = spawn_maintenance_scheduler(&self.state, shutdown.clone());
+        set.spawn(worker_task(
+            TaskId::Worker("maintenance_scheduler"),
+            async move {
+                if let Err(join_error) = scheduler_handle.await
+                    && join_error.is_panic()
+                {
+                    std::panic::resume_unwind(join_error.into_panic());
+                }
+            },
+        ));
+
+        // Audit-seal worker (slice 12): seals shipped audit ranges into signed
+        // checkpoints each tick. Spawns only when the audit-seal key and the
+        // platform-admin pool are both configured.
+        if let Some(handle) = spawn_audit_seal_worker(&self.state, shutdown.clone()) {
+            set.spawn(worker_task(
+                TaskId::Worker("audit_seal_worker"),
                 async move {
                     if let Err(join_error) = handle.await
                         && join_error.is_panic()

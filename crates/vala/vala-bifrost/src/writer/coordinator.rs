@@ -1,44 +1,91 @@
-use std::collections::HashMap;
+//! Per-physical-table group-commit coordinator.
+//!
+//! A coordinator owns one loaded [`Table`] and buffers writes from N tenants,
+//! then commits them as **one Iceberg `fast_append` per chunk** via
+//! [`run_group_commit`] — N requests amortize a single catalog commit.
+//!
+//! **Flush policy** (Q2):
+//! - Flush when `total_rows >= max_rows` (default 50 000) OR the interval timer
+//!   fires (default 1 s), whichever comes first; `max_buffered_bytes` (~128 MiB)
+//!   is a memory ceiling.
+//! - A flush chunks its buffered write units at `max_commit_keys`, so one
+//!   `fast_append` never carries an unbounded number of commit keys.
+//!
+//! **Per-tenant fairness** (Q4): [`TenantAppendBuffer`] drains in interleaved
+//! round-robin order, so a high-volume tenant cannot starve a quiet one or push
+//! its writes ahead into every chunk.
+//!
+//! **Backpressure** (Q5): the coordinator channel is bounded. When it is full the
+//! caller receives [`BifrostError::IngestBusy`] immediately — never a silent drop.
+//!
+//! **Ack-after-commit** (Q1): each write's reply resolves ONLY after the group
+//! commit that covers it is durable (the 2PC completed).
+//!
+//! **Cross-pod serialization** (Q7): Iceberg catalog CAS + the `WRITER_INSTANCE`
+//! fence + `CommitKey{tenant, batch_id}` dedup. No writer election.
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use arrow::array::RecordBatch;
-use arrow::array::{Array, FixedSizeBinaryArray, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::DataType;
-use chrono::{DateTime, Utc};
 use iceberg::table::Table;
 use iceberg_catalog_sql::SqlCatalog;
 use sqlx::PgPool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Instant, interval_at};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
-use wyrd_spec::vala::system_columns::{WYRD_EVENT_TIME, is_reserved_system_column};
+use wyrd_spec::vala::system_columns::is_reserved_system_column;
 
 use crate::batch_builder::stamp_system_columns;
 use crate::error::BifrostError;
-use crate::registry::Registry;
-use crate::tables::{EntityBoundsMapping, PayloadClass};
+use crate::registry::{Registry, RegistryKey};
+use crate::tables::PayloadClass;
 use crate::types::{TableScope, TableUid};
-use crate::writer::buffer::AppendBuffer;
-use crate::writer::commit::run_commit;
-use crate::writer::redaction::{BuiltinRedactionPass, RedactionClassifier};
-use crate::writer::{BifrostWriteContext, TableWriterHandle, WriteCmd};
+use crate::writer::buffer::{TenantAppendBuffer, batch_byte_estimate};
+use crate::writer::commit::{CommitGroup, run_group_commit};
+use crate::writer::redaction::RedactionClassifier;
+use crate::writer::{BifrostWriteContext, CommitKey};
 
-/// The audit-outbox `origin` that marks the relay's own write into
-/// `vala.system.audit_log`. A commit under this origin MUST NOT append an audit
-/// row, or the relay would self-feed the spine (review M-11).
+/// The audit-outbox `origin` for the relay's own write. This origin MUST NOT
+/// append an audit row (M-11: the relay must not self-feed the audit spine).
 pub(crate) const AUDIT_RELAY_ORIGIN: &str = "audit-relay";
 
-/// Build the C1 ingest-commit [`AuditEvent`] from the writer context.
+/// The reply channel one write awaits: the covering group commit's snapshot id.
+type CommitReply = oneshot::Sender<Result<i64, BifrostError>>;
+
+/// Flush policy knobs for the group-commit coordinator.
 ///
-/// The Principal is not reachable this deep in the write path (S3.C5 seam), so
-/// the attribution is reconstructed from the [`BifrostWriteContext`] the C1
-/// orchestrator set: `principal_id` parses `actor`, the writer-identity
-/// `card_ref` carries the principal kind (Service/Agent), and a card-less write
-/// is a `User`. An internal record write authenticates as `Internal`. `result`
-/// is `Success` because this event is only appended on the finalized commit.
+/// Q2: flush on `max_rows` OR `max_interval`, whichever first. `max_buffered_bytes`
+/// is a memory ceiling; `max_commit_keys` caps how many commit keys ride one
+/// `fast_append`.
+#[derive(Debug, Clone, Copy)]
+pub struct FlushPolicy {
+    /// Row-count threshold: flush when `total_rows >= max_rows`.
+    pub max_rows: usize,
+    /// Time trigger: flush every `max_interval` regardless of row count.
+    pub max_interval: Duration,
+    /// Memory ceiling: flush when `total_bytes >= max_buffered_bytes`.
+    pub max_buffered_bytes: usize,
+    /// Chunk size: at most this many commit keys per `fast_append`.
+    pub max_commit_keys: usize,
+}
+
+impl Default for FlushPolicy {
+    fn default() -> Self {
+        Self {
+            max_rows: 50_000,
+            max_interval: Duration::from_secs(1),
+            max_buffered_bytes: 128 * 1024 * 1024, // 128 MiB
+            max_commit_keys: 128,
+        }
+    }
+}
+
+/// Build the C1 ingest-commit [`AuditEvent`] from the writer context.
 fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
     let principal_kind = match ctx.card_ref.as_ref() {
         Some(card) if card.kind == CardKind::Agent => PrincipalKindTag::Agent,
@@ -69,345 +116,413 @@ fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
     }
 }
 
-struct CommitActor {
-    receiver: mpsc::Receiver<WriteCmd>,
-    table: Table,
-    catalog: Arc<SqlCatalog>,
-    pool: Arc<PgPool>,
-    table_uid: TableUid,
-    scope: TableScope,
-    /// Authenticated **data tenant** for this writer handle. Server-stamped into
-    /// `data_tenant_id` on `SystemShared` rows; the control-plane RLS bind for the
-    /// `vala.olap_commits` precommit/finalize rows is *derived* from it via
-    /// `scope.control_bind`, never conflated with it (C2/N-M12).
-    ///
-    /// This is per-handle today: one coordinator is spawned per `writer()` call,
-    /// so a handle (and its actor) serves a single data tenant. When the shared
-    /// per-physical-table coordinator (M5/D3/M16) lands, the data tenant must move
-    /// onto `WriteCmd::Write` so one actor can stamp many tenants' writes. Design
-    /// (queue, backpressure, flush timing, compaction, single/multi-tenant) is not
-    /// yet locked — see
-    /// `.dev/plan/foundations/12-olap-warehouse/stage5/07-write-path-group-commit.md`.
-    data_tenant: DataTenantId,
-    buffer: AppendBuffer,
-    registry: Arc<Registry>,
-    payload_class: PayloadClass,
-    sensitive_columns: &'static [&'static str],
-    /// Optional entity → time bounds mapping for best-effort acceleration (M-06).
-    /// When `Some`, each successful flush upserts per-entity min/max event time
-    /// into `vala.entity_time_bounds` in a separate best-effort transaction.
-    entity_bounds_mapping: Option<EntityBoundsMapping>,
-}
-
-/// Microseconds since the Unix epoch, used for the server-stamped
-/// `wyrd_event_time` / `wyrd_ingested_at` system columns.
 fn now_micros() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
 }
 
-impl CommitActor {
-    /// Serially process [`WriteCmd`]s until the channel closes. Serial execution
-    /// is the concurrency boundary: one actor per table means buffered batches
-    /// and the flush commit never race.
+/// The first reserved system column present in any of `batches`, if any. A caller
+/// batch must carry user fields only; the coordinator stamps system columns.
+fn first_reserved_column(batches: &[RecordBatch]) -> Option<String> {
+    batches.iter().find_map(|batch| {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .find(|f| is_reserved_system_column(f.name()))
+            .map(|f| f.name().clone())
+    })
+}
+
+/// Command sent to the group-commit actor.
+pub(crate) enum CoordinatorCmd {
+    /// Buffer one commit unit (all `batches` share `ctx.batch_id`) for `tenant`.
+    /// The reply resolves only when the group commit covering it is durable (Q1).
+    Write {
+        tenant: DataTenantId,
+        batches: Vec<RecordBatch>,
+        ctx: Box<BifrostWriteContext>,
+        reply: CommitReply,
+    },
+}
+
+/// One buffered commit unit awaiting its covering commit: the caller's batches
+/// (all under `ctx.batch_id`), the attribution context, and the reply channel.
+struct PendingWrite {
+    batches: Vec<RecordBatch>,
+    ctx: BifrostWriteContext,
+    reply: CommitReply,
+}
+
+/// Caller-facing handle for one physical table's group-commit coordinator.
+///
+/// Cloneable cheap sender; all durable work happens in the actor task.
+#[derive(Clone)]
+pub struct GroupCommitHandle {
+    pub(crate) sender: Arc<mpsc::Sender<CoordinatorCmd>>,
+    pub(crate) table_fqn: String,
+}
+
+impl GroupCommitHandle {
+    /// Enqueue a commit unit and return the receiver for its commit-durable ack
+    /// WITHOUT awaiting it. Splitting send from await lets a caller buffer many
+    /// units before any flush, and lets shutdown drain them (the reply channel is
+    /// independent of this handle's sender).
+    ///
+    /// # Errors
+    /// [`BifrostError::IngestBusy`] when the coordinator channel is full (Q5).
+    pub(crate) fn send_write(
+        &self,
+        tenant: DataTenantId,
+        batches: Vec<RecordBatch>,
+        ctx: BifrostWriteContext,
+    ) -> Result<oneshot::Receiver<Result<i64, BifrostError>>, BifrostError> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .try_send(CoordinatorCmd::Write {
+                tenant,
+                batches,
+                ctx: Box::new(ctx),
+                reply: tx,
+            })
+            .map_err(|_| BifrostError::IngestBusy(self.table_fqn.clone()))?;
+        Ok(rx)
+    }
+
+    /// Buffer a commit unit for `tenant` and await its commit-durable ack (Q1).
+    ///
+    /// # Errors
+    /// [`BifrostError::IngestBusy`] on channel-full backpressure (Q5);
+    /// [`BifrostError::WriterUnavailable`] if the coordinator exited before acking.
+    pub async fn write(
+        &self,
+        tenant: DataTenantId,
+        batches: Vec<RecordBatch>,
+        ctx: BifrostWriteContext,
+    ) -> Result<i64, BifrostError> {
+        let rx = self.send_write(tenant, batches, ctx)?;
+        rx.await
+            .map_err(|_| BifrostError::WriterUnavailable(self.table_fqn.clone()))?
+    }
+
+    /// One-shot: submit a single commit unit, close this (sole) handle so the
+    /// coordinator drains immediately, and await the commit-durable snapshot id.
+    /// For writers that own their coordinator for exactly one commit (the audit
+    /// relay, a single ingest stream).
+    ///
+    /// # Errors
+    /// [`BifrostError::IngestBusy`] on backpressure;
+    /// [`BifrostError::WriterUnavailable`] if the coordinator exited before acking.
+    pub async fn commit_one(
+        self,
+        tenant: DataTenantId,
+        batches: Vec<RecordBatch>,
+        ctx: BifrostWriteContext,
+    ) -> Result<i64, BifrostError> {
+        let fqn = self.table_fqn.clone();
+        let rx = self.send_write(tenant, batches, ctx)?;
+        // Drop the last sender so the actor's recv() yields None → drain → commit.
+        drop(self);
+        rx.await.map_err(|_| BifrostError::WriterUnavailable(fqn))?
+    }
+
+    /// Returns `true` when the actor has exited (channel closed).
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+}
+
+/// The per-physical-table group-commit actor.
+struct GroupCommitActor {
+    receiver: mpsc::Receiver<CoordinatorCmd>,
+    table: Table,
+    catalog: Arc<SqlCatalog>,
+    pool: Arc<PgPool>,
+    table_uid: TableUid,
+    scope: TableScope,
+    registry: Arc<Registry>,
+    payload_class: PayloadClass,
+    sensitive_columns: &'static [&'static str],
+    flush_policy: FlushPolicy,
+    buffer: TenantAppendBuffer<PendingWrite>,
+}
+
+impl GroupCommitActor {
     async fn run(mut self) {
-        while let Some(cmd) = self.receiver.recv().await {
-            match cmd {
-                WriteCmd::Write(batch, reply) => {
-                    let _ = reply.send(self.accept(batch));
+        let interval_dur = self.flush_policy.max_interval;
+        let mut timer = interval_at(Instant::now() + interval_dur, interval_dur);
+        // A slow flush must not make the timer fire back-to-back to "catch up"
+        // (the default `Burst` behavior); delay the next tick a full interval
+        // past completion instead. Matches the repo's Delay/Skip convention.
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                cmd = self.receiver.recv() => {
+                    match cmd {
+                        None => {
+                            // All senders dropped — drain the buffer and exit (Q3).
+                            if !self.buffer.is_empty() {
+                                self.flush().await;
+                            }
+                            return;
+                        }
+                        Some(CoordinatorCmd::Write { tenant, batches, ctx, reply }) => {
+                            self.accept(tenant, batches, *ctx, reply).await;
+                        }
+                    }
                 }
-                WriteCmd::Flush(ctx, reply) => {
-                    let result = self.flush(*ctx).await;
-                    let _ = reply.send(result);
+                _ = timer.tick() => {
+                    if !self.buffer.is_empty() {
+                        self.flush().await;
+                    }
                 }
             }
         }
     }
 
-    /// Validate and buffer a caller batch. Callers supply user fields only — the
-    /// server stamps every system column (`wyrd_event_time`, `wyrd_ingested_at`,
-    /// `wyrd_batch_id`, and `data_tenant_id` on `SystemShared`). A caller batch that
-    /// already carries any reserved system column is rejected (MAJOR-9 step 3):
-    /// the server-stamped value must be the sole source, never coexisting with a
-    /// caller-supplied duplicate.
-    fn accept(&mut self, batch: RecordBatch) -> Result<(), BifrostError> {
-        for field in batch.schema().fields() {
-            if is_reserved_system_column(field.name()) {
-                return Err(BifrostError::ReservedColumn(field.name().clone()));
-            }
+    /// Validate one write unit and buffer it; flush if a size threshold is crossed.
+    async fn accept(
+        &mut self,
+        tenant: DataTenantId,
+        batches: Vec<RecordBatch>,
+        ctx: BifrostWriteContext,
+        reply: CommitReply,
+    ) {
+        if let Some(col) = first_reserved_column(&batches) {
+            let _ = reply.send(Err(BifrostError::ReservedColumn(col)));
+            return;
         }
-        self.buffer.push(batch);
-        Ok(())
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let bytes: usize = batches.iter().map(batch_byte_estimate).sum();
+        self.buffer.push(
+            tenant,
+            PendingWrite {
+                batches,
+                ctx,
+                reply,
+            },
+            rows,
+            bytes,
+        );
+
+        if self.buffer.total_rows() >= self.flush_policy.max_rows
+            || self.buffer.total_bytes() >= self.flush_policy.max_buffered_bytes
+        {
+            self.flush().await;
+        }
     }
 
-    /// Stamp every buffered batch with the system columns and commit them as one
-    /// 2PC transaction. On any failure the drained batches are restored to the
-    /// buffer so the caller can retry. An empty buffer is a no-op returning `0`.
-    async fn flush(&mut self, ctx: BifrostWriteContext) -> Result<i64, BifrostError> {
-        if self.buffer.is_empty() {
-            return Ok(0);
+    /// Drain the buffer and commit it as one or more group commits, chunked at
+    /// `max_commit_keys`, acking each write after its covering commit is durable.
+    async fn flush(&mut self) {
+        let writes = self.buffer.drain_round_robin();
+        if writes.is_empty() {
+            return;
         }
 
-        let batches = self.buffer.drain();
-        let batch_id = ctx.batch_id;
         let ingested_at_us = now_micros();
-        let stamp_tenant = self.scope.stamp_tenant(self.data_tenant);
+        let table_fqn = self.table.identifier().to_string();
 
-        // Audit attribution for the transactional outbox append (S3.C5). The
-        // relay's own write (`origin == "audit-relay"`) is skipped so it never
-        // self-feeds the spine (M-11); every other commit appends one row in the
-        // same tx as the finalize.
+        // Build one commit group per buffered write unit; a per-unit stamping or
+        // redaction failure fails just that unit's reply.
+        let mut groups: Vec<(CommitGroup, CommitReply)> = Vec::with_capacity(writes.len());
+        for (tenant, pending) in writes {
+            let PendingWrite {
+                batches,
+                ctx,
+                reply,
+            } = pending;
+            match self.prepare_group(tenant, &batches, ctx, ingested_at_us, &table_fqn) {
+                Ok(group) => groups.push((group, reply)),
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+
+        // Commit each chunk as ONE fast_append; ack its writes; advance the table.
+        let max = self.flush_policy.max_commit_keys.max(1);
+        while !groups.is_empty() {
+            let take = groups.len().min(max);
+            let chunk: Vec<(CommitGroup, CommitReply)> = groups.drain(..take).collect();
+            self.commit_chunk(chunk, &table_fqn).await;
+        }
+    }
+
+    /// Stamp system columns, apply redaction, and assemble the [`CommitGroup`] for
+    /// one buffered write unit.
+    fn prepare_group(
+        &self,
+        tenant: DataTenantId,
+        batches: &[RecordBatch],
+        ctx: BifrostWriteContext,
+        ingested_at_us: i64,
+        table_fqn: &str,
+    ) -> Result<CommitGroup, BifrostError> {
+        let stamp_tenant = self.scope.stamp_tenant(tenant);
+        let redact =
+            self.payload_class == PayloadClass::Sensitive && !self.sensitive_columns.is_empty();
+
+        let mut stamped: Vec<RecordBatch> = Vec::with_capacity(batches.len());
+        for batch in batches {
+            let s = stamp_system_columns(batch, ingested_at_us, ctx.batch_id, stamp_tenant)
+                .map_err(BifrostError::Arrow)?;
+            let s = if redact {
+                use crate::writer::redaction::BuiltinRedactionPass;
+                BuiltinRedactionPass.scrub(&s, self.sensitive_columns)?
+            } else {
+                s
+            };
+            stamped.push(s);
+        }
+
         let audit = if ctx.origin == AUDIT_RELAY_ORIGIN {
             None
         } else {
-            Some(ingest_audit_event(
-                &ctx,
-                &self.table.identifier().to_string(),
-            ))
+            Some(ingest_audit_event(&ctx, table_fqn))
         };
+        let key = CommitKey::new(tenant, ctx.batch_id);
+        Ok(CommitGroup {
+            key,
+            ctx,
+            batches: stamped,
+            audit,
+        })
+    }
 
-        let stamped: Vec<RecordBatch> = match batches
-            .iter()
-            .map(|b| stamp_system_columns(b, ingested_at_us, batch_id, stamp_tenant))
-            .collect::<Result<_, _>>()
-            .map_err(BifrostError::Arrow)
-        {
-            Ok(stamped) => stamped,
-            Err(e) => {
-                self.buffer = AppendBuffer::from_vec(batches);
-                return Err(e);
-            }
-        };
+    /// Run one chunk as a single group commit, advance the table on a fresh append,
+    /// invalidate the registry for every affected `control_bind`, and ack each
+    /// write with the snapshot that covers its key.
+    async fn commit_chunk(&mut self, chunk: Vec<(CommitGroup, CommitReply)>, table_fqn: &str) {
+        let mut cgs: Vec<CommitGroup> = Vec::with_capacity(chunk.len());
+        let mut replies: Vec<(CommitKey, CommitReply)> = Vec::with_capacity(chunk.len());
+        for (cg, reply) in chunk {
+            replies.push((cg.key, reply));
+            cgs.push(cg);
+        }
 
-        // M-03: for Sensitive tables run the built-in redaction pass over
-        // SENSITIVE_PAYLOAD_COLUMNS before committing. A classifier error
-        // refuses the commit (WYRD_VALA_500_REDACTION_FAILED).
-        let stamped = if self.payload_class == PayloadClass::Sensitive
-            && !self.sensitive_columns.is_empty()
-        {
-            let pass = BuiltinRedactionPass;
-            match stamped
-                .iter()
-                .map(|b| pass.scrub(b, self.sensitive_columns))
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(redacted) => redacted,
-                Err(e) => {
-                    self.buffer = AppendBuffer::from_vec(batches);
-                    return Err(e);
-                }
-            }
-        } else {
-            stamped
-        };
-
-        // Extract entity bounds before run_commit consumes `stamped` (best-effort M-06).
-        let entity_bounds: Vec<(String, DateTime<Utc>, DateTime<Utc>)> =
-            if let Some(mapping) = &self.entity_bounds_mapping {
-                extract_entity_bounds(&stamped, &mapping.entity_id_column)
-            } else {
-                vec![]
-            };
-
-        match run_commit(
+        match run_group_commit(
             &self.pool,
             &self.catalog,
             &self.table,
             &self.table_uid,
-            stamped,
-            batch_id,
-            &ctx.origin,
-            &ctx.actor,
-            self.scope.control_bind(self.data_tenant),
-            audit,
+            self.scope,
+            cgs,
         )
         .await
         {
-            Ok((snapshot_id, updated_table)) => {
-                // Adopt the post-commit table snapshot so the next flush bases its
-                // transaction on the current ref (MAJOR-2). The idempotent-replay
-                // path returns `None` and leaves the snapshot untouched.
-                if let Some(table) = updated_table {
+            Ok(outcome) => {
+                if let Some(table) = outcome.updated_table {
                     self.table = table;
-                    // Bump refresh_epochs + evict cache so other pods see the new
-                    // snapshot on their next get(). Best-effort: a failure here
-                    // means the next reader pays a full reload, not correctness.
-                    let key = crate::registry::RegistryKey {
-                        owner: self.scope.control_bind(self.data_tenant),
-                        table_uid: self.table_uid,
-                    };
-                    if let Err(e) = self.registry.invalidate(key).await {
-                        tracing::warn!(
-                            error = %e,
-                            "epoch bump after commit failed (cache may be stale)"
-                        );
+                    self.invalidate_registry(&outcome.committed).await;
+                }
+                // key → covering snapshot: fresh keys share outcome.snapshot_id;
+                // replayed keys keep the snapshot they originally committed to.
+                let mut snaps: HashMap<CommitKey, i64> = HashMap::new();
+                if let Some(sid) = outcome.snapshot_id {
+                    for key in &outcome.committed {
+                        snaps.insert(*key, sid);
                     }
                 }
-
-                // Best-effort entity_time_bounds upsert (M-06).
-                if !entity_bounds.is_empty()
-                    && let Some(mapping) = &self.entity_bounds_mapping
-                {
-                    spawn_entity_bounds_upsert(
-                        Arc::clone(&self.pool),
-                        self.data_tenant,
-                        self.table_uid.0,
-                        mapping.entity_kind.clone(),
-                        entity_bounds,
-                    );
+                for (key, sid) in &outcome.replayed {
+                    snaps.insert(*key, *sid);
                 }
-
-                Ok(snapshot_id)
-            }
-            Err(e) => {
-                self.buffer = AppendBuffer::from_vec(batches);
-                Err(e)
-            }
-        }
-    }
-}
-
-fn spawn_entity_bounds_upsert(
-    pool: Arc<PgPool>,
-    data_tenant: DataTenantId,
-    table_uid_arr: [u8; 16],
-    entity_kind: String,
-    entity_bounds: Vec<(String, DateTime<Utc>, DateTime<Utc>)>,
-) {
-    tokio::spawn(async move {
-        match vala_sql::TenantConn::acquire(&pool, data_tenant).await {
-            Ok(mut conn) => {
-                let refs: Vec<(&str, DateTime<Utc>, DateTime<Utc>)> = entity_bounds
-                    .iter()
-                    .map(|(id, min_t, max_t)| (id.as_str(), *min_t, *max_t))
-                    .collect();
-                if let Err(e) = vala_sql::queries::olap_catalog::record_entity_bounds(
-                    &mut conn,
-                    &table_uid_arr,
-                    &entity_kind,
-                    &refs,
-                )
-                .await
-                {
-                    tracing::warn!(error = %e, "entity_time_bounds upsert failed (best-effort)");
-                    return;
-                }
-                if let Err(e) = conn.commit().await {
-                    tracing::warn!(error = %e, "entity_time_bounds commit failed (best-effort)");
+                for (key, reply) in replies {
+                    let result = match snaps.get(&key) {
+                        Some(sid) => Ok(*sid),
+                        None => Err(BifrostError::WriterUnavailable(table_fqn.to_string())),
+                    };
+                    let _ = reply.send(result);
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "entity_time_bounds connection failed (best-effort)");
-            }
-        }
-    });
-}
-
-/// Extract per-entity (min, max) `wyrd_event_time` bounds from a slice of committed
-/// batches. Entities are identified by `entity_id_column` (Utf8 or FixedSizeBinary(16)).
-/// Binary values are hex-encoded. Rows where either the entity column or the timestamp
-/// is null are skipped. Returns an empty vec when the column is missing or the type is
-/// unsupported (caller treats a missing result as a bounds miss, not an error).
-fn extract_entity_bounds(
-    batches: &[RecordBatch],
-    entity_id_column: &str,
-) -> Vec<(String, DateTime<Utc>, DateTime<Utc>)> {
-    let mut bounds: HashMap<String, (DateTime<Utc>, DateTime<Utc>)> = HashMap::new();
-
-    for batch in batches {
-        let Some(id_idx) = batch.schema().index_of(entity_id_column).ok() else {
-            continue;
-        };
-        let Some(ts_idx) = batch.schema().index_of(WYRD_EVENT_TIME).ok() else {
-            continue;
-        };
-
-        let id_col = batch.column(id_idx);
-        let ts_col = batch.column(ts_idx);
-
-        let Some(ts_arr) = ts_col.as_any().downcast_ref::<TimestampMicrosecondArray>() else {
-            continue;
-        };
-
-        for row in 0..batch.num_rows() {
-            if ts_arr.is_null(row) || id_col.is_null(row) {
-                continue;
-            }
-            let Some(entity_id) = entity_id_str(id_col.as_ref(), row) else {
-                continue;
-            };
-            let ts_us = ts_arr.value(row);
-            let Some(ts) = DateTime::<Utc>::from_timestamp_micros(ts_us) else {
-                continue;
-            };
-            let entry = bounds.entry(entity_id).or_insert((ts, ts));
-            if ts < entry.0 {
-                entry.0 = ts;
-            }
-            if ts > entry.1 {
-                entry.1 = ts;
+                for (_key, reply) in replies {
+                    let _ = reply.send(Err(BifrostError::Internal(e.to_string())));
+                }
             }
         }
     }
 
-    bounds
-        .into_iter()
-        .map(|(id, (min, max))| (id, min, max))
-        .collect()
-}
-
-fn entity_id_str(col: &dyn Array, row: usize) -> Option<String> {
-    match col.data_type() {
-        DataType::Utf8 => col
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .map(|a| a.value(row).to_string()),
-        DataType::FixedSizeBinary(_) => col
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .map(|a| hex::encode(a.value(row))),
-        _ => None,
+    /// Epoch-bump the reader cache for each distinct `control_bind` whose snapshot
+    /// this flush advanced.
+    async fn invalidate_registry(&self, committed: &[CommitKey]) {
+        let binds: HashSet<DataTenantId> = committed
+            .iter()
+            .map(|k| self.scope.control_bind(k.tenant))
+            .collect();
+        for owner in binds {
+            let key = RegistryKey {
+                owner,
+                table_uid: self.table_uid,
+            };
+            if let Err(e) = self.registry.invalidate(key).await {
+                tracing::warn!(
+                    error = %e,
+                    "epoch bump after group commit failed (cache may be stale)"
+                );
+            }
+        }
     }
 }
 
-/// Spawn the per-table commit actor and return a [`TableWriterHandle`] for it.
+/// Spawn the per-physical-table group-commit coordinator.
 ///
-/// One actor is spawned per `writer()` call, each bound to a single data tenant
-/// (see [`CommitActor::data_tenant`]). The actor owns the loaded [`Table`] and
-/// advances its snapshot as flushes commit.
+/// Returns a [`GroupCommitHandle`] the caller uses to submit writes. The actor
+/// owns the loaded [`Table`] and advances its snapshot as flushes commit.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_commit_coordinator(
+pub(crate) fn spawn_group_commit_coordinator(
     table: Table,
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
     table_uid: TableUid,
     table_fqn: String,
     scope: TableScope,
-    data_tenant: DataTenantId,
     registry: Arc<Registry>,
     payload_class: PayloadClass,
     sensitive_columns: &'static [&'static str],
-    entity_bounds_mapping: Option<EntityBoundsMapping>,
-) -> TableWriterHandle {
-    let (sender, receiver) = mpsc::channel(64);
+    flush_policy: FlushPolicy,
+) -> GroupCommitHandle {
+    let (sender, receiver) = mpsc::channel(256);
 
-    let actor = CommitActor {
+    let actor = GroupCommitActor {
         receiver,
         table,
         catalog,
         pool,
         table_uid,
         scope,
-        data_tenant,
-        buffer: AppendBuffer::new(),
         registry,
         payload_class,
         sensitive_columns,
-        entity_bounds_mapping,
+        flush_policy,
+        buffer: TenantAppendBuffer::new(),
     };
 
     tokio::spawn(actor.run());
 
-    TableWriterHandle { sender, table_fqn }
+    GroupCommitHandle {
+        sender: Arc::new(sender),
+        table_fqn,
+    }
+}
+
+// ── Unit tests ───────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::FlushPolicy;
+
+    #[test]
+    fn flush_policy_defaults_match_contract() {
+        let policy = FlushPolicy::default();
+        assert_eq!(policy.max_rows, 50_000);
+        assert_eq!(policy.max_interval, Duration::from_secs(1));
+        assert_eq!(policy.max_buffered_bytes, 128 * 1024 * 1024);
+        assert_eq!(policy.max_commit_keys, 128);
+    }
 }

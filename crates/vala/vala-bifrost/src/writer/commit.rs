@@ -19,8 +19,9 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::error::BifrostError;
-use crate::types::TableUid;
+use crate::types::{TableScope, TableUid};
 use crate::writer::file_writer::bifrost_writer_properties;
+use crate::writer::{BifrostWriteContext, CommitKey};
 
 /// Stable engine-instance identity stamped into `writer_owner` on every
 /// precommit row. A fresh `Uuid::new_v4()` per process start means two pods
@@ -72,6 +73,42 @@ enum Phase1 {
     Fresh { owner: Uuid, fencing_token: i64 },
 }
 
+/// One request's commit unit inside a group flush.
+///
+/// Carries its durable [`CommitKey`] (`key.tenant` is the DATA tenant bound for
+/// this unit's precommit + finalize), the audit-attribution context it arrived
+/// with, its already-system-stamped batches, and the optional audit-outbox event
+/// to append in the same tx as its finalize (S3.C5).
+pub struct CommitGroup {
+    /// `{tenant, batch_id}`; `key.tenant` is the DATA tenant bound for precommit
+    /// + finalize.
+    pub key: CommitKey,
+    /// Origin / actor / `request_id` / `card_ref` for audit attribution.
+    pub ctx: BifrostWriteContext,
+    /// Batches already stamped with system columns, including `data_tenant_id`.
+    pub batches: Vec<RecordBatch>,
+    /// Per-key audit event, appended in this key's finalize tx (C5); `None` on
+    /// the internal/system path.
+    pub audit: Option<AuditEvent>,
+}
+
+/// Outcome of a [`run_group_commit`] flush: the one shared snapshot id (or `None`
+/// when every key replayed and no append happened), the post-append table the
+/// caller must adopt, the fresh keys now durable, and the idempotent replay hits.
+pub struct GroupCommitOutcome {
+    /// `None` when EVERY key replayed (no append happened).
+    pub snapshot_id: Option<i64>,
+    /// The post-append [`Table`] the caller must adopt for its NEXT commit so the
+    /// following `fast_append` CAS builds on the snapshot this flush produced.
+    /// `None` when no append happened (all replayed / every fresh fence lost).
+    pub updated_table: Option<Table>,
+    /// Fresh keys now durable (all share `snapshot_id`).
+    pub committed: Vec<CommitKey>,
+    /// Idempotent replay hits, each paired with the snapshot it originally
+    /// committed to (so the caller can ack a re-submit with its real snapshot).
+    pub replayed: Vec<(CommitKey, i64)>,
+}
+
 /// Execute one 2PC commit of `batches` under `batch_id` for `table`.
 ///
 /// Two phases, each with a clear short-circuit:
@@ -111,10 +148,10 @@ pub async fn run_commit(
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
 
-    let phase1 = claim_batch(
-        pool, table_uid, &batch_id, origin, actor, tenant, &table_fqn,
-    )
-    .await?;
+    // Legacy single-key path: the caller (coordinator) passes the registration
+    // anchor as `tenant`, so control_bind == the bound tenant. Behavior-preserving.
+    let key = CommitKey::new(tenant, batch_id);
+    let phase1 = claim_batch(pool, table_uid, &key, origin, actor, tenant, &table_fqn).await?;
 
     match phase1 {
         Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
@@ -138,6 +175,202 @@ pub async fn run_commit(
             Ok((snapshot_id, Some(updated_table)))
         }
     }
+}
+
+/// Execute one group flush: N per-tenant precommit txns → ONE Iceberg
+/// `fast_append` → N per-tenant finalize txns.
+///
+/// Each [`CommitGroup`] is a distinct durable commit unit keyed by its
+/// [`CommitKey`] (`{tenant, batch_id}`). All the fresh groups' Parquet data files
+/// land in a SINGLE Iceberg snapshot, so N requests amortize one catalog commit.
+/// The precommit and finalize txns bind to each group's DATA tenant
+/// (`group.key.tenant` → `data_tenant_id`, the RLS anchor + dedup discriminator) so
+/// a `SystemShared` table keeps every tenant on its own
+/// `(data_tenant_id, table_uid, batch_id)` row instead of collapsing two tenants'
+/// identical `batch_id`s. `control_bind` (`scope.control_bind`) is only the
+/// `SYSTEM_OWNER` registration anchor for the `bifrost_tables` foreign key.
+///
+/// Flow:
+/// 1. Prepare (N tenant-scoped txns) via [`claim_batch`]. A `Replay` key records
+///    its snapshot and drops from the write set; a `Fresh` key is kept with its
+///    `(owner, fencing_token)`.
+/// 2. If no fresh groups survive (all replayed) return with `snapshot_id: None`
+///    and no Iceberg append.
+/// 3. Fence + write once: renew EVERY fresh group's fence BEFORE writing any
+///    Parquet, dropping a lost-fence group before its bytes hit object storage
+///    (keeps orphaned Parquet at zero on the fence-loss path); then
+///    [`write_batches`] each surviving group into one shared `Vec<DataFile>`.
+/// 4. Append once via [`commit_group_to_iceberg`], stamping `wyrd_commit_keys`.
+/// 5. Finalize (N tenant-scoped txns) via `finalize_committed`, appending each
+///    group's audit event in its finalize tx; a post-append fence loss records
+///    the residual and is left to the recovery oracle.
+///
+/// # Errors
+/// Returns [`BifrostError`] when a control-plane txn, the Parquet write, or the
+/// Iceberg append fails, or when a `batch_id` collides with a failed / in-flight /
+/// aborted anchor (see the 02.4 note below on per-key collision isolation).
+#[allow(clippy::too_many_lines)]
+pub async fn run_group_commit(
+    pool: &PgPool,
+    catalog: &SqlCatalog,
+    table: &Table,
+    table_uid: &TableUid,
+    scope: TableScope,
+    groups: Vec<CommitGroup>,
+) -> Result<GroupCommitOutcome, BifrostError> {
+    let table_fqn = table.identifier().to_string();
+
+    let mut replayed: Vec<(CommitKey, i64)> = Vec::new();
+    // Fresh groups kept together with their claimed fence.
+    let mut fresh: Vec<(CommitGroup, Uuid, i64)> = Vec::new();
+
+    // 1. Prepare: one tenant-scoped precommit txn per group.
+    for group in groups {
+        // control_bind is the registration anchor (SYSTEM_OWNER for SystemShared,
+        // the data tenant for TenantOwned) = the bifrost_tables FK key; the bind
+        // stays the DATA tenant so RLS keeps each tenant on its own commit row.
+        let phase1 = claim_batch(
+            pool,
+            table_uid,
+            &group.key,
+            &group.ctx.origin,
+            &group.ctx.actor,
+            scope.control_bind(group.key.tenant),
+            &table_fqn,
+        )
+        // 02.4: per-key collision isolation (fail only that key's reply and keep
+        // the flush going) needs the coordinator's pending-reply map; here a
+        // claim collision propagates and fails the whole call.
+        .await?;
+
+        match phase1 {
+            Phase1::Replay { snapshot_id } => replayed.push((group.key, snapshot_id)),
+            Phase1::Fresh {
+                owner,
+                fencing_token,
+            } => fresh.push((group, owner, fencing_token)),
+        }
+    }
+
+    // 2. All replayed → no append.
+    if fresh.is_empty() {
+        return Ok(GroupCommitOutcome {
+            snapshot_id: None,
+            updated_table: None,
+            committed: Vec::new(),
+            replayed,
+        });
+    }
+
+    // 3a. Fence every fresh group BEFORE writing any Parquet: a group whose fence
+    // is lost drops out here, before its bytes are written, so no orphaned files.
+    let mut survivors: Vec<(CommitGroup, Uuid, i64)> = Vec::with_capacity(fresh.len());
+    for (group, owner, fencing_token) in fresh {
+        let mut conn = vala_sql::TenantConn::acquire(pool, group.key.tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let held = vala_sql::queries::olap_catalog::renew_writer_fence(
+            &mut conn,
+            table_uid.as_bytes(),
+            &group.key.batch_id,
+            owner,
+            fencing_token,
+            WRITER_LEASE_SECS,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        if held {
+            survivors.push((group, owner, fencing_token));
+        } else {
+            tracing::warn!(
+                batch_id = %group.key.batch_uuid(),
+                "writer fence lost before group append; dropping group before write"
+            );
+        }
+    }
+
+    // A lost fence on every fresh group leaves nothing to append.
+    if survivors.is_empty() {
+        return Ok(GroupCommitOutcome {
+            snapshot_id: None,
+            updated_table: None,
+            committed: Vec::new(),
+            replayed,
+        });
+    }
+
+    // 3b. Write each surviving group's Parquet into one shared data-file set.
+    let mut all_files: Vec<DataFile> = Vec::new();
+    for (group, _, _) in &survivors {
+        let files = write_batches(table, group.batches.clone()).await?;
+        all_files.extend(files);
+    }
+
+    // 4. ONE Iceberg append for the whole group, stamping wyrd_commit_keys.
+    let fresh_keys: Vec<CommitKey> = survivors.iter().map(|(g, _, _)| g.key).collect();
+    let (snapshot_id, updated_table) =
+        commit_group_to_iceberg(catalog, table, all_files, &fresh_keys).await?;
+
+    // 5. Finalize: one tenant-scoped txn per surviving group.
+    let mut committed: Vec<CommitKey> = Vec::new();
+    for (group, owner, fencing_token) in survivors {
+        let mut conn = vala_sql::TenantConn::acquire(pool, group.key.tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let finalized = vala_sql::queries::olap_catalog::finalize_committed(
+            &mut conn,
+            table_uid.as_bytes(),
+            &group.key.batch_id,
+            snapshot_id,
+            owner,
+            fencing_token,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+
+        if finalized {
+            // Append the audit-outbox row in the SAME tx as the finalize (S3.C5):
+            // an append failure fails the op closed.
+            if let Some(event) = group.audit.as_ref() {
+                vala_sql::queries::audit_outbox::append_audit(&mut conn, event)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "audit outbox append failed; refusing commit");
+                        BifrostError::AuditUnavailable("audit outbox append failed".to_string())
+                    })?;
+            }
+            conn.commit().await.map_err(BifrostError::Sql)?;
+            committed.push(group.key);
+        } else {
+            // Fence lost AFTER the append: record the residual; the recovery
+            // oracle owns this row, so it is not pushed to `committed`.
+            let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
+                &mut conn,
+                table_uid.as_bytes(),
+                &group.key.batch_id,
+                owner,
+                fencing_token,
+                snapshot_id,
+                false,
+                None,
+            )
+            .await;
+            let _ = conn.commit().await;
+            tracing::warn!(
+                snapshot_id,
+                batch_id = %group.key.batch_uuid(),
+                "writer fence lost after group append; snapshot key may be orphaned"
+            );
+        }
+    }
+
+    Ok(GroupCommitOutcome {
+        snapshot_id: Some(snapshot_id),
+        updated_table: Some(updated_table),
+        committed,
+        replayed,
+    })
 }
 
 #[cfg(any(test, feature = "bench-bin"))]
@@ -184,20 +417,20 @@ async fn expire_writer_lease(
 async fn claim_batch(
     pool: &PgPool,
     table_uid: &TableUid,
-    batch_id: &[u8; 16],
+    key: &CommitKey,
     origin: &str,
     actor: &str,
-    tenant: DataTenantId,
+    control_bind: DataTenantId,
     table_fqn: &str,
 ) -> Result<Phase1, BifrostError> {
-    let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+    let mut conn = vala_sql::TenantConn::acquire(pool, key.tenant)
         .await
         .map_err(BifrostError::Sql)?;
 
     let existing = vala_sql::queries::olap_catalog::lookup_idempotent(
         &mut conn,
         table_uid.as_bytes(),
-        batch_id,
+        &key.batch_id,
     )
     .await
     .map_err(BifrostError::Sql)?;
@@ -215,7 +448,7 @@ async fn claim_batch(
         Some(row) if row.state == "failed" => {
             conn.commit().await.map_err(BifrostError::Sql)?;
             Err(BifrostError::DuplicateFailedBatch(
-                uuid::Uuid::from_bytes(*batch_id).to_string(),
+                uuid::Uuid::from_bytes(key.batch_id).to_string(),
             ))
         }
         Some(_) => {
@@ -225,10 +458,11 @@ async fn claim_batch(
             Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }
         None => {
-            vala_sql::queries::olap_catalog::precommit(
+            vala_sql::queries::olap_catalog::precommit_with_bind(
                 &mut conn,
                 table_uid.as_bytes(),
-                batch_id,
+                control_bind.as_uuid(),
+                &key.batch_id,
                 origin,
                 actor,
             )
@@ -243,7 +477,7 @@ async fn claim_batch(
             vala_sql::queries::olap_catalog::record_writer_lease(
                 &mut conn,
                 table_uid.as_bytes(),
-                batch_id,
+                &key.batch_id,
                 owner,
                 fencing_token,
                 WRITER_LEASE_SECS,
@@ -506,11 +740,66 @@ async fn commit_to_iceberg(
         "wyrd_batch_id".to_string(),
         uuid::Uuid::from_bytes(*batch_id).simple().to_string(),
     );
+    append_snapshot(catalog, table, data_files, props).await
+}
 
+/// Fast-append `data_files` for a group flush as a single Iceberg transaction.
+///
+/// Stamps ONE snapshot summary property, `wyrd_commit_keys`: a JSON array with one
+/// `{"data_tenant_id","batch_id"}` object per fresh [`CommitKey`], both rendered as
+/// UUID simple-hex. `data_tenant_id` is the DATA tenant (`key.tenant`) — the M02
+/// dedup discriminator the 02.3 recovery oracle matches a stale precommit's
+/// `{data_tenant_id, batch_id}` pair against. It is NOT the `control_bind` column
+/// (the `SYSTEM_OWNER` registration anchor for a shared table), which does not
+/// discriminate tenants and so is useless for recovery. The JSON is built manually
+/// because `serde_json` is not in the production library build; simple-hex values
+/// need no escaping. Returns the new snapshot id alongside the updated [`Table`].
+///
+/// # Errors
+/// Returns [`BifrostError::Iceberg`] when the transaction build or commit fails.
+async fn commit_group_to_iceberg(
+    catalog: &SqlCatalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+    keys: &[CommitKey],
+) -> Result<(i64, Table), BifrostError> {
+    use std::fmt::Write as _;
+
+    let mut objs = String::new();
+    for (i, key) in keys.iter().enumerate() {
+        if i > 0 {
+            objs.push(',');
+        }
+        let tenant_hex = key.tenant.as_uuid().simple();
+        let batch_hex = uuid::Uuid::from_bytes(key.batch_id).simple();
+        let _ = write!(
+            objs,
+            "{{\"data_tenant_id\":\"{tenant_hex}\",\"batch_id\":\"{batch_hex}\"}}"
+        );
+    }
+    let commit_keys = format!("[{objs}]");
+
+    let mut props = HashMap::new();
+    props.insert("wyrd_commit_keys".to_string(), commit_keys);
+    append_snapshot(catalog, table, data_files, props).await
+}
+
+/// Fast-append `data_files` to `table` in one transaction, stamping `summary_props`
+/// into the snapshot summary. Shared by [`commit_to_iceberg`] and
+/// [`commit_group_to_iceberg`] so the transaction-build logic lives in one place.
+///
+/// # Errors
+/// Returns [`BifrostError::Iceberg`] when the transaction build or commit fails.
+async fn append_snapshot(
+    catalog: &SqlCatalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+    summary_props: HashMap<String, String>,
+) -> Result<(i64, Table), BifrostError> {
     let tx = Transaction::new(table);
     let action = tx
         .fast_append()
-        .set_snapshot_properties(props)
+        .set_snapshot_properties(summary_props)
         .add_data_files(data_files);
     let tx = action.apply(tx).map_err(BifrostError::Iceberg)?;
     let committed = tx.commit(catalog).await.map_err(BifrostError::Iceberg)?;
@@ -533,8 +822,9 @@ pub async fn run_commit_with_fault(
     fault: FaultPoint,
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
+    let key = CommitKey::new(tenant, batch_id);
     let phase1 = claim_batch(
-        pool, table_uid, &batch_id, "system", "system", tenant, &table_fqn,
+        pool, table_uid, &key, "system", "system", tenant, &table_fqn,
     )
     .await?;
     let (owner, fencing_token) = match phase1 {

@@ -17,8 +17,7 @@ use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::system_columns::with_system_columns;
 use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
-use crate::writer::TableWriterHandle;
-use crate::writer::coordinator::spawn_commit_coordinator;
+use crate::writer::coordinator::{FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator};
 use wyrd_storage::settings::BackendConfig;
 
 pub mod iceberg_sql;
@@ -348,7 +347,7 @@ impl WyrdCatalog {
         name: &str,
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<TableWriterHandle, BifrostError> {
+    ) -> Result<GroupCommitHandle, BifrostError> {
         let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
         let table = self.catalog.load_table(&table_ident).await?;
         let fqn = format!("{}.{}", ns.as_str(), name);
@@ -363,18 +362,17 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_commit_coordinator(
+        let handle = spawn_group_commit_coordinator(
             table,
             self.catalog.clone(),
             self.pool.clone(),
             table_uid,
             fqn,
             scope,
-            tenant,
             Arc::clone(&self.registry),
             PayloadClass::Standard,
             &[],
-            None,
+            FlushPolicy::default(),
         );
 
         Ok(handle)
@@ -382,14 +380,13 @@ impl WyrdCatalog {
 
     /// Open a write handle for a pre-declared domain table `T`.
     ///
-    /// Carries the table's `PayloadClass`, `SENSITIVE_PAYLOAD_COLUMNS`, and
-    /// `entity_bounds_mapping` into the coordinator so redaction and best-effort
-    /// entity-time-bounds upserts fire automatically on each commit.
+    /// Carries the table's `PayloadClass` and `SENSITIVE_PAYLOAD_COLUMNS` into the
+    /// coordinator so redaction fires automatically on each commit.
     pub async fn typed_writer<T: DomainTable>(
         &self,
         scope: TableScope,
         tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<TableWriterHandle, BifrostError> {
+    ) -> Result<GroupCommitHandle, BifrostError> {
         let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
             BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
         })?;
@@ -407,18 +404,17 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_commit_coordinator(
+        let handle = spawn_group_commit_coordinator(
             table,
             self.catalog.clone(),
             self.pool.clone(),
             table_uid,
             fqn,
             scope,
-            tenant,
             Arc::clone(&self.registry),
             T::PAYLOAD_CLASS,
             T::SENSITIVE_PAYLOAD_COLUMNS,
-            T::entity_bounds_mapping(),
+            FlushPolicy::default(),
         );
 
         Ok(handle)
@@ -685,6 +681,16 @@ impl WyrdCatalog {
         Ok(())
     }
 
+    /// Borrow the optional recovery pool (`vala_recovery` SECURITY DEFINER).
+    ///
+    /// Returns `None` when no recovery pool was provisioned. Production boot
+    /// that requires the commit-recovery sweep must fail hard when this is
+    /// `None` (see `wyrd-server` `ServerBootError::RecoveryPoolRequired`).
+    #[must_use]
+    pub fn recovery_pool(&self) -> Option<&PgPool> {
+        self.recovery_pool.as_deref()
+    }
+
     /// Best-effort startup recovery pass.
     ///
     /// Claims stale `precommit` rows (lease absent/expired) via the SECURITY
@@ -742,7 +748,6 @@ impl WyrdCatalog {
             .try_into()
             .map_err(|_| BifrostError::Internal("recovery: batch_id length mismatch".into()))?;
         let fencing_token = row.fencing_token;
-        let batch_id_hex = uuid::Uuid::from_bytes(batch_id).simple().to_string();
 
         let table_ident = fqn_to_table_ident(&row.fqn)?;
 
@@ -773,14 +778,14 @@ impl WyrdCatalog {
             Ok(t) => t,
         };
 
-        let snapshot_id = find_snapshot_by_batch_id(&table, &batch_id_hex);
+        let decision = decide_recovery(&table, row.data_tenant_id, &batch_id);
 
         let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
             .await
             .map_err(BifrostError::Sql)?;
 
-        match snapshot_id {
-            Some(sid) => {
+        match decision {
+            RecoveryDecision::Committed(sid) => {
                 vala_sql::queries::olap_catalog::finalize_recovered_committed(
                     &mut conn,
                     &table_uid,
@@ -791,7 +796,7 @@ impl WyrdCatalog {
                 .await
                 .map_err(BifrostError::Sql)?;
             }
-            None => {
+            RecoveryDecision::Aborted => {
                 vala_sql::queries::olap_catalog::finalize_recovered_aborted(
                     &mut conn,
                     &table_uid,
@@ -833,15 +838,57 @@ fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
     )))
 }
 
-/// Scan an Iceberg table's snapshot history for a snapshot whose summary
-/// carries `wyrd_batch_id == batch_id_hex`. Returns the first matching
-/// `snapshot_id`, or `None` if no snapshot matches.
-fn find_snapshot_by_batch_id(table: &iceberg::table::Table, batch_id_hex: &str) -> Option<i64> {
+/// Recovery-oracle verdict for one claimed stale precommit row.
+pub(crate) enum RecoveryDecision {
+    /// A snapshot durably carries this row's commit identity — roll forward and
+    /// finalize `committed` against the discovered `snapshot_id`.
+    Committed(i64),
+    /// No snapshot carries this row's identity — the write never landed; abort.
+    Aborted,
+}
+
+/// Decide how to reconcile a claimed stale precommit row by scanning the table's
+/// snapshot history for one that durably carries the commit identity
+/// `{data_tenant_id, batch_id}`.
+///
+/// The group-commit path stamps `wyrd_commit_keys` — a JSON array with one
+/// `{"data_tenant_id","batch_id"}` object per committed key. That pair is the M02
+/// dedup identity and is AUTHORITATIVE: when a snapshot carries `wyrd_commit_keys`,
+/// recovery matches the exact pair and does NOT fall back to `wyrd_batch_id` for
+/// that snapshot. This precedence is what stops two tenants that share a
+/// `batch_id` on a `SystemShared` table from recovering each other's snapshot —
+/// matching `batch_id` alone is not enough to discriminate the data tenant.
+///
+/// A snapshot with NO `wyrd_commit_keys` is a legacy single-key snapshot; recovery
+/// falls back to matching `wyrd_batch_id` alone. (The legacy single-key write path
+/// is removed in a later slice, at which point the fallback goes with it.)
+///
+/// Both hex values are UUID simple-hex, so the pair match is an exact,
+/// escaping-free substring test against the JSON array — no JSON parser is pulled
+/// into the production library build.
+pub(crate) fn decide_recovery(
+    table: &iceberg::table::Table,
+    data_tenant_id: sqlx::types::Uuid,
+    batch_id: &[u8; 16],
+) -> RecoveryDecision {
+    let tenant_hex = data_tenant_id.simple().to_string();
+    let batch_hex = uuid::Uuid::from_bytes(*batch_id).simple().to_string();
+    let pair_needle = format!(r#"{{"data_tenant_id":"{tenant_hex}","batch_id":"{batch_hex}"}}"#);
+
     for snapshot in table.metadata().snapshots() {
         let props = &snapshot.summary().additional_properties;
-        if props.get("wyrd_batch_id").map(String::as_str) == Some(batch_id_hex) {
-            return Some(snapshot.snapshot_id());
+        match props.get("wyrd_commit_keys") {
+            Some(keys) => {
+                if keys.contains(&pair_needle) {
+                    return RecoveryDecision::Committed(snapshot.snapshot_id());
+                }
+            }
+            None => {
+                if props.get("wyrd_batch_id").map(String::as_str) == Some(batch_hex.as_str()) {
+                    return RecoveryDecision::Committed(snapshot.snapshot_id());
+                }
+            }
         }
     }
-    None
+    RecoveryDecision::Aborted
 }

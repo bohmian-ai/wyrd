@@ -365,4 +365,25 @@ pub enum BifrostError {
         remediation = "The principal lacks the payload resource permission; sensitive columns were omitted."
     )]
     PayloadForbidden,
+
+    /// The ingest writer's local buffer is full; the caller must retry.
+    ///
+    /// This is **local buffer backpressure only** — the per-physical-table
+    /// coordinator's bounded channel is saturated. It does NOT indicate a
+    /// partial success: no row from this request was written. Callers should
+    /// back off and retry the full request.
+    ///
+    /// The OTLP ingest path maps overload to a retryable `UNAVAILABLE`/`503`
+    /// response, never to `partial_success`.
+    #[error("ingest writer busy: {table}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_429_INGEST_BUSY",
+        status = 429,
+        title = "Ingest writer busy",
+        remediation = "The per-table ingest buffer is full. Back off and retry the full request — no rows were written."
+    )]
+    IngestBusy {
+        /// Fully-qualified table name whose writer buffer is saturated.
+        table: String,
+    },
 }

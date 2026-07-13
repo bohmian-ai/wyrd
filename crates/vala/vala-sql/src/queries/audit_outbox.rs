@@ -241,6 +241,66 @@ fn result_str(result: AuditResult) -> &'static str {
     }
 }
 
+/// Column values needed to recompute the SHA256 entry hash.
+///
+/// Used by the audit-seal verifier to recompute hashes from the Iceberg
+/// `audit_log` table and cross-check them against seal checkpoints. The
+/// canonical encoding is identical to the private `entry_hash` function.
+pub struct AuditEntryHashInput<'a> {
+    /// Entry hash of `seq - 1` (all-zeros for seq=1).
+    pub prev_hash: &'a [u8],
+    /// Monotonically increasing row sequence number.
+    pub seq: i64,
+    /// Unique request correlation id.
+    pub request_id: &'a str,
+    /// Optional trace id for distributed tracing.
+    pub trace_id: Option<&'a str>,
+    /// The operation name (e.g. `cards.create`).
+    pub operation: &'a str,
+    /// The resource path acted upon.
+    pub resource: &'a str,
+    /// Optional `CardRef` string for card-scoped operations.
+    pub card_ref: Option<&'a str>,
+    /// Raw 16-byte principal UUID.
+    pub principal_id_bytes: &'a [u8; 16],
+    /// The principal kind string (e.g. `user`, `service`).
+    pub principal_kind: &'a str,
+    /// The authentication method used.
+    pub auth_method: &'a str,
+    /// The permission that was checked.
+    pub permission: &'a str,
+    /// The policy decision string (`allow` / `deny`).
+    pub decision: &'a str,
+    /// The operation result string (`success` / `failure`).
+    pub result: &'a str,
+    /// Short human-readable summary of the payload.
+    pub payload_summary: &'a str,
+}
+
+/// Recompute the SHA256 entry hash from the raw stored column bytes.
+///
+/// The canonical encoding is identical to the private `entry_hash` function
+/// so this is the public re-check entry point used by the seal verifier.
+#[must_use]
+pub fn entry_hash_from_cols(input: AuditEntryHashInput<'_>) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(input.prev_hash);
+    buf.extend_from_slice(&input.seq.to_be_bytes());
+    push_str(&mut buf, input.request_id);
+    push_opt(&mut buf, input.trace_id);
+    push_str(&mut buf, input.operation);
+    push_str(&mut buf, input.resource);
+    push_opt(&mut buf, input.card_ref);
+    buf.extend_from_slice(input.principal_id_bytes);
+    push_str(&mut buf, input.principal_kind);
+    push_str(&mut buf, input.auth_method);
+    push_str(&mut buf, input.permission);
+    push_str(&mut buf, input.decision);
+    push_str(&mut buf, input.result);
+    push_str(&mut buf, input.payload_summary);
+    Sha256::digest(&buf).into()
+}
+
 /// A gap detected between consecutive `seq` values for a tenant.
 #[derive(Debug, Clone)]
 pub struct SeqGap {
@@ -354,4 +414,135 @@ pub async fn shipped_outbox_refs(
             .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
             .collect()
     })
+}
+
+/// Return (seq, entry_hash) for shipped outbox rows with `seq > after_seq`, in
+/// seq order. The seal worker uses this to seal only the unsealed tail past the
+/// last checkpoint, so repeated ticks produce contiguous, non-overlapping
+/// checkpoints instead of re-sealing the whole `[1, N]` range each pass.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn shipped_outbox_refs_after(
+    conn: &mut TenantConn<'_>,
+    after_seq: i64,
+) -> Result<Vec<ShippedOutboxRef>, SqlError> {
+    sqlx::query_as::<_, (i64, Vec<u8>)>(
+        r#"
+        SELECT seq, entry_hash
+          FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND shipped = true
+           AND seq > $1
+         ORDER BY seq
+        "#,
+    )
+    .bind(after_seq)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+    .map(|rows| {
+        rows.into_iter()
+            .map(|(seq, entry_hash)| ShippedOutboxRef { seq, entry_hash })
+            .collect()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::types::Uuid;
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::request_id::RequestId;
+
+    fn sample_event() -> AuditEvent {
+        AuditEvent {
+            request_id: RequestId::parse("01890f28-7c4a-7000-98e7-4f4a3c2d1b02")
+                .expect("static request id is valid"),
+            trace_id: Some("trace-abc".to_string()),
+            operation: "bifrost.write".to_string(),
+            resource: "ns.tbl".to_string(),
+            card_ref: None,
+            principal_id: PrincipalId::new(
+                "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"
+                    .parse::<Uuid>()
+                    .expect("static uuid is valid"),
+            ),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Internal,
+            permission: "bifrost.write".to_string(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "redacted".to_string(),
+        }
+    }
+
+    /// Build the verifier-side input mirroring how the seal verifier reconstructs
+    /// column values from the Iceberg `audit_log` row.
+    fn cols_input<'a>(
+        event: &'a AuditEvent,
+        prev: &'a [u8],
+        seq: i64,
+        pid: &'a [u8; 16],
+    ) -> AuditEntryHashInput<'a> {
+        AuditEntryHashInput {
+            prev_hash: prev,
+            seq,
+            request_id: event.request_id.as_str(),
+            trace_id: event.trace_id.as_deref(),
+            operation: &event.operation,
+            resource: &event.resource,
+            card_ref: None,
+            principal_id_bytes: pid,
+            principal_kind: event.principal_kind.as_str(),
+            auth_method: auth_method_str(event.auth_method),
+            permission: &event.permission,
+            decision: decision_str(event.decision),
+            result: result_str(event.result),
+            payload_summary: &event.payload_summary,
+        }
+    }
+
+    /// The public `entry_hash_from_cols` (used by the seal verifier) reproduces
+    /// the private writer `entry_hash` byte-for-byte. This is the parity the seal
+    /// chain relies on: the verifier recomputing from Iceberg content columns
+    /// must land on exactly the hash the writer stored.
+    #[test]
+    fn entry_hash_from_cols_reproduces_writer_hash() {
+        let event = sample_event();
+        let prev = [0u8; 32];
+        let seq = 1;
+        let pid = *event.principal_id.as_uuid().as_bytes();
+
+        let written = entry_hash(&prev, seq, &event, None);
+        let recomputed = entry_hash_from_cols(cols_input(&event, &prev, seq, &pid));
+
+        assert_eq!(
+            written, recomputed,
+            "verifier recompute must match the writer's stored entry hash"
+        );
+    }
+
+    /// Changing any content column changes the recomputed hash — the property
+    /// that makes the seal detect content tampering in the archived warehouse.
+    #[test]
+    fn entry_hash_from_cols_is_content_bound() {
+        let event = sample_event();
+        let prev = [0u8; 32];
+        let seq = 1;
+        let pid = *event.principal_id.as_uuid().as_bytes();
+
+        let base = entry_hash_from_cols(cols_input(&event, &prev, seq, &pid));
+
+        // Flip the authorization decision `allow` → `deny`: a single content
+        // column change must break the recomputed hash.
+        let mut tampered = cols_input(&event, &prev, seq, &pid);
+        tampered.decision = "deny";
+        let tampered_hash = entry_hash_from_cols(tampered);
+
+        assert_ne!(
+            base, tampered_hash,
+            "flipping the decision column must change the recomputed entry hash"
+        );
+    }
 }

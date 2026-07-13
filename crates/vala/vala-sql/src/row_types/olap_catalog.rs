@@ -135,3 +135,36 @@ pub struct RefreshEpochRow {
     /// Wall-clock time of the last bump.
     pub bumped_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// Projection candidate row from `vala.olap_projections`.
+///
+/// Loaded by the matcher to decide whether a projection is substitutable for
+/// a source table scan. Freshness fields drive the matcher decision:
+/// - LookupSet: requires `refresh_epoch == source_refresh_epoch` AND
+///   `built_for_snapshot_id` matches the current source snapshot (exact).
+/// - Rollup/MV: staleness decided by `commit_lag` versus the configured knob.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ProjectionCandidateRow {
+    /// Tenant isolation key.
+    pub data_tenant_id: Uuid,
+    /// Opaque 16-byte projection identifier.
+    pub projection_uid: Vec<u8>,
+    /// Opaque 16-byte source table identifier.
+    pub source_table_uid: Vec<u8>,
+    /// Fully-qualified projection name (`namespace.name`).
+    pub fqn: String,
+    /// Projection kind: `rollup`, `mv`, or `lookup_set`.
+    pub projection_kind: String,
+    /// Current lifecycle state.
+    pub projection_state: String,
+    /// Refresh epoch at last successful refresh.
+    pub refresh_epoch: i64,
+    /// Source table's refresh epoch at last successful refresh.
+    pub source_refresh_epoch: i64,
+    /// Iceberg snapshot id the projection was built for (identity anchor, not numeric).
+    pub built_for_snapshot_id: Option<i64>,
+    /// Commit-lag since last refresh (Rollup/MV staleness knob input).
+    pub commit_lag: i64,
+    /// F14 guard: source schema fingerprint at last refresh (32 bytes).
+    pub source_schema_fingerprint: Vec<u8>,
+}

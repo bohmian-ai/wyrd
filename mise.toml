@@ -136,6 +136,22 @@ depends = ["setup:postgres"]
 env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
+[tasks."test:bifrost:journey"]
+description = """Run the Stage-5 closeout Rust user-journey tests (marked #[ignore] so they
+stay out of the fast lane) against a live Postgres-backed WyrdTestServer. Covers the
+Bifrost read journeys J1-J8: sync/async query + cache-hit audit, presigned result fetch,
+admission floor, audit seal/verify/tamper, group-commit fan-in fairness + drain, and
+maintenance-health transitions. Companion to `py:test:integration` (Python journeys).
+"""
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = """
+cargo test --locked -p vala-sdk --test bifrost_e2e -- --ignored --test-threads=1
+cargo test --locked -p wyrd-server --test query_journey_e2e --test maintenance_journey_e2e -- --ignored --test-threads=1
+cargo test --locked -p wyrd-cli --test audit_verify_e2e -- --ignored --test-threads=1
+cargo test --locked -p wyrd-mcp --test query_tools_journey -- --ignored --test-threads=1
+"""
+
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
@@ -811,6 +827,72 @@ snapshot_codegen > "$AFTER"
 diff -u "$BEFORE" "$AFTER" \
   || { echo 'codegen drift detected - run mise run codegen:regen and commit'; exit 1; }
 """
+
+# --- Stage-5 OpenAPI + napi TypeScript pipeline -----------------------------------
+# Task shells defined ahead of implementation, mirroring `test:bifrost:journey`. They
+# are INERT until their owning slice lands the code: `codegen:openapi` needs the
+# `wyrd-server` `gen_openapi` example (slice 06c); every `ts:*` task needs the napi
+# bindings + package roots (slice 13a). Two separate pnpm packages under `typescript/`
+# glued by `typescript/pnpm-workspace.yaml`: public `@wyrd/sdk` (`typescript/wyrd`,
+# built from `crates/bindings/wyrd-node`) and private `@wyrd/testing`
+# (`typescript/testing`, built from `crates/bindings/wyrd-node-testing`, test-tier).
+# One napi addon per package so the harness never overwrites the SDK's generated
+# loader/`.d.ts`. 06c wires `codegen:openapi` into `codegen:regen`; 13a adds
+# `ts:napi:check`/`ts:typecheck`/`ts:test:unit` to `pre-pr`; `ts:test:integration`
+# runs in the closeout journey lane.
+[tasks."codegen:openapi"]
+description = "Emit openapi.yaml from wyrd-server WyrdApiDoc (slice 06c; wired into codegen:regen). Requires utoipa 'yaml' feature on wyrd-server."
+# Emit to a temp file and move on success so a build/emit failure cannot truncate the
+# committed openapi.yaml to empty.
+run = "cargo run --locked -p wyrd-server --example gen_openapi > openapi.yaml.tmp && mv openapi.yaml.tmp openapi.yaml"
+
+[tasks."ts:install"]
+hide = true
+description = "Install the typescript/ pnpm workspace (@wyrd/sdk + @wyrd/testing) from the frozen lockfile (slice 13a)"
+dir = "typescript"
+run = "pnpm install --frozen-lockfile"
+
+[tasks."ts:build"]
+description = "Build the public @wyrd/sdk napi addon (crates/bindings/wyrd-node) + emit index.d.ts into typescript/wyrd (slice 13a)"
+depends = ["ts:install"]
+dir = "typescript/wyrd"
+run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml"
+
+[tasks."ts:build:testing"]
+description = "Build the private @wyrd/testing napi harness addon (crates/bindings/wyrd-node-testing) into typescript/testing; feeds the integration lane only (slice 13a)"
+depends = ["ts:install"]
+dir = "typescript/testing"
+run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node-testing/Cargo.toml"
+
+[tasks."ts:napi:check"]
+description = "Fail if the public @wyrd/sdk napi-generated index.d.ts is not committed/current (slice 13a; Node analogue of .pyi drift). Scoped to the SDK declaration, not the harness."
+depends = ["ts:build"]
+dir = "typescript/wyrd"
+run = "git diff --exit-code -- index.d.ts || { echo 'napi .d.ts drift - run mise run ts:build and commit typescript/wyrd/index.d.ts'; exit 1; }"
+
+[tasks."ts:typecheck"]
+description = "Typecheck @wyrd/sdk incl. integration sources that resolve the local @wyrd/testing workspace dep (slice 13a)"
+depends = ["ts:build", "ts:build:testing"]
+dir = "typescript/wyrd"
+run = "pnpm exec tsc --noEmit"
+
+[tasks."ts:test:unit"]
+description = "@wyrd/sdk unit tests: auth-parity + an error-set native {value,error} envelope makes unwrapNative throw instanceof WyrdError (hand-authored TS class) exposing code/status/title/detail as properties, not parsed from message (slice 13a)"
+depends = ["ts:build"]
+dir = "typescript/wyrd"
+run = "pnpm exec vitest run tests/unit"
+
+[tasks."ts:test:integration"]
+description = """@wyrd/sdk client->server->client Bifrost journey (slice 13/13a).
+Builds the public @wyrd/sdk addon and the private @wyrd/testing harness addon, then runs
+Vitest, which boots WyrdTestServer IN-PROCESS (embedded Postgres, seeded tenant, minted key)
+via the @wyrd/testing native harness and drives @wyrd/sdk against it, tearing down via
+shutdown() in finally — symmetric with the Python journey. No external Postgres, no
+out-of-process server, no shell orchestration.
+"""
+depends = ["ts:build", "ts:build:testing"]
+dir = "typescript/wyrd"
+run = "pnpm exec vitest run tests/integration"
 
 [tasks."check:single-into-response-impl"]
 hide = true

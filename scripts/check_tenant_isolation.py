@@ -51,6 +51,24 @@ VALA_RELAY_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/relay.rs",
 }
 
+# Vala query modules that manage cross-tenant control-plane state (maintenance
+# leases) via the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Lease keys are
+# global and carry no tenant column, so these functions take `&OperatorPool`
+# rather than a tenant-scoped `TenantConn`. Isolation is a DB-role boundary, not
+# RLS — same posture as VALA_RELAY_ALLOWLIST. Must take PgPool/OperatorPool.
+VALA_OPERATOR_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
+}
+
+# Vala tables that are intentionally cross-tenant control-plane surfaces with no
+# tenant column and NO RLS (accessed only via the OperatorPool). They are
+# exempt from the RLS-triple requirement because there is no `data_tenant_id`
+# column to scope. Keep this set narrow and every entry justified by a
+# control-plane migration.
+VALA_NON_RLS_CONTROL_TABLES = {
+    "vala.maintenance_leases",
+}
+
 RAW_QUERY_ALLOWLIST_MARKERS = [
     "Dynamic query is intentional",
     "raw-query grep allowlist",
@@ -105,6 +123,8 @@ def check_rls_triples(failures: list[str]) -> None:
             sql = strip_sql_line_comments(path.read_text())
             for table, window in tenant_table_windows(sql, schema):
                 qualified = f"{schema}.{table}"
+                if qualified in VALA_NON_RLS_CONTROL_TABLES:
+                    continue
                 normalized_window = normalize_sql(window)
                 table_patterns = [
                     rf"alter\s+table\s+{re.escape(qualified)}\s+enable\s+row\s+level\s+security",
@@ -231,6 +251,11 @@ def check_vala_query_modules(failures: list[str]) -> None:
         if relative in VALA_RELAY_ALLOWLIST:
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(f"{relative}: relay public async fn must take PgPool or Transaction")
+            continue
+
+        if relative in VALA_OPERATOR_ALLOWLIST:
+            if has_public_async_fn(code) and not has_platform_executor(code):
+                failures.append(f"{relative}: operator public async fn must take PgPool or OperatorPool")
             continue
 
         check_tenant_query_file(relative, body, code, failures)
@@ -400,7 +425,7 @@ def public_async_fns(code: str) -> list[tuple[str, str]]:
 
 
 def has_platform_executor(code: str) -> bool:
-    return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_", code) is not None
+    return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_|&\s*OperatorPool\b", code) is not None
 
 
 def has_raw_query_marker(body: str) -> bool:

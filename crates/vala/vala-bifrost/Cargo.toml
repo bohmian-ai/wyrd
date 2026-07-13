@@ -16,9 +16,10 @@ default = []
 bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile", "dep:serde_json"]
 
 [dependencies]
-wyrd-spec    = { workspace = true }
-wyrd-storage = { workspace = true }
-vala-sql     = { path = "../vala-sql", version = "0.0.1" }
+wyrd-spec       = { workspace = true }
+wyrd-storage    = { workspace = true }
+wyrd-auth-issue = { workspace = true }
+vala-sql        = { path = "../vala-sql", version = "0.0.1" }
 
 iceberg                 = { workspace = true }
 iceberg-catalog-sql     = { workspace = true }

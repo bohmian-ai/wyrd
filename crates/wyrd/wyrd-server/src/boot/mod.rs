@@ -983,9 +983,11 @@ pub fn spawn_genai_derivation_worker(
     let catalog = Arc::clone(&state.bifrost);
     let pool = state.postgres.vala_pool().clone();
 
-    Some(vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
-        catalog, pool, op, shutdown,
-    ))
+    Some(
+        vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
+            catalog, pool, op, shutdown,
+        ),
+    )
 }
 
 /// Ensure the recovery pool is present in production deployments.

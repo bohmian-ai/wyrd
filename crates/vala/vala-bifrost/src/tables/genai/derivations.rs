@@ -262,6 +262,33 @@ fn classify(operation: &str) -> GenAiKind {
     }
 }
 
+/// Attribute-column reader that tolerates both `Utf8` and `Utf8View`.
+///
+/// The `attributes` column is declared `Utf8View` in the table schema
+/// (`SpansTable`), but Parquet has no `Utf8View` physical type — round-tripping
+/// through Iceberg storage surfaces it as `Utf8` on read. Support both so the
+/// derivation runs on freshly-committed-and-scanned data.
+enum AttributesArray<'a> {
+    View(&'a StringViewArray),
+    Utf8(&'a StringArray),
+}
+
+impl AttributesArray<'_> {
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            AttributesArray::View(a) => a.is_null(i),
+            AttributesArray::Utf8(a) => a.is_null(i),
+        }
+    }
+
+    fn value(&self, i: usize) -> &str {
+        match self {
+            AttributesArray::View(a) => a.value(i),
+            AttributesArray::Utf8(a) => a.value(i),
+        }
+    }
+}
+
 /// The physical span columns the derivation reads. Downcast once per batch.
 struct SpanColumns<'a> {
     trace_id: &'a FixedSizeBinaryArray,
@@ -272,7 +299,7 @@ struct SpanColumns<'a> {
     duration_ms: &'a Int64Array,
     status: &'a StringArray,
     service_name: &'a StringArray,
-    attributes: Option<&'a StringViewArray>,
+    attributes: Option<AttributesArray<'a>>,
     data_tenant_id: &'a StringArray,
 }
 
@@ -287,7 +314,7 @@ impl<'a> SpanColumns<'a> {
             duration_ms: int64(batch, "duration_ms")?,
             status: string(batch, "status")?,
             service_name: string(batch, "service_name")?,
-            attributes: str_view_opt(batch, "attributes"),
+            attributes: attributes_col(batch),
             data_tenant_id: string(batch, DATA_TENANT_ID)?,
         })
     }
@@ -302,7 +329,7 @@ impl<'a> SpanColumns<'a> {
     }
 
     fn attributes(&self, i: usize) -> Option<serde_json::Map<String, serde_json::Value>> {
-        let arr = self.attributes?;
+        let arr = self.attributes.as_ref()?;
         if arr.is_null(i) {
             return None;
         }
@@ -1047,10 +1074,14 @@ fn string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, Bif
         .ok_or_else(|| BifrostError::Internal(format!("spans {name} not Utf8")))
 }
 
-fn str_view_opt<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringViewArray> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
+fn attributes_col(batch: &RecordBatch) -> Option<AttributesArray<'_>> {
+    let col = batch.column_by_name("attributes")?;
+    if let Some(view) = col.as_any().downcast_ref::<StringViewArray>() {
+        return Some(AttributesArray::View(view));
+    }
+    col.as_any()
+        .downcast_ref::<StringArray>()
+        .map(AttributesArray::Utf8)
 }
 
 // ── column builders (write side) ─────────────────────────────────────────────

@@ -119,10 +119,7 @@ mod pg_tests {
         request
     }
 
-    async fn query_genai_rows(
-        channel: &Channel,
-        jwt: &str,
-    ) -> Vec<wyrd_tonic::wyrd::v1::GenAiRow> {
+    async fn query_genai_rows(channel: &Channel, jwt: &str) -> Vec<wyrd_tonic::wyrd::v1::GenAiRow> {
         let mut query = ValaQueryServiceClient::new(channel.clone());
         query
             .query_gen_ai(with_token(

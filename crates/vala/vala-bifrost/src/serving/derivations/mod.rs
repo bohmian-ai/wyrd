@@ -24,7 +24,7 @@ use crate::writer::CommitEvent;
 /// Fallback poll cadence for the background genai derivation worker.
 ///
 /// The derivation worker is now the ONLY derivation path. It is driven
-/// primarily by PostgreSQL `NOTIFY` wakeups on the `vala_commits` channel,
+/// primarily by `PostgreSQL` `NOTIFY` wakeups on the `vala_commits` channel,
 /// emitted immediately after each committed source span batch. This periodic
 /// tick is the fallback for missed notifications (listener disconnected, server
 /// restarted before a `NOTIFY` was processed) and crash recovery (spans
@@ -141,6 +141,38 @@ pub fn spawn_genai_derivation_worker(
             }
         }
     })
+}
+
+/// Run one full derivation pass NOW.
+///
+/// Test-only seam: real fallback recovery relies on the 60-second `tokio::time`
+/// sleep in [`spawn_genai_derivation_worker`], which cannot be virtualized
+/// reliably in a test that also drives real Postgres/Iceberg I/O. Rather than
+/// wait 60 real seconds, journey tests call this helper directly to prove
+/// "worker tick materialises the missed source batch" against the same runtime
+/// the background worker uses.
+///
+/// Production callers still go through [`spawn_genai_derivation_worker`]; this
+/// entry point does no leasing, listens to no NOTIFY, and never runs on its
+/// own cadence.
+///
+/// # Errors
+/// Returns [`BifrostError`] when table UID loading, source enumeration, or a
+/// target write fails.
+pub async fn run_genai_derivation_tick(
+    catalog: Arc<WyrdCatalog>,
+    pool: sqlx::PgPool,
+    op: vala_sql::OperatorPool,
+) -> Result<(), BifrostError> {
+    let uids = runtime::TableUids::load(&catalog).await?;
+    let rt = runtime::DerivationRuntime {
+        catalog,
+        pool,
+        op,
+        uids,
+        derivation: GenAiFromSpans,
+    };
+    rt.run_tick().await
 }
 
 /// Initialise the [`GenAiFromSpans`] derivation in `vala.olap_derivations`

@@ -459,7 +459,10 @@ mod tests {
                 wyrd_spec::error::WyrdError::Vala {
                     error: BifrostError::WriterUnavailable { table },
                 } => {
-                    assert_eq!(table, expected_table, "signal {signal:?} must name its own table");
+                    assert_eq!(
+                        table, expected_table,
+                        "signal {signal:?} must name its own table"
+                    );
                 }
                 other => panic!("expected WriterUnavailable, got {other:?}"),
             }
@@ -498,7 +501,10 @@ mod tests {
                 wyrd_spec::error::WyrdError::Vala {
                     error: BifrostError::OtlpRequestMalformed { table, .. },
                 } => {
-                    assert_eq!(table, "vala.traces.spans", "{label}: must name the traces table");
+                    assert_eq!(
+                        table, "vala.traces.spans",
+                        "{label}: must name the traces table"
+                    );
                 }
                 other => panic!("{label}: expected OtlpRequestMalformed, got {other:?}"),
             }
@@ -524,8 +530,10 @@ mod tests {
 
     #[test]
     fn metrics_decode_error_names_metrics_table() {
-        let wyrd_err =
-            ingest_error_to_wyrd(IngestError::Decode("bad bytes".to_owned()), OtlpSignal::Metrics);
+        let wyrd_err = ingest_error_to_wyrd(
+            IngestError::Decode("bad bytes".to_owned()),
+            OtlpSignal::Metrics,
+        );
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },
@@ -538,8 +546,10 @@ mod tests {
 
     #[test]
     fn logs_decode_error_names_logs_table() {
-        let wyrd_err =
-            ingest_error_to_wyrd(IngestError::Decode("bad bytes".to_owned()), OtlpSignal::Logs);
+        let wyrd_err = ingest_error_to_wyrd(
+            IngestError::Decode("bad bytes".to_owned()),
+            OtlpSignal::Logs,
+        );
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
                 error: BifrostError::OtlpRequestMalformed { table, .. },

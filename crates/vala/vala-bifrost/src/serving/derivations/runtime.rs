@@ -94,6 +94,16 @@ pub(super) struct DerivationRuntime {
     pub derivation: GenAiFromSpans,
 }
 
+/// Open group-commit handles for every genai target table. Held together so
+/// [`process_tenant`](DerivationRuntime::process_tenant) can pass them into
+/// [`process_batches`](DerivationRuntime::process_batches) as one bundle.
+struct TargetHandles {
+    messages: crate::writer::coordinator::GroupCommitHandle,
+    embeddings: crate::writer::coordinator::GroupCommitHandle,
+    tool_calls: crate::writer::coordinator::GroupCommitHandle,
+    memory: crate::writer::coordinator::GroupCommitHandle,
+}
+
 impl DerivationRuntime {
     /// Enumerate tenants with committed source data and run a derivation pass
     /// for each. Per-tenant errors are logged but do not abort other tenants.
@@ -118,60 +128,12 @@ impl DerivationRuntime {
     }
 
     async fn process_tenant(&self, tenant: DataTenantId) -> Result<(), BifrostError> {
-        let derivation_uid = GenAiFromSpans::DERIVATION_UID;
-        let derivation_uid_bytes: [u8; 16] = *derivation_uid.as_bytes();
+        let derivation_uid_bytes: [u8; 16] = *GenAiFromSpans::DERIVATION_UID.as_bytes();
 
-        // ── 1. Upsert derivation registration (idempotent) ────────────────
-        {
-            let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-                .await
-                .map_err(BifrostError::Sql)?;
-            vala_sql::queries::olap_derivations::insert_derivation(
-                &mut conn,
-                &derivation_uid_bytes,
-                &self.uids.source,
-                // target_table_uid: use messages as the "primary" target for
-                // registration; the derivation emits to multiple targets but
-                // `olap_derivations` tracks watermark per (source, derivation_uid).
-                &self.uids.messages,
-                Uuid::nil(), // control_bind: nil for system derivations
-                "genai_from_spans",
-                None,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-        }
-
-        // ── 2. Resolve pin (COALESCE(watermark, registered_watermark)) ───
-        let pin = {
-            let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-                .await
-                .map_err(BifrostError::Sql)?;
-            let pin = vala_sql::queries::olap_derivations::select_derivation_pin(
-                &mut conn,
-                &derivation_uid_bytes,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-            pin
-        };
-
-        // ── 3. Enumerate committed source batches for this tenant ─────────
-        let all_batches = {
-            let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-                .await
-                .map_err(BifrostError::Sql)?;
-            let batches = vala_sql::queries::olap_derivations::list_tenant_committed_batches(
-                &mut conn,
-                &self.uids.source,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-            batches
-        };
+        self.register_derivation(tenant, &derivation_uid_bytes)
+            .await?;
+        let pin = self.load_pin(tenant, &derivation_uid_bytes).await?;
+        let all_batches = self.load_committed_batches(tenant).await?;
 
         // Filter to batches strictly after the watermark pin (or all batches
         // when pin is None = derive from the beginning).
@@ -180,85 +142,38 @@ impl DerivationRuntime {
             return Ok(());
         }
 
-        // ── 4. Mark derivation as in-progress ────────────────────────────
-        {
-            let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-                .await
-                .map_err(BifrostError::Sql)?;
-            vala_sql::queries::olap_derivations::mark_deriving(&mut conn, &derivation_uid_bytes)
-                .await
-                .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
-        }
+        self.mark_deriving_tx(tenant, &derivation_uid_bytes).await?;
 
-        // ── 5. Open target writers (one coordinator per target table) ─────
-        let messages_handle = self
-            .catalog
-            .typed_writer::<MessagesTable>(TableScope::SystemShared, tenant)
-            .await?;
-        let embeddings_handle = self
-            .catalog
-            .typed_writer::<EmbeddingsTable>(TableScope::SystemShared, tenant)
-            .await?;
-        let tool_calls_handle = self
-            .catalog
-            .typed_writer::<ToolCallsTable>(TableScope::SystemShared, tenant)
-            .await?;
-        let memory_handle = self
-            .catalog
-            .typed_writer::<MemoryTable>(TableScope::SystemShared, tenant)
-            .await?;
-
+        let handles = self.open_target_writers(tenant).await?;
         let batch_result = self
             .process_batches(
                 tenant,
                 &unprocessed,
-                &messages_handle,
-                &embeddings_handle,
-                &tool_calls_handle,
-                &memory_handle,
+                &handles.messages,
+                &handles.embeddings,
+                &handles.tool_calls,
+                &handles.memory,
             )
             .await;
 
-        // ── 7. Extract the last fully-completed batch and any failure ─────
-        //
         // `process_batches` returns the last batch_id that was FULLY written
-        // (all targets) plus any error that stopped the loop. We advance the
+        // (all targets) plus any error that stopped the loop. Advance the
         // watermark to the last successful batch even when an error occurred —
-        // that is safe because those batches completed. Then, if an error
-        // occurred, mark the derivation failed and propagate.
+        // those batches completed. Then, if an error occurred, mark the
+        // derivation failed and propagate.
         let (last_batch_id, batch_err) = match batch_result {
             Ok(last) => (last, None),
             Err((last, err)) => (last, Some(err)),
         };
 
-        // ── 8. Advance watermark to last FULLY-completed batch ────────────
         if let Some(wm) = last_batch_id {
-            let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-                .await
-                .map_err(BifrostError::Sql)?;
-            vala_sql::queries::olap_derivations::advance_watermark(
-                &mut conn,
-                &derivation_uid_bytes,
-                &wm,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
-            conn.commit().await.map_err(BifrostError::Sql)?;
+            self.advance_watermark_tx(tenant, &derivation_uid_bytes, &wm)
+                .await?;
         }
 
-        // ── 9. On failure: persist failed state, then surface the error ───
         if let Some(err) = batch_err {
-            // Best-effort: if marking failed itself errors we still propagate
-            // the original batch error so the caller sees a real failure.
-            if let Ok(mut conn) = vala_sql::TenantConn::acquire(&self.pool, tenant).await {
-                let _ = vala_sql::queries::olap_derivations::mark_failed(
-                    &mut conn,
-                    &derivation_uid_bytes,
-                )
+            self.mark_failed_best_effort(tenant, &derivation_uid_bytes)
                 .await;
-                let _ = conn.commit().await;
-            }
             tracing::error!(
                 tenant = %tenant,
                 error = %err,
@@ -268,6 +183,131 @@ impl DerivationRuntime {
         }
 
         Ok(())
+    }
+
+    async fn register_derivation(
+        &self,
+        tenant: DataTenantId,
+        derivation_uid_bytes: &[u8; 16],
+    ) -> Result<(), BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        vala_sql::queries::olap_derivations::insert_derivation(
+            &mut conn,
+            derivation_uid_bytes,
+            &self.uids.source,
+            // target_table_uid: use messages as the "primary" target for
+            // registration; the derivation emits to multiple targets but
+            // `olap_derivations` tracks watermark per (source, derivation_uid).
+            &self.uids.messages,
+            Uuid::nil(),
+            "genai_from_spans",
+            None,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)
+    }
+
+    async fn load_pin(
+        &self,
+        tenant: DataTenantId,
+        derivation_uid_bytes: &[u8; 16],
+    ) -> Result<Option<Option<Vec<u8>>>, BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let pin = vala_sql::queries::olap_derivations::select_derivation_pin(
+            &mut conn,
+            derivation_uid_bytes,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        Ok(pin)
+    }
+
+    async fn load_committed_batches(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Vec<vala_sql::queries::olap_derivations::CommittedSourceBatch>, BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        let batches = vala_sql::queries::olap_derivations::list_tenant_committed_batches(
+            &mut conn,
+            &self.uids.source,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)?;
+        Ok(batches)
+    }
+
+    async fn mark_deriving_tx(
+        &self,
+        tenant: DataTenantId,
+        derivation_uid_bytes: &[u8; 16],
+    ) -> Result<(), BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        vala_sql::queries::olap_derivations::mark_deriving(&mut conn, derivation_uid_bytes)
+            .await
+            .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)
+    }
+
+    async fn advance_watermark_tx(
+        &self,
+        tenant: DataTenantId,
+        derivation_uid_bytes: &[u8; 16],
+        wm: &[u8; 16],
+    ) -> Result<(), BifrostError> {
+        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
+            .await
+            .map_err(BifrostError::Sql)?;
+        vala_sql::queries::olap_derivations::advance_watermark(&mut conn, derivation_uid_bytes, wm)
+            .await
+            .map_err(BifrostError::Sql)?;
+        conn.commit().await.map_err(BifrostError::Sql)
+    }
+
+    /// Best-effort `mark_failed`: if marking failed itself errors we still let the
+    /// caller propagate the original batch error, so the caller sees a real
+    /// failure. The watermark stays where it was.
+    async fn mark_failed_best_effort(&self, tenant: DataTenantId, derivation_uid_bytes: &[u8; 16]) {
+        if let Ok(mut conn) = vala_sql::TenantConn::acquire(&self.pool, tenant).await {
+            let _ =
+                vala_sql::queries::olap_derivations::mark_failed(&mut conn, derivation_uid_bytes)
+                    .await;
+            let _ = conn.commit().await;
+        }
+    }
+
+    async fn open_target_writers(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<TargetHandles, BifrostError> {
+        Ok(TargetHandles {
+            messages: self
+                .catalog
+                .typed_writer::<MessagesTable>(TableScope::SystemShared, tenant)
+                .await?,
+            embeddings: self
+                .catalog
+                .typed_writer::<EmbeddingsTable>(TableScope::SystemShared, tenant)
+                .await?,
+            tool_calls: self
+                .catalog
+                .typed_writer::<ToolCallsTable>(TableScope::SystemShared, tenant)
+                .await?,
+            memory: self
+                .catalog
+                .typed_writer::<MemoryTable>(TableScope::SystemShared, tenant)
+                .await?,
+        })
     }
 
     /// Process all unprocessed source batches for `tenant`.
@@ -283,7 +323,7 @@ impl DerivationRuntime {
     /// target write for that batch returns `Ok`. On failure the last fully-
     /// completed batch id is returned so partial progress is preserved.
     ///
-    /// Fix 2 (no chunk loss): DataFusion may split one logical source batch across
+    /// Fix 2 (no chunk loss): `DataFusion` may split one logical source batch across
     /// multiple physical `RecordBatch` chunks. We concatenate them into a single
     /// batch before calling `derive`, so one deterministic `derived_batch_id` per
     /// (source batch, target) covers all rows.
@@ -299,16 +339,12 @@ impl DerivationRuntime {
         let mut last_completed: Option<[u8; 16]> = None;
 
         for batch in batches {
-            let batch_id: [u8; 16] = batch
-                .batch_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    (
-                        last_completed,
-                        BifrostError::Internal("source batch_id length mismatch".to_string()),
-                    )
-                })?;
+            let batch_id: [u8; 16] = batch.batch_id.as_slice().try_into().map_err(|_| {
+                (
+                    last_completed,
+                    BifrostError::Internal("source batch_id length mismatch".to_string()),
+                )
+            })?;
 
             // ── Scan: collect all physical chunks for this source batch ───
             let chunks = self
@@ -320,7 +356,7 @@ impl DerivationRuntime {
             // An empty scan (0 chunks, or chunks with 0 rows total) means this
             // source batch produced no derived rows. Advance the watermark across
             // it — it was fully "processed" — but skip writing any target commit.
-            let total_rows: usize = chunks.iter().map(|c| c.num_rows()).sum();
+            let total_rows: usize = chunks.iter().map(RecordBatch::num_rows).sum();
             if total_rows == 0 {
                 last_completed = Some(batch_id);
                 continue;

@@ -351,6 +351,10 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::IngestBusy {
             table: String::new(),
         },
+        BifrostError::OtlpRequestMalformed {
+            table: String::new(),
+            detail: String::new(),
+        },
     ];
 
     if let Some(sentinel) = variants.first() {
@@ -384,7 +388,8 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::PageSnapshotExpired
             | BifrostError::QueryForbidden
             | BifrostError::PayloadForbidden
-            | BifrostError::IngestBusy { .. } => {}
+            | BifrostError::IngestBusy { .. }
+            | BifrostError::OtlpRequestMalformed { .. } => {}
         }
     }
 

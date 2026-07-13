@@ -20,7 +20,6 @@ pub mod map;
 
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use vala_bifrost::tables::logs::RecordsTable;
 use vala_bifrost::tables::metrics::PointsTable;
 use vala_bifrost::tables::traces::SpansTable;

@@ -13,14 +13,23 @@ mod pg_tests {
     mod audit_seal {
         use std::sync::Arc;
 
+        use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
         use sqlx::PgPool;
         use tempfile::TempDir;
         use uuid::Uuid;
+        use vala_bifrost::TableScope;
         use vala_bifrost::catalog::WyrdCatalog;
-        use vala_bifrost::relay::AuditRelay;
+        use vala_bifrost::catalog::namespaces::BifrostNamespace;
+        use vala_bifrost::relay::{AUDIT_LOG_TABLE, AuditRelay};
         use vala_bifrost::serving::audit_seal::verify::{VerifyOutcome, verify_checkpoint_walk};
-        use vala_bifrost::serving::audit_seal::worker::seal_shipped_range;
+        use vala_bifrost::serving::audit_seal::worker::{compute_range_hash, seal_shipped_range};
+        use vala_bifrost::writer::BifrostWriteContext;
         use vala_sql::TenantConn;
+        use vala_sql::queries::audit_outbox::{
+            AuditEntryHashInput, ShippedOutboxRef, entry_hash_from_cols,
+        };
+        use vala_sql::queries::audit_seal::upsert_checkpoint;
         use wyrd_auth_issue::AuditSealKey;
         use wyrd_dev_fixtures::pg::PgFixture;
         use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
@@ -164,6 +173,191 @@ mod pg_tests {
                 VerifyOutcome::Gap,
                 "shipped rows beyond the sealed range must surface as a gap"
             );
+        }
+
+        /// Tamper detection is load-bearing on *content*, not the stored hash.
+        ///
+        /// This writes a warehouse `audit_log` row whose content column
+        /// (`decision`) is tampered while its stored `entry_hash` column stays
+        /// the honest hash of the *original* content, then seals a checkpoint
+        /// over that honest hash. The verifier ignores the stored `entry_hash`
+        /// and recomputes each hash from the content columns, so it must catch
+        /// the divergence and return `Tampered`. A verifier that regressed to
+        /// trusting the stored `entry_hash` (the prior fraud) would report
+        /// `Clean` here — this test would then fail, which is the point.
+        #[tokio::test]
+        async fn verify_reports_tampered_when_content_diverges_from_stored_hash() {
+            let fx = setup().await;
+            let key = AuditSealKey::generate().expect("key generates");
+            let tenant = DataTenantId::new_v7();
+            fx.db
+                .seed_additional_tenant_with_uuid(
+                    tenant,
+                    &format!("seal-{}", tenant.as_uuid().simple()),
+                )
+                .await
+                .unwrap();
+
+            // Original (honest) content for seq 1. The stored entry_hash column
+            // will carry the hash of THIS content; only `decision` is tampered
+            // in the warehouse row below.
+            let seq: i64 = 1;
+            let prev_hash = [0u8; 32];
+            let request_id = Uuid::now_v7().to_string();
+            let operation = "op-0";
+            let resource = "vala.bifrost.thing";
+            let principal_id = Uuid::now_v7();
+            let principal_kind = "user";
+            let auth_method = "internal";
+            let permission = "bifrost.record_write";
+            let honest_decision = "allow";
+            let tampered_decision = "deny";
+            let result = "success";
+            let payload_summary = "op-0";
+
+            let honest_hash = entry_hash_from_cols(AuditEntryHashInput {
+                prev_hash: &prev_hash,
+                seq,
+                request_id: &request_id,
+                trace_id: None,
+                operation,
+                resource,
+                card_ref: None,
+                principal_id_bytes: principal_id.as_bytes(),
+                principal_kind,
+                auth_method,
+                permission,
+                decision: honest_decision,
+                result,
+                payload_summary,
+            });
+
+            // Warehouse row: honest stored entry_hash, tampered `decision`.
+            let batch = audit_log_row_batch(AuditRowCols {
+                seq,
+                entry_hash_hex: &hex::encode(honest_hash),
+                prev_hash_hex: &hex::encode(prev_hash),
+                request_id: &request_id,
+                operation,
+                resource,
+                principal_id: &principal_id.to_string(),
+                principal_kind,
+                auth_method,
+                permission,
+                decision: tampered_decision,
+                result,
+                payload_summary,
+            });
+
+            let writer = fx
+                .catalog
+                .writer(
+                    BifrostNamespace::System,
+                    AUDIT_LOG_TABLE,
+                    TableScope::SystemShared,
+                    tenant,
+                )
+                .await
+                .unwrap();
+            let ctx = BifrostWriteContext {
+                batch_id: *Uuid::now_v7().as_bytes(),
+                // "audit-relay" origin skips the C5 audit self-append (M-11), so
+                // this direct write does not recursively append an audit row.
+                origin: "audit-relay".to_owned(),
+                actor: "audit-relay".to_owned(),
+                request_id: RequestId::now_v7(),
+                card_ref: None,
+            };
+            writer.commit_one(tenant, vec![batch], ctx).await.unwrap();
+
+            // Seal [1,1] over the HONEST hash (what the outbox would have signed).
+            let range_hash = compute_range_hash(
+                seq,
+                seq,
+                &[ShippedOutboxRef {
+                    seq,
+                    entry_hash: honest_hash.to_vec(),
+                }],
+            );
+            let signature = key.sign(&range_hash);
+            let mut conn = TenantConn::acquire(&fx.pool, tenant).await.unwrap();
+            upsert_checkpoint(&mut conn, seq, seq, &range_hash, &signature)
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+
+            let verified = verify_checkpoint_walk(&fx.pool, &fx.catalog, &key, tenant)
+                .await
+                .unwrap();
+            assert_eq!(
+                verified,
+                VerifyOutcome::Tampered {
+                    seq_lo: seq,
+                    seq_hi: seq
+                },
+                "recompute-from-content must catch a tampered content column even \
+                 when the stored entry_hash column is left honest"
+            );
+        }
+
+        /// Column values for one `vala.system.audit_log` warehouse row.
+        struct AuditRowCols<'a> {
+            seq: i64,
+            entry_hash_hex: &'a str,
+            prev_hash_hex: &'a str,
+            request_id: &'a str,
+            operation: &'a str,
+            resource: &'a str,
+            principal_id: &'a str,
+            principal_kind: &'a str,
+            auth_method: &'a str,
+            permission: &'a str,
+            decision: &'a str,
+            result: &'a str,
+            payload_summary: &'a str,
+        }
+
+        /// Build the 16 content-column Arrow batch for one audit_log row. Mirrors
+        /// the relay's `build_audit_log_batch`; the writer stamps the 4 Bifrost
+        /// system columns at flush. `trace_id`/`audit_card_ref` are null.
+        fn audit_log_row_batch(c: AuditRowCols<'_>) -> RecordBatch {
+            let fields = vec![
+                Field::new("seq", DataType::Int64, false),
+                Field::new("entry_hash", DataType::Utf8, false),
+                Field::new("prev_hash", DataType::Utf8, false),
+                Field::new("request_id", DataType::Utf8, false),
+                Field::new("trace_id", DataType::Utf8, true),
+                Field::new("operation", DataType::Utf8, false),
+                Field::new("resource", DataType::Utf8, false),
+                Field::new("audit_card_ref", DataType::Utf8, true),
+                Field::new("principal_id", DataType::Utf8, false),
+                Field::new("principal_kind", DataType::Utf8, false),
+                Field::new("auth_method", DataType::Utf8, false),
+                Field::new("permission", DataType::Utf8, false),
+                Field::new("decision", DataType::Utf8, false),
+                Field::new("result", DataType::Utf8, false),
+                Field::new("payload_summary", DataType::Utf8, false),
+                Field::new("created_at_us", DataType::Int64, false),
+            ];
+            let columns: Vec<ArrayRef> = vec![
+                Arc::new(Int64Array::from(vec![c.seq])),
+                Arc::new(StringArray::from(vec![c.entry_hash_hex])),
+                Arc::new(StringArray::from(vec![c.prev_hash_hex])),
+                Arc::new(StringArray::from(vec![c.request_id])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![c.operation])),
+                Arc::new(StringArray::from(vec![c.resource])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec![c.principal_id])),
+                Arc::new(StringArray::from(vec![c.principal_kind])),
+                Arc::new(StringArray::from(vec![c.auth_method])),
+                Arc::new(StringArray::from(vec![c.permission])),
+                Arc::new(StringArray::from(vec![c.decision])),
+                Arc::new(StringArray::from(vec![c.result])),
+                Arc::new(StringArray::from(vec![c.payload_summary])),
+                Arc::new(Int64Array::from(vec![0i64])),
+            ];
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("audit row batch")
         }
     }
 }

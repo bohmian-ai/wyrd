@@ -26,7 +26,7 @@ CREATE TABLE vala.audit_seal_checkpoints (
 ALTER TABLE vala.audit_seal_checkpoints ENABLE ROW LEVEL SECURITY;
 ALTER TABLE vala.audit_seal_checkpoints FORCE  ROW LEVEL SECURITY;
 
-CREATE POLICY audit_seal_checkpoints_tenant
+CREATE POLICY tenant_isolation
     ON vala.audit_seal_checkpoints
     USING      (data_tenant_id = wyrd.current_tenant())
     WITH CHECK (data_tenant_id = wyrd.current_tenant());

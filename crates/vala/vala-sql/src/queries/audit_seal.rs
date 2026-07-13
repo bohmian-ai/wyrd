@@ -59,6 +59,29 @@ pub async fn upsert_checkpoint(
     Ok(())
 }
 
+/// Return the highest `seq_hi` already sealed for the current tenant, or `None`
+/// when the tenant has no checkpoints yet.
+///
+/// The seal worker uses this as the exclusive lower bound of the next range so
+/// each tick seals only the unsealed tail `(latest_sealed_seq_hi, current]`
+/// instead of re-sealing `[1, N]` and accumulating overlapping checkpoints.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
+pub async fn latest_sealed_seq_hi(conn: &mut TenantConn<'_>) -> Result<Option<i64>, SqlError> {
+    let row: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT max(seq_hi)
+          FROM vala.audit_seal_checkpoints
+         WHERE data_tenant_id = wyrd.current_tenant()
+        "#,
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(row)
+}
+
 /// Load all seal checkpoints for the current tenant, ordered by `seq_lo`.
 ///
 /// # Errors

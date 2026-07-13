@@ -167,9 +167,8 @@ pub(crate) struct ClaimedRow {
     pub table_uid: Vec<u8>,
     pub batch_id: Vec<u8>,
     pub fencing_token: i64,
-    // fqn is retained for tracing/debugging context even though it is not
-    // directly read in the recovery logic.
-    #[allow(dead_code)]
+    // fqn is the authoritative table identity for the recovery oracle
+    // (`oracle_check` resolves the table via `split_fqn`).
     pub fqn: String,
     pub namespace: String,
     pub name: String,
@@ -184,9 +183,25 @@ async fn claim_stale_precommits(
     limit: i32,
 ) -> Result<Vec<ClaimedRow>, SqlError> {
     // Dynamic query is intentional: the SECURITY DEFINER routine is called via
-    // the recovery pool; no TenantConn is possible here.
-    let rows = sqlx::query_as::<_, (Uuid, Vec<u8>, Vec<u8>, i64, String, String, String, String)>(
-        "SELECT data_tenant_id, table_uid, batch_id, fencing_token, fqn, namespace, name, scope \
+    // the recovery pool; no TenantConn is possible here. The routine returns
+    // recovery_attempts directly (for stuck detection) — the recovery role is
+    // NOT BYPASSRLS, so a separate SELECT on vala.olap_commits would trip RLS.
+    let rows = sqlx::query_as::<
+        _,
+        (
+            Uuid,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            i32,
+        ),
+    >(
+        "SELECT data_tenant_id, table_uid, batch_id, fencing_token, fqn, namespace, name, scope, \
+         recovery_attempts \
          FROM vala.claim_stale_precommits($1, $2)",
     )
     .bind(owner)
@@ -195,52 +210,66 @@ async fn claim_stale_precommits(
     .await
     .map_err(SqlError::from)?;
 
-    // Also fetch recovery_attempts for stuck detection. claim_stale_precommits
-    // does not return it; fetch it as a separate query on the recovery pool.
-    let mut claimed = Vec::with_capacity(rows.len());
-    for (data_tenant_id, table_uid, batch_id, fencing_token, fqn, namespace, name, scope) in rows {
-        // Dynamic query is intentional: cross-tenant BYPASSRLS recovery pool.
-        let attempts: i32 = sqlx::query_scalar(
-            "SELECT COALESCE(recovery_attempts, 0) FROM vala.olap_commits \
-             WHERE table_uid = $1 AND batch_id = $2",
+    let claimed = rows
+        .into_iter()
+        .map(
+            |(
+                data_tenant_id,
+                table_uid,
+                batch_id,
+                fencing_token,
+                fqn,
+                namespace,
+                name,
+                scope,
+                recovery_attempts,
+            )| ClaimedRow {
+                data_tenant_id,
+                table_uid,
+                batch_id,
+                fencing_token,
+                fqn,
+                namespace,
+                name,
+                scope,
+                recovery_attempts,
+            },
         )
-        .bind(&table_uid)
-        .bind(&batch_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(SqlError::from)?
-        .unwrap_or(0);
-
-        claimed.push(ClaimedRow {
-            data_tenant_id,
-            table_uid,
-            batch_id,
-            fencing_token,
-            fqn,
-            namespace,
-            name,
-            scope,
-            recovery_attempts: attempts,
-        });
-    }
+        .collect();
 
     Ok(claimed)
 }
 
 /// Check the Iceberg catalog to determine whether the batch was committed.
-/// Returns `Some(snapshot_id)` when a matching snapshot is found, `None` when
-/// the batch's data is absent from the catalog.
+///
+/// Decides by scanning the table's snapshot history for one that durably carries
+/// this row's `{data_tenant_id, batch_id}` commit identity (the same
+/// pair-membership oracle the startup reconcile uses via
+/// [`crate::catalog::decide_recovery`]). Returns `Some(snapshot_id)` for the
+/// snapshot that carries the pair, `None` when no snapshot carries it (the write
+/// never landed) or the table is absent from the catalog.
+///
+/// Deciding on `current_snapshot_id()` alone would be a silent lost-write bug: a
+/// precommit that crashed before its `fast_append` would be finalized `committed`
+/// against an unrelated later snapshot, and the client's idempotent retry would
+/// then dedup and write nothing.
 async fn oracle_check(
     catalog: &WyrdCatalog,
     row: &ClaimedRow,
 ) -> Result<Option<i64>, crate::error::BifrostError> {
     use crate::catalog::namespaces::BifrostNamespace;
+    use crate::catalog::{RecoveryDecision, decide_recovery};
     use crate::types::TableScope;
 
-    let ns = BifrostNamespace::from_domain_namespace(&row.namespace).ok_or_else(|| {
+    // Resolve the table from the full FQN. The claim query's `split_part`
+    // namespace/name columns are unreliable for the dotted Bifrost namespaces
+    // (e.g. "vala.bifrost" → split_part yields "vala"/"bifrost", not the real
+    // table name); `split_fqn` strips the known namespace prefix correctly,
+    // mirroring the startup reconcile's fqn-based resolution.
+    let (ns, table_name) = BifrostNamespace::split_fqn(&row.fqn).ok_or_else(|| {
         crate::error::BifrostError::Internal(format!(
-            "recovery oracle: unknown namespace {:?}",
-            row.namespace
+            "recovery oracle: unparseable fqn {:?}",
+            row.fqn
         ))
     })?;
 
@@ -258,17 +287,24 @@ async fn oracle_check(
         ))
     })?;
 
+    let batch_id: [u8; 16] = row.batch_id.as_slice().try_into().map_err(|_| {
+        crate::error::BifrostError::Internal(format!(
+            "recovery oracle: batch_id length mismatch for {:?}",
+            row.fqn
+        ))
+    })?;
+
     // Two-step: resolve using scope.control_bind(tenant) to find the registration,
-    // then load the Iceberg table to inspect current snapshot.
+    // then decide by commit-key membership against the loaded Iceberg table.
     let meta = catalog
-        .get(ns, &row.name, scope.control_bind(tenant_id))
+        .get(ns, &table_name, scope.control_bind(tenant_id))
         .await;
 
     match meta {
-        Ok(meta) => {
-            let snapshot_id = meta.iceberg_table.metadata().current_snapshot_id();
-            Ok(snapshot_id)
-        }
+        Ok(meta) => match decide_recovery(&meta.iceberg_table, row.data_tenant_id, &batch_id) {
+            RecoveryDecision::Committed(snapshot_id) => Ok(Some(snapshot_id)),
+            RecoveryDecision::Aborted => Ok(None),
+        },
         Err(crate::error::BifrostError::TableNotFound(_)) => Ok(None),
         Err(other) => Err(other),
     }

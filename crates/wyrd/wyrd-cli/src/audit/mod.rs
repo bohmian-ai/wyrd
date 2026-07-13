@@ -11,7 +11,7 @@ use crate::error::WyrdCliError;
 /// Audit subcommands.
 #[derive(Debug, Subcommand)]
 pub enum AuditCommand {
-    /// Verify all audit seal checkpoints for a tenant (POST /v1/admin/audit/verify).
+    /// Verify all audit seal checkpoints for the token's own tenant (POST /v1/admin/audit/verify).
     Verify(verify::AuditVerifyArgs),
 }
 

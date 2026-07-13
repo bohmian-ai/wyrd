@@ -455,14 +455,8 @@ impl MessageRow {
                 attrs,
                 "gen_ai.usage.cache_creation_input_tokens",
             ),
-            usage_cache_read_input_tokens: attr_i64(
-                attrs,
-                "gen_ai.usage.cache_read_input_tokens",
-            ),
-            usage_reasoning_output_tokens: attr_i64(
-                attrs,
-                "gen_ai.usage.reasoning_output_tokens",
-            ),
+            usage_cache_read_input_tokens: attr_i64(attrs, "gen_ai.usage.cache_read_input_tokens"),
+            usage_reasoning_output_tokens: attr_i64(attrs, "gen_ai.usage.reasoning_output_tokens"),
             output_type: attr_str(attrs, "gen_ai.output.type"),
             request_reasoning_level: attr_str(attrs, "gen_ai.request.reasoning.level"),
             conversation_compacted: attr_bool(attrs, "gen_ai.conversation.compacted"),
@@ -529,6 +523,16 @@ impl MessageRow {
     }
 
     fn to_batch(rows: &[Self]) -> Result<RecordBatch, BifrostError> {
+        let mut columns = Self::base_columns(rows);
+        columns.extend(Self::request_columns(rows));
+        columns.extend(Self::usage_columns(rows));
+        columns.extend(Self::metadata_columns(rows));
+
+        RecordBatch::try_new(Self::schema(), columns)
+            .map_err(|e| BifrostError::Internal(format!("build genai.messages batch: {e}")))
+    }
+
+    fn base_columns(rows: &[Self]) -> Vec<Arc<dyn Array>> {
         let trace_id = fixed_bin16_col(rows.iter().map(|r| r.base.trace_id));
         let span_id = fixed_bin8_col(rows.iter().map(|r| Some(r.base.span_id)));
         let parent_span_id = fixed_bin8_col(rows.iter().map(|r| r.base.parent_span_id));
@@ -547,16 +551,35 @@ impl MessageRow {
         let response_id = str_col(rows.iter().map(|r| r.response_id.clone()));
         let response_finish_reasons =
             str_view_col(rows.iter().map(|r| r.response_finish_reasons.clone()));
+
+        vec![
+            trace_id,
+            span_id,
+            parent_span_id,
+            start_time,
+            end_time,
+            duration_ms,
+            status,
+            service_name,
+            provider_name,
+            operation_name,
+            request_model,
+            response_model,
+            conversation_id,
+            response_id,
+            response_finish_reasons,
+        ]
+    }
+
+    fn request_columns(rows: &[Self]) -> Vec<Arc<dyn Array>> {
         let response_time_to_first_chunk_seconds =
             f64_col(rows.iter().map(|r| r.response_time_to_first_chunk_seconds));
         let request_temperature = f64_col(rows.iter().map(|r| r.request_temperature));
         let request_top_p = f64_col(rows.iter().map(|r| r.request_top_p));
         let request_top_k = i64_col(rows.iter().map(|r| r.request_top_k));
         let request_max_tokens = i64_col(rows.iter().map(|r| r.request_max_tokens));
-        let request_frequency_penalty =
-            f64_col(rows.iter().map(|r| r.request_frequency_penalty));
-        let request_presence_penalty =
-            f64_col(rows.iter().map(|r| r.request_presence_penalty));
+        let request_frequency_penalty = f64_col(rows.iter().map(|r| r.request_frequency_penalty));
+        let request_presence_penalty = f64_col(rows.iter().map(|r| r.request_presence_penalty));
         let request_seed = i64_col(rows.iter().map(|r| r.request_seed));
         let request_choice_count = i64_col(rows.iter().map(|r| r.request_choice_count));
         let request_stop_sequences =
@@ -564,6 +587,24 @@ impl MessageRow {
         let request_stream = bool_col(rows.iter().map(|r| r.request_stream));
         let request_encoding_formats =
             str_view_col(rows.iter().map(|r| r.request_encoding_formats.clone()));
+
+        vec![
+            response_time_to_first_chunk_seconds,
+            request_temperature,
+            request_top_p,
+            request_top_k,
+            request_max_tokens,
+            request_frequency_penalty,
+            request_presence_penalty,
+            request_seed,
+            request_choice_count,
+            request_stop_sequences,
+            request_stream,
+            request_encoding_formats,
+        ]
+    }
+
+    fn usage_columns(rows: &[Self]) -> Vec<Arc<dyn Array>> {
         let usage_input_tokens = i64_col(rows.iter().map(|r| r.usage_input_tokens));
         let usage_output_tokens = i64_col(rows.iter().map(|r| r.usage_output_tokens));
         let usage_cache_creation_input_tokens =
@@ -572,72 +613,48 @@ impl MessageRow {
             i64_col(rows.iter().map(|r| r.usage_cache_read_input_tokens));
         let usage_reasoning_output_tokens =
             i64_col(rows.iter().map(|r| r.usage_reasoning_output_tokens));
+
+        vec![
+            usage_input_tokens,
+            usage_output_tokens,
+            usage_cache_creation_input_tokens,
+            usage_cache_read_input_tokens,
+            usage_reasoning_output_tokens,
+        ]
+    }
+
+    fn metadata_columns(rows: &[Self]) -> Vec<Arc<dyn Array>> {
         let output_type = str_col(rows.iter().map(|r| r.output_type.clone()));
         let request_reasoning_level =
             str_col(rows.iter().map(|r| r.request_reasoning_level.clone()));
         let conversation_compacted = bool_col(rows.iter().map(|r| r.conversation_compacted));
         let input_messages = str_view_col(rows.iter().map(|r| r.input_messages.clone()));
         let output_messages = str_view_col(rows.iter().map(|r| r.output_messages.clone()));
-        let system_instructions =
-            str_view_col(rows.iter().map(|r| r.system_instructions.clone()));
+        let system_instructions = str_view_col(rows.iter().map(|r| r.system_instructions.clone()));
         let openai_api_type = str_col(rows.iter().map(|r| r.openai_api_type.clone()));
         let openai_request_service_tier =
             str_col(rows.iter().map(|r| r.openai_request_service_tier.clone()));
         let openai_response_service_tier =
             str_col(rows.iter().map(|r| r.openai_response_service_tier.clone()));
-        let openai_response_system_fingerprint =
-            str_col(rows.iter().map(|r| r.openai_response_system_fingerprint.clone()));
+        let openai_response_system_fingerprint = str_col(
+            rows.iter()
+                .map(|r| r.openai_response_system_fingerprint.clone()),
+        );
         let error_type = str_col(rows.iter().map(|r| r.error_type.clone()));
 
-        RecordBatch::try_new(
-            Self::schema(),
-            vec![
-                trace_id,
-                span_id,
-                parent_span_id,
-                start_time,
-                end_time,
-                duration_ms,
-                status,
-                service_name,
-                provider_name,
-                operation_name,
-                request_model,
-                response_model,
-                conversation_id,
-                response_id,
-                response_finish_reasons,
-                response_time_to_first_chunk_seconds,
-                request_temperature,
-                request_top_p,
-                request_top_k,
-                request_max_tokens,
-                request_frequency_penalty,
-                request_presence_penalty,
-                request_seed,
-                request_choice_count,
-                request_stop_sequences,
-                request_stream,
-                request_encoding_formats,
-                usage_input_tokens,
-                usage_output_tokens,
-                usage_cache_creation_input_tokens,
-                usage_cache_read_input_tokens,
-                usage_reasoning_output_tokens,
-                output_type,
-                request_reasoning_level,
-                conversation_compacted,
-                input_messages,
-                output_messages,
-                system_instructions,
-                openai_api_type,
-                openai_request_service_tier,
-                openai_response_service_tier,
-                openai_response_system_fingerprint,
-                error_type,
-            ],
-        )
-        .map_err(|e| BifrostError::Internal(format!("build genai.messages batch: {e}")))
+        vec![
+            output_type,
+            request_reasoning_level,
+            conversation_compacted,
+            input_messages,
+            output_messages,
+            system_instructions,
+            openai_api_type,
+            openai_request_service_tier,
+            openai_response_service_tier,
+            openai_response_system_fingerprint,
+            error_type,
+        ]
     }
 }
 

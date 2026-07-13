@@ -17,7 +17,10 @@ use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::system_columns::with_system_columns;
 use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
-use crate::writer::coordinator::{FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator};
+use crate::writer::PostgresCommitNotifier;
+use crate::writer::coordinator::{
+    FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator_with_notifier,
+};
 use wyrd_storage::settings::BackendConfig;
 
 pub mod iceberg_sql;
@@ -362,7 +365,7 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_group_commit_coordinator(
+        let handle = spawn_group_commit_coordinator_with_notifier(
             table,
             self.catalog.clone(),
             self.pool.clone(),
@@ -370,6 +373,9 @@ impl WyrdCatalog {
             fqn,
             scope,
             Arc::clone(&self.registry),
+            Arc::new(PostgresCommitNotifier {
+                pool: (*self.pool).clone(),
+            }),
             PayloadClass::Standard,
             &[],
             FlushPolicy::default(),
@@ -404,7 +410,7 @@ impl WyrdCatalog {
                 .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
         );
 
-        let handle = spawn_group_commit_coordinator(
+        let handle = spawn_group_commit_coordinator_with_notifier(
             table,
             self.catalog.clone(),
             self.pool.clone(),
@@ -412,6 +418,9 @@ impl WyrdCatalog {
             fqn,
             scope,
             Arc::clone(&self.registry),
+            Arc::new(PostgresCommitNotifier {
+                pool: (*self.pool).clone(),
+            }),
             T::PAYLOAD_CLASS,
             T::SENSITIVE_PAYLOAD_COLUMNS,
             FlushPolicy::default(),

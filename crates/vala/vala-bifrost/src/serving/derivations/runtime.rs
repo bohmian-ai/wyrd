@@ -25,6 +25,15 @@ use crate::tables::traces::SpansTable;
 use crate::types::TableScope;
 use crate::writer::BifrostWriteContext;
 
+fn table_uid_from_row(
+    row: &vala_sql::row_types::olap_catalog::BifrostTableRow,
+) -> Result<[u8; 16], BifrostError> {
+    row.table_uid
+        .as_slice()
+        .try_into()
+        .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))
+}
+
 /// Pre-fetched table UIDs for the genai derivation.
 ///
 /// Initialised once at worker startup from the catalog SQL registry. UIDs are
@@ -61,19 +70,12 @@ impl TableUids {
             .get(BifrostNamespace::GenAi, MemoryTable::NAME, owner)
             .await?;
 
-        fn uid(row: &vala_sql::row_types::olap_catalog::BifrostTableRow) -> Result<[u8; 16], BifrostError> {
-            row.table_uid
-                .as_slice()
-                .try_into()
-                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))
-        }
-
         Ok(Self {
-            source: uid(&src.row)?,
-            messages: uid(&msg.row)?,
-            embeddings: uid(&emb.row)?,
-            tool_calls: uid(&tc.row)?,
-            memory: uid(&mem.row)?,
+            source: table_uid_from_row(&src.row)?,
+            messages: table_uid_from_row(&msg.row)?,
+            embeddings: table_uid_from_row(&emb.row)?,
+            tool_calls: table_uid_from_row(&tc.row)?,
+            memory: table_uid_from_row(&mem.row)?,
         })
     }
 }
@@ -94,13 +96,12 @@ impl DerivationRuntime {
     /// Enumerate tenants with committed source data and run a derivation pass
     /// for each. Per-tenant errors are logged but do not abort other tenants.
     pub(super) async fn run_tick(&self) -> Result<(), BifrostError> {
-        let tenant_uuids =
-            vala_sql::queries::olap_derivations::list_source_commit_tenants(
-                &self.op,
-                &self.uids.source,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
+        let tenant_uuids = vala_sql::queries::olap_derivations::list_source_commit_tenants(
+            &self.op,
+            &self.uids.source,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
 
         for raw_uuid in tenant_uuids {
             let Ok(tenant) = DataTenantId::try_from(raw_uuid) else {
@@ -172,7 +173,7 @@ impl DerivationRuntime {
 
         // Filter to batches strictly after the watermark pin (or all batches
         // when pin is None = derive from the beginning).
-        let unprocessed = filter_after_pin(all_batches, &pin);
+        let unprocessed = filter_after_pin(all_batches, pin.as_ref());
         if unprocessed.is_empty() {
             return Ok(());
         }
@@ -182,12 +183,9 @@ impl DerivationRuntime {
             let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
                 .await
                 .map_err(BifrostError::Sql)?;
-            vala_sql::queries::olap_derivations::mark_deriving(
-                &mut conn,
-                &derivation_uid_bytes,
-            )
-            .await
-            .map_err(BifrostError::Sql)?;
+            vala_sql::queries::olap_derivations::mark_deriving(&mut conn, &derivation_uid_bytes)
+                .await
+                .map_err(BifrostError::Sql)?;
             conn.commit().await.map_err(BifrostError::Sql)?;
         }
 
@@ -209,67 +207,16 @@ impl DerivationRuntime {
             .typed_writer::<MemoryTable>(TableScope::SystemShared, tenant)
             .await?;
 
-        let mut last_batch_id: Option<[u8; 16]> = None;
-
-        // ── 6. Process each unprocessed source batch ──────────────────────
-        for batch in &unprocessed {
-            let batch_id_arr: [u8; 16] = batch
-                .batch_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| BifrostError::Internal("source batch_id length mismatch".to_string()))?;
-
-            let source_records = self.scan_source_batch(tenant, &batch_id_arr).await?;
-            for source_record in &source_records {
-                let derived_batches = self
-                    .derivation
-                    .derive(source_record, batch_id_arr)
-                    .map_err(|e| {
-                        BifrostError::Internal(format!("genai derivation failed: {e}"))
-                    })?;
-
-                for db in derived_batches {
-                    let target_uid = target_uid_for(
-                        db.target_name,
-                        &self.uids,
-                    );
-                    let derived_batch_id = GenAiFromSpans::derived_batch_id(
-                        &target_uid,
-                        &self.uids.source,
-                        &batch_id_arr,
-                    );
-                    let ctx = BifrostWriteContext {
-                        batch_id: derived_batch_id,
-                        origin: "derivation:genai".to_owned(),
-                        actor: "system".to_owned(),
-                        request_id: wyrd_spec::request_id::RequestId::now_v7(),
-                        card_ref: None,
-                    };
-
-                    let handle = match db.target_name {
-                        MessagesTable::NAME => &messages_handle,
-                        EmbeddingsTable::NAME => &embeddings_handle,
-                        ToolCallsTable::NAME => &tool_calls_handle,
-                        MemoryTable::NAME => &memory_handle,
-                        other => {
-                            tracing::warn!(target = other, "derivation: unknown target table — skipped");
-                            continue;
-                        }
-                    };
-
-                    if let Err(e) = handle.write(tenant, vec![db.batch], ctx).await {
-                        tracing::error!(
-                            target = db.target_name,
-                            tenant = %tenant,
-                            error = %e,
-                            "derivation: target write failed"
-                        );
-                    }
-                }
-            }
-
-            last_batch_id = Some(batch_id_arr);
-        }
+        let last_batch_id = self
+            .process_batches(
+                tenant,
+                &unprocessed,
+                &messages_handle,
+                &embeddings_handle,
+                &tool_calls_handle,
+                &memory_handle,
+            )
+            .await?;
 
         // ── 7. Advance watermark to last processed batch ──────────────────
         if let Some(wm) = last_batch_id {
@@ -289,10 +236,71 @@ impl DerivationRuntime {
         Ok(())
     }
 
+    async fn process_batches(
+        &self,
+        tenant: DataTenantId,
+        batches: &[vala_sql::queries::olap_derivations::CommittedSourceBatch],
+        messages_handle: &crate::writer::coordinator::GroupCommitHandle,
+        embeddings_handle: &crate::writer::coordinator::GroupCommitHandle,
+        tool_calls_handle: &crate::writer::coordinator::GroupCommitHandle,
+        memory_handle: &crate::writer::coordinator::GroupCommitHandle,
+    ) -> Result<Option<[u8; 16]>, BifrostError> {
+        let mut last_batch_id = None;
+        for batch in batches {
+            let batch_id: [u8; 16] = batch.batch_id.as_slice().try_into().map_err(|_| {
+                BifrostError::Internal("source batch_id length mismatch".to_string())
+            })?;
+            let source_records = self.scan_source_batch(tenant, &batch_id).await?;
+            for source_record in &source_records {
+                for db in self
+                    .derivation
+                    .derive(source_record, batch_id)
+                    .map_err(|e| BifrostError::Internal(format!("genai derivation failed: {e}")))?
+                {
+                    let target_uid = target_uid_for(db.target_name, &self.uids);
+                    let ctx = BifrostWriteContext {
+                        batch_id: GenAiFromSpans::derived_batch_id(
+                            &target_uid,
+                            &self.uids.source,
+                            &batch_id,
+                        ),
+                        origin: "derivation:genai".to_owned(),
+                        actor: "system".to_owned(),
+                        request_id: wyrd_spec::request_id::RequestId::now_v7(),
+                        card_ref: None,
+                    };
+                    let handle = match db.target_name {
+                        MessagesTable::NAME => messages_handle,
+                        EmbeddingsTable::NAME => embeddings_handle,
+                        ToolCallsTable::NAME => tool_calls_handle,
+                        MemoryTable::NAME => memory_handle,
+                        other => {
+                            tracing::warn!(
+                                target = other,
+                                "derivation: unknown target table — skipped"
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(error) = handle.write(tenant, vec![db.batch], ctx).await {
+                        tracing::error!(
+                            target = db.target_name,
+                            tenant = %tenant,
+                            error = %error,
+                            "derivation: target write failed"
+                        );
+                    }
+                }
+            }
+            last_batch_id = Some(batch_id);
+        }
+        Ok(last_batch_id)
+    }
+
     /// Scan `traces.spans` for one `wyrd_batch_id` and one tenant.
     ///
     /// Registers the table in a per-call `SessionContext` (tenant-filtered by
-    /// `TenantPredicateRule`) then issues a DataFusion `filter` on the binary
+    /// `TenantPredicateRule`) then issues a `DataFusion` `filter` on the binary
     /// `wyrd_batch_id` column. Returns the collected `RecordBatch`es.
     async fn scan_source_batch(
         &self,
@@ -310,11 +318,8 @@ impl DerivationRuntime {
         };
 
         let ctx = wyrd_session_context(tenant);
-        ctx.register_table(
-            TableReference::bare(SpansTable::NAME),
-            Arc::new(provider),
-        )
-        .map_err(|e| BifrostError::Internal(e.to_string()))?;
+        ctx.register_table(TableReference::bare(SpansTable::NAME), Arc::new(provider))
+            .map_err(|e| BifrostError::Internal(e.to_string()))?;
 
         let batch_id_scalar = ScalarValue::FixedSizeBinary(16, Some(batch_id.to_vec()));
         let filter_expr = col("wyrd_batch_id").eq(lit(batch_id_scalar));
@@ -353,7 +358,7 @@ fn target_uid_for(target_name: &str, uids: &TableUids) -> [u8; 16] {
 /// `wm`; return only those after it.
 fn filter_after_pin(
     batches: Vec<vala_sql::queries::olap_derivations::CommittedSourceBatch>,
-    pin: &Option<Option<Vec<u8>>>,
+    pin: Option<&Option<Vec<u8>>>,
 ) -> Vec<vala_sql::queries::olap_derivations::CommittedSourceBatch> {
     match pin {
         // No pin yet — derive everything from the beginning.

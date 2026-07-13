@@ -13,11 +13,13 @@ mod runtime;
 use std::sync::Arc;
 use std::time::Duration;
 
+use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
 use crate::tables::genai::{DomainDerivation, GenAiFromSpans};
+use crate::writer::CommitEvent;
 
 /// Repair-worker poll cadence for the background genai derivation worker.
 ///
@@ -31,8 +33,8 @@ pub const FALLBACK_CADENCE_SECS: u64 = 60;
 ///
 /// Returns `None` when the operator pool (BYPASSRLS) is unavailable — cross-
 /// tenant tenant enumeration requires it. Otherwise spawns a tokio task that
-/// runs [`DerivationRuntime::run_tick`] on each `FALLBACK_CADENCE` tick
-/// (replacing the NOTIFY-based wake path that lands in Task G).
+/// runs [`DerivationRuntime::run_tick`] on commit notifications and each
+/// `FALLBACK_CADENCE` tick for crash recovery.
 ///
 /// The worker logs per-tenant errors but never panics: a single-tenant failure
 /// does not block other tenants or shut down the worker.
@@ -54,8 +56,28 @@ pub fn spawn_genai_derivation_worker(
                 }
             }
             tokio::select! {
-                _ = shutdown.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+            }
+        };
+
+        let mut listener = match PgListener::connect_with(&pool).await {
+            Ok(mut listener) => match listener.listen("vala_commits").await {
+                Ok(()) => Some(listener),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "genai derivation worker: commit listener setup failed; using fallback only"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "genai derivation worker: commit listener connection failed; using fallback only"
+                );
+                None
             }
         };
 
@@ -68,16 +90,51 @@ pub fn spawn_genai_derivation_worker(
         };
 
         loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {}
+            if let Some(active_listener) = listener.as_mut() {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
+                        if let Err(e) = rt.run_tick().await {
+                            tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+                        }
+                    }
+                    notification = active_listener.recv() => {
+                        match notification {
+                            Ok(notification) => {
+                                let Ok(CommitEvent::SpanCommitted { table_uid, .. }) =
+                                    serde_json::from_str::<CommitEvent>(notification.payload())
+                                else {
+                                    continue;
+                                };
+                                if table_uid != rt.uids.source {
+                                    continue;
+                                }
+                                if let Err(e) = rt.run_tick().await {
+                                    tracing::error!(error = %e, "genai derivation worker: notification tick failed");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    error = %error,
+                                    "genai derivation worker: commit listener receive failed; using fallback only"
+                                );
+                                listener = None;
+                            }
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(FALLBACK_CADENCE_SECS)) => {
+                        if let Err(e) = rt.run_tick().await {
+                            tracing::error!(error = %e, "genai derivation worker: fallback tick failed");
+                        }
+                    }
+                }
             }
             if shutdown.is_cancelled() {
                 break;
-            }
-
-            if let Err(e) = rt.run_tick().await {
-                tracing::error!(error = %e, "genai derivation worker: tick failed");
             }
         }
     })

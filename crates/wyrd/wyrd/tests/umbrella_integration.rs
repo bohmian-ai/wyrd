@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use skald_observer;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,

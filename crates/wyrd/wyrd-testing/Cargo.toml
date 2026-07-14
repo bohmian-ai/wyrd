@@ -17,6 +17,7 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 http = { workspace = true }
+opendal = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -34,6 +35,7 @@ tower = { workspace = true, features = ["util"] }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
+vala-bifrost-redux = { workspace = true, features = ["scribe-inspect"] }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }

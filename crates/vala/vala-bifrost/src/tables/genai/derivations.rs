@@ -1476,7 +1476,7 @@ mod tests {
         .expect("spans batch")
     }
 
-    /// A DataFusion scan of one logical source batch can return multiple
+    /// A `DataFusion` scan of one logical source batch can return multiple
     /// physical `RecordBatch` chunks. `process_batches` concatenates them with
     /// `arrow::compute::concat_batches` and calls `derive` exactly once per
     /// source batch, then writes each target with the deterministic

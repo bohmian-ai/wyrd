@@ -387,6 +387,20 @@ pub enum BifrostError {
         table: String,
     },
 
+    /// The WAL disk is full and cannot accept additional writes.
+    ///
+    /// This is a capacity error at the Scribe WAL layer. The operator must expand
+    /// WAL storage capacity or trigger a seal to free space. No rows from this
+    /// request were written.
+    #[error("WAL disk full")]
+    #[wyrd_error(
+        code = "WYRD_VALA_507_WAL_DISK_FULL",
+        status = 507,
+        title = "WAL disk full",
+        remediation = "The Scribe WAL disk is at capacity. Expand storage or wait for seal to free space, then retry."
+    )]
+    WalDiskFull,
+
     /// The OTLP request body was malformed and could not be decoded.
     ///
     /// Covers both protobuf decode failures and JSON parse errors on the

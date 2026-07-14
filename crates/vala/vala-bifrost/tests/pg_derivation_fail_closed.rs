@@ -122,7 +122,7 @@ mod pg_tests {
         }
     }
 
-    /// mark_failed never touches the watermark: not on a NULL watermark
+    /// `mark_failed` never touches the watermark: not on a NULL watermark
     /// (first-batch failure) and not on a live watermark (later-batch failure).
     #[tokio::test]
     async fn mark_failed_does_not_move_watermark() {

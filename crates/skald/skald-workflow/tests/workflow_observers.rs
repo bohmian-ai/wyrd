@@ -3,7 +3,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use skald_agent::{Agent, Observer};
-use skald_observer;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};

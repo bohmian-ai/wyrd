@@ -67,6 +67,7 @@ VALA_OPERATOR_ALLOWLIST = {
 # control-plane migration.
 VALA_NON_RLS_CONTROL_TABLES = {
     "vala.maintenance_leases",
+    "vala.cluster_nodes",  # cluster-level node registry, not tenant data
 }
 
 RAW_QUERY_ALLOWLIST_MARKERS = [

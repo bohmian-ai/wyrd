@@ -1432,6 +1432,190 @@ mod tests {
         assert_eq!(top_k.value(0), 8);
     }
 
+    /// Build a one-row `traces.spans` batch with a caller-controlled `span_id`
+    /// so a multi-row batch can be constructed by concatenation without
+    /// producing duplicate span identifiers (which downstream dedup would
+    /// collapse).
+    fn spans_batch_with_span_id(
+        tenant: DataTenantId,
+        span_id: [u8; 8],
+        attributes: &serde_json::Value,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            fields::fixed_binary("trace_id", 16, false),
+            fields::fixed_binary("span_id", 8, false),
+            fields::fixed_binary("parent_span_id", 8, true),
+            fields::utf8("name", false),
+            fields::utf8("kind", false),
+            fields::ts_us_utc("start_time", false),
+            fields::ts_us_utc("end_time", false),
+            fields::int64("duration_ms", false),
+            fields::utf8("status", false),
+            fields::utf8_view("attributes", true),
+            fields::utf8("service_name", false),
+            fields::utf8(DATA_TENANT_ID, false),
+        ]));
+        let trace = fixed_bin16_col(std::iter::once([7u8; 16]));
+        let span = fixed_bin8_col(std::iter::once(Some(span_id)));
+        let parent = fixed_bin8_col(std::iter::once(None));
+        let name = str_col(std::iter::once(Some("chat".to_owned())));
+        let kind = str_col(std::iter::once(Some("client".to_owned())));
+        let start = ts_col(std::iter::once(1_000i64));
+        let end = ts_col(std::iter::once(2_000i64));
+        let dur = Arc::new(Int64Array::from_iter_values(std::iter::once(1i64))) as Arc<dyn Array>;
+        let status = str_col(std::iter::once(Some("ok".to_owned())));
+        let attrs = str_view_col(std::iter::once(Some(attributes.to_string())));
+        let service = str_col(std::iter::once(Some("svc".to_owned())));
+        let tid = str_col(std::iter::once(Some(tenant.to_string())));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                trace, span, parent, name, kind, start, end, dur, status, attrs, service, tid,
+            ],
+        )
+        .expect("spans batch")
+    }
+
+    /// A DataFusion scan of one logical source batch can return multiple
+    /// physical `RecordBatch` chunks. `process_batches` concatenates them with
+    /// `arrow::compute::concat_batches` and calls `derive` exactly once per
+    /// source batch, then writes each target with the deterministic
+    /// `derived_batch_id = f(target, source, source_batch_id)`. This test
+    /// concatenates a chunked source and asserts every row survives:
+    /// row counts per target match the row counts in the chunks.
+    #[test]
+    fn genai_derive_over_concatenated_chunks_preserves_every_row() {
+        use arrow::compute::concat_batches;
+
+        let tenant = DataTenantId::new_v7();
+        // 12 spans split across 3 target kinds: 4 chat -> messages,
+        // 4 embeddings -> embeddings, 4 execute_tool -> tool_calls.
+        // Every span carries a distinct span_id so no downstream dedup can
+        // collapse rows accidentally.
+        let mut per_row: Vec<RecordBatch> = Vec::with_capacity(12);
+        for i in 0..12u8 {
+            let op = match i % 3 {
+                0 => "chat",
+                1 => "embeddings",
+                _ => "execute_tool",
+            };
+            let mut attrs = serde_json::json!({
+                "gen_ai.provider.name": "openai",
+                "gen_ai.operation.name": op,
+                "gen_ai.request.model": "gpt-4o",
+            });
+            if op == "execute_tool" {
+                attrs.as_object_mut()
+                    .unwrap()
+                    .insert("gen_ai.tool.name".to_owned(), serde_json::json!("search"));
+            }
+            per_row.push(spans_batch_with_span_id(
+                tenant,
+                [i + 1; 8],
+                &attrs,
+            ));
+        }
+        let schema = per_row[0].schema();
+
+        // Physical scan shape: 3 chunks of 4 rows each. Mirrors DataFusion
+        // splitting a scan into multiple RecordBatches per source batch.
+        let chunk_a = concat_batches(&schema, &per_row[0..4]).expect("chunk a");
+        let chunk_b = concat_batches(&schema, &per_row[4..8]).expect("chunk b");
+        let chunk_c = concat_batches(&schema, &per_row[8..12]).expect("chunk c");
+        let chunks = [chunk_a, chunk_b, chunk_c];
+
+        // Concat physical chunks into one logical batch, then one derive call.
+        let logical = concat_batches(&schema, &chunks).expect("concat logical");
+        assert_eq!(
+            logical.num_rows(),
+            12,
+            "concat_batches sums the physical chunks; nothing is dropped"
+        );
+
+        let derived = GenAiFromSpans
+            .derive(&logical, [0xAAu8; 16])
+            .expect("derive over concatenated batch");
+
+        let count_target = |name: &str| -> usize {
+            derived
+                .iter()
+                .filter(|d| d.target_name == name)
+                .map(|d| d.batch.num_rows())
+                .sum()
+        };
+        let messages = count_target(MessagesTable::NAME);
+        let embeddings = count_target(EmbeddingsTable::NAME);
+        let tool_calls = count_target(ToolCallsTable::NAME);
+
+        assert_eq!(messages, 4, "4 chat spans project to 4 messages rows");
+        assert_eq!(
+            embeddings, 4,
+            "4 embeddings spans project to 4 embeddings rows"
+        );
+        assert_eq!(
+            tool_calls, 4,
+            "4 execute_tool spans project to 4 tool_calls rows"
+        );
+        assert_eq!(
+            messages + embeddings + tool_calls,
+            12,
+            "concat-then-derive preserves every source row across chunk boundaries"
+        );
+    }
+
+    /// Concat-then-derive is semantically equivalent to derive on a single
+    /// batch of the same rows: same per-target partition count, same
+    /// per-target row totals. So chunking is transparent — the derivation's
+    /// output does not depend on how the physical scan is split.
+    #[test]
+    fn genai_derive_on_concat_equals_derive_on_single_batch() {
+        use arrow::compute::concat_batches;
+
+        let tenant = DataTenantId::new_v7();
+        let mut per_row: Vec<RecordBatch> = Vec::with_capacity(6);
+        for i in 0..6u8 {
+            per_row.push(spans_batch_with_span_id(
+                tenant,
+                [i + 1; 8],
+                &serde_json::json!({
+                    "gen_ai.provider.name": "openai",
+                    "gen_ai.operation.name": "chat",
+                    "gen_ai.request.model": format!("m-{i}"),
+                }),
+            ));
+        }
+        let schema = per_row[0].schema();
+
+        // Ground truth: one physical batch of 6 rows.
+        let single = concat_batches(&schema, &per_row).expect("concat single");
+        let single_derived = GenAiFromSpans
+            .derive(&single, [0xBBu8; 16])
+            .expect("derive single");
+
+        // Chunked path: split into 2 chunks of 3 rows, then concat before derive.
+        let chunk_a = concat_batches(&schema, &per_row[0..3]).expect("a");
+        let chunk_b = concat_batches(&schema, &per_row[3..6]).expect("b");
+        let chunks = [chunk_a, chunk_b];
+        let recombined = concat_batches(&schema, &chunks).expect("recombine");
+        let chunked_derived = GenAiFromSpans
+            .derive(&recombined, [0xBBu8; 16])
+            .expect("derive chunked");
+
+        assert_eq!(
+            single_derived.len(),
+            chunked_derived.len(),
+            "same number of DerivedBatch partitions"
+        );
+        let sum_rows =
+            |v: &[DerivedBatch]| -> usize { v.iter().map(|d| d.batch.num_rows()).sum() };
+        assert_eq!(sum_rows(&single_derived), 6, "single-path preserves 6 rows");
+        assert_eq!(
+            sum_rows(&single_derived),
+            sum_rows(&chunked_derived),
+            "concat-then-derive is semantically equivalent to derive on a single batch"
+        );
+    }
+
     /// Small read helper for the tests above: value of a Utf8 column at row 0.
     trait Utf8Col {
         fn target_name_col(&self, name: &str) -> &str;

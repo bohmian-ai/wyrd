@@ -1,8 +1,5 @@
 mod pg_tests {
-    //! Fail-closed watermark invariant tests (CRITICAL 1).
-    //!
-    //! These tests prove the durable state-machine contract that
-    //! [`DerivationRuntime::process_tenant`] relies on:
+    //! Watermark state-machine invariants for `DerivationRuntime::process_tenant`:
     //!
     //! 1. `mark_failed` never moves the watermark. A failed derivation retries
     //!    from its last successful position on the next tick.
@@ -14,7 +11,7 @@ mod pg_tests {
     //!    earlier batch is re-materialised.
     //!
     //! `blocked_tick_does_not_write_watermark` in `pg_derivation_fencing.rs`
-    //! covers the lease-blocked branch of fail-closed. This module covers the
+    //! covers the lease-blocked branch. This module covers the
     //! target-write-failure branch.
     //!
     //! Run via `mise run test:bifrost`.

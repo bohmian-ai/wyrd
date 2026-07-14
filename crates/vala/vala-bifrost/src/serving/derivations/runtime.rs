@@ -476,14 +476,16 @@ impl DerivationRuntime {
     /// and the loop stops at the first failure so no batches after the failed one
     /// are marked as complete.
     ///
-    /// Fix 1 (fail-closed): a source position advances ONLY after every required
-    /// target write for that batch returns `Ok`. On failure the last fully-
-    /// completed batch id is returned so partial progress is preserved.
+    /// Fail-closed invariant: a source position advances ONLY after every
+    /// required target write for that batch returns `Ok`. On failure the last
+    /// fully-completed batch id is returned so partial progress is preserved
+    /// and the failed batch retries on the next tick.
     ///
-    /// Fix 2 (no chunk loss): `DataFusion` may split one logical source batch across
-    /// multiple physical `RecordBatch` chunks. We concatenate them into a single
-    /// batch before calling `derive`, so one deterministic `derived_batch_id` per
-    /// (source batch, target) covers all rows.
+    /// Chunk-safety invariant: `DataFusion` may split one logical source batch
+    /// across multiple physical `RecordBatch` chunks. We concatenate them into
+    /// a single batch before calling `derive`, so one deterministic
+    /// `derived_batch_id` per (source batch, target) covers all rows and no
+    /// chunk gets its own idempotency key.
     async fn process_batches(
         &self,
         tenant: DataTenantId,
@@ -509,7 +511,7 @@ impl DerivationRuntime {
                 .await
                 .map_err(|e| (last_completed, e))?;
 
-            // ── Concatenate chunks into one logical batch (Fix 2) ─────────
+            // ── Concatenate physical chunks into one logical batch ────────
             // An empty scan (0 chunks, or chunks with 0 rows total) means this
             // source batch produced no derived rows. Advance the watermark across
             // it — it was fully "processed" — but skip writing any target commit.
@@ -528,7 +530,7 @@ impl DerivationRuntime {
                 )
             })?;
 
-            // ── Derive: exactly one call per source batch (Fix 2) ─────────
+            // ── Derive: exactly one call per source batch ─────────────────
             let derived = self
                 .derivation
                 .derive(&source_batch, batch_id)
@@ -539,7 +541,7 @@ impl DerivationRuntime {
                     )
                 })?;
 
-            // ── Write each target; fail-closed on any error (Fix 1) ───────
+            // ── Write each target; fail-closed on any error ───────────────
             for db in derived {
                 let target_uid = target_uid_for(db.target_name, &self.uids);
                 let ctx = BifrostWriteContext {

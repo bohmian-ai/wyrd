@@ -21,7 +21,9 @@
 //!
 //! Backpressure: [`vala_ingest::IngestError::WriterBusy`] maps to HTTP `503`
 //! (retryable), never to `partial_success` — no rows from a busy request are
-//! written. Every other ingest failure maps to its stable `WYRD_VALA_*`
+//! written. The gRPC edge maps the same condition to gRPC
+//! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
+//! guidance). Every other ingest failure maps to its stable `WYRD_VALA_*`
 //! [`WyrdError`] and problem+json status. Authentication is enforced by the
 //! `require_authenticated` layer on the `/v1` group; the [`Caller`] extractor
 //! then yields the token-derived tenant/principal (never wire-derived).
@@ -308,7 +310,7 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
 ///
 /// Backpressure ([`IngestError::WriterBusy`]) becomes a retryable `503`, matching
 /// the OTLP/HTTP throttling contract (the gRPC edge maps the same condition to
-/// retryable `UNAVAILABLE`). The `signal` parameter provides the per-endpoint
+/// retryable `RESOURCE_EXHAUSTED` per [`IngestError::grpc_code`]). The `signal` parameter provides the per-endpoint
 /// physical table name so error messages name the correct target table rather
 /// than always reporting the traces table. Every other ingest error renders its
 /// stable `WYRD_VALA_*` [`WyrdError`] problem+json.

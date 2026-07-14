@@ -8,14 +8,18 @@
 //!    protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
 //!    stable `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
 //!
-//! Saturation (backpressure) journey note: forcing deterministic channel
-//! saturation in the test harness would require either a dedicated
-//! coordinator-stall seam that does not exist, or a capacity-1 channel override
-//! that is not exposed. The `WriterBusy → 503` / `WriterBusy → UNAVAILABLE`
-//! mapping is instead pinned as a unit test in `wyrd-server/src/http/otlp.rs`
-//! (the `writer_busy_maps_to_503` and `writer_busy_table_name_is_per_signal`
-//! tests). This matches the decision documented in the existing comment in
-//! `otlp.rs` for the original `writer_busy_maps_to_503` test.
+//! Saturation (backpressure) journey note: driving the group-commit
+//! coordinator's mpsc channel to `try_send` failure end-to-end requires either
+//! a stall seam that does not exist or a low-capacity override that races the
+//! upstream Iceberg catalog commit path (`CatalogCommitConflicts` surfaces as
+//! `WYRD_VALA_500_INGEST_INTERNAL` before the coordinator's channel ever
+//! reports `BifrostError::IngestBusy`). Until the writer serialises catalog
+//! commits under bursty concurrency, the saturation mapping is pinned by unit
+//! tests in `wyrd-server/src/http/otlp.rs` — `writer_busy_maps_to_503` for the
+//! HTTP path and `writer_busy_table_name_is_per_signal` for per-signal table
+//! naming — plus the gRPC mapping in `vala-ingest/src/error.rs`
+//! (`IngestError::WriterBusy → Code::ResourceExhausted` with
+//! `WYRD_VALA_429_INGEST_BUSY`).
 //!
 //! Both tests boot a `start_bound` server (PgFixture), so the fast family lane
 //! skips them via `--skip pg_tests`; `mise run test:e2e` (Postgres up) runs the

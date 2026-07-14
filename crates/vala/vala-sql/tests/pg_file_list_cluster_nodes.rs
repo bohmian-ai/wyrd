@@ -1,8 +1,8 @@
 mod pg_tests {
-    //! Integration tests for vala.file_list and vala.cluster_nodes migrations
-    //! (CONTRACTS §3, §4). Tests verify:
+    //! Integration tests for vala.file_list and vala.cluster_nodes migrations.
     //!
-    //! - Migration applies cleanly (columns, types, nullability match CONTRACTS)
+    //! Tests verify:
+    //! - Migration applies cleanly (columns, types, nullability)
     //! - Indexes exist (watermark, duplicate-range guard, discovery)
     //! - RLS blocks cross-tenant SELECT on file_list
     //! - OperatorPool grants permit required operations
@@ -45,7 +45,7 @@ mod pg_tests {
         let (fixture, _tenant) = setup().await;
         let pool = fixture.superuser_pool().await.expect("superuser pool");
 
-        // Assert every CONTRACTS §3 column present with matching type/nullability.
+        // Assert every file_list column present with matching type/nullability.
         let columns: Vec<(String, String, String)> = sqlx::query_as(
             r#"
             SELECT column_name, data_type, is_nullable
@@ -82,7 +82,7 @@ mod pg_tests {
         assert_eq!(
             columns.len(),
             expected.len(),
-            "file_list column count matches CONTRACTS §3"
+            "file_list column count matches schema"
         );
 
         for ((col_name, col_type, nullable), (exp_name, exp_type, exp_nullable)) in
@@ -99,7 +99,7 @@ mod pg_tests {
         let (fixture, _tenant) = setup().await;
         let pool = fixture.superuser_pool().await.expect("superuser pool");
 
-        // Verify the live-tail watermark composite index exists (CONTRACTS §3, §8).
+        // Verify the live-tail watermark composite index exists.
         let idx: (bool,) = sqlx::query_as(
             r#"
             SELECT EXISTS (
@@ -119,7 +119,7 @@ mod pg_tests {
             "file_list_live_tail_watermark_idx exists for Oracle dedup"
         );
 
-        // Assert index columns match CONTRACTS §3.
+        // Assert index columns match schema.
         let def: (String,) = sqlx::query_as(
             r#"
             SELECT indexdef FROM pg_indexes
@@ -243,7 +243,7 @@ mod pg_tests {
         let (fixture, _tenant) = setup().await;
         let pool = fixture.superuser_pool().await.expect("superuser pool");
 
-        // Assert every CONTRACTS §4 column present with matching type/nullability.
+        // Assert every cluster_nodes column present with matching type/nullability.
         let columns: Vec<(String, String, String)> = sqlx::query_as(
             r#"
             SELECT column_name, data_type, is_nullable
@@ -269,7 +269,7 @@ mod pg_tests {
         assert_eq!(
             columns.len(),
             expected.len(),
-            "cluster_nodes column count matches CONTRACTS §4"
+            "cluster_nodes column count matches schema"
         );
 
         for ((col_name, col_type, nullable), (exp_name, exp_type, exp_nullable)) in
@@ -287,7 +287,7 @@ mod pg_tests {
             .expect("fencing_token column");
         assert_eq!(
             fencing_col.2, "NO",
-            "fencing_token is NOT NULL (CONTRACTS §4)"
+            "fencing_token is NOT NULL (writer_epoch source)"
         );
     }
 

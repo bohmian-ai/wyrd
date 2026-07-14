@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use skald_agent::{
     Agent, AgentError, FinishReason, Journal, JournalError, JournalEvent, RunConfig,
 };
+use skald_observer::{NoopObserver, Observer, set_global, with_observer};
 use skald_prompt::Prompt;
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
@@ -19,7 +20,6 @@ use skald_spec::{
 };
 use skald_tool::{AgentTool, ToolError};
 use tokio::sync::Notify;
-use skald_observer::{NoopObserver, Observer, set_global, with_observer};
 
 static OBSERVER_SLOT: OnceLock<Arc<ObserverSlot>> = OnceLock::new();
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

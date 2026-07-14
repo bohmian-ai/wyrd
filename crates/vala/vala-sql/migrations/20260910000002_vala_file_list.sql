@@ -1,10 +1,15 @@
--- vala.file_list: durable Parquet file index (CONTRACTS §3).
+-- vala.file_list: durable Parquet file index for Bifrost write/read tier.
 --
 -- Scribe INSERTs one row per sealed file; Forge SELECTs + UPDATEs
 -- (compacted = true, committed_snapshot_id); Oracle SELECTs for fused scan.
 -- RLS on data_tenant_id. One row = one physical Parquet file = one partition_day.
--- Writer stream identity (node_id, writer_epoch) plus (wal_lsn_min, wal_lsn_max)
--- supports Oracle live-tail dedup (CONTRACTS §8).
+--
+-- Writer stream identity: Each Scribe pod runs a writer stream identified by
+-- (node_id, writer_epoch). node_id is the pod's stable UUID; writer_epoch is
+-- a per-boot monotonic counter from vala.cluster_nodes.fencing_token. LSNs
+-- (wal_lsn_min, wal_lsn_max) are only comparable within one stream — comparing
+-- LSNs across pods or across epochs is meaningless. Oracle uses this to compute
+-- per-stream watermarks for live-tail dedup.
 
 CREATE TABLE vala.file_list (
     id                    uuid PRIMARY KEY,
@@ -20,9 +25,9 @@ CREATE TABLE vala.file_list (
     tenant_bucket         int  NOT NULL,
     compacted             bool NOT NULL DEFAULT false,
     committed_snapshot_id bigint,
-    -- Writer stream identity (CONTRACTS §8). (node_id, writer_epoch) identifies
-    -- the pod-local WAL stream; wal_lsn_{min,max} are ONLY comparable within that
-    -- stream. Cross-stream comparison is meaningless.
+    -- Writer stream identity: (node_id, writer_epoch) identifies the pod-local
+    -- WAL stream; wal_lsn_{min,max} are ONLY comparable within that stream.
+    -- Cross-stream comparison is meaningless.
     node_id               uuid   NOT NULL,
     writer_epoch          bigint NOT NULL,
     wal_lsn_min           bigint NOT NULL,
@@ -39,7 +44,7 @@ CREATE INDEX file_list_group_idx
 CREATE INDEX file_list_tenant_idx
     ON vala.file_list (data_tenant_id, namespace, table_name);
 
--- Per-stream watermark lookup for Oracle live-tail dedup (CONTRACTS §8).
+-- Per-stream watermark lookup for Oracle live-tail dedup.
 CREATE INDEX file_list_live_tail_watermark_idx
     ON vala.file_list (namespace, table_name, tenant_bucket, node_id, writer_epoch, wal_lsn_max);
 

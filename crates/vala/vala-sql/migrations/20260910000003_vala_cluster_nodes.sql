@@ -1,16 +1,17 @@
--- vala.cluster_nodes: unified Scribe/Oracle node registry (CONTRACTS §4).
+-- vala.cluster_nodes: unified Scribe/Oracle node registry.
 --
--- Scribe INSERTs with role='scribe' on boot, UPDATEs heartbeat_at every 5s.
--- Oracle does the same with role='oracle' (Phase 2). Gate is stateless (no row).
--- Forge uses vala.maintenance_leases, not this table.
+-- Each Bifrost role (Scribe, Oracle) INSERTs a row on boot and UPDATEs
+-- heartbeat_at every 5s. Gate is stateless (no row). Forge uses
+-- vala.maintenance_leases instead.
 --
 -- fencing_token is the writer_epoch source: Scribe bumps it on every boot to
 -- obtain a fresh LSN stream. Each (node_id, writer_epoch) pair identifies one
--- pod-local WAL; LSNs across epochs are never comparable (CONTRACTS §8).
+-- pod-local WAL. LSNs from different epochs (or different pods) are never
+-- comparable — each epoch starts a fresh LSN sequence at 0.
 --
 -- NO RLS: This is a cluster-level node registry, not tenant-scoped data.
 -- All writes via OperatorPool (BYPASSRLS, audited). Reads via OperatorPool
--- for discovery (CONTRACTS §4).
+-- for discovery.
 
 CREATE TABLE vala.cluster_nodes (
     node_id         uuid PRIMARY KEY,

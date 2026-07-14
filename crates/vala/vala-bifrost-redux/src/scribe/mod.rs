@@ -1,8 +1,10 @@
 //! Scribe implementation — WAL append, fsync, replay, and memtable (PR#3/PR#4).
 
 pub mod audit_envelope;
+pub mod filename;
 pub mod manifest;
 pub mod memtable;
+pub mod parquet_writer;
 pub mod replay;
 pub mod seal_key;
 pub mod stream_identity;

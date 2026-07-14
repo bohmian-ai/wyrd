@@ -124,6 +124,11 @@ id_type!(
     "Human-visible tenant slug resolved to a DataTenantId at the auth boundary.",
     validate_tenant_slug
 );
+id_type!(
+    PodId,
+    "Bifrost pod identifier for multi-pod seal coordination.",
+    validate_token
+);
 
 /// Immutable tenant isolation key used by tenant-scoped Wyrd and Vala rows.
 #[derive(

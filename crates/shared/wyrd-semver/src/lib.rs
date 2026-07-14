@@ -21,7 +21,7 @@ pub use crate::range::VersionRange;
 pub use crate::spec::VersionSpec;
 
 /// Initial seed version used when registering a card with no prior version in
-/// the (kind, space, name) scope. Matches the opsml default ("new, sub-1.0").
+/// the (kind, space, name) scope.
 #[must_use]
 pub fn seed_version() -> VersionBlock {
     VersionBlock::parse("0.1.0").expect("seed version literal is a valid semver triple")

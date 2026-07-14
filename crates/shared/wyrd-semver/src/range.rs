@@ -33,7 +33,7 @@ impl VersionRange {
         Ok(Self(value))
     }
 
-    /// Parse a range expression that may include opsml-dialect short forms
+    /// Parse a range expression that may include Wyrd short-form dialects
     /// (`^1.2`, `~1.2`, `1.*`, partial bare versions like `1` or `1.2`).
     ///
     /// Normalizes to a form acceptable to `semver::VersionReq`, so the
@@ -117,7 +117,7 @@ impl VersionRange {
     /// this range expression, for use in SQL predicates of the form
     /// `(major, minor, patch) >= lower AND (major, minor, patch) < upper`.
     ///
-    /// Supported dialect (mirrors opsml's prefix grammar):
+    /// Supported dialect (Wyrd prefix grammar):
     /// - `^1.2.3` → `[1.2.3, 2.0.0)`
     /// - `~1.2.3` → `[1.2.3, 1.3.0)`
     /// - `1.2.*`  → `[1.2.0, 1.3.0)`
@@ -224,7 +224,7 @@ fn normalize_loose(value: &str) -> Result<String, VersionError> {
         return Ok(format!("{prefix}{expanded}"));
     }
 
-    // Bare partials map to opsml partial-pin semantics:
+    // Bare partials map to partial-pin semantics:
     //   "X"     → "^X"    (lock major)
     //   "X.Y"   → "~X.Y"  (lock major+minor)
     //   "X.Y.Z" → "=X.Y.Z" (exact)

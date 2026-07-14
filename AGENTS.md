@@ -410,8 +410,9 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - The plan orchestrator reads this file, `architecture/wyrd-design.md`,
   `architecture/wyrd-doctrine.mdx`, and the applicable repo-local skill before
   decomposing work.
-- Wyrd Rust, Python, server, CLI, MCP, storage, Vala, and contract implementors
-  must receive `.codex/skills/wyrd-rust-python/SKILL.md` in their task packet.
+- Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
+  implementors must receive `.codex/skills/wyrd-implement/SKILL.md` in their
+  task packet.
 - Wyrd UI implementors additionally receive
   `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
 - The complete integration review runs the global `review-and-plan` skill; its

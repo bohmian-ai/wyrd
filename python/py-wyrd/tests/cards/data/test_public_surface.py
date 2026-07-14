@@ -52,7 +52,7 @@ def test_data_stub_public_classes_and_methods_have_docstrings() -> None:
     assert missing == []
 
 
-def test_opsml_style_python_package_layout() -> None:
+def test_wyrd_python_package_layout() -> None:
     assert (PACKAGE_ROOT / "__init__.py").is_file()
     assert (PACKAGE_ROOT / "__init__.pyi").is_file()
     assert (PACKAGE_ROOT / "_wyrd.pyi").is_file()

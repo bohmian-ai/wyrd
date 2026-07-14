@@ -15,20 +15,28 @@ scribe-tail = []
 [dependencies]
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
+wyrd-sql = { workspace = true }
+vala-sql = { workspace = true }
 
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 iceberg = { workspace = true }
 datafusion = { workspace = true }
 opendal = { workspace = true }
+crc32c = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

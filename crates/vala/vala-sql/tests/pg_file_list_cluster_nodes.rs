@@ -232,7 +232,7 @@ mod pg_tests {
             assert!(
                 db_err
                     .constraint()
-                    .map_or(false, |c| c.contains("file_list_stream_range_uniq")),
+                    .is_some_and(|c| c.contains("file_list_stream_range_uniq")),
                 "constraint name matches unique index"
             );
         }

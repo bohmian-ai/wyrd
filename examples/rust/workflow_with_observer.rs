@@ -5,10 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use skald_observer::Observer;
+use skald_observer::OtelObserver;
 use skald_spec::{ProviderRequest, ProviderResponse};
 use skald_workflow::{Workflow, WorkflowInput};
-use wyrd_observe::Observer;
-use wyrd_observe::OtelObserver;
 
 mod common;
 use common::{mock_registry, plan_prompt, write_prompt};

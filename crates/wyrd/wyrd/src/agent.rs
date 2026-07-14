@@ -14,14 +14,14 @@ pub use skald_agent::{
     NoSession, NoopJournal, PromptResolver, Role, RunConfig, SessionId, SessionMemory, SessionTurn,
     clear_prompt_card_registry, default_prompt_resolver, register_prompt_card,
 };
+#[cfg(feature = "otel")]
+pub use skald_observer::OtelObserver;
+pub use skald_observer::{CompositeObserver, set_global, with_observer};
+pub use skald_observer::{NoopObserver, Observer};
 pub use skald_prompt::{
     AnthropicOptions, GeminiOptions, OpenAiChatOptions, Prompt, anthropic, gemini, openai_chat,
 };
 pub use skald_runtime::ProviderRegistry;
 pub use skald_tool::{AgentTool, ToolDef, ToolError};
 pub use skald_workflow::{StepEvent, StepOutcome, TaskStatus as StepStatus, Workflow, WorkflowRun};
-#[cfg(feature = "otel")]
-pub use wyrd_observe::OtelObserver;
-pub use wyrd_observe::{CompositeObserver, set_global, with_observer};
-pub use wyrd_observe::{NoopObserver, Observer};
 pub use wyrd_spec::{AgentCard, WorkflowCard};

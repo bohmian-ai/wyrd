@@ -433,16 +433,16 @@ impl Workflow {
         providers: &skald_runtime::ProviderRegistry,
         input: impl Into<WorkflowInput>,
     ) -> WorkflowResult<WorkflowRun> {
-        wyrd_observe::init();
+        skald_observer::init();
         let input = input.into();
         let inner = self.run_with_inner(providers, input);
         match self.observers.as_slice() {
             [] => inner.await,
-            [one] => wyrd_observe::with_observer(Arc::clone(one), inner).await,
+            [one] => skald_observer::with_observer(Arc::clone(one), inner).await,
             many => {
                 let composite: Arc<dyn Observer> =
-                    Arc::new(wyrd_observe::CompositeObserver::new(many.to_vec()));
-                wyrd_observe::with_observer(composite, inner).await
+                    Arc::new(skald_observer::CompositeObserver::new(many.to_vec()));
+                skald_observer::with_observer(composite, inner).await
             }
         }
     }

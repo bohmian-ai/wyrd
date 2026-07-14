@@ -24,7 +24,7 @@ owner-crate `python` features and registers their submodules; it must not
 duplicate validation, lifecycle, registry, storage, or runtime logic.
 
 Approved owner crates today (12): `wyrd-cards`, `wyrd-config`,
-`wyrd-interfaces`, `wyrd-observe`, `wyrd-testing`, `wyrd-utils`,
+`wyrd-interfaces`, `wyrd-testing`, `wyrd-utils`, `skald-observer`,
 `skald-agent`, `skald-prompt`, `skald-runtime`, `skald-tool`,
 `skald-workflow`, `vala-sdk`. Enforced by `mise run check:pyo3-scope`. Do
 not add PyO3 to another crate without updating the architecture and the
@@ -179,7 +179,7 @@ function. Current submodules:
 - `prompt` (from `skald-prompt`)
 - `providers` (from `skald-runtime`)
 - `bifrost` (from `vala-sdk::bifrost`)
-- `observe` (from `vala-sdk::observe` + `wyrd-observe`)
+- `observe` (from `vala-sdk::observe` + `skald-observer`)
 - `testing` (from `wyrd-testing`, feature-gated, dev-only wheel)
 
 Do not stop after adding `#[pyclass]`; registration, Python package

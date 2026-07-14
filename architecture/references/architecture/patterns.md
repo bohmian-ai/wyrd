@@ -49,8 +49,7 @@ shapes, validation, stable error catalog. PyO3-free, IO-free, async-free.
 - Runtime: `wyrd-runtime` (async runtime + PyO3 sync/async bridge),
   `wyrd-queue` (bounded producer + BatchSink seam).
 - Domain primitives: `wyrd-semver`, `wyrd-version`.
-- Observability: `wyrd-observe` (Observer trait + implementations, Python
-  owner), `wyrd-telemetry`.
+- Observability: `wyrd-telemetry`.
 - Transport / client: `wyrd-client`.
 - Security / crypto: `wyrd-crypt`.
 - Test infra: `wyrd-dev-fixtures`, `wyrd-test-contract-macros`.
@@ -62,6 +61,8 @@ Client-tier crates do not depend on `sqlx`, cloud SDKs, `datafusion`, or
 ### `crates/skald/*` — LLM runtime plane
 
 - `skald-spec` — Skald contracts (no PyO3, no server deps).
+- `skald-observer` — Observer trait + implementations for agent/workflow
+  events (Python owner).
 - `skald-providers` — provider registry + driver interface.
 - `skald-runtime` — native provider runtime dispatch + mock provider seam
   (Python owner).

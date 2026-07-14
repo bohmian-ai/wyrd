@@ -86,7 +86,7 @@ Locked cross-cutting decisions that any contributor must honor:
   owner crates. `python/py-wyrd` is the thin PyO3 module aggregator and Python
   package surface, not the place for duplicated business logic.
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
-  `wyrd-utils`, `wyrd-observe`, `vala-sdk`, `wyrd-sdk`, `skald-prompt`,
+  `wyrd-utils`, `vala-sdk`, `wyrd-sdk`, `skald-observer`, `skald-prompt`,
   `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
   `wyrd-testing`. `wyrd-sdk` owns the `WyrdState` runtime handle (hydrated-tree
   load, CardRef context, observation tying); its PyO3 surface lives behind an

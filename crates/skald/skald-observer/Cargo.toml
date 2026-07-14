@@ -1,5 +1,5 @@
 [package]
-name = "wyrd-observe"
+name = "skald-observer"
 version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
@@ -7,7 +7,7 @@ rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
 publish = false
-description = "Observer trait and Wyrd-side observation primitives for Skald agent runs."
+description = "Observer trait and observation primitives for Skald agent runs."
 
 [lib]
 path = "src/lib.rs"

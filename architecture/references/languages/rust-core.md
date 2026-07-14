@@ -73,7 +73,7 @@ pub trait Observer: Send + Sync + 'static {
 }
 ```
 
-Real example: `crates/shared/wyrd-observe/src/lib.rs` (`Observer` trait with
+Real example: `crates/skald/skald-observer/src/lib.rs` (`Observer` trait with
 `Otel`, `Composite`, and `Scoped` implementations).
 
 Avoid platform traits invented for a single caller. If there is only one impl

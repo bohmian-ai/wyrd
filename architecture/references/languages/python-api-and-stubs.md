@@ -49,7 +49,7 @@ python/py-wyrd/python/wyrd/
 │   └── prompt/
 ├── config/                # wyrd-config
 ├── observer.pyi
-├── observe/               # vala-sdk observe + wyrd-observe surface
+├── observe/               # vala-sdk observe + skald-observer surface
 ├── prompt/                # skald-prompt
 ├── providers/             # skald-runtime
 ├── testing/               # feature-gated, dev-only wheel

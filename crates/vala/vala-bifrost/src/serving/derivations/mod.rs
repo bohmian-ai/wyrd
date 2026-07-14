@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use sqlx::postgres::PgListener;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
@@ -49,6 +50,11 @@ pub fn spawn_genai_derivation_worker(
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Stable per-process identity for the maintenance-lease owner field.
+        // Generated once at spawn so renewal-fencing (`(owner, fencing_token)`)
+        // remains stable across ticks.
+        let worker_owner = Uuid::now_v7();
+
         // Load table UIDs once at startup. If this fails (e.g. tables not yet
         // registered on a fresh node), log and retry on the next tick.
         let uids = loop {
@@ -90,6 +96,7 @@ pub fn spawn_genai_derivation_worker(
             op,
             uids,
             derivation: GenAiFromSpans,
+            worker_owner,
         };
 
         loop {
@@ -163,6 +170,7 @@ pub async fn run_genai_derivation_tick(
     catalog: Arc<WyrdCatalog>,
     pool: sqlx::PgPool,
     op: vala_sql::OperatorPool,
+    worker_owner: Uuid,
 ) -> Result<(), BifrostError> {
     let uids = runtime::TableUids::load(&catalog).await?;
     let rt = runtime::DerivationRuntime {
@@ -171,6 +179,7 @@ pub async fn run_genai_derivation_tick(
         op,
         uids,
         derivation: GenAiFromSpans,
+        worker_owner,
     };
     rt.run_tick().await
 }

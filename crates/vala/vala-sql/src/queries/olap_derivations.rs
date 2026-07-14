@@ -132,6 +132,130 @@ pub async fn list_committed_source_batches(
     })
 }
 
+/// Outcome of [`register_derivation_with_contract`]: distinguishes a brand-new
+/// registration, an identical replay (safe to resume), and a drift rejection
+/// (fingerprint mismatch; caller must skip to prevent stale watermark reuse).
+#[derive(Debug, PartialEq)]
+pub enum ContractOutcome {
+    /// The derivation did not exist; it was inserted with the supplied fingerprints.
+    Registered,
+    /// The derivation already exists and all three fingerprints match the stored
+    /// values. Safe to resume — no semantic drift detected.
+    IdenticalReplay,
+    /// The derivation already exists but at least one fingerprint differs from
+    /// the stored value. `differing` names the changed columns. The worker must
+    /// skip this tenant to avoid resuming a stale watermark under new semantics.
+    DriftRejected {
+        /// Names of the fingerprint columns that differ: a subset of
+        /// `["source_schema_fingerprint", "transform_fingerprint",
+        /// "target_set_fingerprint"]`.
+        differing: Vec<&'static str>,
+    },
+}
+
+/// The three immutable contract fingerprints for a derivation registration.
+///
+/// Passed to [`register_derivation_with_contract`] to guard against silent
+/// watermark reuse under changed derivation semantics on redeployment.
+pub struct DerivationContract<'a> {
+    /// SHA-256 of the source table's declared user Arrow fields (name + data_type
+    /// per field, in declaration order). Computed via `DomainTable::schema_fingerprint()`.
+    pub source_schema_fingerprint: &'a [u8; 32],
+    /// SHA-256 of the derivation's `CONTRACT_VERSION` string. Bump the constant
+    /// whenever transform semantics change (new mapping, new output schema, etc.).
+    pub transform_fingerprint: &'a [u8; 32],
+    /// SHA-256 of all target table UIDs concatenated in lexicographic sort order.
+    /// Detects changes to the target-table routing set.
+    pub target_set_fingerprint: &'a [u8; 32],
+}
+
+type StoredFingerprints = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// Register a derivation with immutable contract fingerprints.
+///
+/// On first call for a `(source_table_uid, target_table_uid, control_bind)`
+/// triple: inserts the row with all three fingerprints and returns
+/// [`ContractOutcome::Registered`].
+///
+/// On subsequent calls:
+/// - If all three fingerprints match the stored values, returns
+///   [`ContractOutcome::IdenticalReplay`] without modifying the row.
+/// - If any fingerprint differs, returns [`ContractOutcome::DriftRejected`]
+///   listing which columns changed. No insert or update is performed; the
+///   caller must skip derivation processing to prevent stale watermark reuse
+///   under changed semantics.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails or an RLS policy rejects the row.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_derivation_with_contract(
+    conn: &mut TenantConn<'_>,
+    derivation_uid: &[u8; 16],
+    source_table_uid: &[u8; 16],
+    target_table_uid: &[u8; 16],
+    control_bind: Uuid,
+    fqn: &str,
+    registered_watermark: Option<&[u8; 16]>,
+    contract: DerivationContract<'_>,
+) -> Result<ContractOutcome, SqlError> {
+    let existing: Option<StoredFingerprints> = sqlx::query_as(
+        r#"
+            SELECT source_schema_fingerprint,
+                   transform_fingerprint,
+                   target_set_fingerprint
+              FROM vala.olap_derivations
+             WHERE derivation_uid = $1
+            "#,
+    )
+    .bind(derivation_uid.as_slice())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    if let Some((stored_source, stored_transform, stored_target)) = existing {
+        let mut differing = Vec::new();
+        if stored_source.as_deref() != Some(contract.source_schema_fingerprint.as_slice()) {
+            differing.push("source_schema_fingerprint");
+        }
+        if stored_transform.as_deref() != Some(contract.transform_fingerprint.as_slice()) {
+            differing.push("transform_fingerprint");
+        }
+        if stored_target.as_deref() != Some(contract.target_set_fingerprint.as_slice()) {
+            differing.push("target_set_fingerprint");
+        }
+        if differing.is_empty() {
+            return Ok(ContractOutcome::IdenticalReplay);
+        }
+        return Ok(ContractOutcome::DriftRejected { differing });
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO vala.olap_derivations
+            (data_tenant_id, derivation_uid, source_table_uid, target_table_uid,
+             control_bind, fqn, registered_watermark,
+             source_schema_fingerprint, transform_fingerprint, target_set_fingerprint)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (data_tenant_id, source_table_uid, target_table_uid, control_bind)
+        DO NOTHING
+        "#,
+    )
+    .bind(derivation_uid.as_slice())
+    .bind(source_table_uid.as_slice())
+    .bind(target_table_uid.as_slice())
+    .bind(control_bind)
+    .bind(fqn)
+    .bind(registered_watermark.map(|w| w.as_slice()))
+    .bind(contract.source_schema_fingerprint.as_slice())
+    .bind(contract.transform_fingerprint.as_slice())
+    .bind(contract.target_set_fingerprint.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(ContractOutcome::Registered)
+}
+
 /// Register a derivation idempotently.
 ///
 /// Inserts one `(source, target, control_bind)` derivation for the current
@@ -139,6 +263,11 @@ pub async fn list_committed_source_batches(
 /// derivation is pinned to (`None` = from the beginning). `ON CONFLICT DO
 /// NOTHING` keys on the `(data_tenant_id, source_table_uid, target_table_uid,
 /// control_bind)` unique constraint so re-registration is a no-op.
+///
+/// # Deprecated
+/// Use [`register_derivation_with_contract`] for new call sites. This function
+/// does not populate the contract fingerprint columns and cannot detect
+/// derivation semantic drift on redeployment.
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails or an RLS policy rejects the row.

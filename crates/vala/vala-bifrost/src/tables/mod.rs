@@ -487,8 +487,8 @@ mod fingerprint_drift {
         243, 159, 254, 166, 176, 213, 219, 232, 255, 124, 29, 120,
     ];
     const SYSTEM_AUDIT_LOG: [u8; 32] = [
-        19, 45, 142, 115, 112, 192, 74, 210, 194, 133, 26, 171, 32, 125, 216, 221, 44, 59, 147,
-        150, 155, 225, 70, 116, 158, 170, 214, 111, 170, 24, 188, 210,
+        89, 188, 52, 180, 246, 60, 100, 140, 252, 148, 135, 184, 247, 96, 117, 175, 246, 148, 183,
+        217, 122, 16, 225, 210, 200, 250, 115, 124, 222, 255, 252, 10,
     ];
 
     // ── Test B ────────────────────────────────────────────────────────────────
@@ -1125,6 +1125,7 @@ mod fingerprint_drift {
             Field::new("decision", DataType::Utf8, false),
             Field::new("result", DataType::Utf8, false),
             Field::new("payload_summary", DataType::Utf8, false),
+            Field::new("detail", DataType::Utf8, true),
             Field::new("created_at_us", DataType::Int64, false),
             Field::new(
                 "wyrd_event_time",

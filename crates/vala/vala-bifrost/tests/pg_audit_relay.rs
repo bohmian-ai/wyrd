@@ -83,6 +83,7 @@ mod pg_tests {
                 decision: AuditDecision::Allow,
                 result: AuditResult::Success,
                 payload_summary: operation.to_string(),
+                detail: None,
             }
         }
 

@@ -164,6 +164,7 @@ mod pg_tests {
                 .postgres
                 .operator_pool()
                 .expect("operator pool for derivation worker"),
+            uuid::Uuid::now_v7(),
         )
         .await
         .expect("recovery tick");
@@ -188,6 +189,7 @@ mod pg_tests {
                 .postgres
                 .operator_pool()
                 .expect("operator pool for derivation worker"),
+            uuid::Uuid::now_v7(),
         )
         .await
         .expect("replay tick");

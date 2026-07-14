@@ -129,6 +129,7 @@ fn ingest_audit_event(ctx: &BifrostWriteContext, resource: &str) -> AuditEvent {
         decision: AuditDecision::Allow,
         result: AuditResult::Success,
         payload_summary: "bifrost record commit".to_string(),
+        detail: None,
     }
 }
 

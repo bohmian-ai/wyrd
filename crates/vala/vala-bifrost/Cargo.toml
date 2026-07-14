@@ -19,8 +19,7 @@ bench-bin = ["dep:criterion", "dep:clap", "dep:rand", "dep:tempfile"]
 wyrd-spec       = { workspace = true }
 wyrd-storage    = { workspace = true }
 wyrd-auth-issue = { workspace = true }
-vala-sql        = { path = "../vala-sql", version = "0.0.1" }
-
+vala-sql        = { workspace = true }
 iceberg                 = { workspace = true }
 iceberg-catalog-sql     = { workspace = true }
 iceberg-datafusion      = { workspace = true }
@@ -65,6 +64,9 @@ name = "pg_commit_idempotency"
 
 [[test]]
 name = "pg_reconcile"
+
+[[test]]
+name = "pg_derivation_fencing"
 
 [[bench]]
 name = "write_throughput"

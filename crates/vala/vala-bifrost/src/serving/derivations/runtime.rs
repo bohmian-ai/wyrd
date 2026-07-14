@@ -12,12 +12,15 @@ use arrow::compute::concat_batches;
 use datafusion::common::TableReference;
 use datafusion::prelude::{col, lit};
 use datafusion::scalar::ScalarValue;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use vala_sql::row_types::maintenance::MaintenanceLeaseKey;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::WyrdCatalog;
 use crate::catalog::namespaces::BifrostNamespace;
 use crate::error::BifrostError;
+use crate::serving::repair::heartbeat::LeaseHeartbeat;
 use crate::session::wyrd_session_context;
 use crate::tables::DomainTable;
 use crate::tables::genai::{
@@ -26,6 +29,13 @@ use crate::tables::genai::{
 use crate::tables::traces::SpansTable;
 use crate::types::TableScope;
 use crate::writer::BifrostWriteContext;
+
+/// Lease duration for the cross-table derivation maintenance lease.
+///
+/// Mirrors [`FALLBACK_CADENCE_SECS`](super::FALLBACK_CADENCE_SECS): one full
+/// fallback interval fits within one lease period, so a single tick always
+/// completes before its own lease expires under normal load.
+const LEASE_SECS: i64 = 60;
 
 fn table_uid_from_row(
     row: &vala_sql::row_types::olap_catalog::BifrostTableRow,
@@ -86,12 +96,17 @@ impl TableUids {
 ///
 /// Accepts a snapshot of pre-fetched UIDs and a live catalog + pools. Calling
 /// [`run_tick`](Self::run_tick) drives one full derivation pass.
+///
+/// `worker_owner` is a stable per-process UUID used as the maintenance-lease
+/// owner identity. It must be generated once per spawned worker (not per tick)
+/// so the owner field stays stable across renewals.
 pub(super) struct DerivationRuntime {
     pub catalog: Arc<WyrdCatalog>,
     pub pool: sqlx::PgPool,
     pub op: vala_sql::OperatorPool,
     pub uids: TableUids,
     pub derivation: GenAiFromSpans,
+    pub worker_owner: Uuid,
 }
 
 /// Open group-commit handles for every genai target table. Held together so
@@ -107,7 +122,35 @@ struct TargetHandles {
 impl DerivationRuntime {
     /// Enumerate tenants with committed source data and run a derivation pass
     /// for each. Per-tenant errors are logged but do not abort other tenants.
+    ///
+    /// Acquires the shared cross-table-derivation maintenance lease before
+    /// enumerating tenants. If another pod already holds the lease this tick
+    /// returns `Ok(())` immediately (fail-closed singleton). The lease is
+    /// renewed between tenants and again inside
+    /// [`fenced_advance_watermark`](Self::fenced_advance_watermark) before every
+    /// watermark advance.
     pub(super) async fn run_tick(&self) -> Result<(), BifrostError> {
+        let lease_key = MaintenanceLeaseKey::cross_table_derivation(
+            &GenAiFromSpans::DERIVATION_UID,
+            &Uuid::nil(),
+        );
+        let token = vala_sql::queries::maintenance_leases::try_acquire_lease(
+            &self.op,
+            lease_key.as_str(),
+            self.worker_owner,
+            LEASE_SECS,
+        )
+        .await
+        .map_err(BifrostError::Sql)?;
+        let Some(fencing_token) = token else {
+            tracing::debug!(
+                owner = %self.worker_owner,
+                "derivation: lease held by another pod — skipping tick"
+            );
+            return Ok(());
+        };
+        let heartbeat = LeaseHeartbeat::new(self.worker_owner, fencing_token, lease_key.as_str());
+
         let tenant_uuids = vala_sql::queries::olap_derivations::list_source_commit_tenants(
             &self.op,
             &self.uids.source,
@@ -120,18 +163,42 @@ impl DerivationRuntime {
                 tracing::warn!(uuid = %raw_uuid, "derivation: skipping non-UUIDv7 tenant");
                 continue;
             };
-            if let Err(e) = self.process_tenant(tenant).await {
+            match heartbeat.renew(&self.op, LEASE_SECS).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        owner = %self.worker_owner,
+                        tenant = %tenant,
+                        "derivation: lease lost between tenants — aborting tick"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        owner = %self.worker_owner,
+                        error = %e,
+                        "derivation: lease renewal error between tenants — aborting tick"
+                    );
+                    return Err(BifrostError::Sql(e));
+                }
+            }
+            if let Err(e) = self.process_tenant(tenant, &heartbeat).await {
                 tracing::error!(tenant = %tenant, error = %e, "derivation: tenant tick failed");
             }
         }
         Ok(())
     }
 
-    async fn process_tenant(&self, tenant: DataTenantId) -> Result<(), BifrostError> {
+    async fn process_tenant(
+        &self,
+        tenant: DataTenantId,
+        heartbeat: &LeaseHeartbeat,
+    ) -> Result<(), BifrostError> {
         let derivation_uid_bytes: [u8; 16] = *GenAiFromSpans::DERIVATION_UID.as_bytes();
 
-        self.register_derivation(tenant, &derivation_uid_bytes)
-            .await?;
+        if !self.check_contract(tenant, &derivation_uid_bytes).await? {
+            return Ok(());
+        }
         let pin = self.load_pin(tenant, &derivation_uid_bytes).await?;
         let all_batches = self.load_committed_batches(tenant).await?;
 
@@ -167,7 +234,7 @@ impl DerivationRuntime {
         };
 
         if let Some(wm) = last_batch_id {
-            self.advance_watermark_tx(tenant, &derivation_uid_bytes, &wm)
+            self.fenced_advance_watermark(tenant, heartbeat, &derivation_uid_bytes, &wm)
                 .await?;
         }
 
@@ -185,29 +252,119 @@ impl DerivationRuntime {
         Ok(())
     }
 
-    async fn register_derivation(
+    /// Register the derivation with immutable contract fingerprints and check
+    /// for drift.
+    ///
+    /// Returns `Ok(true)` when processing should proceed
+    /// ([`ContractOutcome::Registered`] or [`ContractOutcome::IdenticalReplay`]).
+    /// Returns `Ok(false)` when a contract drift was detected
+    /// ([`ContractOutcome::DriftRejected`]); the caller must skip this tenant to
+    /// prevent stale-watermark reuse under changed semantics. Drift is a
+    /// control-plane rejection, not a runtime failure, so we do not mark the
+    /// derivation `failed`.
+    ///
+    /// Fingerprint algorithms:
+    /// - `source_schema_fingerprint`: [`SpansTable::schema_fingerprint`] —
+    ///   SHA-256 of declared user Arrow fields (name || NUL || `data_type` ||
+    ///   NUL per field).
+    /// - `transform_fingerprint`: SHA-256 of
+    ///   [`GenAiFromSpans::CONTRACT_VERSION`].
+    /// - `target_set_fingerprint`: SHA-256 of target UIDs concatenated in
+    ///   lexicographic sort order.
+    ///
+    /// [`ContractOutcome::Registered`]: vala_sql::queries::olap_derivations::ContractOutcome::Registered
+    /// [`ContractOutcome::IdenticalReplay`]: vala_sql::queries::olap_derivations::ContractOutcome::IdenticalReplay
+    /// [`ContractOutcome::DriftRejected`]: vala_sql::queries::olap_derivations::ContractOutcome::DriftRejected
+    async fn check_contract(
         &self,
         tenant: DataTenantId,
         derivation_uid_bytes: &[u8; 16],
-    ) -> Result<(), BifrostError> {
+    ) -> Result<bool, BifrostError> {
+        let source_schema_fingerprint = SpansTable::schema_fingerprint();
+
+        let transform_fingerprint: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(GenAiFromSpans::CONTRACT_VERSION.as_bytes());
+            h.finalize().into()
+        };
+
+        let target_set_fingerprint: [u8; 32] = {
+            let mut target_uids = [
+                self.uids.messages,
+                self.uids.embeddings,
+                self.uids.tool_calls,
+                self.uids.memory,
+            ];
+            target_uids.sort_unstable();
+            let mut h = Sha256::new();
+            for uid in &target_uids {
+                h.update(uid.as_slice());
+            }
+            h.finalize().into()
+        };
+
         let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
             .await
             .map_err(BifrostError::Sql)?;
-        vala_sql::queries::olap_derivations::insert_derivation(
+        let outcome = vala_sql::queries::olap_derivations::register_derivation_with_contract(
             &mut conn,
             derivation_uid_bytes,
             &self.uids.source,
-            // target_table_uid: use messages as the "primary" target for
-            // registration; the derivation emits to multiple targets but
-            // `olap_derivations` tracks watermark per (source, derivation_uid).
+            // target_table_uid records the "primary" target for registration;
+            // full target-set semantics live in target_set_fingerprint.
             &self.uids.messages,
             Uuid::nil(),
             "genai_from_spans",
             None,
+            vala_sql::queries::olap_derivations::DerivationContract {
+                source_schema_fingerprint: &source_schema_fingerprint,
+                transform_fingerprint: &transform_fingerprint,
+                target_set_fingerprint: &target_set_fingerprint,
+            },
         )
         .await
         .map_err(BifrostError::Sql)?;
-        conn.commit().await.map_err(BifrostError::Sql)
+        conn.commit().await.map_err(BifrostError::Sql)?;
+
+        if let vala_sql::queries::olap_derivations::ContractOutcome::DriftRejected { differing } =
+            outcome
+        {
+            tracing::error!(
+                tenant = %tenant,
+                differing = ?differing,
+                "derivation contract drift; skipping tenant to prevent stale watermark reuse"
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// Renew the maintenance lease then advance the watermark — fail-closed.
+    ///
+    /// Skips the watermark advance and returns `Ok(())` if the lease was lost:
+    /// no watermark ever moves on behalf of a stale holder.
+    async fn fenced_advance_watermark(
+        &self,
+        tenant: DataTenantId,
+        heartbeat: &LeaseHeartbeat,
+        derivation_uid_bytes: &[u8; 16],
+        wm: &[u8; 16],
+    ) -> Result<(), BifrostError> {
+        match heartbeat.renew(&self.op, LEASE_SECS).await {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::error!(
+                    owner = %self.worker_owner,
+                    tenant = %tenant,
+                    "derivation: lease lost before watermark advance — skipping (fail-closed)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(BifrostError::Sql(e)),
+        }
+        self.advance_watermark_tx(tenant, derivation_uid_bytes, wm)
+            .await
     }
 
     async fn load_pin(

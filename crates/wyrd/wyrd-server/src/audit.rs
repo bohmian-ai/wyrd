@@ -54,6 +54,7 @@ pub fn audit_event(
         decision,
         result,
         payload_summary: payload_summary.to_owned(),
+        detail: None,
     }
 }
 
@@ -87,6 +88,7 @@ pub fn audit_event_unauthenticated(
         decision,
         result,
         payload_summary: payload_summary.to_owned(),
+        detail: None,
     }
 }
 

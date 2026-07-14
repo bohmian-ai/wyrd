@@ -133,6 +133,14 @@ impl GenAiFromSpans {
         0x9a, 0x1d, 0x77, 0x0c, 0x2b, 0x84, 0x5e, 0x63, 0xb1, 0x0f, 0x3c, 0x21, 0x8d, 0x4e, 0x67,
         0xf2,
     ]);
+
+    /// Semantic version of this derivation's transform. Hashed into the
+    /// `transform_fingerprint` stored on `vala.olap_derivations`. Bump this
+    /// whenever the mapping semantics, output schema, or target routing change
+    /// — any redeploy under a changed constant is rejected as `DriftRejected`
+    /// so the runtime cannot silently resume the old watermark under new
+    /// semantics.
+    pub const CONTRACT_VERSION: &'static str = "genai_from_spans/v1";
 }
 
 impl DomainDerivation for GenAiFromSpans {

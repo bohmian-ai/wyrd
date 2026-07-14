@@ -740,41 +740,44 @@ mod pg_tests {
 
     // There is no dedicated update query; the existing update-like path is a
     // changed auto-version registration and emits a second register detail.
-    e2e_test!(card_register_reregister_delete_write_one_typed_outbox_detail, {
-        let env = TestEnv::new().await;
-        let tenant = env.fresh_tenant().await;
-        let actor = env.fixture_user(tenant).await;
-        let card = fixture_card_auto(CardKind::Prompt, "prod", "audit-lifecycle");
+    e2e_test!(
+        card_register_reregister_delete_write_one_typed_outbox_detail,
+        {
+            let env = TestEnv::new().await;
+            let tenant = env.fresh_tenant().await;
+            let actor = env.fixture_user(tenant).await;
+            let card = fixture_card_auto(CardKind::Prompt, "prod", "audit-lifecycle");
 
-        let registered = scenarios::register(&env, tenant, &actor, &card)
-            .await
-            .expect("register succeeds");
-        let register_audit =
-            scenarios::fetch_registration_audit(&env, tenant, &registered.card_uid).await;
-        assert_eq!(register_audit.len(), 1);
-        assert_card_registration_detail(&register_audit[0], &registered.card_uid);
-        assert_card_registration_operation(&register_audit[0], "register");
+            let registered = scenarios::register(&env, tenant, &actor, &card)
+                .await
+                .expect("register succeeds");
+            let register_audit =
+                scenarios::fetch_registration_audit(&env, tenant, &registered.card_uid).await;
+            assert_eq!(register_audit.len(), 1);
+            assert_card_registration_detail(&register_audit[0], &registered.card_uid);
+            assert_card_registration_operation(&register_audit[0], "register");
 
-        let mut updated_card = card.clone();
-        per_kind::mutate_for_drift(&mut updated_card);
-        let updated = scenarios::register(&env, tenant, &actor, &updated_card)
-            .await
-            .expect("update registration succeeds");
-        let update_audit =
-            scenarios::fetch_registration_audit(&env, tenant, &updated.card_uid).await;
-        assert_eq!(update_audit.len(), 1);
-        assert_card_registration_detail(&update_audit[0], &updated.card_uid);
-        assert_card_registration_operation(&update_audit[0], "register");
+            let mut updated_card = card.clone();
+            per_kind::mutate_for_drift(&mut updated_card);
+            let updated = scenarios::register(&env, tenant, &actor, &updated_card)
+                .await
+                .expect("update registration succeeds");
+            let update_audit =
+                scenarios::fetch_registration_audit(&env, tenant, &updated.card_uid).await;
+            assert_eq!(update_audit.len(), 1);
+            assert_card_registration_detail(&update_audit[0], &updated.card_uid);
+            assert_card_registration_operation(&update_audit[0], "register");
 
-        scenarios::soft_delete(&env, tenant, &updated.card_uid, &actor)
-            .await
-            .expect("delete succeeds");
-        let delete_audit =
-            scenarios::fetch_registration_audit(&env, tenant, &updated.card_uid).await;
-        assert_eq!(delete_audit.len(), 2);
-        assert_card_registration_detail(&delete_audit[1], &updated.card_uid);
-        assert_card_registration_operation(&delete_audit[1], "delete");
-    });
+            scenarios::soft_delete(&env, tenant, &updated.card_uid, &actor)
+                .await
+                .expect("delete succeeds");
+            let delete_audit =
+                scenarios::fetch_registration_audit(&env, tenant, &updated.card_uid).await;
+            assert_eq!(delete_audit.len(), 2);
+            assert_card_registration_detail(&delete_audit[1], &updated.card_uid);
+            assert_card_registration_operation(&delete_audit[1], "delete");
+        }
+    );
 
     e2e_test!(card_audit_append_failure_rolls_back_registration, {
         let env = TestEnv::new().await;

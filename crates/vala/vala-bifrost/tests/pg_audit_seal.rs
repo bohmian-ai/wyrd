@@ -27,7 +27,7 @@ mod pg_tests {
         use vala_bifrost::writer::BifrostWriteContext;
         use vala_sql::TenantConn;
         use vala_sql::queries::audit_outbox::{
-            AuditEntryHashInput, ShippedOutboxRef, entry_hash_from_cols,
+            AuditEntryHashInput, ShippedOutboxRef, entry_hash_from_cols_with_detail,
         };
         use vala_sql::queries::audit_seal::upsert_checkpoint;
         use wyrd_auth_issue::AuditSealKey;
@@ -91,6 +91,7 @@ mod pg_tests {
                 decision: AuditDecision::Allow,
                 result: AuditResult::Success,
                 payload_summary: operation.to_string(),
+                detail: None,
             }
         }
 
@@ -215,7 +216,7 @@ mod pg_tests {
             let result = "success";
             let payload_summary = "op-0";
 
-            let honest_hash = entry_hash_from_cols(AuditEntryHashInput {
+            let cols = AuditEntryHashInput {
                 prev_hash: &prev_hash,
                 seq,
                 request_id: &request_id,
@@ -230,7 +231,8 @@ mod pg_tests {
                 decision: honest_decision,
                 result,
                 payload_summary,
-            });
+            };
+            let honest_hash = entry_hash_from_cols_with_detail(cols, None);
 
             // Warehouse row: honest stored entry_hash, tampered `decision`.
             let batch = audit_log_row_batch(&AuditRowCols {
@@ -337,6 +339,7 @@ mod pg_tests {
                 Field::new("decision", DataType::Utf8, false),
                 Field::new("result", DataType::Utf8, false),
                 Field::new("payload_summary", DataType::Utf8, false),
+                Field::new("detail", DataType::Utf8, true),
                 Field::new("created_at_us", DataType::Int64, false),
             ];
             let columns: Vec<ArrayRef> = vec![
@@ -355,6 +358,7 @@ mod pg_tests {
                 Arc::new(StringArray::from(vec![c.decision])),
                 Arc::new(StringArray::from(vec![c.result])),
                 Arc::new(StringArray::from(vec![c.payload_summary])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
                 Arc::new(Int64Array::from(vec![0i64])),
             ];
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("audit row batch")

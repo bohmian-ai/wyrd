@@ -25,10 +25,7 @@ pub use error::SqlError;
 pub use operator_pool::OperatorPool;
 pub use pool::PoolConfig;
 pub use postgres::WyrdPostgres;
-pub use row_types::cards::{
-    AuditCardRegistrationRow, CardRegistrationOperation, CardRegistrationOutcome, CardRow,
-    CardStatus, NewAuditCardRegistrationRow, ParsedCardRow,
-};
+pub use row_types::cards::{CardRow, CardStatus, ParsedCardRow};
 pub use tenant_conn::TenantConn;
 
 /// Platform-global schema owned by `wyrd-sql`.
@@ -301,11 +298,9 @@ mod tests {
             "src/queries/platform/users.rs",
             "src/queries/platform/roles.rs",
             "src/queries/platform/api_keys.rs",
-            "src/queries/platform/audit_log.rs",
             "src/queries/storage/mod.rs",
             "src/queries/storage/multipart_uploads.rs",
             "src/queries/storage/artifact_metadata.rs",
-            "src/queries/storage/access_ledger.rs",
             "src/queries/storage/idempotency.rs",
             "src/queries/storage/admin/mod.rs",
             "src/queries/storage/admin/multipart_uploads.rs",
@@ -444,11 +439,22 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        let historical_storage = fs::read_to_string(
+            crate_dir
+                .join("migrations")
+                .join("20260601000002_storage.sql"),
+        )
+        .expect("historical storage migration is readable");
+        let retirement = fs::read_to_string(
+            crate_dir
+                .join("migrations")
+                .join("20260601000014_storage_access_ledger_retirement.sql"),
+        )
+        .expect("storage retirement migration is readable");
 
         for table in [
             "wyrd.storage_multipart_uploads",
             "wyrd.storage_artifact_metadata",
-            "wyrd.storage_access_ledger",
             "wyrd.storage_idempotency_keys",
         ] {
             assert!(
@@ -456,6 +462,27 @@ mod tests {
                 "storage migration must create or configure {table}"
             );
         }
+        assert!(
+            historical_storage.contains("CREATE TABLE wyrd.storage_access_ledger"),
+            "historical storage migration must preserve the legacy access ledger"
+        );
+        for statement in [
+            "DROP POLICY IF EXISTS admin_cross_tenant ON wyrd.storage_access_ledger;",
+            "DROP POLICY IF EXISTS tenant_isolation ON wyrd.storage_access_ledger;",
+            "DROP INDEX IF EXISTS wyrd.storage_access_ledger_tenant_created;",
+            "DROP INDEX IF EXISTS wyrd.storage_access_ledger_upload;",
+            "DROP TABLE IF EXISTS wyrd.storage_access_ledger;",
+            "DROP SEQUENCE IF EXISTS wyrd.storage_access_ledger_id_seq;",
+        ] {
+            assert!(
+                retirement.contains(statement),
+                "storage retirement migration must contain {statement}"
+            );
+        }
+        assert!(
+            migrations.contains("storage_access_ledger"),
+            "storage migration set must include the historical ledger and its retirement"
+        );
 
         let forbidden_parts_table = ["storage_multipart_upload", "_parts"].concat();
         assert!(
@@ -505,11 +532,6 @@ mod tests {
                 "GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;",
             ),
             (
-                "wyrd.storage_access_ledger",
-                "GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_app;",
-                "GRANT SELECT, INSERT ON wyrd.storage_access_ledger TO wyrd_platform_admin;",
-            ),
-            (
                 "wyrd.storage_idempotency_keys",
                 "GRANT SELECT, INSERT ON wyrd.storage_idempotency_keys TO wyrd_app;",
                 "GRANT SELECT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_platform_admin;",
@@ -545,27 +567,6 @@ mod tests {
                 "storage migrations must not leave broad grant shape: {forbidden}"
             );
         }
-
-        assert!(
-            migrations.contains(
-                "REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_app;"
-            ),
-            "ledger sequence must revoke inherited app privileges before narrow grant"
-        );
-        assert!(
-            migrations.contains(
-                "REVOKE ALL ON SEQUENCE wyrd.storage_access_ledger_id_seq FROM wyrd_platform_admin;"
-            ),
-            "ledger sequence must revoke inherited platform-admin privileges before narrow grant"
-        );
-        assert!(
-            migrations.contains(
-                "GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_app;"
-            ) && migrations.contains(
-                "GRANT USAGE, SELECT ON SEQUENCE wyrd.storage_access_ledger_id_seq TO wyrd_platform_admin;"
-            ),
-            "ledger inserts require narrow sequence usage grants"
-        );
     }
 
     #[test]
@@ -574,7 +575,6 @@ mod tests {
         let tenant_modules = [
             "multipart_uploads.rs",
             "artifact_metadata.rs",
-            "access_ledger.rs",
             "idempotency.rs",
         ];
 
@@ -596,19 +596,24 @@ mod tests {
         }
 
         let admin_dir = crate_dir.join("src/queries/storage/admin");
+        let multipart_admin_path = admin_dir.join("multipart_uploads.rs");
+        let multipart_admin_body = fs::read_to_string(&multipart_admin_path)
+            .expect("storage multipart admin query is readable");
         let admin_body = rust_files_under(&admin_dir)
             .into_iter()
+            .filter(|path| path != &multipart_admin_path)
             .map(|path| fs::read_to_string(path).expect("storage admin query is readable"))
             .collect::<Vec<_>>()
             .join("\n");
         let admin_checked = without_line_comments(&admin_body);
+        let multipart_admin_checked = without_line_comments(&multipart_admin_body);
 
         assert!(
-            admin_checked.contains("&PgPool"),
+            admin_checked.contains("&PgPool") && multipart_admin_checked.contains("&PgPool"),
             "storage admin queries must make their cross-tenant pool boundary explicit"
         );
         assert!(
-            !admin_checked.contains("TenantConn"),
+            !admin_checked.contains("TenantConn") && multipart_admin_checked.contains("TenantConn"),
             "storage admin query implementations must not pretend to be tenant-scoped"
         );
     }

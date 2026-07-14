@@ -17,11 +17,14 @@ wyrd-runtime = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 arrow = { workspace = true, features = ["ipc"] }
+chrono = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 secrecy = { workspace = true }
 base64 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]

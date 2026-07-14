@@ -140,23 +140,56 @@ pub const ERROR_TYPE: &str = "error.type";
 pub const GEN_AI_INPUT_MESSAGES: &str = "gen_ai.input.messages";
 /// Opt-in captured GenAI output messages.
 pub const GEN_AI_OUTPUT_MESSAGES: &str = "gen_ai.output.messages";
-/// Opt-in captured GenAI system instructions.
-///
-/// Single-segment suffix is intentional per the Wyrd GenAI semconv extension.
-/// The upstream OTel GenAI semconv does not yet define a canonical key for
-/// system instructions; track <https://github.com/open-telemetry/semantic-conventions>
-/// and rename if the spec stabilizes on a different key.
+/// Opt-in captured GenAI system instructions. Canonical in the current OTel
+/// GenAI semantic conventions.
 pub const GEN_AI_SYSTEM_INSTRUCTIONS: &str = "gen_ai.system_instructions";
 
 /// Retrieved documents used by a GenAI call.
 pub const GEN_AI_RETRIEVAL_DOCUMENTS: &str = "gen_ai.retrieval.documents";
 /// Retrieval query text.
 pub const GEN_AI_RETRIEVAL_QUERY_TEXT: &str = "gen_ai.retrieval.query.text";
+/// Retrieval top-k count.
+pub const GEN_AI_RETRIEVAL_TOP_K: &str = "gen_ai.retrieval.top_k";
 
-/// OpenAI API type.
-pub const GEN_AI_OPENAI_API_TYPE: &str = "gen_ai.openai.api.type";
-/// OpenAI service tier.
-pub const GEN_AI_OPENAI_SERVICE_TIER: &str = "gen_ai.openai.service_tier";
+/// Requested model reasoning effort level, such as `low`, `medium`, or `high`.
+pub const GEN_AI_REQUEST_REASONING_LEVEL: &str = "gen_ai.request.reasoning.level";
+/// Whether the conversation history was compacted before this call.
+pub const GEN_AI_CONVERSATION_COMPACTED: &str = "gen_ai.conversation.compacted";
+/// Version of the prompt used for this call.
+pub const GEN_AI_PROMPT_VERSION: &str = "gen_ai.prompt.version";
+
+/// Memory store identifier.
+pub const GEN_AI_MEMORY_STORE_ID: &str = "gen_ai.memory.store.id";
+/// Memory record identifier.
+pub const GEN_AI_MEMORY_RECORD_ID: &str = "gen_ai.memory.record.id";
+/// Number of memory records touched by the operation.
+pub const GEN_AI_MEMORY_RECORD_COUNT: &str = "gen_ai.memory.record.count";
+/// Memory query text.
+pub const GEN_AI_MEMORY_QUERY_TEXT: &str = "gen_ai.memory.query.text";
+/// Memory records payload (JSON).
+pub const GEN_AI_MEMORY_RECORDS: &str = "gen_ai.memory.records";
+
+/// OpenAI API type, such as `chat_completions` or `responses`. General OTel
+/// semantic-convention key in the `openai.*` namespace, without a `gen_ai.`
+/// prefix.
+pub const OPENAI_API_TYPE: &str = "openai.api.type";
+/// OpenAI requested service tier, such as `auto` or `default`. `openai.*`
+/// namespace.
+pub const OPENAI_REQUEST_SERVICE_TIER: &str = "openai.request.service_tier";
+/// OpenAI response service tier. `openai.*` namespace.
+pub const OPENAI_RESPONSE_SERVICE_TIER: &str = "openai.response.service_tier";
+/// OpenAI response system fingerprint. `openai.*` namespace.
+pub const OPENAI_RESPONSE_SYSTEM_FINGERPRINT: &str = "openai.response.system_fingerprint";
+
+/// MCP session identifier. `mcp.*` correlation namespace, without a `gen_ai.`
+/// prefix.
+pub const MCP_SESSION_ID: &str = "mcp.session.id";
+/// MCP method name. `mcp.*` namespace.
+pub const MCP_METHOD_NAME: &str = "mcp.method.name";
+/// MCP protocol version. `mcp.*` namespace.
+pub const MCP_PROTOCOL_VERSION: &str = "mcp.protocol.version";
+/// MCP resource URI. `mcp.*` namespace.
+pub const MCP_RESOURCE_URI: &str = "mcp.resource.uri";
 
 /// Event name for a GenAI evaluation result.
 pub const GEN_AI_EVALUATION_EVENT: &str = "gen_ai.evaluation.result";
@@ -230,10 +263,34 @@ pub const GEN_AI_KEYS: &[&str] = &[
     GEN_AI_SYSTEM_INSTRUCTIONS,
     GEN_AI_RETRIEVAL_DOCUMENTS,
     GEN_AI_RETRIEVAL_QUERY_TEXT,
-    GEN_AI_OPENAI_API_TYPE,
-    GEN_AI_OPENAI_SERVICE_TIER,
+    GEN_AI_RETRIEVAL_TOP_K,
+    GEN_AI_REQUEST_REASONING_LEVEL,
+    GEN_AI_CONVERSATION_COMPACTED,
+    GEN_AI_PROMPT_VERSION,
+    GEN_AI_MEMORY_STORE_ID,
+    GEN_AI_MEMORY_RECORD_ID,
+    GEN_AI_MEMORY_RECORD_COUNT,
+    GEN_AI_MEMORY_QUERY_TEXT,
+    GEN_AI_MEMORY_RECORDS,
 ];
 
 /// General OTel semantic convention keys that GenAI spans borrow from the
 /// OTel references section.
 pub const OTEL_REFERENCED_KEYS: &[&str] = &[SERVER_ADDRESS, SERVER_PORT, ERROR_TYPE];
+
+/// `openai.*` semantic convention keys tracked in typed columns by the trace
+/// surface. These live in OpenAI's own namespace, not under `gen_ai.`.
+pub const OPENAI_KEYS: &[&str] = &[
+    OPENAI_API_TYPE,
+    OPENAI_REQUEST_SERVICE_TIER,
+    OPENAI_RESPONSE_SERVICE_TIER,
+    OPENAI_RESPONSE_SYSTEM_FINGERPRINT,
+];
+
+/// `mcp.*` correlation keys tracked in typed columns by the trace surface.
+pub const MCP_KEYS: &[&str] = &[
+    MCP_SESSION_ID,
+    MCP_METHOD_NAME,
+    MCP_PROTOCOL_VERSION,
+    MCP_RESOURCE_URI,
+];

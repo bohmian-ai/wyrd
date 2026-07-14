@@ -15,6 +15,7 @@ pub mod drift_alerts;
 pub mod maintenance_leases;
 pub mod monitor;
 pub mod olap_catalog;
+pub mod olap_derivations;
 pub mod olap_query_jobs;
 pub mod profiles;
 pub mod queues;

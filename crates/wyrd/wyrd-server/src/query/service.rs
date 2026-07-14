@@ -24,7 +24,7 @@ use vala_bifrost::session::wyrd_session_context;
 use vala_bifrost::{BifrostNamespace, SchemaFingerprint};
 use vala_sql::TenantConn;
 use vala_sql::queries::olap_query_jobs::{NewQueryJob, enqueue_query_job, query_job_status};
-use wyrd_runtime::Permission;
+use wyrd_runtime::{Permission, PermissionVerdict};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::BifrostError as ValaError;
 use wyrd_spec::vala::api::{
@@ -36,6 +36,7 @@ use crate::AppState;
 use crate::audit;
 use crate::bifrost::convert;
 use crate::components::auth::Caller;
+use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::query::floor;
 
 /// Materialized sync-query result: the Arrow IPC stream plus the header metadata
@@ -65,23 +66,26 @@ pub(crate) async fn authorize_audited(
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdError> {
-    if caller.principal.effective_permissions.contains(&required) {
-        return Ok(());
+    match state
+        .authz
+        .permission_check
+        .check(&caller.principal, &required)
+    {
+        PermissionVerdict::Allow => Ok(()),
+        PermissionVerdict::Deny { reason } => {
+            let event = audit::audit_event(
+                caller,
+                operation,
+                resource,
+                &required.to_string(),
+                AuditDecision::Deny,
+                AuditResult::Failure,
+                "rbac permission denied",
+            );
+            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
+            Err(permission_deny_reason_to_wyrd(reason))
+        }
     }
-    let event = audit::audit_event(
-        caller,
-        operation,
-        resource,
-        &required.to_string(),
-        AuditDecision::Deny,
-        AuditResult::Failure,
-        "rbac permission denied",
-    );
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-    Err(WyrdError::PermissionDeniedRbac {
-        message: format!("caller lacks required permission {required}"),
-        details: json!({ "required": required }),
-    })
 }
 
 /// Map an engine Bifrost error to the public `WyrdError` via the single delegate.

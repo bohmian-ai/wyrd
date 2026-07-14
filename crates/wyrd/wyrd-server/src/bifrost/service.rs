@@ -15,10 +15,13 @@ use wyrd_spec::vala::api::{
     RegisterTableRequest, RegisterTableResponse, TableScopeWire,
 };
 
+use wyrd_runtime::PermissionVerdict;
+
 use crate::AppState;
 use crate::audit;
 use crate::bifrost::convert;
 use crate::components::auth::Caller;
+use crate::http::error::permission_deny_reason_to_wyrd;
 
 /// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
 fn map_engine_error(error: EngineBifrostError) -> WyrdError {
@@ -26,14 +29,13 @@ fn map_engine_error(error: EngineBifrostError) -> WyrdError {
 }
 
 /// Authorize the caller against a required permission before execution.
-fn authorize(caller: &Caller, required: Permission) -> Result<(), WyrdError> {
-    if caller.principal.effective_permissions.contains(&required) {
-        return Ok(());
-    }
-    Err(WyrdError::PermissionDeniedRbac {
-        message: format!("caller lacks required permission {required}"),
-        details: serde_json::json!({ "required": required }),
-    })
+fn authorize(state: &AppState, caller: &Caller, required: &Permission) -> Result<(), WyrdError> {
+    state
+        .authz
+        .permission_check
+        .check(&caller.principal, required)
+        .into_result()
+        .map_err(permission_deny_reason_to_wyrd)
 }
 
 /// Authorize, appending a `decision = deny` audit row (own tx) on refusal.
@@ -44,23 +46,26 @@ async fn authorize_audited(
     operation: &str,
     resource: &str,
 ) -> Result<(), WyrdError> {
-    if caller.principal.effective_permissions.contains(required) {
-        return Ok(());
+    match state
+        .authz
+        .permission_check
+        .check(&caller.principal, required)
+    {
+        PermissionVerdict::Allow => Ok(()),
+        PermissionVerdict::Deny { reason } => {
+            let event = audit::audit_event(
+                caller,
+                operation,
+                resource,
+                &required.to_string(),
+                AuditDecision::Deny,
+                AuditResult::Failure,
+                "rbac permission denied",
+            );
+            audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
+            Err(permission_deny_reason_to_wyrd(reason))
+        }
     }
-    let event = audit::audit_event(
-        caller,
-        operation,
-        resource,
-        &required.to_string(),
-        AuditDecision::Deny,
-        AuditResult::Failure,
-        "rbac permission denied",
-    );
-    audit::record_audit(state.postgres.vala_pool(), caller.data_tenant_id, &event).await?;
-    Err(WyrdError::PermissionDeniedRbac {
-        message: format!("caller lacks required permission {required}"),
-        details: serde_json::json!({ "required": required }),
-    })
 }
 
 /// Map the wire scope enum to the engine scope.
@@ -160,7 +165,7 @@ pub async fn list_tables(
     state: &AppState,
     caller: Caller,
 ) -> Result<Vec<BifrostTableEntry>, WyrdError> {
-    authorize(&caller, Permission::bifrost_table_read())?;
+    authorize(state, &caller, &Permission::bifrost_table_read())?;
     state
         .bifrost
         .list_tables(caller.data_tenant_id)
@@ -175,7 +180,7 @@ pub async fn describe_table(
     namespace: String,
     name: String,
 ) -> Result<BifrostTableDescription, WyrdError> {
-    authorize(&caller, Permission::bifrost_table_read())?;
+    authorize(state, &caller, &Permission::bifrost_table_read())?;
     let ns = convert::namespace_from_wire(&namespace)?;
     state
         .bifrost

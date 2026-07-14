@@ -14,7 +14,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use vala_sql::TenantConn;
 use vala_sql::queries::audit_outbox::{
-    AuditEntryHashInput, entry_hash_from_cols, shipped_outbox_refs,
+    AuditEntryHashInput, entry_hash_from_cols_with_detail, shipped_outbox_refs,
 };
 use vala_sql::queries::audit_seal::list_checkpoints;
 use wyrd_auth_issue::AuditSealKey;
@@ -191,7 +191,7 @@ async fn recomputed_entry_hashes_by_seq(
         .sql(
             "SELECT seq, prev_hash, request_id, trace_id, operation, resource, \
              audit_card_ref, principal_id, principal_kind, auth_method, permission, \
-             decision, result, payload_summary \
+             decision, result, payload_summary, detail \
              FROM audit_log ORDER BY seq",
         )
         .await
@@ -218,6 +218,7 @@ async fn recomputed_entry_hashes_by_seq(
         let decision = str_col(batch, "decision")?;
         let result = str_col(batch, "result")?;
         let payload_summary = str_col(batch, "payload_summary")?;
+        let detail = str_col(batch, "detail")?;
 
         for i in 0..seq.len() {
             if seq.is_null(i) {
@@ -230,22 +231,25 @@ async fn recomputed_entry_hashes_by_seq(
             })?;
             let pid_bytes = *pid.as_bytes();
 
-            let recomputed = entry_hash_from_cols(AuditEntryHashInput {
-                prev_hash: &prev_bytes,
-                seq: seq.value(i),
-                request_id: request_id.value(i),
-                trace_id: opt_str(trace_id, i),
-                operation: operation.value(i),
-                resource: resource.value(i),
-                card_ref: opt_str(audit_card_ref, i),
-                principal_id_bytes: &pid_bytes,
-                principal_kind: principal_kind.value(i),
-                auth_method: auth_method.value(i),
-                permission: permission.value(i),
-                decision: decision.value(i),
-                result: result.value(i),
-                payload_summary: payload_summary.value(i),
-            });
+            let recomputed = entry_hash_from_cols_with_detail(
+                AuditEntryHashInput {
+                    prev_hash: &prev_bytes,
+                    seq: seq.value(i),
+                    request_id: request_id.value(i),
+                    trace_id: opt_str(trace_id, i),
+                    operation: operation.value(i),
+                    resource: resource.value(i),
+                    card_ref: opt_str(audit_card_ref, i),
+                    principal_id_bytes: &pid_bytes,
+                    principal_kind: principal_kind.value(i),
+                    auth_method: auth_method.value(i),
+                    permission: permission.value(i),
+                    decision: decision.value(i),
+                    result: result.value(i),
+                    payload_summary: payload_summary.value(i),
+                },
+                opt_str(detail, i),
+            );
             rows.push((seq.value(i), recomputed.to_vec()));
         }
     }

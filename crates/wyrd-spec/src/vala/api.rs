@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
+pub use crate::vala::audit_detail::{
+    AuditDetail, AuditDetailValueError, BatchId, ScopeHash, StoragePath,
+    audit_detail_canonical_json,
+};
 
 /// Bifrost table-identifier newtype.
 ///
@@ -1369,6 +1373,55 @@ pub struct AuditEvent {
     pub result: AuditResult,
     /// Redacted summary of the operation payload.
     pub payload_summary: String,
+    /// Optional typed, redacted operation detail used as the canonical hash preimage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<AuditDetail>,
+}
+
+impl AuditEvent {
+    /// Constructs an audit event from the required operation fields.
+    #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the constructor mirrors the complete audit wire shape"
+    )]
+    pub fn new(
+        request_id: RequestId,
+        trace_id: Option<String>,
+        operation: String,
+        resource: String,
+        card_ref: Option<CardRef>,
+        principal_id: PrincipalId,
+        principal_kind: PrincipalKindTag,
+        auth_method: AuthMethod,
+        permission: String,
+        decision: AuditDecision,
+        result: AuditResult,
+        payload_summary: String,
+    ) -> Self {
+        Self {
+            request_id,
+            trace_id,
+            operation,
+            resource,
+            card_ref,
+            principal_id,
+            principal_kind,
+            auth_method,
+            permission,
+            decision,
+            result,
+            payload_summary,
+            detail: None,
+        }
+    }
+
+    /// Attach typed, already-redacted detail to this event.
+    #[must_use]
+    pub fn with_detail(mut self, detail: AuditDetail) -> Self {
+        self.detail = Some(detail);
+        self
+    }
 }
 
 #[cfg(test)]

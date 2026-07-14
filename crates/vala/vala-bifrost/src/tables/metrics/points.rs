@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{boolean, float64, int32, ts_us_utc, uint32, uint64, utf8, utf8_view};
+use crate::tables::fields::{boolean, float64, int32, int64, ts_us_utc, uint32, utf8, utf8_view};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -26,14 +26,14 @@ impl DomainTable for PointsTable {
             boolean("is_monotonic", true),
             uint32("flags", true),
             float64("value", true),
-            uint64("count", true),
+            int64("count", true),
             float64("sum", true),
             float64("min", true),
             float64("max", true),
             utf8_view("bucket_counts", true),
             utf8_view("explicit_bounds", true),
             int32("scale", true),
-            uint64("zero_count", true),
+            int64("zero_count", true),
             float64("zero_threshold", true),
             utf8_view("positive_buckets", true),
             utf8_view("negative_buckets", true),

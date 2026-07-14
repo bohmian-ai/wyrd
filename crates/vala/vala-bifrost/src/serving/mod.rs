@@ -12,6 +12,7 @@
 //! - `derivations` — cross-table derivation worker (slice 05b)
 
 pub mod audit_seal;
+pub mod derivations;
 pub mod projections;
 pub mod repair;
 pub mod session;

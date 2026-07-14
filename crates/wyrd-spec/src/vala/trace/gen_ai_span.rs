@@ -204,13 +204,63 @@ pub struct GenAiSpanRecord {
     /// `gen_ai.retrieval.query.text` - retrieval query string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_query_text: Option<String>,
+    /// `gen_ai.retrieval.top_k` - retrieval top-k count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retrieval_top_k: Option<u32>,
 
-    /// `gen_ai.openai.api.type`.
+    /// `gen_ai.request.reasoning.level` - requested reasoning effort level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_reasoning_level: Option<String>,
+    /// `gen_ai.conversation.compacted` - whether the conversation history was
+    /// compacted before this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_compacted: Option<bool>,
+    /// `gen_ai.prompt.version` - version of the prompt used for this call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_version: Option<String>,
+
+    /// `gen_ai.memory.store.id` - memory store identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_store_id: Option<String>,
+    /// `gen_ai.memory.record.id` - memory record identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_record_id: Option<String>,
+    /// `gen_ai.memory.record.count` - number of memory records touched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_record_count: Option<u32>,
+    /// `gen_ai.memory.query.text` - memory query text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_query_text: Option<String>,
+    /// `gen_ai.memory.records` - memory records payload. Opt-in and redactable
+    /// at producer or ingest boundaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_records: Option<serde_json::Value>,
+
+    /// `openai.api.type`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_api_type: Option<String>,
-    /// `gen_ai.openai.service_tier`.
+    /// `openai.request.service_tier`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub openai_service_tier: Option<String>,
+    pub openai_request_service_tier: Option<String>,
+    /// `openai.response.service_tier`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_response_service_tier: Option<String>,
+    /// `openai.response.system_fingerprint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_response_system_fingerprint: Option<String>,
+
+    /// `mcp.session.id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_session_id: Option<String>,
+    /// `mcp.method.name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_method_name: Option<String>,
+    /// `mcp.protocol.version`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_protocol_version: Option<String>,
+    /// `mcp.resource.uri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_resource_uri: Option<String>,
 
     /// Extracted `gen_ai.evaluation.result` events on the source span.
     #[serde(default)]
@@ -281,6 +331,7 @@ impl GenAiSpanRecord {
             ("tool_call_arguments", &self.tool_call_arguments),
             ("tool_call_result", &self.tool_call_result),
             ("retrieval_documents", &self.retrieval_documents),
+            ("memory_records", &self.memory_records),
         ] {
             if let Some(v) = value {
                 let size = serde_json::to_vec(v).map(|b| b.len()).unwrap_or(0);

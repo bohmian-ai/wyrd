@@ -206,8 +206,14 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
         Some(Arc::new(recovery_pool)),
     )
     .await?;
+    let bifrost = Arc::new(bifrost);
 
-    Ok(AppState::new(postgres, storage, Arc::new(bifrost)))
+    // Provision the pre-declared OLAP domain tables (traces.spans, genai.*, ...)
+    // so the ingest and query paths have their physical Iceberg tables. Idempotent
+    // and append-only — a no-op after first boot; fails closed on schema drift.
+    vala_bifrost::tables::register_all(&bifrost).await?;
+
+    Ok(AppState::new(postgres, storage, bifrost))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -957,6 +963,31 @@ pub fn spawn_audit_seal_worker(
     });
 
     Some(handle)
+}
+
+/// Spawn the genai derivation worker (slice 05b).
+///
+/// Periodically projects committed `gen_ai.*` span attributes from
+/// `traces.spans` into the `genai.*` fact tables, watermarked in
+/// `vala.olap_derivations`. Returns `None` when the operator pool
+/// (BYPASSRLS) is unavailable — cross-tenant tenant enumeration requires it.
+#[must_use]
+pub fn spawn_genai_derivation_worker(
+    state: &crate::state::AppState,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(op) = state.postgres.operator_pool() else {
+        tracing::warn!("genai derivation worker skipped: operator pool unavailable");
+        return None;
+    };
+    let catalog = Arc::clone(&state.bifrost);
+    let pool = state.postgres.vala_pool().clone();
+
+    Some(
+        vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
+            catalog, pool, op, shutdown,
+        ),
+    )
 }
 
 /// Ensure the recovery pool is present in production deployments.

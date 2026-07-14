@@ -11,7 +11,6 @@
 pub mod actor;
 pub mod api_version;
 pub mod auth;
-pub mod authz;
 pub mod card;
 pub mod envelope;
 pub mod error;
@@ -31,7 +30,6 @@ pub mod storage;
 pub mod trace;
 pub mod vala;
 
-pub use authz::{Principal, Role, Scope};
 pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,

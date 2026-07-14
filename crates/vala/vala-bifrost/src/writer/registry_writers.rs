@@ -227,6 +227,7 @@ mod tests {
         GroupCommitHandle {
             sender: std::sync::Arc::new(sender),
             table_fqn: "test.table".to_string(),
+            table_uid: [0u8; 16],
         }
     }
 

@@ -33,6 +33,7 @@ impl DomainTable for AuditLogTable {
             utf8("decision", false),
             utf8("result", false),
             utf8("payload_summary", false),
+            utf8("detail", true),
             Field::new("created_at_us", DataType::Int64, false),
         ]
     }

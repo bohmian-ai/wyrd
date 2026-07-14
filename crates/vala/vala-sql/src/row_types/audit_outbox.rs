@@ -41,6 +41,8 @@ pub struct AuditOutboxRow {
     pub result: String,
     /// Redacted operation payload summary.
     pub payload_summary: String,
+    /// Canonical JSON detail for the audited operation, when present.
+    pub detail: Option<String>,
     /// Wall-clock append time.
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// Relay batch idempotency key stamped at claim time; `None` for rows not yet

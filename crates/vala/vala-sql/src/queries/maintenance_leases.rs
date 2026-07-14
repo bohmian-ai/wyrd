@@ -82,6 +82,14 @@ pub async fn try_acquire_lease(
 ) -> Result<Option<i64>, SqlError> {
     // Dynamic query is intentional: maintenance leases are a cross-tenant
     // control-plane table accessed via the operator pool (BYPASSRLS).
+    //
+    // The WHERE clause also allows re-acquisition by the SAME owner (equal
+    // `owner`), which is how back-to-back ticks from one process (NOTIFY →
+    // fallback → NOTIFY, …) keep re-taking their own lease without the second
+    // acquire silently no-op'ing. Same-owner re-acquire bumps the fencing token,
+    // so any lingering copy of the old token can no longer renew (fencing check
+    // in `renew_lease` requires (owner, fencing_token) match). A different
+    // owner is still blocked until the current owner's lease expires.
     let token: Option<i64> = sqlx::query_scalar(
         r#"
         INSERT INTO vala.maintenance_leases
@@ -95,6 +103,7 @@ pub async fn try_acquire_lease(
                 expires_at    = now() + ($3 * interval '1 second'),
                 heartbeat_at  = now()
             WHERE vala.maintenance_leases.expires_at < now()
+               OR vala.maintenance_leases.owner    = EXCLUDED.owner
         RETURNING fencing_token
         "#,
     )

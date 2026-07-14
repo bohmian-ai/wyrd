@@ -1,0 +1,527 @@
+//! Typed, redacted detail carried by the transactional audit event.
+
+use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use crate::auth::{PrincipalId, PrincipalKindTag};
+use crate::envelope::{CardKind, SpecHash};
+use crate::ids::CardUid;
+use crate::origin::Origin;
+use crate::reference::CardRef;
+use crate::vala::api::AuditDecision;
+
+/// Error returned when an audit-detail identifier is empty, malformed, or
+/// contains a value that must never enter an audit record.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuditDetailValueError {
+    /// The value was empty after boundary normalization.
+    #[error("{field} must not be empty")]
+    Empty {
+        /// The audit-detail field being validated.
+        field: &'static str,
+    },
+    /// The value contains a control character.
+    #[error("{field} contains a control character")]
+    ControlCharacter {
+        /// The audit-detail field being validated.
+        field: &'static str,
+    },
+    /// The value resembles a credential or other secret.
+    #[error("{field} contains a secret-like value")]
+    SecretLike {
+        /// The audit-detail field being validated.
+        field: &'static str,
+    },
+}
+
+macro_rules! audit_detail_value {
+    ($name:ident, $field:literal, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
+        #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+        #[serde(transparent)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Construct a normalized, non-secret audit-detail value.
+            ///
+            /// # Errors
+            /// Returns an error when the value is empty, contains controls, or
+            /// resembles a credential.
+            pub fn new(value: impl Into<String>) -> Result<Self, AuditDetailValueError> {
+                let value = value.into();
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(AuditDetailValueError::Empty { field: $field });
+                }
+                if value.chars().any(char::is_control) {
+                    return Err(AuditDetailValueError::ControlCharacter { field: $field });
+                }
+                if is_secret_like(value) {
+                    return Err(AuditDetailValueError::SecretLike { field: $field });
+                }
+                Ok(Self(value.to_owned()))
+            }
+
+            /// Borrow the normalized value.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+audit_detail_value!(
+    ScopeHash,
+    "scope_hash",
+    "Stable, non-secret digest identifying a card scope."
+);
+audit_detail_value!(
+    StoragePath,
+    "storage_path",
+    "Logical, non-secret path identifying stored audit data."
+);
+audit_detail_value!(
+    BatchId,
+    "batch_id",
+    "Idempotent, non-secret identifier for an ingest batch."
+);
+
+fn is_secret_like(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("-----begin ")
+        || lower.starts_with("bearer ")
+        || lower.starts_with("sk-")
+        || lower.starts_with("pk-")
+        || lower.starts_with("eyj")
+        || lower.contains("api_key=")
+        || lower.contains("apikey=")
+        || lower.contains("authorization=")
+        || lower.contains("password=")
+        || lower.contains("secret=")
+        || lower.contains("token=")
+        || lower.contains("/secrets/")
+}
+
+/// Closed operation names for storage lifecycle audit rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StorageAuditOperation {
+    /// An upload session was durably created.
+    SessionCreated,
+    /// The object-store backend was initialized.
+    BackendInitialized,
+    /// The object-store backend initialization failed.
+    BackendFailed,
+    /// An upload completed.
+    Complete,
+    /// An upload was aborted.
+    Abort,
+    /// A download was initialized.
+    Download,
+    /// A stale upload was reclaimed.
+    Reclaimed,
+}
+
+/// Closed stable codes used for audit failures and denial reasons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AuditErrorCode {
+    /// The caller lacked the required permission.
+    PermissionDenied,
+    /// The audit outbox was unavailable.
+    AuditUnavailable,
+    /// The supplied token was invalid.
+    InvalidToken,
+    /// The requested resource was not found.
+    NotFound,
+    /// The operation failed in the storage backend.
+    StorageBackendFailure,
+    /// The operation failed validation.
+    ValidationFailed,
+}
+
+/// Closed card-registration operation names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CardRegistrationOperation {
+    /// A card was registered.
+    Register,
+    /// A card was updated.
+    Update,
+    /// A card was deleted.
+    Delete,
+}
+
+/// Closed card-registration outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CardRegistrationOutcome {
+    /// A new card was created.
+    Created,
+    /// The registration was an idempotent no-op.
+    IdempotentNoop,
+    /// The registration was deduplicated.
+    Deduplicated,
+}
+
+/// Closed card-scope mint operation names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CardScopeMintKind {
+    /// Minted during API-key exchange.
+    ApiKeyExchange,
+    /// Minted during token refresh.
+    Refresh,
+    /// Minted for delegation.
+    Delegation,
+    /// Minted during JWT bearer exchange.
+    JwtBearer,
+}
+
+/// Structured detail for one auditable operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditDetail {
+    /// Authentication failure metadata; credentials are never representable here.
+    AuthFailure {
+        /// Stable reason for the authentication refusal.
+        error_code: AuditErrorCode,
+    },
+    /// API-key issuance metadata; the key value is never representable here.
+    CredentialIssuance {
+        /// Principal receiving the credential.
+        target_principal_id: PrincipalId,
+        /// Identifier of the issued API key, not its secret value.
+        api_key_id: uuid::Uuid,
+        /// Credential expiry.
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Token exchange metadata; bearer values are never representable here.
+    TokenExchange {
+        /// Subject principal in the exchanged token.
+        subject_principal_id: PrincipalId,
+        /// Principal that performed the exchange.
+        actor_principal_id: PrincipalId,
+        /// Typed delegation chain.
+        delegation_chain: Vec<CardRef>,
+        /// Token expiry.
+        expires_at: chrono::DateTime<chrono::Utc>,
+    },
+    /// Refresh-token family revocation metadata.
+    RefreshFamilyRevocation {
+        /// Principal whose refresh-token family was revoked.
+        principal_id: PrincipalId,
+        /// Principal kind owning the family.
+        principal_kind: PrincipalKindTag,
+        /// Number of active refresh rows revoked.
+        revoked_token_count: u64,
+    },
+    /// Authorization decision metadata.
+    AuthzCheck {
+        /// Calling principal.
+        caller_principal_id: PrincipalId,
+        /// Called principal.
+        callee_principal_id: PrincipalId,
+        /// Typed delegation chain.
+        delegation_chain: Vec<CardRef>,
+        /// Authorization result.
+        decision: AuditDecision,
+        /// Stable denial reason, present only for a denial.
+        deny_reason: Option<AuditErrorCode>,
+    },
+    /// Card registration metadata.
+    CardRegistration {
+        /// Registered card UID.
+        card_uid: CardUid,
+        /// Registered card kind.
+        card_kind: CardKind,
+        /// Registration operation.
+        operation: CardRegistrationOperation,
+        /// Registration outcome, when applicable.
+        outcome: Option<CardRegistrationOutcome>,
+        /// Prior spec hash, when applicable.
+        before_spec_hash: Option<SpecHash>,
+        /// Resulting spec hash, when applicable.
+        after_spec_hash: Option<SpecHash>,
+    },
+    /// Card-scope mint metadata; scope members are references, never secrets.
+    CardScopeMint {
+        /// How the scope was minted.
+        mint_kind: CardScopeMintKind,
+        /// Root card reference.
+        root_card_ref: CardRef,
+        /// Stable scope digest.
+        scope_hash: Option<ScopeHash>,
+        /// Number of scope members.
+        scope_member_count: Option<u32>,
+        /// Typed scope members.
+        scope_members: Vec<CardRef>,
+        /// Stable failure code, present only on failure.
+        failure_code: Option<AuditErrorCode>,
+    },
+    /// Storage lifecycle transition metadata.
+    Storage {
+        /// Storage transition.
+        operation: StorageAuditOperation,
+        /// Multipart upload identifier, when applicable.
+        upload_id: Option<uuid::Uuid>,
+        /// Logical storage path.
+        storage_path: StoragePath,
+        /// Closed backend identifier.
+        backend: StorageBackend,
+        /// HTTP/backend status code.
+        status_code: u16,
+        /// Stable failure code, when applicable.
+        error_code: Option<AuditErrorCode>,
+    },
+    /// Ingest batch metadata.
+    Ingest {
+        /// Code-origin of the emitting card or agent.
+        origin: Origin,
+        /// Idempotent batch identifier.
+        batch_id: BatchId,
+        /// Destination Bifrost table.
+        table: crate::vala::api::BifrostTableName,
+        /// Number of records in the batch.
+        record_count: u64,
+        /// Ingest authorization decision.
+        decision: AuditDecision,
+    },
+}
+
+/// Closed storage backend identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum StorageBackend {
+    /// Local filesystem backend.
+    Local,
+    /// Amazon S3 backend.
+    S3,
+    /// Google Cloud Storage backend.
+    Gcs,
+    /// Azure Blob Storage backend.
+    Azure,
+}
+
+/// Serialize detail into the deterministic JSON string used as the audit hash preimage.
+#[must_use]
+pub fn audit_detail_canonical_json(detail: &AuditDetail) -> String {
+    serde_jcs::to_string(detail).expect("AuditDetail is always JSON-serializable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AuditDetail, AuditDetailValueError, AuditErrorCode, BatchId, ScopeHash,
+        StorageAuditOperation, StoragePath, audit_detail_canonical_json,
+    };
+    use crate::auth::{PrincipalId, PrincipalKindTag};
+    use crate::origin::{CommitSha, Origin};
+    use crate::request_id::RequestId;
+    use crate::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostTableName};
+
+    #[test]
+    fn canonical_json_is_compact_and_stable() {
+        let detail = AuditDetail::Storage {
+            operation: StorageAuditOperation::BackendFailed,
+            upload_id: None,
+            storage_path: StoragePath::new("cards/a").expect("valid path"),
+            backend: super::StorageBackend::S3,
+            status_code: 503,
+            error_code: Some(AuditErrorCode::StorageBackendFailure),
+        };
+        assert_eq!(
+            audit_detail_canonical_json(&detail),
+            r#"{"backend":"s3","error_code":"STORAGE_BACKEND_FAILURE","kind":"storage","operation":"backend_failed","status_code":503,"storage_path":"cards/a","upload_id":null}"#
+        );
+        assert!(!audit_detail_canonical_json(&detail).contains(' '));
+    }
+
+    #[test]
+    fn all_detail_variants_round_trip() {
+        let origin = Origin {
+            repo: "github.com/wyrd-ai/wyrd".to_string(),
+            commit: CommitSha::new("0123456").expect("valid commit"),
+            path: Some("cards/agent.yaml".to_string()),
+            dirty: false,
+        };
+        let detail = AuditDetail::Ingest {
+            origin,
+            batch_id: BatchId::new("batch-1").expect("valid batch id"),
+            table: BifrostTableName::new("vala.events"),
+            record_count: 2,
+            decision: AuditDecision::Allow,
+        };
+        let value = serde_json::to_value(&detail).expect("serialize");
+        let back: AuditDetail = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(detail, back);
+        let _ = PrincipalId::new(uuid::Uuid::now_v7());
+    }
+
+    #[test]
+    fn constructors_normalize_and_reject_secret_like_values() {
+        assert_eq!(
+            StoragePath::new("  cards/a  ")
+                .expect("valid path")
+                .as_str(),
+            "cards/a"
+        );
+        assert!(matches!(
+            ScopeHash::new("Bearer very-secret"),
+            Err(AuditDetailValueError::SecretLike {
+                field: "scope_hash"
+            })
+        ));
+        assert!(matches!(
+            StoragePath::new("/var/run/secrets/wyrd/api-key"),
+            Err(AuditDetailValueError::SecretLike {
+                field: "storage_path"
+            })
+        ));
+        assert!(matches!(
+            BatchId::new("token=plaintext"),
+            Err(AuditDetailValueError::SecretLike { field: "batch_id" })
+        ));
+    }
+
+    #[test]
+    fn serde_cannot_bypass_secret_classification() {
+        for (field, value) in [
+            ("scope_hash", serde_json::json!("api_key=plaintext")),
+            ("storage_path", serde_json::json!("Bearer plaintext")),
+            ("batch_id", serde_json::json!("password=plaintext")),
+        ] {
+            let json = match field {
+                "scope_hash" => serde_json::json!({
+                    "kind": "card_scope_mint",
+                    "mint_kind": "refresh",
+                    "root_card_ref": {"kind": "Agent", "name": "worker", "version": "1.0.0", "space": "prod"},
+                    "scope_hash": value,
+                    "scope_members": []
+                }),
+                "storage_path" => serde_json::json!({
+                    "kind": "storage",
+                    "operation": "complete",
+                    "storage_path": value,
+                    "backend": "s3",
+                    "status_code": 200
+                }),
+                _ => serde_json::json!({
+                    "kind": "ingest",
+                    "origin": {"repo": "github.com/wyrd-ai/wyrd", "commit": "0123456", "dirty": false},
+                    "batch_id": value,
+                    "table": "vala.events",
+                    "record_count": 1,
+                    "decision": "allow"
+                }),
+            };
+            assert!(
+                serde_json::from_value::<AuditDetail>(json).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_detail_golden_vectors_cover_all_variants_and_nested_values() {
+        let vectors = [
+            (
+                r#"{"expires_at":"2026-01-02T03:04:05Z","kind":"credential_issuance","target_principal_id":"00000000-0000-0000-0000-000000000001","api_key_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"api_key_id":"00000000-0000-0000-0000-000000000002","expires_at":"2026-01-02T03:04:05Z","kind":"credential_issuance","target_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
+            ),
+            (
+                r#"{"kind":"token_exchange","expires_at":"2026-01-02T03:04:05Z","delegation_chain":[{"space":"prod","version":"1.0.0","name":"worker","kind":"Agent"}],"actor_principal_id":"00000000-0000-0000-0000-000000000001","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+                r#"{"actor_principal_id":"00000000-0000-0000-0000-000000000001","delegation_chain":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}],"expires_at":"2026-01-02T03:04:05Z","kind":"token_exchange","subject_principal_id":"00000000-0000-0000-0000-000000000002"}"#,
+            ),
+            (
+                r#"{"deny_reason":"PERMISSION_DENIED","delegation_chain":[],"decision":"deny","callee_principal_id":"00000000-0000-0000-0000-000000000002","kind":"authz_check","caller_principal_id":"00000000-0000-0000-0000-000000000001"}"#,
+                r#"{"callee_principal_id":"00000000-0000-0000-0000-000000000002","caller_principal_id":"00000000-0000-0000-0000-000000000001","decision":"deny","delegation_chain":[],"deny_reason":"PERMISSION_DENIED","kind":"authz_check"}"#,
+            ),
+            (
+                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","operation":"register","kind":"card_registration","card_kind":"Agent","outcome":"created","before_spec_hash":null}"#,
+                r#"{"after_spec_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","before_spec_hash":null,"card_kind":"Agent","card_uid":"01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00","kind":"card_registration","operation":"register","outcome":"created"}"#,
+            ),
+            (
+                r#"{"scope_members":[{"kind":"Agent","name":"worker","version":"1.0.0","space":"prod"}],"root_card_ref":{"space":"prod","name":"root","version":"1.0.0","kind":"Agent"},"scope_hash":"scope-digest","mint_kind":"refresh","kind":"card_scope_mint","scope_member_count":1,"failure_code":null}"#,
+                r#"{"failure_code":null,"kind":"card_scope_mint","mint_kind":"refresh","root_card_ref":{"kind":"Agent","name":"root","space":"prod","version":"1.0.0"},"scope_hash":"scope-digest","scope_member_count":1,"scope_members":[{"kind":"Agent","name":"worker","space":"prod","version":"1.0.0"}]}"#,
+            ),
+            (
+                r#"{"status_code":200,"storage_path":" cards/a ","backend":"s3","operation":"complete","kind":"storage","upload_id":null,"error_code":null}"#,
+                r#"{"backend":"s3","error_code":null,"kind":"storage","operation":"complete","status_code":200,"storage_path":"cards/a","upload_id":null}"#,
+            ),
+            (
+                r#"{"record_count":2,"table":"vala.events","decision":"allow","batch_id":"batch-1","origin":{"dirty":false,"path":"cards/agent.yaml","commit":"0123456","repo":"github.com/wyrd-ai/wyrd"},"kind":"ingest"}"#,
+                r#"{"batch_id":"batch-1","decision":"allow","kind":"ingest","origin":{"commit":"0123456","path":"cards/agent.yaml","repo":"github.com/wyrd-ai/wyrd"},"record_count":2,"table":"vala.events"}"#,
+            ),
+        ];
+
+        for (input, expected) in vectors {
+            let detail: AuditDetail = serde_json::from_str(input).expect("golden input");
+            assert_eq!(audit_detail_canonical_json(&detail), expected);
+        }
+    }
+
+    #[test]
+    fn audit_event_golden_shape_distinguishes_absent_and_present_detail() {
+        let event = AuditEvent::new(
+            RequestId::now_v7(),
+            None,
+            "bifrost.ingest".to_owned(),
+            "vala.events".to_owned(),
+            None,
+            PrincipalId::new(uuid::Uuid::nil()),
+            PrincipalKindTag::User,
+            AuthMethod::Internal,
+            "bifrost:write".to_owned(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "accepted".to_owned(),
+        );
+        let absent = serde_json::to_value(&event).expect("serialize absent detail");
+        assert!(absent.get("detail").is_none());
+
+        let present = event.with_detail(AuditDetail::Storage {
+            operation: StorageAuditOperation::Complete,
+            upload_id: None,
+            storage_path: StoragePath::new("cards/a").expect("valid path"),
+            backend: super::StorageBackend::S3,
+            status_code: 200,
+            error_code: None,
+        });
+        assert_eq!(
+            serde_json::to_value(present).expect("serialize present detail")["detail"]["kind"],
+            "storage"
+        );
+    }
+}

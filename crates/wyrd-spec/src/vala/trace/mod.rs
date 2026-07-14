@@ -410,12 +410,39 @@ mod attributes_tests {
 
     #[test]
     fn gen_ai_keys_count_locked() {
-        assert_eq!(GEN_AI_KEYS.len(), 47);
+        assert_eq!(GEN_AI_KEYS.len(), 54);
     }
 
     #[test]
     fn otel_referenced_keys_count_locked() {
         assert_eq!(OTEL_REFERENCED_KEYS.len(), 3);
+    }
+
+    #[test]
+    fn openai_keys_count_locked() {
+        assert_eq!(OPENAI_KEYS.len(), 4);
+        for key in OPENAI_KEYS {
+            assert!(
+                key.starts_with("openai."),
+                "{key} not in openai.* namespace"
+            );
+            assert!(
+                !GEN_AI_KEYS.contains(key),
+                "{key} must not also be in GEN_AI_KEYS"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_keys_count_locked() {
+        assert_eq!(MCP_KEYS.len(), 4);
+        for key in MCP_KEYS {
+            assert!(key.starts_with("mcp."), "{key} not in mcp.* namespace");
+            assert!(
+                !GEN_AI_KEYS.contains(key),
+                "{key} must not also be in GEN_AI_KEYS"
+            );
+        }
     }
 
     #[test]
@@ -1939,8 +1966,23 @@ mod gen_ai_span_record_tests {
             tool_call_result: None,
             retrieval_documents: None,
             retrieval_query_text: None,
+            retrieval_top_k: None,
+            request_reasoning_level: None,
+            conversation_compacted: None,
+            prompt_version: None,
+            memory_store_id: None,
+            memory_record_id: None,
+            memory_record_count: None,
+            memory_query_text: None,
+            memory_records: None,
             openai_api_type: None,
-            openai_service_tier: None,
+            openai_request_service_tier: None,
+            openai_response_service_tier: None,
+            openai_response_system_fingerprint: None,
+            mcp_session_id: None,
+            mcp_method_name: None,
+            mcp_protocol_version: None,
+            mcp_resource_uri: None,
             eval_results: vec![],
             extra: serde_json::Map::new(),
         }
@@ -2021,8 +2063,23 @@ mod gen_ai_span_record_tests {
             tool_call_result: None,
             retrieval_documents: None,
             retrieval_query_text: None,
+            retrieval_top_k: None,
+            request_reasoning_level: None,
+            conversation_compacted: None,
+            prompt_version: None,
+            memory_store_id: None,
+            memory_record_id: None,
+            memory_record_count: None,
+            memory_query_text: None,
+            memory_records: None,
             openai_api_type: None,
-            openai_service_tier: None,
+            openai_request_service_tier: None,
+            openai_response_service_tier: None,
+            openai_response_system_fingerprint: None,
+            mcp_session_id: None,
+            mcp_method_name: None,
+            mcp_protocol_version: None,
+            mcp_resource_uri: None,
             eval_results: vec![],
             extra: serde_json::Map::new(),
         };
@@ -2341,8 +2398,15 @@ mod key_array_sync_tests {
             GEN_AI_SYSTEM_INSTRUCTIONS,
             GEN_AI_RETRIEVAL_DOCUMENTS,
             GEN_AI_RETRIEVAL_QUERY_TEXT,
-            GEN_AI_OPENAI_API_TYPE,
-            GEN_AI_OPENAI_SERVICE_TIER,
+            GEN_AI_RETRIEVAL_TOP_K,
+            GEN_AI_REQUEST_REASONING_LEVEL,
+            GEN_AI_CONVERSATION_COMPACTED,
+            GEN_AI_PROMPT_VERSION,
+            GEN_AI_MEMORY_STORE_ID,
+            GEN_AI_MEMORY_RECORD_ID,
+            GEN_AI_MEMORY_RECORD_COUNT,
+            GEN_AI_MEMORY_QUERY_TEXT,
+            GEN_AI_MEMORY_RECORDS,
         ];
 
         for key in &declared {
@@ -2747,8 +2811,23 @@ mod otel_proto_parity_tests {
             tool_call_result: None,
             retrieval_documents: None,
             retrieval_query_text: None,
+            retrieval_top_k: None,
+            request_reasoning_level: None,
+            conversation_compacted: None,
+            prompt_version: None,
+            memory_store_id: None,
+            memory_record_id: None,
+            memory_record_count: None,
+            memory_query_text: None,
+            memory_records: None,
             openai_api_type: None,
-            openai_service_tier: None,
+            openai_request_service_tier: None,
+            openai_response_service_tier: None,
+            openai_response_system_fingerprint: None,
+            mcp_session_id: None,
+            mcp_method_name: None,
+            mcp_protocol_version: None,
+            mcp_resource_uri: None,
             eval_results: vec![],
             extra: serde_json::Map::new(),
         };

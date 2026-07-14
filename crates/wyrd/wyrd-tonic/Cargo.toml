@@ -26,12 +26,18 @@ optional = true
 workspace = true
 optional = true
 
+# OTLP collector proto surface (server-side tonic codegen). Gated behind the
+# `server` feature so the client tier stays axum-free.
+[dependencies.opentelemetry-proto]
+workspace = true
+optional = true
+
 [build-dependencies]
 tonic-build = { workspace = true }
 
 [features]
 default = []
-server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server"]
+server = ["dep:tonic-reflection", "dep:tonic-health", "tonic/server", "dep:opentelemetry-proto"]
 # Marker feature: opts the generated `wyrd::v1` client stub into codegen (see
 # build.rs). No extra tonic surface needed — the client rides the default
 # `channel` transport already enabled above.

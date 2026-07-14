@@ -5929,9 +5929,11 @@ version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6e05acbfada5ec79023c85368af14abd0b307c015e9064d249b2a950ef459a6"
 dependencies = [
+ "hex",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
+ "serde",
  "tonic 0.12.3",
 ]
 
@@ -9762,6 +9764,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "vala-sql",
@@ -9832,12 +9835,15 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "base64 0.22.1",
+ "chrono",
  "secrecy",
+ "serde",
  "serde_json",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "vala-bifrost",
  "vala-sql",
@@ -10896,6 +10902,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx 0.9.0",
  "thiserror 2.0.18",
  "tokio",
@@ -11017,6 +11024,7 @@ name = "wyrd-tonic"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "opentelemetry-proto",
  "prost",
  "serde_json",
  "thiserror 2.0.18",

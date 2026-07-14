@@ -21,6 +21,7 @@ use crate::components::health::health_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
+use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
 use crate::vala_query::routes::router as vala_query_router;
@@ -49,6 +50,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(bifrost_router())
         .merge(query_router())
         .merge(vala_query_router())
+        .merge(otlp_router())
         .fallback(v1_not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

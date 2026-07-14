@@ -9797,17 +9797,25 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
+ "crc32c",
  "datafusion",
  "iceberg",
  "opendal",
  "parquet",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
+ "sqlx 0.9.0",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
+ "vala-sql",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-sql",
 ]
 
 [[package]]

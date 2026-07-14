@@ -34,6 +34,7 @@ references/
 
 - `.claude/skills/wyrd-implement/SKILL.md`
 - `.codex/skills/wyrd-implement/SKILL.md`
+- Global Claude and Codex `wyrd-plan-reviewer` skills
 
 New skills that need shared doctrine route here instead of carrying their
 own copy. Add new files only when a doctrine gap forces it — extend an

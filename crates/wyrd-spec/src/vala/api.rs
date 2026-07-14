@@ -1332,7 +1332,7 @@ pub enum AuditResult {
     Failure,
 }
 
-/// One audited data-plane operation — the FULL locked M-06 field set.
+/// One audited data-plane operation.
 ///
 /// Every audited op (register/install, sync query, async submit/status, ingest
 /// commit, RBAC deny) appends exactly one hash-chained `AuditEvent` row in the

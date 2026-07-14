@@ -6,9 +6,16 @@
 //!
 //! Segment format per `scribe/00-architecture.md §Crash-consistent WAL format`:
 //! - Fixed 64-byte header with magic, version, `node_id`, `writer_epoch`, CRC
-//! - Variable-length framed records: `[len][lsn][kind][reserved][payload][crc32c]`
+//! - Variable-length framed records: `[len][lsn][kind][reserved][batch_id][payload][crc32c]`
 //! - Atomic segment rollover: write-fsync-rename-fsync-parent
 //! - Torn tail truncation on replay at first CRC/length/monotonicity failure
+//!
+//! ## WAL Format Version History
+//!
+//! - **Version 2** (PR#4): Added `batch_id` field to record header for deduplication.
+//!   Breaking change from version 1 — segments written with version 1 cannot be
+//!   replayed by version 2 readers. Delete WAL directory and restart if upgrading.
+//! - **Version 1** (PR#3): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -76,7 +83,7 @@ pub struct SegmentHeader {
 }
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 const SEGMENT_HEADER_SIZE: usize = 64;
 
 impl SegmentHeader {
@@ -161,6 +168,13 @@ impl SegmentHeader {
         if header.compute_crc() != crc32c {
             return Err(ScribeError::Internal {
                 detail: "segment header CRC mismatch".to_string(),
+            });
+        }
+
+        // Reject version 1 segments (incompatible with PR#4's batch_id field)
+        if version == 1 {
+            return Err(ScribeError::Internal {
+                detail: "WAL format version 1 is incompatible with PR#4 (batch_id field added). Delete WAL directory and restart.".to_string(),
             });
         }
 

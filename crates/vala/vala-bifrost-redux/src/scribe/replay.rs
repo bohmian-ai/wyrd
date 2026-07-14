@@ -101,7 +101,7 @@ pub fn replay_wal_directory(
             // Data record — pair with pending audit
             if let Some((audit_record, batch_id)) = pending_audit.take() {
                 // Extract seal-key from WAL directory path
-                let seal_key = extract_seal_key_from_path(wal_dir);
+                let seal_key = extract_seal_key_from_path(wal_dir)?;
                 let seal_key_str = seal_key.as_path_components();
 
                 // Skip if this LSN is sealed
@@ -150,20 +150,26 @@ pub fn replay_wal_directory(
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if the path format is invalid.
-fn extract_seal_key_from_path(_wal_dir: &Path) -> SealKey {
-    // For PR#4, use a simple placeholder that returns a valid SealKey.
-    // Full path parsing will be implemented when WAL directory structure is finalized.
-    //
-    // Expected structure (from plan):
-    // ${SCRIBE_WAL_DIR}/{namespace}/{table}/tenant={tenant}/day={YYYY-MM-DD}/seg-N.arrow
-    //
-    // For now, return a placeholder seal-key. Real implementation in PR#5 when
-    // WAL directory routing is integrated.
-    SealKey::new(
+///
+/// # Implementation Note (PR#4)
+///
+/// This function currently returns a placeholder seal-key because full path parsing
+/// requires WAL directory routing from PR#5. The real implementation will:
+///
+/// 1. Parse path structure: `${SCRIBE_WAL_DIR}/{namespace}/{table}/tenant={uuid}/day={YYYY-MM-DD}`
+/// 2. Extract `tenant=` component and parse UUID
+/// 3. Extract `day=` component and parse date
+/// 4. Build `TableRef` from namespace + table components
+///
+/// For PR#4, tests use a flat temp directory structure. Real multi-key replay testing
+/// requires the directory routing in PR#5.
+fn extract_seal_key_from_path(_wal_dir: &Path) -> Result<SealKey, ScribeError> {
+    // Placeholder for PR#4 — real path parsing in PR#5
+    Ok(SealKey::new(
         DataTenantId::SYSTEM_OWNER,
         TableRef::new("vala.bifrost".to_string(), "events".to_string()),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
-    )
+    ))
 }
 
 #[cfg(test)]

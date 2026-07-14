@@ -181,4 +181,31 @@ mod pg_tests {
             "snapshot_id should be positive after commit"
         );
     }
+
+    /// `register_all` runs on every server boot, so a re-boot against an already
+    /// provisioned catalog must stay `Ok`. Guards against the steady-state
+    /// `physical_matches_declared` check reporting spurious `PhysicalDrift` on
+    /// Iceberg type normalizations (e.g. declared `UInt32` reads back as `Int64`).
+    #[tokio::test]
+    async fn register_all_is_idempotent_across_boots() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let catalog_uri = fixture.catalog_uri();
+        let pool = Arc::new(fixture.app_pool().clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = wyrd_storage::settings::BackendConfig::Local {
+            root: tmp.path().to_path_buf(),
+        };
+        let catalog = Arc::new(
+            vala_bifrost::catalog::WyrdCatalog::new(&catalog_uri, &backend, pool.clone(), None)
+                .await
+                .unwrap(),
+        );
+
+        vala_bifrost::tables::register_all(&catalog)
+            .await
+            .expect("first register_all provisions all domain tables");
+        vala_bifrost::tables::register_all(&catalog)
+            .await
+            .expect("second register_all is idempotent (steady-state)");
+    }
 }

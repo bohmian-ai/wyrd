@@ -6,16 +6,13 @@
 //! resolve to a fixed tenant.
 #![deny(missing_docs)]
 
-use ulid::Ulid;
-use uuid::Uuid;
-
 use wyrd_runtime::principal::Principal;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::audit_detail::CardRegistrationOperation;
 
-use crate::queries::cards::audit::record_card_registration_audit;
-use crate::row_types::cards::{CardRegistrationOperation, NewAuditCardRegistrationRow};
+use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
 use crate::tenant_conn::TenantConn;
 
 /// Soft-delete a card: set `status = 'deleted'` and write an audit row.
@@ -80,18 +77,15 @@ pub async fn soft_delete_card(
 
     record_card_registration_audit(
         conn,
-        NewAuditCardRegistrationRow {
-            audit_id: Uuid::from_bytes(Ulid::new().to_bytes()),
-            data_tenant_id: conn.data_tenant_id().as_uuid(),
+        CardRegistrationAuditInput {
             card_uid: uid,
-            kind: card_kind,
+            card_kind,
             operation: CardRegistrationOperation::Delete,
             outcome: None,
-            actor_principal_id: actor.id,
-            actor_kind: actor.kind.clone(),
+            actor,
             before_spec_hash: Some(spec_hash.as_str()),
             after_spec_hash: None,
-            request_id: request_id.map(RequestId::as_str),
+            request_id,
         },
     )
     .await

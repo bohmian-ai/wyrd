@@ -13,6 +13,8 @@
 
 /// Public Bifrost wire contracts — table management, query, and ingest types.
 pub mod api;
+/// Typed and redacted audit detail contracts.
+pub mod audit_detail;
 /// Observation correlation: the code axis carried on a run and the reserved
 /// correlation column names.
 pub mod correlation;
@@ -35,6 +37,10 @@ pub mod observation;
 pub mod system_columns;
 pub mod trace;
 
+pub use audit_detail::{
+    AuditDetail, AuditDetailValueError, BatchId, ScopeHash, StoragePath,
+    audit_detail_canonical_json,
+};
 pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::BifrostError;
 pub use system_columns::{

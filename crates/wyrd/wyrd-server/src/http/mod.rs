@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod middleware;
+pub mod otlp;
 pub mod router;
 
 pub use router::build_router;

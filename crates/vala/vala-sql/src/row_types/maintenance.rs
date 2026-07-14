@@ -22,6 +22,9 @@ use uuid::Uuid;
 /// Prefix for the per-table-writer maintenance lease key.
 const TABLE_WRITER_PREFIX: &str = "table_writer";
 
+/// Prefix for the per-derivation cross-table-derivation maintenance lease key.
+const CROSS_TABLE_DERIVATION_PREFIX: &str = "cross_table_derivation";
+
 /// The key that names a maintenance lease row.
 ///
 /// Renders to the `&str` shape the lease query fns and `LeaseHeartbeat` accept.
@@ -39,6 +42,22 @@ impl MaintenanceLeaseKey {
     #[must_use]
     pub fn table_writer(uid: &Uuid) -> Self {
         Self(format!("{TABLE_WRITER_PREFIX}:{uid}"))
+    }
+
+    /// Build the lease key for one cross-table derivation:
+    /// `cross_table_derivation:{uid}:{control_bind}`.
+    ///
+    /// The `uid` identifies the derivation registration and `control_bind` is
+    /// the logical commit identity the derivation consumes (see
+    /// `vala.olap_derivations` / `olap_commits`), so two derivations that share
+    /// a `uid` across distinct control binds hold distinct leases. The
+    /// `cross_table_derivation` namespace is admitted by the
+    /// `maintenance_leases_lease_key_namespace_check` CHECK.
+    #[must_use]
+    pub fn cross_table_derivation(uid: &Uuid, control_bind: &Uuid) -> Self {
+        Self(format!(
+            "{CROSS_TABLE_DERIVATION_PREFIX}:{uid}:{control_bind}"
+        ))
     }
 
     /// Borrow the rendered key as the `&str` the lease fns accept.
@@ -65,5 +84,24 @@ mod tests {
 
         assert_eq!(key.as_str(), format!("table_writer:{uid}"));
         assert_eq!(key.to_string(), format!("table_writer:{uid}"));
+    }
+
+    #[test]
+    fn cross_table_derivation_key() {
+        let uid = Uuid::parse_str("018f3c1e-2a4b-7c8d-9e0f-1a2b3c4d5e6f").expect("valid uuid");
+        let control_bind =
+            Uuid::parse_str("00000000-0000-0000-0000-000000000000").expect("valid uuid");
+        let key = MaintenanceLeaseKey::cross_table_derivation(&uid, &control_bind);
+
+        assert_eq!(
+            key.as_str(),
+            format!("cross_table_derivation:{uid}:{control_bind}")
+        );
+        // The namespace (substring before the first ':') is what the
+        // maintenance_leases CHECK whitelists.
+        assert_eq!(
+            key.as_str().split(':').next(),
+            Some("cross_table_derivation")
+        );
     }
 }

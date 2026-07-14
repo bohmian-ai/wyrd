@@ -46,6 +46,7 @@ CREATE TABLE vala.audit_outbox (
     decision        text   NOT NULL CHECK (decision IN ('allow', 'deny')),
     result          text   NOT NULL CHECK (result IN ('success', 'failure')),
     payload_summary text   NOT NULL,
+    detail          text,
     shipped         boolean NOT NULL DEFAULT false,
     ship_batch_id   bytea  CHECK (ship_batch_id IS NULL OR octet_length(ship_batch_id) = 16),
     created_at      timestamptz NOT NULL DEFAULT now(),
@@ -100,6 +101,7 @@ BEGIN
        OR NEW.decision        IS DISTINCT FROM OLD.decision
        OR NEW.result          IS DISTINCT FROM OLD.result
        OR NEW.payload_summary IS DISTINCT FROM OLD.payload_summary
+       OR NEW.detail          IS DISTINCT FROM OLD.detail
        OR NEW.created_at      IS DISTINCT FROM OLD.created_at THEN
         RAISE EXCEPTION 'vala.audit_outbox content is immutable; only shipped may transition'
             USING ERRCODE = 'P0001';
@@ -158,6 +160,7 @@ RETURNS TABLE(
     decision        text,
     result          text,
     payload_summary text,
+    detail          text,
     created_at      timestamptz
 )
 LANGUAGE plpgsql
@@ -169,7 +172,7 @@ BEGIN
     SELECT o.data_tenant_id, o.seq, o.entry_hash, o.prev_hash,
            o.request_id, o.trace_id, o.operation, o.resource, o.card_ref,
            o.principal_id, o.principal_kind, o.auth_method, o.permission,
-           o.decision, o.result, o.payload_summary, o.created_at
+           o.decision, o.result, o.payload_summary, o.detail, o.created_at
       FROM vala.audit_outbox o
      WHERE NOT o.shipped
      ORDER BY o.data_tenant_id, o.seq

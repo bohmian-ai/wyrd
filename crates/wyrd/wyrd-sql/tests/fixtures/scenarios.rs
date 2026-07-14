@@ -23,7 +23,7 @@ use wyrd_sql::queries::cards::{
     find_card_by_spec_hash, get_card_by_ref, get_latest_card_by_range, get_unique_spaces,
     list_versions, query_cards, register_card, soft_delete_card,
 };
-use wyrd_sql::{AuditCardRegistrationRow, CardRow, ParsedCardRow};
+use wyrd_sql::{CardRow, ParsedCardRow};
 
 use super::{TestEnv, per_kind};
 
@@ -280,24 +280,27 @@ pub async fn try_update_version(
     .expect_err("canonical version update must fail")
 }
 
-/// Fetch all `audit_card_registration` rows for a card uid, ordered by
-/// `occurred_at ASC`. Used to verify that the correct sequence of audit
-/// outcomes (Created, Deduplicated, IdempotentNoop) was recorded.
+/// A card-registration detail read from the Vala audit outbox.
+#[derive(Debug, sqlx::FromRow)]
+pub struct RegistrationAuditRow {
+    /// Canonical typed detail JSON.
+    pub detail: Option<String>,
+}
+
+/// Fetch card-registration events from the tenant audit outbox.
 pub async fn fetch_registration_audit(
     env: &TestEnv,
     tenant: DataTenantId,
     uid: &CardUid,
-) -> Vec<AuditCardRegistrationRow> {
+) -> Vec<RegistrationAuditRow> {
     let mut conn = env.tenant_conn(tenant).await;
     sqlx::query_as(
-        "SELECT audit_id, data_tenant_id, card_uid, kind, operation, outcome, \
-                actor_principal_id, actor_kind, before_spec_hash, after_spec_hash, \
-                request_id, occurred_at \
-         FROM wyrd.audit_card_registration \
-         WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1 \
-         ORDER BY occurred_at ASC",
+        "SELECT detail FROM vala.audit_outbox \
+         WHERE data_tenant_id = wyrd.current_tenant() \
+           AND resource = $1 AND operation = 'card.registration' \
+         ORDER BY seq ASC",
     )
-    .bind(uid.as_uuid())
+    .bind(format!("card:{uid}"))
     .fetch_all(&mut **conn.transaction())
     .await
     .expect("registration audit fetch")

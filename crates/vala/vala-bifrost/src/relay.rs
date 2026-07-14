@@ -261,6 +261,7 @@ fn audit_log_fields() -> Vec<Field> {
         Field::new("decision", DataType::Utf8, false),
         Field::new("result", DataType::Utf8, false),
         Field::new("payload_summary", DataType::Utf8, false),
+        Field::new("detail", DataType::Utf8, true),
         Field::new("created_at_us", DataType::Int64, false),
     ]
 }
@@ -309,6 +310,7 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
             .map(|r| r.payload_summary.clone())
             .collect::<Vec<_>>(),
     );
+    let detail = StringArray::from(rows.iter().map(|r| r.detail.clone()).collect::<Vec<_>>());
     let created_at_us = Int64Array::from(
         rows.iter()
             .map(|r| r.created_at.timestamp_micros())
@@ -333,6 +335,7 @@ fn build_audit_log_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, Bifrost
         Arc::new(decision),
         Arc::new(result),
         Arc::new(payload_summary),
+        Arc::new(detail),
         Arc::new(created_at_us),
     ];
 

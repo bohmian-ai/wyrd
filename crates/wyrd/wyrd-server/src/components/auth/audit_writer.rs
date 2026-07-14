@@ -55,6 +55,7 @@ impl AuthzAuditWriter for RealAuthzAuditWriter {
             decision: audit_decision,
             result: audit_result,
             payload_summary: format!("authz check; action={}", ctx.request.action),
+            detail: None,
         };
         append_audit(conn, &event)
             .await

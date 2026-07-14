@@ -9,6 +9,7 @@
 //! tonic / prost / tonic-types are consumed only through `wyrd-tonic` re-exports.
 
 pub mod auth;
+pub mod collector;
 pub mod decode;
 pub mod error;
 pub mod limits;
@@ -16,6 +17,10 @@ pub mod orchestrator;
 pub mod service;
 
 pub use auth::{AuthContext, IngestAuthInterceptor, ingest_auth_interceptor};
+pub use collector::{
+    IngestOutcome, LogsOutcome, MetricsOutcome, OtlpLogsService, OtlpMetricsService,
+    OtlpTraceService, ingest_resource_logs, ingest_resource_metrics, ingest_resource_spans,
+};
 pub use error::IngestError;
 pub use limits::{IngestLimits, StreamSemaphores};
 pub use service::BifrostIngestGrpc;

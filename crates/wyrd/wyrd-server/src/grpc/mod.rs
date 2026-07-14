@@ -8,7 +8,10 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
-use vala_ingest::{BifrostIngestGrpc, ingest_auth_interceptor};
+use vala_ingest::{
+    BifrostIngestGrpc, OtlpLogsService, OtlpMetricsService, OtlpTraceService,
+    ingest_auth_interceptor,
+};
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
@@ -39,11 +42,25 @@ where
         .token_verifier
         .clone()
         .ok_or(GrpcError::MissingTokenVerifier)?;
-    let interceptor = ingest_auth_interceptor(verifier);
-    let ingest = BifrostIngestGrpc::new(state.bifrost.clone(), interceptor);
+    let ingest = BifrostIngestGrpc::new(
+        state.bifrost.clone(),
+        ingest_auth_interceptor(verifier.clone()),
+    );
+    let traces = OtlpTraceService::new(
+        state.bifrost.clone(),
+        ingest_auth_interceptor(verifier.clone()),
+    );
+    let metrics = OtlpMetricsService::new(
+        state.bifrost.clone(),
+        ingest_auth_interceptor(verifier.clone()),
+    );
+    let logs = OtlpLogsService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier));
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router
         .add_service(ingest.into_server())
+        .add_service(traces.into_server())
+        .add_service(metrics.into_server())
+        .add_service(logs.into_server())
         .add_service(query.into_server()))
 }

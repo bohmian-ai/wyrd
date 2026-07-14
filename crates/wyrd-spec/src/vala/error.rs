@@ -386,4 +386,23 @@ pub enum BifrostError {
         /// Fully-qualified table name whose writer buffer is saturated.
         table: String,
     },
+
+    /// The OTLP request body was malformed and could not be decoded.
+    ///
+    /// Covers both protobuf decode failures and JSON parse errors on the
+    /// OTLP/HTTP path. The request must be fixed before retrying — no rows
+    /// were written and no retry will succeed with the same payload.
+    #[error("OTLP request body malformed for table {table}: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+        status = 400,
+        title = "OTLP request body malformed",
+        remediation = "The OTLP request body could not be decoded. Verify the Content-Type matches the encoding (application/x-protobuf or application/json) and that the payload is a valid OTLP ExportRequest."
+    )]
+    OtlpRequestMalformed {
+        /// Fully-qualified table name the request was targeting.
+        table: String,
+        /// Human-readable decode error detail.
+        detail: String,
+    },
 }

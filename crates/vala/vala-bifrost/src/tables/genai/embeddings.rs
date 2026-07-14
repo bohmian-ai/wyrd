@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, uint64, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8, utf8_view};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -21,17 +21,18 @@ impl DomainTable for EmbeddingsTable {
             fixed_binary("span_id", 8, false),
             ts_us_utc("start_time", false),
             ts_us_utc("end_time", false),
-            uint64("duration_ms", false),
+            int64("duration_ms", false),
             utf8("status", false),
             utf8("service_name", false),
             utf8("provider_name", false),
             utf8("operation_name", false),
             utf8("request_model", false),
             utf8("response_model", true),
-            uint32("embeddings_dimension_count", true),
+            int64("embeddings_dimension_count", true),
             utf8("data_source_id", true),
-            uint32("usage_input_tokens", true),
-            uint32("usage_output_tokens", true),
+            int64("usage_input_tokens", true),
+            int64("usage_output_tokens", true),
+            int64("retrieval_top_k", true),
             utf8("error_type", true),
             utf8("retrieval_query_text", true),
             utf8_view("extra", true),

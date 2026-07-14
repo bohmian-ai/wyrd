@@ -14,8 +14,8 @@
 use std::collections::HashMap;
 
 use arrow::array::{
-    Array, FixedSizeBinaryArray, Float64Array, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt32Array, UInt64Array,
+    Array, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    StringViewArray, TimestampMicrosecondArray,
 };
 use axum::Json;
 use axum::Router;
@@ -85,16 +85,10 @@ fn col_str<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringArray> {
         .and_then(|c| c.as_any().downcast_ref::<StringArray>())
 }
 
-fn col_u32<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt32Array> {
+fn col_i64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Int64Array> {
     batch
         .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-}
-
-fn col_u64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a UInt64Array> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
 }
 
 fn col_f64<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a Float64Array> {
@@ -161,7 +155,7 @@ fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>
         let name_col = col_str(batch, "name");
         let kind_col = col_str(batch, "kind");
         let start_col = col_ts(batch, "start_time");
-        let dur_col = col_u64(batch, "duration_ms");
+        let dur_col = col_i64(batch, "duration_ms");
         let status_col = col_str(batch, "status");
         let attr_col = col_str_view(batch, "attributes");
 
@@ -281,8 +275,9 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
         let model_col = col_str(batch, "request_model");
         let prov_col = col_str(batch, "provider_name");
         let start_col = col_ts(batch, "start_time");
-        let in_tok_col = col_u32(batch, "usage_input_tokens");
-        let out_tok_col = col_u32(batch, "usage_output_tokens");
+        // `usage_*_tokens` are physically int64 in genai.messages.
+        let in_tok_i64 = col_i64(batch, "usage_input_tokens");
+        let out_tok_i64 = col_i64(batch, "usage_output_tokens");
         let prompt_col = col_str_view(batch, "input_messages");
         let completion_col = col_str_view(batch, "output_messages");
 
@@ -295,12 +290,8 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                input_tokens: in_tok_col
-                    .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as i64),
-                output_tokens: out_tok_col
-                    .filter(|a| !a.is_null(i))
-                    .map(|a| a.value(i) as i64),
+                input_tokens: in_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
+                output_tokens: out_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
                 cost_usd: None, // Stage N placeholder — no physical column in genai.messages yet
                 prompt: get_str_view(prompt_col, i).map(|s| s.to_owned()),
                 completion: get_str_view(completion_col, i).map(|s| s.to_owned()),
@@ -397,7 +388,9 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
     let mut rows = Vec::new();
     for batch in batches {
         let ts_col = col_ts(batch, "observed_time");
-        let sev_num_col = col_u32(batch, "severity_number");
+        // Iceberg has no unsigned integer type: the UInt32 `severity_number` write
+        // column is stored and read back as Int64.
+        let sev_num_col = col_i64(batch, "severity_number");
         let sev_txt_col = col_str(batch, "severity_text");
         let trace_col = col_bin16(batch, "trace_id");
         let span_col = batch

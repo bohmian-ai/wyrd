@@ -4,8 +4,11 @@
 use wyrd_semver::VersionBlock;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::vala::audit_detail::CardRegistrationOutcome;
 use wyrd_sql::queries::cards::{ListPage, RegisterCardOutcome, RegisterCardOutcomeKind};
-use wyrd_sql::{AuditCardRegistrationRow, CardRegistrationOutcome, CardRow, ParsedCardRow};
+use wyrd_sql::{CardRow, ParsedCardRow};
+
+use super::scenarios::RegistrationAuditRow;
 
 pub fn assert_created(o: &RegisterCardOutcome) {
     assert_eq!(
@@ -127,13 +130,40 @@ pub fn assert_page_uids(page: &ListPage<CardRow>, expected_len: usize) {
     }
 }
 
-pub fn assert_registration_outcome(
-    row: &AuditCardRegistrationRow,
-    expected: CardRegistrationOutcome,
-) {
+pub fn assert_registration_outcome(row: &RegistrationAuditRow, expected: CardRegistrationOutcome) {
+    let detail = row
+        .detail
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok());
+    let actual = detail
+        .as_ref()
+        .and_then(|value| value.get("outcome"))
+        .and_then(serde_json::Value::as_str);
+    let expected =
+        serde_json::to_value(expected).expect("card registration outcome is JSON serializable");
     assert_eq!(
-        row.outcome.as_deref(),
-        Some(expected.as_db_str()),
+        actual,
+        expected.as_str(),
         "registration audit outcome mismatch"
     );
+}
+
+pub fn assert_card_registration_detail(row: &RegistrationAuditRow, uid: &CardUid) {
+    let detail = row
+        .detail
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .expect("audit row has valid typed detail");
+    let expected_uid = uid.to_string();
+    assert_eq!(detail["kind"], "card_registration");
+    assert_eq!(detail["card_uid"].as_str(), Some(expected_uid.as_str()));
+}
+
+pub fn assert_card_registration_operation(row: &RegistrationAuditRow, expected: &str) {
+    let detail = row
+        .detail
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+        .expect("audit row has valid typed detail");
+    assert_eq!(detail["operation"].as_str(), Some(expected));
 }

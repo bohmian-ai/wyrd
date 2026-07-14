@@ -1,151 +1,197 @@
 //! Transactional audit writer for the card registry plane.
 //!
-//! The only callers are `register_card` and `soft_delete_card` — both inside
-//! the same `TenantConn` tx as the corresponding `wyrd.cards` write.
-//! Fire-and-forget audit emission is forbidden: an audit row must commit in
-//! the same transaction as the write it describes.
+//! Card registration is a control-plane operation, so its outbox append lives
+//! in the same tenant transaction as the card write. The append is deliberately
+//! fail-closed: a failed chain update aborts the caller's transaction.
 #![deny(missing_docs)]
 
+use sha2::{Digest, Sha256};
+use wyrd_runtime::principal::Principal;
+use wyrd_spec::envelope::{CardKind, SpecHash};
 use wyrd_spec::error::WyrdError;
-
-use crate::row_types::cards::{
-    CardRegistrationOperation, NewAuditCardRegistrationRow, actor_kind_db_str,
+use wyrd_spec::ids::CardUid;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::audit_detail::{
+    AuditDetail, CardRegistrationOperation, CardRegistrationOutcome, audit_detail_canonical_json,
 };
+
 use crate::tenant_conn::TenantConn;
 
-/// Insert one append-only audit row for a card registration event.
-///
-/// Callers supply a fully-populated [`NewAuditCardRegistrationRow`]. The hash
-/// fields and `outcome` must satisfy the per-operation invariant:
-///
-/// | `operation`  | `before_spec_hash` | `after_spec_hash` | `outcome`     |
-/// |---|---|---|---|
-/// | `Register`   | `None`             | `Some(_)`         | `Some(_)`     |
-/// | `Update`     | `Some(_)`          | `Some(_)`         | `None`        |
-/// | `Delete`     | `Some(_)`          | `None`            | `None`        |
-///
-/// This function enforces the invariant at the `debug_assert!` level in Rust
-/// and relies on `audit_card_registration_op_hash_consistency` and
-/// `audit_card_registration_outcome_operation_check` check constraints in the
-/// database as a second gate.
-///
-/// # Errors
-/// Returns `WYRD_INTERNAL` if the database rejects the row due to a
-/// constraint violation (indicates a caller bug, not a user error).
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on transient database errors.
-///
-/// # Invariant
-/// MUST be called inside the same [`TenantConn`] tx as the corresponding
-/// `wyrd.cards` write. Fire-and-forget audit emission is forbidden.
-#[tracing::instrument(
-    skip(conn, row),
-    fields(
-        tenant_id = %row.data_tenant_id,
-        audit_id = %row.audit_id,
-        operation = ?row.operation,
-        kind = ?row.kind,
-    )
-)]
+pub(super) struct CardRegistrationAuditInput<'a> {
+    pub(super) card_uid: &'a CardUid,
+    pub(super) card_kind: CardKind,
+    pub(super) operation: CardRegistrationOperation,
+    pub(super) outcome: Option<CardRegistrationOutcome>,
+    pub(super) actor: &'a Principal,
+    pub(super) before_spec_hash: Option<&'a str>,
+    pub(super) after_spec_hash: Option<&'a str>,
+    pub(super) request_id: Option<&'a RequestId>,
+}
+
+/// Append one typed card-registration event to the tenant audit outbox.
 pub(crate) async fn record_card_registration_audit(
     conn: &mut TenantConn<'_>,
-    row: NewAuditCardRegistrationRow<'_>,
+    input: CardRegistrationAuditInput<'_>,
 ) -> Result<(), WyrdError> {
-    debug_assert!(
-        match row.operation {
-            CardRegistrationOperation::Register =>
-                row.before_spec_hash.is_none()
-                    && row.after_spec_hash.is_some()
-                    && row.outcome.is_some(),
-            CardRegistrationOperation::Update =>
-                row.before_spec_hash.is_some()
-                    && row.after_spec_hash.is_some()
-                    && row.outcome.is_none(),
-            CardRegistrationOperation::Delete =>
-                row.before_spec_hash.is_some()
-                    && row.after_spec_hash.is_none()
-                    && row.outcome.is_none(),
-        },
-        "audit row operation/hash invariant violated"
+    let detail = AuditDetail::CardRegistration {
+        card_uid: input.card_uid.clone(),
+        card_kind: input.card_kind,
+        operation: input.operation,
+        outcome: input.outcome,
+        before_spec_hash: input.before_spec_hash.map(spec_hash),
+        after_spec_hash: input.after_spec_hash.map(spec_hash),
+    };
+    let detail = audit_detail_canonical_json(&detail);
+    let request_id = input.request_id.cloned().unwrap_or_else(RequestId::now_v7);
+    let principal_kind = input.actor.kind.tag().as_str();
+    let card_ref = input.actor.card_ref().map(ToString::to_string);
+    let resource = format!("card:{}", input.card_uid);
+    let operation_name = "card.registration";
+    let permission = "cards:write";
+    let decision = "allow";
+    let result = "success";
+    let payload_summary = "card registration";
+
+    sqlx::query(
+        r#"INSERT INTO vala.audit_chain_head (data_tenant_id)
+           VALUES (wyrd.current_tenant())
+           ON CONFLICT (data_tenant_id) DO NOTHING"#,
+    )
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(|error| audit_error(error, "initialize chain head"))?;
+
+    let (last_seq, prev_hash): (i64, Vec<u8>) = sqlx::query_as(
+        r#"SELECT last_seq, head_hash
+           FROM vala.audit_chain_head
+           WHERE data_tenant_id = wyrd.current_tenant()
+           FOR UPDATE"#,
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(|error| audit_error(error, "lock chain head"))?;
+
+    let seq = last_seq + 1;
+    let entry_hash = entry_hash(
+        &prev_hash,
+        seq,
+        request_id.as_str(),
+        None,
+        operation_name,
+        &resource,
+        card_ref.as_deref(),
+        input.actor.id.as_uuid().as_bytes(),
+        principal_kind,
+        "internal",
+        permission,
+        decision,
+        result,
+        payload_summary,
+        Some(&detail),
     );
 
-    let kind_db = row.kind.wire_name();
-    let operation_db = row.operation.as_db_str();
-    let outcome_db = row.outcome.map(|outcome| outcome.as_db_str());
-    let actor_kind_db = actor_kind_db_str(&row.actor_kind);
-
-    // Dynamic query is intentional: the audit table is append-only and the
-    // sqlx macro adds no value here. The data_tenant_id is sourced from
-    // `wyrd.current_tenant()` (set by TenantConn) so callers cannot write
-    // an audit row scoped to a different tenant.
-    let result = sqlx::query(
-        r#"
-        INSERT INTO wyrd.audit_card_registration (
-            audit_id,
-            data_tenant_id,
-            card_uid,
-            kind,
-            operation,
-            outcome,
-            actor_principal_id,
-            actor_kind,
-            before_spec_hash,
-            after_spec_hash,
-            request_id,
-            occurred_at
-        )
-        VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
-        "#,
+    sqlx::query(
+        r#"INSERT INTO vala.audit_outbox
+           (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
+            operation, resource, card_ref, principal_id, principal_kind,
+            auth_method, permission, decision, result, payload_summary, detail)
+           VALUES (wyrd.current_tenant(), $1, $2, $3, $4, NULL, $5, $6, $7,
+                   $8, $9, $10, $11, $12, $13, $14, $15)"#,
     )
-    .bind(row.audit_id)
-    .bind(row.card_uid.as_uuid())
-    .bind(kind_db)
-    .bind(operation_db)
-    .bind(outcome_db)
-    .bind(row.actor_principal_id.as_uuid())
-    .bind(actor_kind_db)
-    .bind(row.before_spec_hash)
-    .bind(row.after_spec_hash)
-    .bind(row.request_id)
+    .bind(seq)
+    .bind(prev_hash.as_slice())
+    .bind(entry_hash.as_slice())
+    .bind(request_id.as_str())
+    .bind(operation_name)
+    .bind(&resource)
+    .bind(card_ref.as_deref())
+    .bind(input.actor.id.as_uuid())
+    .bind(principal_kind)
+    .bind("internal")
+    .bind(permission)
+    .bind(decision)
+    .bind(result)
+    .bind(payload_summary)
+    .bind(&detail)
     .execute(&mut **conn.transaction())
-    .await;
+    .await
+    .map_err(|error| audit_error(error, "insert outbox row"))?;
 
-    match result {
-        Ok(_) => Ok(()),
-        Err(sqlx::Error::Database(db)) => {
-            let code = db.code().map(|c| c.into_owned());
-            let constraint = db.constraint().map(|c| c.to_owned());
-            match (code.as_deref(), constraint.as_deref()) {
-                (Some("42501"), Some("audit_card_registration_append_only")) => {
-                    tracing::error!("audit_card_registration is append-only; this is a bug");
-                    Err(WyrdError::internal(
-                        "audit_card_registration is append-only; Rust contract guarantees no mutation",
-                    ))
-                }
-                (Some("23514"), Some("audit_card_registration_op_hash_consistency")) => {
-                    tracing::error!("audit op/hash invariant violated; this is a bug");
-                    Err(WyrdError::internal(
-                        "audit_card_registration op/hash invariant violated",
-                    ))
-                }
-                // `outcome_operation_check` enforces that `outcome IS NOT NULL`
-                // only for `Register` rows and `IS NULL` for `Update`/`Delete`.
-                // A violation here means the Rust caller passed the wrong
-                // operation/outcome combination — it is always a caller bug.
-                (Some("23514"), Some("audit_card_registration_outcome_operation_check")) => {
-                    tracing::error!("audit outcome invariant violated; this is a bug");
-                    Err(WyrdError::internal(
-                        "audit_card_registration outcome invariant violated",
-                    ))
-                }
-                (Some("23514"), Some("audit_card_registration_kind_check")) => {
-                    tracing::error!("audit kind literal drift; this is a bug");
-                    Err(WyrdError::internal(
-                        "audit_card_registration.kind literal mismatch; CardKind::wire_name drift",
-                    ))
-                }
-                _ => Err(WyrdError::registry_unavailable(db.message().to_owned())),
-            }
+    sqlx::query(
+        r#"UPDATE vala.audit_chain_head
+           SET last_seq = $1, head_hash = $2, updated_at = now()
+           WHERE data_tenant_id = wyrd.current_tenant()"#,
+    )
+    .bind(seq)
+    .bind(entry_hash.as_slice())
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(|error| audit_error(error, "advance chain head"))?;
+
+    Ok(())
+}
+
+fn spec_hash(value: &str) -> SpecHash {
+    value
+        .parse()
+        .expect("registry spec hashes are canonical BLAKE3 hex")
+}
+
+fn audit_error(error: sqlx::Error, stage: &str) -> WyrdError {
+    WyrdError::registry_unavailable(format!("card audit {stage}: {error}"))
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches the audit hash wire fields"
+)]
+fn entry_hash(
+    prev_hash: &[u8],
+    seq: i64,
+    request_id: &str,
+    trace_id: Option<&str>,
+    operation: &str,
+    resource: &str,
+    card_ref: Option<&str>,
+    principal_id: &[u8],
+    principal_kind: &str,
+    auth_method: &str,
+    permission: &str,
+    decision: &str,
+    result: &str,
+    payload_summary: &str,
+    detail: Option<&str>,
+) -> [u8; 32] {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(prev_hash);
+    bytes.extend_from_slice(&seq.to_be_bytes());
+    push_str(&mut bytes, request_id);
+    push_opt(&mut bytes, trace_id);
+    push_str(&mut bytes, operation);
+    push_str(&mut bytes, resource);
+    push_opt(&mut bytes, card_ref);
+    bytes.extend_from_slice(principal_id);
+    push_str(&mut bytes, principal_kind);
+    push_str(&mut bytes, auth_method);
+    push_str(&mut bytes, permission);
+    push_str(&mut bytes, decision);
+    push_str(&mut bytes, result);
+    push_str(&mut bytes, payload_summary);
+    push_opt(&mut bytes, detail);
+    Sha256::digest(bytes).into()
+}
+
+fn push_str(bytes: &mut Vec<u8>, value: &str) {
+    bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    bytes.extend_from_slice(value.as_bytes());
+}
+
+fn push_opt(bytes: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            bytes.push(1);
+            push_str(bytes, value);
         }
-        Err(other) => Err(WyrdError::registry_unavailable(other.to_string())),
+        None => bytes.push(0),
     }
 }

@@ -12,7 +12,9 @@
 // raw-query grep allowlist: audit outbox tables post-date the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sha2::{Digest, Sha256};
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditEvent, AuditResult, AuthMethod, audit_detail_canonical_json,
+};
 use wyrd_sql::TenantConn;
 
 use crate::SqlError;
@@ -53,16 +55,23 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
 
     let seq = last_seq + 1;
     let card_ref = event.card_ref.as_ref().map(ToString::to_string);
-    let entry_hash = entry_hash(&prev_hash, seq, event, card_ref.as_deref());
+    let detail = event.detail.as_ref().map(audit_detail_canonical_json);
+    let entry_hash = entry_hash(
+        &prev_hash,
+        seq,
+        event,
+        card_ref.as_deref(),
+        detail.as_deref(),
+    );
 
     sqlx::query(
         r#"
         INSERT INTO vala.audit_outbox
             (data_tenant_id, seq, prev_hash, entry_hash, request_id, trace_id,
              operation, resource, card_ref, principal_id, principal_kind,
-             auth_method, permission, decision, result, payload_summary)
+             auth_method, permission, decision, result, payload_summary, detail)
         VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                $11, $12, $13, $14, $15)
+                $11, $12, $13, $14, $15, $16)
         "#,
     )
     .bind(seq)
@@ -80,6 +89,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(decision_str(event.decision))
     .bind(result_str(event.result))
     .bind(event.payload_summary.as_str())
+    .bind(detail.as_deref())
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
@@ -98,6 +108,17 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .map_err(SqlError::from)?;
 
     Ok(seq)
+}
+
+/// Append one audit row on a caller-provided tenant-scoped transaction.
+///
+/// The caller owns the [`TenantConn`] lifetime and transaction commit, so this
+/// primitive can participate in the audited operation's transaction.
+///
+/// # Errors
+/// Returns [`SqlError`] when appending the audit row fails.
+pub async fn record_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+    append_audit(conn, event).await
 }
 
 /// Mark a contiguous `seq` range shipped for the current tenant.
@@ -186,7 +207,13 @@ pub async fn stamp_audit_ship_batch_id(
 /// The canonical encoding is a length-prefixed concatenation owned here, so the
 /// chain is reproducible from the stored columns alone. `card_ref` is passed as
 /// its already-canonicalized string to avoid recomputing it.
-fn entry_hash(prev_hash: &[u8], seq: i64, event: &AuditEvent, card_ref: Option<&str>) -> [u8; 32] {
+fn entry_hash(
+    prev_hash: &[u8],
+    seq: i64,
+    event: &AuditEvent,
+    card_ref: Option<&str>,
+    detail: Option<&str>,
+) -> [u8; 32] {
     let mut buf = Vec::new();
     buf.extend_from_slice(prev_hash);
     buf.extend_from_slice(&seq.to_be_bytes());
@@ -202,6 +229,7 @@ fn entry_hash(prev_hash: &[u8], seq: i64, event: &AuditEvent, card_ref: Option<&
     push_str(&mut buf, decision_str(event.decision));
     push_str(&mut buf, result_str(event.result));
     push_str(&mut buf, &event.payload_summary);
+    push_opt(&mut buf, detail);
     Sha256::digest(&buf).into()
 }
 
@@ -298,6 +326,33 @@ pub fn entry_hash_from_cols(input: AuditEntryHashInput<'_>) -> [u8; 32] {
     push_str(&mut buf, input.decision);
     push_str(&mut buf, input.result);
     push_str(&mut buf, input.payload_summary);
+    Sha256::digest(&buf).into()
+}
+
+/// Recompute the SHA256 entry hash from stored columns and optional canonical
+/// JSON detail. The detail presence marker is part of the canonical preimage,
+/// so absent detail and present detail remain distinct.
+#[must_use]
+pub fn entry_hash_from_cols_with_detail(
+    input: AuditEntryHashInput<'_>,
+    detail: Option<&str>,
+) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(input.prev_hash);
+    buf.extend_from_slice(&input.seq.to_be_bytes());
+    push_str(&mut buf, input.request_id);
+    push_opt(&mut buf, input.trace_id);
+    push_str(&mut buf, input.operation);
+    push_str(&mut buf, input.resource);
+    push_opt(&mut buf, input.card_ref);
+    buf.extend_from_slice(input.principal_id_bytes);
+    push_str(&mut buf, input.principal_kind);
+    push_str(&mut buf, input.auth_method);
+    push_str(&mut buf, input.permission);
+    push_str(&mut buf, input.decision);
+    push_str(&mut buf, input.result);
+    push_str(&mut buf, input.payload_summary);
+    push_opt(&mut buf, detail);
     Sha256::digest(&buf).into()
 }
 
@@ -456,25 +511,25 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
 
     fn sample_event() -> AuditEvent {
-        AuditEvent {
-            request_id: RequestId::parse("01890f28-7c4a-7000-98e7-4f4a3c2d1b02")
+        AuditEvent::new(
+            RequestId::parse("01890f28-7c4a-7000-98e7-4f4a3c2d1b02")
                 .expect("static request id is valid"),
-            trace_id: Some("trace-abc".to_string()),
-            operation: "bifrost.write".to_string(),
-            resource: "ns.tbl".to_string(),
-            card_ref: None,
-            principal_id: PrincipalId::new(
+            Some("trace-abc".to_string()),
+            "bifrost.write".to_string(),
+            "ns.tbl".to_string(),
+            None,
+            PrincipalId::new(
                 "01890f28-7c4a-7000-98e7-4f4a3c2d1b03"
                     .parse::<Uuid>()
                     .expect("static uuid is valid"),
             ),
-            principal_kind: PrincipalKindTag::User,
-            auth_method: AuthMethod::Internal,
-            permission: "bifrost.write".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: "redacted".to_string(),
-        }
+            PrincipalKindTag::User,
+            AuthMethod::Internal,
+            "bifrost.write".to_string(),
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "redacted".to_string(),
+        )
     }
 
     /// Build the verifier-side input mirroring how the seal verifier reconstructs
@@ -514,8 +569,12 @@ mod tests {
         let seq = 1;
         let pid = *event.principal_id.as_uuid().as_bytes();
 
-        let written = entry_hash(&prev, seq, &event, None);
-        let recomputed = entry_hash_from_cols(cols_input(&event, &prev, seq, &pid));
+        let detail = event.detail.as_ref().map(audit_detail_canonical_json);
+        let written = entry_hash(&prev, seq, &event, None, detail.as_deref());
+        let recomputed = entry_hash_from_cols_with_detail(
+            cols_input(&event, &prev, seq, &pid),
+            detail.as_deref(),
+        );
 
         assert_eq!(
             written, recomputed,

@@ -10,7 +10,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
-use wyrd_runtime::{Permission, PrincipalKind};
+use wyrd_runtime::{Permission, PermissionCheck, PrincipalKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::storage::{
@@ -48,7 +48,7 @@ async fn init(
     headers: HeaderMap,
     Json(body): Json<UploadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadInitResponse>, WyrdErrorResponse> {
-    authorize_card_write(&caller)?;
+    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let idempotency_key = extract_idempotency_key(&headers)?;
     let storage_caller = storage_caller(&caller);
     service::upload_init(
@@ -74,7 +74,7 @@ async fn part_url(
     Path(id): Path<String>,
     Query(query): Query<PartUrlQuery>,
 ) -> Result<Json<PartUrlResponse>, WyrdErrorResponse> {
-    authorize_card_write(&caller)?;
+    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_part_url(
@@ -95,7 +95,7 @@ async fn complete(
     Path(id): Path<String>,
     Json(body): Json<UploadCompleteRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
-    authorize_card_write(&caller)?;
+    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_complete(
@@ -115,7 +115,7 @@ async fn abort(
     caller: Caller,
     Path(id): Path<String>,
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
-    authorize_card_write(&caller)?;
+    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
@@ -135,7 +135,7 @@ async fn local_blob(
     Path(path): Path<String>,
     body: Bytes,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
-    authorize_card_write(&caller)?;
+    authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
     service::upload_local_blob(&state.storage, caller.data_tenant_id, path, &body)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -147,7 +147,7 @@ async fn download_init(
     caller: Caller,
     Json(body): Json<DownloadInitRequest>,
 ) -> Result<Json<wyrd_spec::storage::DownloadInitResponse>, WyrdErrorResponse> {
-    authorize_card_read(&caller)?;
+    authorize_card_read(state.authz.permission_check.as_ref(), &caller)?;
     let storage_caller = storage_caller(&caller);
     service::download_init(&state.storage, state.postgres.wyrd(), &storage_caller, body)
         .await
@@ -160,7 +160,7 @@ async fn download_local_blob(
     caller: Caller,
     Path(path): Path<String>,
 ) -> Result<Response, WyrdErrorResponse> {
-    authorize_card_read(&caller)?;
+    authorize_card_read(state.authz.permission_check.as_ref(), &caller)?;
     let (file, len) = service::download_local_blob(&state.storage, caller.data_tenant_id, path)
         .await
         .map_err(WyrdErrorResponse::from)?;
@@ -209,26 +209,29 @@ fn extract_idempotency_key(
         .map_err(WyrdErrorResponse::from)
 }
 
-fn authorize_card_write(caller: &Caller) -> Result<(), WyrdErrorResponse> {
-    authorize(caller, Permission::card_write(), "card:write")
+fn authorize_card_write(
+    check: &dyn PermissionCheck,
+    caller: &Caller,
+) -> Result<(), WyrdErrorResponse> {
+    authorize(check, caller, Permission::card_write())
 }
 
-fn authorize_card_read(caller: &Caller) -> Result<(), WyrdErrorResponse> {
-    authorize(caller, Permission::card_read(), "card:read")
+fn authorize_card_read(
+    check: &dyn PermissionCheck,
+    caller: &Caller,
+) -> Result<(), WyrdErrorResponse> {
+    authorize(check, caller, Permission::card_read())
 }
 
 fn authorize(
+    check: &dyn PermissionCheck,
     caller: &Caller,
     required: Permission,
-    label: &'static str,
 ) -> Result<(), WyrdErrorResponse> {
-    if caller.principal.effective_permissions.contains(&required) {
-        return Ok(());
-    }
-    Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-        message: format!("caller lacks required permission {label}"),
-        details: serde_json::json!({ "required": required }),
-    }))
+    check
+        .check(&caller.principal, &required)
+        .into_result()
+        .map_err(WyrdErrorResponse::from)
 }
 
 fn storage_caller(caller: &Caller) -> StorageCaller {
@@ -287,8 +290,11 @@ mod tests {
     fn local_blob_helpers_require_route_permissions() {
         let caller = caller_with_permissions(PrincipalKind::User, []);
 
-        let read = authorize_card_read(&caller).expect_err("missing read permission must fail");
-        let write = authorize_card_write(&caller).expect_err("missing write permission must fail");
+        let check = wyrd_runtime::RbacCheck;
+        let read =
+            authorize_card_read(&check, &caller).expect_err("missing read permission must fail");
+        let write =
+            authorize_card_write(&check, &caller).expect_err("missing write permission must fail");
 
         assert_eq!(read.0.status(), 403);
         assert_eq!(write.0.status(), 403);

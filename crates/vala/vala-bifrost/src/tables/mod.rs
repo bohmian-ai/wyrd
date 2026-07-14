@@ -209,6 +209,7 @@ pub async fn register_all(catalog: &Arc<WyrdCatalog>) -> Result<(), BifrostError
     register::<genai::MessagesTable>(catalog).await?;
     register::<genai::EmbeddingsTable>(catalog).await?;
     register::<genai::ToolCallsTable>(catalog).await?;
+    register::<genai::MemoryTable>(catalog).await?;
     // metrics
     register::<metrics::PointsTable>(catalog).await?;
     // logs
@@ -414,6 +415,7 @@ mod fingerprint_drift {
             genai::ToolCallsTable::schema_fingerprint(),
             GENAI_TOOL_CALLS
         );
+        assert_eq!(genai::MemoryTable::schema_fingerprint(), GENAI_MEMORY);
         assert_eq!(metrics::PointsTable::schema_fingerprint(), METRICS_POINTS);
         assert_eq!(logs::RecordsTable::schema_fingerprint(), LOGS_RECORDS);
         assert_eq!(eval::RunsTable::schema_fingerprint(), EVAL_RUNS);
@@ -433,8 +435,8 @@ mod fingerprint_drift {
     }
 
     const TRACES_SPANS: [u8; 32] = [
-        237, 8, 179, 234, 40, 191, 48, 132, 0, 89, 247, 165, 172, 47, 182, 120, 91, 48, 68, 189,
-        59, 14, 244, 35, 112, 61, 60, 74, 164, 145, 38, 63,
+        117, 123, 6, 179, 56, 96, 0, 186, 121, 79, 11, 80, 39, 98, 14, 107, 69, 100, 183, 245, 234,
+        210, 43, 64, 31, 239, 198, 172, 171, 145, 83, 133,
     ];
     const TRACES_EVENTS: [u8; 32] = [
         226, 118, 169, 168, 66, 138, 130, 223, 181, 82, 231, 97, 58, 210, 210, 130, 117, 35, 71,
@@ -445,20 +447,24 @@ mod fingerprint_drift {
         254, 215, 103, 109, 128, 107, 244, 28, 77, 199, 241, 93,
     ];
     const GENAI_MESSAGES: [u8; 32] = [
-        51, 46, 154, 71, 211, 230, 132, 40, 16, 247, 249, 53, 171, 185, 211, 135, 21, 172, 198,
-        147, 105, 21, 102, 114, 53, 94, 227, 244, 119, 242, 34, 131,
+        16, 227, 176, 112, 122, 82, 185, 123, 203, 18, 209, 228, 30, 226, 148, 67, 42, 167, 185,
+        146, 25, 26, 161, 62, 158, 151, 145, 191, 219, 188, 211, 248,
     ];
     const GENAI_EMBEDDINGS: [u8; 32] = [
-        26, 4, 11, 206, 198, 75, 19, 151, 88, 125, 70, 248, 205, 201, 171, 2, 64, 244, 14, 106,
-        180, 152, 169, 160, 132, 236, 62, 246, 38, 174, 15, 72,
+        70, 206, 187, 2, 42, 150, 167, 242, 56, 8, 240, 240, 41, 41, 82, 229, 169, 148, 83, 240,
+        102, 131, 103, 157, 156, 128, 136, 223, 4, 12, 235, 56,
     ];
     const GENAI_TOOL_CALLS: [u8; 32] = [
-        173, 3, 14, 244, 10, 62, 130, 153, 234, 64, 42, 243, 65, 122, 9, 134, 144, 174, 119, 186,
-        49, 252, 178, 203, 137, 6, 65, 123, 79, 242, 191, 50,
+        118, 27, 201, 72, 178, 53, 147, 52, 82, 237, 62, 49, 95, 139, 246, 192, 147, 56, 86, 230,
+        31, 222, 32, 41, 216, 100, 121, 43, 204, 154, 117, 214,
+    ];
+    const GENAI_MEMORY: [u8; 32] = [
+        103, 0, 176, 197, 26, 38, 144, 38, 225, 69, 207, 13, 70, 80, 114, 130, 70, 125, 129, 236,
+        148, 137, 122, 63, 89, 70, 86, 255, 204, 180, 100, 113,
     ];
     const METRICS_POINTS: [u8; 32] = [
-        226, 207, 30, 177, 15, 157, 226, 205, 120, 104, 240, 69, 49, 156, 93, 10, 155, 171, 47, 56,
-        143, 26, 82, 181, 68, 22, 163, 133, 71, 140, 255, 250,
+        148, 86, 36, 185, 229, 163, 186, 129, 219, 113, 27, 66, 152, 156, 153, 174, 169, 6, 11,
+        192, 176, 50, 56, 214, 66, 127, 186, 36, 143, 88, 81, 167,
     ];
     const LOGS_RECORDS: [u8; 32] = [
         51, 247, 38, 148, 208, 151, 64, 71, 131, 104, 39, 145, 187, 244, 21, 20, 73, 92, 27, 1,
@@ -481,8 +487,8 @@ mod fingerprint_drift {
         243, 159, 254, 166, 176, 213, 219, 232, 255, 124, 29, 120,
     ];
     const SYSTEM_AUDIT_LOG: [u8; 32] = [
-        19, 45, 142, 115, 112, 192, 74, 210, 194, 133, 26, 171, 32, 125, 216, 221, 44, 59, 147,
-        150, 155, 225, 70, 116, 158, 170, 214, 111, 170, 24, 188, 210,
+        89, 188, 52, 180, 246, 60, 100, 140, 252, 148, 135, 184, 247, 96, 117, 175, 246, 148, 183,
+        217, 122, 16, 225, 210, 200, 250, 115, 124, 222, 255, 252, 10,
     ];
 
     // ── Test B ────────────────────────────────────────────────────────────────
@@ -511,6 +517,7 @@ mod fingerprint_drift {
             genai::ToolCallsTable::schema().as_ref(),
             &genai_tool_calls_full()
         );
+        assert_eq!(genai::MemoryTable::schema().as_ref(), &genai_memory_full());
         assert_eq!(
             metrics::PointsTable::schema().as_ref(),
             &metrics_points_full()
@@ -554,7 +561,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("attributes", DataType::Utf8View, true),
             Field::new("dropped_attributes_count", DataType::UInt32, false),
@@ -654,7 +661,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
@@ -671,26 +678,30 @@ mod fingerprint_drift {
             ),
             Field::new("request_temperature", DataType::Float64, true),
             Field::new("request_top_p", DataType::Float64, true),
-            Field::new("request_top_k", DataType::UInt32, true),
-            Field::new("request_max_tokens", DataType::UInt32, true),
+            Field::new("request_top_k", DataType::Int64, true),
+            Field::new("request_max_tokens", DataType::Int64, true),
             Field::new("request_frequency_penalty", DataType::Float64, true),
             Field::new("request_presence_penalty", DataType::Float64, true),
             Field::new("request_seed", DataType::Int64, true),
-            Field::new("request_choice_count", DataType::UInt32, true),
+            Field::new("request_choice_count", DataType::Int64, true),
             Field::new("request_stop_sequences", DataType::Utf8View, true),
             Field::new("request_stream", DataType::Boolean, true),
             Field::new("request_encoding_formats", DataType::Utf8View, true),
-            Field::new("usage_input_tokens", DataType::UInt32, true),
-            Field::new("usage_output_tokens", DataType::UInt32, true),
-            Field::new("usage_cache_creation_input_tokens", DataType::UInt32, true),
-            Field::new("usage_cache_read_input_tokens", DataType::UInt32, true),
-            Field::new("usage_reasoning_output_tokens", DataType::UInt32, true),
+            Field::new("usage_input_tokens", DataType::Int64, true),
+            Field::new("usage_output_tokens", DataType::Int64, true),
+            Field::new("usage_cache_creation_input_tokens", DataType::Int64, true),
+            Field::new("usage_cache_read_input_tokens", DataType::Int64, true),
+            Field::new("usage_reasoning_output_tokens", DataType::Int64, true),
             Field::new("output_type", DataType::Utf8, true),
+            Field::new("request_reasoning_level", DataType::Utf8, true),
+            Field::new("conversation_compacted", DataType::Boolean, true),
             Field::new("input_messages", DataType::Utf8View, true),
             Field::new("output_messages", DataType::Utf8View, true),
             Field::new("system_instructions", DataType::Utf8View, true),
             Field::new("openai_api_type", DataType::Utf8, true),
-            Field::new("openai_service_tier", DataType::Utf8, true),
+            Field::new("openai_request_service_tier", DataType::Utf8, true),
+            Field::new("openai_response_service_tier", DataType::Utf8, true),
+            Field::new("openai_response_system_fingerprint", DataType::Utf8, true),
             Field::new("error_type", DataType::Utf8, true),
             Field::new("eval_results", DataType::Utf8View, true),
             Field::new("extra", DataType::Utf8View, true),
@@ -726,17 +737,18 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
             Field::new("operation_name", DataType::Utf8, false),
             Field::new("request_model", DataType::Utf8, false),
             Field::new("response_model", DataType::Utf8, true),
-            Field::new("embeddings_dimension_count", DataType::UInt32, true),
+            Field::new("embeddings_dimension_count", DataType::Int64, true),
             Field::new("data_source_id", DataType::Utf8, true),
-            Field::new("usage_input_tokens", DataType::UInt32, true),
-            Field::new("usage_output_tokens", DataType::UInt32, true),
+            Field::new("usage_input_tokens", DataType::Int64, true),
+            Field::new("usage_output_tokens", DataType::Int64, true),
+            Field::new("retrieval_top_k", DataType::Int64, true),
             Field::new("error_type", DataType::Utf8, true),
             Field::new("retrieval_query_text", DataType::Utf8, true),
             Field::new("extra", DataType::Utf8View, true),
@@ -774,7 +786,7 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("duration_ms", DataType::UInt64, false),
+            Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("service_name", DataType::Utf8, false),
             Field::new("provider_name", DataType::Utf8, false),
@@ -785,6 +797,55 @@ mod fingerprint_drift {
             Field::new("tool_description", DataType::Utf8, true),
             Field::new("tool_call_arguments", DataType::Utf8View, true),
             Field::new("tool_call_result", DataType::Utf8View, true),
+            Field::new("mcp_session_id", DataType::Utf8, true),
+            Field::new("mcp_method_name", DataType::Utf8, true),
+            Field::new("mcp_protocol_version", DataType::Utf8, true),
+            Field::new("mcp_resource_uri", DataType::Utf8, true),
+            Field::new("error_type", DataType::Utf8, true),
+            Field::new("extra", DataType::Utf8View, true),
+            Field::new("run_id", DataType::Utf8, true),
+            Field::new("card_uid", DataType::Utf8, true),
+            Field::new("principal_id", DataType::Utf8, true),
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "wyrd_ingested_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
+            Field::new("data_tenant_id", DataType::Utf8, false),
+        ])
+    }
+
+    fn genai_memory_full() -> Schema {
+        Schema::new(vec![
+            Field::new("trace_id", DataType::FixedSizeBinary(16), false),
+            Field::new("span_id", DataType::FixedSizeBinary(8), false),
+            Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
+            Field::new(
+                "start_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new(
+                "end_time",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                false,
+            ),
+            Field::new("duration_ms", DataType::Int64, false),
+            Field::new("status", DataType::Utf8, false),
+            Field::new("service_name", DataType::Utf8, false),
+            Field::new("provider_name", DataType::Utf8, false),
+            Field::new("operation_name", DataType::Utf8, false),
+            Field::new("memory_store_id", DataType::Utf8, true),
+            Field::new("memory_record_id", DataType::Utf8, true),
+            Field::new("memory_record_count", DataType::Int64, true),
+            Field::new("memory_query_text", DataType::Utf8, true),
+            Field::new("memory_records", DataType::Utf8View, true),
             Field::new("error_type", DataType::Utf8, true),
             Field::new("extra", DataType::Utf8View, true),
             Field::new("run_id", DataType::Utf8, true),
@@ -825,14 +886,14 @@ mod fingerprint_drift {
             Field::new("is_monotonic", DataType::Boolean, true),
             Field::new("flags", DataType::UInt32, true),
             Field::new("value", DataType::Float64, true),
-            Field::new("count", DataType::UInt64, true),
+            Field::new("count", DataType::Int64, true),
             Field::new("sum", DataType::Float64, true),
             Field::new("min", DataType::Float64, true),
             Field::new("max", DataType::Float64, true),
             Field::new("bucket_counts", DataType::Utf8View, true),
             Field::new("explicit_bounds", DataType::Utf8View, true),
             Field::new("scale", DataType::Int32, true),
-            Field::new("zero_count", DataType::UInt64, true),
+            Field::new("zero_count", DataType::Int64, true),
             Field::new("zero_threshold", DataType::Float64, true),
             Field::new("positive_buckets", DataType::Utf8View, true),
             Field::new("negative_buckets", DataType::Utf8View, true),
@@ -1064,6 +1125,7 @@ mod fingerprint_drift {
             Field::new("decision", DataType::Utf8, false),
             Field::new("result", DataType::Utf8, false),
             Field::new("payload_summary", DataType::Utf8, false),
+            Field::new("detail", DataType::Utf8, true),
             Field::new("created_at_us", DataType::Int64, false),
             Field::new(
                 "wyrd_event_time",

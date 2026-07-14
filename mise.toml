@@ -319,6 +319,13 @@ hide = true
 description = "Assert PyO3 stays out of pure contracts and Python-free shared crates"
 run = "bash scripts/checks/pyo3-scope.sh"
 
+[tasks."check:redux-isolation"]
+hide = true
+description = "Assert vala-bifrost-redux has zero dependency on vala-bifrost (CONTRACTS §13)"
+run = """
+grep -E '\\bvala-bifrost\\b' crates/vala/vala-bifrost-redux/Cargo.toml | grep -v 'vala-bifrost-redux' && exit 1 || exit 0
+"""
+
 [tasks."check:mocks-scope"]
 hide = true
 description = "Assert mock helpers stay out of production source"

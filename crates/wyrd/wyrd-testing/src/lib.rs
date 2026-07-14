@@ -1,5 +1,6 @@
 //! Shared Wyrd integration-test harness.
 
+pub mod bifrost;
 pub mod env;
 pub mod keys;
 pub mod multipart_client;

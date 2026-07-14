@@ -9792,6 +9792,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vala-bifrost-redux"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "datafusion",
+ "iceberg",
+ "opendal",
+ "parquet",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wyrd-runtime",
+ "wyrd-spec",
+]
+
+[[package]]
 name = "vala-core"
 version = "0.0.1"
 dependencies = [
@@ -10986,6 +11005,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "http 1.4.2",
+ "opendal",
  "pyo3",
  "reqwest 0.12.28",
  "secrecy",
@@ -11002,6 +11022,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-bifrost",
+ "vala-bifrost-redux",
  "wyrd-auth",
  "wyrd-auth-check",
  "wyrd-auth-issue",

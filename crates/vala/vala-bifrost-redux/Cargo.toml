@@ -1,0 +1,34 @@
+[package]
+name = "vala-bifrost-redux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+scribe-inspect = []
+scribe-tail = []
+
+[dependencies]
+wyrd-spec = { workspace = true }
+wyrd-runtime = { workspace = true }
+
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+serde = { workspace = true }
+arrow = { workspace = true }
+parquet = { workspace = true }
+iceberg = { workspace = true }
+datafusion = { workspace = true }
+opendal = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[lints]
+workspace = true

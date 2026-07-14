@@ -8,7 +8,7 @@
 //!
 //! Adjacent crates own adjacent surfaces: [`wyrd_spec::AgentCard`] is the
 //! durable on-disk envelope, [`skald_tool::AgentTool`] and [`AgentDelegateTool`]
-//! provide callable tools and delegation, and `wyrd-observe` auto-attaches
+//! provide callable tools and delegation, and `skald-observer` auto-attaches
 //! observers when configured by the Wyrd runtime.
 
 #![deny(missing_docs)]
@@ -49,4 +49,4 @@ pub use python::python_register;
 pub use registry::system_messages;
 pub use run::{AgentRun, FinishReason, RunConfig, RunError};
 pub use session::{NoSession, Role, SessionError, SessionId, SessionMemory, SessionTurn};
-pub use wyrd_observe::{NoopObserver, Observer};
+pub use skald_observer::{NoopObserver, Observer};

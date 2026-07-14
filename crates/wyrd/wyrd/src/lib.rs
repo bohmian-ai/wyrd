@@ -18,7 +18,7 @@
 /// This is idempotent. Rust users may call it manually when they want Skald
 /// agent runs to resolve observers through Wyrd observer state.
 pub fn init() {
-    wyrd_observe::init();
+    skald_observer::init();
     skald_runtime::refresh_default_registry_from_env();
 }
 

@@ -6621,6 +6621,7 @@ version = "0.0.1"
 dependencies = [
  "pyo3",
  "skald-agent",
+ "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-tool",
@@ -6628,7 +6629,6 @@ dependencies = [
  "vala-sdk",
  "wyrd-cards",
  "wyrd-config",
- "wyrd-observe",
  "wyrd-testing",
  "wyrd-utils",
 ]
@@ -8110,6 +8110,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8119,7 +8120,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
- "wyrd-observe",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -8136,6 +8136,23 @@ dependencies = [
  "sha2 0.10.9",
  "skald-spec",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "skald-observer"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "pyo3",
+ "serde",
+ "serde_json",
+ "skald-prompt",
+ "skald-spec",
+ "tokio",
+ "wyrd-spec",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -8236,6 +8253,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "skald-agent",
+ "skald-observer",
  "skald-prompt",
  "skald-providers",
  "skald-runtime",
@@ -8245,7 +8263,6 @@ dependencies = [
  "tokio",
  "url",
  "uuid",
- "wyrd-observe",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-utils",
@@ -10429,13 +10446,13 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
+ "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
  "skald-tool",
  "skald-workflow",
  "tokio",
- "wyrd-observe",
  "wyrd-spec",
 ]
 
@@ -10712,23 +10729,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wyrd-observe"
-version = "0.0.1"
-dependencies = [
- "async-trait",
- "opentelemetry",
- "opentelemetry_sdk",
- "pyo3",
- "serde",
- "serde_json",
- "skald-prompt",
- "skald-spec",
- "tokio",
- "wyrd-spec",
- "wyrd-utils",
-]
-
-[[package]]
 name = "wyrd-queue"
 version = "0.0.1"
 dependencies = [
@@ -10773,6 +10773,7 @@ dependencies = [
  "serde",
  "serde_json",
  "skald-agent",
+ "skald-observer",
  "skald-prompt",
  "skald-runtime",
  "skald-spec",
@@ -10781,7 +10782,6 @@ dependencies = [
  "tokio",
  "wyrd",
  "wyrd-client",
- "wyrd-observe",
  "wyrd-spec",
 ]
 

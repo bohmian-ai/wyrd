@@ -23,7 +23,7 @@ use crate::journal::JournalEvent;
 use crate::request_builder::{assistant_message, extract_messages, request_from_conversation};
 use crate::run::{AgentRun, FinishReason};
 use crate::session::{Role, SessionId, SessionTurn, session_turn_to_conversation_turn};
-use wyrd_observe::{Observer, current};
+use skald_observer::{Observer, current};
 
 #[derive(Debug, Clone)]
 struct ToolCall {

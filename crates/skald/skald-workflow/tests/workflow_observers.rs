@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use skald_agent::{Agent, Observer};
+use skald_observer;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
 use skald_providers::{ProviderError, ProviderStream};
 use skald_runtime::{Provider, ProviderRegistry};
@@ -257,7 +258,7 @@ async fn workflow_with_multiple_observers_dispatches_in_order() {
 #[tokio::test(flavor = "multi_thread")]
 async fn workflow_observers_override_global() {
     let global = Arc::new(EventLog::default());
-    wyrd_observe::set_global(Arc::clone(&global) as Arc<dyn Observer>);
+    skald_observer::set_global(Arc::clone(&global) as Arc<dyn Observer>);
 
     let scoped = Arc::new(EventLog::default());
     let wf = workflow_named("scoped-research")

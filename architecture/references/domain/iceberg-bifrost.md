@@ -44,7 +44,7 @@ serving crates.
 - `vala-bifrost-redux` **must not** depend on `vala-bifrost`. Enforced by
   `check:redux-isolation`.
 - Redux imports from: `wyrd-spec`, `wyrd-runtime`, `wyrd-sql`,
-  `wyrd-auth-verify`, `wyrd-observe`, `datafusion`, `iceberg`.
+  `wyrd-auth-verify`, `datafusion`, `iceberg`.
 - Copy — do not depend on — patterns like `BifrostNamespace`,
   `SchemaFingerprint`, `TableRef`, system-column constants,
   `bifrost_writer_properties`, `attach_tenant_filter`.

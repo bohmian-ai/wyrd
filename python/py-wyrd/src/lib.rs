@@ -50,7 +50,7 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_submodule(&providers)?;
     register_submodule(py, "wyrd._wyrd.providers", &providers)?;
 
-    wyrd_observe::python::python_register(m)?;
+    skald_observer::python::python_register(m)?;
 
     let bifrost = PyModule::new(py, "bifrost")?;
     vala_sdk::python::register_bifrost(&bifrost)?;

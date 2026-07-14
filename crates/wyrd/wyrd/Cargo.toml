@@ -14,15 +14,15 @@ path = "src/lib.rs"
 
 [features]
 default = []
-otel = ["wyrd-observe/otel"]
+otel = ["skald-observer/otel"]
 
 [dependencies]
 skald-agent = { workspace = true }
+skald-observer = { workspace = true }
 skald-prompt = { workspace = true }
 skald-runtime = { workspace = true }
 skald-tool = { workspace = true }
 skald-workflow = { workspace = true }
-wyrd-observe = { workspace = true }
 wyrd-spec = { workspace = true }
 
 [dev-dependencies]

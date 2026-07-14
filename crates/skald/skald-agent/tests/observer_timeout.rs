@@ -19,7 +19,7 @@ use skald_spec::{
 };
 use skald_tool::{AgentTool, ToolError};
 use tokio::sync::Notify;
-use wyrd_observe::{NoopObserver, Observer, set_global, with_observer};
+use skald_observer::{NoopObserver, Observer, set_global, with_observer};
 
 static OBSERVER_SLOT: OnceLock<Arc<ObserverSlot>> = OnceLock::new();
 static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

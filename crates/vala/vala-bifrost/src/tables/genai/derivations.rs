@@ -1505,15 +1505,12 @@ mod tests {
                 "gen_ai.request.model": "gpt-4o",
             });
             if op == "execute_tool" {
-                attrs.as_object_mut()
+                attrs
+                    .as_object_mut()
                     .unwrap()
                     .insert("gen_ai.tool.name".to_owned(), serde_json::json!("search"));
             }
-            per_row.push(spans_batch_with_span_id(
-                tenant,
-                [i + 1; 8],
-                &attrs,
-            ));
+            per_row.push(spans_batch_with_span_id(tenant, [i + 1; 8], &attrs));
         }
         let schema = per_row[0].schema();
 
@@ -1606,8 +1603,7 @@ mod tests {
             chunked_derived.len(),
             "same number of DerivedBatch partitions"
         );
-        let sum_rows =
-            |v: &[DerivedBatch]| -> usize { v.iter().map(|d| d.batch.num_rows()).sum() };
+        let sum_rows = |v: &[DerivedBatch]| -> usize { v.iter().map(|d| d.batch.num_rows()).sum() };
         assert_eq!(sum_rows(&single_derived), 6, "single-path preserves 6 rows");
         assert_eq!(
             sum_rows(&single_derived),

@@ -76,7 +76,7 @@ fn capture_observer_stores_events() {
 
 #[test]
 fn composite_observer_fans_out() {
-    use wyrd_observe::CompositeObserver;
+    use skald_observer::CompositeObserver;
 
     let (obs_a, store_a) = Capture::new();
     let (obs_b, store_b) = Capture::new();

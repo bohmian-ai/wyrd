@@ -6,11 +6,11 @@ use std::time::Instant;
 
 use serde_json::Value;
 use skald_agent::{Agent, AgentError};
+use skald_observer::current;
 use skald_prompt::Prompt as RuntimePrompt;
 use skald_runtime::ProviderRegistry;
 use skald_spec::{MessageNum, Prompt, ProviderName, ProviderRequest, ProviderResponse};
 use tokio::sync::RwLock;
-use wyrd_observe::current;
 
 use crate::context::Context;
 use crate::def::WorkflowDef;
@@ -123,7 +123,7 @@ impl DagExecutor {
                 handles.push(tokio::spawn(async move {
                     let task =
                         workflow.run_one_with_retries(task, &events, context, &parent_run_id);
-                    wyrd_observe::with_observer(task_observer, task).await
+                    skald_observer::with_observer(task_observer, task).await
                 }));
             }
 

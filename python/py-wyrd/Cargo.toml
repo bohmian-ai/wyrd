@@ -21,13 +21,13 @@ testing = ["dep:wyrd-testing"]
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py310", "chrono"] }
 skald-agent = { workspace = true, features = ["python"] }
+skald-observer = { workspace = true, features = ["python"] }
 skald-workflow = { workspace = true, features = ["python"] }
 skald-tool = { workspace = true, features = ["python"] }
 skald-prompt = { workspace = true, features = ["python"] }
 skald-runtime = { workspace = true, features = ["python"] }
 wyrd-cards = { workspace = true, features = ["python"] }
 wyrd-config = { workspace = true, features = ["python"] }
-wyrd-observe = { workspace = true, features = ["python"] }
 vala-sdk = { workspace = true, features = ["python"] }
 wyrd-utils = { workspace = true, features = ["python"] }
 wyrd-testing = { workspace = true, features = ["python"], optional = true }

@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use skald_observer;
 use skald_runtime::{MockProvider, ProviderRegistry};
 use skald_spec::wire::openai_chat::{
     OpenAiChatChoice, OpenAiChatMessage, OpenAiChatRequest, OpenAiChatResponse, OpenAiChatSettings,
@@ -89,7 +90,7 @@ async fn agent_run_scoped_observer_overrides_global() {
 
     wyrd::init();
     let scoped_observer: Arc<dyn Observer> = scoped.clone();
-    let run = wyrd_observe::with_observer(scoped_observer, async {
+    let run = skald_observer::with_observer(scoped_observer, async {
         agent
             .run_with(&providers, None, "make a plan")
             .await
@@ -114,7 +115,7 @@ fn global_recorder() -> Arc<RecordingObserver> {
         .get_or_init(|| {
             let recorder = Arc::new(RecordingObserver::default());
             let observer: Arc<dyn Observer> = recorder.clone();
-            wyrd_observe::set_global(observer);
+            skald_observer::set_global(observer);
             recorder
         })
         .clone();

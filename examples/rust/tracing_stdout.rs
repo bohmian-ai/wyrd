@@ -13,8 +13,8 @@ fn main() {
         .build();
     global::set_tracer_provider(provider);
 
+    use skald_observer::{OtelObserver, set_global};
     use std::sync::Arc;
-    use wyrd_observe::{OtelObserver, set_global};
 
     set_global(Arc::new(OtelObserver::new()));
     wyrd::init();

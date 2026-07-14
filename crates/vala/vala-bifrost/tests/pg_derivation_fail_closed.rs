@@ -41,10 +41,7 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
-            .seed_additional_tenant_with_uuid(
-                tenant,
-                &format!("fc-{}", tenant.as_uuid().simple()),
-            )
+            .seed_additional_tenant_with_uuid(tenant, &format!("fc-{}", tenant.as_uuid().simple()))
             .await
             .expect("seed tenant");
 

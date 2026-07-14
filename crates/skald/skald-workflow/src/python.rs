@@ -139,7 +139,7 @@ fn extract_observers(
             )));
         }
         out.push(
-            Arc::new(wyrd_observe::python::PythonObserver::new(observer)) as Arc<dyn Observer>,
+            Arc::new(skald_observer::python::PythonObserver::new(observer)) as Arc<dyn Observer>,
         );
     }
     Ok(out)

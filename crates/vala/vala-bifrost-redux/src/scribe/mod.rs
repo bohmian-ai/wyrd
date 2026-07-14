@@ -82,11 +82,8 @@ impl Scribe for ScribeImpl {
         let event_day = EventDay::from_timestamp(chrono::Utc::now());
 
         // 4. Build SealKey
-        let seal_key = crate::scribe::seal_key::SealKey::new(
-            req.principal.tenant_id,
-            table_ref,
-            event_day,
-        );
+        let seal_key =
+            crate::scribe::seal_key::SealKey::new(req.principal.tenant_id, table_ref, event_day);
 
         // 5. Build AuditEvent from principal
         let audit_event = AuditEvent {

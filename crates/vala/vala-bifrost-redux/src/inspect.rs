@@ -5,13 +5,13 @@
 use async_trait::async_trait;
 
 use crate::contracts::ScribeError;
+use crate::scribe::seal_key::SealKey;
 
 /// Memtable key for per-bucket row-count inspection.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MemtableKey {
-    pub table_fqn: String,
-    pub tenant: String,
-}
+///
+/// Type alias for [`SealKey`] — memtable buckets are keyed by
+/// (`tenant`, `table`, `event_day`).
+pub type MemtableKey = SealKey;
 
 /// Test-inspect trait exposing pod-local state for multi-pod harness verification.
 ///

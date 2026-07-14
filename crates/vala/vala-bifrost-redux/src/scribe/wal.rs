@@ -6,9 +6,16 @@
 //!
 //! Segment format per `scribe/00-architecture.md §Crash-consistent WAL format`:
 //! - Fixed 64-byte header with magic, version, `node_id`, `writer_epoch`, CRC
-//! - Variable-length framed records: `[len][lsn][kind][reserved][payload][crc32c]`
+//! - Variable-length framed records: `[len][lsn][kind][reserved][batch_id][payload][crc32c]`
 //! - Atomic segment rollover: write-fsync-rename-fsync-parent
 //! - Torn tail truncation on replay at first CRC/length/monotonicity failure
+//!
+//! ## WAL Format Version History
+//!
+//! - **Version 2** (PR#4): Added `batch_id` field to record header for deduplication.
+//!   Breaking change from version 1 — segments written with version 1 cannot be
+//!   replayed by version 2 readers. Delete WAL directory and restart if upgrading.
+//! - **Version 1** (PR#3): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -76,7 +83,7 @@ pub struct SegmentHeader {
 }
 
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
-const WAL_VERSION: u16 = 1;
+const WAL_VERSION: u16 = 2;
 const SEGMENT_HEADER_SIZE: usize = 64;
 
 impl SegmentHeader {
@@ -164,6 +171,13 @@ impl SegmentHeader {
             });
         }
 
+        // Reject version 1 segments (incompatible with PR#4's batch_id field)
+        if version == 1 {
+            return Err(ScribeError::Internal {
+                detail: "WAL format version 1 is incompatible with PR#4 (batch_id field added). Delete WAL directory and restart.".to_string(),
+            });
+        }
+
         if version != WAL_VERSION {
             return Err(ScribeError::Internal {
                 detail: format!("unsupported WAL version: {version}"),
@@ -196,24 +210,27 @@ impl SegmentHeader {
 
 /// WAL record — variable length framed entry.
 ///
-/// Layout: [len:u32][lsn:u64][kind:u8][reserved:u8×3][payload][crc32c:u32]
+/// Layout: `[len:u32][lsn:u64][kind:u8][reserved:u8×3][batch_id:u8×16][payload][crc32c:u32]`
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
     pub lsn: WalLsn,
     /// Envelope kind: 0 = data, 1 = audit-envelope-only.
     pub envelope_kind: u8,
-    /// Payload bytes (Arrow IPC for kind=0, bincode `AuditEvent` for kind=1).
+    /// Batch ID for deduplication (shared across paired audit+data records).
+    pub batch_id: [u8; 16],
+    /// Payload bytes (Arrow IPC for kind=0, JSON `AuditEvent` for kind=1).
     pub payload: Vec<u8>,
 }
 
 impl WalRecord {
     /// Construct a new WAL record.
     #[must_use]
-    pub fn new(lsn: WalLsn, envelope_kind: u8, payload: Vec<u8>) -> Self {
+    pub fn new(lsn: WalLsn, envelope_kind: u8, batch_id: [u8; 16], payload: Vec<u8>) -> Self {
         Self {
             lsn,
             envelope_kind,
+            batch_id,
             payload,
         }
     }
@@ -226,15 +243,16 @@ impl WalRecord {
     )]
     pub fn encode(&self) -> Vec<u8> {
         let len = self.payload.len() as u32;
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + 3 + self.payload.len() + 4);
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + self.payload.len() + 4);
 
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&self.lsn.as_u64().to_le_bytes());
         buf.push(self.envelope_kind);
         buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&self.batch_id);
         buf.extend_from_slice(&self.payload);
 
-        // Compute CRC over len + lsn + kind + reserved + payload
+        // Compute CRC over len + lsn + kind + reserved + batch_id + payload
         let crc = crc32c_hash(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
 
@@ -297,6 +315,14 @@ impl WalRecord {
             });
         }
 
+        // Read batch_id
+        let mut batch_id = [0u8; 16];
+        reader
+            .read_exact(&mut batch_id)
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("WAL record batch_id read error: {e}"),
+            })?;
+
         // Read payload
         let mut payload = vec![0u8; len as usize];
         reader
@@ -314,12 +340,13 @@ impl WalRecord {
             })?;
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        // Verify CRC over [len][lsn][kind][reserved][payload]
-        let mut crc_input = Vec::with_capacity(4 + 8 + 1 + 3 + payload.len());
+        // Verify CRC over [len][lsn][kind][reserved][batch_id][payload]
+        let mut crc_input = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + payload.len());
         crc_input.extend_from_slice(&len_buf);
         crc_input.extend_from_slice(&lsn_bytes);
         crc_input.extend_from_slice(&kind_buf);
         crc_input.extend_from_slice(&reserved_buf);
+        crc_input.extend_from_slice(&batch_id);
         crc_input.extend_from_slice(&payload);
 
         let computed_crc = crc32c_hash(&crc_input);
@@ -334,6 +361,7 @@ impl WalRecord {
         Ok(Some(Self {
             lsn,
             envelope_kind,
+            batch_id,
             payload,
         }))
     }
@@ -529,14 +557,15 @@ impl WalWriter {
     /// Returns the assigned LSN (same for both records).
     pub fn append_and_fsync(
         &self,
+        batch_id: [u8; 16],
         audit_payload: Vec<u8>,
         data_payload: Vec<u8>,
     ) -> Result<WalLsn, ScribeError> {
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
 
         // Build records to calculate their sizes
-        let audit_record = WalRecord::new(lsn, 1, audit_payload);
-        let data_record = WalRecord::new(lsn, 0, data_payload);
+        let audit_record = WalRecord::new(lsn, 1, batch_id, audit_payload);
+        let data_record = WalRecord::new(lsn, 0, batch_id, data_payload);
 
         let audit_size = audit_record.encode().len() as u64;
         let data_size = data_record.encode().len() as u64;
@@ -707,7 +736,8 @@ mod tests {
 
     #[test]
     fn wal_record_roundtrip() {
-        let record = WalRecord::new(WalLsn::new(5), 0, b"test data".to_vec());
+        let batch_id = [42u8; 16];
+        let record = WalRecord::new(WalLsn::new(5), 0, batch_id, b"test data".to_vec());
         let encoded = record.encode();
 
         let mut cursor = std::io::Cursor::new(encoded);
@@ -717,6 +747,7 @@ mod tests {
 
         assert_eq!(decoded.lsn, WalLsn::new(5));
         assert_eq!(decoded.envelope_kind, 0);
+        assert_eq!(decoded.batch_id, batch_id);
         assert_eq!(decoded.payload, b"test data");
     }
 
@@ -728,8 +759,9 @@ mod tests {
 
         let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, None).expect("writer");
 
+        let batch_id = [1u8; 16];
         let lsn = writer
-            .append_and_fsync(b"audit".to_vec(), b"data".to_vec())
+            .append_and_fsync(batch_id, b"audit".to_vec(), b"data".to_vec())
             .expect("append");
 
         assert_eq!(lsn, WalLsn::new(0));
@@ -755,10 +787,15 @@ mod tests {
             WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, Some(500)).expect("writer");
 
         // Write appends totaling >500 bytes (each record has overhead)
-        for i in 0..10 {
+        for i in 0u8..10 {
             let payload = format!("data-{i:03}").repeat(20); // ~100 bytes per payload
+            let batch_id = [i; 16];
             writer
-                .append_and_fsync(payload.as_bytes().to_vec(), payload.as_bytes().to_vec())
+                .append_and_fsync(
+                    batch_id,
+                    payload.as_bytes().to_vec(),
+                    payload.as_bytes().to_vec(),
+                )
                 .expect("append");
         }
 
@@ -789,11 +826,13 @@ mod tests {
         let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, None).expect("writer");
 
         // Write 2 appends to segment 0
+        let batch_id1 = [1u8; 16];
+        let batch_id2 = [2u8; 16];
         writer
-            .append_and_fsync(b"audit1".to_vec(), b"data1".to_vec())
+            .append_and_fsync(batch_id1, b"audit1".to_vec(), b"data1".to_vec())
             .expect("append 1");
         writer
-            .append_and_fsync(b"audit2".to_vec(), b"data2".to_vec())
+            .append_and_fsync(batch_id2, b"audit2".to_vec(), b"data2".to_vec())
             .expect("append 2");
 
         // Manually create a .tmp file to simulate crash during segment creation

@@ -291,6 +291,7 @@ pub(crate) fn provider_name_to_string(provider: &skald_spec::ProviderName) -> St
 }
 
 #[cfg(feature = "python")]
+// justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn wrong_provider(
     expected: &str,
@@ -901,6 +902,7 @@ impl Prompt {
     }
 
     /// Return a copy with a media placeholder bound to a provider-native value.
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn bind_media(&self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<Self> {
         Ok(Self::from_native(
@@ -911,6 +913,7 @@ impl Prompt {
     }
 
     /// Bind a media placeholder in place.
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn bind_media_mut(&mut self, name: &str, media: PyRef<'_, PyMediaRef>) -> CardPyResult<()> {
         Ok(self

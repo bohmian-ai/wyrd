@@ -121,6 +121,7 @@ impl SampleInput {
 
     /// Write the held sample input beside the local model artifact.
     #[pyo3(signature = (path, save_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn save(
         &self,
@@ -135,6 +136,7 @@ impl SampleInput {
 
     /// Read the kind-derived sample input artifact and retain it.
     #[pyo3(signature = (path, load_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn load(
         &mut self,

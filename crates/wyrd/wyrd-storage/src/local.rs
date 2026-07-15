@@ -91,6 +91,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
     #[allow(clippy::unused_async)]
     pub async fn presign_single_put(
         &self,
@@ -110,6 +111,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
     #[allow(clippy::unused_async)]
     pub async fn init_multipart(
         &self,
@@ -145,6 +147,7 @@ impl LocalSigner {
     /// # Errors
     /// Returns an invalid URI error if the local file path cannot be rendered
     /// as a file URL.
+    // justification: signature parity with sibling cloud backends (S3/GCS/Azure); BackendSigner dispatch awaits the returned future uniformly across variants
     #[allow(clippy::unused_async)]
     pub async fn presign_get(
         &self,

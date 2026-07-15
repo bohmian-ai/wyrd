@@ -863,11 +863,10 @@ mod tests {
         // io::ErrorKind::StorageFull.
 
         // Compile-time check that WalDiskFull variant exists
-        #[allow(clippy::let_unit_value)]
-        let _unit = match ScribeError::WalDiskFull {
+        match ScribeError::WalDiskFull {
             ScribeError::WalDiskFull => (),
             _ => unreachable!(),
-        };
+        }
 
         // TODO: Once wyrd_spec::error::WyrdError derive is available for ScribeError,
         // verify: assert_eq!(ScribeError::WalDiskFull.status(), 507);

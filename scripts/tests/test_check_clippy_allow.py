@@ -131,6 +131,70 @@ def test_is_ignored_path_skips_pg_tests_dir() -> None:
     assert is_ignored_path(p)
 
 
+def test_allow_inside_cfg_test_mod_is_skipped() -> None:
+    src = (
+        "fn prod() {}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    use super::*;\n"
+        "    #[allow(clippy::let_unit_value)]\n"
+        "    fn t() {}\n"
+        "}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_allow_after_cfg_test_mod_is_flagged() -> None:
+    src = (
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    fn a() {}\n"
+        "}\n"
+        "\n"
+        "#[allow(clippy::let_unit_value)]\n"
+        "fn prod() {}\n"
+    )
+    assert _scan(src) == [6]
+
+
+def test_allow_inside_cfg_all_test_feature_mod_is_skipped() -> None:
+    src = (
+        "#[cfg(all(test, feature = \"foo\"))]\n"
+        "mod tests {\n"
+        "    #[allow(clippy::let_unit_value)]\n"
+        "    fn t() {}\n"
+        "}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_allow_inside_nested_braces_in_cfg_test_mod_is_skipped() -> None:
+    src = (
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    fn t() {\n"
+        "        let x = || { 1 };\n"
+        "        #[allow(clippy::let_unit_value)]\n"
+        "        let _ = ();\n"
+        "    }\n"
+        "}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_cfg_test_with_blank_line_before_mod_is_skipped() -> None:
+    src = (
+        "#[cfg(test)]\n"
+        "\n"
+        "mod tests {\n"
+        "    #[allow(clippy::let_unit_value)]\n"
+        "    fn t() {}\n"
+        "}\n"
+    )
+    assert _scan(src) == []
+
+
 def test_is_ignored_path_allows_production_file() -> None:
     assert not is_ignored_path(ROOT / "crates" / "foo" / "src" / "lib.rs")
 

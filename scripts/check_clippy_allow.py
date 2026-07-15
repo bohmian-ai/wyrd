@@ -82,13 +82,81 @@ def has_justification_above(lines: list[str], attr_index: int) -> bool:
     return False
 
 
+CFG_TEST_RE = re.compile(r"^\s*#\[\s*cfg\s*\(\s*(?:all\s*\([^)]*?\btest\b|test)\b")
+MOD_DECL_RE = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
+
+
+def find_cfg_test_line_ranges(lines: list[str]) -> list[tuple[int, int]]:
+    """Return 1-indexed inclusive `(start, end)` line ranges for every
+    inline `#[cfg(test)] mod ... { ... }` block in the file.
+
+    The heuristic:
+    1. A line matching `CFG_TEST_RE` (handles `#[cfg(test)]` and
+       `#[cfg(all(test, ...))]`).
+    2. The next non-blank line starts a `mod NAME {`.
+    3. Track `{`/`}` balance from that opening brace forward; when depth
+       returns to zero, the mod block ends.
+
+    Braces inside string literals or block comments are not stripped —
+    same limitation as the attribute regex (documented on the test).
+    """
+    ranges: list[tuple[int, int]] = []
+    n = len(lines)
+    i = 0
+    while i < n:
+        if not CFG_TEST_RE.match(lines[i]):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and not lines[j].strip():
+            j += 1
+        if j >= n or not MOD_DECL_RE.match(lines[j]):
+            i += 1
+            continue
+        start = i + 1
+        depth = 0
+        started = False
+        k = j
+        while k < n:
+            for ch in lines[k]:
+                if ch == "{":
+                    depth += 1
+                    started = True
+                elif ch == "}":
+                    depth -= 1
+            if started and depth == 0:
+                ranges.append((start, k + 1))
+                i = k + 1
+                break
+            k += 1
+        else:
+            ranges.append((start, n))
+            break
+    return ranges
+
+
+def _line_in_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
+    for start, end in ranges:
+        if start <= line <= end:
+            return True
+    return False
+
+
 def scan_file(path: Path) -> list[Finding]:
-    """Return unjustified `#[allow(clippy::...)]` findings from one file."""
+    """Return unjustified `#[allow(clippy::...)]` findings from one file.
+
+    Skips attributes inside inline `#[cfg(test)] mod ... { ... }` blocks —
+    test-only code is not audited (mirrors the tests/ and examples/
+    exclusions in `is_ignored_path`).
+    """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
+    cfg_test_ranges = find_cfg_test_line_ranges(lines)
     findings: list[Finding] = []
     for line_number, raw_line in enumerate(lines, start=1):
         if not ATTR_RE.search(raw_line):
+            continue
+        if _line_in_ranges(line_number, cfg_test_ranges):
             continue
         if has_justification_above(lines, line_number - 1):
             continue

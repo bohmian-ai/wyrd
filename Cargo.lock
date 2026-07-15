@@ -9816,6 +9816,7 @@ dependencies = [
  "ulid",
  "uuid",
  "vala-sql",
+ "wyrd-dev-fixtures",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-sql",

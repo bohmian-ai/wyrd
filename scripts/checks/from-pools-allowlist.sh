@@ -16,6 +16,7 @@ set -e
 # 9 production wiring files: wyrd-server/src/{state,boot/mod,http/middleware/authenticate,components/{auth/{principal_extractor,caller_extractor,policy_hook,routes},health},postgres}.rs
 # 3 in-src #[cfg(test)] sites: wyrd-server/src/{bifrost/service,query/service,app/server}.rs
 # 5 integration test files: wyrd-server/tests/{pg_authz_check_route,pg_grpc_smoke,pg_router_smoke,pg_grpc_ingest_smoke,pg_merge_http_protected}.rs
+# 2 vala-bifrost-redux test/harness files: wyrd-testing/src/bifrost/scribe_harness.rs, vala-bifrost-redux/tests/pg_scribe_seal.rs
 ! rg -n --no-heading -e '\.from_pools\(|::from_pools\(' \
     --glob '!crates/wyrd/wyrd-sql/src/postgres.rs' \
     --glob '!crates/vala/vala-sql/src/postgres.rs' \
@@ -36,4 +37,6 @@ set -e
     --glob '!crates/wyrd/wyrd-server/tests/pg_router_smoke.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/pg_grpc_ingest_smoke.rs' \
     --glob '!crates/wyrd/wyrd-server/tests/pg_merge_http_protected.rs' \
+    --glob '!crates/vala/vala-bifrost-redux/tests/pg_scribe_seal.rs' \
+    --glob '!crates/wyrd/wyrd-testing/src/bifrost/scribe_harness.rs' \
     crates/ python/

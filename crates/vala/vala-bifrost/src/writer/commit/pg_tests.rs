@@ -1120,13 +1120,15 @@ mod recovery {
         // Writer records the residual: it appended a snapshot it can no longer own.
         vala_sql::queries::olap_catalog::record_fence_loss_after_append(
             &mut conn,
-            h.table_uid.as_bytes(),
-            &batch_id,
-            writer_owner,
-            writer_token,
-            snapshot_id,
-            false,
-            Some("fence lost after fast_append; recovery already aborted the row"),
+            vala_sql::queries::olap_catalog::FenceLossRecord {
+                table_uid: h.table_uid.as_bytes(),
+                batch_id: &batch_id,
+                owner: writer_owner,
+                token: writer_token,
+                snapshot_id,
+                rolled_back: false,
+                error: Some("fence lost after fast_append; recovery already aborted the row"),
+            },
         )
         .await
         .unwrap();

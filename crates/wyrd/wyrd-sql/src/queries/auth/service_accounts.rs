@@ -369,21 +369,38 @@ pub async fn insert_audit_token_exchange(
     Ok(())
 }
 
+/// One `wyrd.audit_card_scope_mint` row payload for
+/// [`insert_audit_card_scope_mint`]. The tenant is derived from the
+/// `TenantConn`, not carried here.
+pub struct CardScopeMintAudit<'a> {
+    /// Row primary key.
+    pub id: Uuid,
+    /// Optional minting principal (None for pre-authentication failures).
+    pub principal_id: Option<Uuid>,
+    /// Mint kind: `api_key_exchange`, `refresh`, `delegation`, `jwt_bearer`, …
+    pub mint_kind: &'a str,
+    /// Root card whose scope was being minted.
+    pub root_card_ref: &'a CardRef,
+    /// Correlating request identifier.
+    pub request_id: &'a str,
+    /// Outcome tag: `success` or `failure`.
+    pub result: &'a str,
+    /// Number of cards in the resolved scope (present on success).
+    pub scope_member_count: Option<i32>,
+    /// Stable hash of the sorted scope member list (present on success).
+    pub scope_hash: Option<&'a str>,
+    /// JSON summary of scope members (empty array on failure).
+    pub scope_members: Value,
+    /// Stable Wyrd error code when `result = "failure"`.
+    pub failure_code: Option<&'a str>,
+    /// Human-readable error text when `result = "failure"`.
+    pub failure_reason: Option<&'a str>,
+}
+
 /// Insert durable card-ref scope mint audit.
-#[allow(clippy::too_many_arguments)]
 pub async fn insert_audit_card_scope_mint(
     conn: &mut TenantConn<'_>,
-    id: Uuid,
-    principal_id: Option<Uuid>,
-    mint_kind: &str,
-    root_card_ref: &CardRef,
-    request_id: &str,
-    result: &str,
-    scope_member_count: Option<i32>,
-    scope_hash: Option<&str>,
-    scope_members: Value,
-    failure_code: Option<&str>,
-    failure_reason: Option<&str>,
+    audit: CardScopeMintAudit<'_>,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
@@ -394,18 +411,18 @@ pub async fn insert_audit_card_scope_mint(
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         "#,
     )
-    .bind(id)
+    .bind(audit.id)
     .bind(conn.data_tenant_id().as_uuid())
-    .bind(principal_id)
-    .bind(mint_kind)
-    .bind(Json(root_card_ref))
-    .bind(request_id)
-    .bind(result)
-    .bind(scope_member_count)
-    .bind(scope_hash)
-    .bind(scope_members)
-    .bind(failure_code)
-    .bind(failure_reason)
+    .bind(audit.principal_id)
+    .bind(audit.mint_kind)
+    .bind(Json(audit.root_card_ref))
+    .bind(audit.request_id)
+    .bind(audit.result)
+    .bind(audit.scope_member_count)
+    .bind(audit.scope_hash)
+    .bind(audit.scope_members)
+    .bind(audit.failure_code)
+    .bind(audit.failure_reason)
     .execute(&mut **conn.transaction())
     .await?;
     Ok(())

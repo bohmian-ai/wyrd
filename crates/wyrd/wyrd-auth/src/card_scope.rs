@@ -11,7 +11,7 @@ use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_sql::TenantConn;
-use wyrd_sql::queries::auth::insert_audit_card_scope_mint;
+use wyrd_sql::queries::auth::{CardScopeMintAudit, insert_audit_card_scope_mint};
 use wyrd_sql::queries::cards::get_card_by_ref;
 
 const MAX_SCOPE_DEPTH: usize = 16;
@@ -133,20 +133,22 @@ pub async fn write_scope_mint_success_audit(
     let scope_hash = scope_hash(&members);
     insert_audit_card_scope_mint(
         conn,
-        Uuid::new_v4(),
-        Some(principal_id),
-        mint_kind,
-        root,
-        request_id,
-        "success",
-        Some(
-            i32::try_from(scope.len())
-                .expect("MAX_SCOPE_CARDS invariant: scope count fits into i32"),
-        ),
-        Some(&scope_hash),
-        scope_member_summary(&members),
-        None,
-        None,
+        CardScopeMintAudit {
+            id: Uuid::new_v4(),
+            principal_id: Some(principal_id),
+            mint_kind,
+            root_card_ref: root,
+            request_id,
+            result: "success",
+            scope_member_count: Some(
+                i32::try_from(scope.len())
+                    .expect("MAX_SCOPE_CARDS invariant: scope count fits into i32"),
+            ),
+            scope_hash: Some(&scope_hash),
+            scope_members: scope_member_summary(&members),
+            failure_code: None,
+            failure_reason: None,
+        },
     )
     .await
 }
@@ -205,17 +207,19 @@ async fn write_scope_mint_failure_audit(
 ) -> Result<(), sqlx::Error> {
     insert_audit_card_scope_mint(
         conn,
-        Uuid::new_v4(),
-        None,
-        mint_kind,
-        root,
-        request_id,
-        "failure",
-        None,
-        None,
-        json!([]),
-        Some(error.code()),
-        Some(&error.to_string()),
+        CardScopeMintAudit {
+            id: Uuid::new_v4(),
+            principal_id: None,
+            mint_kind,
+            root_card_ref: root,
+            request_id,
+            result: "failure",
+            scope_member_count: None,
+            scope_hash: None,
+            scope_members: json!([]),
+            failure_code: Some(error.code()),
+            failure_reason: Some(&error.to_string()),
+        },
     )
     .await
 }

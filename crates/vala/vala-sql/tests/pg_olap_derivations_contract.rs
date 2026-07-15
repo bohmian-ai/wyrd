@@ -13,8 +13,8 @@ mod pg_tests {
     use vala_sql::TenantConn;
     use vala_sql::queries::olap_catalog::upsert_table;
     use vala_sql::queries::olap_derivations::{
-        ContractOutcome, DerivationContract, advance_watermark, register_derivation_with_contract,
-        select_derivation_pin,
+        ContractOutcome, DerivationContract, DerivationRegistration, advance_watermark,
+        register_derivation_with_contract, select_derivation_pin,
     };
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
@@ -64,16 +64,18 @@ mod pg_tests {
 
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -105,16 +107,18 @@ mod pg_tests {
         // First registration.
         register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -128,16 +132,18 @@ mod pg_tests {
         // Re-register with the SAME fingerprints.
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -178,16 +184,18 @@ mod pg_tests {
 
         register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02), // original
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02), // original
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -196,16 +204,18 @@ mod pg_tests {
         // Re-register with a different transform_fingerprint.
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0xff), // CHANGED
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0xff), // CHANGED
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -240,16 +250,18 @@ mod pg_tests {
 
         register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01), // original
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01), // original
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -257,16 +269,18 @@ mod pg_tests {
 
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0xff), // CHANGED
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0xff), // CHANGED
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -301,16 +315,18 @@ mod pg_tests {
 
         register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03), // original
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03), // original
+                },
             },
         )
         .await
@@ -318,16 +334,18 @@ mod pg_tests {
 
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0xff), // CHANGED
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0xff), // CHANGED
+                },
             },
         )
         .await
@@ -362,16 +380,18 @@ mod pg_tests {
 
         register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0x01),
-                transform_fingerprint: &fp(0x02),
-                target_set_fingerprint: &fp(0x03),
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0x01),
+                    transform_fingerprint: &fp(0x02),
+                    target_set_fingerprint: &fp(0x03),
+                },
             },
         )
         .await
@@ -380,16 +400,18 @@ mod pg_tests {
         // Change source_schema and transform fingerprints; keep target the same.
         let outcome = register_derivation_with_contract(
             &mut conn,
-            &derivation_uid,
-            &source_uid,
-            &target_uid,
-            control_bind,
-            "genai_from_spans",
-            None,
-            DerivationContract {
-                source_schema_fingerprint: &fp(0xaa), // CHANGED
-                transform_fingerprint: &fp(0xbb),     // CHANGED
-                target_set_fingerprint: &fp(0x03),    // unchanged
+            DerivationRegistration {
+                derivation_uid: &derivation_uid,
+                source_table_uid: &source_uid,
+                target_table_uid: &target_uid,
+                control_bind: control_bind,
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: DerivationContract {
+                    source_schema_fingerprint: &fp(0xaa), // CHANGED
+                    transform_fingerprint: &fp(0xbb),     // CHANGED
+                    target_set_fingerprint: &fp(0x03),    // unchanged
+                },
             },
         )
         .await

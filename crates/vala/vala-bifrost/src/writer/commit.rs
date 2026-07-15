@@ -347,13 +347,15 @@ pub async fn run_group_commit(
             // oracle owns this row, so it is not pushed to `committed`.
             let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
                 &mut conn,
-                table_uid.as_bytes(),
-                &group.key.batch_id,
-                owner,
-                fencing_token,
-                snapshot_id,
-                false,
-                None,
+                vala_sql::queries::olap_catalog::FenceLossRecord {
+                    table_uid: table_uid.as_bytes(),
+                    batch_id: &group.key.batch_id,
+                    owner,
+                    token: fencing_token,
+                    snapshot_id,
+                    rolled_back: false,
+                    error: None,
+                },
             )
             .await;
             let _ = conn.commit().await;
@@ -614,13 +616,15 @@ async fn write_and_finalize(
             .map_err(BifrostError::Sql)?;
         let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
             &mut audit_conn,
-            table_uid.as_bytes(),
-            batch_id,
-            owner,
-            fencing_token,
-            snapshot_id,
-            false,
-            None,
+            vala_sql::queries::olap_catalog::FenceLossRecord {
+                table_uid: table_uid.as_bytes(),
+                batch_id,
+                owner,
+                token: fencing_token,
+                snapshot_id,
+                rolled_back: false,
+                error: None,
+            },
         )
         .await;
         let _ = audit_conn.commit().await;
@@ -914,13 +918,15 @@ pub async fn run_commit_with_fault(
                     .map_err(BifrostError::Sql)?;
                 let _ = vala_sql::queries::olap_catalog::record_fence_loss_after_append(
                     &mut audit,
-                    table_uid.as_bytes(),
-                    &batch_id,
-                    owner,
-                    fencing_token,
-                    snapshot_id,
-                    false,
-                    None,
+                    vala_sql::queries::olap_catalog::FenceLossRecord {
+                        table_uid: table_uid.as_bytes(),
+                        batch_id: &batch_id,
+                        owner,
+                        token: fencing_token,
+                        snapshot_id,
+                        rolled_back: false,
+                        error: None,
+                    },
                 )
                 .await;
                 let _ = audit.commit().await;

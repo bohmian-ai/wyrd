@@ -3,6 +3,7 @@
 //! Gated behind `scribe-inspect` feature — never compiled in production.
 
 use async_trait::async_trait;
+use vala_sql::TenantConn;
 
 use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
@@ -32,5 +33,7 @@ pub trait ScribeInspect {
     /// Force-seal every non-empty memtable bucket on this pod and wait for the
     /// seal tx to commit. Returns once `wal_pending_bytes() == 0` and every
     /// `memtable_row_count(&k) == 0`.
-    async fn force_seal(&self) -> Result<(), ScribeError>;
+    ///
+    /// The caller provides a tenant-scoped connection for the seal transaction.
+    async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError>;
 }

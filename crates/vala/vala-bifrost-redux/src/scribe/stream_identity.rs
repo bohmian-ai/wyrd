@@ -6,7 +6,7 @@
 //! LSNs are meaningful only within one stream — never across pods or epochs.
 
 use uuid::Uuid;
-use wyrd_sql::OperatorPool;
+use vala_sql::OperatorPool;
 
 use crate::contracts::ScribeError;
 

@@ -178,9 +178,12 @@ fn extract_row_group_stats(bytes: &[u8]) -> Result<Vec<RowGroupStats>, ScribeErr
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if column stats are missing.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn extract_row_group_time_range(rg: &RowGroupMetaData) -> Result<RowGroupStats, ScribeError> {
-    let row_count = rg.num_rows() as usize;
+    // Parquet row-group `num_rows()` is i64; RowGroupStats.row_count is usize.
+    // A negative row count would be a Parquet-writer invariant violation.
+    let row_count = usize::try_from(rg.num_rows()).map_err(|_| ScribeError::Internal {
+        detail: format!("row group has invalid num_rows: {}", rg.num_rows()),
+    })?;
 
     // Find wyrd_event_time column index (column order matches Arrow schema order)
     let time_col = rg
@@ -296,7 +299,7 @@ mod tests {
         let frozen = build_test_frozen(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
             vec![t3.as_str(), t1.as_str(), t2.as_str(), t1.as_str()], // Shuffled tenant IDs
-            vec![400, 100, 300, 200], // Shuffled timestamps
+            vec![400, 100, 300, 200],                                 // Shuffled timestamps
         );
 
         let encoded = write_frozen_to_parquet(&frozen).unwrap();

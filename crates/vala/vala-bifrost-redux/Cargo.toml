@@ -35,9 +35,10 @@ chrono = { workspace = true }
 sqlx = { workspace = true }
 ulid = { workspace = true }
 bytes = "1"
+rand = "0.8"
+tokio = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
 tempfile = { workspace = true }
 
 [[bench]]

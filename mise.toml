@@ -502,6 +502,16 @@ hide = true
 description = "Self-tests for the unwrap/expect audit script"
 run = "python scripts/tests/test_check_unwrap_audit.py"
 
+[tasks."check:clippy-allow-audit"]
+hide = true
+description = "Audit `#[allow(clippy::...)]` attributes outside tests and examples (requires a `// justification:` comment on the previous line)"
+run = "python scripts/check_clippy_allow.py"
+
+[tasks."check:clippy-allow-audit:self"]
+hide = true
+description = "Self-tests for the clippy-allow audit script"
+run = "python scripts/tests/test_check_clippy_allow.py"
+
 [tasks."check:test-coverage:self"]
 hide = true
 description = "Self-tests for the test-family coverage checker (dedup, missing, phantom detection)"
@@ -947,6 +957,8 @@ depends = [
   "check:mocks-scope",
   "check:unwrap-audit",
   "check:audit-script",
+  "check:clippy-allow-audit",
+  "check:clippy-allow-audit:self",
   "check:test-coverage:self",
   "check:storage:drift",
   "check:registry-tx-coupling",

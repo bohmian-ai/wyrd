@@ -74,10 +74,16 @@ impl EventDay {
         Self(dt.date_naive())
     }
 
-    /// Get the underlying `NaiveDate`.
+    /// Get a reference to the underlying `NaiveDate`.
     #[must_use]
     pub const fn as_date(&self) -> &NaiveDate {
         &self.0
+    }
+
+    /// Get the underlying `NaiveDate` value (for SQL bindings).
+    #[must_use]
+    pub const fn as_naive_date(&self) -> NaiveDate {
+        self.0
     }
 
     /// Format as `YYYY-MM-DD`.

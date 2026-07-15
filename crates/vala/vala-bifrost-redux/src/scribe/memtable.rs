@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
@@ -28,7 +29,7 @@ const SEAL_INACTIVITY_SECS: u64 = 5;
 /// `ScribeAppendMeta` list. Freezing a seal-key detaches an immutable snapshot.
 #[derive(Debug)]
 pub struct Memtable {
-    buckets: Arc<Mutex<HashMap<SealKey, MemtableBucket>>>,
+    pub(crate) buckets: Arc<Mutex<HashMap<SealKey, MemtableBucket>>>,
 }
 
 impl Memtable {
@@ -114,6 +115,26 @@ impl Memtable {
 
         Ok(buckets.get(seal_key).map_or(0, |b| b.row_count))
     }
+
+    /// Snapshot every active seal-key currently held by the memtable whose
+    /// tenant equals `tenant`. Used by `ScribeInspect::force_seal` to drive a
+    /// per-tenant seal loop without exposing the private `MemtableBucket` type.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
+    pub fn active_seal_keys_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self.buckets.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable bucket lock poisoned: {e}"),
+        })?;
+        Ok(buckets
+            .keys()
+            .filter(|k| k.tenant == tenant)
+            .cloned()
+            .collect())
+    }
 }
 
 impl Default for Memtable {
@@ -124,7 +145,7 @@ impl Default for Memtable {
 
 /// Per-seal-key bucket holding Arrow buffers + audit events + metadata.
 #[derive(Debug)]
-struct MemtableBucket {
+pub(crate) struct MemtableBucket {
     seal_key: SealKey,
     schema: SchemaRef,
     batches: Vec<RecordBatch>,

@@ -28,10 +28,10 @@ fn build_test_batch(rows: usize) -> RecordBatch {
     ]));
 
     // Generate tenant UUIDs once to reuse across rows
-    let tenants: Vec<String> = (0..10).map(|_| DataTenantId::new_v7().to_string()).collect();
-    let tenant_ids: Vec<&str> = (0..rows)
-        .map(|i| tenants[i % 10].as_str())
+    let tenants: Vec<String> = (0..10)
+        .map(|_| DataTenantId::new_v7().to_string())
         .collect();
+    let tenant_ids: Vec<&str> = (0..rows).map(|i| tenants[i % 10].as_str()).collect();
     let timestamps: Vec<i64> = (0..rows).map(|i| i as i64 * 1_000_000).collect();
 
     RecordBatch::try_new(

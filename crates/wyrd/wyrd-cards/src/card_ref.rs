@@ -121,11 +121,13 @@ impl Kind {
 impl Kind {
     /// Native Wyrd kind wire name.
     #[getter]
+    // justification: pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance
     #[allow(clippy::trivially_copy_pass_by_ref)]
     fn name(&self) -> &'static str {
         self.wire_name()
     }
 
+    // justification: pyo3 #[pymethods] on a #[pyclass(eq_int)] enum require &self; taking self by value would consume the Python-owned instance
     #[allow(clippy::trivially_copy_pass_by_ref)]
     fn __repr__(&self) -> String {
         format!("CardKind.{}", self.wire_name())

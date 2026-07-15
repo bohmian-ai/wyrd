@@ -171,6 +171,25 @@ pub struct DerivationContract<'a> {
 
 type StoredFingerprints = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// Registration payload for [`register_derivation_with_contract`]:
+/// the derivation identity plus its fingerprint contract.
+pub struct DerivationRegistration<'a> {
+    /// Stable derivation identifier (UUID bytes).
+    pub derivation_uid: &'a [u8; 16],
+    /// Source table UID.
+    pub source_table_uid: &'a [u8; 16],
+    /// Target table UID.
+    pub target_table_uid: &'a [u8; 16],
+    /// Control bind: registration anchor (SYSTEM_OWNER or data tenant).
+    pub control_bind: Uuid,
+    /// Fully-qualified derivation name.
+    pub fqn: &'a str,
+    /// Earliest source position the derivation may process.
+    pub registered_watermark: Option<&'a [u8; 16]>,
+    /// Fingerprint contract bound at registration.
+    pub contract: DerivationContract<'a>,
+}
+
 /// Register a derivation with immutable contract fingerprints.
 ///
 /// On first call for a `(source_table_uid, target_table_uid, control_bind)`
@@ -187,17 +206,19 @@ type StoredFingerprints = (Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>);
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails or an RLS policy rejects the row.
-#[allow(clippy::too_many_arguments)]
 pub async fn register_derivation_with_contract(
     conn: &mut TenantConn<'_>,
-    derivation_uid: &[u8; 16],
-    source_table_uid: &[u8; 16],
-    target_table_uid: &[u8; 16],
-    control_bind: Uuid,
-    fqn: &str,
-    registered_watermark: Option<&[u8; 16]>,
-    contract: DerivationContract<'_>,
+    reg: DerivationRegistration<'_>,
 ) -> Result<ContractOutcome, SqlError> {
+    let DerivationRegistration {
+        derivation_uid,
+        source_table_uid,
+        target_table_uid,
+        control_bind,
+        fqn,
+        registered_watermark,
+        contract,
+    } = reg;
     let existing: Option<StoredFingerprints> = sqlx::query_as(
         r#"
             SELECT source_schema_fingerprint,

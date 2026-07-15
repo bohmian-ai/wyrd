@@ -496,16 +496,31 @@ pub async fn renew_writer_fence(
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
-#[allow(clippy::too_many_arguments)]
+/// Row payload for [`record_fence_loss_after_append`].
+pub struct FenceLossRecord<'a> {
+    /// UID of the OLAP table.
+    pub table_uid: &'a [u8; 16],
+    /// UID of the batch whose commit is being recovered.
+    pub batch_id: &'a [u8; 16],
+    /// Recovery worker that observed the fence loss.
+    pub owner: Uuid,
+    /// Fencing token held by the recovery worker at observation time.
+    pub token: i64,
+    /// Snapshot id that was appended before fence was lost.
+    pub snapshot_id: i64,
+    /// Whether the rollback succeeded (best-effort).
+    pub rolled_back: bool,
+    /// Optional human-readable error text captured during recovery.
+    pub error: Option<&'a str>,
+}
+
+/// Record a `fence_lost_after_append` recovery event.
+///
+/// # Errors
+/// Returns [`SqlError`] when the query fails.
 pub async fn record_fence_loss_after_append(
     conn: &mut TenantConn<'_>,
-    table_uid: &[u8; 16],
-    batch_id: &[u8; 16],
-    owner: Uuid,
-    token: i64,
-    snapshot_id: i64,
-    rolled_back: bool,
-    error: Option<&str>,
+    record: FenceLossRecord<'_>,
 ) -> Result<(), SqlError> {
     sqlx::query(
         r#"
@@ -519,13 +534,13 @@ pub async fn record_fence_loss_after_append(
          WHERE table_uid = $1 AND batch_id = $2
         "#,
     )
-    .bind(table_uid.as_slice())
-    .bind(batch_id.as_slice())
-    .bind(owner)
-    .bind(token)
-    .bind(snapshot_id)
-    .bind(rolled_back)
-    .bind(error)
+    .bind(record.table_uid.as_slice())
+    .bind(record.batch_id.as_slice())
+    .bind(record.owner)
+    .bind(record.token)
+    .bind(record.snapshot_id)
+    .bind(record.rolled_back)
+    .bind(record.error)
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;

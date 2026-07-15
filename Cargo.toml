@@ -190,3 +190,7 @@ unsafe_code = "deny"
 pedantic = { level = "warn", priority = -1 }
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
+# Idiomatic Rust for namespaced crates (wyrd_cards::CardRef, skald_agent::AgentSpec, etc.);
+# the "repetition" is the crate namespace, not accidental noise. Blanket-allowed to
+# avoid 11+ per-crate `#![allow]` lines and per-site `// justification:` overhead.
+module_name_repetitions = "allow"

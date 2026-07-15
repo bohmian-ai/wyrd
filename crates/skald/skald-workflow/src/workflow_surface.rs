@@ -211,6 +211,7 @@ impl Workflow {
     ///
     /// # Errors
     /// Returns DAG validation errors when the resulting graph is invalid.
+    // justification: builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic
     #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.append_agent_step(agent, Vec::new())?;
@@ -585,6 +586,7 @@ impl WorkflowBuilder {
     ///
     /// # Errors
     /// Returns when the resulting workflow cannot be appended to.
+    // justification: builder-pattern add() means append-a-workflow-step (returns Self for chaining), not std::ops::Add arithmetic
     #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, agent: Agent) -> WorkflowResult<Self> {
         self.wf.append_agent_step(agent, Vec::new())?;

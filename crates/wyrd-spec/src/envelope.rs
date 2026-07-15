@@ -225,6 +225,7 @@ impl Metadata {
 /// Kind-specific Card spec payload.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+// justification: public Card contract used by every kind; boxing variants would break call sites throughout the codebase and defeats the flat pattern-match shape that this contract exposes to consumers
 #[allow(clippy::large_enum_variant)]
 pub enum Spec {
     /// Data card spec.

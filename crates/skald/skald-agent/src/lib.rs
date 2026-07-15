@@ -12,7 +12,6 @@
 //! observers when configured by the Wyrd runtime.
 
 #![deny(missing_docs)]
-#![allow(clippy::module_name_repetitions)]
 
 pub mod agent;
 pub mod callbacks;

@@ -10,17 +10,16 @@ use crate::toolerror::ToolError;
 use crate::trait_::AgentTool;
 
 /// In-memory registry of executable tools keyed by tool name.
+#[derive(Default)]
 pub struct ToolRegistry {
     inner: RwLock<HashMap<String, Arc<dyn AgentTool>>>,
 }
 
 impl ToolRegistry {
     /// Creates a new, empty tool registry.
-    #[allow(clippy::new_without_default)]
+    #[must_use]
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// Register a tool name uniquely.

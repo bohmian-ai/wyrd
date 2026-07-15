@@ -23,7 +23,7 @@ use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, Up
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::StorageHandle;
-use crate::audit::{self, UploadAuditOperation};
+use crate::audit::{self, UploadAuditOperation, UploadAuditRow};
 use crate::error::StorageError;
 use crate::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
 use crate::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
@@ -367,12 +367,14 @@ pub async fn upload_abort(
     audit::write(
         &mut conn,
         caller,
-        UploadAuditOperation::UploadAbort,
-        Some(upload_uuid),
-        &validated.full,
-        row.backend,
-        200,
-        None,
+        UploadAuditRow {
+            operation: UploadAuditOperation::UploadAbort,
+            upload_id: Some(upload_uuid),
+            storage_path: &validated.full,
+            backend: row.backend,
+            status_code: 200,
+            error_code: None,
+        },
     )
     .await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
@@ -437,12 +439,14 @@ pub async fn download_init(
     audit::write(
         &mut conn,
         caller,
-        UploadAuditOperation::DownloadInit,
-        None,
-        &validated.full,
-        metadata.backend,
-        200,
-        None,
+        UploadAuditRow {
+            operation: UploadAuditOperation::DownloadInit,
+            upload_id: None,
+            storage_path: &validated.full,
+            backend: metadata.backend,
+            status_code: 200,
+            error_code: None,
+        },
     )
     .await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
@@ -904,12 +908,14 @@ async fn persist_s3_upload_id_and_audit(
     audit::write(
         conn,
         caller,
-        UploadAuditOperation::UploadInit,
-        Some(upload_uuid),
-        &validated.full,
-        backend,
-        200,
-        None,
+        UploadAuditRow {
+            operation: UploadAuditOperation::UploadInit,
+            upload_id: Some(upload_uuid),
+            storage_path: &validated.full,
+            backend,
+            status_code: 200,
+            error_code: None,
+        },
     )
     .await
 }
@@ -1128,12 +1134,14 @@ async fn persist_completed_upload(
     audit::write(
         conn,
         caller,
-        UploadAuditOperation::UploadComplete,
-        Some(upload_uuid),
-        &validated.full,
-        row.backend,
-        200,
-        None,
+        UploadAuditRow {
+            operation: UploadAuditOperation::UploadComplete,
+            upload_id: Some(upload_uuid),
+            storage_path: &validated.full,
+            backend: row.backend,
+            status_code: 200,
+            error_code: None,
+        },
     )
     .await
 }
@@ -1216,12 +1224,14 @@ async fn mark_failed_best_effort(
     if let Err(error) = audit::write(
         &mut conn,
         caller,
-        ctx.operation,
-        Some(upload_uuid),
-        &validated.full,
-        backend,
-        ctx.status_code,
-        ctx.error_code,
+        UploadAuditRow {
+            operation: ctx.operation,
+            upload_id: Some(upload_uuid),
+            storage_path: &validated.full,
+            backend,
+            status_code: ctx.status_code,
+            error_code: ctx.error_code,
+        },
     )
     .await
     {

@@ -4,8 +4,6 @@
 //! concrete provider clients. Clients serialize native `skald-spec` request
 //! variants directly and decode native response variants.
 
-#![allow(clippy::module_name_repetitions)]
-
 pub mod auth;
 pub mod clients;
 pub mod error;

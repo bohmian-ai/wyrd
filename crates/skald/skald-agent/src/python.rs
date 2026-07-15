@@ -81,6 +81,7 @@ impl Agent {
         provider_api_key = None,
         output_type = None
     ))]
+    // justification: pyo3 #[new] signature must match the Python API surface; the params correspond 1:1 to the exposed Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         py: Python<'_>,

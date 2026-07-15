@@ -39,33 +39,6 @@ pub struct DataSpec {
 }
 
 impl DataSpec {
-    /// Build a DataSpec and run the locked DataCard validator.
-    ///
-    /// # Errors
-    /// Returns a [`DataCardError`] when any locked DataCard invariant fails.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        interface: DataInterface,
-        schema: DataSchema,
-        card_refs: Vec<CardRef>,
-        splits: HashMap<SplitName, DataSplit>,
-        target_columns: Vec<ColumnName>,
-        sql: Option<SqlLogic>,
-        stats: DataStats,
-    ) -> Result<Self, DataCardError> {
-        let spec = Self {
-            interface,
-            schema,
-            card_refs,
-            splits,
-            target_columns,
-            sql,
-            stats,
-        };
-        spec.validate()?;
-        Ok(spec)
-    }
-
     /// Re-run locked validation invariants on this spec.
     ///
     /// # Errors

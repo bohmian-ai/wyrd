@@ -390,7 +390,8 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
             | BifrostError::PayloadForbidden
             | BifrostError::IngestBusy { .. }
             | BifrostError::WalDiskFull
-            | BifrostError::OtlpRequestMalformed { .. } => {}
+            | BifrostError::OtlpRequestMalformed { .. }
+            | BifrostError::StreamMismatch { .. } => {}
         }
     }
 

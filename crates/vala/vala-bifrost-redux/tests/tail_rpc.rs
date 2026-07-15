@@ -1,4 +1,4 @@
-//! Phase-2 `FetchLiveTail` server tests.
+//! `FetchLiveTail` server tests.
 //!
 //! Covers the four invariants called out in the plan:
 //!

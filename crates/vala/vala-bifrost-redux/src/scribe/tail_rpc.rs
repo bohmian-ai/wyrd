@@ -1,4 +1,4 @@
-//! Phase-2 `FetchLiveTail` server.
+//! `FetchLiveTail` server.
 //!
 //! `FetchLiveTailService` streams WAL data records to a caller (Oracle) that
 //! is merging seals with an active writer's tail. The request targets a specific

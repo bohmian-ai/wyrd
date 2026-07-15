@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StoredArtifactEntry",
+  "description": "One stored artifact.",
+  "type": "object",
+  "required": [
+    "relative_path",
+    "sha256",
+    "size_bytes"
+  ],
+  "properties": {
+    "content_type": {
+      "description": "Optional MIME type.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "relative_path": {
+      "description": "Relative artifact path.",
+      "type": "string"
+    },
+    "sha256": {
+      "description": "Base64-encoded SHA-256.",
+      "type": "string"
+    },
+    "size_bytes": {
+      "description": "Stored byte length.",
+      "type": "integer",
+      "format": "int64"
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ArtifactManifestEntry",
+  "description": "One artifact expected by a registration.",
+  "type": "object",
+  "required": [
+    "expected_sha256",
+    "expected_size_bytes",
+    "relative_path"
+  ],
+  "properties": {
+    "content_type": {
+      "description": "Optional MIME type.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "expected_sha256": {
+      "description": "Base64-encoded SHA-256 digest.",
+      "type": "string"
+    },
+    "expected_size_bytes": {
+      "description": "Expected byte length.",
+      "type": "integer",
+      "format": "int64"
+    },
+    "relative_path": {
+      "description": "Relative artifact path.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

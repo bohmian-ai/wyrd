@@ -1022,6 +1022,118 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Card registration requires an idempotency key.
+    #[error("[WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED",
+        status = 400,
+        title = "Idempotency key required",
+        remediation = "Provide a stable Idempotency-Key header and retry the registration."
+    )]
+    RegistryIdempotencyKeyRequired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The supplied artifact manifest hash did not match the server hash.
+    #[error("[WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH",
+        status = 400,
+        title = "Artifact manifest hash mismatch",
+        remediation = "Recompute the JCS manifest hash and retry."
+    )]
+    RegistryManifestHashMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An artifact path failed relative-path validation.
+    #[error("[WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_INVALID_ARTIFACT_PATH",
+        status = 400,
+        title = "Invalid artifact path",
+        remediation = "Use a relative forward-slash path without empty or parent-traversal segments."
+    )]
+    RegistryInvalidArtifactPath {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A local upload was interrupted by the caller.
+    #[error("[WYRD_REGISTRY_400_UPLOAD_INTERRUPTED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_UPLOAD_INTERRUPTED",
+        status = 400,
+        title = "Upload interrupted",
+        remediation = "Retry the upload while the registration operation remains pending."
+    )]
+    RegistryUploadInterrupted {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A list cursor does not match the request filters.
+    #[error("[WYRD_REGISTRY_400_CURSOR_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_CURSOR_MISMATCH",
+        status = 400,
+        title = "Cursor does not match filters",
+        remediation = "Discard the cursor and restart pagination with the current filters."
+    )]
+    RegistryCursorMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An idempotency key was reused for different content.
+    #[error("[WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT",
+        status = 409,
+        title = "Idempotency key conflict",
+        remediation = "Use the original request with this key or choose a new key for different content."
+    )]
+    RegistryIdempotencyConflict {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A pending registration operation has expired.
+    #[error("[WYRD_REGISTRY_410_OPERATION_EXPIRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_410_OPERATION_EXPIRED",
+        status = 410,
+        title = "Registration operation expired",
+        remediation = "Start a new registration with a new idempotency key."
+    )]
+    RegistryOperationExpired {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Artifact verification failed at finalization.
+    #[error("[WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED",
+        status = 507,
+        title = "Artifact verification failed",
+        remediation = "Re-upload the artifact and retry finalization."
+    )]
+    RegistryArtifactVerifyFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The backing Service or Agent card has been soft-deleted.
     #[error("[WYRD_AUTH_403_PRINCIPAL_ORPHANED] {message}")]
     #[wyrd_error(
@@ -2389,6 +2501,14 @@ impl WyrdError {
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
             | Self::RegistryUnavailable { message, details }
+            | Self::RegistryIdempotencyKeyRequired { message, details }
+            | Self::RegistryManifestHashMismatch { message, details }
+            | Self::RegistryInvalidArtifactPath { message, details }
+            | Self::RegistryUploadInterrupted { message, details }
+            | Self::RegistryCursorMismatch { message, details }
+            | Self::RegistryIdempotencyConflict { message, details }
+            | Self::RegistryOperationExpired { message, details }
+            | Self::RegistryArtifactVerifyFailed { message, details }
             | Self::PrincipalOrphaned { message, details }
             | Self::ServerNotReady { message, details }
             | Self::ServiceUnavailable { message, details }

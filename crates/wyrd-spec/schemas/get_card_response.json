@@ -1,0 +1,434 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GetCardResponse",
+  "description": "Full card response.",
+  "type": "object",
+  "required": [
+    "card",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "card": {
+      "description": "Card envelope.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/Card"
+        }
+      ]
+    },
+    "created_at": {
+      "description": "Creation time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "description": "Last update time.",
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AnnotationValue": {
+      "description": "Validated value for free-form Card annotations.",
+      "type": "string"
+    },
+    "ApiVersion": {
+      "description": "Canonical Wyrd API version.",
+      "type": "string"
+    },
+    "Card": {
+      "description": "Universal registered Card envelope.",
+      "type": "object",
+      "required": [
+        "kind",
+        "metadata",
+        "spec"
+      ],
+      "properties": {
+        "apiVersion": {
+          "description": "API version. Must be `wyrd/v1` for v1 Cards.",
+          "default": "wyrd/v1",
+          "allOf": [
+            {
+              "$ref": "#/definitions/ApiVersion"
+            }
+          ]
+        },
+        "kind": {
+          "description": "Card kind discriminator.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "metadata": {
+          "description": "Card metadata.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Metadata"
+            }
+          ]
+        },
+        "relationships": {
+          "description": "Server-derived relationship summary.",
+          "default": {},
+          "allOf": [
+            {
+              "$ref": "#/definitions/Relationships"
+            }
+          ]
+        },
+        "spec": {
+          "description": "Kind-specific spec payload."
+        },
+        "status": {
+          "description": "Optional server-derived status.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Status"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "CommitSha": {
+      "type": "string",
+      "maxLength": 40,
+      "minLength": 7,
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
+    "Metadata": {
+      "description": "Card metadata common to every kind.\n\n`version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:\n\n- Pre-register: `version` may be `None` (server bumps absolute latest or seeds `0.1.0`), `Some(VersionSpec::Scope(\"1.0\"))` (server bumps within the prefix line), or `Some(VersionSpec::Pin(\"1.4.2\"))` (exact pin). `bump` selects the bump level applied on the auto-bump paths (defaults to `Patch` if unset). - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`; readers may use [`Metadata::resolved_pin`] to extract the [`VersionBlock`].",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "annotations": {
+          "description": "Free-form annotations for automation, UI, and integration metadata.\n\nAs of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/AnnotationValue"
+          }
+        },
+        "artifact_hash": {
+          "description": "Artifact content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "bump": {
+          "description": "Bump level applied on the auto-bump paths (`None` or `Scope` `version`). Defaults to `Patch` when unset. Ignored on the exact-pin path.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VersionBump"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "labels": {
+          "description": "Display labels.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/LabelValue"
+          }
+        },
+        "name": {
+          "description": "Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "origin": {
+          "description": "Code-origin provenance: the repository commit this card was declared from. Populated on the register path for cards authored in a repo; `None` for cards with no code origin (e.g. UI-authored).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Origin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "space": {
+          "description": "Optional space.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spec_hash": {
+          "description": "Spec content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Authored version: `None` (auto-bump from absolute latest), a bare partial scope (`\"1\"` / `\"1.0\"` — bump within the prefix line), or a full triple pin (`\"1.4.2\"`). Always populated and always a pin post-register.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VersionSpec"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "Origin": {
+      "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",
+      "type": "object",
+      "required": [
+        "commit",
+        "repo"
+      ],
+      "properties": {
+        "commit": {
+          "description": "Commit the card was declared from. When `dirty`, this is the base commit of the uncommitted working tree.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommitSha"
+            }
+          ]
+        },
+        "dirty": {
+          "description": "Whether the card was declared from an uncommitted working tree.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Declaration path within the repository (monorepo disambiguation).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "Normalized repository identifier, e.g. `github.com/org/repo`.",
+          "type": "string"
+        }
+      }
+    },
+    "Relationships": {
+      "description": "Server-derived relationship summary for graph, UI, policy, imports, and diff.",
+      "type": "object",
+      "properties": {
+        "inbound": {
+          "description": "Inbound references as normalized display strings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outbound": {
+          "description": "Outbound references as normalized display strings.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "Status": {
+      "description": "Server-derived Card status.",
+      "type": "object",
+      "required": [
+        "phase"
+      ],
+      "properties": {
+        "message": {
+          "description": "Human-readable status message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "phase": {
+          "description": "Lifecycle phase such as `draft`, `active`, or `deprecated`.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "Last status update timestamp.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      }
+    },
+    "VersionBump": {
+      "description": "Semantic version bump level.\n\n`Major`, `Minor`, and `Patch` perform a conventional semver bump and clear any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are additive: they apply the requested pre-release or build metadata to the existing triple without resetting it.",
+      "oneOf": [
+        {
+          "description": "Increment major and reset minor, patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "major"
+          ]
+        },
+        {
+          "description": "Increment minor and reset patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "minor"
+          ]
+        },
+        {
+          "description": "Increment patch and reset pre-release and build metadata.",
+          "type": "string",
+          "enum": [
+            "patch"
+          ]
+        },
+        {
+          "description": "Set the pre-release identifier on the current triple (e.g. \"rc.1\").",
+          "type": "object",
+          "required": [
+            "pre"
+          ],
+          "properties": {
+            "pre": {
+              "type": "object",
+              "required": [
+                "identifier"
+              ],
+              "properties": {
+                "identifier": {
+                  "description": "Pre-release identifier as defined by SemVer 2.0 §9.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set the build metadata on the current triple (e.g. \"001\", \"sha-abc123\").",
+          "type": "object",
+          "required": [
+            "build"
+          ],
+          "properties": {
+            "build": {
+              "type": "object",
+              "required": [
+                "metadata"
+              ],
+              "properties": {
+                "metadata": {
+                  "description": "Build metadata as defined by SemVer 2.0 §10.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set both pre-release and build metadata on the current triple.",
+          "type": "object",
+          "required": [
+            "pre_build"
+          ],
+          "properties": {
+            "pre_build": {
+              "type": "object",
+              "required": [
+                "build",
+                "pre"
+              ],
+              "properties": {
+                "build": {
+                  "description": "Build metadata.",
+                  "type": "string"
+                },
+                "pre": {
+                  "description": "Pre-release identifier.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VersionSpec": {
+      "description": "Authored version on the card-registration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
+      "examples": [
+        "1.4.2",
+        "1.4.2-rc.1+meta",
+        "1.0",
+        "1"
+      ],
+      "type": "string"
+    }
+  }
+}

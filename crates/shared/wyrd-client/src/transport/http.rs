@@ -13,6 +13,14 @@
 //! client is the request origin, so there is no inbound id to forward. The
 //! forwarding seam already exists ([`AuthMiddleware::request_id`] accepts an
 //! inbound id) for a future relay caller; the helpers pass `None` today.
+//!
+//! All authenticated helpers route through [`HttpTransport::authenticated_url`],
+//! which rejects absolute URLs that do not match the configured Wyrd origin.
+//! This prevents `x-wyrd-access-token` and `wyrd-request-id` from being
+//! attached to a third-party host. Cross-origin traffic (S3/GCS/Azure
+//! presigned PUT/GET) must go through
+//! [`HttpTransport::request_external_stream`], which never sends Wyrd auth
+//! headers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +75,12 @@ impl std::fmt::Debug for HttpTransport {
 }
 
 impl HttpTransport {
+    /// Clone the shared reqwest client for a capability that must reuse this
+    /// transport's connection and TLS pools.
+    #[must_use]
+    pub fn client(&self) -> reqwest::Client {
+        self.client.clone()
+    }
     /// Build a transport from config and a shared auth middleware.
     ///
     /// Sets the per-request timeout from `config.timeout_ms` and enables gzip
@@ -116,7 +130,7 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
-        let url = self.url(path);
+        let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
         let body_bytes = serialize_body(body)?;
 
@@ -155,7 +169,7 @@ impl HttpTransport {
     where
         S: Serialize,
     {
-        let url = self.url(path);
+        let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
         let body_bytes = serialize_body(body)?;
 
@@ -172,6 +186,112 @@ impl HttpTransport {
             schema_fingerprint,
             row_count,
         })
+    }
+
+    /// Send an authenticated request whose body is a one-shot stream.
+    ///
+    /// This capability is used by the storage client for LocalFs routes. The
+    /// body is deliberately not retried because a streaming body cannot be
+    /// replayed without re-opening its source.
+    pub async fn request_stream(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: reqwest::Body,
+    ) -> Result<reqwest::Response, WyrdError> {
+        let url = self.authenticated_url(path)?;
+        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let request = self
+            .client
+            .request(method, url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .body(body);
+        let response = request.send().await.map_err(|err| WyrdError::Internal {
+            message: format!("transport error: {err}"),
+            details: serde_json::json!({"transport": "http"}),
+        })?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Err(from_problem_json(&body))
+        }
+    }
+
+    /// Send a **cross-origin** streaming request through the shared client
+    /// pool without Wyrd credentials.
+    ///
+    /// This is the storage-client seam: presigned/SAS backend PUTs and GETs
+    /// (S3, GCS, Azure) must never carry `x-wyrd-access-token`, but they
+    /// should reuse the same `reqwest::Client` connection pool as the
+    /// authenticated Wyrd traffic. This helper serves those cross-origin
+    /// calls: no `x-wyrd-access-token`, no `wyrd-request-id`, no retry
+    /// (streaming bodies cannot be replayed), and caller-supplied headers
+    /// (`Content-Range`, `Content-Type`, ETag validators, …) applied verbatim.
+    ///
+    /// # Errors
+    /// Transport failures become [`WyrdError::Internal`]. Non-`2xx`
+    /// responses are returned untouched so callers can inspect response
+    /// headers (S3 `ETag`, Azure block ack) before mapping to a
+    /// `StorageClientError`.
+    pub async fn request_external_stream(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<reqwest::Body>,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response, WyrdError> {
+        let mut request = self.client.request(method, url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        if let Some(body) = body {
+            request = request.body(body);
+        }
+        request.send().await.map_err(|err| WyrdError::Internal {
+            message: format!("external transport error: {err}"),
+            details: serde_json::json!({"transport": "http-external"}),
+        })
+    }
+
+    /// Send an authenticated request and return its streaming response.
+    pub async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::Response, WyrdError> {
+        let url = self.authenticated_url(path)?;
+        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let response = self
+            .client
+            .request(method, url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .send()
+            .await
+            .map_err(|err| WyrdError::Internal {
+                message: format!("transport error: {err}"),
+                details: serde_json::json!({"transport": "http"}),
+            })?;
+        if response.status().is_success() {
+            Ok(response)
+        } else {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Err(from_problem_json(&body))
+        }
     }
 
     /// Send a request with a stable UUIDv7 `Idempotency-Key`.
@@ -195,9 +315,51 @@ impl HttpTransport {
         S: Serialize,
         D: DeserializeOwned,
     {
-        let url = self.url(path);
+        self.submit_with_optional_idempotency_key(method, path, body, None)
+            .await
+    }
+
+    /// Send a JSON mutation with a caller-supplied stable `Idempotency-Key`.
+    ///
+    /// The key is passed unchanged to every retry attempt. This is intended
+    /// for deterministic saga keys; callers that do not need deterministic
+    /// replay should use [`Self::submit_idempotent`].
+    pub async fn submit_with_idempotency_key<S, D>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        key: &str,
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        self.submit_with_optional_idempotency_key(method, path, body, Some(key))
+            .await
+    }
+
+    async fn submit_with_optional_idempotency_key<S, D>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        key: Option<&str>,
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        let url = self.authenticated_url(path)?;
         let request_id = self.auth.request_id(None);
-        let idempotency_key = Uuid::now_v7().to_string();
+        let generated_key;
+        let idempotency_key = match key {
+            Some(key) => key,
+            None => {
+                generated_key = Uuid::now_v7().to_string();
+                &generated_key
+            }
+        };
         let body_bytes = serde_json::to_vec(body).map_err(|err| WyrdError::Internal {
             message: format!("request serialization failed: {err}"),
             details: serde_json::json!({}),
@@ -209,7 +371,7 @@ impl HttpTransport {
                 &url,
                 &request_id,
                 Some(&body_bytes),
-                Some(&idempotency_key),
+                Some(idempotency_key),
             )
             .await?;
 
@@ -220,8 +382,38 @@ impl HttpTransport {
         })
     }
 
-    fn url(&self, path: &str) -> String {
-        format!("{}/{}", self.base_url, path.trim_start_matches('/'))
+    /// Resolve a path or absolute URL to a same-origin URL suitable for
+    /// authenticated requests.
+    ///
+    /// A relative path is joined to the configured `base_url`. An absolute URL
+    /// is accepted only when it targets the exact configured Wyrd origin;
+    /// cross-origin URLs are rejected so that `x-wyrd-access-token` and
+    /// `wyrd-request-id` never travel to a third-party host (V-001).
+    ///
+    /// # Errors
+    /// Returns [`WyrdError::Validation`] when the input is an absolute URL
+    /// whose scheme+authority does not match the configured base URL.
+    fn authenticated_url(&self, path: &str) -> Result<String, WyrdError> {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            if same_origin(&self.base_url, path) {
+                Ok(path.to_owned())
+            } else {
+                Err(WyrdError::Validation {
+                    message: "authenticated request URL must match the configured Wyrd origin"
+                        .to_owned(),
+                    details: serde_json::json!({
+                        "reason": "cross_origin_url_rejected",
+                        "transport": "http",
+                    }),
+                })
+            }
+        } else {
+            Ok(format!(
+                "{}/{}",
+                self.base_url,
+                path.trim_start_matches('/')
+            ))
+        }
     }
 
     /// Core send-with-retry loop shared by all three helpers.
@@ -384,4 +576,35 @@ fn auth_to_wyrd(err: AuthError) -> WyrdError {
 /// Extract a response header value as a `&str`.
 fn header_str<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
     resp.headers().get(name)?.to_str().ok()
+}
+
+/// Return `true` when `candidate` targets the same scheme+authority as
+/// `configured_origin`.
+///
+/// Compares the scheme (`http`/`https`) and authority (host and optional
+/// port) portions and requires them to be byte-for-byte identical. Paths are
+/// intentionally ignored — the caller may reach any route under the origin,
+/// but never a different host.
+fn same_origin(configured_origin: &str, candidate: &str) -> bool {
+    match (split_origin(configured_origin), split_origin(candidate)) {
+        (Some(base), Some(cand)) => base == cand,
+        _ => false,
+    }
+}
+
+/// Extract the `(scheme, authority)` prefix of an absolute URL, or `None` if
+/// the input is not a recognizable absolute URL.
+fn split_origin(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        return None;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    Some((scheme, authority))
 }

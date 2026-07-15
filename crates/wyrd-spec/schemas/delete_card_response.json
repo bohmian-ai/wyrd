@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeleteCardResponse",
+  "description": "Soft-delete response.",
+  "type": "object",
+  "required": [
+    "card_uid",
+    "deleted"
+  ],
+  "properties": {
+    "card_uid": {
+      "description": "Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "deleted": {
+      "description": "True only on the first delete.",
+      "type": "boolean"
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    }
+  }
+}

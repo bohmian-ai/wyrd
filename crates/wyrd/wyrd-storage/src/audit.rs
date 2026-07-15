@@ -32,29 +32,36 @@ impl UploadAuditOperation {
     }
 }
 
+/// Fields describing one storage access ledger append.
+///
+/// The subject and request identity come from the `StorageCaller` passed
+/// separately to [`write`]; only the op-scoped fields live here.
+pub(crate) struct UploadAuditRow<'a> {
+    pub operation: UploadAuditOperation,
+    pub upload_id: Option<Uuid>,
+    pub storage_path: &'a str,
+    pub backend: StorageBackendKind,
+    pub status_code: i32,
+    pub error_code: Option<&'a str>,
+}
+
 /// Append one storage access ledger row for a caller-scoped operation.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn write(
     conn: &mut TenantConn<'_>,
     caller: &StorageCaller,
-    operation: UploadAuditOperation,
-    upload_id: Option<Uuid>,
-    storage_path: &str,
-    backend: StorageBackendKind,
-    status_code: i32,
-    error_code: Option<&str>,
+    row: UploadAuditRow<'_>,
 ) -> Result<(), WyrdError> {
     let subject_id = subject_id(caller);
     access_ledger::append(
         conn,
         NewLedgerEntry {
             subject_id: &subject_id,
-            operation: operation.as_sql_str(),
-            upload_id,
-            storage_path,
-            backend,
-            status_code,
-            error_code,
+            operation: row.operation.as_sql_str(),
+            upload_id: row.upload_id,
+            storage_path: row.storage_path,
+            backend: row.backend,
+            status_code: row.status_code,
+            error_code: row.error_code,
             request_id: caller.request_id.as_str(),
         },
     )

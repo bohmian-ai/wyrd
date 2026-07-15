@@ -115,7 +115,12 @@ pub enum IssueErrorOrWyrd {
 }
 
 /// Write the successful card-ref scope mint audit row on the mint transaction.
-#[allow(clippy::missing_panics_doc)]
+///
+/// # Panics
+///
+/// Panics if `scope.len()` exceeds `i32::MAX`. Callers must enforce the
+/// `MAX_SCOPE_CARDS` limit upstream; violating it is a programmer error,
+/// not a runtime condition.
 pub async fn write_scope_mint_success_audit(
     conn: &mut TenantConn<'_>,
     principal_id: Uuid,

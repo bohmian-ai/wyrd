@@ -5,12 +5,18 @@ use futures_util::stream::{BoxStream, StreamExt};
 
 use crate::error::StorageClientError;
 
+/// Buffered stream reader for chunked upload protocols.
+///
+/// Reads from a fallible byte stream and emits fixed-size chunks on demand,
+/// buffering partial reads across calls. Used by multipart upload to ensure
+/// each part matches the plan's `part_size_bytes`.
 pub(crate) struct SourceReader {
     stream: BoxStream<'static, Result<Bytes, StorageClientError>>,
     pending: Bytes,
 }
 
 impl SourceReader {
+    /// Wraps a byte stream with buffering.
     pub(crate) fn new(stream: BoxStream<'static, Result<Bytes, StorageClientError>>) -> Self {
         Self {
             stream,
@@ -18,6 +24,10 @@ impl SourceReader {
         }
     }
 
+    /// Reads up to `max` bytes from the stream, buffering across chunk
+    /// boundaries.
+    ///
+    /// Returns `Ok(None)` when the stream is exhausted.
     pub(crate) async fn next_chunk(
         &mut self,
         max: usize,
@@ -41,6 +51,7 @@ impl SourceReader {
         }
     }
 
+    /// Checks whether more data is available without consuming it.
     pub(crate) async fn has_more(&mut self) -> Result<bool, StorageClientError> {
         if self.pending.has_remaining() {
             return Ok(true);
@@ -54,6 +65,8 @@ impl SourceReader {
         }
     }
 
+    /// Consumes the reader and returns the underlying stream with any buffered
+    /// data prepended.
     pub(crate) fn stream(self) -> BoxStream<'static, Result<Bytes, StorageClientError>> {
         let Self { stream, pending } = self;
         futures_util::stream::once(async move { pending })

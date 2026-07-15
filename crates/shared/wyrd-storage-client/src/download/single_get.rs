@@ -9,6 +9,9 @@ use wyrd_spec::storage::DownloadPlan;
 use super::DownloadOutcome;
 use crate::error::StorageClientError;
 
+/// Downloads an artifact via presigned or SAS GET URL.
+///
+/// External request with no Wyrd auth headers.
 pub(crate) async fn download(
     client: &WyrdClient,
     plan: &DownloadPlan,
@@ -23,6 +26,7 @@ pub(crate) async fn download(
     write_response(response, dest).await
 }
 
+/// Writes a successful HTTP response body to a file, tracking bytes written.
 pub(crate) async fn write_response(
     response: reqwest::Response,
     dest: &Path,

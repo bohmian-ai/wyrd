@@ -22,6 +22,13 @@ use crate::upload::reader::SourceReader;
 
 const MAX_PART_ATTEMPTS: u32 = 3;
 
+/// Executes S3 multipart upload with retry and progress tracking.
+///
+/// Each part is retried up to 3 times on transport failure or 5xx. A 403
+/// (expired presigned URL) triggers a fresh URL mint via
+/// `hooks.part_url_minter`. Returns a completion payload with one
+/// `(part_number, etag)` entry per part in ascending order—retries never
+/// duplicate parts (V-003).
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

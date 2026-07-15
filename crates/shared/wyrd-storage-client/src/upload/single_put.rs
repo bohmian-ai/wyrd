@@ -7,6 +7,11 @@ use super::{UploadHooks, UploadOutcome};
 use crate::error::StorageClientError;
 use crate::upload::reader::SourceReader;
 
+/// Executes a single-PUT upload via presigned URL.
+///
+/// Streams the source body directly to the storage backend with the plan's
+/// required headers plus the idempotency key. No retry—transport failures
+/// propagate immediately.
 pub(crate) async fn upload(
     client: &WyrdClient,
     plan: &UploadPlan,

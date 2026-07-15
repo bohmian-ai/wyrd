@@ -46,6 +46,25 @@ impl WyrdStorageClient {
     }
 
     /// Upload an artifact according to a server-minted plan.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - Server-generated upload plan containing storage backend
+    ///   details, part sizing, and presigned URLs or authenticated endpoints
+    /// * `source` - Artifact data source (file, bytes, or stream)
+    /// * `hooks` - Progress callbacks and idempotency key
+    ///
+    /// # Returns
+    ///
+    /// * `UploadOutcome::Uploaded` - Single-PUT completed successfully
+    /// * `UploadOutcome::NeedsServerComplete` - Multipart upload requires
+    ///   server-side completion call
+    ///
+    /// # Errors
+    ///
+    /// * Transport failures, 5xx responses (retried up to 3 times for multipart)
+    /// * Plan/source size mismatch
+    /// * Backend-specific errors (S3/GCS/Azure)
     pub async fn upload<S: ArtifactSource>(
         &self,
         plan: &UploadPlan,
@@ -56,6 +75,22 @@ impl WyrdStorageClient {
     }
 
     /// Download an artifact according to a server-minted plan.
+    ///
+    /// # Arguments
+    ///
+    /// * `plan` - Server-generated download plan with presigned GET URL or
+    ///   authenticated LocalFs endpoint
+    /// * `dest` - Filesystem path where the downloaded artifact will be written
+    ///
+    /// # Returns
+    ///
+    /// `DownloadOutcome` with total bytes written to disk
+    ///
+    /// # Errors
+    ///
+    /// * Transport failures
+    /// * Filesystem write errors
+    /// * Non-success HTTP status from storage backend
     pub async fn download(
         &self,
         plan: &DownloadPlan,

@@ -1,4 +1,4 @@
-//! Phase-2 `FetchLiveTail` server tests — gated on `scribe-inspect`.
+//! Phase-2 `FetchLiveTail` server tests.
 //!
 //! Covers the four invariants called out in the plan:
 //!
@@ -280,4 +280,84 @@ async fn live_tail_sealed_range_index_ignores_other_streams() {
         vec![lsns[1], lsns[2]],
         "only this-stream's sealed range excludes rows; other-stream range must not"
     );
+}
+
+mod pg_tests {
+    use super::*;
+    use chrono::Utc;
+    use sqlx::types::Uuid;
+    use vala_sql::OperatorPool;
+    use wyrd_dev_fixtures::pg::PgFixture;
+
+    async fn insert_file_list_range(
+        pool: &OperatorPool,
+        tenant: DataTenantId,
+        stream: StreamIdentity,
+        min_lsn: i64,
+        max_lsn: i64,
+    ) {
+        let event_time = Utc::now();
+        sqlx::query(
+            "INSERT INTO vala.file_list (
+                id, data_tenant_id, namespace, table_name, file_path, file_size,
+                row_count, min_event_time, max_event_time, partition_day,
+                tenant_bucket, node_id, writer_epoch, wal_lsn_min, wal_lsn_max
+             ) VALUES (
+                $1, $2, 'vala', 'events', $3, 128, 2, $4, $4, $5, 0, $6, $7, $8, $9
+             )",
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant.as_uuid())
+        .bind(format!("sealed/{min_lsn}-{max_lsn}.parquet"))
+        .bind(event_time)
+        .bind(event_time.date_naive())
+        .bind(stream.node_id.as_uuid())
+        .bind(stream.writer_epoch.as_i64())
+        .bind(min_lsn)
+        .bind(max_lsn)
+        .execute(pool.pool())
+        .await
+        .expect("insert file_list range");
+    }
+
+    #[tokio::test]
+    async fn sealed_range_index_hydrates_from_file_list() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let pool = OperatorPool::from(fixture.platform_admin_pool().clone());
+        let tenant_a = DataTenantId::new_v7();
+        let tenant_b = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(
+                tenant_a,
+                &format!("test-{}", tenant_a.as_uuid().simple()),
+            )
+            .await
+            .expect("seed tenant A");
+        fixture
+            .seed_additional_tenant_with_uuid(
+                tenant_b,
+                &format!("test-{}", tenant_b.as_uuid().simple()),
+            )
+            .await
+            .expect("seed tenant B");
+
+        let this = stream(7, 3);
+        let other = stream(8, 3);
+        insert_file_list_range(&pool, tenant_a, this, 40, 60).await;
+        insert_file_list_range(&pool, tenant_b, this, 80, 100).await;
+        insert_file_list_range(&pool, tenant_a, other, 120, 140).await;
+
+        let index = SealedRangeIndex::hydrate_from_file_list(&pool, this)
+            .await
+            .expect("hydrate sealed ranges");
+
+        assert!(index.contains(this, WalLsn::new(40)));
+        assert!(index.contains(this, WalLsn::new(50)));
+        assert!(index.contains(this, WalLsn::new(60)));
+        assert!(!index.contains(this, WalLsn::new(70)));
+        assert!(index.contains(this, WalLsn::new(80)));
+        assert!(index.contains(this, WalLsn::new(100)));
+        assert!(!index.contains(this, WalLsn::new(110)));
+        assert!(!index.contains(other, WalLsn::new(120)));
+    }
 }

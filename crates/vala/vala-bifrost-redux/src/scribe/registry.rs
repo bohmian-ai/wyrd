@@ -94,13 +94,19 @@ impl Drop for ScribeHeartbeat {
 /// # Errors
 /// Returns [`ScribeError::Internal`] if the UPDATE fails.
 pub async fn heartbeat_tick(pool: &OperatorPool, node_id: NodeId) -> Result<(), ScribeError> {
-    sqlx::query("UPDATE vala.cluster_nodes SET heartbeat_at = now() WHERE node_id = $1")
-        .bind(node_id.as_uuid())
-        .execute(pool.pool())
-        .await
-        .map_err(|e| ScribeError::Internal {
-            detail: format!("failed to update heartbeat_at: {e}"),
-        })?;
+    let result =
+        sqlx::query("UPDATE vala.cluster_nodes SET heartbeat_at = now() WHERE node_id = $1")
+            .bind(node_id.as_uuid())
+            .execute(pool.pool())
+            .await
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("failed to update heartbeat_at: {e}"),
+            })?;
+    if result.rows_affected() == 0 {
+        return Err(ScribeError::Internal {
+            detail: format!("cluster_nodes row missing for node_id={node_id}"),
+        });
+    }
     Ok(())
 }
 

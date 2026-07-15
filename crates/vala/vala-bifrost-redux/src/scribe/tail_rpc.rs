@@ -1,4 +1,4 @@
-//! Phase-2 `FetchLiveTail` server — feature-gated on `scribe-inspect`.
+//! Phase-2 `FetchLiveTail` server.
 //!
 //! `FetchLiveTailService` streams WAL data records to a caller (Oracle) that
 //! is merging seals with an active writer's tail. The request targets a specific
@@ -12,15 +12,14 @@
 //!   already covered by a stream-scoped sealed range in `SealedRangeIndex` is
 //!   emitted, so the caller never sees a row twice even mid-seal.
 //!
-//! This module is compiled only under the `scribe-inspect` cargo feature and
-//! is never wired into the default build or `mise run test:vala`. Oracle owns
-//! the client half and the server plumbing in a later PR.
+//! This module compiles unconditionally. The tonic streaming wire-up and
+//! in-crate consumer land in Phase B.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vala_sql::TenantConn;
+use vala_sql::OperatorPool;
 use wyrd_spec::vala::error::BifrostError;
 
 use crate::contracts::ScribeError;
@@ -85,16 +84,17 @@ impl SealedRangeIndex {
             .is_some_and(|ranges| ranges.iter().any(|(min, max)| lsn >= *min && lsn <= *max))
     }
 
-    /// Load sealed ranges for `stream` from `vala.file_list`.
+    /// Load every sealed WAL LSN range for `stream` from `vala.file_list`.
     ///
-    /// RLS on `vala.file_list` restricts the read to the connection's tenant;
-    /// Oracle drives one tenant per fetch, matching how tail merges are scoped.
+    /// The tail RPC is pod-scoped: ranges for a `(node_id, writer_epoch)` stream
+    /// span every tenant that pod has hosted. This uses the operator pool
+    /// (BYPASSRLS) because the stream axis crosses tenants.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the query fails or an LSN column
     /// is negative (invariant violation — `wal_lsn_*` is unsigned semantically).
     pub async fn hydrate_from_file_list(
-        conn: &mut TenantConn<'_>,
+        pool: &OperatorPool,
         stream: StreamIdentity,
     ) -> Result<Self, ScribeError> {
         let node_uuid = stream.node_id.as_uuid();
@@ -105,7 +105,7 @@ impl SealedRangeIndex {
         )
         .bind(node_uuid)
         .bind(stream.writer_epoch.as_i64())
-        .fetch_all(&mut **conn.transaction())
+        .fetch_all(pool.pool())
         .await
         .map_err(|e| ScribeError::Internal {
             detail: format!("SealedRangeIndex file_list query: {e}"),
@@ -134,7 +134,7 @@ impl SealedRangeIndex {
 /// The caller identifies the target writer stream and the last LSN it has
 /// already observed; Scribe returns every subsequent data record on that
 /// stream (subject to `SealedRangeIndex` exclusion).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct FetchLiveTailRequest {
     /// The writer stream the caller believes it is talking to.
     pub target_stream: StreamIdentity,
@@ -207,17 +207,25 @@ impl FetchLiveTailService {
         &self,
         req: FetchLiveTailRequest,
     ) -> Result<Vec<ArrowIpcBatch>, BifrostError> {
+        self.read_tail_blocking(req)
+    }
+
+    fn read_tail_blocking(
+        &self,
+        req: FetchLiveTailRequest,
+    ) -> Result<Vec<ArrowIpcBatch>, BifrostError> {
         if req.target_stream != self.stream {
             return Err(BifrostError::StreamMismatch {
                 requested: req.target_stream.to_string(),
-                expected: self.stream.to_string(),
+                actual: self.stream.to_string(),
             });
         }
 
-        let reader =
-            WalReader::open_directory(&self.wal_dir).map_err(|e| BifrostError::Internal {
+        let reader = WalReader::open_directory(&self.wal_dir, self.stream).map_err(|e| {
+            BifrostError::Internal {
                 detail: format!("live-tail WAL open failed: {e}"),
-            })?;
+            }
+        })?;
         let records = reader
             .read_all_records()
             .map_err(|e| BifrostError::Internal {

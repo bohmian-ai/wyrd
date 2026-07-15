@@ -73,7 +73,7 @@ pub fn replay_wal_directory(
         })
         .unwrap_or_default();
 
-    let reader = WalReader::open_directory(wal_dir)?;
+    let reader = WalReader::open_directory_unfiltered(wal_dir)?;
     let records = reader.read_all_records()?;
 
     // Truncate torn tails — already handled by WalRecord::decode_from returning Err on CRC mismatch

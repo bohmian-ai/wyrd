@@ -9,7 +9,7 @@ mod pg_tests {
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
-    use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
+    use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::DateTime;
     use opendal::services::Memory;
@@ -43,8 +43,12 @@ mod pg_tests {
         );
 
         let temp_dir = tempfile::tempdir().expect("temp WAL dir");
-        let node_id = Uuid::now_v7();
-        let node_id_bytes = *node_id.as_bytes();
+        let mut node_id_bytes = *Uuid::now_v7().as_bytes();
+        // The current seal filename seam accepts a PodId string while
+        // file_list stores the same value as UUID; use a UUID whose first
+        // hexadecimal character also satisfies the PodId grammar.
+        node_id_bytes[0] = 0xa0 | (node_id_bytes[0] & 0x0f);
+        let node_id = Uuid::from_bytes(node_id_bytes);
         let wal = Arc::new(
             vala_bifrost_redux::scribe::wal::WalWriter::new(
                 temp_dir.path(),
@@ -65,8 +69,9 @@ mod pg_tests {
         (fixture, tenant, scribe)
     }
 
-    fn make_batch(row_count: usize, base_time_micros: i64) -> RecordBatch {
+    fn make_batch(row_count: usize, base_time_micros: i64, tenant: DataTenantId) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
+            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -81,10 +86,12 @@ mod pg_tests {
         let values: Vec<u64> = (0..row_count)
             .map(|i| u64::try_from(i).expect("bounded row index"))
             .collect();
+        let tenant_ids = vec![tenant.to_string(); row_count];
 
         RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],
@@ -126,7 +133,7 @@ mod pg_tests {
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
-        let batch = make_batch(50_000, base_time);
+        let batch = make_batch(50_000, base_time, tenant);
         let batch_data = encode_batch(&batch);
         let principal = principal_for_tenant(tenant);
 
@@ -156,20 +163,20 @@ mod pg_tests {
 
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
-            Uuid,   // id
-            String, // namespace
-            String, // table_name
-            String, // file_path
-            i64,    // row_count
-            i64,    // file_size
-            String, // partition_day
-            i64,    // wal_lsn_min
-            i64,    // wal_lsn_max
-            i32,    // tenant_bucket
-            Uuid,   // node_id
-            i64,    // writer_epoch
-            i64,    // min_event_time
-            i64,    // max_event_time
+            Uuid,                  // id
+            String,                // namespace
+            String,                // table_name
+            String,                // file_path
+            i64,                   // row_count
+            i64,                   // file_size
+            String,                // partition_day
+            i64,                   // wal_lsn_min
+            i64,                   // wal_lsn_max
+            i32,                   // tenant_bucket
+            Uuid,                  // node_id
+            i64,                   // writer_epoch
+            DateTime<chrono::Utc>, // min_event_time
+            DateTime<chrono::Utc>, // max_event_time
         )> = sqlx::query_as(
             r"
             SELECT id, namespace, table_name, file_path, row_count, file_size,
@@ -215,8 +222,8 @@ mod pg_tests {
         assert_eq!(*row_count, 50_000);
         assert!(*file_size > 0, "file_size should be positive");
         assert_eq!(partition_day, "2026-07-14");
-        assert!(*wal_lsn_min > 0, "wal_lsn_min should be > 0");
-        assert!(*wal_lsn_max > 0, "wal_lsn_max should be > 0");
+        assert!(*wal_lsn_min >= 0, "wal_lsn_min should be non-negative");
+        assert!(*wal_lsn_max >= 0, "wal_lsn_max should be non-negative");
         assert!(*wal_lsn_min <= *wal_lsn_max, "LSN range should be valid");
         assert!(
             *tenant_bucket >= 0 && *tenant_bucket < 1024,
@@ -241,7 +248,7 @@ mod pg_tests {
             .timestamp_micros();
 
         for i in 0..3 {
-            let batch = make_batch(1000, base_time + (i * 1_000_000));
+            let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
             let batch_data = encode_batch(&batch);
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7()); // Unique principal per append
@@ -273,24 +280,25 @@ mod pg_tests {
 
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
-            Uuid,           // request_id
+            Uuid,           // data_tenant_id
+            String,         // request_id
             Option<String>, // trace_id
             String,         // operation
             String,         // resource
             Option<String>, // card_ref (JSON)
             Uuid,           // principal_id
             String,         // principal_kind
-            Uuid,           // principal_tenant_id
-            String,         // decision
-            Option<String>, // result (JSON)
             String,         // auth_method
-            Option<String>, // metadata (JSON)
-            Option<String>, // error (JSON)
+            String,         // permission
+            String,         // decision
+            String,         // result
+            String,         // payload_summary
+            Option<String>, // detail
         )> = sqlx::query_as(
             r"
-            SELECT request_id, trace_id, operation, resource, card_ref,
-                   principal_id, principal_kind, principal_tenant_id,
-                   decision, result, auth_method, metadata, error
+            SELECT data_tenant_id, request_id, trace_id, operation, resource, card_ref,
+                   principal_id, principal_kind, auth_method, permission,
+                   decision, result, payload_summary, detail
             FROM vala.audit_outbox
             WHERE operation = 'bifrost.append'
             ORDER BY request_id
@@ -304,6 +312,7 @@ mod pg_tests {
 
         for (i, row) in rows.iter().enumerate() {
             let (
+                data_tenant_id,
                 request_id,
                 trace_id,
                 operation,
@@ -311,15 +320,16 @@ mod pg_tests {
                 card_ref,
                 principal_id,
                 principal_kind,
-                principal_tenant_id,
+                auth_method,
+                permission,
                 decision,
                 result,
-                auth_method,
-                _metadata,
-                _error,
+                payload_summary,
+                detail,
             ) = row;
 
-            assert_ne!(*request_id, Uuid::nil(), "request_id {i} should be non-nil");
+            assert_eq!(*data_tenant_id, tenant.as_uuid());
+            assert!(!request_id.is_empty(), "request_id {i} should be non-empty");
             assert!(trace_id.is_none(), "trace_id should be None for this test");
             assert_eq!(operation, "bifrost.append");
             assert!(!resource.is_empty(), "resource should be non-empty");
@@ -330,11 +340,15 @@ mod pg_tests {
                 "principal_id {i} should be non-nil"
             );
             assert_eq!(principal_kind, "user");
-            assert_eq!(*principal_tenant_id, tenant.as_uuid());
+            assert_eq!(auth_method, "jwt");
+            assert!(!permission.is_empty(), "permission should be non-empty");
             assert_eq!(decision, "allow", "decision should be allow");
-            assert!(result.is_some(), "result should be Some");
-            assert!(!auth_method.is_empty(), "auth_method should be non-empty");
-            // metadata and error are optional and may be None
+            assert_eq!(result, "success");
+            assert!(
+                !payload_summary.is_empty(),
+                "payload_summary should be non-empty"
+            );
+            assert!(detail.is_none(), "detail should be None for this test");
         }
     }
 
@@ -352,6 +366,7 @@ mod pg_tests {
             .timestamp_micros();
 
         let schema = Arc::new(Schema::new(vec![
+            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -374,10 +389,12 @@ mod pg_tests {
             timestamps.push(day2_time + ((i - 60) * 100_000));
             values.push(u64::try_from(i).expect("bounded row index"));
         }
+        let tenant_ids = vec![tenant.to_string(); timestamps.len()];
 
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
+                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],

@@ -31,7 +31,6 @@ use crate::contracts::{AppendAck, Scribe, ScribeAppend, ScribeError};
 #[cfg(feature = "scribe-inspect")]
 use crate::inspect::{MemtableKey, ScribeInspect};
 use crate::scribe::memtable::Memtable;
-use crate::scribe::registry::ScribeHeartbeat;
 use crate::scribe::seal_key::{EventDay, SealKey, TableRef};
 use crate::scribe::wal::ScribeAppendMeta;
 
@@ -52,9 +51,6 @@ pub struct ScribeImpl {
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
     writer_epoch: i64,
-    /// Recurring `vala.cluster_nodes.heartbeat_at` updater; `None` when the
-    /// heartbeat lifecycle is not attached (e.g. unit-test constructors).
-    heartbeat: Option<ScribeHeartbeat>,
 }
 
 impl ScribeImpl {
@@ -71,31 +67,6 @@ impl ScribeImpl {
             wal,
             node_id,
             writer_epoch,
-            heartbeat: None,
-        }
-    }
-
-    /// Attach the recurring `vala.cluster_nodes.heartbeat_at` updater.
-    ///
-    /// Boot flow: `stream_identity::acquire_on_boot` creates the row and
-    /// returns a fresh `WriterEpoch`; the caller then starts a
-    /// [`ScribeHeartbeat`] against the same `node_id` and hands it here. The
-    /// heartbeat is aborted on [`ScribeImpl::shutdown`] or on `Drop` as a
-    /// backstop.
-    #[must_use]
-    pub fn with_heartbeat(mut self, heartbeat: ScribeHeartbeat) -> Self {
-        self.heartbeat = Some(heartbeat);
-        self
-    }
-
-    /// Stop the heartbeat lifecycle (if attached).
-    ///
-    /// Idempotent: safe to call once during graceful shutdown. `Drop` also
-    /// aborts the heartbeat, but explicit shutdown is preferred so the loop
-    /// stops before the pool it borrows is dropped.
-    pub fn shutdown(&mut self) {
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.shutdown();
         }
     }
 
@@ -137,7 +108,6 @@ impl ScribeImpl {
             wal,
             node_id: "00000000-0000-0000-0000-000000000000".to_string(),
             writer_epoch: 1,
-            heartbeat: None,
         }
     }
 

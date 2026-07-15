@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use wyrd_spec::ids::DataTenantId;
 
 use crate::contracts::ScribeError;
+use crate::scribe::stream_identity::StreamIdentity;
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
@@ -652,8 +653,33 @@ pub struct WalReader {
 }
 
 impl WalReader {
-    /// Open all segments in the given directory.
-    pub fn open_directory(dir: impl AsRef<Path>) -> Result<Self, ScribeError> {
+    /// Open only segments belonging to `stream`.
+    ///
+    /// A Scribe WAL directory may retain segments from another writer epoch
+    /// after a restart. The live-tail path is stream-scoped, so it must reject
+    /// those segments at the read boundary. Tenant IDs are intentionally not a
+    /// filter here: one pod stream can contain multiple tenants, while the
+    /// tail response is scoped by the stream identity.
+    pub fn open_directory(
+        dir: impl AsRef<Path>,
+        stream: StreamIdentity,
+    ) -> Result<Self, ScribeError> {
+        Self::open_directory_filtered(dir, Some(stream))
+    }
+
+    /// Open all segments in the given directory for replay.
+    ///
+    /// Replay intentionally reconstructs state across writer epochs. Callers
+    /// serving a live stream must use [`Self::open_directory`] so stale or
+    /// foreign stream segments are excluded at the read boundary.
+    pub fn open_directory_unfiltered(dir: impl AsRef<Path>) -> Result<Self, ScribeError> {
+        Self::open_directory_filtered(dir, None)
+    }
+
+    fn open_directory_filtered(
+        dir: impl AsRef<Path>,
+        stream: Option<StreamIdentity>,
+    ) -> Result<Self, ScribeError> {
         let dir = dir.as_ref();
         if !dir.exists() {
             return Ok(Self {
@@ -671,6 +697,12 @@ impl WalReader {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("arrow") {
                 let segment = WalSegment::open(&path)?;
+                if let Some(stream) = stream
+                    && (segment.header().node_id != *stream.node_id.as_uuid().as_bytes()
+                        || segment.header().writer_epoch != stream.writer_epoch.as_i64())
+                {
+                    continue;
+                }
                 segments.push(Arc::new(segment));
             }
         }
@@ -773,7 +805,7 @@ mod tests {
 
         assert_eq!(lsn, WalLsn::new(0));
 
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         let records = reader.read_all_records().expect("read records");
 
         assert_eq!(records.len(), 2);
@@ -807,7 +839,7 @@ mod tests {
         }
 
         // Verify multiple segments were created
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert!(
             reader.segments.len() > 1,
             "expected multiple segments, got {}",
@@ -847,7 +879,7 @@ mod tests {
         std::fs::write(&tmp_path, b"incomplete segment data").expect("write tmp file");
 
         // Reopen directory — should ignore .tmp files
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert_eq!(
             reader.segments.len(),
             1,
@@ -861,6 +893,69 @@ mod tests {
         // Verify seg-1.arrow does not exist
         let seg1_path = temp_dir.path().join("seg-1.arrow");
         assert!(!seg1_path.exists(), "seg-1.arrow should not exist");
+    }
+
+    #[test]
+    fn wal_reader_filters_segments_by_stream_identity() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let expected_node = [6u8; 16];
+        let foreign_node = [7u8; 16];
+        let expected_stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(expected_node)),
+            crate::scribe::stream_identity::WriterEpoch::new(3),
+        );
+
+        let expected_writer = WalWriter::new(
+            temp_dir.path(),
+            expected_node,
+            3,
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .expect("expected writer");
+        expected_writer
+            .append_and_fsync([1u8; 16], b"audit".to_vec(), b"data".to_vec())
+            .expect("expected append");
+
+        let foreign_segment_path = temp_dir.path().join("foreign.arrow");
+        let foreign_segment = WalSegment::create(
+            &foreign_segment_path,
+            SegmentHeader::new(
+                foreign_node,
+                9,
+                0,
+                *DataTenantId::SYSTEM_OWNER.as_uuid().as_bytes(),
+                0,
+            ),
+        )
+        .expect("foreign segment");
+        foreign_segment
+            .append_and_fsync(&WalRecord::new(
+                WalLsn::new(0),
+                0,
+                [2u8; 16],
+                b"foreign".to_vec(),
+            ))
+            .expect("foreign append");
+
+        let reader =
+            WalReader::open_directory(temp_dir.path(), expected_stream).expect("filtered reader");
+        assert_eq!(
+            reader.read_all_records().expect("filtered records").len(),
+            2,
+            "the expected stream's audit and data records remain readable"
+        );
+
+        let unfiltered =
+            WalReader::open_directory_unfiltered(temp_dir.path()).expect("unfiltered reader");
+        assert_eq!(
+            unfiltered
+                .read_all_records()
+                .expect("unfiltered records")
+                .len(),
+            3,
+            "the test fixture contains both expected and foreign segments"
+        );
     }
 
     #[test]

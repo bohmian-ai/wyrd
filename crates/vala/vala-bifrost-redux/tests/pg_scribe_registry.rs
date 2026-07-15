@@ -17,7 +17,8 @@ mod pg_tests {
     use std::time::Duration;
 
     use sqlx::types::Uuid;
-    use vala_bifrost_redux::scribe::registry::{ScribeHeartbeat, live_scribes};
+    use vala_bifrost_redux::contracts::ScribeError;
+    use vala_bifrost_redux::scribe::registry::{ScribeHeartbeat, heartbeat_tick, live_scribes};
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -60,18 +61,52 @@ mod pg_tests {
 
         let heartbeat = ScribeHeartbeat::start(pool.clone(), node_id, TICK);
 
-        // Two full ticks + slack — at least two `heartbeat_at` updates should
-        // have run by now (loop skips its immediate first tick).
-        tokio::time::sleep(TICK * 3).await;
-
-        let (_, after_heartbeat) = read_row(&pool, node_id).await;
+        let mut samples = vec![initial_heartbeat];
+        let deadline = std::time::Instant::now() + TICK * 8;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(TICK / 2).await;
+            let (_, latest) = read_row(&pool, node_id).await;
+            if samples.last().copied() != Some(latest) {
+                samples.push(latest);
+            }
+            if samples.len() >= 3 {
+                break;
+            }
+        }
         heartbeat.shutdown();
 
         assert!(
-            after_heartbeat > initial_heartbeat,
-            "heartbeat_at must advance after ~{}ms of ticks (initial={initial_heartbeat}, after={after_heartbeat})",
-            (TICK * 3).as_millis(),
+            samples.len() >= 3,
+            "expected at least 2 heartbeat updates producing 3 distinct heartbeat_at values within {}ms; got {samples:?}",
+            (TICK * 8).as_millis(),
         );
+    }
+
+    #[tokio::test]
+    async fn scribe_heartbeat_errors_when_row_missing() {
+        let (fixture, pool) = setup().await;
+        let node_id = NodeId::generate();
+        acquire_on_boot(&pool, node_id, "scribe", "127.0.0.1:9003")
+            .await
+            .expect("acquire");
+
+        let superuser = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query("DELETE FROM vala.cluster_nodes WHERE node_id = $1")
+            .bind(node_id.as_uuid())
+            .execute(&superuser)
+            .await
+            .expect("delete cluster_nodes row");
+
+        match heartbeat_tick(&pool, node_id).await {
+            Err(ScribeError::Internal { detail }) => {
+                assert!(
+                    detail.contains("cluster_nodes row missing"),
+                    "unexpected missing-row detail: {detail}"
+                );
+            }
+            Ok(()) => panic!("heartbeat_tick must reject a missing cluster_nodes row"),
+            Err(other) => panic!("unexpected heartbeat error: {other}"),
+        }
     }
 
     #[tokio::test]

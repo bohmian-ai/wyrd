@@ -11,7 +11,6 @@
 //! in their owning crate.
 
 #![deny(missing_docs)]
-#![allow(clippy::module_name_repetitions)]
 
 /// Initialize Wyrd subsystems.
 ///

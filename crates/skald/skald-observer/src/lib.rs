@@ -1,7 +1,6 @@
 //! Observer trait and Wyrd-side observation primitives for Skald agent runs.
 
 #![deny(missing_docs)]
-#![allow(clippy::module_name_repetitions)]
 
 mod composite;
 mod current;

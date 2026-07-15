@@ -33,7 +33,6 @@
 //! stable Wyrd workflow error codes.
 
 #![deny(missing_docs)]
-#![allow(clippy::module_name_repetitions)]
 
 pub mod context;
 pub mod def;

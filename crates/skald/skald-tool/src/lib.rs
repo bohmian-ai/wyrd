@@ -3,8 +3,6 @@
 //! This crate describes tool schemas and creates provider-native tool-use
 //! message fragments. It does not execute tools or call providers.
 
-#![allow(clippy::module_name_repetitions)]
-
 pub mod def;
 pub mod error;
 pub mod helpers;

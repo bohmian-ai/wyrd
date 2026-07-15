@@ -1,6 +1,6 @@
 ---
 title: Data plane internals
-description: How Bifrost commits writes, recovers from writer failures, seals the audit chain, and enforces privilege separation across its three database pools.
+description: Scribe WAL format, seal state machine, vala.file_list schema, Forge compaction, and audit chain sealing.
 pillar: wyrd
 group: Bifrost
 order: 8
@@ -8,125 +8,109 @@ order: 8
 
 # Data plane internals
 
-This document covers the parts of Bifrost that are invisible to a normal caller but matter for operational correctness, security review, and incident investigation: the group-commit write path, the precommit recovery FSM, the audit sealing pipeline, and the database privilege model.
+This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, the Forge tick, and the audit sealing pipeline.
 
-The write surface is described in [Writing data](./writing-data). This document is the internals view.
+The write surface is in [Writing data](/bifrost/writing-data); the overall system model is in [Architecture](/bifrost/architecture). This is the operator's view.
 
-## Write path
+## Scribe WAL format
 
-Every write enters as an Arrow `RecordBatch` through `BifrostIngestService` and ends as an Iceberg snapshot on object storage. The path has four stages.
+Every Scribe pod owns a local write-ahead log. Writes ack only after `fsync(2)` returns, so the ack is durable against pod crash and clean host reboot. On restart the pod replays the WAL to rebuild in-memory state before accepting new writes.
 
-```
-[SDK / gRPC client]
-        │ Arrow IPC stream (one batch per write unit)
-        ▼
-[BifrostIngestService]
-        │ schema fingerprint check (rejects mismatch → 400)
-        │ system column stamp (data_tenant_id, wyrd_ingested_at, …)
-        │ redaction (zero sensitive fields if tenant policy requires)
-        ▼
-[GroupCommitHandle.send_write()]  ← returns a oneshot receiver
-        │ bounded mpsc channel (backpressure → IngestBusy 429)
-        ▼
-[GroupCommitActor]  ← one actor per physical Iceberg table
-        │ buffers writes from multiple tenants
-        │ flushes when any trigger fires:
-        │   • row count ≥ 50 000
-        │   • wall time ≥ 1 s (MissedTickBehavior::Delay)
-        │   • buffered bytes ≥ 128 MiB
-        │   • channel closed (actor draining)
-        ▼
-[run_group_commit()]
-        │ Postgres: INSERT INTO vala.olap_commits (state='precommit')
-        │ Iceberg: fast_append (one call per chunk of ≤ 128 commit keys)
-        │   └─ stamps snapshot property wyrd_commit_keys =
-        │        [{data_tenant_id, batch_id}, …]
-        │ Postgres: UPDATE olap_commits SET state='committed'
-        │ audit outbox: append hash-chained row per ingest operation
-        ▼
-[oneshot reply → caller]  ← snapshot_id on success
-```
+Format:
 
-The `wyrd_commit_keys` snapshot property is the authoritative record of which `{data_tenant_id, batch_id}` pairs landed in which Iceberg snapshot. The recovery sweep reads this to determine whether a precommit actually made it to object storage.
+- Magic bytes (`WRAW`) and format version in the segment header.
+- Framed records with CRC32C on each frame. Two record kinds: audit (kind=1) and data (kind=0). Every data record is immediately preceded by its audit record.
+- Records carry a monotonically increasing LSN scoped to `(node_id, writer_epoch)`. LSNs are meaningful only within one Scribe pod's stream; cross-pod LSN comparison is undefined.
+- Segments roll over atomically at a size threshold; the header of the new segment is fsynced before the writer switches to it.
 
-On `SystemShared` tables (for example, `vala.system.audit_log`), multiple tenants write to the same physical Iceberg table. The `wyrd_commit_keys` set in each snapshot can carry commit keys from several tenants. The `data_tenant_id` column enforces read-time isolation through the `TenantPredicateRule` DataFusion analyzer.
+Replay is bounded and deterministic:
 
-## The `olap_commits` state machine
+- Torn-tail truncation: a frame whose CRC fails or whose LSN goes backwards ends replay. Everything past that point is discarded.
+- Sealed-LSN cutoff: the seal manifest records `sealed_lsn[K]` per seal-key. Replay skips records with `lsn <= sealed_lsn` for their key.
+- Replay is idempotent. Crashing mid-replay and restarting yields the same reconstructed memtables.
 
-Every write unit has a row in `vala.olap_commits` tracking its lifecycle. The FSM has four states.
+## Seal state machine
 
-```
-                writer crash between precommit
-                and fast_append → row stays here
-                        │
-  write starts          ▼
-  ──────────► precommit ──── fast_append succeeds ──► committed (terminal)
-                  │
-                  ├── recovery oracle: snapshot absent ──► aborted  (terminal)
-                  │
-                  └── recovery oracle: Iceberg error  ──► (stays precommit,
-                                                            recovery_attempts++)
-                                                            → stuck after 5
-```
+A seal-key is `(DataTenantId, TableRef, EventDay)`. Each seal-key has one active memtable per Scribe pod. A seal fires when any trigger hits: 50 000 rows, 1 s wall time, 128 MiB in memory, or 5 s of inactivity.
 
-`committed` and `aborted` are terminal states. A row in `precommit` with an expired writer lease (or no lease at all) is eligible for the recovery sweep. `failed` is a legacy state that predates the recovery sweep and is not produced by the current write path.
+The seal itself is a pre-commit sequence followed by a single Postgres transaction:
 
-`recovery_attempts` increments each time the recovery sweep processes the row and encounters an oracle error. At 5 attempts the row emits a `recovery_stuck` tracing event and the sweep stops touching it. A human must inspect and manually resolve stuck rows.
+1. **Freeze memtable.** Swap the mutable buffer for a fresh one; the frozen snapshot is immutable from here.
+2. **Encode Parquet.** Sort by `(data_tenant_id, wyrd_event_time)`. Build bloom filters on tenant + trace_id, write the page index.
+3. **PUT to object store.** Path: `s3://{namespace}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`. The `{pod_id}-{ulid}` suffix guarantees uniqueness across pods writing the same partition in the same second.
+4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)` plus append the sealed audit rows for the batch. Commit or rollback as one unit.
+5. **Retire WAL bytes.** Update the seal manifest with the new `sealed_lsn`, truncate the covered WAL segments.
 
-## Recovery sweep
+Failure at any point before step 4 leaves the row invisible: no `file_list` entry, no audit rows. Any Parquet file already PUT becomes an orphan and is reaped later by Forge GC. Failure between steps 4 and 5 is safe too: the file is visible, replay skips it via `sealed_lsn`, and the WAL bytes are retired on the next successful seal for that key.
 
-Writer pods can crash between recording `state='precommit'` and landing the Iceberg `fast_append`. The recovery sweep resolves these orphan rows every 60 seconds.
+Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls back cleanly; any crash after it is guaranteed to converge on restart.
 
-```
-Tokio interval (60 s, MissedTickBehavior::Delay)
-        │
-        ▼
-claim_stale_precommits(owner, limit)
-        │ SECURITY DEFINER, owned by vala_recovery_owner (BYPASSRLS)
-        │ called on the recovery pool (vala_recovery role)
-        │ atomically:
-        │   SELECT … FOR UPDATE SKIP LOCKED
-        │   UPDATE SET recovery_fencing_token = nextval(recovery_fencing_seq)
-        │            , recovery_owner = $owner
-        │   RETURNING …, recovery_attempts
-        │
-        ▼ Vec<ClaimedRow>
-        │
-        ├─ recovery_attempts ≥ 5 → log recovery_stuck, skip row
-        │
-        └─ oracle_check(row):
-                │ BifrostNamespace::split_fqn(row.fqn)
-                │   → (namespace, table_name)
-                │ WyrdCatalog.get(ns, table_name, scope.control_bind(tenant))
-                │   → Iceberg table metadata (all snapshots)
-                │ decide_recovery(table, data_tenant_id, batch_id):
-                │   scan every snapshot's wyrd_commit_keys
-                │   → Committed(snapshot_id) if pair found
-                │   → Aborted              if pair absent from all snapshots
-                │
-                ├─ Committed(snapshot_id)
-                │       └─ finalize_recovered_committed(table_uid, batch_id,
-                │                                       snapshot_id, token)
-                │              WHERE recovery_fencing_token = token  ← CAS
-                │
-                ├─ Aborted
-                │       └─ finalize_recovered_aborted(table_uid, batch_id,
-                │                                     token, reason)
-                │              WHERE recovery_fencing_token = token  ← CAS
-                │
-                └─ error
-                        └─ mark_recovery_scan_failed(…, token, error)
-                               audit INSERT first, then clear token
-                               so row becomes re-claimable next tick
-```
+## `vala.file_list` schema
 
-The `recovery_fencing_token` is a monotonically increasing integer from `vala.recovery_fencing_seq`. Two concurrent sweep instances cannot both finalize the same row: the first one to call `finalize_recovered_committed` sets `state='committed'` via `WHERE recovery_fencing_token = token`; the second finds no matching row and returns without writing.
+`vala.file_list` is the un-compacted staging index. Every sealed Parquet file registers here before Forge folds it into an Iceberg snapshot.
 
-The audit INSERT inside each finalization routine is also scoped by `recovery_fencing_token`. On `SystemShared` tables, two tenants can share the same `(table_uid, batch_id)` combination. Without the token scope, the audit read would return both tenants' rows and insert duplicate recovery events for the wrong tenant. The token is globally unique per claimed row, so scoping by it reads exactly one row.
+| Column | Type | Purpose |
+|---|---|---|
+| `id` | `uuid` | Row identity |
+| `data_tenant_id` | `text` | Tenant partition; tied to RLS |
+| `namespace` | `text` | e.g. `vala.traces` |
+| `table_name` | `text` | e.g. `spans` |
+| `file_path` | `text` | Object store path |
+| `file_size` | `bigint` | Bytes, for compaction planning |
+| `row_count` | `bigint` | Rows in file |
+| `min_event_time` | `timestamptz` | Partition-pruning bound |
+| `max_event_time` | `timestamptz` | Partition-pruning bound |
+| `partition_day` | `date` | `Day(event_time)` partition |
+| `tenant_bucket` | `int` | `Bucket(tenant, 64)` partition |
+| `compacted` | `bool` | Flipped to `true` when Forge folds the file into a snapshot |
+| `committed_snapshot_id` | `bigint` | Iceberg snapshot ID after compaction; NULL until compacted |
+| `node_id` | `text` | Emitting Scribe pod |
+| `writer_epoch` | `bigint` | Epoch for that pod's LSN stream |
+| `wal_lsn_min` | `bigint` | First LSN covered |
+| `wal_lsn_max` | `bigint` | Last LSN covered; Oracle uses `MAX(wal_lsn_max)` per stream for live-tail dedup |
+| `created_at` | `timestamptz` | Seal commit time |
+
+Oracle scans `WHERE NOT compacted` for staging data and lets Iceberg handle the rest. Forge scans the same predicate to pick compaction candidates.
+
+## Forge tick (planned)
+
+Forge is not yet implemented; this section describes the target behavior. Until Forge ships, sealed Parquet accumulates in `vala.file_list` and Oracle serves it directly.
+
+<WyrdSequenceDiagram dense
+  title="One Forge tick"
+  participants={['Forge', 'Postgres', 'Object store']}
+  messages={[
+    { from: 'Forge', to: 'Postgres', label: 'acquire lease (namespace, table)' },
+    { from: 'Postgres', to: 'Forge', label: 'lease granted', dashed: true },
+    { from: 'Forge', to: 'Postgres', label: 'SELECT file_list WHERE NOT compacted' },
+    { from: 'Postgres', to: 'Forge', label: 'candidate small files', dashed: true },
+    { from: 'Forge', to: 'Object store', label: 'GET small Parquet' },
+    { from: 'Object store', to: 'Forge', label: 'Arrow batches', dashed: true },
+    { from: 'Forge', to: 'Forge', label: 'bin-pack · sort by (tenant, event_time)' },
+    { from: 'Forge', to: 'Object store', label: 'PUT compacted Parquet' },
+    { from: 'Forge', to: 'Object store', label: 'Iceberg REPLACE (Mitari)' },
+    { from: 'Forge', to: 'Postgres', label: 'UPDATE file_list SET compacted = true' },
+    { from: 'Forge', to: 'Postgres', label: 'release lease' }
+  ]}
+/>
+
+Each Forge pod runs a tick loop against Postgres-leased `(namespace, table)` pairs:
+
+1. Acquire lease on `(namespace, table)` via `vala.maintenance_leases`. Skip if held.
+2. `SELECT * FROM vala.file_list WHERE NOT compacted AND partition_day = <target>`.
+3. Read the small Parquet files from object store; bin-pack into large Parquet files (sorted by `data_tenant_id, wyrd_event_time`).
+4. PUT the compacted files.
+5. Iceberg REPLACE via Mitari: fold new files in, mark old files for deletion.
+6. `UPDATE vala.file_list SET compacted = true, committed_snapshot_id = <id> WHERE id IN (...)`.
+7. Release lease.
+
+A crashed Forge tick loses its lease on expiry. The next holder re-derives state from `vala.file_list` and Iceberg metadata and re-runs; the operation is idempotent because every step is derivable from durable state.
+
+Orphan Parquet files (PUT succeeded, Postgres commit did not) are reaped by a separate Forge GC pass that compares object store listings against `vala.file_list` and Iceberg manifests.
 
 ## Audit sealing
 
-Every write operation appends a row to the hash-chained audit outbox in Postgres. The audit relay ships those rows to the `vala.system.audit_log` Iceberg table. The seal worker then signs the shipped history so it cannot be modified retroactively without detection.
+Every write appends a row to the hash-chained audit outbox in Postgres. The audit relay ships those rows to the `vala.system.audit_log` Iceberg table. The seal worker then signs the shipped history so it cannot be modified retroactively without detection.
 
 ```
 [vala.audit_outbox (Postgres)]
@@ -136,7 +120,7 @@ Every write operation appends a row to the hash-chained audit outbox in Postgres
         │ reads unshipped rows, appends to Iceberg audit_log table
         │ marks rows shipped, records seq and entry_hash
         ▼
-[seal_shipped_range() — 60 s interval]
+[seal_shipped_range() every 60 s]
         │ latest_sealed_seq_hi()   → last checkpoint's seq_hi (0 if none)
         │ shipped_outbox_refs_after(seq_hi)  → unsealed tail only
         │ compute_range_hash(seq_lo, seq_hi, [entry_hash_0, …])
@@ -148,7 +132,7 @@ Every write operation appends a row to the hash-chained audit outbox in Postgres
         │ reads audit_seal_checkpoints ordered by seq_lo
         │ for each checkpoint:
         │   recompute every entry_hash from warehouse content columns
-        │     (NOT the stored entry_hash column — that column is untrusted)
+        │     (NOT the stored entry_hash column; that column is untrusted)
         │   recompute range_hash from recomputed hashes
         │   AuditSealKey.verify(range_hash, signature)
         │
@@ -168,30 +152,32 @@ The verifier deliberately ignores the `entry_hash` column stored in the Iceberg 
 
 ## Database privilege model
 
-Bifrost uses three database pools, each connecting as a different Postgres role with different privilege levels.
+Bifrost uses three database pools, each connecting as a different Postgres role.
 
 | Pool | Connecting role | RLS | Purpose |
 |---|---|---|---|
-| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | All tenant data reads and writes from the server |
-| Recovery pool | `vala_recovery` | Not BYPASSRLS | Recovery sweep: calls SECURITY DEFINER routines only |
-| Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (maintenance leases) |
+| App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe audit inserts |
+| Recovery pool | `vala_recovery` | Not BYPASSRLS; SECURITY DEFINER only | Reserved for future maintenance routines that need cross-tenant access under audit |
+| Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (`vala.maintenance_leases`, Forge lease coordination) |
 
 A few things worth being explicit about for audit purposes.
 
-`vala_recovery` is NOT BYPASSRLS. The recovery pool executes `vala.claim_stale_precommits`, `vala.finalize_recovered_committed`, `vala.finalize_recovered_aborted`, and `vala.mark_recovery_scan_failed` as SQL calls. Those functions are owned by `vala_recovery_owner`, which is BYPASSRLS, and are declared `SECURITY DEFINER`. The functions execute under `vala_recovery_owner`'s privileges; the connection itself connects as `vala_recovery`. If anyone attempts a direct `SELECT` or `UPDATE` on `vala.olap_commits` from the recovery pool outside of these SECURITY DEFINER routines, the RLS policy (`wyrd.current_tenant()`) will reject the query. There is no `SET app.current_tenant` in effect on the recovery pool.
+`vala_recovery` is NOT BYPASSRLS. It executes only `SECURITY DEFINER` routines owned by `vala_recovery_owner` (which is BYPASSRLS). A direct `SELECT` or `UPDATE` from the recovery pool against a tenant-scoped table is rejected by RLS because no `app.current_tenant` is set on that connection.
 
-The `OperatorPool` (`wyrd_platform_admin`, BYPASSRLS) is the sole path to tables that are intentionally cross-tenant by design. `vala.maintenance_leases` is the only such table currently. All other `vala.*` tables are RLS-enforced. The `check:tenant-isolation` CI script enforces this: any new query module against a non-RLS table that is not in `VALA_NON_RLS_CONTROL_TABLES` and not using `OperatorPool` will fail the check.
+The operator pool is the sole path to tables that are intentionally cross-tenant by design. `vala.maintenance_leases` is the only such table today. All other `vala.*` tables are RLS-enforced. The `check:tenant-isolation` CI script fails any new query module that reads a non-RLS table without using the operator pool.
 
-The app pool enforces tenant isolation via a Postgres RLS policy on every table. The policy calls `wyrd.current_tenant()`, which reads `current_setting('app.current_tenant')`. `TenantConn::acquire` sets this parameter at connection acquisition; any query on an `wyrd_app` connection without a tenant bound will fail the policy check.
+The app pool enforces tenant isolation via a Postgres RLS policy on every table. The policy calls `wyrd.current_tenant()`, which reads `current_setting('app.current_tenant')`. `TenantConn::acquire` sets this parameter at connection acquisition; any query on a `wyrd_app` connection without a tenant bound will fail the policy check.
 
 ## Failure modes
 
-**`IngestBusy` (429)**: the group-commit actor's inbound channel is full. This is a backpressure signal, not a data loss event. The write was never recorded in `olap_commits`. Callers should retry with exponential backoff.
+**Scribe crash before Postgres commit.** WAL replay rebuilds the memtable from `sealed_lsn`. The seal retries. Any Parquet already PUT is orphaned and reaped by Forge GC. No visibility, no double-write.
 
-**Writer crash after precommit, before fast_append**: the row stays in `precommit`. The recovery sweep will claim it within 60 seconds (plus the lease expiry window) and run the oracle check. If the `fast_append` never happened, `decide_recovery` finds no matching snapshot and marks the row `aborted`. The caller's idempotent retry (same `batch_id`) will then succeed as a new write.
+**Scribe crash after Postgres commit, before WAL retire.** The file is visible via `vala.file_list`. Replay skips it via `sealed_lsn`. The stale WAL bytes are retired on the next successful seal for that key.
 
-**Writer crash after fast_append, before `committed` update**: the recovery sweep runs `decide_recovery`, finds the `{data_tenant_id, batch_id}` pair in a snapshot's `wyrd_commit_keys`, and calls `finalize_recovered_committed`. The data is already in Iceberg; recovery just updates the FSM to reflect that.
+**Object store unavailable during seal.** Seal retries with backoff. New appends continue landing in the WAL until the memtable's byte budget fills, at which point ack returns `429_INGEST_BUSY`. No data is lost; the WAL keeps everything already acked.
 
-**Oracle error during recovery**: the row stays in `precommit`, the error is recorded in `recovery_last_error`, and `recovery_attempts` increments. At 5 attempts the row emits `recovery_stuck`. The data is still in its last known state; no data has been modified by the failed oracle call.
+**Postgres unavailable during seal.** Same shape as above. Seal retries; the memtable stays in memory; the WAL keeps the acked data. New appends can proceed until the memtable fills.
 
-**Seal worker not running**: shipped rows accumulate as a gap. `verify_checkpoint_walk` returns `VerifyOutcome::Gap`. No data is lost or corrupted; only the signed coverage window is smaller than expected.
+**Forge crash mid-tick.** Lease expires. Successor Forge pod picks up the same table, re-derives state from `vala.file_list` and Iceberg metadata, re-runs the tick. Idempotent by construction.
+
+**Seal worker not running.** Shipped audit rows accumulate as a gap. `verify_checkpoint_walk` returns `VerifyOutcome::Gap`. No data is lost or corrupted; only the signed coverage window is smaller than expected.

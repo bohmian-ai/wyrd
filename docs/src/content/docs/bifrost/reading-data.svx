@@ -8,7 +8,42 @@ order: 6
 
 # Reading Data
 
-Bifrost exposes its domain tables through the `ValaQueryService` — nine typed methods, one per observation domain. A governed generic SQL surface (`POST /v1/observations/query`) is also available for ad-hoc analysis.
+Bifrost exposes its domain tables through the `ValaQueryService`: nine typed methods, one per observation domain. A governed generic SQL surface (`POST /v1/observations/query`) is also available for ad-hoc analysis.
+
+## Query freshness and fused scan
+
+<WyrdSequenceDiagram dense
+  title="Query to fused result"
+  participants={['Client', 'Gate', 'Oracle', 'Postgres', 'Object store', 'Scribe']}
+  messages={[
+    { from: 'Client', to: 'Gate', label: 'query (typed or SQL)' },
+    { from: 'Gate', to: 'Oracle', label: 'route: tenant + perms resolved' },
+    { from: 'Oracle', to: 'Postgres', label: 'SELECT vala.file_list WHERE NOT compacted' },
+    { from: 'Postgres', to: 'Oracle', label: 'un-compacted refs', dashed: true },
+    { from: 'Oracle', to: 'Object store', label: 'scan Iceberg + sealed Parquet' },
+    { from: 'Object store', to: 'Oracle', label: 'Arrow batches', dashed: true },
+    { from: 'Oracle', to: 'Scribe', label: 'live-tail RPC (Phase 2)' },
+    { from: 'Scribe', to: 'Oracle', label: 'in-memory rows', dashed: true },
+    { from: 'Oracle', to: 'Oracle', label: 'union · FilterExec(tenant) · execute' },
+    { from: 'Oracle', to: 'Client', label: 'Arrow IPC stream', dashed: true }
+  ]}
+/>
+
+Reads go through Gate to Oracle. Oracle builds a DataFusion plan whose scan fuses three sources:
+
+- **Iceberg snapshots.** Compacted historical data written by Forge.
+- **`vala.file_list` un-compacted files.** Sealed Parquet from Scribe that Forge has not yet folded into a snapshot.
+- **Live Scribe WAL (Phase 2).** Recent rows still in Scribe memtables, streamed via live-tail RPC.
+
+Fresh data becomes visible within seal latency (~1-5s typical) even before Forge compacts it. Oracle is stateless: any Oracle pod can serve any query, so you can scale it independently of the write path.
+
+**Implementation status:**
+
+- Iceberg scan: planned.
+- `vala.file_list` scan: planned.
+- Live-tail RPC: partially implemented (heartbeat + tail RPC skeleton in `vala-bifrost-redux`, no distributed fan-out yet).
+
+Until fused scan lands, only the typed query methods that route through the current Vala query service are available end-to-end.
 
 ## ValaQueryService methods
 
@@ -52,31 +87,31 @@ Sensitive columns are projected away unless the caller holds the matching payloa
 | `bifrost_genai_payload:read` | `input_messages`, `output_messages` on GenAI rows |
 | `bifrost_agent_trace_payload:read` | `messages`, `tool_io` on agent-trace rows |
 
-Without the payload permission the method still returns the metadata columns — it does not return an error. Only if the caller explicitly requests a gated column through the generic SQL surface does the server return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
+Without the payload permission the method still returns the metadata columns; it does not return an error. Only if the caller explicitly requests a gated column through the generic SQL surface does the server return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
 
 ## Column name mapping for `QueryEval`
 
-The `QueryEval` typed method accepts an `eval_id` filter parameter, which maps to the physical column `eval_ref` in the `vala.eval.assertions` table. If you write raw SQL against the generic SQL surface, use `eval_ref` — `eval_id` does not exist as a physical column and will return `column not found`.
+The `QueryEval` typed method accepts an `eval_id` filter parameter, which maps to the physical column `eval_ref` in the `vala.eval.assertions` table. If you write raw SQL against the generic SQL surface, use `eval_ref`. The name `eval_id` does not exist as a physical column and will return `column not found`.
 
 ## Signed page tokens and pagination
 
 When a response carries `next_page_token`, pass it in the next request's `page_token` field to get the next page. Tokens are:
 
-- **Tenant-bound** — a token issued under tenant A is rejected under tenant B.
-- **Permission-bound** — a token encodes a hash of the caller's effective permissions; a token issued before a permission was revoked is rejected after revocation.
-- **Query-bound** — changing any filter field invalidates the token.
-- **TTL-bounded** — tokens expire after 300 seconds (default). An expired token returns `400 WYRD_VALA_400_PAGE_TOKEN_INVALID`. If the underlying Iceberg snapshot was pruned by the time the token is used, the server returns `410 WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED`, which is a signal to restart from page 1.
+- **Tenant-bound.** A token issued under tenant A is rejected under tenant B.
+- **Permission-bound.** A token encodes a hash of the caller's effective permissions; a token issued before a permission was revoked is rejected after revocation.
+- **Query-bound.** Changing any filter field invalidates the token.
+- **TTL-bounded.** Tokens expire after 300 seconds (default). An expired token returns `400 WYRD_VALA_400_PAGE_TOKEN_INVALID`. If the underlying Iceberg snapshot was pruned by the time the token is used, the server returns `410 WYRD_VALA_410_PAGE_SNAPSHOT_EXPIRED`, which is a signal to restart from page 1.
 
 ## TraceSummaryRow derivation
 
-`QueryTraces` and `QueryRecentTraces` return `TraceSummaryRow` — a derived row that does not exist in the physical table. It is computed from the raw `vala.traces.spans` scan by grouping on `trace_id` and computing:
+`QueryTraces` and `QueryRecentTraces` return `TraceSummaryRow`, a derived row that does not exist in the physical table. It is computed from the raw `vala.traces.spans` scan by grouping on `trace_id` and computing:
 
-- `root_name` — name of the span with `parent_span_id IS NULL`
-- `service` — `service_name` of the root span
-- `started_at` — min `start_time` across all spans
-- `duration_ms` — `(max(end_time) - min(start_time)) / 1000`
-- `span_count` — count of spans
-- `error` — any span has `status = "ERROR"`
+- `root_name`: name of the span with `parent_span_id IS NULL`
+- `service`: `service_name` of the root span
+- `started_at`: min `start_time` across all spans
+- `duration_ms`: `(max(end_time) - min(start_time)) / 1000`
+- `span_count`: count of spans
+- `error`: any span has `status = "ERROR"`
 
 This GROUP-BY runs in Rust after collecting the scanned batches. In Stage 5 it will be pushed into the DataFusion plan.
 

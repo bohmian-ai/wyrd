@@ -22,25 +22,28 @@
   let {
     title,
     participants,
-    messages
-  }: { title: string; participants: string[]; messages: Message[] } = $props();
+    messages,
+    dense = false
+  }: { title: string; participants: string[]; messages: Message[]; dense?: boolean } = $props();
 
-  const PART_W = 122;
-  const PART_H = 40;
-  const COL_GAP = 190;
-  const LEFT = PART_W / 2 + 14;
-  const TOP_GAP = 30;
-  const ROW_H = 48;
-  const SELF_W = 46;
-  const SELF_H = 26;
-  const SELF_ADVANCE = SELF_H + 24;
+  // `dense` shrinks participant boxes, column gap, and row height so a data-plane
+  // flow with 5-6 participants and 10+ messages doesn't blow up vertically.
+  // Auth pages leave `dense` unset and get the original geometry.
+  const PART_W = $derived(dense ? 96 : 122);
+  const PART_H = $derived(dense ? 32 : 40);
+  const COL_GAP = $derived(dense ? 140 : 190);
+  const LEFT = $derived(PART_W / 2 + 14);
+  const TOP_GAP = $derived(dense ? 22 : 30);
+  const ROW_H = $derived(dense ? 34 : 48);
+  const SELF_W = $derived(dense ? 36 : 46);
+  const SELF_H = $derived(dense ? 20 : 26);
+  const SELF_ADVANCE = $derived(SELF_H + (dense ? 18 : 24));
+  const CHAR_W = $derived(dense ? 5.7 : 6.4);
 
   const model = $derived.by(() => {
     const marker = `sq-arrow-${title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
     const colX = (name: string) => LEFT + participants.indexOf(name) * COL_GAP;
     const baseVw = LEFT * 2 + (participants.length - 1) * COL_GAP;
-    // Mono glyph advance at 10.5px, used to keep labels inside the viewBox.
-    const CHAR_W = 6.4;
 
     const arrows: {
       d: string;
@@ -100,7 +103,7 @@
 </script>
 
 <svg
-  class="wyrd-diagram"
+  class={dense ? 'wyrd-diagram sq-dense' : 'wyrd-diagram'}
   viewBox={`${model.minX} 0 ${model.vw} ${model.height}`}
   role="img"
   aria-label={model.ariaLabel}
@@ -117,11 +120,11 @@
     <rect class="node-shadow" x={box.x + 4} y={4} width={PART_W} height={PART_H} />
     <rect class="node-fill-accent" x={box.x} y={0} width={PART_W} height={PART_H} />
     <rect class="node-stroke" x={box.x} y={0} width={PART_W} height={PART_H} />
-    <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={25}>{box.name}</text>
+    <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={dense ? 21 : 25}>{box.name}</text>
     <rect class="node-shadow" x={box.x + 4} y={model.lifelineBottom + 4} width={PART_W} height={PART_H} />
     <rect class="node-fill-accent" x={box.x} y={model.lifelineBottom} width={PART_W} height={PART_H} />
     <rect class="node-stroke" x={box.x} y={model.lifelineBottom} width={PART_W} height={PART_H} />
-    <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={model.lifelineBottom + 25}>{box.name}</text>
+    <text class="node-text node-text-on-accent" x={box.x + PART_W / 2} y={model.lifelineBottom + (dense ? 21 : 25)}>{box.name}</text>
   {/each}
 
   {#each model.arrows as arrow (arrow.d)}
@@ -152,5 +155,14 @@
     fill: var(--text);
     font-family: var(--font-mono);
     font-size: 10.5px;
+  }
+  :global(.wyrd-diagram.sq-dense) .node-text {
+    font-size: 12px;
+  }
+  .sq-dense .sq-msg {
+    font-size: 9.5px;
+  }
+  .sq-dense .sq-line {
+    stroke-width: 2;
   }
 </style>

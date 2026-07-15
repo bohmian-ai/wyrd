@@ -10,7 +10,20 @@ order: 7
 
 Performance targets for the Bifrost OLAP warehouse. All numbers below are `TBD (pending bench:bifrost)`. They will be replaced with verified figures from the `bench:bifrost` criterion suite once that suite runs against a named, fixed hardware profile.
 
-> **No performance number ships in this doc unless a verified bench run produced it.** The benchmark suite backing these figures is authored in the consolidated bench pass (after Stage 4 + 4b + 5 are green). Do not replace these placeholders with estimates.
+> **No performance number ships in this doc unless a verified bench run produced it.** The benchmark suite backing these figures is authored in the consolidated bench pass. Do not replace these placeholders with estimates.
+
+## Architecture-aligned expectations
+
+These are the shapes of the numbers to expect, not committed SLOs. Use them to sanity-check whether observed behavior is broken or working as designed. The `bench:bifrost` suite will produce actual figures.
+
+| Stage | Expected shape | Bound |
+|---|---|---|
+| Write ack (Gate → Scribe → WAL fsync → ack) | Single-digit milliseconds | fsync latency of the Scribe local disk |
+| Seal to Parquet (memtable → object store → `vala.file_list` INSERT) | ~1-5s typical | Time-based seal trigger (1s) + object store PUT + Postgres commit |
+| Query freshness (write ack → visible to Oracle) | Within seal latency | Same as seal to Parquet, until live-tail RPC lands |
+| Forge compaction lag | TBD | Forge not yet implemented; tick cadence undefined |
+
+**Backpressure boundary:** When seal is stalled (object store slow, Postgres slow), new appends return `429_INGEST_BUSY` rather than growing WAL unboundedly. Watch this counter in production. Sustained rejections mean seal cannot keep up with ingest.
 
 ## Write path
 
@@ -40,9 +53,9 @@ When the `bench:bifrost` suite runs:
 3. The p50/p95 figures from that summary replace the `TBD` placeholders here.
 4. The hardware profile + run timestamp are cited alongside each figure.
 
-The suite does not run in `pre-pr` — benchmarks are not a correctness gate. The SLO figures are refreshed deliberately when a performance-relevant change lands.
+The suite does not run in `pre-pr`; benchmarks are not a correctness gate. The SLO figures are refreshed deliberately when a performance-relevant change lands.
 
-## Benchmark suite (spec — not yet authored)
+## Benchmark suite (spec, not yet authored)
 
 The following benchmarks will be authored in `crates/vala/vala-bifrost/benches/` as part of the consolidated bench pass:
 

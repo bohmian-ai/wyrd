@@ -11,7 +11,6 @@ pub mod replay;
 pub mod seal;
 pub mod seal_key;
 pub mod stream_identity;
-#[cfg(feature = "scribe-inspect")]
 pub mod tail_rpc;
 pub mod wal;
 

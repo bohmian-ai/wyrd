@@ -12,8 +12,6 @@
 //! 4. `SealedRangeIndex` scopes exclusion per stream — ranges from another
 //!    `(node_id, writer_epoch)` never suppress this stream's rows (C4).
 
-#![cfg(feature = "scribe-inspect")]
-
 use std::sync::Arc;
 
 use tempfile::TempDir;

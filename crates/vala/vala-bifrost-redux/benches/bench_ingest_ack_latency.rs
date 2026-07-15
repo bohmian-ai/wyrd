@@ -1,6 +1,6 @@
 //! Benchmark: ingest→ack latency (append → fsync → ack).
 //!
-//! Measures end-to-end latency from Scribe::append call to AppendAck return.
+//! Measures end-to-end latency from `Scribe::append` call to `AppendAck` return.
 //! Not CI-gated; compile-only verification.
 
 use std::sync::Arc;
@@ -10,9 +10,33 @@ use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
+
+fn stub_scribe() -> ScribeImpl {
+    let operator = Arc::new(
+        opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory backend")
+            .finish(),
+    );
+    let temp = tempfile::tempdir().expect("temp WAL dir");
+    let node_id_bytes = *uuid::Uuid::nil().as_bytes();
+    let wal = Arc::new(
+        WalWriter::new(
+            temp.path(),
+            node_id_bytes,
+            1,
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .expect("WAL writer"),
+    );
+    // Leak the tempdir so it outlives the bench binary; benches never clean up.
+    std::mem::forget(temp);
+    ScribeImpl::new_with_deps(operator, wal, uuid::Uuid::nil().to_string(), 1)
+}
 
 fn make_batch(row_count: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -26,9 +50,11 @@ fn make_batch(row_count: usize) -> RecordBatch {
 
     let base_time = chrono::Utc::now().timestamp_micros();
     let timestamps: Vec<i64> = (0..row_count)
-        .map(|i| base_time + (i as i64 * 1000))
+        .map(|i| base_time + (i64::try_from(i).expect("bounded row index") * 1000))
         .collect();
-    let values: Vec<u64> = (0..row_count).map(|i| i as u64).collect();
+    let values: Vec<u64> = (0..row_count)
+        .map(|i| u64::try_from(i).expect("bounded row index"))
+        .collect();
 
     RecordBatch::try_new(
         schema.clone(),
@@ -58,7 +84,7 @@ async fn main() {
     // - Real WAL with fsync
     // - Statistical latency distribution (p50, p95, p99)
 
-    let scribe = ScribeImpl::new();
+    let scribe = stub_scribe();
     let tenant = DataTenantId::new_v7();
     let principal = Principal {
         id: PrincipalId::new(uuid::Uuid::now_v7()),
@@ -82,5 +108,5 @@ async fn main() {
     let _ack = scribe.append(req).await.expect("append");
     let latency = start.elapsed();
 
-    println!("Append latency: {:?}", latency);
+    println!("Append latency: {latency:?}");
 }

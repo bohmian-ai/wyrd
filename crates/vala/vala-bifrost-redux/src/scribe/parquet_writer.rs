@@ -230,6 +230,8 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::NaiveDate;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
     use wyrd_spec::ids::DataTenantId;
 
@@ -306,7 +308,6 @@ mod tests {
 
         // Re-read and verify sorted order
         let bytes_copy = bytes::Bytes::from(encoded.bytes);
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_copy).unwrap();
         let mut reader = builder.build().unwrap();
         let batch = reader.next().unwrap().unwrap();
@@ -353,7 +354,6 @@ mod tests {
 
         let encoded = write_frozen_to_parquet(&frozen).unwrap();
 
-        use parquet::file::reader::{FileReader, SerializedFileReader};
         let reader = SerializedFileReader::new(bytes::Bytes::from(encoded.bytes)).unwrap();
         let metadata = reader.metadata();
 

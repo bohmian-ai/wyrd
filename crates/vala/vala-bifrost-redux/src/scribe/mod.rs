@@ -17,6 +17,7 @@ pub mod wal;
 use arrow::array::Array;
 use arrow::compute::take;
 use arrow::ipc::reader::StreamReader;
+use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -39,7 +40,7 @@ use crate::scribe::wal::ScribeAppendMeta;
 /// `append` splits the batch by event day, writes paired (audit, data) WAL records,
 /// fsyncs, and forwards to the memtable. Seal predicate triggers freeze at first-of:
 /// 50k rows | 1s | 128 MiB | 5s inactivity. Seal state machine executes:
-/// Freeze → Parquet → PUT → PG tx (file_list + audit) → manifest → retire WAL.
+/// Freeze → Parquet → PUT → PG tx (`file_list` + audit) → manifest → retire WAL.
 #[derive(Debug)]
 pub struct ScribeImpl {
     /// In-memory memtable keyed by seal-key.
@@ -48,7 +49,7 @@ pub struct ScribeImpl {
     operator: Arc<opendal::Operator>,
     /// WAL writer for durable append fsync.
     wal: Arc<wal::WalWriter>,
-    /// Pod identity (node_id, writer_epoch).
+    /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
     writer_epoch: i64,
     /// Recurring `vala.cluster_nodes.heartbeat_at` updater; `None` when the
@@ -156,6 +157,8 @@ impl ScribeImpl {
         seal_key: &SealKey,
         conn: &mut TenantConn<'_>,
     ) -> Result<seal::SealCommit, ScribeError> {
+        use crate::scribe::seal::SealDriver;
+
         // Cross-tenant guard: seal_key.tenant must match conn.data_tenant_id()
         let conn_tenant = conn.data_tenant_id();
         if seal_key.tenant != conn_tenant {
@@ -166,8 +169,6 @@ impl ScribeImpl {
                 ),
             });
         }
-
-        use crate::scribe::seal::SealDriver;
 
         let driver = SealDriver::new(self.operator.clone());
         driver
@@ -193,7 +194,7 @@ impl ScribeImpl {
     }
 }
 
-/// Split a RecordBatch by wyrd_event_time day, returning (EventDay, RecordBatch) pairs.
+/// Split a `RecordBatch` by `wyrd_event_time` day, returning (`EventDay`, `RecordBatch`) pairs.
 fn split_batch_by_event_day(
     batch: &RecordBatch,
 ) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
@@ -223,7 +224,10 @@ fn split_batch_by_event_day(
             }
         })?;
         let day = dt.date_naive();
-        day_indices.entry(day).or_default().push(i as u32);
+        day_indices
+            .entry(day)
+            .or_default()
+            .push(u32::try_from(i).expect("row index within u32 range"));
     }
 
     // Build one RecordBatch per day using arrow::compute::take
@@ -320,7 +324,6 @@ impl Scribe for ScribeImpl {
                 })?;
 
             // Encode day_batch to Arrow IPC for WAL
-            use arrow::ipc::writer::StreamWriter;
             let mut data_payload = Vec::new();
             {
                 let mut writer = StreamWriter::try_new(&mut data_payload, &day_batch.schema())

@@ -141,7 +141,7 @@ mod pg_tests {
         let node_id = NodeId::generate();
         let advertise_addr = format!(
             "127.0.0.1:{}",
-            9100_u16 + (Uuid::now_v7().as_u128() as u16 % 500)
+            9100_u16 + u16::try_from(Uuid::now_v7().as_u128() % 500).expect("port offset < 500")
         );
         let identity = acquire_on_boot(&pool, node_id, "scribe", &advertise_addr)
             .await

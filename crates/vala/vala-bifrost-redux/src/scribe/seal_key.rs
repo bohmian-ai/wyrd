@@ -11,21 +11,24 @@ use crate::contracts::ScribeError;
 
 /// Check if a string is a safe identifier for object-store paths.
 ///
-/// Allows only `[A-Za-z0-9_-]`, max 63 characters, prevents path traversal
-/// attacks on opendal-fs backends.
+/// Allows `[A-Za-z0-9_.-]` (dots permitted so dotted namespaces like
+/// `vala.bifrost` are accepted), max 63 characters. Rejects `..`, `/`, `\`,
+/// and bare/leading/trailing `.` to prevent path traversal on opendal-fs.
 fn is_safe_identifier(s: &str) -> bool {
     if s.is_empty() || s.len() > 63 {
         return false;
     }
 
-    // Reject path traversal patterns
     if s.contains("..") || s.contains('/') || s.contains('\\') {
         return false;
     }
 
-    // Allow only alphanumeric, underscore, hyphen
+    if s.starts_with('.') || s.ends_with('.') {
+        return false;
+    }
+
     s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 /// Table reference — namespace + name.

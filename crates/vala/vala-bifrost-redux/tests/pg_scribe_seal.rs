@@ -4,10 +4,10 @@ mod pg_tests {
     //! Tests verify:
     //! - Seal writes exactly one `vala.file_list` row with correct metadata
     //! - Seal emits one `vala.audit_outbox` row per append (preserves principal)
-    //! - Cross-day batches produce separate file_list rows per partition_day
-    //! - Seal tx failure leaves no file_list or audit rows (rollback atomicity)
+    //! - Cross-day batches produce separate `file_list` rows per `partition_day`
+    //! - Seal tx failure leaves no `file_list` or audit rows (rollback atomicity)
     //!
-    //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
+    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
     use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -76,9 +76,11 @@ mod pg_tests {
         ]));
 
         let timestamps: Vec<i64> = (0..row_count)
-            .map(|i| base_time_micros + (i as i64 * 1000))
+            .map(|i| base_time_micros + (i64::try_from(i).expect("bounded row index") * 1000))
             .collect();
-        let values: Vec<u64> = (0..row_count).map(|i| i as u64).collect();
+        let values: Vec<u64> = (0..row_count)
+            .map(|i| u64::try_from(i).expect("bounded row index"))
+            .collect();
 
         RecordBatch::try_new(
             schema.clone(),
@@ -317,12 +319,7 @@ mod pg_tests {
                 _error,
             ) = row;
 
-            assert_ne!(
-                *request_id,
-                Uuid::nil(),
-                "request_id {} should be non-nil",
-                i
-            );
+            assert_ne!(*request_id, Uuid::nil(), "request_id {i} should be non-nil");
             assert!(trace_id.is_none(), "trace_id should be None for this test");
             assert_eq!(operation, "bifrost.append");
             assert!(!resource.is_empty(), "resource should be non-empty");
@@ -330,11 +327,10 @@ mod pg_tests {
             assert_ne!(
                 *principal_id,
                 Uuid::nil(),
-                "principal_id {} should be non-nil",
-                i
+                "principal_id {i} should be non-nil"
             );
             assert_eq!(principal_kind, "user");
-            assert_eq!(*principal_tenant_id, tenant.as_uuid().to_owned());
+            assert_eq!(*principal_tenant_id, tenant.as_uuid());
             assert_eq!(decision, "allow", "decision should be allow");
             assert!(result.is_some(), "result should be Some");
             assert!(!auth_method.is_empty(), "auth_method should be non-empty");
@@ -368,15 +364,15 @@ mod pg_tests {
         let mut values: Vec<u64> = Vec::new();
 
         // 60 rows on day 1
-        for i in 0..60 {
+        for i in 0_i64..60 {
             timestamps.push(day1_time + (i * 100_000)); // 100ms apart
-            values.push(i as u64);
+            values.push(u64::try_from(i).expect("bounded row index"));
         }
 
         // 40 rows on day 2
-        for i in 60..100 {
+        for i in 60_i64..100 {
             timestamps.push(day2_time + ((i - 60) * 100_000));
-            values.push(i as u64);
+            values.push(u64::try_from(i).expect("bounded row index"));
         }
 
         let batch = RecordBatch::try_new(

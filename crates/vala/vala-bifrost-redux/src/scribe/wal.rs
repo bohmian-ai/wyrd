@@ -13,8 +13,8 @@
 //! ## WAL Format Version History
 //!
 //! - **Version 2** (): Added `batch_id` field to record header for deduplication.
-//! Breaking change from version 1 — segments written with version 1 cannot be
-//! replayed by version 2 readers. Delete WAL directory and restart if upgrading.
+//!   Breaking change from version 1 — segments written with version 1 cannot be
+//!   replayed by version 2 readers. Delete WAL directory and restart if upgrading.
 //! - **Version 1** (): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};

@@ -22,6 +22,7 @@ pub mod origin;
 pub mod query;
 pub mod redaction;
 pub mod reference;
+pub mod registry;
 pub mod request_id;
 pub mod run;
 pub mod schema;

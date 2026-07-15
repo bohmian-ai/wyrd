@@ -38,6 +38,13 @@ use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::registry::{
+    ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
+    CardSubmission, CardSummary, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+    GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
+    RegisterOutcome as CardRegisterOutcome, RegistrationOperationId, RegistrationReceipt,
+    RelativeArtifactPath, StoredArtifactEntry, SubmissionMetadata,
+};
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};
 use wyrd_spec::storage::{
@@ -141,6 +148,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<DownloadPlan>(out, golden, "download_plan")?;
     write::<WireProtocol>(out, golden, "wire_protocol")?;
     write::<VerificationGuarantee>(out, golden, "verification_guarantee")?;
+
+    // Card registration wire contracts (task 01).
+    write::<CardSubmission>(out, golden, "card_submission")?;
+    write::<SubmissionMetadata>(out, golden, "submission_metadata")?;
+    write::<ArtifactManifestEntry>(out, golden, "artifact_manifest_entry")?;
+    write::<CreateCardRequest>(out, golden, "create_card_request")?;
+    write::<CreateCardResponse>(out, golden, "create_card_response")?;
+    write::<RegistrationReceipt>(out, golden, "registration_receipt")?;
+    write::<RegistrationOperationId>(out, golden, "registration_operation_id")?;
+    write::<RelativeArtifactPath>(out, golden, "relative_artifact_path")?;
+    write::<CardLifecycleStatus>(out, golden, "card_lifecycle_status")?;
+    write::<CardRegisterOutcome>(out, golden, "card_register_outcome")?;
+    write::<GetCardResponse>(out, golden, "get_card_response")?;
+    write::<DeleteCardResponse>(out, golden, "delete_card_response")?;
+    write::<CardSummary>(out, golden, "card_summary")?;
+    write::<ListCardsRequest>(out, golden, "list_cards_request")?;
+    write::<ListCardsResponse>(out, golden, "list_cards_response")?;
+    write::<ListVersionsResponse>(out, golden, "list_versions_response")?;
+    write::<CardLocator>(out, golden, "card_locator")?;
+    write::<ArtifactInventoryResponse>(out, golden, "artifact_inventory_response")?;
+    write::<StoredArtifactEntry>(out, golden, "stored_artifact_entry")?;
 
     // Auth contracts.
     write::<TokenRequest>(out, golden, "auth_token_request")?;

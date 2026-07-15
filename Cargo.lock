@@ -10910,6 +10910,7 @@ dependencies = [
  "serde",
  "serde_jcs",
  "serde_json",
+ "serde_urlencoded",
  "serde_yaml",
  "sha2 0.10.9",
  "skald-spec",
@@ -10981,6 +10982,26 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-testing",
+]
+
+[[package]]
+name = "wyrd-storage-client"
+version = "0.0.1"
+dependencies = [
+ "async-stream",
+ "base64 0.22.1",
+ "bytes",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "wiremock",
+ "wyrd-client",
+ "wyrd-spec",
 ]
 
 [[package]]

@@ -68,6 +68,7 @@ wyrd-semver = { path = "crates/shared/wyrd-semver", version = "0.0.1" }
 tokio = { version = "1.49", features = ["macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7", features = ["io", "rt"] }
 async-trait = "0.1"
+async-stream = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "stream", "blocking"] }
@@ -82,6 +83,8 @@ schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
 blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"

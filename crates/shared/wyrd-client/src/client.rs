@@ -78,6 +78,27 @@ impl WyrdClient {
         })
     }
 
+    /// Assemble a client from pre-built layers.
+    ///
+    /// Use this when a caller has already constructed an [`AuthMiddleware`] and
+    /// an [`HttpTransport`] against them (for example, a test harness dialing
+    /// a mock server, or an embedder that shares an auth stack across several
+    /// service clients). The regular [`Self::from_env`] and
+    /// [`Self::with_config`] paths remain the recommended constructors for
+    /// production callers.
+    #[must_use]
+    pub fn from_parts(
+        auth: Arc<AuthMiddleware>,
+        http: HttpTransport,
+        grpc_config: GrpcConfig,
+    ) -> Self {
+        Self {
+            auth,
+            http,
+            grpc_config,
+        }
+    }
+
     /// Send a JSON request and decode the JSON response body.
     ///
     /// Delegates to [`HttpTransport::request_json`].
@@ -136,6 +157,27 @@ impl WyrdClient {
         D: DeserializeOwned,
     {
         self.http.submit_idempotent(method, path, body).await
+    }
+
+    /// Send a cross-origin streaming request through the shared pool without
+    /// Wyrd credentials.
+    ///
+    /// Delegates to [`HttpTransport::request_external_stream`]. Used by
+    /// storage-client dispatch modules for presigned/SAS backend PUTs and
+    /// GETs.
+    ///
+    /// # Errors
+    /// Transport failures become [`WyrdError::Internal`].
+    pub async fn request_external_stream(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<reqwest::Body>,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response, WyrdError> {
+        self.http
+            .request_external_stream(method, url, body, headers)
+            .await
     }
 
     /// Return the shared [`AuthMiddleware`] handle.

@@ -42,6 +42,7 @@ wyrd-semver = { workspace = true }
 [dev-dependencies]
 pretty_assertions = "1"
 proptest = { workspace = true }
+serde_urlencoded = "0.7"
 [[example]]
 name = "gen_schemas"
 path = "examples/gen_schemas.rs"

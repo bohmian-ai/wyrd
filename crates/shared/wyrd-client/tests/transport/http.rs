@@ -445,6 +445,40 @@ mod transport_behavior {
     }
 
     #[tokio::test]
+    async fn submit_with_idempotency_key_replays_caller_key_across_retry() {
+        let server = spawn_mock(vec![
+            MockResponse::status(
+                503,
+                r#"{"code":"WYRD_SPEC_500_INTERNAL","detail":"overloaded","details":{}}"#,
+            ),
+            MockResponse::ok(r#"{"job_id":"456"}"#),
+        ])
+        .await;
+        let transport = make_transport(server.base_url.clone());
+        let payload = serde_json::json!({"op": "run"});
+
+        let _: serde_json::Value = transport
+            .submit_with_idempotency_key(
+                reqwest::Method::POST,
+                "/v1/jobs",
+                &payload,
+                "wyrd-engine-deterministic-key",
+            )
+            .await
+            .expect("submit succeeds on retry");
+
+        let captured = server.captured.lock().await;
+        assert_eq!(
+            extract_header(&captured[0], "Idempotency-Key").as_deref(),
+            Some("wyrd-engine-deterministic-key")
+        );
+        assert_eq!(
+            extract_header(&captured[1], "Idempotency-Key").as_deref(),
+            Some("wyrd-engine-deterministic-key")
+        );
+    }
+
+    #[tokio::test]
     async fn four_oh_one_re_exchanges_api_key_and_retries_with_fresh_token() {
         // With an ApiKey credential the reactive 401 path must re-exchange
         // and retry with the *new* token. Scripted exchange: the mock serves,
@@ -499,6 +533,73 @@ mod transport_behavior {
             retried, "Bearer tok-B",
             "the retry must use the re-exchanged token, not the stale one"
         );
+    }
+
+    #[tokio::test]
+    async fn same_origin_absolute_url_is_accepted_for_authenticated_requests() {
+        // V-001 (same-origin allowed): LocalFs upload plans may hand the
+        // client back a full absolute URL rooted at the configured Wyrd
+        // origin. That must still work, and it must carry the
+        // `x-wyrd-access-token` bearer.
+        let server = spawn_mock(vec![MockResponse::ok("{}")]).await;
+        let t = make_transport(server.base_url.clone());
+        let absolute = format!("{}/v1/cards/upload/local/blob", server.base_url);
+
+        let _: serde_json::Value = t
+            .request_json(reqwest::Method::GET, &absolute, None::<&serde_json::Value>)
+            .await
+            .expect("same-origin absolute URL must be accepted");
+
+        let captured = server.captured.lock().await;
+        let raw = captured.first().expect("one request captured");
+        assert!(
+            extract_header(raw, "x-wyrd-access-token").is_some(),
+            "same-origin absolute URL must still carry the Wyrd bearer"
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_origin_absolute_url_is_rejected_for_authenticated_requests() {
+        // V-001 (leak prevention): if an authenticated helper is handed an
+        // absolute URL that does not match the configured Wyrd origin, the
+        // request must fail *before* the client attaches any Wyrd headers or
+        // opens a socket to the third-party host. This guards against a
+        // server-minted plan that inadvertently points a LocalFs URL at an
+        // attacker-controlled host.
+        let server = spawn_mock(vec![MockResponse::ok("{}")]).await;
+        let t = make_transport(server.base_url.clone());
+
+        let attacker_url = "https://attacker.example.com/v1/cards/upload/local/blob";
+        let err = t
+            .request_json::<serde_json::Value, serde_json::Value>(
+                reqwest::Method::GET,
+                attacker_url,
+                None,
+            )
+            .await
+            .expect_err("cross-origin absolute URL must be rejected");
+        assert_eq!(err.code(), "WYRD_SPEC_400_VALIDATION");
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            0,
+            "no socket may be opened to a cross-origin authenticated target"
+        );
+
+        let stream_err = t
+            .request_stream(
+                reqwest::Method::PUT,
+                attacker_url,
+                reqwest::Body::from("payload"),
+            )
+            .await
+            .expect_err("request_stream must reject cross-origin URLs");
+        assert_eq!(stream_err.code(), "WYRD_SPEC_400_VALIDATION");
+
+        let raw_err = t
+            .request_raw(reqwest::Method::GET, attacker_url)
+            .await
+            .expect_err("request_raw must reject cross-origin URLs");
+        assert_eq!(raw_err.code(), "WYRD_SPEC_400_VALIDATION");
     }
 
     #[tokio::test]

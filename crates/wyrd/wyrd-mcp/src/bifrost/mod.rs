@@ -256,7 +256,7 @@ pub fn bifrost_permissions() -> Vec<BifrostPermissionDescriptor> {
 /// definitions. The `codegen:check` snapshot covers only the descriptor
 /// *schema* (via `write::<BifrostErrorDescriptor>` in gen_schemas), not the
 /// catalog contents — so completeness rests on [`bifrost_error_variants`]'s
-/// compile-time exhaustiveness tripwire, not on the golden.
+/// explicit variant list and coverage test, not on the golden.
 pub fn bifrost_error_catalog() -> Vec<BifrostErrorDescriptor> {
     bifrost_error_variants()
         .iter()
@@ -273,10 +273,7 @@ pub fn bifrost_error_catalog() -> Vec<BifrostErrorDescriptor> {
 /// the derive metadata into the catalog (field values are placeholders — the
 /// accessors read the `#[wyrd_error]` attributes, not the instance data).
 ///
-/// The `match` below is a compile-time exhaustiveness tripwire: adding a
-/// `BifrostError` variant fails to compile until it is listed here, which is
-/// the reminder to add it to the catalog above. Keep the `vec!` and the `match`
-/// arms in sync.
+/// The catalog test below keeps this list aligned with the `BifrostError` enum.
 fn bifrost_error_variants() -> Vec<BifrostError> {
     let variants = vec![
         BifrostError::ReservedColumn {
@@ -351,48 +348,16 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::IngestBusy {
             table: String::new(),
         },
+        BifrostError::WalDiskFull,
         BifrostError::OtlpRequestMalformed {
             table: String::new(),
             detail: String::new(),
         },
+        BifrostError::StreamMismatch {
+            requested: String::new(),
+            actual: String::new(),
+        },
     ];
-
-    if let Some(sentinel) = variants.first() {
-        match sentinel {
-            BifrostError::ReservedColumn { .. }
-            | BifrostError::MissingTenantColumn { .. }
-            | BifrostError::UnexpectedTenantColumn { .. }
-            | BifrostError::TenantBindingMissing
-            | BifrostError::CardScopeDenied { .. }
-            | BifrostError::TableNotFound { .. }
-            | BifrostError::FingerprintMismatch { .. }
-            | BifrostError::CommitConflict { .. }
-            | BifrostError::DuplicateFailedBatch { .. }
-            | BifrostError::MetadataMismatch { .. }
-            | BifrostError::CatalogUnreachable { .. }
-            | BifrostError::StorageUnreachable { .. }
-            | BifrostError::WriterUnavailable { .. }
-            | BifrostError::QueryInvalidSql { .. }
-            | BifrostError::QueryTimeout
-            | BifrostError::QueryResultTooLarge
-            | BifrostError::Internal { .. }
-            | BifrostError::AuditUnavailable { .. }
-            | BifrostError::SchemaDrift { .. }
-            | BifrostError::PhysicalDrift { .. }
-            | BifrostError::IcebergMissing { .. }
-            | BifrostError::RedactionFailed(..)
-            | BifrostError::TraceNotFound { .. }
-            | BifrostError::WindowRequired
-            | BifrostError::FilterInvalid { .. }
-            | BifrostError::PageTokenInvalid
-            | BifrostError::PageSnapshotExpired
-            | BifrostError::QueryForbidden
-            | BifrostError::PayloadForbidden
-            | BifrostError::IngestBusy { .. }
-            | BifrostError::WalDiskFull
-            | BifrostError::OtlpRequestMalformed { .. } => {}
-        }
-    }
 
     variants
 }
@@ -405,7 +370,9 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
 mod bifrost_tools {
     use serde_json::json;
     use skald_tool::ToolRegistry;
+    use strum::EnumCount;
     use wyrd_client::{WyrdClient, config::ClientConfig};
+    use wyrd_spec::vala::error::BifrostError;
 
     use crate::bifrost::{bifrost_error_catalog, bifrost_permissions, register_bifrost_tools};
 
@@ -524,6 +491,23 @@ mod bifrost_tools {
         assert!(
             codes.contains(&"WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"),
             "C1 code missing from error catalog"
+        );
+        assert!(
+            codes.contains(&"WYRD_VALA_409_STREAM_MISMATCH"),
+            "stream mismatch code missing from error catalog"
+        );
+        assert!(
+            codes.contains(&"WYRD_VALA_507_WAL_DISK_FULL"),
+            "WAL disk full code missing from error catalog"
+        );
+    }
+
+    #[test]
+    fn bifrost_error_variants_covers_all() {
+        assert_eq!(
+            super::bifrost_error_variants().len(),
+            BifrostError::COUNT,
+            "bifrost_error_variants() must list every BifrostError variant"
         );
     }
 

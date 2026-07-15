@@ -5,7 +5,16 @@ use crate::error::derive::WyrdError;
 
 /// Public Bifrost error variants exchanged across HTTP, MCP, and the Python SDK.
 #[derive(
-    Clone, Debug, PartialEq, Eq, Error, Serialize, Deserialize, schemars::JsonSchema, WyrdError,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    Error,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    WyrdError,
+    strum::EnumCount,
 )]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
@@ -123,6 +132,22 @@ pub enum BifrostError {
     DuplicateFailedBatch {
         /// The idempotency batch ID that previously failed.
         batch_id: String,
+    },
+
+    /// The tail-fetch request targets a `(node_id, writer_epoch)` that does not
+    /// match this Scribe's current writer stream (pod was replaced or restarted).
+    #[error("live-tail stream mismatch: requested={requested}, actual={actual}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_409_STREAM_MISMATCH",
+        status = 409,
+        title = "Live-tail stream identity mismatch",
+        remediation = "Refresh the Scribe stream identity from the cluster catalog and retry the tail-fetch against the current writer stream."
+    )]
+    StreamMismatch {
+        /// The stream identity the caller requested (e.g. "node:epoch").
+        requested: String,
+        /// The stream identity this Scribe actually owns.
+        actual: String,
     },
 
     /// Registered catalog metadata is inconsistent with the actual catalog state.

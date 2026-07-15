@@ -77,6 +77,7 @@ serde = { version = "1", features = ["derive"] }
 serde_jcs = "0.1"
 serde_json = "1"
 serde_yaml = "0.9"
+strum = { version = "0.27", features = ["derive"] }
 jsonschema = { version = "0.18", default-features = false }
 schemars = { version = "0.8", features = ["chrono", "uuid1"] }
 utoipa = { version = "5", features = ["chrono", "uuid"] }

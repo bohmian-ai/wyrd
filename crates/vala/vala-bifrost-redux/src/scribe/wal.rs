@@ -12,10 +12,10 @@
 //!
 //! ## WAL Format Version History
 //!
-//! - **Version 2** (PR#4): Added `batch_id` field to record header for deduplication.
+//! - **Version 2** (): Added `batch_id` field to record header for deduplication.
 //!   Breaking change from version 1 — segments written with version 1 cannot be
 //!   replayed by version 2 readers. Delete WAL directory and restart if upgrading.
-//! - **Version 1** (PR#3): Initial implementation with paired audit/data records.
+//! - **Version 1** (): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use wyrd_spec::ids::DataTenantId;
 
 use crate::contracts::ScribeError;
+use crate::scribe::stream_identity::StreamIdentity;
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
@@ -171,11 +172,11 @@ impl SegmentHeader {
             });
         }
 
-        // Reject version 1 segments (incompatible with PR#4's batch_id field)
+        // Reject version 1 segments (incompatible with 's batch_id field)
         if version == 1 {
             return Err(ScribeError::Internal {
-                detail: "WAL format version 1 is incompatible with PR#4 (batch_id field added). Delete WAL directory and restart.".to_string(),
-            });
+ detail: "WAL format version 1 is incompatible with (batch_id field added). Delete WAL directory and restart.".to_string(),
+ });
         }
 
         if version != WAL_VERSION {
@@ -455,10 +456,11 @@ impl WalSegment {
     /// Append a record to the segment and fsync.
     ///
     /// # Panics
-    /// May panic if the segment file lock is poisoned.
     pub fn append_and_fsync(&self, record: &WalRecord) -> Result<(), ScribeError> {
         let encoded = record.encode();
-        let mut file = self.file.lock().expect("WAL segment file lock poisoned");
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (append_and_fsync)".to_string(),
+        })?;
 
         file.write_all(&encoded).map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
@@ -478,11 +480,10 @@ impl WalSegment {
     }
 
     /// Read all records from the segment.
-    ///
-    /// # Panics
-    /// May panic if the segment file lock is poisoned.
     pub fn read_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
-        let mut file = self.file.lock().expect("WAL segment file lock poisoned");
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (read_records)".to_string(),
+        })?;
         file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
             .map_err(|e| ScribeError::Internal {
                 detail: format!("WAL segment seek failed: {e}"),
@@ -574,7 +575,7 @@ impl WalWriter {
         // Check if we need to roll to a new segment
         let current_size = self.current_segment_size.load(Ordering::SeqCst);
         if current_size + total_size > self.max_segment_size {
-            self.roll_segment();
+            self.roll_segment()?;
         }
 
         let segment = self.ensure_segment()?;
@@ -594,18 +595,25 @@ impl WalWriter {
 
     /// Roll to a new segment.
     ///
-    /// # Panics
-    /// May panic if the segment lock is poisoned.
-    fn roll_segment(&self) {
-        let mut current = self.current_segment.lock().expect("segment lock poisoned");
+    fn roll_segment(&self) -> Result<(), ScribeError> {
+        let mut current = self
+            .current_segment
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "segment lock poisoned (roll_segment)".to_string(),
+            })?;
         *current = None;
         self.current_segment_size.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
-    /// # Panics
-    /// May panic if the segment lock is poisoned.
     fn ensure_segment(&self) -> Result<Arc<WalSegment>, ScribeError> {
-        let mut current = self.current_segment.lock().expect("segment lock poisoned");
+        let mut current = self
+            .current_segment
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "segment lock poisoned (ensure_segment)".to_string(),
+            })?;
 
         if let Some(ref segment) = *current {
             return Ok(Arc::clone(segment));
@@ -645,8 +653,33 @@ pub struct WalReader {
 }
 
 impl WalReader {
-    /// Open all segments in the given directory.
-    pub fn open_directory(dir: impl AsRef<Path>) -> Result<Self, ScribeError> {
+    /// Open only segments belonging to `stream`.
+    ///
+    /// A Scribe WAL directory may retain segments from another writer epoch
+    /// after a restart. The live-tail path is stream-scoped, so it must reject
+    /// those segments at the read boundary. Tenant IDs are intentionally not a
+    /// filter here: one pod stream can contain multiple tenants, while the
+    /// tail response is scoped by the stream identity.
+    pub fn open_directory(
+        dir: impl AsRef<Path>,
+        stream: StreamIdentity,
+    ) -> Result<Self, ScribeError> {
+        Self::open_directory_filtered(dir, Some(stream))
+    }
+
+    /// Open all segments in the given directory for replay.
+    ///
+    /// Replay intentionally reconstructs state across writer epochs. Callers
+    /// serving a live stream must use [`Self::open_directory`] so stale or
+    /// foreign stream segments are excluded at the read boundary.
+    pub fn open_directory_unfiltered(dir: impl AsRef<Path>) -> Result<Self, ScribeError> {
+        Self::open_directory_filtered(dir, None)
+    }
+
+    fn open_directory_filtered(
+        dir: impl AsRef<Path>,
+        stream: Option<StreamIdentity>,
+    ) -> Result<Self, ScribeError> {
         let dir = dir.as_ref();
         if !dir.exists() {
             return Ok(Self {
@@ -664,6 +697,12 @@ impl WalReader {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) == Some("arrow") {
                 let segment = WalSegment::open(&path)?;
+                if let Some(stream) = stream
+                    && (segment.header().node_id != *stream.node_id.as_uuid().as_bytes()
+                        || segment.header().writer_epoch != stream.writer_epoch.as_i64())
+                {
+                    continue;
+                }
                 segments.push(Arc::new(segment));
             }
         }
@@ -766,7 +805,7 @@ mod tests {
 
         assert_eq!(lsn, WalLsn::new(0));
 
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         let records = reader.read_all_records().expect("read records");
 
         assert_eq!(records.len(), 2);
@@ -800,7 +839,7 @@ mod tests {
         }
 
         // Verify multiple segments were created
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert!(
             reader.segments.len() > 1,
             "expected multiple segments, got {}",
@@ -840,7 +879,7 @@ mod tests {
         std::fs::write(&tmp_path, b"incomplete segment data").expect("write tmp file");
 
         // Reopen directory — should ignore .tmp files
-        let reader = WalReader::open_directory(temp_dir.path()).expect("reader");
+        let reader = WalReader::open_directory_unfiltered(temp_dir.path()).expect("reader");
         assert_eq!(
             reader.segments.len(),
             1,
@@ -854,6 +893,69 @@ mod tests {
         // Verify seg-1.arrow does not exist
         let seg1_path = temp_dir.path().join("seg-1.arrow");
         assert!(!seg1_path.exists(), "seg-1.arrow should not exist");
+    }
+
+    #[test]
+    fn wal_reader_filters_segments_by_stream_identity() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let expected_node = [6u8; 16];
+        let foreign_node = [7u8; 16];
+        let expected_stream = StreamIdentity::new(
+            crate::scribe::stream_identity::NodeId::new(uuid::Uuid::from_bytes(expected_node)),
+            crate::scribe::stream_identity::WriterEpoch::new(3),
+        );
+
+        let expected_writer = WalWriter::new(
+            temp_dir.path(),
+            expected_node,
+            3,
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .expect("expected writer");
+        expected_writer
+            .append_and_fsync([1u8; 16], b"audit".to_vec(), b"data".to_vec())
+            .expect("expected append");
+
+        let foreign_segment_path = temp_dir.path().join("foreign.arrow");
+        let foreign_segment = WalSegment::create(
+            &foreign_segment_path,
+            SegmentHeader::new(
+                foreign_node,
+                9,
+                0,
+                *DataTenantId::SYSTEM_OWNER.as_uuid().as_bytes(),
+                0,
+            ),
+        )
+        .expect("foreign segment");
+        foreign_segment
+            .append_and_fsync(&WalRecord::new(
+                WalLsn::new(0),
+                0,
+                [2u8; 16],
+                b"foreign".to_vec(),
+            ))
+            .expect("foreign append");
+
+        let reader =
+            WalReader::open_directory(temp_dir.path(), expected_stream).expect("filtered reader");
+        assert_eq!(
+            reader.read_all_records().expect("filtered records").len(),
+            2,
+            "the expected stream's audit and data records remain readable"
+        );
+
+        let unfiltered =
+            WalReader::open_directory_unfiltered(temp_dir.path()).expect("unfiltered reader");
+        assert_eq!(
+            unfiltered
+                .read_all_records()
+                .expect("unfiltered records")
+                .len(),
+            3,
+            "the test fixture contains both expected and foreign segments"
+        );
     }
 
     #[test]

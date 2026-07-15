@@ -33,6 +33,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 - [Concepts](https://mitari-ai.github.io/wyrd/concepts/): The Card/Spec/Run/Observation ontology — the four nouns everything else builds on.
 - [Architecture](https://mitari-ai.github.io/wyrd/concepts/architecture/): The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
+- [Audit Relay](https://mitari-ai.github.io/wyrd/concepts/audit-relay/): How Vala's background relay pumps audit events from the transactional outbox into the queryable Iceberg warehouse, with crash-safe idempotency and tenant isolation.
 - [Authentication](https://mitari-ai.github.io/wyrd/concepts/authentication/): How Wyrd tokens work and how humans, API-key principals, and machine workloads each obtain one.
 - [Authorization](https://mitari-ai.github.io/wyrd/concepts/authorization/): How Wyrd resolves permissions from token role claims, and how the PolicyHook authz extension gates the POST /v1/authz/check endpoint. Covers the request contract, hook context, and how to implement, register, and mesh-integrate a hook.
 - [Card](https://mitari-ai.github.io/wyrd/concepts/card/): The typed, versioned envelope for one AI system component — its outer shape, lifecycle, and identity rules.
@@ -61,6 +62,17 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 - [Error remediation](https://mitari-ai.github.io/wyrd/for-agents/error-remediation/): How agents should handle Wyrd errors.
 - [Agent workflow](https://mitari-ai.github.io/wyrd/for-agents/workflow/): A copyable end-to-end workflow for agents that declare cards and register them over HTTP.
 
+## Bifrost
+
+- [Bifrost](https://mitari-ai.github.io/wyrd/bifrost/): The Wyrd analytical warehouse. Apache Iceberg tables, DataFusion queries, and a typed read surface for all Vala observations.
+- [Architecture](https://mitari-ai.github.io/wyrd/bifrost/architecture/): Component responsibilities, data flow, storage model, concurrency, durability, and scaling for Gate, Scribe, Oracle, and Forge.
+- [Data plane internals](https://mitari-ai.github.io/wyrd/bifrost/data-plane-internals/): Scribe WAL format, seal state machine, vala.file_list schema, Forge compaction, and audit chain sealing.
+- [Quickstart](https://mitari-ai.github.io/wyrd/bifrost/quickstart/): Emit an observation via vala-sdk and query it back through a typed ValaQueryService method.
+- [Reading Data](https://mitari-ai.github.io/wyrd/bifrost/reading-data/): ValaQueryService typed methods, signed page tokens, payload-read permissions, the governed generic SQL surface, and Arrow conversion.
+- [Schema](https://mitari-ai.github.io/wyrd/bifrost/schema/): Pre-declared Bifrost domain tables, physical schemas, system columns, and type mapping.
+- [SLOs](https://mitari-ai.github.io/wyrd/bifrost/slos/): Bifrost performance targets and methodology. All figures are TBD pending the bench:bifrost suite.
+- [Writing Data](https://mitari-ai.github.io/wyrd/bifrost/writing-data/): vala-sdk producer, batching, backpressure, payload governance, and tenant stamping.
+
 ## Get Started
 
 - [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
@@ -69,6 +81,21 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 
 - [Reference](https://mitari-ai.github.io/wyrd/reference/): The literal contract — CLI verbs, card schemas, error codes, and the API surface.
 - [CLI](https://mitari-ai.github.io/wyrd/reference/cli/): The wyrd binary — auth, eval, and principal commands, with every flag and environment variable.
+
+## Self Hosting
+
+- [Self-hosting](https://mitari-ai.github.io/wyrd/self-hosting/): Run the Wyrd server yourself. Configuration, database, storage, auth, and the runtime architecture.
+- [Architecture](https://mitari-ai.github.io/wyrd/self-hosting/architecture/): The server's components, how a request flows through the protective edge, and how the process supervises and shuts down.
+- [Authentication](https://mitari-ai.github.io/wyrd/self-hosting/authentication/): The principals, tokens, and grants the server uses, plus generating and mounting the signing and sealing keys.
+- [Binary](https://mitari-ai.github.io/wyrd/self-hosting/binary/): Deploy the compiled server to a host or VM.
+- [Configuration](https://mitari-ai.github.io/wyrd/self-hosting/configuration/): Every environment variable, the config file resolution order, and the validation rules the server enforces at boot.
+- [Database](https://mitari-ai.github.io/wyrd/self-hosting/database/): Postgres setup for the server. External and embedded modes, the roles the server needs, and migrations.
+- [Docker](https://mitari-ai.github.io/wyrd/self-hosting/docker/): Run the open-source server image against your own Postgres and object storage.
+- [Enterprise](https://mitari-ai.github.io/wyrd/self-hosting/enterprise/): Multi-tenant SaaS deployment with custom policy, audit, and identity.
+- [Local development](https://mitari-ai.github.io/wyrd/self-hosting/local-development/): Run the server on your machine with embedded Postgres, local storage, and a development signing key.
+- [Running the server](https://mitari-ai.github.io/wyrd/self-hosting/running-the-server/): The CLI, serve modes, the boot sequence, graceful shutdown, and the health and readiness probes.
+- [SSO and OIDC](https://mitari-ai.github.io/wyrd/self-hosting/sso-and-oidc/): Wire an identity provider for human single sign-on and for machine workload federation.
+- [Storage](https://mitari-ai.github.io/wyrd/self-hosting/storage/): The artifact store. Local, S3, GCS, and Azure backends with the credentials each one needs.
 
 ## Card schemas
 
@@ -15110,11 +15137,11 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "additionalProperties": {
             "$ref": "#/definitions/NonSecretValue"
           },
-          "description": "Component config.",
+          "description": "Component config. TODO: does this earn its place?",
           "type": "object"
         },
         "credential_refs": {
-          "description": "Component credential references.",
+          "description": "Component credential references. TODO: does this earn its place?",
           "items": {
             "$ref": "#/definitions/CredentialRef"
           },

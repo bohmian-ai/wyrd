@@ -10,7 +10,6 @@ rust-version.workspace = true
 [features]
 default = []
 scribe-inspect = []
-scribe-tail = []
 
 [dependencies]
 wyrd-spec = { workspace = true }
@@ -40,9 +39,18 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 
 [[bench]]
 name = "bench_ingest_seal_throughput"
+harness = false
+
+[[bench]]
+name = "bench_ingest_ack_latency"
+harness = false
+
+[[bench]]
+name = "bench_ingest_multi_tenant_fairness"
 harness = false
 
 [lints]

@@ -118,27 +118,27 @@ pub async fn acquire_on_boot(
 
     // INSERT if not exists
     sqlx::query(
-        "INSERT INTO vala.cluster_nodes (node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at)
-        VALUES ($1, $2, $3, 1, now(), now())
-        ON CONFLICT (node_id) DO NOTHING",
-    )
-    .bind(node_uuid)
-    .bind(role)
-    .bind(advertise_addr)
-    .execute(pool.pool())
-    .await
-    .map_err(|e| ScribeError::Internal {
-        detail: format!("failed to insert cluster_nodes row: {e}"),
-    })?;
+ "INSERT INTO vala.cluster_nodes (node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at)
+ VALUES ($1, $2, $3, 1, now(), now())
+ ON CONFLICT (node_id) DO NOTHING",
+ )
+ .bind(node_uuid)
+ .bind(role)
+ .bind(advertise_addr)
+ .execute(pool.pool())
+ .await
+ .map_err(|e| ScribeError::Internal {
+ detail: format!("failed to insert cluster_nodes row: {e}"),
+ })?;
 
     // UPDATE and return the new fencing_token
     let row: (i64,) = sqlx::query_as(
         "UPDATE vala.cluster_nodes
-           SET fencing_token = fencing_token + 1,
-               started_at = now(),
-               heartbeat_at = now()
-         WHERE node_id = $1
-     RETURNING fencing_token",
+ SET fencing_token = fencing_token + 1,
+ started_at = now(),
+ heartbeat_at = now()
+ WHERE node_id = $1
+ RETURNING fencing_token",
     )
     .bind(node_uuid)
     .fetch_one(pool.pool())

@@ -1,8 +1,8 @@
-//! Parquet writer for frozen memtable snapshots — PR#5.
+//! Parquet writer for frozen memtable snapshots — .
 //!
 //! `write_frozen_to_parquet` encodes a `FrozenMemtable` snapshot (a per-seal-key,
-//! per-day slice from PR#4) to Parquet bytes using the copied `bifrost_writer_properties`
-//! (PR#1), with sort order `(data_tenant_id, wyrd_event_time)` and partition day = the
+//! per-day slice from ) to Parquet bytes using the copied `bifrost_writer_properties`
+//! (), with sort order `(data_tenant_id, wyrd_event_time)` and partition day = the
 //! seal-key's `event_day` (never derived from row min/max).
 
 use arrow::compute::SortColumn;
@@ -29,9 +29,9 @@ pub struct ParquetEncoded {
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
     pub partition_day: EventDay,
-    /// `AuditEvent` list threaded forward for PR#6's seal transaction.
+    /// `AuditEvent` list threaded forward for 's seal transaction.
     pub audit_events: Vec<AuditEvent>,
-    /// `ScribeAppendMeta` list threaded forward for PR#6's `file_list` INSERT.
+    /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
 }
 
@@ -49,7 +49,7 @@ pub struct RowGroupStats {
 /// Encode a frozen memtable snapshot to Parquet bytes.
 ///
 /// Returns encoded bytes, row-group stats, `partition_day` (from seal-key), and the paired
-/// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for PR#6's seal
+/// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
 /// transaction).
 ///
 /// # Errors
@@ -81,7 +81,7 @@ pub fn write_frozen_to_parquet(frozen: &FrozenMemtable) -> Result<ParquetEncoded
 
     let bytes = buf.into_inner();
 
-    // 3. Extract row-group stats (for verification only; PR#6 derives file-level min/max)
+    // 3. Extract row-group stats (for verification only; derives file-level min/max)
     let row_group_stats = extract_row_group_stats(&bytes)?;
 
     // 4. Return encoded result with partition_day from seal-key (not row min/max)
@@ -230,6 +230,8 @@ mod tests {
     use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::NaiveDate;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::sync::Arc;
     use wyrd_spec::ids::DataTenantId;
 
@@ -306,7 +308,6 @@ mod tests {
 
         // Re-read and verify sorted order
         let bytes_copy = bytes::Bytes::from(encoded.bytes);
-        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
         let builder = ParquetRecordBatchReaderBuilder::try_new(bytes_copy).unwrap();
         let mut reader = builder.build().unwrap();
         let batch = reader.next().unwrap().unwrap();
@@ -353,7 +354,6 @@ mod tests {
 
         let encoded = write_frozen_to_parquet(&frozen).unwrap();
 
-        use parquet::file::reader::{FileReader, SerializedFileReader};
         let reader = SerializedFileReader::new(bytes::Bytes::from(encoded.bytes)).unwrap();
         let metadata = reader.metadata();
 

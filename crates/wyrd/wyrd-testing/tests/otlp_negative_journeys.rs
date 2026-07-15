@@ -3,10 +3,10 @@
 //! Covers two stable negative contracts over both transports (gRPC and HTTP):
 //!
 //! 1. **Permission denial** — a principal without `bifrost_record:write` is
-//!    rejected with gRPC `PERMISSION_DENIED` / HTTP `403` and no row is written.
+//! rejected with gRPC `PERMISSION_DENIED` / HTTP `403` and no row is written.
 //! 2. **Malformed request body** — a body that cannot be decoded as OTLP
-//!    protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
-//!    stable `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
+//! protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
+//! stable `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
 //!
 //! Saturation (backpressure) journey note: driving the group-commit
 //! coordinator's mpsc channel to `try_send` failure end-to-end requires either

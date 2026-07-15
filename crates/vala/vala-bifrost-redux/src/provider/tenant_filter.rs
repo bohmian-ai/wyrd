@@ -43,7 +43,7 @@ pub fn attach_tenant_filter(
         Some(predicate) => Ok(Arc::new(FilterExec::try_new(predicate, plan)?)),
         None => Err(DataFusionError::Internal(
             "vala.tenant.predicate_missing: SystemShared scan reached execution \
-             without a bindable data_tenant_id filter"
+ without a bindable data_tenant_id filter"
                 .to_string(),
         )),
     }

@@ -16,22 +16,19 @@ pub mod wal;
 
 use arrow::array::Array;
 use arrow::compute::take;
-use arrow::ipc::reader::StreamReader;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
 use vala_sql::TenantConn;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-use crate::contracts::{AppendAck, Scribe, ScribeAppend, ScribeError};
+use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 #[cfg(feature = "scribe-inspect")]
 use crate::inspect::{MemtableKey, ScribeInspect};
 use crate::scribe::memtable::Memtable;
-use crate::scribe::seal_key::{EventDay, SealKey, TableRef};
+use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::wal::ScribeAppendMeta;
 
 /// Scribe implementation with WAL append, fsync, replay, memtable, and seal ().
@@ -232,50 +229,24 @@ impl Default for ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
-    async fn append(&self, req: ScribeAppend) -> Result<AppendAck, ScribeError> {
-        // Generate batch_id using UUID v7 (time-ordered, monotonic)
-        let batch_id = *uuid::Uuid::now_v7().as_bytes();
+    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        // batch_id comes from the request (client-supplied v7 UUID); 2PC
+        // recovery in catalog::recovery keys off this exact value.
+        let batch_id = *req.batch_id.as_bytes();
+        let table_fqn = req.table.fqn();
 
-        // 1. Parse table_fqn → TableRef
-        let table_ref =
-            TableRef::parse_fqn(&req.table_fqn).ok_or_else(|| ScribeError::Internal {
-                detail: format!("invalid table FQN: {}", req.table_fqn),
-            })?;
+        // Split cross-day input into per-day slices; a cross-day batch
+        // produces two seals into two file_list rows (see seal_key module).
+        let event_days = split_batch_by_event_day(&req.rows)?;
 
-        // 2. Decode Arrow IPC bytes → RecordBatch
-        let mut cursor = Cursor::new(&req.batch_data);
-        let mut reader =
-            StreamReader::try_new(&mut cursor, None).map_err(|e| ScribeError::Internal {
-                detail: format!("failed to decode Arrow IPC: {e}"),
-            })?;
-
-        let batch = reader
-            .next()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "no RecordBatch in IPC stream".to_string(),
-            })?
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("Arrow batch decode error: {e}"),
-            })?;
-
-        // 3. Extract event day from wyrd_event_time column — split cross-day batches
-        let event_days = split_batch_by_event_day(&batch)?;
-
-        // 4-10: Process each day part separately
         for (event_day, day_batch) in event_days {
-            // Build SealKey for this day part
-            let seal_key = crate::scribe::seal_key::SealKey::new(
-                req.principal.tenant_id,
-                table_ref.clone(),
-                event_day,
-            );
+            let seal_key = SealKey::new(req.principal.tenant_id, req.table.clone(), event_day);
 
-            // Build AuditEvent from principal for this day part
             let audit_event = AuditEvent {
-                request_id: RequestId::now_v7(),
+                request_id: req.request_id.clone(),
                 trace_id: None,
                 operation: "bifrost.append".to_string(),
-                resource: req.table_fqn.clone(),
+                resource: table_fqn.clone(),
                 card_ref: req.principal.card_ref().cloned(),
                 principal_id: req.principal.id,
                 principal_kind: req.principal.kind.tag(),
@@ -287,13 +258,11 @@ impl Scribe for ScribeImpl {
                 detail: None,
             };
 
-            // Serialize AuditEvent to JSON for WAL
             let audit_payload =
                 serde_json::to_vec(&audit_event).map_err(|e| ScribeError::Internal {
                     detail: format!("failed to serialize AuditEvent: {e}"),
                 })?;
 
-            // Encode day_batch to Arrow IPC for WAL
             let mut data_payload = Vec::new();
             {
                 let mut writer = StreamWriter::try_new(&mut data_payload, &day_batch.schema())
@@ -310,12 +279,10 @@ impl Scribe for ScribeImpl {
                 })?;
             }
 
-            // WAL append + fsync (paired audit + data records)
             let wal_lsn = self
                 .wal
                 .append_and_fsync(batch_id, audit_payload, data_payload)?;
 
-            // Build ScribeAppendMeta with real LSNs
             let meta = ScribeAppendMeta {
                 batch_id,
                 rows_accepted: day_batch.num_rows(),
@@ -324,20 +291,15 @@ impl Scribe for ScribeImpl {
                 seal_key: seal_key.as_path_components(),
             };
 
-            // Insert into memtable
             self.memtable
                 .insert(&seal_key, audit_event, meta, day_batch)?;
 
-            // Check seal predicate
             if self.memtable.should_seal(&seal_key)? {
                 tracing::info!(seal_key = %seal_key, "seal predicate triggered");
             }
         }
 
-        Ok(AppendAck {
-            batch_id,
-            tenant: req.principal.tenant_id,
-        })
+        Ok(())
     }
 }
 

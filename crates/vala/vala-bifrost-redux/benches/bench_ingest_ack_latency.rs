@@ -1,7 +1,7 @@
 //! Benchmark: ingest→ack latency (append → fsync → ack).
 //!
-//! Measures end-to-end latency from `Scribe::append` call to `AppendAck` return.
-//! Not CI-gated; compile-only verification.
+//! Measures end-to-end latency from `Scribe::append` call to durable-ack
+//! return (`Ok(())`). Not CI-gated; compile-only verification.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -9,11 +9,14 @@ use std::time::Instant;
 use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::seal_key::TableRef;
 use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::request_id::RequestId;
 
 fn stub_scribe() -> ScribeImpl {
     let operator = Arc::new(
@@ -66,17 +69,6 @@ fn make_batch(row_count: usize) -> RecordBatch {
     .expect("batch")
 }
 
-fn encode_batch(batch: &RecordBatch) -> Vec<u8> {
-    use arrow::ipc::writer::StreamWriter;
-    let mut buf = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).expect("writer");
-        writer.write(batch).expect("write");
-        writer.finish().expect("finish");
-    }
-    buf
-}
-
 #[tokio::main]
 async fn main() {
     // Compile-only benchmark. Real implementation requires:
@@ -95,17 +87,18 @@ async fn main() {
     };
 
     let batch = make_batch(1000);
-    let batch_data = encode_batch(&batch);
 
     let req = ScribeAppend {
-        table_fqn: "vala.events".to_string(),
-        schema_fingerprint: [0u8; 32],
-        batch_data,
         principal,
+        table: TableRef::new("vala".to_string(), "events".to_string()),
+        rows: batch,
+        schema_fingerprint: SchemaFingerprint([0u8; 32]),
+        request_id: RequestId::now_v7(),
+        batch_id: uuid::Uuid::now_v7(),
     };
 
     let start = Instant::now();
-    let _ack = scribe.append(req).await.expect("append");
+    scribe.append(req).await.expect("append");
     let latency = start.elapsed();
 
     println!("Append latency: {latency:?}");

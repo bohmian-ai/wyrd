@@ -1,4 +1,4 @@
-//! Benchmark: ingest + seal throughput (PR#5).
+//! Benchmark: ingest + seal throughput.
 //!
 //! Measures end-to-end throughput for the append → memtable → freeze → Parquet
 //! encode path. This benchmark compiles but is not gated (no CI requirement).
@@ -83,8 +83,8 @@ fn main() {
     };
 
     println!("Benchmark: ingest + seal throughput");
-    println!("  Batch size: {} rows", BATCH_SIZE);
-    println!("  Iterations: {}", ITERATIONS);
+    println!(" Batch size: {} rows", BATCH_SIZE);
+    println!(" Iterations: {}", ITERATIONS);
     println!();
 
     // Warmup
@@ -113,8 +113,8 @@ fn main() {
     let avg_latency = elapsed / ITERATIONS as u32;
 
     println!("Results:");
-    println!("  Total time: {:?}", elapsed);
-    println!("  Avg latency per seal: {:?}", avg_latency);
-    println!("  Throughput: {:.0} rows/sec", rows_per_sec);
-    println!("  Total rows: {}", total_rows);
+    println!(" Total time: {:?}", elapsed);
+    println!(" Avg latency per seal: {:?}", avg_latency);
+    println!(" Throughput: {:.0} rows/sec", rows_per_sec);
+    println!(" Total rows: {}", total_rows);
 }

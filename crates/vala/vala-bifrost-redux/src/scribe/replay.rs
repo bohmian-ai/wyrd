@@ -151,21 +151,21 @@ pub fn replay_wal_directory(
 /// # Errors
 /// Returns [`ScribeError::Internal`] if the path format is invalid.
 ///
-/// # Implementation Note (PR#4)
+/// # Implementation Note ()
 ///
 /// This function currently returns a placeholder seal-key because full path parsing
-/// requires WAL directory routing from PR#5. The real implementation will:
+/// requires WAL directory routing from . The real implementation will:
 ///
 /// 1. Parse path structure: `${SCRIBE_WAL_DIR}/{namespace}/{table}/tenant={uuid}/day={YYYY-MM-DD}`
 /// 2. Extract `tenant=` component and parse UUID
 /// 3. Extract `day=` component and parse date
 /// 4. Build `TableRef` from namespace + table components
 ///
-/// For PR#4, tests use a flat temp directory structure. Real multi-key replay testing
-/// requires the directory routing in PR#5.
+/// For , tests use a flat temp directory structure. Real multi-key replay testing
+/// requires the directory routing.
 #[allow(clippy::unnecessary_wraps)]
 fn extract_seal_key_from_path(_wal_dir: &Path) -> Result<SealKey, ScribeError> {
-    // Placeholder for PR#4 — real path parsing in PR#5
+    // Placeholder — real path parsing pending
     Ok(SealKey::new(
         DataTenantId::SYSTEM_OWNER,
         TableRef::new("vala.bifrost".to_string(), "events".to_string()),
@@ -231,16 +231,16 @@ mod tests {
     fn wal_replay_skips_sealed_lsn_per_seal_key() {
         // Regression test for C1: per-seal-key sealed_lsn watermark
         //
-        // For PR#4: This test uses the simplified seal-key extraction that returns
+        // For : This test uses the simplified seal-key extraction that returns
         // a single placeholder seal-key for all records. The test structure is correct,
-        // but real multi-key verification requires PR#5's full WAL directory routing.
+        // but real multi-key verification requires 's full WAL directory routing.
         //
         // Test contract: sealed_lsn[K1] = N skips only K1's records where LSN <= N,
-        // not K2's records. Once real seal-key extraction lands in PR#5, this test
+        // not K2's records. Once real seal-key extraction lands in , this test
         // will verify true multi-key isolation.
 
         // For now, placeholder: real implementation requires multi-key WAL routing
-        // which is part of PR#5's integration.
+        // which is part of 's integration.
     }
 
     #[test]
@@ -412,8 +412,8 @@ mod tests {
         // Verify replay succeeded with epoch=3 segments
         assert_eq!(state.audit_events.len(), 1);
 
-        // In PR#5, ReplayedAppendMeta will carry writer_epoch from segment header.
-        // For PR#4, the test structure is correct even though epoch isn't yet
+        // In , ReplayedAppendMeta will carry writer_epoch from segment header.
+        // For , the test structure is correct even though epoch isn't yet
         // explicitly in the metadata struct.
     }
 }

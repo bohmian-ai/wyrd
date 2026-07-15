@@ -2,28 +2,35 @@
 
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use vala_sql::TenantConn;
+use vala_sql::{SqlError, TenantConn};
+use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::ParquetEncoded;
 
-/// Metadata extracted from encoded Parquet for the `file_list` INSERT.
-struct FileListMetadata {
-    wal_lsn_min: i64,
-    wal_lsn_max: i64,
-    min_event_time: chrono::DateTime<chrono::Utc>,
-    max_event_time: chrono::DateTime<chrono::Utc>,
-    row_count: i64,
-    file_size: i64,
-    tenant_bucket: i32,
-    node_uuid: Uuid,
+/// File list INSERT row matching the 14 vala.file_list columns.
+pub struct FileListInsert<'a> {
+    pub id: Uuid,
+    pub namespace: &'a str,
+    pub table_name: &'a str,
+    pub file_path: &'a str,
+    pub file_size: i64,
+    pub row_count: i64,
+    pub min_event_time: chrono::DateTime<chrono::Utc>,
+    pub max_event_time: chrono::DateTime<chrono::Utc>,
+    pub partition_day: chrono::NaiveDate,
+    pub tenant_bucket: i32,
+    pub node_id: Uuid,
+    pub writer_epoch: i64,
+    pub wal_lsn_min: i64,
+    pub wal_lsn_max: i64,
 }
 
 /// Extract LSN range from append metadata.
 ///
 /// LSN values are u64 but real-world Postgres LSNs fit in i64 (PG column is BIGINT).
-fn extract_lsn_range(encoded: &ParquetEncoded) -> (i64, i64) {
+fn extract_lsn_range(encoded: &ParquetEncoded) -> Result<(i64, i64), ScribeError> {
     let min = encoded
         .append_metas
         .iter()
@@ -37,7 +44,14 @@ fn extract_lsn_range(encoded: &ParquetEncoded) -> (i64, i64) {
         .max()
         .unwrap_or(0);
 
-    (min.cast_signed(), max.cast_signed())
+    let min_i = i64::try_from(min).map_err(|_| ScribeError::Internal {
+        detail: format!("wal_lsn_min {min} exceeds i64::MAX (invariant violation)"),
+    })?;
+    let max_i = i64::try_from(max).map_err(|_| ScribeError::Internal {
+        detail: format!("wal_lsn_max {max} exceeds i64::MAX (invariant violation)"),
+    })?;
+
+    Ok((min_i, max_i))
 }
 
 /// Extract min/max event time from row group stats.
@@ -64,16 +78,18 @@ fn compute_tenant_bucket(frozen: &FrozenMemtable) -> i32 {
     hasher.update(frozen.seal_key.tenant.as_uuid().as_bytes());
     let hash = hasher.finalize();
     let bucket_u32 = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
-    (bucket_u32 % 1024).cast_signed()
+    i32::try_from(bucket_u32 % 1024).expect("tenant_bucket in 0..1024 fits in i32")
 }
 
-/// Gather all metadata needed for the `file_list` INSERT.
-fn extract_file_list_metadata(
-    frozen: &FrozenMemtable,
-    encoded: &ParquetEncoded,
+/// Build the FileListInsert row from freeze metadata.
+pub fn build_insert<'a>(
+    frozen: &'a FrozenMemtable,
+    encoded: &'a ParquetEncoded,
     node_id: &str,
-) -> Result<FileListMetadata, ScribeError> {
-    let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded);
+    writer_epoch: i64,
+    file_path: &'a str,
+) -> Result<FileListInsert<'a>, ScribeError> {
+    let (wal_lsn_min, wal_lsn_max) = extract_lsn_range(encoded)?;
     let (min_event_time, max_event_time) = extract_event_time_range(encoded);
 
     // Row count and file size are usize; the Postgres columns are BIGINT (i64).
@@ -92,105 +108,111 @@ fn extract_file_list_metadata(
         detail: format!("invalid node_id UUID: {e}"),
     })?;
 
-    Ok(FileListMetadata {
-        wal_lsn_min,
-        wal_lsn_max,
+    Ok(FileListInsert {
+        id: Uuid::now_v7(),
+        namespace: &frozen.seal_key.table.namespace,
+        table_name: &frozen.seal_key.table.name,
+        file_path,
+        file_size,
+        row_count,
         min_event_time,
         max_event_time,
-        row_count,
-        file_size,
+        partition_day: encoded.partition_day.as_naive_date(),
         tenant_bucket,
-        node_uuid,
+        node_id: node_uuid,
+        writer_epoch,
+        wal_lsn_min,
+        wal_lsn_max,
     })
 }
 
 /// Insert one `vala.file_list` row + N `vala.audit_outbox` rows in one transaction.
 ///
-/// Executes `INSERT vala.file_list` (stamped with `node_id`, `writer_epoch`,
-/// `wal_lsn_min`, `wal_lsn_max`, `partition_day`) + one
-/// `vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)` call per
-/// staged `wyrd_spec::vala::api::AuditEvent` within a single `TenantConn`
-/// transaction.
+/// Executes `INSERT vala.file_list` with ON CONFLICT DO NOTHING on the
+/// `(node_id, writer_epoch, wal_lsn_min, wal_lsn_max)` unique key. If the insert
+/// is a no-op (replay-driven re-seal), returns `Ok(())` without emitting audit
+/// rows — the audit rows for that range were already durably written in the prior
+/// seal.
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] wrapping `vala_sql::SqlError` on transaction failure.
+/// Returns `vala_sql::SqlError` on transaction failure.
 pub async fn insert_and_audit(
     conn: &mut TenantConn<'_>,
-    frozen: &FrozenMemtable,
-    encoded: &ParquetEncoded,
-    file_path: &str,
-    node_id: &str,
-    writer_epoch: i64,
-) -> Result<(), ScribeError> {
-    let meta = extract_file_list_metadata(frozen, encoded, node_id)?;
-
-    // 1. INSERT vala.file_list
-    sqlx::query(
+    row: &FileListInsert<'_>,
+    events: &[AuditEvent],
+) -> Result<(), SqlError> {
+    // 1. INSERT vala.file_list with ON CONFLICT DO NOTHING
+    let result = sqlx::query(
         r"
-        INSERT INTO vala.file_list (
-            id,
-            data_tenant_id,
-            namespace,
-            table_name,
-            file_path,
-            file_size,
-            row_count,
-            min_event_time,
-            max_event_time,
-            partition_day,
-            tenant_bucket,
-            node_id,
-            writer_epoch,
-            wal_lsn_min,
-            wal_lsn_max
-        )
-        VALUES (
-            $1,
-            wyrd.current_tenant(),
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            $7,
-            $8,
-            $9,
-            $10,
-            $11,
-            $12,
-            $13,
-            $14
-        )
-        ON CONFLICT (node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
-        ",
+ INSERT INTO vala.file_list (
+ id,
+ data_tenant_id,
+ namespace,
+ table_name,
+ file_path,
+ file_size,
+ row_count,
+ min_event_time,
+ max_event_time,
+ partition_day,
+ tenant_bucket,
+ node_id,
+ writer_epoch,
+ wal_lsn_min,
+ wal_lsn_max
+ )
+ VALUES (
+ $1,
+ wyrd.current_tenant(),
+ $2,
+ $3,
+ $4,
+ $5,
+ $6,
+ $7,
+ $8,
+ $9,
+ $10,
+ $11,
+ $12,
+ $13,
+ $14
+ )
+ ON CONFLICT (node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
+ ",
     )
-    .bind(Uuid::now_v7())
-    .bind(&frozen.seal_key.table.namespace)
-    .bind(&frozen.seal_key.table.name)
-    .bind(file_path)
-    .bind(meta.file_size)
-    .bind(meta.row_count)
-    .bind(meta.min_event_time)
-    .bind(meta.max_event_time)
-    .bind(encoded.partition_day.as_naive_date())
-    .bind(meta.tenant_bucket)
-    .bind(meta.node_uuid)
-    .bind(writer_epoch)
-    .bind(meta.wal_lsn_min)
-    .bind(meta.wal_lsn_max)
+    .bind(row.id)
+    .bind(row.namespace)
+    .bind(row.table_name)
+    .bind(row.file_path)
+    .bind(row.file_size)
+    .bind(row.row_count)
+    .bind(row.min_event_time)
+    .bind(row.max_event_time)
+    .bind(row.partition_day)
+    .bind(row.tenant_bucket)
+    .bind(row.node_id)
+    .bind(row.writer_epoch)
+    .bind(row.wal_lsn_min)
+    .bind(row.wal_lsn_max)
     .execute(&mut **conn.transaction())
-    .await
-    .map_err(|e| ScribeError::Internal {
-        detail: format!("file_list INSERT failed: {e}"),
-    })?;
+    .await?;
+
+    // Early return if the row was a replay no-op
+    if result.rows_affected() == 0 {
+        tracing::debug!(
+        node_id = %row.node_id,
+        writer_epoch = row.writer_epoch,
+        wal_lsn_min = row.wal_lsn_min,
+        wal_lsn_max = row.wal_lsn_max,
+        "replay-driven re-seal: file_list row already exists; skipping audit fan-out",
+        );
+        return Ok(());
+    }
 
     // 2. Append audit events (one per staged AuditEvent)
-    for event in &encoded.audit_events {
-        vala_sql::queries::audit_outbox::append_audit(conn, event)
-            .await
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("audit append failed: {e}"),
-            })?;
+    for event in events {
+        vala_sql::queries::audit_outbox::append_audit(conn, event).await?;
     }
 
     Ok(())

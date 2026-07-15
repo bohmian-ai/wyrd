@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use opendal::Operator;
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::AssertSqlSafe;
 use thiserror::Error;
+use vala_sql::ValaPostgres;
 use wyrd_spec::ids::DataTenantId;
+use wyrd_sql::TenantConn;
 
 use vala_bifrost_redux::scribe::ScribeImpl;
 
@@ -62,13 +64,14 @@ pub struct HarnessConfig {
 /// Multi-pod Scribe harness for journey tests.
 ///
 /// Constructs N stub `ScribeImpl` instances sharing a single opendal `Operator`
-/// (memory backend) and a PG pool. Provides `wait_for_drain` and `shutdown`
+/// (memory backend) and a ValaPostgres handle. Provides `wait_for_drain` and `shutdown`
 /// for coordinated test teardown.
 pub struct MultiScribeHarness {
     pods: Vec<ScribeImpl>,
     operator: Arc<Operator>,
-    pg_pool: PgPool,
+    pg: Arc<ValaPostgres>,
     schema: String,
+    tenants: Vec<DataTenantId>,
 }
 
 impl MultiScribeHarness {
@@ -87,10 +90,18 @@ impl MultiScribeHarness {
                 .finish(),
         );
 
-        // Construct PG pool from wyrd test DATABASE_URL
+        // Construct ValaPostgres from admin+tenant pools
         let database_url = std::env::var("WYRD_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd".to_string());
-        let pg_pool = PgPool::connect(&database_url).await?;
+
+        // Build pool for ValaPostgres
+        use wyrd_sql::PoolConfig;
+        use wyrd_sql::pool::build_pool;
+        let runtime_pool = build_pool(&database_url, PoolConfig::default())
+            .await
+            .map_err(|e| HarnessError::Internal(format!("runtime pool: {e}")))?;
+
+        let pg = Arc::new(ValaPostgres::from_pools(runtime_pool, None));
 
         // Create per-test schema for isolation
         // Schema names can't be parameters in PG DDL; validate for SQL safety
@@ -101,22 +112,49 @@ impl MultiScribeHarness {
         let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {}", cfg.schema);
         let create_schema_static: &'static str = Box::leak(create_schema_sql.into_boxed_str());
         sqlx::raw_sql(AssertSqlSafe(create_schema_static))
-            .execute(&pg_pool)
+            .execute(pg.pool())
             .await?;
         let set_path_sql = format!("SET search_path TO {}", cfg.schema);
         let set_path_static: &'static str = Box::leak(set_path_sql.into_boxed_str());
         sqlx::raw_sql(AssertSqlSafe(set_path_static))
-            .execute(&pg_pool)
+            .execute(pg.pool())
             .await?;
 
-        // Construct N stub Scribe pods
-        let pods = (0..cfg.pods).map(|_| ScribeImpl::new()).collect();
+        // Construct N stub Scribe pods with temp WAL per pod
+        let pods = (0..cfg.pods)
+            .map(|i| {
+                let temp_dir = tempfile::tempdir()
+                    .map_err(|e| HarnessError::Internal(format!("temp WAL dir: {e}")))?;
+                let node_id = uuid::Uuid::new_v4();
+                let node_id_str = node_id.to_string();
+                let wal = Arc::new(
+                    vala_bifrost_redux::scribe::wal::WalWriter::new(
+                        temp_dir.path(),
+                        *node_id.as_bytes(),
+                        1 + i as i64, // writer_epoch per pod
+                        cfg.tenants
+                            .first()
+                            .copied()
+                            .unwrap_or_else(DataTenantId::new_v7),
+                        None,
+                    )
+                    .map_err(|e| HarnessError::Internal(format!("WAL init: {e}")))?,
+                );
+                Ok(ScribeImpl::new_with_deps(
+                    operator.clone(),
+                    wal,
+                    node_id_str,
+                    1 + i as i64,
+                ))
+            })
+            .collect::<Result<Vec<_>, HarnessError>>()?;
 
         Ok(Self {
             pods,
             operator,
-            pg_pool,
+            pg,
             schema: cfg.schema,
+            tenants: cfg.tenants,
         })
     }
 
@@ -135,9 +173,19 @@ impl MultiScribeHarness {
         &self.operator
     }
 
-    /// Shared PG pool.
-    pub fn pg_pool(&self) -> &PgPool {
-        &self.pg_pool
+    /// Shared ValaPostgres handle.
+    pub fn pg(&self) -> &Arc<ValaPostgres> {
+        &self.pg
+    }
+
+    /// Acquire a tenant-scoped connection.
+    ///
+    /// # Errors
+    /// Returns an error if the connection cannot be acquired.
+    pub async fn tenant_conn(&self, tenant: DataTenantId) -> Result<TenantConn<'_>, HarnessError> {
+        TenantConn::acquire(self.pg.pool(), tenant)
+            .await
+            .map_err(|e| HarnessError::Internal(format!("tenant_conn: {e}")))
     }
 
     /// Force-seal every pod and poll `ScribeInspect` until `wal_pending_bytes == 0`
@@ -150,11 +198,17 @@ impl MultiScribeHarness {
 
         let start = std::time::Instant::now();
 
-        // Force-seal all pods
-        for pod in &self.pods {
-            pod.force_seal()
+        // Force-seal all pods per tenant
+        for tenant in &self.tenants {
+            let mut conn = self.tenant_conn(*tenant).await?;
+            for pod in &self.pods {
+                pod.force_seal(&mut conn)
+                    .await
+                    .map_err(|e| HarnessError::Internal(format!("force_seal: {e}")))?;
+            }
+            conn.commit()
                 .await
-                .map_err(|e| HarnessError::Internal(format!("force_seal: {e}")))?;
+                .map_err(|e| HarnessError::Internal(format!("commit: {e}")))?;
         }
 
         // Poll until drained
@@ -166,7 +220,7 @@ impl MultiScribeHarness {
                     all_drained = false;
                 }
 
-                // TODO(PR#N): Once real memtables exist, collect active keys from all pods
+                // TODO: Once real memtables exist, collect active keys from all pods
                 // and verify memtable_row_count(&key) == 0 for each key.
             }
 
@@ -194,9 +248,9 @@ impl MultiScribeHarness {
         let drop_schema_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema);
         let drop_schema_static: &'static str = Box::leak(drop_schema_sql.into_boxed_str());
         sqlx::raw_sql(AssertSqlSafe(drop_schema_static))
-            .execute(&self.pg_pool)
+            .execute(self.pg.pool())
             .await?;
-        self.pg_pool.close().await;
+        self.pg.pool().close().await;
         Ok(())
     }
 }

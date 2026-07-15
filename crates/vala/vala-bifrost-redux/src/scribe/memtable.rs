@@ -17,7 +17,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
-/// Seal predicate thresholds (hardcoded constants for PR#4).
+/// Seal predicate thresholds (hardcoded constants for ).
 const SEAL_ROWS_THRESHOLD: usize = 50_000;
 const SEAL_BYTES_THRESHOLD: usize = 128 * 1024 * 1024; // 128 MiB
 const SEAL_INTERVAL_SECS: u64 = 1;

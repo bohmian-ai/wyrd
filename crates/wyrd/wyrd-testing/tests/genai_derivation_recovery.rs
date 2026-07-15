@@ -8,7 +8,7 @@
 //! - The source span commits successfully with no worker present.
 //! - The derivation worker (started after) recovers on the first fallback tick.
 //! - A second fallback tick (replay) produces no duplicate target rows — the
-//!   derived_batch_id dedup at the coordinator level is idempotent.
+//! derived_batch_id dedup at the coordinator level is idempotent.
 
 mod pg_tests {
     use axum::body::{Body, to_bytes};
@@ -181,7 +181,7 @@ mod pg_tests {
         );
 
         // ── Replay: run the same tick again; watermark advanced so the
-        //    worker must NOT produce duplicate rows. ──────────────────────────
+        // worker must NOT produce duplicate rows. ──────────────────────────
         vala_bifrost::serving::derivations::run_genai_derivation_tick(
             srv.state().bifrost.clone(),
             srv.app_pool(),

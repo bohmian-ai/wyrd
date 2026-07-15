@@ -1,4 +1,4 @@
-//! Scribe implementation — WAL append, fsync, replay, and memtable (PR#3/PR#4).
+//! Scribe implementation — WAL append, fsync, replay, and memtable (/).
 
 pub mod audit_envelope;
 pub mod file_list_writer;
@@ -12,8 +12,12 @@ pub mod seal_key;
 pub mod stream_identity;
 pub mod wal;
 
+use arrow::array::Array;
+use arrow::compute::take;
 use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use vala_sql::TenantConn;
@@ -25,9 +29,9 @@ use crate::contracts::{AppendAck, Scribe, ScribeAppend, ScribeError};
 use crate::inspect::{MemtableKey, ScribeInspect};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::seal_key::{EventDay, SealKey, TableRef};
-use crate::scribe::wal::{ScribeAppendMeta, WalLsn};
+use crate::scribe::wal::ScribeAppendMeta;
 
-/// Scribe implementation with WAL append, fsync, replay, memtable, and seal (PR#3-PR#6).
+/// Scribe implementation with WAL append, fsync, replay, memtable, and seal ().
 ///
 /// `append` splits the batch by event day, writes paired (audit, data) WAL records,
 /// fsyncs, and forwards to the memtable. Seal predicate triggers freeze at first-of:
@@ -39,6 +43,8 @@ pub struct ScribeImpl {
     memtable: Arc<Memtable>,
     /// Opendal operator for object store (shared across seal drivers).
     operator: Arc<opendal::Operator>,
+    /// WAL writer for durable append fsync.
+    wal: Arc<wal::WalWriter>,
     /// Pod identity (node_id, writer_epoch).
     node_id: String,
     writer_epoch: i64,
@@ -46,42 +52,67 @@ pub struct ScribeImpl {
 
 impl ScribeImpl {
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
-    #[must_use]
     pub fn new_with_deps(
         operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
         node_id: String,
         writer_epoch: i64,
     ) -> Self {
         Self {
             memtable: Arc::new(Memtable::new()),
             operator,
+            wal,
             node_id,
             writer_epoch,
         }
     }
 
-    /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity).
+    /// Construct a stub `ScribeImpl` for tests (memory backend, stub node identity, temp WAL).
+    ///
+    /// # Panics
+    /// Panics if temp WAL directory or operator init fails.
     #[must_use]
+    #[cfg(test)]
     pub fn new() -> Self {
         let operator = Arc::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("memory backend init")
                 .finish(),
         );
+
+        let temp_dir = tempfile::tempdir().expect("temp WAL dir");
+        let node_id_bytes = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000")
+            .expect("valid UUID")
+            .as_bytes()
+            .to_owned();
+        let wal = Arc::new(
+            wal::WalWriter::new(
+                temp_dir.path(),
+                node_id_bytes,
+                1,
+                wyrd_spec::ids::DataTenantId::new_v7(),
+                None,
+            )
+            .expect("test WAL init"),
+        );
+
+        // Leak temp_dir to keep WAL files for the test lifetime
+        std::mem::forget(temp_dir);
+
         Self {
             memtable: Arc::new(Memtable::new()),
             operator,
-            node_id: "test-node".to_string(),
+            wal,
+            node_id: "00000000-0000-0000-0000-000000000000".to_string(),
             writer_epoch: 1,
         }
     }
 
-    /// Execute the seal state machine for a specific seal-key on the caller's
-    /// tenant-scoped transaction.
+    /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
+    /// specific seal-key on the caller's tenant-scoped transaction.
     ///
-    /// The caller opens and owns the `TenantConn`; this method drives the seal
-    /// state machine against it and returns without committing. The caller
-    /// commits (or rolls back) the transaction.
+    /// Returns a `SealCommit` handle that the caller must pass to `seal_one_post_commit`
+    /// after committing the transaction. The caller owns commit/rollback.
     ///
     /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
     /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
@@ -92,23 +123,101 @@ impl ScribeImpl {
         &self,
         seal_key: &SealKey,
         conn: &mut TenantConn<'_>,
-    ) -> Result<(), ScribeError> {
+    ) -> Result<seal::SealCommit, ScribeError> {
+        // Cross-tenant guard: seal_key.tenant must match conn.data_tenant_id()
+        let conn_tenant = conn.data_tenant_id();
+        if seal_key.tenant != conn_tenant {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "tenant mismatch: seal_key.tenant={} vs conn.data_tenant_id={}",
+                    seal_key.tenant, conn_tenant
+                ),
+            });
+        }
+
         use crate::scribe::seal::SealDriver;
 
         let driver = SealDriver::new(self.operator.clone());
         driver
-            .seal(
+            .pre_commit(
                 &self.memtable,
                 seal_key,
                 conn,
                 &self.node_id,
                 self.writer_epoch,
             )
-            .await?;
-        Ok(())
+            .await
+    }
+
+    /// Complete seal post-commit stages (manifest + WAL retirement) after the
+    /// caller commits the seal transaction.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] if any post-commit stage fails.
+    pub async fn seal_one_post_commit(&self, handle: seal::SealCommit) -> Result<(), ScribeError> {
+        use crate::scribe::seal::SealDriver;
+        let driver = SealDriver::new(self.operator.clone());
+        driver.post_commit(handle).await
     }
 }
 
+/// Split a RecordBatch by wyrd_event_time day, returning (EventDay, RecordBatch) pairs.
+fn split_batch_by_event_day(
+    batch: &RecordBatch,
+) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
+    let ts_col = batch
+        .column_by_name("wyrd_event_time")
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "missing wyrd_event_time column".into(),
+        })?;
+
+    let ts_array = ts_col
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "wyrd_event_time must be TimestampMicrosecond".into(),
+        })?;
+
+    // Group row indices by UTC day
+    let mut day_indices: HashMap<chrono::NaiveDate, Vec<u32>> = HashMap::new();
+    for i in 0..ts_array.len() {
+        if ts_array.is_null(i) {
+            continue;
+        }
+        let micros = ts_array.value(i);
+        let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+            ScribeError::Internal {
+                detail: format!("invalid timestamp micros: {micros}"),
+            }
+        })?;
+        let day = dt.date_naive();
+        day_indices.entry(day).or_default().push(i as u32);
+    }
+
+    // Build one RecordBatch per day using arrow::compute::take
+    let mut result = Vec::with_capacity(day_indices.len());
+    for (day, indices) in day_indices {
+        let indices_array = arrow::array::UInt32Array::from(indices);
+        let columns: Result<Vec<_>, _> = batch
+            .columns()
+            .iter()
+            .map(|col| {
+                take(col.as_ref(), &indices_array, None).map_err(|e| ScribeError::Internal {
+                    detail: format!("arrow take failed: {e}"),
+                })
+            })
+            .collect();
+        let day_batch =
+            RecordBatch::try_new(batch.schema(), columns?).map_err(|e| ScribeError::Internal {
+                detail: format!("RecordBatch::try_new failed: {e}"),
+            })?;
+        result.push((EventDay::new(day), day_batch));
+    }
+
+    Ok(result)
+}
+
+#[cfg(test)]
 impl Default for ScribeImpl {
     fn default() -> Self {
         Self::new()
@@ -143,46 +252,81 @@ impl Scribe for ScribeImpl {
                 detail: format!("Arrow batch decode error: {e}"),
             })?;
 
-        // 3. Extract event day from first row's wyrd_event_time
-        // For PR#4, use placeholder single-day assertion (real multi-day split in PR#5)
-        let event_day = EventDay::from_timestamp(chrono::Utc::now());
+        // 3. Extract event day from wyrd_event_time column — split cross-day batches
+        let event_days = split_batch_by_event_day(&batch)?;
 
-        // 4. Build SealKey
-        let seal_key =
-            crate::scribe::seal_key::SealKey::new(req.principal.tenant_id, table_ref, event_day);
+        // 4-10: Process each day part separately
+        for (event_day, day_batch) in event_days {
+            // Build SealKey for this day part
+            let seal_key = crate::scribe::seal_key::SealKey::new(
+                req.principal.tenant_id,
+                table_ref.clone(),
+                event_day,
+            );
 
-        // 5. Build AuditEvent from principal
-        let audit_event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: "bifrost.append".to_string(),
-            resource: req.table_fqn.clone(),
-            card_ref: req.principal.card_ref().cloned(),
-            principal_id: req.principal.id,
-            principal_kind: req.principal.kind.tag(),
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:append".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: format!("{} rows", batch.num_rows()),
-            detail: None,
-        };
+            // Build AuditEvent from principal for this day part
+            let audit_event = AuditEvent {
+                request_id: RequestId::now_v7(),
+                trace_id: None,
+                operation: "bifrost.append".to_string(),
+                resource: req.table_fqn.clone(),
+                card_ref: req.principal.card_ref().cloned(),
+                principal_id: req.principal.id,
+                principal_kind: req.principal.kind.tag(),
+                auth_method: AuthMethod::Jwt,
+                permission: "bifrost:append".to_string(),
+                decision: AuditDecision::Allow,
+                result: AuditResult::Success,
+                payload_summary: format!("{} rows", day_batch.num_rows()),
+                detail: None,
+            };
 
-        // 6. Build ScribeAppendMeta with placeholder LSNs (real WAL integration in PR#5)
-        let meta = ScribeAppendMeta {
-            batch_id,
-            rows_accepted: batch.num_rows(),
-            wal_lsn_min: WalLsn::new(0),
-            wal_lsn_max: WalLsn::new(0),
-            seal_key: seal_key.as_path_components(),
-        };
+            // Serialize AuditEvent to JSON for WAL
+            let audit_payload =
+                serde_json::to_vec(&audit_event).map_err(|e| ScribeError::Internal {
+                    detail: format!("failed to serialize AuditEvent: {e}"),
+                })?;
 
-        // 7. Insert into memtable
-        self.memtable.insert(&seal_key, audit_event, meta, batch)?;
+            // Encode day_batch to Arrow IPC for WAL
+            use arrow::ipc::writer::StreamWriter;
+            let mut data_payload = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut data_payload, &day_batch.schema())
+                    .map_err(|e| ScribeError::Internal {
+                        detail: format!("Arrow IPC writer init: {e}"),
+                    })?;
+                writer
+                    .write(&day_batch)
+                    .map_err(|e| ScribeError::Internal {
+                        detail: format!("Arrow IPC write: {e}"),
+                    })?;
+                writer.finish().map_err(|e| ScribeError::Internal {
+                    detail: format!("Arrow IPC finish: {e}"),
+                })?;
+            }
 
-        // 8. Check seal predicate
-        if self.memtable.should_seal(&seal_key)? {
-            tracing::info!(seal_key = %seal_key, "seal predicate triggered (will freeze in PR#6)");
+            // WAL append + fsync (paired audit + data records)
+            let wal_lsn = self
+                .wal
+                .append_and_fsync(batch_id, audit_payload, data_payload)?;
+
+            // Build ScribeAppendMeta with real LSNs
+            let meta = ScribeAppendMeta {
+                batch_id,
+                rows_accepted: day_batch.num_rows(),
+                wal_lsn_min: wal_lsn,
+                wal_lsn_max: wal_lsn,
+                seal_key: seal_key.as_path_components(),
+            };
+
+            // Insert into memtable
+            self.memtable
+                .insert(&seal_key, audit_event, meta, day_batch)?;
+
+            // Check seal predicate
+            if self.memtable.should_seal(&seal_key)? {
+                tracing::info!(seal_key = %seal_key, "seal predicate triggered");
+            }
         }
 
         Ok(AppendAck {
@@ -196,7 +340,7 @@ impl Scribe for ScribeImpl {
 #[async_trait]
 impl ScribeInspect for ScribeImpl {
     fn wal_pending_bytes(&self) -> u64 {
-        0 // TODO PR#7+: Real WAL pending bytes
+        0 // TODO : Real WAL pending bytes
     }
 
     fn memtable_row_count(&self, key: &MemtableKey) -> usize {
@@ -204,20 +348,30 @@ impl ScribeInspect for ScribeImpl {
     }
 
     fn sealed_parquet_paths(&self) -> Vec<String> {
-        // TODO PR#7+: Query vala.file_list for sealed paths for this node
+        // TODO : Query vala.file_list for sealed paths for this node
         vec![]
     }
 
     async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError> {
         // A `TenantConn` is bound to exactly one tenant. Seal only the
         // memtable buckets whose seal-key belongs to that tenant; the harness
-        // iterates tenants and opens a fresh `TenantConn` per tenant. The
-        // caller owns commit/rollback.
+        // iterates tenants and opens a fresh `TenantConn` per tenant.
+        //
+        // Pre-commit stages only — caller owns commit and post_commit.
+        // This simplified implementation runs post_commit immediately after,
+        // but real production usage would separate them.
         let tenant = conn.data_tenant_id();
         let keys = self.memtable.active_seal_keys_for_tenant(tenant)?;
 
+        let mut handles = Vec::with_capacity(keys.len());
         for key in keys {
-            self.seal_one(&key, conn).await?;
+            let handle = self.seal_one(&key, conn).await?;
+            handles.push(handle);
+        }
+
+        // Post-commit stages (simplified: run immediately without waiting for commit)
+        for handle in handles {
+            self.seal_one_post_commit(handle).await?;
         }
 
         Ok(())

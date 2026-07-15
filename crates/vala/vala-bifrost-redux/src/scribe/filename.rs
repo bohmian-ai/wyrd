@@ -1,4 +1,4 @@
-//! Seal filename generation — PR#5.
+//! Seal filename generation.
 //!
 //! `seal_filename` produces unique Parquet filenames in the form `{pod_id}-{ulid}.parquet`
 //! so multi-pod seals into the same partition never collide.

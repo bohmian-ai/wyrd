@@ -14,6 +14,15 @@ use crate::scribe::memtable::{FrozenMemtable, Memtable};
 use crate::scribe::parquet_writer::{ParquetEncoded, write_frozen_to_parquet};
 use crate::scribe::seal_key::SealKey;
 
+/// Handle returned by `pre_commit` to be passed to `post_commit` after the
+/// caller commits the seal transaction.
+#[derive(Debug, Clone)]
+pub struct SealCommit {
+    pub seal_key: SealKey,
+    pub wal_lsn_max: u64,
+    pub parquet_path: String,
+}
+
 /// Seal state machine for one seal-key.
 ///
 /// States: `Freeze` → `WriteParquet` → `PutObject` → `AtomicPgTx` → `ManifestUpdate` → `RetireWal`
@@ -29,26 +38,34 @@ impl SealDriver {
         Self { operator }
     }
 
-    /// Execute the seal state machine for one seal-key.
+    /// Execute seal stages 1-4 (Freeze → Parquet → PUT → PG tx) and return a
+    /// commit handle. The caller must commit the transaction, then call
+    /// `post_commit` with the handle to complete stages 5-6 (manifest + WAL
+    /// retirement).
     ///
     /// # Errors
-    /// Returns [`ScribeError`] if any seal stage fails.
+    /// Returns [`ScribeError`] if any pre-commit stage fails.
     #[tracing::instrument(skip(self, memtable, conn), fields(seal_key = %seal_key))]
-    pub async fn seal(
+    pub async fn pre_commit(
         &self,
         memtable: &Memtable,
         seal_key: &SealKey,
         conn: &mut TenantConn<'_>,
         node_id: &str,
         writer_epoch: i64,
-    ) -> Result<(), ScribeError> {
+    ) -> Result<SealCommit, ScribeError> {
         // 1. Freeze
         info!("seal stage: Freeze");
         let frozen = memtable.freeze(seal_key)?;
 
-        // 2. WriteParquet
+        // 2. WriteParquet (spawn_blocking to avoid blocking reactor)
         info!("seal stage: WriteParquet");
-        let encoded = write_frozen_to_parquet(&frozen)?;
+        let frozen_clone = frozen.clone();
+        let encoded = tokio::task::spawn_blocking(move || write_frozen_to_parquet(&frozen_clone))
+            .await
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("Parquet encode task panic: {e}"),
+            })??;
 
         // 3. PutObject
         info!("seal stage: PutObject");
@@ -56,23 +73,47 @@ impl SealDriver {
 
         // 4. AtomicPgTx
         info!("seal stage: AtomicPgTx");
-        file_list_writer::insert_and_audit(
-            conn,
+        let row = file_list_writer::build_insert(
             &frozen,
             &encoded,
-            &parquet_path,
             node_id,
             writer_epoch,
-        )
-        .await?;
+            &parquet_path,
+        )?;
+        file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
+            .await
+            .map_err(ScribeError::from)?;
 
+        // Extract max WAL LSN from append metas
+        let wal_lsn_max = encoded
+            .append_metas
+            .iter()
+            .map(|m| m.wal_lsn_max.as_u64())
+            .max()
+            .unwrap_or(0);
+
+        // Return handle for post-commit stages
+        Ok(SealCommit {
+            seal_key: seal_key.clone(),
+            wal_lsn_max,
+            parquet_path,
+        })
+    }
+
+    /// Complete seal stages 5-6 (manifest + WAL retirement) after the caller
+    /// commits the seal transaction.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] if any post-commit stage fails.
+    #[tracing::instrument(skip(self), fields(seal_key = %handle.seal_key))]
+    pub async fn post_commit(&self, handle: SealCommit) -> Result<(), ScribeError> {
         // 5. ManifestUpdate
-        info!("seal stage: ManifestUpdate (stub for PR#6)");
-        // TODO PR#7+: Update manifest sealed_lsn[K] and retire WAL bytes
+        info!("seal stage: ManifestUpdate (stub)");
+        // TODO: Update manifest sealed_lsn[K] and retire WAL bytes
 
         // 6. RetireWal
-        info!("seal stage: RetireWal (stub for PR#6)");
-        // TODO PR#7+: Retire WAL bytes at or below the new watermark
+        info!("seal stage: RetireWal (stub)");
+        // TODO: Retire WAL bytes at or below the new watermark
 
         Ok(())
     }
@@ -107,40 +148,62 @@ impl SealDriver {
 
         loop {
             attempt += 1;
-            match self.operator.write(&path, encoded.bytes.clone()).await {
-                Ok(_) => {
+
+            // Wrap the write in a 30-second timeout
+            let write_result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(30),
+                self.operator.write(&path, encoded.bytes.clone()),
+            )
+            .await;
+
+            match write_result {
+                Ok(Ok(_)) => {
                     info!(path = %path, bytes = encoded.bytes.len(), "Parquet PUT succeeded");
                     return Ok(path);
                 }
-                Err(e) => {
-                    let is_transient =
-                        matches!(e.kind(), ErrorKind::RateLimited | ErrorKind::Unexpected)
-                            && e.is_temporary();
+                Ok(Err(e)) => {
+                    // Classify error for retry
+                    let is_fail_fast = matches!(
+                        e.kind(),
+                        ErrorKind::NotFound
+                            | ErrorKind::PermissionDenied
+                            | ErrorKind::ConditionNotMatch
+                            | ErrorKind::ConfigInvalid
+                    );
 
-                    let is_retriable = is_transient && attempt < max_attempts;
+                    let is_retriable = matches!(e.kind(), ErrorKind::RateLimited)
+                        || (matches!(e.kind(), ErrorKind::Unexpected) && e.is_temporary());
 
-                    if !is_retriable {
-                        // Fail-fast on non-transient errors or max attempts reached
-                        return Err(ScribeError::Internal {
-                            detail: format!("object store PUT failed: {e}"),
-                        });
+                    if is_fail_fast || (!is_retriable) || attempt >= max_attempts {
+                        return Err(ScribeError::ObjectStorePutFailed(e));
                     }
 
-                    // Exponential backoff with jitter (+0..10% of the base delay).
-                    // Integer math avoids float→int casts entirely — the jitter
-                    // is uniform over `0..=(delay_ms / 10)`.
+                    // Exponential backoff with jitter
                     let delay_ms = (base_delay_ms * 2_u64.pow(attempt - 1)).min(max_delay_ms);
                     let jitter = rand::random::<u64>() % (delay_ms / 10 + 1);
                     let actual_delay_ms = delay_ms + jitter;
 
                     warn!(
-                        attempt = attempt,
-                        delay_ms = actual_delay_ms,
-                        error = %e,
-                        "transient object store error, retrying"
+                    attempt = attempt,
+                    delay_ms = actual_delay_ms,
+                    error = %e,
+                    "transient object store error, retrying"
                     );
 
                     tokio::time::sleep(tokio::time::Duration::from_millis(actual_delay_ms)).await;
+                }
+                Err(_) => {
+                    // Timeout - treat as transient
+                    if attempt >= max_attempts {
+                        return Err(ScribeError::ObjectStorePutFailed(opendal::Error::new(
+                            ErrorKind::Unexpected,
+                            "write timeout after 30s",
+                        )));
+                    }
+                    warn!(attempt = attempt, "object store write timeout, retrying");
+                    let delay_ms = (base_delay_ms * 2_u64.pow(attempt - 1)).min(max_delay_ms);
+                    let jitter = rand::random::<u64>() % (delay_ms / 10 + 1);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms + jitter)).await;
                 }
             }
         }

@@ -11,9 +11,32 @@ use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
+
+fn stub_scribe() -> ScribeImpl {
+    let operator = Arc::new(
+        opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory backend")
+            .finish(),
+    );
+    let temp = tempfile::tempdir().expect("temp WAL dir");
+    let node_id_bytes = *uuid::Uuid::nil().as_bytes();
+    let wal = Arc::new(
+        WalWriter::new(
+            temp.path(),
+            node_id_bytes,
+            1,
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .expect("WAL writer"),
+    );
+    std::mem::forget(temp);
+    ScribeImpl::new_with_deps(operator, wal, uuid::Uuid::nil().to_string(), 1)
+}
 
 fn make_batch(row_count: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -27,9 +50,11 @@ fn make_batch(row_count: usize) -> RecordBatch {
 
     let base_time = chrono::Utc::now().timestamp_micros();
     let timestamps: Vec<i64> = (0..row_count)
-        .map(|i| base_time + (i as i64 * 1000))
+        .map(|i| base_time + (i64::try_from(i).expect("bounded row index") * 1000))
         .collect();
-    let values: Vec<u64> = (0..row_count).map(|i| i as u64).collect();
+    let values: Vec<u64> = (0..row_count)
+        .map(|i| u64::try_from(i).expect("bounded row index"))
+        .collect();
 
     RecordBatch::try_new(
         schema.clone(),
@@ -60,7 +85,7 @@ async fn main() {
     // - Per-tenant latency histograms
     // - Fairness metric (e.g., max(p95_latency) / min(p95_latency) < 2.0)
 
-    let scribe = Arc::new(ScribeImpl::new());
+    let scribe = Arc::new(stub_scribe());
     let tenants: Vec<DataTenantId> = (0..10).map(|_| DataTenantId::new_v7()).collect();
 
     let batch = make_batch(1000);
@@ -91,7 +116,7 @@ async fn main() {
             let _ack = scribe.append(req).await.expect("append");
             let latency = start.elapsed();
 
-            println!("Tenant {:?} append latency: {:?}", tenant, latency);
+            println!("Tenant {tenant:?} append latency: {latency:?}");
         });
     }
 

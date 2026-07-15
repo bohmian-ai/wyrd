@@ -2,10 +2,10 @@ mod pg_tests {
     //! Backpressure and error-code tests for Scribe.
     //!
     //! Tests verify:
-    //! - WAL disk full returns ScribeError::WalDiskFull
-    //! - Memtable full + blocked seal returns ScribeError::IngestBusy
+    //! - WAL disk full returns `ScribeError::WalDiskFull`
+    //! - Memtable full + blocked seal returns `ScribeError::IngestBusy`
     //!
-    //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
+    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
     #[tokio::test]
     #[ignore = "requires WAL disk-full fault injection"]

@@ -8,7 +8,37 @@ order: 5
 
 # Writing Data
 
-Observations flow into Bifrost through `vala-sdk`'s `ValaHandle`. The SDK buffers records in memory, builds Arrow batches at a configurable flush boundary, and streams them to `BifrostIngestService` over gRPC.
+Observations flow into Bifrost through `vala-sdk`'s `ValaHandle`. The SDK buffers records in memory, builds Arrow batches at a configurable flush boundary, and streams them through the Gate → Scribe write path.
+
+## Write path
+
+<WyrdSequenceDiagram dense
+  title="Client to sealed Parquet"
+  participants={['Client SDK', 'Gate', 'Scribe', 'Object store', 'Postgres']}
+  messages={[
+    { from: 'Client SDK', to: 'Gate', label: 'batch (HTTP/gRPC)' },
+    { from: 'Gate', to: 'Gate', label: 'auth · fingerprint check · stamp' },
+    { from: 'Gate', to: 'Scribe', label: 'route' },
+    { from: 'Scribe', to: 'Scribe', label: 'WAL append + fsync' },
+    { from: 'Scribe', to: 'Gate', label: 'ack (durable)', dashed: true },
+    { from: 'Gate', to: 'Client SDK', label: 'ack ~1-5 ms', dashed: true },
+    { from: 'Scribe', to: 'Scribe', label: 'memtable · seal trigger' },
+    { from: 'Scribe', to: 'Object store', label: 'PUT sealed Parquet' },
+    { from: 'Scribe', to: 'Postgres', label: 'INSERT vala.file_list + audit (atomic)' },
+    { from: 'Scribe', to: 'Scribe', label: 'truncate WAL past sealed_lsn' }
+  ]}
+/>
+
+1. **Client SDK** (`vala-sdk`) batches observations in memory.
+2. **Gate** authenticates the request, resolves `DataTenantId` + `TableRef` from Bifrost catalog, validates schema fingerprint, stamps system columns, dispatches to any Scribe.
+3. **Scribe** appends to local WAL (Arrow IPC format, fsync) → ack ~1-5ms (fsync-bound).
+4. **Scribe** accumulates rows in memtable keyed by seal-key: `(DataTenantId, TableRef, EventDay)`.
+5. **Seal trigger:** 50k rows | 1s | 128 MiB | 5s inactivity → seal to Parquet, register in `vala.file_list`, write audit rows.
+6. **(Async) Forge** bin-packs small Parquet files into large ones, commits Iceberg snapshot.
+
+**Durability guarantee:** Ack means durable in WAL. Visible to queries within seal latency (~1-5s typical).
+
+**Backpressure:** New appends return `429_INGEST_BUSY` when Scribe seal queue is full (seal stalled on object storage or Postgres).
 
 ## vala-sdk producer
 
@@ -41,29 +71,32 @@ Records accumulate in a bounded in-memory ring. The flush worker drains the ring
 - The batch reaches the configured row count limit, OR
 - The flush interval elapses (default: 1 second).
 
-If the ring is full, new observations are dropped with a counter increment — **fire-and-forget semantics**. Use `vala.observe.flush()` before a process exit to drain the buffer.
+If the ring is full, new observations are dropped with a counter increment (fire-and-forget semantics). Use `vala.observe.flush()` before a process exit to drain the buffer.
 
 ## Payload governance and redaction
 
-Sensitive fields (`input_messages`, `output_messages`, `body`, `attributes`, `messages`) are always written to the physical Iceberg table — they are not filtered at write time. Access control is enforced at read time by the payload permission gate.
+Sensitive fields (`input_messages`, `output_messages`, `body`, `attributes`, `messages`) are always written to the physical Parquet files; they are not filtered at write time. Access control is enforced at read time by Oracle's payload permission gate.
 
-If a tenant has redaction enabled (server-side policy), the ingest service zeroes the sensitive columns before the Iceberg commit. The redaction is logged in the audit row. This is transparent to the SDK.
+If a tenant has redaction enabled (server-side policy), Scribe zeroes the sensitive columns before seal to Parquet. The redaction is logged in the audit row. This is transparent to the SDK.
 
 ## Tenant and correlation stamping
 
-The ingest service stamps:
+Gate stamps:
 
-- `data_tenant_id` — from the authenticated principal's tenant claim.
-- `wyrd_event_time` — first observation timestamp in the batch (or `wyrd_ingested_at` if absent).
-- `wyrd_ingested_at` — server wall clock at flush time.
-- `wyrd_batch_id` — UUIDv7 unique per gRPC stream.
-- `run_id`, `card_uid`, `principal_id` — from the `ObservationContext` if present, per the table's `CorrelationPolicy`.
+- `data_tenant_id`: from the authenticated principal's tenant claim.
+- `wyrd_event_time`: first observation timestamp in the batch (or `wyrd_ingested_at` if absent).
+- `wyrd_batch_id`: UUIDv7 unique per batch.
+- `run_id`, `card_uid`, `principal_id`: from the `ObservationContext` if present, per the table's `CorrelationPolicy`.
+
+Scribe stamps:
+
+- `wyrd_ingested_at`: wall clock at seal time.
 
 Callers cannot override system columns. Any batch that contains rows with system column values set is rejected with `400 WYRD_VALA_400_SYSTEM_COLUMN_VIOLATION`.
 
 ## Schema validation
 
-The batch is validated against the stored `SchemaFingerprint` before any Iceberg commit. A fingerprint mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH`. The fingerprint is computed over the canonical Arrow schema (field names, types, nullability, sorted metadata keys).
+Gate validates the batch against the stored `SchemaFingerprint` before Scribe accept. A fingerprint mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH`. The fingerprint is computed over the canonical Arrow schema (field names, types, nullability, sorted metadata keys).
 
 ## Direct gRPC (Rust)
 
@@ -75,4 +108,4 @@ let client = BifrostIngestClient::connect("https://your-wyrd-server")?;
 client.insert_batch(vec![batch]).await?;
 ```
 
-The `insert_batch` call is idempotent at the batch level — a replayed `wyrd_batch_id` is detected and the prior row count is returned without a double-write.
+The `insert_batch` call is idempotent at the batch level. A replayed `wyrd_batch_id` is detected and the prior row count is returned without a double-write.

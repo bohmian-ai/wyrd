@@ -12,10 +12,10 @@
 //!
 //! ## WAL Format Version History
 //!
-//! - **Version 2** (PR#4): Added `batch_id` field to record header for deduplication.
-//!   Breaking change from version 1 — segments written with version 1 cannot be
-//!   replayed by version 2 readers. Delete WAL directory and restart if upgrading.
-//! - **Version 1** (PR#3): Initial implementation with paired audit/data records.
+//! - **Version 2** (): Added `batch_id` field to record header for deduplication.
+//! Breaking change from version 1 — segments written with version 1 cannot be
+//! replayed by version 2 readers. Delete WAL directory and restart if upgrading.
+//! - **Version 1** (): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -171,11 +171,11 @@ impl SegmentHeader {
             });
         }
 
-        // Reject version 1 segments (incompatible with PR#4's batch_id field)
+        // Reject version 1 segments (incompatible with 's batch_id field)
         if version == 1 {
             return Err(ScribeError::Internal {
-                detail: "WAL format version 1 is incompatible with PR#4 (batch_id field added). Delete WAL directory and restart.".to_string(),
-            });
+ detail: "WAL format version 1 is incompatible with (batch_id field added). Delete WAL directory and restart.".to_string(),
+ });
         }
 
         if version != WAL_VERSION {
@@ -455,10 +455,11 @@ impl WalSegment {
     /// Append a record to the segment and fsync.
     ///
     /// # Panics
-    /// May panic if the segment file lock is poisoned.
     pub fn append_and_fsync(&self, record: &WalRecord) -> Result<(), ScribeError> {
         let encoded = record.encode();
-        let mut file = self.file.lock().expect("WAL segment file lock poisoned");
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (append_and_fsync)".to_string(),
+        })?;
 
         file.write_all(&encoded).map_err(|e| {
             if e.kind() == io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
@@ -478,11 +479,10 @@ impl WalSegment {
     }
 
     /// Read all records from the segment.
-    ///
-    /// # Panics
-    /// May panic if the segment file lock is poisoned.
     pub fn read_records(&self) -> Result<Vec<WalRecord>, ScribeError> {
-        let mut file = self.file.lock().expect("WAL segment file lock poisoned");
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (read_records)".to_string(),
+        })?;
         file.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
             .map_err(|e| ScribeError::Internal {
                 detail: format!("WAL segment seek failed: {e}"),
@@ -574,7 +574,7 @@ impl WalWriter {
         // Check if we need to roll to a new segment
         let current_size = self.current_segment_size.load(Ordering::SeqCst);
         if current_size + total_size > self.max_segment_size {
-            self.roll_segment();
+            self.roll_segment()?;
         }
 
         let segment = self.ensure_segment()?;
@@ -594,18 +594,25 @@ impl WalWriter {
 
     /// Roll to a new segment.
     ///
-    /// # Panics
-    /// May panic if the segment lock is poisoned.
-    fn roll_segment(&self) {
-        let mut current = self.current_segment.lock().expect("segment lock poisoned");
+    fn roll_segment(&self) -> Result<(), ScribeError> {
+        let mut current = self
+            .current_segment
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "segment lock poisoned (roll_segment)".to_string(),
+            })?;
         *current = None;
         self.current_segment_size.store(0, Ordering::SeqCst);
+        Ok(())
     }
 
-    /// # Panics
-    /// May panic if the segment lock is poisoned.
     fn ensure_segment(&self) -> Result<Arc<WalSegment>, ScribeError> {
-        let mut current = self.current_segment.lock().expect("segment lock poisoned");
+        let mut current = self
+            .current_segment
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "segment lock poisoned (ensure_segment)".to_string(),
+            })?;
 
         if let Some(ref segment) = *current {
             return Ok(Arc::clone(segment));

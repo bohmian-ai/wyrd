@@ -9,6 +9,25 @@ use wyrd_spec::ids::DataTenantId;
 
 use crate::contracts::ScribeError;
 
+/// Check if a string is a safe identifier for object-store paths.
+///
+/// Allows only `[A-Za-z0-9_-]`, max 63 characters, prevents path traversal
+/// attacks on opendal-fs backends.
+fn is_safe_identifier(s: &str) -> bool {
+    if s.is_empty() || s.len() > 63 {
+        return false;
+    }
+
+    // Reject path traversal patterns
+    if s.contains("..") || s.contains('/') || s.contains('\\') {
+        return false;
+    }
+
+    // Allow only alphanumeric, underscore, hyphen
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 /// Table reference — namespace + name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
@@ -28,14 +47,21 @@ impl TableRef {
     /// Parse a fully-qualified table name into `(namespace, name)`.
     ///
     /// Returns `None` for names that don't have at least one dot separator,
-    /// or if the table name part contains dots.
+    /// if the table name part contains dots, or if either part is unsafe for
+    /// object-store path construction (prevents path traversal on opendal-fs).
     pub fn parse_fqn(fqn: &str) -> Option<Self> {
         let mut parts = fqn.rsplitn(2, '.');
         let name = parts.next()?.to_string();
         let namespace = parts.next()?.to_string();
 
-        // Reject if either part is empty or if the table name contains dots
-        if name.is_empty() || namespace.is_empty() || name.contains('.') {
+        // Reject if either part is empty, if the table name contains dots,
+        // or if either part is not a safe identifier
+        if name.is_empty()
+            || namespace.is_empty()
+            || name.contains('.')
+            || !is_safe_identifier(&namespace)
+            || !is_safe_identifier(&name)
+        {
             return None;
         }
 
@@ -74,10 +100,16 @@ impl EventDay {
         Self(dt.date_naive())
     }
 
-    /// Get the underlying `NaiveDate`.
+    /// Get a reference to the underlying `NaiveDate`.
     #[must_use]
     pub const fn as_date(&self) -> &NaiveDate {
         &self.0
+    }
+
+    /// Get the underlying `NaiveDate` value (for SQL bindings).
+    #[must_use]
+    pub const fn as_naive_date(&self) -> NaiveDate {
+        self.0
     }
 
     /// Format as `YYYY-MM-DD`.
@@ -142,14 +174,14 @@ pub struct DaySlice {
 
 /// Split a batch by `wyrd_event_time` into per-day slices.
 ///
-/// This function is a placeholder for the real Arrow-based implementation in PR#3.
+/// This function is a placeholder for the real Arrow-based implementation in .
 /// The real version will:
 /// - Take an Arrow `RecordBatch` and extract the `wyrd_event_time` column
 /// - Partition rows by `Day(wyrd_event_time)`
 /// - Return one `DaySlice` per day with row indices
 ///
-/// For PR#2 (this PR), we only need the signature and the contract test; the
-/// memtable integration happens in PR#4.
+/// For (this PR), we only need the signature and the contract test; the
+/// memtable integration happens in .
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if:
@@ -160,8 +192,7 @@ pub fn split_batch_by_event_day(
     _tenant: DataTenantId,
     _table: TableRef,
 ) -> Result<Vec<DaySlice>, ScribeError> {
-    // Placeholder implementation for PR#2
-    // Real implementation in PR#3 when Arrow batch handling lands
+    // Placeholder implementation for  // Real implementation in when Arrow batch handling lands
     Ok(Vec::new())
 }
 
@@ -207,11 +238,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "split_batch_by_event_day moved to mod.rs"]
     fn split_batch_by_event_day_partitions_correctly() {
-        // Placeholder test for PR#2 — real implementation in PR#3
-        let tenant = DataTenantId::SYSTEM_OWNER;
-        let table = TableRef::new("vala.bifrost".to_string(), "events".to_string());
-        let slices = split_batch_by_event_day(&[], tenant, table).unwrap();
-        assert_eq!(slices.len(), 0); // Placeholder returns empty
+        // This test is obsolete - split_batch_by_event_day is now implemented
+        // in mod.rs and tested via integration tests in pg_scribe_seal.rs
+        // (pg_scribe_cross_day_batch_produces_two_files).
     }
 }

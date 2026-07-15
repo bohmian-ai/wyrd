@@ -1,8 +1,8 @@
-//! Parquet writer for frozen memtable snapshots — PR#5.
+//! Parquet writer for frozen memtable snapshots — .
 //!
 //! `write_frozen_to_parquet` encodes a `FrozenMemtable` snapshot (a per-seal-key,
-//! per-day slice from PR#4) to Parquet bytes using the copied `bifrost_writer_properties`
-//! (PR#1), with sort order `(data_tenant_id, wyrd_event_time)` and partition day = the
+//! per-day slice from ) to Parquet bytes using the copied `bifrost_writer_properties`
+//! (), with sort order `(data_tenant_id, wyrd_event_time)` and partition day = the
 //! seal-key's `event_day` (never derived from row min/max).
 
 use arrow::compute::SortColumn;
@@ -29,9 +29,9 @@ pub struct ParquetEncoded {
     pub row_group_stats: Vec<RowGroupStats>,
     /// Partition day (from seal-key, not row min/max).
     pub partition_day: EventDay,
-    /// `AuditEvent` list threaded forward for PR#6's seal transaction.
+    /// `AuditEvent` list threaded forward for 's seal transaction.
     pub audit_events: Vec<AuditEvent>,
-    /// `ScribeAppendMeta` list threaded forward for PR#6's `file_list` INSERT.
+    /// `ScribeAppendMeta` list threaded forward for 's `file_list` INSERT.
     pub append_metas: Vec<ScribeAppendMeta>,
 }
 
@@ -49,7 +49,7 @@ pub struct RowGroupStats {
 /// Encode a frozen memtable snapshot to Parquet bytes.
 ///
 /// Returns encoded bytes, row-group stats, `partition_day` (from seal-key), and the paired
-/// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for PR#6's seal
+/// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
 /// transaction).
 ///
 /// # Errors
@@ -81,7 +81,7 @@ pub fn write_frozen_to_parquet(frozen: &FrozenMemtable) -> Result<ParquetEncoded
 
     let bytes = buf.into_inner();
 
-    // 3. Extract row-group stats (for verification only; PR#6 derives file-level min/max)
+    // 3. Extract row-group stats (for verification only; derives file-level min/max)
     let row_group_stats = extract_row_group_stats(&bytes)?;
 
     // 4. Return encoded result with partition_day from seal-key (not row min/max)
@@ -178,9 +178,12 @@ fn extract_row_group_stats(bytes: &[u8]) -> Result<Vec<RowGroupStats>, ScribeErr
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if column stats are missing.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn extract_row_group_time_range(rg: &RowGroupMetaData) -> Result<RowGroupStats, ScribeError> {
-    let row_count = rg.num_rows() as usize;
+    // Parquet row-group `num_rows()` is i64; RowGroupStats.row_count is usize.
+    // A negative row count would be a Parquet-writer invariant violation.
+    let row_count = usize::try_from(rg.num_rows()).map_err(|_| ScribeError::Internal {
+        detail: format!("row group has invalid num_rows: {}", rg.num_rows()),
+    })?;
 
     // Find wyrd_event_time column index (column order matches Arrow schema order)
     let time_col = rg
@@ -296,7 +299,7 @@ mod tests {
         let frozen = build_test_frozen(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
             vec![t3.as_str(), t1.as_str(), t2.as_str(), t1.as_str()], // Shuffled tenant IDs
-            vec![400, 100, 300, 200], // Shuffled timestamps
+            vec![400, 100, 300, 200],                                 // Shuffled timestamps
         );
 
         let encoded = write_frozen_to_parquet(&frozen).unwrap();

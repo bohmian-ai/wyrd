@@ -136,6 +136,13 @@ depends = ["setup:postgres"]
 env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test --locked -p vala-bifrost -- --test-threads=1"
 
+[tasks."test:vala:integration"]
+hide = true
+description = "Run vala-bifrost-redux Postgres+opendal integration tests (scribe seal state machine)"
+depends = ["setup:postgres"]
+env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd" }
+run = "cargo test --locked -p vala-bifrost-redux --tests --features scribe-inspect -- --test-threads=1"
+
 [tasks."test:bifrost:journey"]
 description = """Run the Stage-5 closeout Rust user-journey tests (marked #[ignore] so they
 stay out of the fast lane) against a live Postgres-backed WyrdTestServer. Covers the
@@ -501,6 +508,16 @@ run = "python scripts/check_unwrap_audit.py"
 hide = true
 description = "Self-tests for the unwrap/expect audit script"
 run = "python scripts/tests/test_check_unwrap_audit.py"
+
+[tasks."check:clippy-allow-audit"]
+hide = true
+description = "Audit `#[allow(clippy::...)]` attributes outside tests and examples (requires a `// justification:` comment on the previous line)"
+run = "python scripts/check_clippy_allow.py"
+
+[tasks."check:clippy-allow-audit:self"]
+hide = true
+description = "Self-tests for the clippy-allow audit script"
+run = "python scripts/tests/test_check_clippy_allow.py"
 
 [tasks."check:test-coverage:self"]
 hide = true
@@ -938,6 +955,7 @@ depends = [
   "check",
   "test:unit",
   "test:bifrost",
+  "test:vala:integration",
   "codegen:check",
   "cardkind:check",
   "check:design-sync",
@@ -947,6 +965,8 @@ depends = [
   "check:mocks-scope",
   "check:unwrap-audit",
   "check:audit-script",
+  "check:clippy-allow-audit",
+  "check:clippy-allow-audit:self",
   "check:test-coverage:self",
   "check:storage:drift",
   "check:registry-tx-coupling",

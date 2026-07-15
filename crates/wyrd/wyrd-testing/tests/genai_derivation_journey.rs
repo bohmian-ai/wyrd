@@ -3,12 +3,12 @@
 //!
 //! Source-first lifecycle assertions:
 //! - The source span is committed (visible via catalog scan) before the
-//!   derivation worker runs.
+//! derivation worker runs.
 //! - The derivation worker is the ONLY path that writes target rows — no inline
-//!   derivation occurs in the collector.
+//! derivation occurs in the collector.
 //! - After the worker tick the target row is visible.
 //! - A second export of the SAME span (same derived_batch_id) is a replay and
-//!   produces no duplicate target rows.
+//! produces no duplicate target rows.
 
 mod pg_tests {
     use std::time::{Duration, Instant};
@@ -196,10 +196,10 @@ mod pg_tests {
         }
 
         // ── Replay: a second export with a DIFFERENT span_id produces
-        //    exactly ONE more source batch but the SAME model/provider label.
-        //    After the worker processes it we should have 2 rows total (not 3).
-        //    This confirms the derived_batch_id dedup works at the coordinator
-        //    level and we never lose rows across batches. ─────────────────────
+        // exactly ONE more source batch but the SAME model/provider label.
+        // After the worker processes it we should have 2 rows total (not 3).
+        // This confirms the derived_batch_id dedup works at the coordinator
+        // level and we never lose rows across batches. ─────────────────────
         otlp.export(with_token(
             Request::new(export_request_with_span_id(SPAN_ID_2.to_vec())),
             &jwt,

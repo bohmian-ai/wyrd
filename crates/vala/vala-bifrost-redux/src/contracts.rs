@@ -35,6 +35,9 @@ pub enum ScribeError {
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
 
+    #[error("object store PUT failed")]
+    ObjectStorePutFailed(#[source] opendal::Error),
+
     #[error("internal scribe failure: {detail}")]
     Internal { detail: String },
 }
@@ -51,9 +54,20 @@ impl ScribeError {
             Self::FingerprintMismatch { table } => BifrostError::FingerprintMismatch {
                 table: table.clone(),
             },
+            Self::ObjectStorePutFailed(e) => BifrostError::Internal {
+                detail: format!("object store PUT failed: {e}"),
+            },
             Self::Internal { detail } => BifrostError::Internal {
                 detail: detail.clone(),
             },
+        }
+    }
+}
+
+impl From<vala_sql::SqlError> for ScribeError {
+    fn from(e: vala_sql::SqlError) -> Self {
+        Self::Internal {
+            detail: e.to_string(),
         }
     }
 }

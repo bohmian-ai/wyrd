@@ -100,18 +100,29 @@ async fn run(args: Args) {
     .expect("seed bench tenant");
 
     catalog
-        .create_table(
-            ns,
-            "bench_wl",
-            vec![
-                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
-            ],
-            TableScope::TenantOwned,
-            tenant,
-            &[],
-            None,
-        )
+        .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+            ns: ns,
+
+            name: "bench_wl",
+
+            user_fields: vec![
+
+                            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+
+                            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
+
+                        ],
+
+            scope: TableScope::TenantOwned,
+
+            tenant: tenant,
+
+            partition_columns: &[],
+
+            audit: None,
+
+        })
         .await
         .expect("create bench table");
 

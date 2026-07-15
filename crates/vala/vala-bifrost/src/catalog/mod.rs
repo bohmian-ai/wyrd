@@ -19,7 +19,8 @@ use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::PostgresCommitNotifier;
 use crate::writer::coordinator::{
-    FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator_with_notifier,
+    FlushPolicy, GroupCommitHandle, GroupCoordinatorInputs,
+    spawn_group_commit_coordinator_with_notifier,
 };
 use wyrd_storage::settings::BackendConfig;
 
@@ -45,6 +46,28 @@ pub struct WyrdCatalog {
 /// sqlx rolls back the open transaction.
 pub struct AdvisoryLockGuard {
     _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+}
+
+/// Inputs for [`WyrdCatalog::create_table`].
+///
+/// `audit`, when present, appends one hash-chained `AuditEvent` row into the
+/// transactional outbox in the same tx as the `vala.bifrost_tables`
+/// registration.
+pub struct CreateTableRequest<'a> {
+    /// Bifrost namespace under which the table lives.
+    pub ns: BifrostNamespace,
+    /// Table name (unique within the namespace).
+    pub name: &'a str,
+    /// Arrow schema fields for the user payload (system columns are added by the catalog).
+    pub user_fields: Vec<Field>,
+    /// Tenancy scope: SystemShared or TenantOwned.
+    pub scope: TableScope,
+    /// Registering tenant.
+    pub tenant: wyrd_spec::ids::DataTenantId,
+    /// Optional Iceberg partition transforms `(source_field_name, transform)`.
+    pub partition_columns: &'a [(String, PartitionTransform)],
+    /// Optional audit event appended in the same tx as the control-table row.
+    pub audit: Option<wyrd_spec::vala::api::AuditEvent>,
 }
 
 impl WyrdCatalog {
@@ -118,15 +141,15 @@ impl WyrdCatalog {
         if self.catalog.table_exists(&table_ident).await? {
             return Ok(());
         }
-        self.create_table(
+        self.create_table(CreateTableRequest {
             ns,
             name,
             user_fields,
-            TableScope::SystemShared,
-            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
+            scope: TableScope::SystemShared,
+            tenant: wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
             partition_columns,
-            None,
-        )
+            audit: None,
+        })
         .await?;
         Ok(())
     }
@@ -135,17 +158,19 @@ impl WyrdCatalog {
     /// transactional outbox **in the same tx as the `vala.bifrost_tables`
     /// registration** (S3.C5): the control-table row and its audit record commit
     /// atomically, and an audit-append failure fails the registration closed.
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_table(
         &self,
-        ns: BifrostNamespace,
-        name: &str,
-        user_fields: Vec<Field>,
-        scope: TableScope,
-        tenant: wyrd_spec::ids::DataTenantId,
-        partition_columns: &[(String, PartitionTransform)],
-        audit: Option<wyrd_spec::vala::api::AuditEvent>,
+        request: CreateTableRequest<'_>,
     ) -> Result<TableUid, BifrostError> {
+        let CreateTableRequest {
+            ns,
+            name,
+            user_fields,
+            scope,
+            tenant,
+            partition_columns,
+            audit,
+        } = request;
         // M6 reserved-name guard: a user field may not take a reserved system
         // (`wyrd_*`/`data_tenant_id`) or correlation (`card_uid`/`run_id`/`principal_id`) name —
         // the server stamps the former and carries the latter as cell values.
@@ -366,19 +391,21 @@ impl WyrdCatalog {
         );
 
         let handle = spawn_group_commit_coordinator_with_notifier(
-            table,
-            self.catalog.clone(),
-            self.pool.clone(),
-            table_uid,
-            fqn,
-            scope,
-            Arc::clone(&self.registry),
+            GroupCoordinatorInputs {
+                table,
+                catalog: self.catalog.clone(),
+                pool: self.pool.clone(),
+                table_uid,
+                table_fqn: fqn,
+                scope,
+                registry: Arc::clone(&self.registry),
+                payload_class: PayloadClass::Standard,
+                sensitive_columns: &[],
+                flush_policy: FlushPolicy::default(),
+            },
             Arc::new(PostgresCommitNotifier {
                 pool: (*self.pool).clone(),
             }),
-            PayloadClass::Standard,
-            &[],
-            FlushPolicy::default(),
         );
 
         Ok(handle)
@@ -411,19 +438,21 @@ impl WyrdCatalog {
         );
 
         let handle = spawn_group_commit_coordinator_with_notifier(
-            table,
-            self.catalog.clone(),
-            self.pool.clone(),
-            table_uid,
-            fqn,
-            scope,
-            Arc::clone(&self.registry),
+            GroupCoordinatorInputs {
+                table,
+                catalog: self.catalog.clone(),
+                pool: self.pool.clone(),
+                table_uid,
+                table_fqn: fqn,
+                scope,
+                registry: Arc::clone(&self.registry),
+                payload_class: T::PAYLOAD_CLASS,
+                sensitive_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
+                flush_policy: FlushPolicy::default(),
+            },
             Arc::new(PostgresCommitNotifier {
                 pool: (*self.pool).clone(),
             }),
-            T::PAYLOAD_CLASS,
-            T::SENSITIVE_PAYLOAD_COLUMNS,
-            FlushPolicy::default(),
         );
 
         Ok(handle)

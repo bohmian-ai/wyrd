@@ -116,6 +116,10 @@ def test_is_ignored_path_skips_examples_dir() -> None:
     assert is_ignored_path(ROOT / "crates" / "foo" / "examples" / "bar.rs")
 
 
+def test_is_ignored_path_skips_benches_dir() -> None:
+    assert is_ignored_path(ROOT / "crates" / "foo" / "benches" / "bench_x.rs")
+
+
 def test_is_ignored_path_skips_pg_tests_file() -> None:
     p = ROOT / "crates" / "vala" / "vala-bifrost" / "src" / "writer" / "commit" / "pg_tests.rs"
     assert is_ignored_path(p)
@@ -181,6 +185,33 @@ def test_allow_inside_nested_braces_in_cfg_test_mod_is_skipped() -> None:
         "}\n"
     )
     assert _scan(src) == []
+
+
+def test_allow_next_to_cfg_test_on_fn_is_skipped() -> None:
+    src = (
+        "#[cfg(test)]\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn helper() {}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_allow_before_cfg_test_on_fn_is_skipped() -> None:
+    src = (
+        "#[allow(clippy::too_many_arguments)]\n"
+        "#[cfg(test)]\n"
+        "fn helper() {}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_allow_without_cfg_test_sibling_still_flagged() -> None:
+    src = (
+        "#[inline]\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn helper() {}\n"
+    )
+    assert _scan(src) == [2]
 
 
 def test_cfg_test_with_blank_line_before_mod_is_skipped() -> None:

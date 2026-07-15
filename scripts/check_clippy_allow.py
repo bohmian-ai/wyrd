@@ -53,7 +53,7 @@ def is_ignored_path(path: Path) -> bool:
       (see `architecture/agent-rules.md`).
     """
     parts = path.relative_to(ROOT).parts
-    if "tests" in parts or "examples" in parts:
+    if "tests" in parts or "examples" in parts or "benches" in parts:
         return True
     if "pg_tests" in parts:
         return True
@@ -142,12 +142,49 @@ def _line_in_ranges(line: int, ranges: list[tuple[int, int]]) -> bool:
     return False
 
 
+def _attribute_has_cfg_test_sibling(lines: list[str], attr_index: int) -> bool:
+    """Return True if the `#[allow(...)]` at `lines[attr_index]` is part of
+    an attribute stack (contiguous `#[...]` lines with no blank/code between)
+    that also contains a `#[cfg(test)]` (or `#[cfg(all(test, ...))]`).
+
+    Handles both orderings:
+        #[cfg(test)]
+        #[allow(clippy::...)]
+        fn t() { }
+    and
+        #[allow(clippy::...)]
+        #[cfg(test)]
+        fn t() { }
+    """
+    i = attr_index - 1
+    while i >= 0:
+        stripped = lines[i].strip()
+        if not stripped:
+            break
+        if not stripped.startswith("#["):
+            break
+        if CFG_TEST_RE.match(lines[i]):
+            return True
+        i -= 1
+    i = attr_index + 1
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if not stripped:
+            break
+        if not stripped.startswith("#["):
+            break
+        if CFG_TEST_RE.match(lines[i]):
+            return True
+        i += 1
+    return False
+
+
 def scan_file(path: Path) -> list[Finding]:
     """Return unjustified `#[allow(clippy::...)]` findings from one file.
 
-    Skips attributes inside inline `#[cfg(test)] mod ... { ... }` blocks —
-    test-only code is not audited (mirrors the tests/ and examples/
-    exclusions in `is_ignored_path`).
+    Skips attributes inside inline `#[cfg(test)] mod ... { ... }` blocks or
+    attached to a `#[cfg(test)]`-gated item — test-only code is not audited
+    (mirrors the tests/ and examples/ exclusions in `is_ignored_path`).
     """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -157,6 +194,8 @@ def scan_file(path: Path) -> list[Finding]:
         if not ATTR_RE.search(raw_line):
             continue
         if _line_in_ranges(line_number, cfg_test_ranges):
+            continue
+        if _attribute_has_cfg_test_sibling(lines, line_number - 1):
             continue
         if has_justification_above(lines, line_number - 1):
             continue

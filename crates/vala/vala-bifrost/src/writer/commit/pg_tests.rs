@@ -84,15 +84,23 @@ mod recovery {
 
         let fields = vec![Field::new("val", DataType::Int64, false)];
         let table_uid = catalog
-            .create_table(
-                NS,
-                TABLE,
-                fields,
-                TableScope::TenantOwned,
-                tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: TABLE,
+
+                user_fields: fields,
+
+                scope: TableScope::TenantOwned,
+
+                tenant: tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
 
@@ -590,15 +598,23 @@ mod recovery {
         let catalog = rebuild_catalog(&h).await;
         let fields = vec![Field::new("val", DataType::Int64, false)];
         let sys_uid = catalog
-            .create_table(
-                NS,
-                "crash_test_sys",
-                fields,
-                TableScope::SystemShared,
-                DataTenantId::SYSTEM_OWNER,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: "crash_test_sys",
+
+                user_fields: fields,
+
+                scope: TableScope::SystemShared,
+
+                tenant: DataTenantId::SYSTEM_OWNER,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
         drop(catalog);
@@ -1320,15 +1336,23 @@ mod group_commit {
 
         let catalog = build_catalog(&h).await;
         let table_uid: TableUid = catalog
-            .create_table(
-                NS,
-                TABLE,
-                vec![Field::new("val", DataType::Int64, false)],
-                TableScope::TenantOwned,
-                tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: TABLE,
+
+                user_fields: vec![Field::new("val", DataType::Int64, false)],
+
+                scope: TableScope::TenantOwned,
+
+                tenant: tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
         drop(catalog);
@@ -1427,15 +1451,23 @@ mod group_commit {
 
         let catalog = build_catalog(&h).await;
         let table_uid: TableUid = catalog
-            .create_table(
-                NS,
-                TABLE,
-                vec![Field::new("val", DataType::Int64, false)],
-                TableScope::SystemShared,
-                DataTenantId::SYSTEM_OWNER,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: TABLE,
+
+                user_fields: vec![Field::new("val", DataType::Int64, false)],
+
+                scope: TableScope::SystemShared,
+
+                tenant: DataTenantId::SYSTEM_OWNER,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
         drop(catalog);
@@ -1571,7 +1603,7 @@ mod coordinator {
     use crate::types::{TableScope, TableUid};
     use crate::writer::BifrostWriteContext;
     use crate::writer::coordinator::{
-        FlushPolicy, GroupCommitHandle, spawn_group_commit_coordinator,
+        FlushPolicy, GroupCommitHandle, GroupCoordinatorInputs, spawn_group_commit_coordinator,
     };
 
     const NS: BifrostNamespace = BifrostNamespace::Bifrost;
@@ -1674,15 +1706,23 @@ mod coordinator {
     ) -> TableUid {
         let catalog = build_catalog(h).await;
         catalog
-            .create_table(
-                NS,
-                table,
-                vec![Field::new("val", DataType::Int64, false)],
-                scope,
-                owner,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: table,
+
+                user_fields: vec![Field::new("val", DataType::Int64, false)],
+
+                scope: scope,
+
+                tenant: owner,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap()
     }
@@ -1696,18 +1736,18 @@ mod coordinator {
         scope: TableScope,
         policy: FlushPolicy,
     ) -> GroupCommitHandle {
-        spawn_group_commit_coordinator(
+        spawn_group_commit_coordinator(GroupCoordinatorInputs {
             table,
-            Arc::new(sql_catalog),
-            h.pool.clone(),
+            catalog: Arc::new(sql_catalog),
+            pool: h.pool.clone(),
             table_uid,
-            fqn.to_string(),
+            table_fqn: fqn.to_string(),
             scope,
-            Arc::new(Registry::new(h.pool.clone())),
-            PayloadClass::Standard,
-            &[],
-            policy,
-        )
+            registry: Arc::new(Registry::new(h.pool.clone())),
+            payload_class: PayloadClass::Standard,
+            sensitive_columns: &[],
+            flush_policy: policy,
+        })
     }
 
     #[derive(sqlx::FromRow)]

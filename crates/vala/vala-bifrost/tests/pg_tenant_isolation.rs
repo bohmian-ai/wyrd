@@ -145,15 +145,23 @@ mod pg_tests {
         // write binds its OWN data tenant into `olap_commits.data_tenant_id`, so A
         // and B must be real platform tenants (the `data_tenant_id` FK).
         catalog
-            .create_table(
-                NS,
-                TABLE,
-                vec![Field::new("payload", DataType::Utf8, false)],
-                TableScope::SystemShared,
-                DataTenantId::SYSTEM_OWNER,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: NS,
+
+                name: TABLE,
+
+                user_fields: vec![Field::new("payload", DataType::Utf8, false)],
+
+                scope: TableScope::SystemShared,
+
+                tenant: DataTenantId::SYSTEM_OWNER,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
 

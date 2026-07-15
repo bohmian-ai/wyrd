@@ -502,20 +502,38 @@ impl GroupCommitActor {
 /// commit tests. Production catalog writers use
 /// [`spawn_group_commit_coordinator_with_notifier`].
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_group_commit_coordinator(
-    table: Table,
-    catalog: Arc<SqlCatalog>,
-    pool: Arc<PgPool>,
-    table_uid: TableUid,
-    table_fqn: String,
-    scope: TableScope,
-    registry: Arc<Registry>,
-    payload_class: PayloadClass,
-    sensitive_columns: &'static [&'static str],
-    flush_policy: FlushPolicy,
+    inputs: GroupCoordinatorInputs,
 ) -> GroupCommitHandle {
     spawn_group_commit_coordinator_with_notifier(
+        inputs,
+        Arc::new(crate::writer::NoOpCommitNotifier),
+    )
+}
+
+/// Inputs shared by both variants of the group-commit coordinator spawner.
+pub(crate) struct GroupCoordinatorInputs {
+    pub table: Table,
+    pub catalog: Arc<SqlCatalog>,
+    pub pool: Arc<PgPool>,
+    pub table_uid: TableUid,
+    pub table_fqn: String,
+    pub scope: TableScope,
+    pub registry: Arc<Registry>,
+    pub payload_class: PayloadClass,
+    pub sensitive_columns: &'static [&'static str],
+    pub flush_policy: FlushPolicy,
+}
+
+/// Spawn the per-physical-table group-commit coordinator with a commit notifier.
+///
+/// Returns a [`GroupCommitHandle`] the caller uses to submit writes. The actor
+/// owns the loaded [`Table`] and advances its snapshot as flushes commit.
+pub(crate) fn spawn_group_commit_coordinator_with_notifier(
+    inputs: GroupCoordinatorInputs,
+    commit_notifier: Arc<dyn CommitNotifier>,
+) -> GroupCommitHandle {
+    let GroupCoordinatorInputs {
         table,
         catalog,
         pool,
@@ -523,31 +541,10 @@ pub(crate) fn spawn_group_commit_coordinator(
         table_fqn,
         scope,
         registry,
-        Arc::new(crate::writer::NoOpCommitNotifier),
         payload_class,
         sensitive_columns,
         flush_policy,
-    )
-}
-
-/// Spawn the per-physical-table group-commit coordinator with a commit notifier.
-///
-/// Returns a [`GroupCommitHandle`] the caller uses to submit writes. The actor
-/// owns the loaded [`Table`] and advances its snapshot as flushes commit.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_group_commit_coordinator_with_notifier(
-    table: Table,
-    catalog: Arc<SqlCatalog>,
-    pool: Arc<PgPool>,
-    table_uid: TableUid,
-    table_fqn: String,
-    scope: TableScope,
-    registry: Arc<Registry>,
-    commit_notifier: Arc<dyn CommitNotifier>,
-    payload_class: PayloadClass,
-    sensitive_columns: &'static [&'static str],
-    flush_policy: FlushPolicy,
-) -> GroupCommitHandle {
+    } = inputs;
     let (sender, receiver) = mpsc::channel(256);
 
     let actor = GroupCommitActor {
@@ -689,15 +686,23 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let table_name = "coordinator_notify";
         let table_uid = catalog
-            .create_table(
-                BifrostNamespace::Bifrost,
-                table_name,
-                vec![Field::new("value", DataType::Int64, false)],
-                TableScope::TenantOwned,
-                tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: BifrostNamespace::Bifrost,
+
+                name: table_name,
+
+                user_fields: vec![Field::new("value", DataType::Int64, false)],
+
+                scope: TableScope::TenantOwned,
+
+                tenant: tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .expect("test table");
 

@@ -132,15 +132,23 @@ mod pg_tests {
 
         let user_fields = vec![Field::new("val", DataType::Int64, false)];
         let uid = catalog
-            .create_table(
-                vala_bifrost::catalog::namespaces::BifrostNamespace::Bifrost,
-                "rt_test",
-                user_fields,
-                TableScope::TenantOwned,
-                tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: vala_bifrost::catalog::namespaces::BifrostNamespace::Bifrost,
+
+                name: "rt_test",
+
+                user_fields: user_fields,
+
+                scope: TableScope::TenantOwned,
+
+                tenant: tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
 

@@ -73,15 +73,23 @@ impl BenchFixture {
     ) {
         match self
             .catalog
-            .create_table(
-                ns,
-                name,
-                extra_fields.clone(),
-                scope,
-                self.tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: ns,
+
+                name: name,
+
+                user_fields: extra_fields.clone(),
+
+                scope: scope,
+
+                tenant: self.tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
         {
             Ok(_) => {}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RegisterOutcome",
+  "description": "Result of a registration write.",
+  "oneOf": [
+    {
+      "description": "A new registration row was created.",
+      "type": "string",
+      "enum": [
+        "created"
+      ]
+    },
+    {
+      "description": "The same idempotent request was replayed.",
+      "type": "string",
+      "enum": [
+        "idempotent_noop"
+      ]
+    },
+    {
+      "description": "An active card with identical content already exists.",
+      "type": "string",
+      "enum": [
+        "deduplicated"
+      ]
+    }
+  ]
+}

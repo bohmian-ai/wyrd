@@ -1,0 +1,559 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ListCardsRequest",
+  "description": "Query parameters for card listing.",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "description": "Opaque continuation cursor.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "filter": {
+      "description": "Optional metadata query encoded as its canonical query-language string.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/MetadataQuery"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "include_prerelease": {
+      "description": "Include prerelease versions.",
+      "default": false,
+      "type": "boolean"
+    },
+    "kind": {
+      "description": "Optional kind filter.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardKind"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limit": {
+      "description": "Maximum result count.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "name": {
+      "description": "Optional name filter.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardName"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "space": {
+      "description": "Optional workspace filter.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpaceName"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "status": {
+      "description": "Optional lifecycle filter.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardLifecycleStatus"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version_range": {
+      "description": "Optional semver range filter.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardLifecycleStatus": {
+      "description": "Server-managed lifecycle state for a Card.",
+      "oneOf": [
+        {
+          "description": "Registration is waiting for artifact upload and verification.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Card is available for use.",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "Card has been superseded by a newer version.",
+          "type": "string",
+          "enum": [
+            "deprecated"
+          ]
+        },
+        {
+          "description": "Registration failed and awaits cleanup or retry.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "Registration expired before completion.",
+          "type": "string",
+          "enum": [
+            "expired"
+          ]
+        },
+        {
+          "description": "Card was soft-deleted.",
+          "type": "string",
+          "enum": [
+            "deleted"
+          ]
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "FieldRef": {
+      "description": "A reference to a queryable field.",
+      "oneOf": [
+        {
+          "description": "`labels.<key>`.",
+          "type": "object",
+          "required": [
+            "label"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`annotations.<key>`.",
+          "type": "object",
+          "required": [
+            "annotation"
+          ],
+          "properties": {
+            "annotation": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`attributes.<key>`.",
+          "type": "object",
+          "required": [
+            "attribute"
+          ],
+          "properties": {
+            "attribute": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A bare reserved column name.",
+          "type": "object",
+          "required": [
+            "reserved"
+          ],
+          "properties": {
+            "reserved": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "MetadataQuery": {
+      "description": "A boolean tree of metadata predicates.",
+      "oneOf": [
+        {
+          "description": "All sub-queries must match.",
+          "type": "object",
+          "required": [
+            "and"
+          ],
+          "properties": {
+            "and": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetadataQuery"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "At least one sub-query must match.",
+          "type": "object",
+          "required": [
+            "or"
+          ],
+          "properties": {
+            "or": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/MetadataQuery"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Negation.",
+          "type": "object",
+          "required": [
+            "not"
+          ],
+          "properties": {
+            "not": {
+              "$ref": "#/definitions/MetadataQuery"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "A single leaf predicate.",
+          "type": "object",
+          "required": [
+            "predicate"
+          ],
+          "properties": {
+            "predicate": {
+              "$ref": "#/definitions/Predicate"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "Operator": {
+      "description": "Operator and operand.",
+      "oneOf": [
+        {
+          "description": "`=`.",
+          "type": "object",
+          "required": [
+            "eq"
+          ],
+          "properties": {
+            "eq": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`!=`.",
+          "type": "object",
+          "required": [
+            "ne"
+          ],
+          "properties": {
+            "ne": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`>`.",
+          "type": "object",
+          "required": [
+            "gt"
+          ],
+          "properties": {
+            "gt": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`>=`.",
+          "type": "object",
+          "required": [
+            "ge"
+          ],
+          "properties": {
+            "ge": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`<`.",
+          "type": "object",
+          "required": [
+            "lt"
+          ],
+          "properties": {
+            "lt": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`<=`.",
+          "type": "object",
+          "required": [
+            "le"
+          ],
+          "properties": {
+            "le": {
+              "$ref": "#/definitions/Value"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`=~`.",
+          "type": "object",
+          "required": [
+            "matches"
+          ],
+          "properties": {
+            "matches": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`!~`.",
+          "type": "object",
+          "required": [
+            "not_matches"
+          ],
+          "properties": {
+            "not_matches": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`in [..]`.",
+          "type": "object",
+          "required": [
+            "in"
+          ],
+          "properties": {
+            "in": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Value"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`not in [..]`.",
+          "type": "object",
+          "required": [
+            "not_in"
+          ],
+          "properties": {
+            "not_in": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/Value"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`exists`.",
+          "type": "string",
+          "enum": [
+            "exists"
+          ]
+        },
+        {
+          "description": "`not exists`.",
+          "type": "string",
+          "enum": [
+            "not_exists"
+          ]
+        }
+      ]
+    },
+    "Predicate": {
+      "description": "A single field/operator predicate.",
+      "type": "object",
+      "required": [
+        "field",
+        "op"
+      ],
+      "properties": {
+        "field": {
+          "description": "Field being tested.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/FieldRef"
+            }
+          ]
+        },
+        "op": {
+          "description": "Operator and operand.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Operator"
+            }
+          ]
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "Value": {
+      "description": "A typed literal operand.",
+      "oneOf": [
+        {
+          "description": "UTF-8 string.",
+          "type": "object",
+          "required": [
+            "string"
+          ],
+          "properties": {
+            "string": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "64-bit signed integer.",
+          "type": "object",
+          "required": [
+            "int"
+          ],
+          "properties": {
+            "int": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "64-bit float.",
+          "type": "object",
+          "required": [
+            "float"
+          ],
+          "properties": {
+            "float": {
+              "type": "number",
+              "format": "double"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Boolean.",
+          "type": "object",
+          "required": [
+            "bool"
+          ],
+          "properties": {
+            "bool": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Duration in whole nanoseconds.",
+          "type": "object",
+          "required": [
+            "duration"
+          ],
+          "properties": {
+            "duration": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Absolute UTC timestamp.",
+          "type": "object",
+          "required": [
+            "timestamp"
+          ],
+          "properties": {
+            "timestamp": {
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

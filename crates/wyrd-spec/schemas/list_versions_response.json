@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ListVersionsResponse",
+  "description": "Versions available for one card identity.",
+  "type": "object",
+  "required": [
+    "versions"
+  ],
+  "properties": {
+    "versions": {
+      "description": "Resolved versions.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/VersionBlock"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

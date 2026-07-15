@@ -1,0 +1,207 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SubmissionMetadata",
+  "description": "Metadata accepted on a registration submission.",
+  "type": "object",
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "annotations": {
+      "description": "Free-form annotations.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/AnnotationValue"
+      }
+    },
+    "bump": {
+      "description": "Version bump requested when version is omitted or scoped.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/VersionBump"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "labels": {
+      "description": "Display labels.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/definitions/LabelValue"
+      }
+    },
+    "name": {
+      "description": "Card name.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardName"
+        }
+      ]
+    },
+    "space": {
+      "description": "Optional workspace.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/SpaceName"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "uid": {
+      "description": "Optional client-provided UID, used only where the server permits it.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "description": "Requested version or version scope.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/VersionSpec"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "AnnotationValue": {
+      "description": "Validated value for free-form Card annotations.",
+      "type": "string"
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "LabelValue": {
+      "description": "Validated value for queryable Card and Run labels.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBump": {
+      "description": "Semantic version bump level.\n\n`Major`, `Minor`, and `Patch` perform a conventional semver bump and clear any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are additive: they apply the requested pre-release or build metadata to the existing triple without resetting it.",
+      "oneOf": [
+        {
+          "description": "Increment major and reset minor, patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "major"
+          ]
+        },
+        {
+          "description": "Increment minor and reset patch, pre-release, and build metadata.",
+          "type": "string",
+          "enum": [
+            "minor"
+          ]
+        },
+        {
+          "description": "Increment patch and reset pre-release and build metadata.",
+          "type": "string",
+          "enum": [
+            "patch"
+          ]
+        },
+        {
+          "description": "Set the pre-release identifier on the current triple (e.g. \"rc.1\").",
+          "type": "object",
+          "required": [
+            "pre"
+          ],
+          "properties": {
+            "pre": {
+              "type": "object",
+              "required": [
+                "identifier"
+              ],
+              "properties": {
+                "identifier": {
+                  "description": "Pre-release identifier as defined by SemVer 2.0 §9.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set the build metadata on the current triple (e.g. \"001\", \"sha-abc123\").",
+          "type": "object",
+          "required": [
+            "build"
+          ],
+          "properties": {
+            "build": {
+              "type": "object",
+              "required": [
+                "metadata"
+              ],
+              "properties": {
+                "metadata": {
+                  "description": "Build metadata as defined by SemVer 2.0 §10.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Set both pre-release and build metadata on the current triple.",
+          "type": "object",
+          "required": [
+            "pre_build"
+          ],
+          "properties": {
+            "pre_build": {
+              "type": "object",
+              "required": [
+                "build",
+                "pre"
+              ],
+              "properties": {
+                "build": {
+                  "description": "Build metadata.",
+                  "type": "string"
+                },
+                "pre": {
+                  "description": "Pre-release identifier.",
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "VersionSpec": {
+      "description": "Authored version on the card-registration path. Either a full semver triple pin (e.g. \"1.4.2\", \"1.4.2-rc.1+meta\") or a bare partial scope (e.g. \"1\", \"1.0\"). Range comparators (^, ~, *, >=, ...) are rejected on this path.",
+      "examples": [
+        "1.4.2",
+        "1.4.2-rc.1+meta",
+        "1.0",
+        "1"
+      ],
+      "type": "string"
+    }
+  }
+}

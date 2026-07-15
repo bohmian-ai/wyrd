@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CardSummary",
+  "description": "Metadata-only card list item.",
+  "type": "object",
+  "required": [
+    "card_uid",
+    "created_at",
+    "kind",
+    "name",
+    "space",
+    "spec_hash",
+    "status",
+    "updated_at",
+    "version"
+  ],
+  "properties": {
+    "artifact_hash": {
+      "description": "Optional BLAKE3-hex artifact hash.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "card_uid": {
+      "description": "Card UID.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardUid"
+        }
+      ]
+    },
+    "created_at": {
+      "description": "Creation time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "kind": {
+      "description": "Card kind.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardKind"
+        }
+      ]
+    },
+    "name": {
+      "description": "Card name.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardName"
+        }
+      ]
+    },
+    "space": {
+      "description": "Workspace.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/SpaceName"
+        }
+      ]
+    },
+    "spec_hash": {
+      "description": "BLAKE3-hex spec hash.",
+      "type": "string"
+    },
+    "status": {
+      "description": "Lifecycle status.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardLifecycleStatus"
+        }
+      ]
+    },
+    "updated_at": {
+      "description": "Last update time.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "version": {
+      "description": "Resolved version.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/VersionBlock"
+        }
+      ]
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "CardKind": {
+      "title": "CardKind",
+      "description": "Wyrd Card kind.",
+      "type": "string",
+      "enum": [
+        "Data",
+        "Model",
+        "Experiment",
+        "Prompt",
+        "Agent",
+        "Workflow",
+        "Eval",
+        "Drift",
+        "Service",
+        "Policy",
+        "Mcp",
+        "Audit",
+        "Artifact",
+        "Trigger",
+        "Operator",
+        "Source"
+      ]
+    },
+    "CardLifecycleStatus": {
+      "description": "Server-managed lifecycle state for a Card.",
+      "oneOf": [
+        {
+          "description": "Registration is waiting for artifact upload and verification.",
+          "type": "string",
+          "enum": [
+            "pending"
+          ]
+        },
+        {
+          "description": "Card is available for use.",
+          "type": "string",
+          "enum": [
+            "active"
+          ]
+        },
+        {
+          "description": "Card has been superseded by a newer version.",
+          "type": "string",
+          "enum": [
+            "deprecated"
+          ]
+        },
+        {
+          "description": "Registration failed and awaits cleanup or retry.",
+          "type": "string",
+          "enum": [
+            "failed"
+          ]
+        },
+        {
+          "description": "Registration expired before completion.",
+          "type": "string",
+          "enum": [
+            "expired"
+          ]
+        },
+        {
+          "description": "Card was soft-deleted.",
+          "type": "string",
+          "enum": [
+            "deleted"
+          ]
+        }
+      ]
+    },
+    "CardName": {
+      "description": "Human-visible Card name.",
+      "type": "string"
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
+    },
+    "VersionBlock": {
+      "description": "Semver-compatible version string.",
+      "type": "string"
+    }
+  }
+}

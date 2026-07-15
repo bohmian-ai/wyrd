@@ -133,6 +133,11 @@ pub struct GroupCommitOutcome {
 /// the audit spine — most importantly the relay flush (`origin == "audit-relay"`,
 /// review M-11) — and on the internal/system re-flush. On the idempotent replay
 /// path no new op occurred, so no audit row is appended.
+// justification: single-key atomic-commit entry point; the 10 params (4 runtime handles,
+// the batch payload, origin+actor+tenant attribution, and the audit event) are all
+// inherent to the commit and are used through the CommitKey / claim_batch / audit-outbox
+// contract. Bundling them into a struct would only move the noise while breaking every
+// call site including the 4 pg_tests scenarios.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_commit(
     pool: &PgPool,
@@ -209,6 +214,7 @@ pub async fn run_commit(
 /// Returns [`BifrostError`] when a control-plane txn, the Parquet write, or the
 /// Iceberg append fails, or when a `batch_id` collides with a failed / in-flight /
 /// aborted anchor (see the 02.4 note below on per-key collision isolation).
+// justification: single-flush 2PC orchestrator that owns the entire prepare→drop-lost-fence→write-parquet→append→finalize sequence. Extracting stages into helpers would fragment the state that flows between steps (owner + fencing_token + files + fresh_groups + replayed indexes) into multi-field intermediates, obscuring the linear commit story the reader has to follow.
 #[allow(clippy::too_many_lines)]
 pub async fn run_group_commit(
     pool: &PgPool,
@@ -509,6 +515,10 @@ async fn claim_batch(
 /// # Errors
 /// Returns the underlying [`BifrostError`] from the Parquet write or Iceberg
 /// append, or [`BifrostError::Sql`] when the `committed` finalize fails.
+// justification: private phase-2 helper called only by run_commit; its 10 params are the exact
+// state that survived phase-1 claim (runtime handles + payload + tenant + owner + fencing_token
+// + audit). Bundling them would just wrap the existing local variables into a struct built one
+// call-line above the call, adding indirection without eliminating any state.
 #[allow(clippy::too_many_arguments)]
 async fn write_and_finalize(
     pool: &PgPool,

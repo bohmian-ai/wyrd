@@ -63,26 +63,30 @@ def is_ignored_path(path: Path) -> bool:
 
 
 def has_justification_above(lines: list[str], attr_index: int) -> bool:
-    """Return whether a `// justification:` comment sits in the two
-    non-blank lines immediately above `lines[attr_index]`.
+    """Return whether a `// justification:` comment sits in the block of
+    contiguous `//` comment lines immediately above `lines[attr_index]`.
 
-    A blank line separates the justification from an unrelated comment; we
-    stop scanning at the first blank line above the attribute.
+    Walks upward through non-blank `//` lines; the `justification:` marker
+    may sit anywhere in the block (top for a wrapped explanation, bottom
+    for a one-liner). A blank line, a non-comment line, or a doc comment
+    (`///`, `//!`) ends the block.
     """
-    seen = 0
     i = attr_index - 1
-    while i >= 0 and seen < 2:
+    while i >= 0:
         stripped = lines[i].strip()
         if not stripped:
             return False
+        if not stripped.startswith("//"):
+            return False
+        if stripped.startswith("///") or stripped.startswith("//!"):
+            return False
         if JUSTIFICATION_RE.search(stripped):
             return True
-        seen += 1
         i -= 1
     return False
 
 
-CFG_TEST_RE = re.compile(r"^\s*#\[\s*cfg\s*\(\s*(?:all\s*\([^)]*?\btest\b|test)\b")
+CFG_TEST_RE = re.compile(r"^\s*#\[\s*cfg\s*\([^)]*\btest\b")
 MOD_DECL_RE = re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+\w+\s*\{")
 
 

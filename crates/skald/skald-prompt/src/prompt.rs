@@ -342,6 +342,7 @@ impl Prompt {
     #[pyo3(signature = (messages, model, *, provider, system=None, response_format=None, output=None, operation=None, cache=None, model_settings=None, variables=None, version=None))]
     // justification: pyo3 #[new]/#[staticmethod] signature must match the Python API surface; params correspond 1:1 to the exposed Python constructor keyword arguments
     #[allow(clippy::too_many_arguments)]
+    // justification: pyo3 #[new] constructor with 12 keyword args must materialize each variant into the appropriate ProviderRequest inline; splitting into per-variant helpers would either lose the shared pre-conversion (messages/model/provider extraction) or trigger tuple returns that erase the type into runtime dispatch.
     #[allow(clippy::too_many_lines)]
     pub fn __new__(
         messages: &Bound<'_, PyAny>,

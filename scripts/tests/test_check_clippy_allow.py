@@ -66,6 +66,49 @@ def test_allow_with_justification_two_lines_up_passes() -> None:
     assert _scan(src) == []
 
 
+def test_multi_line_justification_block_passes() -> None:
+    src = (
+        "// justification: single-key atomic-commit entry point; the 10 params\n"
+        "// (4 runtime handles, the payload, attribution, and the audit event)\n"
+        "// are all inherent to the commit and would just move noise.\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn f() {}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_multi_line_comment_without_justification_is_flagged() -> None:
+    src = (
+        "// this is a comment\n"
+        "// that spans multiple lines\n"
+        "// but does not use the marker\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn f() {}\n"
+    )
+    assert _scan(src) == [4]
+
+
+def test_doc_comment_above_allow_ends_block_and_is_flagged() -> None:
+    src = (
+        "/// Public doc for the fn\n"
+        "// justification: reason\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn f() {}\n"
+    )
+    # The `// justification:` between /// doc and #[allow] is still adjacent,
+    # so this passes. Contrast with the next test.
+    assert _scan(src) == []
+
+
+def test_doc_comment_directly_above_allow_without_justification_flagged() -> None:
+    src = (
+        "/// Public doc for the fn\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn f() {}\n"
+    )
+    assert _scan(src) == [2]
+
+
 def test_allow_with_blank_line_before_justification_is_flagged() -> None:
     src = (
         "// justification: real reason\n"
@@ -183,6 +226,15 @@ def test_allow_inside_nested_braces_in_cfg_test_mod_is_skipped() -> None:
         "        let _ = ();\n"
         "    }\n"
         "}\n"
+    )
+    assert _scan(src) == []
+
+
+def test_allow_next_to_cfg_any_test_feature_is_skipped() -> None:
+    src = (
+        "#[cfg(any(test, feature = \"bench-bin\"))]\n"
+        "#[allow(clippy::too_many_arguments)]\n"
+        "fn helper() {}\n"
     )
     assert _scan(src) == []
 

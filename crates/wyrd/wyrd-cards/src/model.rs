@@ -50,6 +50,7 @@ use {
 /// This is not the durable registry record. It is converted into `ModelSpec`
 /// when a Rust-only spec body is needed.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.model", from_py_object))]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelCardMetadata {
@@ -94,6 +95,7 @@ impl Default for ModelCardMetadata {
     feature = "python",
     pyclass(module = "wyrd.model", skip_from_py_object)
 )]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize)]
 pub struct ModelCard {
@@ -276,6 +278,7 @@ impl ModelCard {
     /// conversion, or model spec validation fails.
     #[new]
     #[pyo3(signature = (model_or_interface, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the ModelCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         model_or_interface: &Bound<'_, PyAny>,
@@ -484,6 +487,7 @@ impl ModelCard {
     /// fails, or card JSON cannot be written.
     #[wyrd_test_contract_macros::critical("python:ModelCard.save")]
     #[pyo3(signature = (path, save_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn save(
         &mut self,
@@ -509,6 +513,7 @@ impl ModelCard {
     /// fails.
     #[wyrd_test_contract_macros::critical("python:ModelCard.load")]
     #[pyo3(signature = (path=None, load_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
@@ -555,6 +560,7 @@ impl ModelCard {
         Ok(card)
     }
 
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(interface) = self.interface.as_ref() {

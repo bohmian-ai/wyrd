@@ -4,7 +4,7 @@ mod pg_tests {
     //! Tests verify:
     //! - Crash at each seal stage → no data loss, no duplicates after replay
     //!
-    //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
+    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
     /// Fault injection points in the seal state machine.
     #[cfg(test)]
@@ -17,7 +17,7 @@ mod pg_tests {
         MidSegmentRoll,
         /// Crash during manifest rename (atomic rename may or may not complete).
         MidManifestRename,
-        /// Crash after Parquet PUT but before PG commit (object exists, no file_list row).
+        /// Crash after Parquet PUT but before PG commit (object exists, no `file_list` row).
         PostParquetPutPreCommit,
         /// Crash after PG commit but before WAL retire (sealed LSN watermark not advanced).
         PostCommitPreWalRetire,

@@ -13,15 +13,15 @@
 //! sub-files. Each sub-module owns a `register` helper that adds its
 //! `#[pyclass]` types to the parent Python module.
 
-// PyO3 `__repr__` methods must take `&self` even when they return a static string.
+// justification: PyO3 `__repr__` methods must take `&self` even when they return a static string.
 #![allow(clippy::unused_self)]
-// PyO3 bridge code uses match-let patterns that predate `let…else` and are clearer inline.
+// justification: PyO3 bridge code uses match-let patterns that predate `let…else` and are clearer inline.
 #![allow(clippy::manual_let_else)]
-// Large bridge file: exhaustive single-remaining-variant matches are overly verbose.
+// justification: large bridge file; exhaustive single-remaining-variant matches are overly verbose.
 #![allow(clippy::match_wildcard_for_single_variants)]
-// `|v| v.len()` is clearer than `Vec::len` in closure context here.
+// justification: `|v| v.len()` is clearer than `Vec::len` in closure context here.
 #![allow(clippy::redundant_closure_for_method_calls)]
-// CardPyResult return types are intentionally uniform even when infallible.
+// justification: CardPyResult return types are intentionally uniform across the bridge, even when infallible.
 #![allow(clippy::unnecessary_wraps)]
 #![allow(missing_docs)]
 

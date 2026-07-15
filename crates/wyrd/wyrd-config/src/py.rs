@@ -27,6 +27,7 @@ impl WyrdConfigPy {
     /// Load `wyrd.toml`.
     #[classmethod]
     #[pyo3(signature = (path=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn load(_cls: &Bound<'_, PyType>, path: Option<PathBuf>) -> PyResult<Self> {
         let cfg = WyrdConfig::load(path.as_deref()).map_err(to_py_err)?;

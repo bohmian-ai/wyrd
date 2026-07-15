@@ -22,3 +22,4 @@ export { default as WyrdFlowDiagram } from '$lib/components/WyrdFlowDiagram.svel
 export { default as WyrdSequenceDiagram } from '$lib/components/WyrdSequenceDiagram.svelte';
 export { default as WyrdServerGraph } from '$lib/components/WyrdServerGraph.svelte';
 export { default as WyrdShutdownGraph } from '$lib/components/WyrdShutdownGraph.svelte';
+export { default as WyrdBifrostSystem } from '$lib/components/WyrdBifrostSystem.svelte';

@@ -139,15 +139,23 @@ pub async fn register_table(
             );
             let table_uid = state
                 .bifrost
-                .create_table(
-                    ns,
-                    &body.name,
-                    user_fields,
-                    scope,
-                    caller.data_tenant_id,
-                    &partition_columns,
-                    Some(event),
-                )
+                .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                    ns: ns,
+
+                    name: &body.name,
+
+                    user_fields: user_fields,
+
+                    scope: scope,
+
+                    tenant: caller.data_tenant_id,
+
+                    partition_columns: &partition_columns,
+
+                    audit: Some(event),
+
+                })
                 .await
                 .map_err(map_engine_error)?;
             Ok(RegisterTableResponse {

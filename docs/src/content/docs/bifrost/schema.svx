@@ -8,7 +8,29 @@ order: 4
 
 # Bifrost Schema
 
-All tables are pre-declared `DomainTable` instances registered at boot. The physical schemas below are what DataFusion sees at scan time — they include system columns. The Rust record types in `wyrd-spec` (`SpanRecord`, `GenAiSpanRecord`, etc.) are the canonical source; this page documents the derived physical layout.
+All tables are pre-declared `DomainTable` instances registered at boot. The physical schemas below are what DataFusion sees at scan time; they include system columns. The Rust record types in `wyrd-spec` (`SpanRecord`, `GenAiSpanRecord`, etc.) are the canonical source; this page documents the derived physical layout.
+
+## Table namespaces
+
+### Shared signal tables
+
+**Namespace:** `vala.traces`, `vala.metrics`, `vala.logs`, `vala.genai`, `vala.eval`, `vala.drift`, `vala.dev`
+
+**Partitioning:** `Day(event_time) + Bucket(tenant, 64)`
+
+**Tenant isolation:** `data_tenant_id` column + bucket + `FilterExec` (via `TenantPredicateRule`)
+
+All tenants write to the same physical Iceberg table. The `data_tenant_id` column + partitioning bucket enforce tenant isolation at scan time.
+
+### Tenant-scoped dynamic datasets
+
+**Namespace:** `vala.datasets.<tenant_uuid>.<name>`
+
+**Partitioning:** `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot for single-tenant tables)
+
+**Tenant isolation:** Physical namespace + `data_tenant_id` + `FilterExec`
+
+User-defined datasets for high-volume custom observability writes. Each tenant gets its own physical table namespace. Schema defined at Data Card registration.
 
 ## Common system columns (all tables)
 
@@ -38,7 +60,7 @@ Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
 | `end_time` | `Timestamp(µs, UTC)` | Span end |
 | `duration_ms` | `UInt64` | `(end_time - start_time) / 1000` |
 | `status` | `Utf8` | `OK`, `ERROR`, `UNSET` |
-| `attributes` | `Utf8View` nullable | JSON-serialized span attributes — **payload-gated** |
+| `attributes` | `Utf8View` nullable | JSON-serialized span attributes, **payload-gated** |
 | `service_name` | `Utf8` | Emitting service |
 | + system columns | | |
 
@@ -50,7 +72,7 @@ Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
 | `span_id` | `FixedSizeBinary(8)` |
 | `timestamp` | `Timestamp(µs, UTC)` |
 | `name` | `Utf8` |
-| `attributes` | `Utf8View` nullable — **payload-gated** |
+| `attributes` | `Utf8View` nullable, **payload-gated** |
 | + system columns | |
 
 ## vala.traces.links
@@ -61,7 +83,7 @@ Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
 | `span_id` | `FixedSizeBinary(8)` |
 | `linked_trace_id` | `FixedSizeBinary(16)` |
 | `linked_span_id` | `FixedSizeBinary(8)` |
-| `attributes` | `Utf8View` nullable — **payload-gated** |
+| `attributes` | `Utf8View` nullable, **payload-gated** |
 | + system columns | |
 
 ## vala.genai.messages
@@ -105,8 +127,8 @@ Source type: `LogRecord`.
 | `observed_time` | `Timestamp(µs, UTC)` |
 | `severity_number` | `UInt32` nullable |
 | `severity_text` | `Utf8` nullable |
-| `event_name` | `Utf8` nullable — **payload-gated** |
-| `body` | `Utf8View` nullable — **payload-gated** |
+| `event_name` | `Utf8` nullable, **payload-gated** |
+| `body` | `Utf8View` nullable, **payload-gated** |
 | `trace_id` | `FixedSizeBinary(16)` nullable |
 | `span_id` | `FixedSizeBinary(8)` nullable |
 | + system columns | |
@@ -150,8 +172,8 @@ Source type: `AgentTraceRecord`.
 | `run_id` | `Utf8` |
 | `started_at` | `Timestamp(µs, UTC)` |
 | `ended_at` | `Timestamp(µs, UTC)` |
-| `messages` | `Utf8View` — **payload-gated** |
-| `tool_io` | `Utf8View` nullable — **payload-gated** |
+| `messages` | `Utf8View`, **payload-gated** |
+| `tool_io` | `Utf8View` nullable, **payload-gated** |
 | + system columns | |
 
 ## Type mapping

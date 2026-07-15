@@ -2,10 +2,10 @@ mod pg_tests {
     //! Idempotency tests for Scribe seal.
     //!
     //! Tests verify:
-    //! - Duplicate batch_id across appends is idempotent
+    //! - Duplicate `batch_id` across appends is idempotent
     //! - Replay-driven re-seal hits unique index, no duplicate rows
     //!
-    //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
+    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
     #[tokio::test]
     #[ignore = "requires WAL replay deduplication infrastructure"]

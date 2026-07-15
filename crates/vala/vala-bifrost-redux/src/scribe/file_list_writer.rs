@@ -9,7 +9,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::ParquetEncoded;
 
-/// File list INSERT row matching the 14 vala.file_list columns.
+/// File list INSERT row matching the 14 `vala.file_list` columns.
 pub struct FileListInsert<'a> {
     pub id: Uuid,
     pub namespace: &'a str,
@@ -81,7 +81,7 @@ fn compute_tenant_bucket(frozen: &FrozenMemtable) -> i32 {
     i32::try_from(bucket_u32 % 1024).expect("tenant_bucket in 0..1024 fits in i32")
 }
 
-/// Build the FileListInsert row from freeze metadata.
+/// Build the `FileListInsert` row from freeze metadata.
 pub fn build_insert<'a>(
     frozen: &'a FrozenMemtable,
     encoded: &'a ParquetEncoded,

@@ -63,19 +63,19 @@ mod pg_tests {
             .unwrap();
 
         let table_uid = wyrd_catalog
-            .create_table(
-                NS,
-                TABLE,
-                vec![arrow::datatypes::Field::new(
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+                ns: NS,
+                name: TABLE,
+                user_fields: vec![arrow::datatypes::Field::new(
                     "val",
                     arrow::datatypes::DataType::Int64,
                     false,
                 )],
-                TableScope::TenantOwned,
+                scope: TableScope::TenantOwned,
                 tenant,
-                &[],
-                None,
-            )
+                partition_columns: &[],
+                audit: None,
+            })
             .await
             .unwrap();
 

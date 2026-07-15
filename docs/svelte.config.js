@@ -119,7 +119,8 @@ const AUTHORING_COMPONENTS = [
   'WyrdFlowDiagram',
   'WyrdSequenceDiagram',
   'WyrdServerGraph',
-  'WyrdShutdownGraph'
+  'WyrdShutdownGraph',
+  'WyrdBifrostSystem'
 ];
 
 // Svelte preprocessor that runs AFTER mdsvex. mdsvex 0.12.7's layout-module

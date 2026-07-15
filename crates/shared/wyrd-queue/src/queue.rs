@@ -106,6 +106,7 @@ impl RecordQueue {
     /// Returns the `Row` by value on rejection, mirroring `ArrayQueue::push` so
     /// the caller can re-buffer without a heap allocation on the hot ingest path;
     /// boxing the (large, `CardRef`-carrying) `Row` here would defeat that.
+    // justification: returns the Row by value on rejection so the ingest hot path can re-buffer without a heap allocation; boxing the (large, CardRef-carrying) Row here would defeat that
     #[allow(clippy::result_large_err)]
     pub(crate) fn push(&self, row: Row) -> Result<(), Row> {
         self.staging.push(row)

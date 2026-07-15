@@ -32,7 +32,9 @@ fn build_test_batch(rows: usize) -> RecordBatch {
         .map(|_| DataTenantId::new_v7().to_string())
         .collect();
     let tenant_ids: Vec<&str> = (0..rows).map(|i| tenants[i % 10].as_str()).collect();
-    let timestamps: Vec<i64> = (0..rows).map(|i| i as i64 * 1_000_000).collect();
+    let timestamps: Vec<i64> = (0..rows)
+        .map(|i| i64::try_from(i).expect("bounded row index") * 1_000_000)
+        .collect();
 
     RecordBatch::try_new(
         schema,
@@ -83,8 +85,8 @@ fn main() {
     };
 
     println!("Benchmark: ingest + seal throughput");
-    println!(" Batch size: {} rows", BATCH_SIZE);
-    println!(" Iterations: {}", ITERATIONS);
+    println!(" Batch size: {BATCH_SIZE} rows");
+    println!(" Iterations: {ITERATIONS}");
     println!();
 
     // Warmup
@@ -109,12 +111,13 @@ fn main() {
     let elapsed = start.elapsed();
 
     let total_rows = BATCH_SIZE * ITERATIONS;
+    #[allow(clippy::cast_precision_loss)]
     let rows_per_sec = (total_rows as f64) / elapsed.as_secs_f64();
-    let avg_latency = elapsed / ITERATIONS as u32;
+    let avg_latency = elapsed / u32::try_from(ITERATIONS).expect("bounded iteration count");
 
     println!("Results:");
-    println!(" Total time: {:?}", elapsed);
-    println!(" Avg latency per seal: {:?}", avg_latency);
-    println!(" Throughput: {:.0} rows/sec", rows_per_sec);
-    println!(" Total rows: {}", total_rows);
+    println!(" Total time: {elapsed:?}");
+    println!(" Avg latency per seal: {avg_latency:?}");
+    println!(" Throughput: {rows_per_sec:.0} rows/sec");
+    println!(" Total rows: {total_rows}");
 }

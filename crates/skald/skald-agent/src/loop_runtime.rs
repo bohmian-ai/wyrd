@@ -127,12 +127,14 @@ pub(crate) async fn run(
             run_loop(
                 this,
                 providers,
-                &run_id,
-                rendered,
-                seed_messages,
-                conversation,
-                session_id.as_ref(),
-                Arc::clone(&observer),
+                RunLoopInputs {
+                    run_id: &run_id,
+                    template: rendered,
+                    seed_messages,
+                    conversation,
+                    session_id: session_id.as_ref(),
+                    observer: Arc::clone(&observer),
+                },
             )
             .await
         };
@@ -208,12 +210,14 @@ pub(crate) async fn run_prompt(
             run_loop(
                 this,
                 providers,
-                &run_id,
-                rendered,
-                seed_messages,
-                Conversation::new(),
-                None,
-                Arc::clone(&observer),
+                RunLoopInputs {
+                    run_id: &run_id,
+                    template: rendered,
+                    seed_messages,
+                    conversation: Conversation::new(),
+                    session_id: None,
+                    observer: Arc::clone(&observer),
+                },
             )
             .await
         };
@@ -237,17 +241,28 @@ pub(crate) async fn run_prompt(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+struct RunLoopInputs<'a> {
+    run_id: &'a str,
+    template: ProviderRequest,
+    seed_messages: Vec<skald_spec::MessageNum>,
+    conversation: Conversation,
+    session_id: Option<&'a SessionId>,
+    observer: Arc<dyn Observer>,
+}
+
 async fn run_loop(
     this: &Agent,
     providers: &ProviderRegistry,
-    run_id: &str,
-    template: ProviderRequest,
-    seed_messages: Vec<skald_spec::MessageNum>,
-    mut conversation: Conversation,
-    session_id: Option<&SessionId>,
-    observer: Arc<dyn Observer>,
+    inputs: RunLoopInputs<'_>,
 ) -> AgentResult<AgentRun> {
+    let RunLoopInputs {
+        run_id,
+        template,
+        seed_messages,
+        mut conversation,
+        session_id,
+        observer,
+    } = inputs;
     if this.run_config.max_iterations == 0 {
         return Err(AgentError::max_iterations(
             &this.id,
@@ -282,13 +297,15 @@ async fn run_loop(
                 let synthetic_resp = synthetic_null_response();
                 append_model_journal_call_result(
                     this,
-                    iteration,
-                    &request,
-                    "callback_aborted".to_owned(),
-                    true,
-                    run_id,
-                    &*observer,
-                    &synthetic_resp,
+                    ModelJournalCallRecord {
+                        iteration,
+                        request: &request,
+                        finish_reason: "callback_aborted".to_owned(),
+                        synthetic: true,
+                        run_id,
+                        observer: &*observer,
+                        response: &synthetic_resp,
+                    },
                 )
                 .await?;
                 return Ok(AgentRun {
@@ -633,17 +650,29 @@ async fn append_terminal_observer_event(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn append_model_journal_call_result(
-    this: &Agent,
+struct ModelJournalCallRecord<'a> {
     iteration: u32,
-    request: &ProviderRequest,
+    request: &'a ProviderRequest,
     finish_reason: String,
     synthetic: bool,
-    run_id: &str,
-    observer: &dyn Observer,
-    response: &ProviderResponse,
+    run_id: &'a str,
+    observer: &'a dyn Observer,
+    response: &'a ProviderResponse,
+}
+
+async fn append_model_journal_call_result(
+    this: &Agent,
+    record: ModelJournalCallRecord<'_>,
 ) -> AgentResult<()> {
+    let ModelJournalCallRecord {
+        iteration,
+        request,
+        finish_reason,
+        synthetic,
+        run_id,
+        observer,
+        response,
+    } = record;
     append_model_journal_call(this, iteration, request, run_id, observer).await?;
     append_model_journal_result(
         this,

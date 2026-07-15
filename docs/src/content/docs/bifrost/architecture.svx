@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: DomainTable registration, schema fingerprinting, system columns, audit relay, and write-path redaction.
+description: Component responsibilities, data flow, storage model, concurrency, durability, and scaling for Gate, Scribe, Oracle, and Forge.
 pillar: wyrd
 group: Bifrost
 order: 3
@@ -8,37 +8,256 @@ order: 3
 
 # Bifrost Architecture
 
+Bifrost uses a four-component design: Gate (stateless routing), Scribe (durable WAL + seal), Oracle (stateless query), and Forge (stateless compaction). One binary can run all four roles by default. Optional role specialization via `WYRD_ROLES` env flag for separated deployments.
+
+## System diagram
+
+One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to scale horizontally. Postgres holds `vala.maintenance_leases` so Forge can lease `(namespace, table)` pairs and run one tick per table at a time.
+
+<WyrdBifrostSystem />
+
+## Component responsibilities
+
+| Component | Role | Statefulness | Scaling |
+|-----------|------|--------------|---------|
+| **Gate** | Auth, tenant/table resolution, dispatch | Stateless | Add pods, any pod handles any request |
+| **Scribe** | WAL append, memtable buffer, seal to Parquet, file_list registration | Per-pod stateful (WAL, memtables) | Add pods, symmetric (any Scribe handles any write) |
+| **Oracle** | Query execution, fused scan | Stateless (local caches only) | Add pods, any pod handles any query |
+| **Forge** | Bin-pack Parquet, Iceberg snapshot commits, GC | Stateless (Postgres-leased) | Multiple pods race for table leases |
+
+## End-to-end write flow
+
+<WyrdSequenceDiagram dense
+  title="Bifrost write flow"
+  participants={['Client SDK', 'Gate', 'Scribe', 'Object store', 'Postgres']}
+  messages={[
+    { from: 'Client SDK', to: 'Gate', label: 'batch (HTTP/gRPC)' },
+    { from: 'Gate', to: 'Scribe', label: 'route: tenant + table resolved' },
+    { from: 'Scribe', to: 'Scribe', label: 'WAL append + fsync' },
+    { from: 'Scribe', to: 'Gate', label: 'ack (durable, ~1-5 ms)', dashed: true },
+    { from: 'Gate', to: 'Client SDK', label: 'ack', dashed: true },
+    { from: 'Scribe', to: 'Scribe', label: 'accumulate in memtable' },
+    { from: 'Scribe', to: 'Scribe', label: 'seal: 50k · 1s · 128 MiB · 5s inactivity' },
+    { from: 'Scribe', to: 'Object store', label: 'PUT sealed Parquet' },
+    { from: 'Scribe', to: 'Postgres', label: 'INSERT vala.file_list + audit (atomic)' },
+    { from: 'Scribe', to: 'Scribe', label: 'truncate WAL past sealed_lsn' }
+  ]}
+/>
+
+1. **Client SDK** batches observations (traces, metrics, logs, evals, drift, user datasets).
+2. **Gate** authenticates, resolves DataTenantId + TableRef from Bifrost catalog, routes to any Scribe.
+3. **Scribe** appends to local WAL (Arrow IPC format, fsync), acks in ~1-5ms (fsync-bound).
+4. **Scribe** accumulates rows in memtable keyed by seal-key: `(DataTenantId, TableRef, EventDay)`.
+5. **Seal trigger:** 50k rows | 1s | 128 MiB | 5s inactivity.
+6. **Seal state machine:**
+   - Freeze memtable into an immutable Arrow snapshot.
+   - Encode Parquet (sorted by `data_tenant_id`, `wyrd_event_time`; bloom filters, page index).
+   - PUT to object store: `s3://{ns}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`.
+   - Atomic Postgres transaction: INSERT `vala.file_list` row + append audit rows.
+   - On commit, truncate WAL and retire manifest.
+7. **(Async) Forge** leases partition via `vala.maintenance_leases`, bin-packs small Parquet files into large ones, commits Iceberg snapshot via Mitari REPLACE, updates `vala.file_list` SET `compacted = true`.
+
+**Critical:** Scribe never writes Iceberg snapshots on the ingest hot path. Forge is the only Iceberg snapshot writer.
+
+## End-to-end read flow
+
+<WyrdSequenceDiagram dense
+  title="Bifrost read flow"
+  participants={['Client', 'Gate', 'Oracle', 'Postgres', 'Object store', 'Scribe']}
+  messages={[
+    { from: 'Client', to: 'Gate', label: 'query (typed method or SQL)' },
+    { from: 'Gate', to: 'Oracle', label: 'route: tenant + perms resolved' },
+    { from: 'Oracle', to: 'Postgres', label: 'SELECT vala.file_list WHERE NOT compacted' },
+    { from: 'Postgres', to: 'Oracle', label: 'un-compacted Parquet refs', dashed: true },
+    { from: 'Oracle', to: 'Object store', label: 'scan Iceberg + sealed Parquet' },
+    { from: 'Object store', to: 'Oracle', label: 'Arrow batches', dashed: true },
+    { from: 'Oracle', to: 'Scribe', label: 'live-tail RPC (Phase 2)' },
+    { from: 'Scribe', to: 'Oracle', label: 'in-memory rows', dashed: true },
+    { from: 'Oracle', to: 'Oracle', label: 'union · FilterExec(tenant_id) · execute' },
+    { from: 'Oracle', to: 'Gate', label: 'Arrow IPC stream', dashed: true },
+    { from: 'Gate', to: 'Client', label: 'result', dashed: true }
+  ]}
+/>
+
+1. **Client** issues query via typed `ValaQueryService` method (e.g., `QueryTraces`, `QueryMetrics`) or generic SQL (`POST /v1/observations/query`).
+2. **Gate** authenticates, resolves tenant + permissions, routes to any Oracle.
+3. **Oracle** builds DataFusion session with fused scan:
+   - **IcebergTableScan** (compacted data, partition-pruned by `Day(event_time)` + `Bucket(tenant, 64)`)
+   - **FileListScan** (`SELECT vala.file_list WHERE NOT compacted`, un-compacted Parquet files)
+   - **ScribeLiveTailScan** (gRPC to live Scribe pods for recent WAL data; Phase 2, partially implemented)
+4. Union, then `FilterExec(data_tenant_id = $tenant)` applied (non-removable via `TenantPredicateRule`).
+5. Execute plan, return Arrow IPC stream.
+
+**Query freshness:** Fresh data visible within seal latency (~1-5s typical) even before Forge compacts it.
+
+**Availability note:** Iceberg scan and FileListScan are planned. Live-tail RPC is partially implemented.
+
+## Storage model
+
+Data moves through four durability tiers. Each is written by exactly one component and read by at most one query path:
+
+| Layer | Purpose | Durability | Queried By |
+|-------|---------|------------|------------|
+| **WAL** (local disk) | Acknowledgment path | fsync before ack | Never (only for replay on restart) |
+| **Memtable** (RAM) | Accumulation buffer | Durable in WAL | Never (only live-tail in Phase 2) |
+| **Sealed Parquet** (object store) | Un-compacted staging files | Durable, indexed in `vala.file_list` | Oracle (FileListScan) |
+| **Iceberg snapshots** (object store) | Compacted files | Durable, tracked in Iceberg catalog | Oracle (IcebergTableScan) |
+
+### vala.file_list schema
+
+Postgres table tracking all sealed Parquet files:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | `BIGSERIAL PRIMARY KEY` | |
+| `data_tenant_id` | `UUID NOT NULL` | Tenant isolation key |
+| `namespace` | `TEXT NOT NULL` | e.g., `vala.traces`, `vala.metrics` |
+| `table_name` | `TEXT NOT NULL` | e.g., `spans`, `points` |
+| `file_path` | `TEXT NOT NULL UNIQUE` | Object store path |
+| `file_size` | `BIGINT NOT NULL` | Bytes |
+| `row_count` | `BIGINT NOT NULL` | Rows in file |
+| `min_event_time` | `TIMESTAMPTZ NOT NULL` | Earliest `wyrd_event_time` |
+| `max_event_time` | `TIMESTAMPTZ NOT NULL` | Latest `wyrd_event_time` |
+| `partition_day` | `DATE NOT NULL` | Exactly one Day per file |
+| `tenant_bucket` | `INT NOT NULL` | `Bucket(tenant, 64)` |
+| `compacted` | `BOOLEAN NOT NULL DEFAULT false` | `false` until Forge folds into snapshot |
+| `committed_snapshot_id` | `BIGINT` nullable | Iceberg snapshot ID (NULL until Forge commits) |
+| `node_id` | `TEXT NOT NULL` | Scribe pod ID |
+| `writer_epoch` | `BIGINT NOT NULL` | Scribe fencing token |
+| `wal_lsn_min` | `BIGINT NOT NULL` | WAL LSN range start |
+| `wal_lsn_max` | `BIGINT NOT NULL` | WAL LSN range end |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | |
+
+**LSN streams:** LSN is append-position in one Scribe pod's local WAL. LSNs are meaningful ONLY within one `(node_id, writer_epoch)` stream. Cross-pod LSNs are unrelated integers. Oracle uses per-stream watermark `MAX(wal_lsn_max)` per `(ns, table, tenant_bucket, node_id, writer_epoch)` to dedupe live-tail data.
+
+## Concurrency model
+
+### Stateless routing
+
+Gate has no affinity. Any pod handles any request.
+
+### Symmetric Scribes
+
+Any Scribe accepts any write on any table. No coordination on write path. Multiple Scribes writing to same partition on same wall-clock second: filenames encode `{pod_id}-{ulid}` for uniqueness. Oracle unions them at read time.
+
+### Epochs and LSN streams
+
+- **Fencing token.** On boot, Scribe bumps `vala.cluster_nodes.fencing_token` atomically and returns it as `writer_epoch`. Monotonic per `node_id`.
+- **LSN.** `u64` append-position in one Scribe pod's local WAL.
+- **Stream identity.** `(node_id, writer_epoch)` identifies the WAL stream producing a file.
+- **Cross-pod LSNs are unrelated.** LSNs from different pods or different epochs of the same pod are incomparable.
+- **Oracle deduplication.** Per-stream watermark prevents double-counting live-tail data.
+
+### Postgres-leased Forge
+
+Multiple Forge pods race for `(namespace, table)` leases via `vala.maintenance_leases`. One tick per table at a time. Scales linearly with table count (N pods × M tables, optimal when N ≤ M).
+
+### Cluster heartbeats
+
+- **`vala.cluster_nodes`.** Scribe and Oracle register with `role='scribe'|'oracle'`, heartbeat every 5s, 15s TTL.
+- **Fencing.** New epoch on boot gives a fresh LSN stream at LSN 0.
+
+### Bounded queues and backpressure
+
+- Scribe seal queue: bounded capacity. New appends return `429_INGEST_BUSY` when queue full (seal stalled).
+- Oracle query admission: bounded concurrency per pod.
+
+## Durability and failure handling
+
+### fsync acknowledgment
+
+Scribe appends WAL record, calls `fsync(segment_fd)`, returns `Ok(lsn)` only after fsync. Ack is durable.
+
+Every `ScribeAppend` produces audit record (kind=1) immediately followed by data record (kind=0); both fsync'd before ack.
+
+### WAL replay on restart
+
+Scribe's manifest records `sealed_lsn[K]` per seal-key. On boot:
+1. Read WAL segments past `sealed_lsn`
+2. Rebuild memtables and staged `AuditEvent`s
+3. Dedupe by `batch_id` at replay layer
+4. Dedupe by `(node_id, writer_epoch, wal_lsn_min, wal_lsn_max)` on `file_list` INSERT (unique index)
+5. Truncate torn tails (CRC validation, LSN monotonicity check)
+
+Idempotent: if the pod crashed after PUT but before COMMIT, replay re-encodes Parquet under a new ulid; the pre-crash file becomes an orphan and Forge GC reaps it.
+
+### Failure scenarios
+
+| Failure | Behavior |
+|---------|----------|
+| Scribe crashes after WAL append but before seal | WAL replay rebuilds memtable, seal retries |
+| Scribe crashes after Parquet PUT but before Postgres COMMIT | Rollback atomically, no `file_list` row, no audit rows, Parquet becomes orphan (Forge GC reaps) |
+| Scribe crashes after Postgres COMMIT | WAL bytes retired, file visible to Oracle |
+| Forge crashes mid-tick | Lease expires, successor pod re-derives state from durable surface and re-runs (idempotent) |
+| Object storage temporarily unavailable | Seal retries with backoff; new appends return `429_INGEST_BUSY` until PUT succeeds |
+| Postgres temporarily unavailable | Seal retries; WAL replay reconstructs state on recovery |
+
+## Horizontal scaling
+
+- **Gate:** Add pods, autoscale on CPU/memory via HPA.
+- **Scribe:** Add pods, autoscale, symmetric. Any pod handles any write.
+- **Oracle:** Add pods, autoscale, stateless per query. Distributed lane scatters broad scans across peer Oracle pods (planned).
+- **Forge:** Add pods, scales linearly with table count until N pods = M tables.
+
+## Deployment modes
+
+**Default:** One binary runs all four roles: Gate + Scribe + Oracle + Forge.
+
+**Optional specialization via `WYRD_ROLES` env flag:**
+- `WYRD_ROLES=gate,scribe,forge,oracle` (default if unset)
+- Operator may restrict pod to subset: e.g., `WYRD_ROLES=scribe` for fast-disk StatefulSets, `WYRD_ROLES=oracle` for memory-heavy nodes.
+
+Not a requirement; architecture works with flag unset. Autoscaling is per-pod, not per-role: HPA on CPU/memory, add pods, done.
+
+## Data categories
+
+All categories flow through unified Bifrost schema:
+
+| Category | Table | Partitioning | Isolation |
+|----------|-------|--------------|-----------|
+| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Traces (spans)** | `vala.traces.spans` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Traces (events, links)** | `vala.traces.events`, `vala.traces.links` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Metrics** | `vala.metrics.points` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Logs** | `vala.logs.records` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **GenAI signals** | `vala.genai.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Evaluations** | `vala.eval.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **Drift** | `vala.drift.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
+| **User datasets** | `vala.datasets.<tenant_uuid>.<name>` | `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot) | Physical namespace + `data_tenant_id` + `FilterExec` |
+
+**Shared signal tables** use multi-tenant partitioning via `Bucket(tenant, 64)`. **Tenant-scoped dynamic datasets** collapse to 1 bucket (physical isolation + logical RLS).
+
 ## DomainTable and boot registration
 
-Every queryable table in Bifrost is a `DomainTable` — a pre-declared, validated description of the physical schema a Vala domain owns. At server boot, `register_all` iterates the full `DomainTable` set and ensures each table exists in the Iceberg catalog under its fully-qualified name (`vala.<namespace>.<table>`). Tables that are absent are created; tables with a mismatched fingerprint are flagged and not silently migrated.
+Every queryable table in Bifrost is a `DomainTable`: a pre-declared, validated description of the physical schema a Vala domain owns. At server boot, `register_all` iterates the full `DomainTable` set and ensures each table exists in the Iceberg catalog under its fully-qualified name (`vala.<namespace>.<table>`). Tables that are absent are created; tables with a mismatched fingerprint are flagged and not silently migrated.
 
 A `DomainTable` carries:
 
-- **FQN** — `vala.traces.spans`, `vala.genai.messages`, etc.
-- **Schema** — Arrow field list with types, nullability, and metadata.
-- **Scope** — `SystemShared`: all tenants write to the same physical Iceberg table; the `data_tenant_id` column enforces tenant isolation in the scan path.
-- **Partition spec** — typically `[data_tenant_id, wyrd_event_time_day]`.
-- **Sensitive payload columns** — the columns projected away by the payload permission gate.
-- **Correlation policy** — which of `run_id`, `card_uid`, `principal_id` are stamped.
+- **FQN.** `vala.traces.spans`, `vala.genai.messages`, etc.
+- **Schema.** Arrow field list with types, nullability, and metadata.
+- **Scope.** `SystemShared`: all tenants write to the same physical Iceberg table; the `data_tenant_id` column enforces tenant isolation in the scan path.
+- **Partition spec.** Typically `Day(event_time) + Bucket(tenant, 64)`.
+- **Sensitive payload columns.** The columns projected away by the payload permission gate.
+- **Correlation policy.** Which of `run_id`, `card_uid`, `principal_id` are stamped.
 
 ## Schema fingerprinting and strict schema matching
 
-The `SchemaFingerprint` is a 32-byte SHA-256 hash of the Arrow IPC bytes of the table's declared user fields. The fingerprint is stored alongside the `DomainTable` registration. Every Arrow batch arriving at `BifrostIngestService` is validated against the stored fingerprint before any Iceberg commit. A mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH` and writes no data.
+The `SchemaFingerprint` is a 32-byte SHA-256 hash of the Arrow IPC bytes of the table's declared user fields. The fingerprint is stored alongside the `DomainTable` registration. Every Arrow batch arriving at Gate is validated against the stored fingerprint before Scribe accept. A mismatch returns `400 WYRD_VALA_400_SCHEMA_FINGERPRINT_MISMATCH` and writes no data.
 
-This means the physical schema is frozen at registration — schema evolution requires an explicit migration (Stage 5 concern).
+This means the physical schema is frozen at registration; schema evolution requires an explicit migration (deferred).
 
 ## System columns
 
-Every domain table appends system columns that are not part of the user-declared schema. All system and correlation columns are server-stamped — callers never write them. Any row that arrives with a system column set in the user payload is rejected.
+Every domain table appends system columns that are not part of the user-declared schema. All system and correlation columns are server-stamped; callers never write them. Any row that arrives with a system column set in the user payload is rejected.
 
 **Bifrost system columns** (always present):
 
 | Column | Type | Stamped by |
 |---|---|---|
-| `data_tenant_id` | `Utf8` | Ingest service (from the authenticated principal) |
-| `wyrd_event_time` | `Timestamp(Microseconds, UTC)` | Ingest service (first observation timestamp in the batch) |
-| `wyrd_ingested_at` | `Timestamp(Microseconds, UTC)` | Ingest service (wall-clock flush time) |
-| `wyrd_batch_id` | `FixedSizeBinary(16)` | Ingest service (UUIDv7, unique per batch) |
+| `data_tenant_id` | `Utf8` | Gate (from authenticated principal) |
+| `wyrd_event_time` | `Timestamp(Microseconds, UTC)` | Gate (first observation timestamp in batch) |
+| `wyrd_ingested_at` | `Timestamp(Microseconds, UTC)` | Scribe (wall-clock seal time) |
+| `wyrd_batch_id` | `FixedSizeBinary(16)` | Gate (UUIDv7, unique per batch) |
 
 **Correlation columns** (policy-conditional, server-stamped, non-writable by callers):
 
@@ -48,20 +267,39 @@ Every domain table appends system columns that are not part of the user-declared
 | `card_uid` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
 | `principal_id` | `Utf8` (nullable) | `CorrelationPolicy::Observation` or `CodeAxis` |
 
-`CorrelationPolicy::None` tables (e.g. `system.audit_log`) receive no correlation columns. `CorrelationPolicy::CodeAxis` tables (e.g. `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`. See `CorrelationPolicy` in `crates/vala/vala-bifrost/src/tables/mod.rs` for the authoritative mapping.
+`CorrelationPolicy::None` tables (e.g., `system.audit_log`) receive no correlation columns. `CorrelationPolicy::CodeAxis` tables (e.g., `dev.agent_traces`) own `run_id` as a content column and do not receive the universal correlation `run_id`.
 
 ## Tenant isolation: TenantPredicateRule
 
-The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `SessionContext` created by `wyrd_session_context(tenant_id)`. It walks every `TableScan` node in the plan, identifies any `WyrdTableProvider` source (all domain tables use this provider), and prepends a filter `data_tenant_id = $tenant` as a non-removable predicate. The rule runs at analysis time — before optimization and before execution — so a plan that reaches execution is guaranteed to carry the predicate.
+The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `SessionContext` created by `wyrd_session_context(tenant_id)`. It walks every `TableScan` node in the plan, identifies any `WyrdTableProvider` source (all domain tables use this provider), and prepends a filter `data_tenant_id = $tenant` as a non-removable predicate. The rule runs at analysis time, before optimization and before execution, so a plan that reaches execution is guaranteed to carry the predicate.
 
 The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
 
 ## Audit relay
 
-Every Bifrost write operation appends an audit row to the `vala.audit.log` domain table via the audit relay — a background worker that tails the `vala_outbox` table and ships rows to the OLAP store on a configurable schedule. The relay is a supervision-tree worker started at boot (`spawn_audit_relay`).
+Every Bifrost write operation appends audit rows atomically with the `vala.file_list` INSERT. Audit records are hash-chained and Ed25519-signed at seal boundaries. A separate audit relay worker tails the audit outbox and ships finalized records to long-term storage on a configurable schedule.
 
-The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and a detail field. Denials are written in a separate fail-closed transaction before the `403` is returned to the caller.
+The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.
 
-## Write-path redaction (M-03)
+## Payload governance
 
-Certain domain tables carry a redaction policy. Columns in the `REDACTED_COLUMNS` set are zeroed (strings → empty, numerics → 0, binaries → zero bytes) before the Arrow batch is committed. This applies to fields that should never be stored at rest — for example, raw prompt text in GenAI tables when a tenant has redaction enabled. Redaction happens server-side, is transparent to the SDK, and is logged in the audit row.
+Sensitive columns (span attributes, log body, GenAI messages, agent-trace payloads) are projected away at the DataFusion plan stage unless the caller holds the matching payload read permission:
+
+- `bifrost_trace_payload:read`
+- `bifrost_log_payload:read`
+- `bifrost_genai_payload:read`
+- `bifrost_agent_trace_payload:read`
+
+Projection happens in Oracle before execution. Callers without permission see `NULL` for payload columns.
+
+Write-path redaction (when enabled) zeros sensitive columns before seal. Columns in the `REDACTED_COLUMNS` set are zeroed (strings become empty, numerics become 0, binaries become zero bytes) before the Arrow batch is sealed to Parquet. Redaction is transparent to the SDK and logged in the audit row.
+
+## Database privilege model
+
+Bifrost uses three Postgres connection pools with distinct privilege levels:
+
+- **TenantConn** (RLS-enforced, `wyrd_app` role). Tenant-scoped queries and writes. Row-level security enforced on `data_tenant_id`.
+- **OperatorPool** (BYPASSRLS, `wyrd_platform_admin` role). Cross-tenant reads/writes for Forge compaction, Oracle fused scans, and maintenance tasks.
+- **RecoveryConn** (`wyrd_recovery` role). Disaster recovery and migration tasks only.
+
+Scribe uses TenantConn for audit writes (RLS-bound). Forge and Oracle use OperatorPool for cross-tenant operations with explicit admin roles.

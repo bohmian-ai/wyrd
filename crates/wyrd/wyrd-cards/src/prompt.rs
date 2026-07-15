@@ -37,6 +37,7 @@ use {
 /// This is not a registry record. It stores the native Skald prompt that will
 /// be wrapped in a Wyrd `PromptSpec` when the holder is serialized.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.prompt", from_py_object))]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptCardMetadata {
@@ -52,6 +53,7 @@ pub struct PromptCardMetadata {
     feature = "python",
     pyclass(module = "wyrd.prompt", name = "PromptRef", skip_from_py_object)
 )]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptRef {
@@ -87,6 +89,7 @@ impl PromptCardMetadata {
     feature = "python",
     pyclass(module = "wyrd.prompt", skip_from_py_object)
 )]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize)]
 pub struct PromptCard {
@@ -403,6 +406,7 @@ impl PromptCard {
     /// Returns a Wyrd error when the prompt, settings, or metadata labels are invalid.
     #[new]
     #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, model_settings=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the PromptCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         py: Python<'_>,
@@ -610,6 +614,7 @@ impl PromptCard {
     /// Returns a Wyrd error when `PromptSpec` validation, serialization, or
     /// filesystem IO fails.
     #[wyrd_test_contract_macros::critical("python:PromptCard.save")]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn save(&self, path: PathBuf) -> CardPyResult<()> {
         Ok(io::write_card_file(&self.to_card()?, &path)?)
@@ -625,6 +630,7 @@ impl PromptCard {
     /// fails.
     #[wyrd_test_contract_macros::critical("python:PromptCard.load")]
     #[staticmethod]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
@@ -644,6 +650,7 @@ impl PromptCard {
     #[wyrd_test_contract_macros::critical("python:PromptCard.from_path")]
     #[staticmethod]
     #[pyo3(name = "from_path")]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn from_path_py(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
         let mut card = Self::from_card(io::read_card_file(&path)?)?;
@@ -693,6 +700,7 @@ impl PromptCard {
         }
     }
 
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(prompt) = self.prompt.as_ref() {

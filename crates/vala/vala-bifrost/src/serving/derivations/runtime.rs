@@ -308,18 +308,20 @@ impl DerivationRuntime {
             .map_err(BifrostError::Sql)?;
         let outcome = vala_sql::queries::olap_derivations::register_derivation_with_contract(
             &mut conn,
-            derivation_uid_bytes,
-            &self.uids.source,
-            // target_table_uid records the "primary" target for registration;
-            // full target-set semantics live in target_set_fingerprint.
-            &self.uids.messages,
-            Uuid::nil(),
-            "genai_from_spans",
-            None,
-            vala_sql::queries::olap_derivations::DerivationContract {
-                source_schema_fingerprint: &source_schema_fingerprint,
-                transform_fingerprint: &transform_fingerprint,
-                target_set_fingerprint: &target_set_fingerprint,
+            vala_sql::queries::olap_derivations::DerivationRegistration {
+                derivation_uid: derivation_uid_bytes,
+                source_table_uid: &self.uids.source,
+                // target_table_uid records the "primary" target for registration;
+                // full target-set semantics live in target_set_fingerprint.
+                target_table_uid: &self.uids.messages,
+                control_bind: Uuid::nil(),
+                fqn: "genai_from_spans",
+                registered_watermark: None,
+                contract: vala_sql::queries::olap_derivations::DerivationContract {
+                    source_schema_fingerprint: &source_schema_fingerprint,
+                    transform_fingerprint: &transform_fingerprint,
+                    target_set_fingerprint: &target_set_fingerprint,
+                },
             },
         )
         .await

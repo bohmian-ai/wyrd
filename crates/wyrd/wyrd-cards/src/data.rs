@@ -46,6 +46,7 @@ use {
 /// contract from the `DataCard` plan and is converted into `DataSpec` when a
 /// Rust-only spec body is needed.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", from_py_object))]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DataCardMetadata {
@@ -94,6 +95,7 @@ impl Default for DataCardMetadata {
 /// data interface. It can save and load local filesystem materialization, but
 /// it never registers itself and never creates Artifact cards.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", skip_from_py_object))]
+// justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Serialize, Deserialize)]
 pub struct DataCard {
@@ -265,6 +267,7 @@ impl DataCard {
     /// conversion, or schema inference fails.
     #[new]
     #[pyo3(signature = (data, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the DataCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         data: &Bound<'_, PyAny>,
@@ -490,6 +493,7 @@ impl DataCard {
     /// fails, or card JSON cannot be written.
     #[wyrd_test_contract_macros::critical("python:DataCard.save")]
     #[pyo3(signature = (path, save_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn save(
         &mut self,
@@ -517,6 +521,7 @@ impl DataCard {
     /// fails.
     #[wyrd_test_contract_macros::critical("python:DataCard.load")]
     #[pyo3(signature = (path=None, load_kwargs=None))]
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
@@ -569,6 +574,7 @@ impl DataCard {
         Ok(card)
     }
 
+    // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         if let Some(interface) = self.interface.as_ref() {

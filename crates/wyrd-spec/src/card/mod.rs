@@ -126,16 +126,16 @@ mod data_methods_tests {
         let split_ref = card_ref();
         let train_split = DataSplit::materialized(split("train"), split_ref.clone());
         let artifact = card_ref();
-        let spec = DataSpec::new(
-            interface(),
-            schema(),
-            vec![artifact.clone()],
-            HashMap::from([(split("train"), train_split)]),
-            vec![col("target")],
-            None,
-            stats(),
-        )
-        .unwrap();
+        let spec = DataSpec {
+            interface: interface(),
+            schema: schema(),
+            card_refs: vec![artifact.clone()],
+            splits: HashMap::from([(split("train"), train_split)]),
+            target_columns: vec![col("target")],
+            sql: None,
+            stats: stats(),
+        };
+        spec.validate().unwrap();
 
         assert_eq!(spec.interface_kind(), "Pandas");
         assert!(spec.is_tabular());
@@ -266,16 +266,17 @@ mod data_roundtrip_tests {
         } else {
             DataSchema::empty()
         };
-        DataSpec::new(
+        let spec = DataSpec {
             interface,
             schema,
-            Vec::new(),
-            HashMap::new(),
-            Vec::new(),
+            card_refs: Vec::new(),
+            splits: HashMap::new(),
+            target_columns: Vec::new(),
             sql,
-            stats(),
-        )
-        .unwrap()
+            stats: stats(),
+        };
+        spec.validate().unwrap();
+        spec
     }
 
     fn interfaces() -> Vec<DataInterface> {

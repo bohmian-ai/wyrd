@@ -3,10 +3,10 @@ mod pg_tests {
     //!
     //! Tests verify:
     //! - Interleaved tenant LSNs seal correctly after crash/replay
-    //! - Replay-driven seal preserves per-append audit with correct principal_id
-    //! - Restart reproduces file_list rows with prior writer_epoch
+    //! - Replay-driven seal preserves per-append audit with correct `principal_id`
+    //! - Restart reproduces `file_list` rows with prior `writer_epoch`
     //!
-    //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
+    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
     #[tokio::test]
     #[ignore = "requires WAL replay + multi-tenant test harness"]

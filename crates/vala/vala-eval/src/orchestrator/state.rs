@@ -161,6 +161,7 @@ impl RunState {
     ///
     /// # Errors
     /// Returns [`OrchestratorError`] if an internal state invariant is broken.
+    // justification: orchestrator next() returns Result and is retry-safe on outstanding directives; does not match Iterator::next semantics
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<NextDirective, OrchestratorError> {
         if let Some(outstanding) = &self.outstanding {

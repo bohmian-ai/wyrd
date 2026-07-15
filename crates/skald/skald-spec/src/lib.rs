@@ -2,8 +2,6 @@
 //!
 //! Pure Rust. No IO. No async. No PyO3. No HTTP clients.
 
-#![allow(clippy::module_name_repetitions)]
-
 pub mod adapter;
 pub mod authoring;
 pub mod convert;

@@ -126,15 +126,23 @@ mod pg_tests {
             .unwrap();
 
         catalog
-            .create_table(
-                BifrostNamespace::Bifrost,
-                "dup_test",
-                vec![Field::new("val", DataType::Int64, false)],
-                TableScope::TenantOwned,
-                tenant,
-                &[],
-                None,
-            )
+            .create_table(vala_bifrost::catalog::CreateTableRequest {
+
+                ns: BifrostNamespace::Bifrost,
+
+                name: "dup_test",
+
+                user_fields: vec![Field::new("val", DataType::Int64, false)],
+
+                scope: TableScope::TenantOwned,
+
+                tenant: tenant,
+
+                partition_columns: &[],
+
+                audit: None,
+
+            })
             .await
             .unwrap();
 

@@ -97,13 +97,15 @@ mod pg_tests {
             .unwrap();
         vala_sql::queries::olap_catalog::record_fence_loss_after_append(
             &mut conn,
-            &table_uid,
-            &batch_id,
-            owner,
-            token,
-            snapshot_id,
-            false,
-            Some("iceberg append succeeded but fence lost"),
+            vala_sql::queries::olap_catalog::FenceLossRecord {
+                table_uid: &table_uid,
+                batch_id: &batch_id,
+                owner,
+                token,
+                snapshot_id,
+                rolled_back: false,
+                error: Some("iceberg append succeeded but fence lost"),
+            },
         )
         .await
         .unwrap();

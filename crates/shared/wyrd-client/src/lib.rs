@@ -5,7 +5,6 @@
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-#![allow(clippy::module_name_repetitions)]
 
 pub mod auth;
 pub mod client;

@@ -163,6 +163,7 @@ pub fn replay_wal_directory(
 ///
 /// For PR#4, tests use a flat temp directory structure. Real multi-key replay testing
 /// requires the directory routing in PR#5.
+// justification: stub implementation for path-parsing; the real implementation returns fallible Result<SealKey, ScribeError>
 #[allow(clippy::unnecessary_wraps)]
 fn extract_seal_key_from_path(_wal_dir: &Path) -> Result<SealKey, ScribeError> {
     // Placeholder for PR#4 — real path parsing in PR#5

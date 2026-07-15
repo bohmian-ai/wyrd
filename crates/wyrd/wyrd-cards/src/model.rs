@@ -278,6 +278,7 @@ impl ModelCard {
     /// conversion, or model spec validation fails.
     #[new]
     #[pyo3(signature = (model_or_interface, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the ModelCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         model_or_interface: &Bound<'_, PyAny>,

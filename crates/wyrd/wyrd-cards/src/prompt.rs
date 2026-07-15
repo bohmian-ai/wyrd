@@ -406,6 +406,7 @@ impl PromptCard {
     /// Returns a Wyrd error when the prompt, settings, or metadata labels are invalid.
     #[new]
     #[pyo3(signature = (prompt, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None, model_settings=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the PromptCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         py: Python<'_>,

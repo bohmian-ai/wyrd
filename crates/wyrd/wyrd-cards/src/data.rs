@@ -267,6 +267,7 @@ impl DataCard {
     /// conversion, or schema inference fails.
     #[new]
     #[pyo3(signature = (data, space=None, name=None, version=None, uid=None, labels=None, annotations=None, metadata=None))]
+    // justification: pyo3 #[new] signature must match the Python API surface; params correspond 1:1 to the DataCard() Python constructor
     #[allow(clippy::too_many_arguments)]
     pub fn __new__(
         data: &Bound<'_, PyAny>,

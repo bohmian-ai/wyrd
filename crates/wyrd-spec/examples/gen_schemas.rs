@@ -40,10 +40,10 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
-    CardSubmission, CardSummary, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
-    GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
-    RegisterOutcome as CardRegisterOutcome, RegistrationOperationId, RegistrationReceipt,
-    RelativeArtifactPath, StoredArtifactEntry, SubmissionMetadata,
+    CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadPlan, CreateCardRequest,
+    CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
+    ListVersionsResponse, PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind,
+    RegistrationReceipt, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};
@@ -151,15 +151,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Card registration wire contracts (task 01).
     write::<CardSubmission>(out, golden, "card_submission")?;
-    write::<SubmissionMetadata>(out, golden, "submission_metadata")?;
     write::<ArtifactManifestEntry>(out, golden, "artifact_manifest_entry")?;
+    write::<CardRegistrationOutcome>(out, golden, "card_registration_outcome")?;
+    write::<CardUploadPlan>(out, golden, "card_upload_plan")?;
+    write::<PresignedUpload>(out, golden, "presigned_upload")?;
     write::<CreateCardRequest>(out, golden, "create_card_request")?;
     write::<CreateCardResponse>(out, golden, "create_card_response")?;
     write::<RegistrationReceipt>(out, golden, "registration_receipt")?;
     write::<RegistrationOperationId>(out, golden, "registration_operation_id")?;
     write::<RelativeArtifactPath>(out, golden, "relative_artifact_path")?;
     write::<CardLifecycleStatus>(out, golden, "card_lifecycle_status")?;
-    write::<CardRegisterOutcome>(out, golden, "card_register_outcome")?;
+    write::<RegistrationOutcomeKind>(out, golden, "registration_outcome_kind")?;
     write::<GetCardResponse>(out, golden, "get_card_response")?;
     write::<DeleteCardResponse>(out, golden, "delete_card_response")?;
     write::<CardSummary>(out, golden, "card_summary")?;

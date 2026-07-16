@@ -112,7 +112,7 @@ mod pg_tests {
     });
 
     // Verify that a card missing `metadata.space` is rejected at the boundary
-    // before any database write, returning WYRD_REG_400_INVALID_CARD_SPEC.
+    // before any database write, returning WYRD_REGISTRY_400_INVALID_CARD_SPEC.
     e2e_test!(register_missing_space_returns_400_invalid_card_spec, {
         let env = TestEnv::new().await;
         let tenant = env.fresh_tenant().await;
@@ -122,7 +122,7 @@ mod pg_tests {
 
         let err = scenarios::expect_register_error(&env, tenant, &actor, &card).await;
 
-        assert_error_code(&err, "WYRD_REG_400_INVALID_CARD_SPEC");
+        assert_error_code(&err, "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
     });
 
     // ─── PR2 Group V — Version resolution, dedup, range reads ─────────────────
@@ -190,7 +190,7 @@ mod pg_tests {
 
     // Service and Agent cards require an explicit semver pin. Verify that
     // auto-version (None) and scope-version submissions are rejected with
-    // WYRD_REG_400_INVALID_VERSION_BLOCK for both kinds, while a correctly
+    // WYRD_REGISTRY_400_INVALID_VERSION_BLOCK for both kinds, while a correctly
     // pinned submission succeeds and projects a service account.
     e2e_test!(service_and_agent_remain_pin_only, {
         let env = TestEnv::new().await;
@@ -216,17 +216,17 @@ mod pg_tests {
 
             let auto = fixture_card_auto(kind.clone(), "prod", &auto_name);
             let err = scenarios::expect_register_error(&env, tenant, &actor, &auto).await;
-            assert_error_code(&err, "WYRD_REG_400_INVALID_VERSION_BLOCK");
+            assert_error_code(&err, "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK");
 
             let scoped = fixture_card_scoped(kind, "prod", &scope_name, "1");
             let err = scenarios::expect_register_error(&env, tenant, &actor, &scoped).await;
-            assert_error_code(&err, "WYRD_REG_400_INVALID_VERSION_BLOCK");
+            assert_error_code(&err, "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK");
         }
     });
 
     // A scoped version (e.g. `~1.2`) with a Minor bump that would exit the
     // authored range (1.3.x is outside `~1.2`) must be rejected with
-    // WYRD_REG_400_INVALID_VERSION_BLOCK rather than silently emitting an
+    // WYRD_REGISTRY_400_INVALID_VERSION_BLOCK rather than silently emitting an
     // out-of-range version.
     e2e_test!(scoped_bump_must_stay_inside_authored_range, {
         let env = TestEnv::new().await;
@@ -243,7 +243,7 @@ mod pg_tests {
         );
         per_kind::mutate_for_drift(&mut escaping);
         let err = scenarios::expect_register_error(&env, tenant, &actor, &escaping).await;
-        assert_error_code(&err, "WYRD_REG_400_INVALID_VERSION_BLOCK");
+        assert_error_code(&err, "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK");
     });
 
     // Seeds a range-card line with five stable versions (1.0.0, 1.2.0, 1.2.5,
@@ -369,7 +369,7 @@ mod pg_tests {
             .expect("first register must succeed");
 
         assert_created(&first);
-        assert_error_code(&err, "WYRD_REG_409_SPEC_DRIFT");
+        assert_error_code(&err, "WYRD_REGISTRY_409_SPEC_DRIFT");
     });
 
     // ─── Group D — Delete ───────────────────────────────────────────────────────
@@ -393,7 +393,7 @@ mod pg_tests {
     });
 
     // Soft-deleting a uid that does not exist in the tenant must return
-    // WYRD_REG_404_CARD_NOT_FOUND rather than silently succeeding.
+    // WYRD_REGISTRY_404_CARD_NOT_FOUND rather than silently succeeding.
     e2e_test!(soft_delete_unknown_uid_returns_404, {
         let env = TestEnv::new().await;
         let tenant = env.fresh_tenant().await;
@@ -405,7 +405,7 @@ mod pg_tests {
             .await
             .expect_err("unknown uid must return 404");
 
-        assert_error_code(&err, "WYRD_REG_404_CARD_NOT_FOUND");
+        assert_error_code(&err, "WYRD_REGISTRY_404_CARD_NOT_FOUND");
     });
 
     // ─── PR2 Group Q/P/H/S — Query, pagination, probes, invariants ────────────
@@ -633,7 +633,7 @@ mod pg_tests {
     // 2. `version` is immutable after INSERT — UPDATE is rejected by the
     //    `cards_version_immutable` trigger.
     // 3. A card whose `kind` field does not match its spec variant is rejected
-    //    with WYRD_REG_400_INVALID_CARD_SPEC before the INSERT.
+    //    with WYRD_REGISTRY_400_INVALID_CARD_SPEC before the INSERT.
     e2e_test!(version_columns_and_kind_spec_mismatch_are_rejected, {
         let env = TestEnv::new().await;
         let tenant = env.fresh_tenant().await;
@@ -663,7 +663,7 @@ mod pg_tests {
         let mut mismatch = fixture_card(CardKind::Model, "prod", "mismatch-card", "1.0.0");
         mismatch.kind = CardKind::Service;
         let err = scenarios::expect_register_error(&env, tenant, &actor, &mismatch).await;
-        assert_error_code(&err, "WYRD_REG_400_INVALID_CARD_SPEC");
+        assert_error_code(&err, "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
 
         assert!(VersionSpec::parse("^1.0").is_err());
     });
@@ -990,7 +990,7 @@ mod pg_tests {
 
     // ─── Group N — No-stable-match error from get_latest_card_by_range ──────────
 
-    // `get_latest_card_by_range` returns WYRD_REG_404_CARD_NOT_FOUND in two
+    // `get_latest_card_by_range` returns WYRD_REGISTRY_404_CARD_NOT_FOUND in two
     // cases: (1) the line contains only a pre-release row and the range matches
     // no stable version, and (2) the line does not exist at all. Both paths must
     // return 404 rather than 500.
@@ -1015,7 +1015,7 @@ mod pg_tests {
         .await
         .expect_err("no stable match must return error");
 
-        assert_error_code(&err, "WYRD_REG_404_CARD_NOT_FOUND");
+        assert_error_code(&err, "WYRD_REGISTRY_404_CARD_NOT_FOUND");
 
         let no_card_err = scenarios::latest_by_range(
             &env,
@@ -1028,6 +1028,6 @@ mod pg_tests {
         .await
         .expect_err("missing card must return 404");
 
-        assert_error_code(&no_card_err, "WYRD_REG_404_CARD_NOT_FOUND");
+        assert_error_code(&no_card_err, "WYRD_REGISTRY_404_CARD_NOT_FOUND");
     });
 }

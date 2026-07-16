@@ -85,7 +85,7 @@ resp = httpx.post(
 )
 if resp.status_code >= 400:
     problem = resp.json()
-    if problem["code"] == "WYRD_REG_409_SPEC_DRIFT":
+    if problem["code"] == "WYRD_REGISTRY_409_SPEC_DRIFT":
         # Spec changed at the same version — bump the version and retry.
         ...
     # Preserve the full structure; never collapse it into prose.

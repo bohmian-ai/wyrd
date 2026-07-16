@@ -1,27 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CreateCardRequest",
-  "description": "Create-card request.",
+  "description": "Composite registration request.",
   "type": "object",
   "required": [
-    "card"
+    "submissions"
   ],
   "properties": {
-    "artifacts": {
-      "description": "Artifact manifest, empty for metadata-only cards.",
-      "default": [],
+    "submissions": {
+      "description": "Flat list of cards. The server topo-sorts the graph and derives root.",
       "type": "array",
       "items": {
-        "$ref": "#/definitions/ArtifactManifestEntry"
+        "$ref": "#/definitions/CardSubmission"
       }
-    },
-    "card": {
-      "description": "Submitted card data.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/CardSubmission"
-        }
-      ]
     }
   },
   "additionalProperties": false,
@@ -35,33 +26,34 @@
       "type": "string"
     },
     "ArtifactManifestEntry": {
-      "description": "One artifact expected by a registration.",
+      "description": "One heavy artifact declared by a submission.",
       "type": "object",
       "required": [
-        "expected_sha256",
-        "expected_size_bytes",
-        "relative_path"
+        "relative_path",
+        "sha256",
+        "size_bytes"
       ],
       "properties": {
         "content_type": {
-          "description": "Optional MIME type.",
+          "description": "Optional MIME type for the stored object.",
           "type": [
             "string",
             "null"
           ]
         },
-        "expected_sha256": {
-          "description": "Base64-encoded SHA-256 digest.",
-          "type": "string"
-        },
-        "expected_size_bytes": {
-          "description": "Expected byte length.",
-          "type": "integer",
-          "format": "int64"
-        },
         "relative_path": {
-          "description": "Relative artifact path.",
+          "description": "Validated path below the registered card's artifact prefix.",
           "type": "string"
+        },
+        "sha256": {
+          "description": "Base64-encoded SHA-256 digest of the artifact bytes.",
+          "type": "string"
+        },
+        "size_bytes": {
+          "description": "Declared artifact size in bytes.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0.0
         }
       },
       "additionalProperties": false
@@ -94,7 +86,7 @@
       "type": "string"
     },
     "CardSubmission": {
-      "description": "Card envelope submitted for registration, without server-managed fields.",
+      "description": "One card submitted for registration.\n\nThe server derives relationships, lifecycle status, resolved version, and UID. A submission is therefore intentionally smaller than a stored Card envelope and cannot carry those server-managed fields.",
       "type": "object",
       "required": [
         "apiVersion",
@@ -111,6 +103,14 @@
             }
           ]
         },
+        "artifacts": {
+          "description": "Heavy artifact manifest for this submission.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ArtifactManifestEntry"
+          }
+        },
         "kind": {
           "description": "Card kind.",
           "allOf": [
@@ -120,44 +120,56 @@
           ]
         },
         "metadata": {
-          "description": "Author-supplied metadata.",
+          "description": "Author-supplied card metadata.",
           "allOf": [
             {
-              "$ref": "#/definitions/SubmissionMetadata"
+              "$ref": "#/definitions/Metadata"
             }
           ]
         },
         "spec": {
-          "description": "Kind-specific spec."
+          "description": "Kind-specific spec body."
         }
       },
       "additionalProperties": false
+    },
+    "CardUid": {
+      "description": "Resolved immutable Card UID.",
+      "type": "string"
+    },
+    "CommitSha": {
+      "type": "string",
+      "maxLength": 40,
+      "minLength": 7,
+      "pattern": "^[0-9a-f]{7,40}$"
     },
     "LabelValue": {
       "description": "Validated value for queryable Card and Run labels.",
       "type": "string"
     },
-    "SpaceName": {
-      "description": "Human-visible namespace for Cards and Runs.",
-      "type": "string"
-    },
-    "SubmissionMetadata": {
-      "description": "Metadata accepted on a registration submission.",
+    "Metadata": {
+      "description": "Card metadata common to every kind.\n\n`version` and `bump` capture the author's declarative intent on the register path. The server resolves both to a concrete pin before the envelope is returned to the caller:\n\n- Pre-register: `version` may be `None` (server bumps absolute latest or seeds `0.1.0`), `Some(VersionSpec::Scope(\"1.0\"))` (server bumps within the prefix line), or `Some(VersionSpec::Pin(\"1.4.2\"))` (exact pin). `bump` selects the bump level applied on the auto-bump paths (defaults to `Patch` if unset). - Post-register: `version` is always `Some(VersionSpec::Pin(resolved))`; readers may use [`Metadata::resolved_pin`] to extract the [`VersionBlock`].",
       "type": "object",
       "required": [
-        "name",
-        "space"
+        "name"
       ],
       "properties": {
         "annotations": {
-          "description": "Free-form annotations.",
+          "description": "Free-form annotations for automation, UI, and integration metadata.\n\nAs of 2026-05-18, keys under `wyrd.io/*` MUST remain reserved for Wyrd-owned runtime and registry metadata. User and vendor annotations MUST use another DNS-style prefix, such as `acme.com/cost-center`, to avoid collisions.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/definitions/AnnotationValue"
           }
         },
+        "artifact_hash": {
+          "description": "Artifact content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "bump": {
-          "description": "Version bump requested when version is omitted or scoped.",
+          "description": "Bump level applied on the auto-bump paths (`None` or `Scope` `version`). Defaults to `Patch` when unset. Ignored on the exact-pin path.",
           "anyOf": [
             {
               "$ref": "#/definitions/VersionBump"
@@ -182,16 +194,48 @@
             }
           ]
         },
+        "origin": {
+          "description": "Code-origin provenance: the repository commit this card was declared from. Populated on the register path for cards authored in a repo; `None` for cards with no code origin (e.g. UI-authored).",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Origin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "space": {
-          "description": "Registration workspace. The loader supplies the configured default before this submission crosses the HTTP boundary.",
-          "allOf": [
+          "description": "Optional space.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "spec_hash": {
+          "description": "Spec content hash.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "uid": {
+          "description": "Optional resolved UID.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
             }
           ]
         },
         "version": {
-          "description": "Requested version or version scope.",
+          "description": "Authored version: `None` (auto-bump from absolute latest), a bare partial scope (`\"1\"` / `\"1.0\"` — bump within the prefix line), or a full triple pin (`\"1.4.2\"`). Always populated and always a pin post-register.",
           "anyOf": [
             {
               "$ref": "#/definitions/VersionSpec"
@@ -201,8 +245,44 @@
             }
           ]
         }
-      },
-      "additionalProperties": false
+      }
+    },
+    "Origin": {
+      "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",
+      "type": "object",
+      "required": [
+        "commit",
+        "repo"
+      ],
+      "properties": {
+        "commit": {
+          "description": "Commit the card was declared from. When `dirty`, this is the base commit of the uncommitted working tree.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CommitSha"
+            }
+          ]
+        },
+        "dirty": {
+          "description": "Whether the card was declared from an uncommitted working tree.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "Declaration path within the repository (monorepo disambiguation).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "Normalized repository identifier, e.g. `github.com/org/repo`.",
+          "type": "string"
+        }
+      }
+    },
+    "SpaceName": {
+      "description": "Human-visible namespace for Cards and Runs.",
+      "type": "string"
     },
     "VersionBump": {
       "description": "Semantic version bump level.\n\n`Major`, `Minor`, and `Patch` perform a conventional semver bump and clear any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are additive: they apply the requested pre-release or build metadata to the existing triple without resetting it.",

@@ -79,7 +79,7 @@ pub async fn register_then_reapply_identical(
 /// Register a card at a pinned version, then mutate the spec and attempt to
 /// re-register at the same pin. Returns the first (successful) outcome and
 /// the error produced by the drifted re-register. The error should be
-/// `WYRD_REG_409_SPEC_DRIFT`.
+/// `WYRD_REGISTRY_409_SPEC_DRIFT`.
 pub async fn register_then_reapply_with_drift(
     env: &TestEnv,
     tenant: DataTenantId,
@@ -131,7 +131,7 @@ pub async fn soft_delete(
 }
 
 /// Fetch a card by its exact `(kind, space, name, version)` identity.
-/// Returns `WYRD_REG_404_CARD_NOT_FOUND` when no active row matches.
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no active row matches.
 pub async fn get_by_ref(
     env: &TestEnv,
     tenant: DataTenantId,
@@ -145,7 +145,7 @@ pub async fn get_by_ref(
 }
 
 /// Fetch the latest stable card within a semver range. Pre-release rows are
-/// always excluded. Returns `WYRD_REG_404_CARD_NOT_FOUND` when no stable row
+/// always excluded. Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no stable row
 /// falls within `range`.
 pub async fn latest_by_range(
     env: &TestEnv,

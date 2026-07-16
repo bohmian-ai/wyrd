@@ -157,7 +157,7 @@ pub async fn register_card(
 ///
 /// Checks: supported `apiVersion`, presence of `metadata.space`, `kind` /
 /// `spec` consistency, non-empty `metadata.version`, and the Service/Agent
-/// pin-only rule. All failures map to `WYRD_REG_400_*` errors.
+/// pin-only rule. All failures map to `WYRD_REGISTRY_400_*` errors.
 fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
     if card.api_version.as_str() != ApiVersion::V1 {
         return Err(WyrdError::registry_invalid_card_spec(
@@ -395,7 +395,7 @@ async fn insert_legacy_card_row(
 ///
 /// Called by `register_auto` after a `Deduplicated` resolution to convert the
 /// resolved version string back to a uid without re-doing the full content
-/// comparison. Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` if the row has
+/// comparison. Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` if the row has
 /// disappeared between resolution and lookup (should not happen under the
 /// advisory lock, but guarded defensively).
 async fn lookup_uid_by_ref(
@@ -432,7 +432,7 @@ async fn lookup_uid_by_ref(
 /// existing row's `spec_hash` and compares it against the submitted hash:
 ///
 /// - Same hash → `IdempotentNoop` (caller re-submitted identical content).
-/// - Different hash → `WYRD_REG_409_SPEC_DRIFT` (caller is trying to change
+/// - Different hash → `WYRD_REGISTRY_409_SPEC_DRIFT` (caller is trying to change
 ///   a pinned version in place, which is forbidden).
 ///
 /// The `AND status <> 'deleted'` guard ensures that a previously soft-deleted
@@ -821,8 +821,13 @@ pub async fn insert_artifact_manifest_rows(
         )
         .bind(card_uid.as_uuid())
         .bind(artifact.relative_path.as_str())
-        .bind(&artifact.expected_sha256)
-        .bind(artifact.expected_size_bytes)
+        .bind(&artifact.sha256)
+        .bind(
+            i64::try_from(artifact.size_bytes).map_err(|_| WyrdError::RegistrySpecTooLarge {
+                message: "artifact size exceeds the database integer range".to_owned(),
+                details: serde_json::json!({ "size_bytes": artifact.size_bytes }),
+            })?,
+        )
         .bind(&artifact.content_type)
         .execute(&mut **conn.transaction())
         .await
@@ -895,11 +900,13 @@ pub async fn mark_manifest_upload_initialized(
 ///
 /// Unknown literals are treated as a database invariant failure instead of
 /// silently projecting them as a successful registration.
-pub fn operation_outcome(value: &str) -> Result<wyrd_spec::registry::RegisterOutcome, WyrdError> {
+pub fn operation_outcome(
+    value: &str,
+) -> Result<wyrd_spec::registry::RegistrationOutcomeKind, WyrdError> {
     match value {
-        "created" => Ok(wyrd_spec::registry::RegisterOutcome::Created),
-        "idempotent_noop" => Ok(wyrd_spec::registry::RegisterOutcome::IdempotentNoop),
-        "deduplicated" => Ok(wyrd_spec::registry::RegisterOutcome::Deduplicated),
+        "created" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::Registered),
+        "idempotent_noop" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::IdempotentNoop),
+        "deduplicated" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::Deduplicated),
         _ => Err(WyrdError::registry_unavailable("card registry unavailable")),
     }
 }
@@ -1018,7 +1025,9 @@ fn map_card_ref_row(
 #[cfg(test)]
 mod tests {
     use super::{artifact_manifest_hash, operation_outcome, registration_request_hash};
-    use wyrd_spec::registry::{ArtifactManifestEntry, RegisterOutcome, RelativeArtifactPath};
+    use wyrd_spec::registry::{
+        ArtifactManifestEntry, RegistrationOutcomeKind, RelativeArtifactPath,
+    };
 
     #[test]
     fn request_hash_is_lowercase_blake3_over_the_jcs_shape() {
@@ -1039,14 +1048,14 @@ mod tests {
         assert_eq!(artifact_manifest_hash(&[]), None);
         let first = ArtifactManifestEntry {
             relative_path: RelativeArtifactPath::new("a.bin").expect("valid path"),
-            expected_sha256: "YQ==".to_owned(),
-            expected_size_bytes: 1,
+            sha256: "YQ==".to_owned(),
+            size_bytes: 1,
             content_type: None,
         };
         let second = ArtifactManifestEntry {
             relative_path: RelativeArtifactPath::new("b.bin").expect("valid path"),
-            expected_sha256: "Yg==".to_owned(),
-            expected_size_bytes: 1,
+            sha256: "Yg==".to_owned(),
+            size_bytes: 1,
             content_type: None,
         };
         assert_ne!(
@@ -1059,7 +1068,7 @@ mod tests {
     fn operation_outcome_rejects_unknown_database_literals() {
         assert_eq!(
             operation_outcome("created").expect("known outcome"),
-            RegisterOutcome::Created
+            RegistrationOutcomeKind::Registered
         );
         assert!(operation_outcome("unexpected").is_err());
     }

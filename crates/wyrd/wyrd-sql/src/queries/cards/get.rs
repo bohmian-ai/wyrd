@@ -31,8 +31,8 @@ const SELECT_BY_REF: &str = r#"
 /// Load one card by UID within the current tenant.
 ///
 /// # Errors
-/// Returns `WYRD_REG_404_CARD_NOT_FOUND` when no row matches.
-/// Returns `WYRD_REG_400_INVALID_CARD_SPEC` when stored data fails re-parse.
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no row matches.
+/// Returns `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when stored data fails re-parse.
 #[tracing::instrument(skip(conn), fields(tenant_id = %conn.data_tenant_id(), card_uid = %uid))]
 pub async fn get_card_by_uid(
     conn: &mut TenantConn<'_>,

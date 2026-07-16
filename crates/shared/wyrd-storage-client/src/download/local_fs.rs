@@ -18,7 +18,6 @@ pub(crate) async fn download(
     dest: &Path,
 ) -> Result<DownloadOutcome, StorageClientError> {
     let response = client
-        .http()
         .request_raw(reqwest::Method::GET, &plan.get_url)
         .await
         .map_err(from_authenticated)?;

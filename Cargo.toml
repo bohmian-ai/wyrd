@@ -117,7 +117,7 @@ governor = "0.10"
 tower_governor = { version = "0.8", features = ["axum"] }
 rand = "0.9"
 pg-embed = { version = "1.0.0", default-features = false, features = ["rt_tokio"] }
-url = "2"
+url = { version = "2", features = ["serde"] }
 urlencoding = "2"
 httpdate = "1"
 regex = "1"

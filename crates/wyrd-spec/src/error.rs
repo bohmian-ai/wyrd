@@ -869,9 +869,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// Card spec failed type-driven deserialization.
-    #[error("[WYRD_REG_400_INVALID_CARD_SPEC] {message}")]
+    #[error("[WYRD_REGISTRY_400_INVALID_CARD_SPEC] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_INVALID_CARD_SPEC",
+        code = "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
         status = 400,
         title = "Card spec failed type-driven deserialization",
         remediation = "Verify the kind/spec field combination matches the documented Wyrd v1 schema for that kind."
@@ -883,9 +883,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// The version block is invalid for this operation.
-    #[error("[WYRD_REG_400_INVALID_VERSION_BLOCK] {message}")]
+    #[error("[WYRD_REGISTRY_400_INVALID_VERSION_BLOCK] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_INVALID_VERSION_BLOCK",
+        code = "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK",
         status = 400,
         title = "The version block is invalid for this operation",
         remediation = "Check the error message for the specific constraint: Service and Agent cards require an exact semver pin; version components must fit i64; a scoped bump must stay within the authored range."
@@ -897,9 +897,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// Card spec exceeds MAX_SPEC_BYTES (256 KiB).
-    #[error("[WYRD_REG_400_SPEC_TOO_LARGE] {message}")]
+    #[error("[WYRD_REGISTRY_400_SPEC_TOO_LARGE] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_SPEC_TOO_LARGE",
+        code = "WYRD_REGISTRY_400_SPEC_TOO_LARGE",
         status = 400,
         title = "Card spec exceeds MAX_SPEC_BYTES (256 KiB)",
         remediation = "Reduce the spec size or split into multiple cards. If artifacts are inlined, move them to an Artifact card with object_store backing."
@@ -911,9 +911,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// `metadata.version` was present but empty.
-    #[error("[WYRD_REG_400_VERSION_REQUIRED] {message}")]
+    #[error("[WYRD_REGISTRY_400_VERSION_REQUIRED] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_VERSION_REQUIRED",
+        code = "WYRD_REGISTRY_400_VERSION_REQUIRED",
         status = 400,
         title = "`metadata.version` is present but empty",
         remediation = "Provide a valid semver string (e.g. `\"1.0.0\"`) or omit `metadata.version` entirely to let the server auto-assign the next version."
@@ -925,9 +925,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// List `limit` is zero or exceeds the per-tenant cap.
-    #[error("[WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE] {message}")]
+    #[error("[WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE",
+        code = "WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE",
         status = 400,
         title = "List `limit` is zero or exceeds the per-tenant cap",
         remediation = "Pass a `limit` in `1..=LIST_LIMIT_MAX` (currently 200)."
@@ -939,9 +939,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// `card_ref.uid` was populated for a registry lookup that resolves by (space, name, version).
-    #[error("[WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
+    #[error("[WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
+        code = "WYRD_REGISTRY_400_CARD_REF_UID_NOT_RESOLVABLE_HERE",
         status = 400,
         title = "`card_ref.uid` was populated for a registry lookup that resolves by (space, name, version)",
         remediation = "Submit the request with `card_ref.uid = None`; the registry resolves by identity tuple. Use `get_card_by_uid` if you have a `card_uid`."
@@ -953,9 +953,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// `card_ref.version` is a Requirement; this endpoint accepts a Pin.
-    #[error("[WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE] {message}")]
+    #[error("[WYRD_REGISTRY_400_REQUIREMENT_NOT_RESOLVABLE_HERE] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_400_REQUIREMENT_NOT_RESOLVABLE_HERE",
+        code = "WYRD_REGISTRY_400_REQUIREMENT_NOT_RESOLVABLE_HERE",
         status = 400,
         title = "`card_ref.version` is a Requirement; this endpoint accepts a Pin",
         remediation = "Resolve the Requirement to a Pin via the future `resolve_card_ref` endpoint, or pass a Pin directly."
@@ -967,9 +967,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// No card matches the supplied identity.
-    #[error("[WYRD_REG_404_CARD_NOT_FOUND] {message}")]
+    #[error("[WYRD_REGISTRY_404_CARD_NOT_FOUND] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_404_CARD_NOT_FOUND",
+        code = "WYRD_REGISTRY_404_CARD_NOT_FOUND",
         status = 404,
         title = "No card matches the supplied identity",
         remediation = "Check (space, kind, name, version) or the `card_uid` is correct and the card is registered in the current tenant."
@@ -995,9 +995,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// Defense-in-depth: an existing card with the same identity has a different uid.
-    #[error("[WYRD_REG_500_VERSION_CONFLICT] {message}")]
+    #[error("[WYRD_REGISTRY_500_VERSION_CONFLICT] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_500_VERSION_CONFLICT",
+        code = "WYRD_REGISTRY_500_VERSION_CONFLICT",
         status = 500,
         title = "Card uid mismatch for same identity",
         remediation = "Internal invariant violation; report with the request id and audit_id."
@@ -1009,9 +1009,9 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// Re-apply with the same identity but a different spec_hash; same-version cards are immutable.
-    #[error("[WYRD_REG_409_SPEC_DRIFT] {message}")]
+    #[error("[WYRD_REGISTRY_409_SPEC_DRIFT] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_409_SPEC_DRIFT",
+        code = "WYRD_REGISTRY_409_SPEC_DRIFT",
         status = 409,
         title = "Re-apply with the same identity but a different spec_hash; same-version cards are immutable",
         remediation = "Bump `metadata.version` to publish a new spec, or revert your spec to match the registered version."
@@ -1023,14 +1023,70 @@ pub enum WyrdError {
         details: serde_json::Value,
     },
     /// Transient Postgres or RLS misconfiguration; retry with backoff.
-    #[error("[WYRD_REG_503_REGISTRY_UNAVAILABLE] {message}")]
+    #[error("[WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE] {message}")]
     #[wyrd_error(
-        code = "WYRD_REG_503_REGISTRY_UNAVAILABLE",
+        code = "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE",
         status = 503,
         title = "Transient Postgres or RLS misconfiguration; retry with backoff",
         remediation = "Retry with exponential backoff (60s cap). If persistent, check Postgres connectivity, the tenant row, and the RLS role bindings."
     )]
     RegistryUnavailable {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// The submitted card graph contains a dependency cycle.
+    #[error("[WYRD_REGISTRY_400_DEPENDENCY_CYCLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_DEPENDENCY_CYCLE",
+        status = 400,
+        title = "Card dependency cycle",
+        remediation = "Remove the cyclic CardRef dependency and submit an acyclic card graph."
+    )]
+    RegistryDependencyCycle {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// An inline body reached the server with an unresolved nested reference.
+    #[error("[WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE",
+        status = 400,
+        title = "Unresolved inline CardRef",
+        remediation = "Resolve nested inline file references in the loader before submitting the card."
+    )]
+    RegistryUnresolvedInlineReference {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A heavy artifact manifest was included with other submissions.
+    #[error("[WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION",
+        status = 400,
+        title = "Heavy artifact submission must be standalone",
+        remediation = "Register the artifact-bearing card alone, then reference it from a later composite request."
+    )]
+    RegistryHeavyArtifactNotSoleSubmission {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A loader-only path reference reached the server.
+    #[error("[WYRD_REGISTRY_400_UNRESOLVED_PATH_REF] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF",
+        status = 400,
+        title = "Unresolved path CardRef",
+        remediation = "Expand path references in the loader before submitting the card."
+    )]
+    RegistryUnresolvedPathRef {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -1143,6 +1199,48 @@ pub enum WyrdError {
         remediation = "Re-upload the artifact and retry finalization."
     )]
     RegistryArtifactVerifyFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A spec declares the same publication target more than once.
+    #[error("[WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET",
+        status = 400,
+        title = "Duplicate publication target",
+        remediation = "Remove duplicate Eval or Drift CardRefs from publishes_to."
+    )]
+    SpecDuplicatePublishTarget {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A spec publication target is not an Eval or Drift card.
+    #[error("[WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND",
+        status = 400,
+        title = "Invalid publication target kind",
+        remediation = "Set publishes_to targets to Eval or Drift CardRefs."
+    )]
+    SpecInvalidPublishTargetKind {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// TypeScript heavy-upload support is deferred to another surface.
+    #[error("[WYRD_TS_501_HEAVY_UPLOAD_DEFERRED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_TS_501_HEAVY_UPLOAD_DEFERRED",
+        status = 501,
+        title = "TypeScript heavy upload is deferred",
+        remediation = "Use the CLI or Python SDK for heavy artifact uploads."
+    )]
+    TsHeavyUploadDeferred {
         /// Human-readable error message.
         message: String,
         /// Structured detail payload.
@@ -2516,6 +2614,10 @@ impl WyrdError {
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
             | Self::RegistryUnavailable { message, details }
+            | Self::RegistryDependencyCycle { message, details }
+            | Self::RegistryUnresolvedInlineReference { message, details }
+            | Self::RegistryHeavyArtifactNotSoleSubmission { message, details }
+            | Self::RegistryUnresolvedPathRef { message, details }
             | Self::RegistryIdempotencyKeyRequired { message, details }
             | Self::RegistryManifestHashMismatch { message, details }
             | Self::RegistryInvalidArtifactPath { message, details }
@@ -2524,6 +2626,9 @@ impl WyrdError {
             | Self::RegistryIdempotencyConflict { message, details }
             | Self::RegistryOperationExpired { message, details }
             | Self::RegistryArtifactVerifyFailed { message, details }
+            | Self::SpecDuplicatePublishTarget { message, details }
+            | Self::SpecInvalidPublishTargetKind { message, details }
+            | Self::TsHeavyUploadDeferred { message, details }
             | Self::PrincipalOrphaned { message, details }
             | Self::ServerNotReady { message, details }
             | Self::ServiceUnavailable { message, details }
@@ -3442,7 +3547,7 @@ mod error_registry_tests {
             let problem = err.as_problem_json();
             let code = problem["code"].as_str().expect("code is a string");
             assert!(
-                code.starts_with("WYRD_REG_") || code.starts_with("WYRD_AUTH_"),
+                code.starts_with("WYRD_REGISTRY_") || code.starts_with("WYRD_AUTH_"),
                 "unexpected code prefix: {code}"
             );
             assert!(problem["status"].as_u64().unwrap() >= 400);
@@ -3458,7 +3563,7 @@ mod error_registry_tests {
         };
         let problem = err.as_problem_json();
         assert_eq!(problem["status"], 503);
-        assert_eq!(problem["code"], "WYRD_REG_503_REGISTRY_UNAVAILABLE");
+        assert_eq!(problem["code"], "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE");
     }
 
     #[test]
@@ -3469,7 +3574,7 @@ mod error_registry_tests {
         };
         let problem = err.as_problem_json();
         assert_eq!(problem["status"], 409);
-        assert_eq!(problem["code"], "WYRD_REG_409_SPEC_DRIFT");
+        assert_eq!(problem["code"], "WYRD_REGISTRY_409_SPEC_DRIFT");
     }
 
     #[test]
@@ -3480,7 +3585,7 @@ mod error_registry_tests {
         };
         let problem = err.as_problem_json();
         assert_eq!(problem["status"], 404);
-        assert_eq!(problem["code"], "WYRD_REG_404_CARD_NOT_FOUND");
+        assert_eq!(problem["code"], "WYRD_REGISTRY_404_CARD_NOT_FOUND");
     }
 
     #[test]
@@ -3525,7 +3630,7 @@ mod error_registry_tests {
         };
         let problem = err.as_problem_json();
         assert_eq!(problem["status"], 500);
-        assert_eq!(problem["code"], "WYRD_REG_500_VERSION_CONFLICT");
+        assert_eq!(problem["code"], "WYRD_REGISTRY_500_VERSION_CONFLICT");
     }
 
     #[test]

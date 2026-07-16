@@ -1,35 +1,56 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CreateCardResponse",
-  "description": "Composite registration response.",
+  "title": "CardRegistrationOutcome",
+  "description": "Outcome for one submission in a composite registration.",
   "type": "object",
   "required": [
-    "outcomes",
-    "root"
+    "card_ref",
+    "outcome",
+    "spec_hash",
+    "status"
   ],
   "properties": {
-    "outcomes": {
-      "description": "Per-submission outcomes in server topo order.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRegistrationOutcome"
-      }
+    "artifact_hash": {
+      "description": "BLAKE3 hex hash of the sorted artifact manifest, when present.",
+      "type": [
+        "string",
+        "null"
+      ]
     },
-    "root": {
-      "description": "Server-derived graph root.",
+    "card_blob_uri": {
+      "description": "URI of the durable card blob once written.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "card_ref": {
+      "description": "Server-resolved card identity.",
       "allOf": [
         {
           "$ref": "#/definitions/CardRef"
         }
       ]
     },
-    "upload_plans": {
-      "description": "Upload plans for artifact-bearing submissions.",
-      "default": [],
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardUploadPlan"
-      }
+    "outcome": {
+      "description": "Registration result for this submission.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/RegistrationOutcomeKind"
+        }
+      ]
+    },
+    "spec_hash": {
+      "description": "BLAKE3 hex hash of the JCS-canonical resolved spec.",
+      "type": "string"
+    },
+    "status": {
+      "description": "Server-managed lifecycle state.",
+      "allOf": [
+        {
+          "$ref": "#/definitions/CardLifecycleStatus"
+        }
+      ]
     }
   },
   "additionalProperties": false,
@@ -163,154 +184,9 @@
         }
       }
     },
-    "CardRegistrationOutcome": {
-      "description": "Outcome for one submission in a composite registration.",
-      "type": "object",
-      "required": [
-        "card_ref",
-        "outcome",
-        "spec_hash",
-        "status"
-      ],
-      "properties": {
-        "artifact_hash": {
-          "description": "BLAKE3 hex hash of the sorted artifact manifest, when present.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "card_blob_uri": {
-          "description": "URI of the durable card blob once written.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "card_ref": {
-          "description": "Server-resolved card identity.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ]
-        },
-        "outcome": {
-          "description": "Registration result for this submission.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/RegistrationOutcomeKind"
-            }
-          ]
-        },
-        "spec_hash": {
-          "description": "BLAKE3 hex hash of the JCS-canonical resolved spec.",
-          "type": "string"
-        },
-        "status": {
-          "description": "Server-managed lifecycle state.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardLifecycleStatus"
-            }
-          ]
-        }
-      },
-      "additionalProperties": false
-    },
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
-    },
-    "CardUploadPlan": {
-      "description": "Upload plan group keyed by the resolved card reference.",
-      "type": "object",
-      "required": [
-        "card_ref",
-        "entries"
-      ],
-      "properties": {
-        "card_ref": {
-          "description": "Card whose submission declared the artifact manifest.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ]
-        },
-        "entries": {
-          "description": "One presigned upload per manifest entry.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/PresignedUpload"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "HttpMethod": {
-      "description": "HTTP method permitted for a presigned upload.",
-      "oneOf": [
-        {
-          "description": "Upload bytes with a single PUT request.",
-          "type": "string",
-          "enum": [
-            "PUT"
-          ]
-        }
-      ]
-    },
-    "PresignedUpload": {
-      "description": "One tenant-scoped, single-artifact presigned upload.",
-      "type": "object",
-      "required": [
-        "expires_at",
-        "method",
-        "relative_path",
-        "url"
-      ],
-      "properties": {
-        "expires_at": {
-          "description": "URL expiration instant.",
-          "type": "string",
-          "format": "date-time"
-        },
-        "method": {
-          "description": "Only `PUT` is legal for v1 artifact uploads.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/HttpMethod"
-            }
-          ]
-        },
-        "relative_path": {
-          "description": "Manifest path this URL accepts.",
-          "type": "string"
-        },
-        "required_headers": {
-          "description": "Headers required by the storage provider.",
-          "default": [],
-          "type": "array",
-          "items": {
-            "type": "array",
-            "items": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "string"
-              }
-            ],
-            "maxItems": 2,
-            "minItems": 2
-          }
-        },
-        "url": {
-          "description": "Presigned PUT URL.",
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
     },
     "RegistrationOutcomeKind": {
       "description": "Result of a registration write.",

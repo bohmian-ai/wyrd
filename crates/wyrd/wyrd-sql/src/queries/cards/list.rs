@@ -132,7 +132,7 @@ pub async fn query_cards(
 /// returned when multiple rows share the same hash.
 ///
 /// # Errors
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 pub async fn find_card_by_spec_hash(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
@@ -159,7 +159,7 @@ pub async fn find_card_by_spec_hash(
 /// True when a card with this uid exists in the tenant, including deleted rows.
 ///
 /// # Errors
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Result<bool, WyrdError> {
     let found: Option<(i32,)> = sqlx::query_as(
         "SELECT 1 FROM wyrd.cards \
@@ -175,8 +175,8 @@ pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Resul
 /// Distinct non-deleted space slugs in the tenant, sorted ascending.
 ///
 /// # Errors
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors or
-/// `WYRD_REG_400_INVALID_CARD_SPEC` when a stored space is invalid.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors or
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored space is invalid.
 pub async fn get_unique_spaces(conn: &mut TenantConn<'_>) -> Result<Vec<SpaceName>, WyrdError> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT space FROM wyrd.cards \
@@ -294,7 +294,7 @@ mod tests {
             limit: 0,
         };
         let err = validate_cursor(&cursor).expect_err("limit 0 must be rejected");
-        assert_eq!(err.code(), "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE");
+        assert_eq!(err.code(), "WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE");
     }
 
     #[test]
@@ -305,7 +305,7 @@ mod tests {
             limit: MAX_LIST_LIMIT + 1,
         };
         let err = validate_cursor(&cursor).expect_err("limit > MAX must be rejected");
-        assert_eq!(err.code(), "WYRD_REG_400_LIST_LIMIT_OUT_OF_RANGE");
+        assert_eq!(err.code(), "WYRD_REGISTRY_400_LIST_LIMIT_OUT_OF_RANGE");
     }
 
     #[test]

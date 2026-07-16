@@ -209,7 +209,7 @@ def render_errors() -> str:
             "",
             "| Code | Status | When |",
             "| --- | --- | --- |",
-            "| `WYRD_REG_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different `spec_hash`; same-version cards are immutable. |",
+            "| `WYRD_REGISTRY_409_SPEC_DRIFT` | 409 | Re-apply with the same identity but a different `spec_hash`; same-version cards are immutable. |",
             "",
             "## Eval protocol codes",
             "",

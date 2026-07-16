@@ -1,6 +1,7 @@
 //! Card references authored inside specs.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,31 @@ pub struct CardRef {
     /// lineage without changing the authored reference identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
+}
+
+/// A reference position that requires durable identity.
+///
+/// Loaders rewrite `Path` values to `Ref` values before submitting a request;
+/// the server rejects unresolved paths at the wire boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", untagged)]
+pub enum Ref {
+    /// A local authored path awaiting loader resolution.
+    Path(PathBuf),
+    /// A direct reference to a registered Card.
+    Ref(CardRef),
+}
+
+/// A reference position that may carry an embedded child spec.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", untagged)]
+pub enum InlineableRef<T> {
+    /// A local authored path awaiting loader resolution.
+    Path(PathBuf),
+    /// A direct reference to a registered Card.
+    Ref(CardRef),
+    /// An embedded child spec.
+    Inline(Box<T>),
 }
 
 impl CardRef {

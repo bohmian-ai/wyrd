@@ -17,10 +17,10 @@ registration spec-drift response looks like this:
 
 ```json
 {
-  "type": "https://wyrd.dev/problems/WYRD_REG_409_SPEC_DRIFT",
+  "type": "https://wyrd.dev/problems/WYRD_REGISTRY_409_SPEC_DRIFT",
   "title": "Card spec drift on re-apply",
   "status": 409,
-  "code": "WYRD_REG_409_SPEC_DRIFT",
+  "code": "WYRD_REGISTRY_409_SPEC_DRIFT",
   "detail": "Card 'fraud-model@2.1.0' already exists with a different spec_hash; same-version cards are immutable.",
   "remediation": "Bump the card version, or re-apply the exact spec that was first registered at this version.",
   "details": {

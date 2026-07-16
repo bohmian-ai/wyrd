@@ -84,9 +84,9 @@ async fn latest_stable_in_line(
 /// Hash dedup compares only against the latest stable row in the authored line.
 ///
 /// # Errors
-/// Returns `WYRD_REG_400_INVALID_VERSION_BLOCK` for invalid bounds, overflow,
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for invalid bounds, overflow,
 /// stored-version parse failures, or a scoped bump that leaves the authored
-/// range. Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
+/// range. Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 pub async fn resolve_version(
     conn: &mut TenantConn<'_>,
     kind: CardKind,

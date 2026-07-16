@@ -4,14 +4,17 @@ mod enums;
 mod ids;
 mod reads;
 mod submission;
+mod upload;
 
-pub use enums::{CardLifecycleStatus, RegisterOutcome};
+pub use crate::reference::{InlineableRef, Ref};
+pub use enums::{CardLifecycleStatus, RegistrationOutcomeKind};
 pub use ids::{PathValidationError, RegistrationOperationId, RelativeArtifactPath};
 pub use reads::{
     ArtifactInventoryResponse, CardLocator, CardSummary, DeleteCardResponse, GetCardResponse,
     ListCardsRequest, ListCardsResponse, ListVersionsResponse, StoredArtifactEntry,
 };
 pub use submission::{
-    ArtifactManifestEntry, CardSubmission, CreateCardRequest, CreateCardResponse,
-    RegistrationReceipt, SubmissionMetadata,
+    ArtifactManifestEntry, CardRegistrationOutcome, CardSubmission, CardUploadPlan,
+    CreateCardRequest, CreateCardResponse, RegistrationReceipt,
 };
+pub use upload::{HttpMethod, PresignedUpload};

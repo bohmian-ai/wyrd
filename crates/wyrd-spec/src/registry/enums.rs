@@ -25,9 +25,9 @@ pub enum CardLifecycleStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
-pub enum RegisterOutcome {
+pub enum RegistrationOutcomeKind {
     /// A new registration row was created.
-    Created,
+    Registered,
     /// The same idempotent request was replayed.
     IdempotentNoop,
     /// An active card with identical content already exists.
@@ -36,7 +36,7 @@ pub enum RegisterOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardLifecycleStatus, RegisterOutcome};
+    use super::{CardLifecycleStatus, RegistrationOutcomeKind};
     use crate::error::WyrdError;
 
     #[test]
@@ -46,7 +46,7 @@ mod tests {
             "\"pending\""
         );
         assert_eq!(
-            serde_json::to_string(&RegisterOutcome::IdempotentNoop).unwrap(),
+            serde_json::to_string(&RegistrationOutcomeKind::IdempotentNoop).unwrap(),
             "\"idempotent_noop\""
         );
     }
@@ -63,7 +63,7 @@ mod tests {
                     message: "bad".into(),
                     details: serde_json::json!({}),
                 },
-                "WYRD_REG_400_INVALID_CARD_SPEC",
+                "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
                 400,
             ),
             (
@@ -71,7 +71,7 @@ mod tests {
                     message: "bad".into(),
                     details: serde_json::json!({}),
                 },
-                "WYRD_REG_400_INVALID_VERSION_BLOCK",
+                "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK",
                 400,
             ),
             (
@@ -79,7 +79,7 @@ mod tests {
                     message: "too large".into(),
                     details: serde_json::json!({}),
                 },
-                "WYRD_REG_400_SPEC_TOO_LARGE",
+                "WYRD_REGISTRY_400_SPEC_TOO_LARGE",
                 400,
             ),
             (
@@ -87,7 +87,7 @@ mod tests {
                     message: "missing".into(),
                     details: serde_json::json!({}),
                 },
-                "WYRD_REG_404_CARD_NOT_FOUND",
+                "WYRD_REGISTRY_404_CARD_NOT_FOUND",
                 404,
             ),
             (
@@ -95,7 +95,7 @@ mod tests {
                     message: "drift".into(),
                     details: serde_json::json!({}),
                 },
-                "WYRD_REG_409_SPEC_DRIFT",
+                "WYRD_REGISTRY_409_SPEC_DRIFT",
                 409,
             ),
             (

@@ -19,7 +19,6 @@ pub(crate) async fn upload(
         });
     };
     client
-        .http()
         .request_stream(
             reqwest::Method::PUT,
             put_url,

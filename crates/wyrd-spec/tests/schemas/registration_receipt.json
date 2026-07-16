@@ -1,49 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "RegistrationReceipt",
-  "description": "Server-resolved registration receipt.",
+  "description": "SDK-facing projection of a composite registration response.",
   "type": "object",
   "required": [
-    "card_ref",
-    "created_at",
-    "outcome",
-    "status"
+    "outcomes",
+    "root"
   ],
   "properties": {
-    "card_ref": {
-      "description": "Resolved card reference.",
+    "outcomes": {
+      "description": "Per-submission registration outcomes.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRegistrationOutcome"
+      }
+    },
+    "root": {
+      "description": "Server-derived graph root.",
       "allOf": [
         {
           "$ref": "#/definitions/CardRef"
-        }
-      ]
-    },
-    "created_at": {
-      "description": "Creation timestamp.",
-      "type": "string",
-      "format": "date-time"
-    },
-    "outcome": {
-      "description": "Registration result.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/RegisterOutcome"
-        }
-      ]
-    },
-    "principal_id": {
-      "description": "Principal attributed to the operation.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "format": "uuid"
-    },
-    "status": {
-      "description": "Lifecycle status.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/CardLifecycleStatus"
         }
       ]
     }
@@ -179,18 +155,73 @@
         }
       }
     },
+    "CardRegistrationOutcome": {
+      "description": "Outcome for one submission in a composite registration.",
+      "type": "object",
+      "required": [
+        "card_ref",
+        "outcome",
+        "spec_hash",
+        "status"
+      ],
+      "properties": {
+        "artifact_hash": {
+          "description": "BLAKE3 hex hash of the sorted artifact manifest, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "card_blob_uri": {
+          "description": "URI of the durable card blob once written.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "card_ref": {
+          "description": "Server-resolved card identity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "outcome": {
+          "description": "Registration result for this submission.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RegistrationOutcomeKind"
+            }
+          ]
+        },
+        "spec_hash": {
+          "description": "BLAKE3 hex hash of the JCS-canonical resolved spec.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Server-managed lifecycle state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardLifecycleStatus"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "RegisterOutcome": {
+    "RegistrationOutcomeKind": {
       "description": "Result of a registration write.",
       "oneOf": [
         {
           "description": "A new registration row was created.",
           "type": "string",
           "enum": [
-            "created"
+            "registered"
           ]
         },
         {

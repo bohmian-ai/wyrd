@@ -159,6 +159,45 @@ impl WyrdClient {
         self.http.submit_idempotent(method, path, body).await
     }
 
+    /// Send a JSON mutation with a caller-supplied idempotency key.
+    ///
+    /// The key is passed verbatim through the transport retry loop, allowing a
+    /// deterministic client saga to safely replay a lost response.
+    pub async fn submit_with_idempotency_key<S, D>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+        key: &str,
+    ) -> Result<D, WyrdError>
+    where
+        S: Serialize,
+        D: DeserializeOwned,
+    {
+        self.http
+            .submit_with_idempotency_key(method, path, body, key)
+            .await
+    }
+
+    /// Send an authenticated one-shot streaming request.
+    pub async fn request_stream(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: reqwest::Body,
+    ) -> Result<reqwest::Response, WyrdError> {
+        self.http.request_stream(method, path, body).await
+    }
+
+    /// Send an authenticated raw request and return its response stream.
+    pub async fn request_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+    ) -> Result<reqwest::Response, WyrdError> {
+        self.http.request_raw(method, path).await
+    }
+
     /// Send a cross-origin streaming request through the shared pool without
     /// Wyrd credentials.
     ///

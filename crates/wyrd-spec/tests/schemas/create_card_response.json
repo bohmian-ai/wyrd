@@ -1,115 +1,35 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CreateCardResponse",
-  "description": "Server response to card creation.",
+  "description": "Composite registration response.",
   "type": "object",
   "required": [
-    "card_uid",
-    "created_at",
-    "kind",
-    "name",
-    "outcome",
-    "space",
-    "spec_hash",
-    "status",
-    "version"
+    "outcomes",
+    "root"
   ],
   "properties": {
-    "artifact_hash": {
-      "description": "BLAKE3-hex hash of the JCS canonical manifest.",
-      "type": [
-        "string",
-        "null"
-      ]
+    "outcomes": {
+      "description": "Per-submission outcomes in server topo order.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/CardRegistrationOutcome"
+      }
     },
-    "card_uid": {
-      "description": "Resolved card UID.",
+    "root": {
+      "description": "Server-derived graph root.",
       "allOf": [
         {
-          "$ref": "#/definitions/CardUid"
+          "$ref": "#/definitions/CardRef"
         }
       ]
     },
-    "created_at": {
-      "description": "Creation timestamp.",
-      "type": "string",
-      "format": "date-time"
-    },
-    "kind": {
-      "description": "Resolved kind.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/CardKind"
-        }
-      ]
-    },
-    "name": {
-      "description": "Resolved name.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/CardName"
-        }
-      ]
-    },
-    "operation_id": {
-      "description": "Pending operation id.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "format": "uuid"
-    },
-    "outcome": {
-      "description": "Registration result.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/RegisterOutcome"
-        }
-      ]
-    },
-    "principal_id": {
-      "description": "Principal attributed to the operation.",
-      "type": [
-        "string",
-        "null"
-      ],
-      "format": "uuid"
-    },
-    "space": {
-      "description": "Resolved workspace.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/SpaceName"
-        }
-      ]
-    },
-    "spec_hash": {
-      "description": "BLAKE3-hex hash of JCS canonical spec bytes.",
-      "type": "string"
-    },
-    "status": {
-      "description": "Server-managed lifecycle status.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/CardLifecycleStatus"
-        }
-      ]
-    },
-    "uploads": {
-      "description": "Upload plans for artifacts that still need bytes.",
+    "upload_plans": {
+      "description": "Upload plans for artifact-bearing submissions.",
       "default": [],
       "type": "array",
       "items": {
-        "$ref": "#/definitions/UploadInitResponse"
+        "$ref": "#/definitions/CardUploadPlan"
       }
-    },
-    "version": {
-      "description": "Resolved version.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/VersionBlock"
-        }
-      ]
     }
   },
   "additionalProperties": false,
@@ -188,37 +108,218 @@
       "description": "Human-visible Card name.",
       "type": "string"
     },
+    "CardRef": {
+      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "type": "object",
+      "required": [
+        "kind",
+        "name",
+        "space",
+        "version"
+      ],
+      "properties": {
+        "kind": {
+          "description": "Referenced Card kind.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardKind"
+            }
+          ]
+        },
+        "name": {
+          "description": "Referenced Card name.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardName"
+            }
+          ]
+        },
+        "space": {
+          "description": "Space pinning identity together with `name` and `version`.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/SpaceName"
+            }
+          ]
+        },
+        "uid": {
+          "description": "Optional server-resolved durable UID.\n\nAuthors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/CardUid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "version": {
+          "description": "Exact referenced Card version.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/VersionBlock"
+            }
+          ]
+        }
+      }
+    },
+    "CardRegistrationOutcome": {
+      "description": "Outcome for one submission in a composite registration.",
+      "type": "object",
+      "required": [
+        "card_ref",
+        "outcome",
+        "spec_hash",
+        "status"
+      ],
+      "properties": {
+        "artifact_hash": {
+          "description": "BLAKE3 hex hash of the sorted artifact manifest, when present.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "card_blob_uri": {
+          "description": "URI of the durable card blob once written.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "card_ref": {
+          "description": "Server-resolved card identity.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "outcome": {
+          "description": "Registration result for this submission.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/RegistrationOutcomeKind"
+            }
+          ]
+        },
+        "spec_hash": {
+          "description": "BLAKE3 hex hash of the JCS-canonical resolved spec.",
+          "type": "string"
+        },
+        "status": {
+          "description": "Server-managed lifecycle state.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardLifecycleStatus"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "HeaderPair": {
-      "description": "Required HTTP header for a client upload request.",
+    "CardUploadPlan": {
+      "description": "Upload plan group keyed by the resolved card reference.",
       "type": "object",
       "required": [
-        "name",
-        "value"
+        "card_ref",
+        "entries"
       ],
       "properties": {
-        "name": {
-          "description": "Header name.",
+        "card_ref": {
+          "description": "Card whose submission declared the artifact manifest.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        "entries": {
+          "description": "One presigned upload per manifest entry.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PresignedUpload"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HttpMethod": {
+      "description": "HTTP method permitted for a presigned upload.",
+      "oneOf": [
+        {
+          "description": "Upload bytes with a single PUT request.",
+          "type": "string",
+          "enum": [
+            "PUT"
+          ]
+        }
+      ]
+    },
+    "PresignedUpload": {
+      "description": "One tenant-scoped, single-artifact presigned upload.",
+      "type": "object",
+      "required": [
+        "expires_at",
+        "method",
+        "relative_path",
+        "url"
+      ],
+      "properties": {
+        "expires_at": {
+          "description": "URL expiration instant.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "method": {
+          "description": "Only `PUT` is legal for v1 artifact uploads.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/HttpMethod"
+            }
+          ]
+        },
+        "relative_path": {
+          "description": "Manifest path this URL accepts.",
           "type": "string"
         },
-        "value": {
-          "description": "Header value.",
+        "required_headers": {
+          "description": "Headers required by the storage provider.",
+          "default": [],
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2
+          }
+        },
+        "url": {
+          "description": "Presigned PUT URL.",
           "type": "string"
         }
       },
       "additionalProperties": false
     },
-    "RegisterOutcome": {
+    "RegistrationOutcomeKind": {
       "description": "Result of a registration write.",
       "oneOf": [
         {
           "description": "A new registration row was created.",
           "type": "string",
           "enum": [
-            "created"
+            "registered"
           ]
         },
         {
@@ -240,288 +341,6 @@
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
-    },
-    "StorageBackendKind": {
-      "description": "Object-storage backend configured for artifact bytes.",
-      "oneOf": [
-        {
-          "description": "Local filesystem storage.",
-          "type": "string",
-          "enum": [
-            "local"
-          ]
-        },
-        {
-          "description": "AWS S3 or compatible object storage.",
-          "type": "string",
-          "enum": [
-            "s3"
-          ]
-        },
-        {
-          "description": "Google Cloud Storage.",
-          "type": "string",
-          "enum": [
-            "gcs"
-          ]
-        },
-        {
-          "description": "Azure Blob Storage.",
-          "type": "string",
-          "enum": [
-            "azure"
-          ]
-        }
-      ]
-    },
-    "UploadInitResponse": {
-      "description": "Server response to an upload-init request.",
-      "type": "object",
-      "required": [
-        "backend",
-        "plan",
-        "storage_path",
-        "upload_id"
-      ],
-      "properties": {
-        "backend": {
-          "description": "Configured storage backend.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/StorageBackendKind"
-            }
-          ]
-        },
-        "plan": {
-          "description": "Backend-specific upload plan.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/UploadPlan"
-            }
-          ]
-        },
-        "storage_path": {
-          "description": "Full tenant-scoped storage path.",
-          "type": "string"
-        },
-        "upload_id": {
-          "description": "Durable upload identifier.",
-          "type": "string"
-        }
-      },
-      "additionalProperties": false
-    },
-    "UploadPlan": {
-      "description": "Tagged union describing how the client uploads bytes.",
-      "oneOf": [
-        {
-          "description": "Single PUT to a presigned URL.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "put_url",
-                "ttl_secs"
-              ],
-              "properties": {
-                "put_url": {
-                  "description": "Presigned PUT URL.",
-                  "type": "string"
-                },
-                "required_headers": {
-                  "description": "Headers the client must include on the PUT.",
-                  "default": [],
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/definitions/HeaderPair"
-                  }
-                },
-                "ttl_secs": {
-                  "description": "URL time-to-live in seconds.",
-                  "type": "integer",
-                  "format": "uint32",
-                  "minimum": 0.0
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "single_put"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Local filesystem auth-gated upload.\n\nSignals that the upload URL is an auth-gated server route, not a presigned PUT. SDK clients must include `Authorization: Bearer` and `x-wyrd-data-tenant-id` on the PUT request.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "put_url",
-                "ttl_secs"
-              ],
-              "properties": {
-                "put_url": {
-                  "description": "Server route PUT URL.",
-                  "type": "string"
-                },
-                "ttl_secs": {
-                  "description": "URL time-to-live in seconds.",
-                  "type": "integer",
-                  "format": "uint32",
-                  "minimum": 0.0
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "local_fs"
-              ]
-            }
-          }
-        },
-        {
-          "description": "AWS S3 multipart upload.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "part_count",
-                "part_size_bytes",
-                "part_url_ttl_secs"
-              ],
-              "properties": {
-                "part_count": {
-                  "description": "Number of parts planned.",
-                  "type": "integer",
-                  "format": "uint32",
-                  "minimum": 0.0
-                },
-                "part_size_bytes": {
-                  "description": "Size of each non-final part.",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0.0
-                },
-                "part_url_ttl_secs": {
-                  "description": "Time-to-live for per-part URLs in seconds.",
-                  "type": "integer",
-                  "format": "uint32",
-                  "minimum": 0.0
-                },
-                "required_headers": {
-                  "description": "Headers the client must include on each part PUT.",
-                  "default": [],
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/definitions/HeaderPair"
-                  }
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "s3_multipart"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Google Cloud Storage resumable upload.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "chunk_size_bytes",
-                "session_uri"
-              ],
-              "properties": {
-                "chunk_size_bytes": {
-                  "description": "Recommended chunk size in bytes.",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0.0
-                },
-                "session_uri": {
-                  "description": "Resumable session URI returned once to the client.",
-                  "type": "string"
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "gcs_resumable"
-              ]
-            }
-          }
-        },
-        {
-          "description": "Azure block blob upload.",
-          "type": "object",
-          "required": [
-            "data",
-            "protocol"
-          ],
-          "properties": {
-            "data": {
-              "type": "object",
-              "required": [
-                "block_count_planned",
-                "block_size_bytes",
-                "sas_url"
-              ],
-              "properties": {
-                "block_count_planned": {
-                  "description": "Number of blocks the server expects to commit.",
-                  "type": "integer",
-                  "format": "uint32",
-                  "minimum": 0.0
-                },
-                "block_size_bytes": {
-                  "description": "Recommended block size in bytes.",
-                  "type": "integer",
-                  "format": "uint64",
-                  "minimum": 0.0
-                },
-                "sas_url": {
-                  "description": "SAS URL returned once to the client.",
-                  "type": "string"
-                }
-              }
-            },
-            "protocol": {
-              "type": "string",
-              "enum": [
-                "azure_block_blob"
-              ]
-            }
-          }
-        }
-      ]
     },
     "VersionBlock": {
       "description": "Semver-compatible version string.",

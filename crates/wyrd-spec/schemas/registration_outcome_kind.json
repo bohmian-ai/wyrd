@@ -1,13 +1,13 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "RegisterOutcome",
+  "title": "RegistrationOutcomeKind",
   "description": "Result of a registration write.",
   "oneOf": [
     {
       "description": "A new registration row was created.",
       "type": "string",
       "enum": [
-        "created"
+        "registered"
       ]
     },
     {

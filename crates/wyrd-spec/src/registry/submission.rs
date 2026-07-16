@@ -1,46 +1,19 @@
-//! Registration submission and response contracts.
+//! Composite card registration request and response contracts.
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
+use url::Url;
 
 use crate::api_version::ApiVersion;
-use crate::auth::PrincipalId;
-use crate::envelope::{CardKind, Spec};
-use crate::ids::{CardName, CardUid, SpaceName};
-use crate::metadata::{Annotations, Labels};
+use crate::envelope::{CardKind, Metadata};
 use crate::reference::CardRef;
-use crate::registry::{
-    CardLifecycleStatus, RegisterOutcome, RegistrationOperationId, RelativeArtifactPath,
-};
-use crate::storage::UploadInitResponse;
+use crate::registry::{CardLifecycleStatus, PresignedUpload, RegistrationOutcomeKind};
 
-/// Metadata accepted on a registration submission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct SubmissionMetadata {
-    /// Card name.
-    pub name: CardName,
-    /// Requested version or version scope.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<VersionSpec>,
-    /// Version bump requested when version is omitted or scoped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bump: Option<VersionBump>,
-    /// Registration workspace. The loader supplies the configured default
-    /// before this submission crosses the HTTP boundary.
-    pub space: SpaceName,
-    /// Display labels.
-    #[serde(default, skip_serializing_if = "Labels::is_empty")]
-    pub labels: Labels,
-    /// Free-form annotations.
-    #[serde(default, skip_serializing_if = "Annotations::is_empty")]
-    pub annotations: Annotations,
-}
-
-/// Card envelope submitted for registration, without server-managed fields.
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+/// One card submitted for registration.
+///
+/// The server derives relationships, lifecycle status, resolved version, and
+/// UID. A submission is therefore intentionally smaller than a stored Card
+/// envelope and cannot carry those server-managed fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct CardSubmission {
@@ -49,214 +22,177 @@ pub struct CardSubmission {
     pub api_version: ApiVersion,
     /// Card kind.
     pub kind: CardKind,
-    /// Author-supplied metadata.
-    pub metadata: SubmissionMetadata,
-    /// Kind-specific spec.
+    /// Author-supplied card metadata.
+    pub metadata: Metadata,
+    /// Kind-specific spec body.
     #[schemars(with = "serde_json::Value")]
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
-    pub spec: Spec,
-}
-
-impl<'de> Deserialize<'de> for CardSubmission {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields, rename_all = "snake_case")]
-        struct RawCardSubmission {
-            #[serde(rename = "apiVersion")]
-            api_version: ApiVersion,
-            kind: CardKind,
-            metadata: SubmissionMetadata,
-            spec: serde_json::Value,
-        }
-
-        let raw = RawCardSubmission::deserialize(deserializer)?;
-        let spec =
-            Spec::from_kind_and_value(&raw.kind, raw.spec).map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            api_version: raw.api_version,
-            kind: raw.kind,
-            metadata: raw.metadata,
-            spec,
-        })
-    }
-}
-
-/// One artifact expected by a registration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct ArtifactManifestEntry {
-    /// Relative artifact path.
-    pub relative_path: RelativeArtifactPath,
-    /// Base64-encoded SHA-256 digest.
-    pub expected_sha256: String,
-    /// Expected byte length.
-    pub expected_size_bytes: i64,
-    /// Optional MIME type.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_type: Option<String>,
-}
-
-/// Create-card request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct CreateCardRequest {
-    /// Submitted card data.
-    pub card: CardSubmission,
-    /// Artifact manifest, empty for metadata-only cards.
+    pub spec: serde_json::Value,
+    /// Heavy artifact manifest for this submission.
     #[serde(default)]
     pub artifacts: Vec<ArtifactManifestEntry>,
 }
 
-/// Server response to card creation.
+/// One heavy artifact declared by a submission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct ArtifactManifestEntry {
+    /// Validated path below the registered card's artifact prefix.
+    pub relative_path: crate::registry::RelativeArtifactPath,
+    /// Base64-encoded SHA-256 digest of the artifact bytes.
+    pub sha256: String,
+    /// Declared artifact size in bytes.
+    pub size_bytes: u64,
+    /// Optional MIME type for the stored object.
+    pub content_type: Option<String>,
+}
+
+/// Composite registration request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct CreateCardRequest {
+    /// Flat list of cards. The server topo-sorts the graph and derives root.
+    pub submissions: Vec<CardSubmission>,
+}
+
+/// Outcome for one submission in a composite registration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct CardRegistrationOutcome {
+    /// Server-resolved card identity.
+    pub card_ref: CardRef,
+    /// BLAKE3 hex hash of the JCS-canonical resolved spec.
+    pub spec_hash: String,
+    /// BLAKE3 hex hash of the sorted artifact manifest, when present.
+    pub artifact_hash: Option<String>,
+    /// Server-managed lifecycle state.
+    pub status: CardLifecycleStatus,
+    /// Registration result for this submission.
+    pub outcome: RegistrationOutcomeKind,
+    /// URI of the durable card blob once written.
+    #[schemars(with = "Option<String>")]
+    #[cfg_attr(feature = "server", schema(value_type = Option<String>))]
+    pub card_blob_uri: Option<Url>,
+}
+
+/// Upload plan group keyed by the resolved card reference.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct CardUploadPlan {
+    /// Card whose submission declared the artifact manifest.
+    pub card_ref: CardRef,
+    /// One presigned upload per manifest entry.
+    pub entries: Vec<PresignedUpload>,
+}
+
+/// Composite registration response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct CreateCardResponse {
-    /// Resolved card UID.
-    pub card_uid: CardUid,
-    /// Resolved kind.
-    pub kind: CardKind,
-    /// Resolved workspace.
-    pub space: SpaceName,
-    /// Resolved name.
-    pub name: CardName,
-    /// Resolved version.
-    pub version: VersionBlock,
-    /// BLAKE3-hex hash of JCS canonical spec bytes.
-    pub spec_hash: String,
-    /// BLAKE3-hex hash of the JCS canonical manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_hash: Option<String>,
-    /// Registration result.
-    pub outcome: RegisterOutcome,
-    /// Server-managed lifecycle status.
-    pub status: CardLifecycleStatus,
-    /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
-    /// Principal attributed to the operation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_id: Option<PrincipalId>,
-    /// Pending operation id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operation_id: Option<RegistrationOperationId>,
-    /// Upload plans for artifacts that still need bytes.
+    /// Server-derived graph root.
+    pub root: CardRef,
+    /// Per-submission outcomes in server topo order.
+    pub outcomes: Vec<CardRegistrationOutcome>,
+    /// Upload plans for artifact-bearing submissions.
     #[serde(default)]
-    pub uploads: Vec<UploadInitResponse>,
+    pub upload_plans: Vec<CardUploadPlan>,
 }
 
-#[cfg(test)]
-mod submission_tests {
-    use super::{CardSubmission, CreateCardResponse, SubmissionMetadata};
-    use crate::api_version::ApiVersion;
-    use crate::envelope::CardKind;
-    use crate::ids::{CardName, CardUid, SpaceName};
-    use crate::registry::{CardLifecycleStatus, RegisterOutcome};
-    use chrono::Utc;
-    use serde_json::json;
-    use wyrd_semver::VersionBlock;
-
-    #[test]
-    fn card_submission_deserializes_from_the_flat_wire_shape() {
-        let body = json!({
-            "apiVersion": "wyrd/v1",
-            "kind": "Audit",
-            "metadata": {
-                "name": "audit-a",
-                "space": "default",
-            },
-            "spec": {}
-        });
-        let submission: CardSubmission =
-            serde_json::from_value(body).expect("flat wire submission deserializes");
-        assert_eq!(submission.api_version.as_str(), ApiVersion::V1);
-        assert_eq!(submission.kind, CardKind::Audit);
-        assert_eq!(submission.metadata.name.as_str(), "audit-a");
-    }
-
-    #[test]
-    fn card_submission_rejects_unknown_top_level_fields() {
-        let body = json!({
-            "apiVersion": "wyrd/v1",
-            "kind": "Audit",
-            "metadata": { "name": "audit-a", "space": "default" },
-            "spec": {},
-            "status": "active",
-        });
-        let error = serde_json::from_value::<CardSubmission>(body)
-            .expect_err("unknown top-level fields must be rejected");
-        assert!(
-            error.to_string().contains("status"),
-            "error message must name the rejected field, got {error}",
-        );
-    }
-
-    #[test]
-    fn submission_metadata_rejects_server_managed_fields() {
-        let body = json!({
-            "name": "greeter",
-            "space": "default",
-            "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00",
-        });
-        serde_json::from_value::<SubmissionMetadata>(body)
-            .expect_err("uid is server-derived and must not appear in submission metadata");
-    }
-
-    #[test]
-    fn card_submission_requires_space() {
-        let body = json!({
-            "apiVersion": "wyrd/v1",
-            "kind": "Audit",
-            "metadata": { "name": "audit-a" },
-            "spec": {},
-        });
-        serde_json::from_value::<CardSubmission>(body)
-            .expect_err("registration submissions require metadata.space");
-    }
-
-    #[test]
-    fn create_card_response_carries_server_managed_fields() {
-        let response = CreateCardResponse {
-            card_uid: CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").unwrap(),
-            kind: CardKind::Prompt,
-            space: SpaceName::new("default").unwrap(),
-            name: CardName::new("greeter").unwrap(),
-            version: VersionBlock::parse("1.0.0").unwrap(),
-            spec_hash: "abc".to_owned(),
-            artifact_hash: None,
-            outcome: RegisterOutcome::Created,
-            status: CardLifecycleStatus::Active,
-            created_at: Utc::now(),
-            principal_id: None,
-            operation_id: None,
-            uploads: Vec::new(),
-        };
-        let encoded = serde_json::to_value(&response).unwrap();
-        assert!(encoded.get("card_uid").is_some());
-        assert!(encoded.get("spec_hash").is_some());
-        assert_eq!(encoded["outcome"], "created");
-        assert_eq!(encoded["status"], "active");
-    }
-}
-
-/// Server-resolved registration receipt.
+/// SDK-facing projection of a composite registration response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct RegistrationReceipt {
-    /// Resolved card reference.
-    pub card_ref: CardRef,
-    /// Registration result.
-    pub outcome: RegisterOutcome,
-    /// Lifecycle status.
-    pub status: CardLifecycleStatus,
-    /// Creation timestamp.
-    pub created_at: DateTime<Utc>,
-    /// Principal attributed to the operation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub principal_id: Option<PrincipalId>,
+    /// Server-derived graph root.
+    pub root: CardRef,
+    /// Per-submission registration outcomes.
+    pub outcomes: Vec<CardRegistrationOutcome>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CardSubmission, CreateCardRequest, CreateCardResponse};
+    use crate::api_version::ApiVersion;
+    use crate::envelope::{CardKind, Metadata};
+    use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
+    use serde_json::json;
+
+    fn submission() -> CardSubmission {
+        CardSubmission {
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Audit,
+            metadata: Metadata {
+                name: "audit-a".parse().expect("test name is valid"),
+                version: None,
+                bump: None,
+                space: Some("default".parse().expect("test space is valid")),
+                uid: None,
+                labels: Default::default(),
+                annotations: Default::default(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
+            },
+            spec: json!({}),
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn create_card_request_is_flat_submissions_list() {
+        let request: CreateCardRequest = serde_json::from_value(json!({
+            "submissions": [{
+                "apiVersion": "wyrd/v1",
+                "kind": "Audit",
+                "metadata": {"name": "audit-a", "space": "default"},
+                "spec": {}
+            }]
+        }))
+        .expect("flat request deserializes");
+        assert_eq!(request.submissions.len(), 1);
+        assert!(
+            serde_json::from_value::<CreateCardRequest>(json!({
+                "card": {}, "artifacts": []
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn card_submission_artifacts_default_is_empty() {
+        let encoded = serde_json::to_value(submission()).expect("submission serializes");
+        assert!(encoded["artifacts"].as_array().is_some());
+        assert!(encoded["artifacts"].as_array().expect("array").is_empty());
+    }
+
+    #[test]
+    fn card_submission_server_managed_fields_are_not_top_level_fields() {
+        let mut encoded = serde_json::to_value(submission()).expect("submission serializes");
+        encoded["relationships"] = json!([]);
+        encoded["status"] = json!("active");
+        assert!(serde_json::from_value::<CardSubmission>(encoded).is_err());
+    }
+
+    #[test]
+    fn create_card_response_carries_root_outcomes_and_upload_plans() {
+        let response = CreateCardResponse {
+            root: serde_json::from_value(json!({
+                "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
+            }))
+            .expect("card ref deserializes"),
+            outcomes: Vec::new(),
+            upload_plans: Vec::new(),
+        };
+        assert!(response.outcomes.is_empty());
+        assert!(response.upload_plans.is_empty());
+        let _ = (
+            CardLifecycleStatus::Pending,
+            RegistrationOutcomeKind::Registered,
+        );
+    }
 }

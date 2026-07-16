@@ -14,10 +14,10 @@ use crate::tenant_conn::TenantConn;
 /// Return the latest stable card whose version falls within `range`.
 ///
 /// # Errors
-/// Returns `WYRD_REG_400_INVALID_VERSION_BLOCK` for non-representable ranges or
-/// bounds overflow, `WYRD_REG_404_CARD_NOT_FOUND` when no stable row matches,
-/// `WYRD_REG_400_INVALID_CARD_SPEC` when a stored row fails to parse, and
-/// `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` for non-representable ranges or
+/// bounds overflow, `WYRD_REGISTRY_404_CARD_NOT_FOUND` when no stable row matches,
+/// `WYRD_REGISTRY_400_INVALID_CARD_SPEC` when a stored row fails to parse, and
+/// `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 #[tracing::instrument(skip(conn), fields(tenant_id = %conn.data_tenant_id(), kind = ?kind, space = %space, name = %name, range = %range))]
 pub async fn get_latest_card_by_range(
     conn: &mut TenantConn<'_>,
@@ -66,8 +66,8 @@ pub async fn get_latest_card_by_range(
 /// List versions registered in a `(kind, space, name)` line, newest first.
 ///
 /// # Errors
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors or
-/// `WYRD_REG_400_INVALID_VERSION_BLOCK` when a stored version fails to parse.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors or
+/// `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when a stored version fails to parse.
 #[tracing::instrument(skip(conn), fields(tenant_id = %conn.data_tenant_id(), kind = ?kind, space = %space, name = %name, include_prerelease))]
 pub async fn list_versions(
     conn: &mut TenantConn<'_>,

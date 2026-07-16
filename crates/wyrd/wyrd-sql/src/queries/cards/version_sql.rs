@@ -18,7 +18,7 @@ const ADVISORY_CLASS_CARD_VERSION: i32 = 0x0C_A2_D0_01;
 /// Append the half-open bounds predicate to `qb`, binding all integers.
 ///
 /// # Errors
-/// Returns `WYRD_REG_400_INVALID_VERSION_BLOCK` when a version component cannot
+/// Returns `WYRD_REGISTRY_400_INVALID_VERSION_BLOCK` when a version component cannot
 /// be represented as `i64` for PostgreSQL `BIGINT` comparison.
 pub(crate) fn push_bounds(
     qb: &mut QueryBuilder<Postgres>,
@@ -59,7 +59,7 @@ fn triple_i64(t: SemverTriple) -> Result<(i64, i64, i64), WyrdError> {
 /// parallel; rare `hashtext` collisions only cause false contention.
 ///
 /// # Errors
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 pub async fn lock_version_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
@@ -103,6 +103,6 @@ mod tests {
 
         let err = push_bounds(&mut qb, &bounds).expect_err("overflow rejected");
 
-        assert_eq!(err.code(), "WYRD_REG_400_INVALID_VERSION_BLOCK");
+        assert_eq!(err.code(), "WYRD_REGISTRY_400_INVALID_VERSION_BLOCK");
     }
 }

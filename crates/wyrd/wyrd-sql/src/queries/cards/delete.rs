@@ -20,8 +20,8 @@ use crate::tenant_conn::TenantConn;
 /// Idempotent on already-deleted cards (no audit row, no error).
 ///
 /// # Errors
-/// Returns `WYRD_REG_404_CARD_NOT_FOUND` when the uid is not present.
-/// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on transient DB errors.
+/// Returns `WYRD_REGISTRY_404_CARD_NOT_FOUND` when the uid is not present.
+/// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on transient DB errors.
 #[tracing::instrument(
     skip(conn),
     fields(tenant_id = %conn.data_tenant_id(), card_uid = %uid, actor = %actor.id),

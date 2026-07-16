@@ -56,6 +56,15 @@ Before editing:
 Do not invent a new architecture until the current Wyrd boundary proves
 wrong for the user workflow.
 
+### Mandatory reference gate
+
+Before any edit, identify the applicable files in the reference table below,
+read each one completely to EOF, and record a short read ledger in the working
+update. A truncated tool result is not a complete read; continue in chunks.
+Do not call an editing tool until the ledger names every loaded reference and
+the decision it governs. If a required reference cannot be read, stop and
+report the blocker.
+
 ## CodeGraph Hydration (if available)
 
 `.dev/` is gitignored — the plan files described here exist only in the
@@ -439,6 +448,19 @@ Full guidance:
 `architecture/references/languages/testing-workflows.md`.
 
 ## Completion Standard
+
+### Documentation
+
+- Document all new code and all behavior changed by an edit, including private
+  and internal functions, types, modules, helpers, and control-flow stages.
+  Use rustdoc comments for Rust, docstrings for Python, and the repository's
+  established documentation convention for TypeScript. Explain purpose,
+  inputs/outputs, errors, invariants, and non-obvious design choices where
+  applicable.
+- Do not skip documentation because an implementation is small or obvious;
+  maintainers and agents should understand touched code without reconstructing
+  its intent from callers.
+- Do not add documentation churn to code outside the edit's scope.
 
 A change is not done until:
 

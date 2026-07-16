@@ -14,7 +14,7 @@ Downstream artifacts are brought up to this version in a sync pass.
 
 ## Table of contents
 
-- [Doctrine](#doctrine) — 20 design principles
+- [Doctrine](#doctrine) — 21 design principles
 - [Client model](#client-model) — language-agnostic protocol and first-class SDKs
 - [Kind catalog](#kind-catalog) — 16 native kinds + External
 - [Per-kind specs](#per-kind-specs) — field shapes per kind
@@ -23,6 +23,7 @@ Downstream artifacts are brought up to this version in a sync pass.
   - [Service](#service) · [Policy](#policy) · [Audit](#audit)
   - [Drift](#drift) · [Eval](#eval) · [Source](#source) · [Bifrost](#bifrost--wyrds-olap-warehouse)
   - [Trigger](#trigger) · [Operator](#operator)
+- [Registry lifecycle](#registry-lifecycle) — composite registration, card blob, idempotency
 - [Spec-file authoring](#spec-file-authoring) — `ref` / `select` / `path` / `inline`, pre-registration matrix
 - [Workspace config](#workspace-config-wyrdtoml) — `wyrd.toml` defaults and merge rules
 - [Reference-direction quick reference](#reference-direction-quick-reference) — who refs whom
@@ -37,9 +38,13 @@ Downstream artifacts are brought up to this version in a sync pass.
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
-3. **Monitors declare subjects.** Drift and Eval reference what they
-   observe. Subjects do not list their observers. Each declares a single
-   `subject_ref`.
+3. **Publishers declare subscriptions; monitors are subject-less.**
+   Component kinds (Model, Data, Agent, Service) declare
+   `publishes_to: [CardRef]` naming peer Drift/Eval cards that receive
+   their runtime observations. Peer cards (Drift, Eval, Operator) carry
+   no `subject_ref` — subject identity is supplied by the publisher at
+   observation time. Triggers filter subscriptions by subject via
+   `TriggerSource.*.subject_filter: Option<CardRef>`.
 4. **Reactions are Operators; wiring is Triggers.** Drift/Eval/Policy never
    inline reaction logic.
 5. **Service composes for deployment, not observation.** Drift/Eval/Trigger/
@@ -88,9 +93,11 @@ Downstream artifacts are brought up to this version in a sync pass.
     `Agent.prompt` accepts `PromptRef = CardRef | Inline`. Inline definitions
     have no card identity, are not registered
     standalone, and cannot be referenced from outside their parent. To reuse,
-    register as a card and reference by `CardRef`. Heavy refs (`subject_ref`,
-    `dataset`, `Service.components.ref`, `Workflow.steps.target`) stay
-    `CardRef`-only — identity is the point.
+    register as a card and reference by `CardRef`. Heavy refs
+    (`Eval.dataset`, `Model.card_refs`, `Data.card_refs`,
+    `Service.components.ref`, `Workflow.steps.target`, `publishes_to`,
+    `TriggerSource.*.subject_filter`) stay `CardRef`-only — identity is
+    the point.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -196,6 +203,22 @@ Downstream artifacts are brought up to this version in a sync pass.
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
     §11 for the tier definitions and gates.
+21. **`publishes_to` is the subscription contract.** Component kinds
+    (Model, Data, Agent, Service) MAY declare
+    `publishes_to: Vec<CardRef>`. Each ref MUST resolve to `Eval` or
+    `Drift` — no other kind is a publication target. The field is a
+    **static declaration**, not a runtime routing table: at runtime the
+    publisher emits observations tagged with its own `card_ref` as
+    subject, and the server routes them to declared peers. Mutating
+    `publishes_to` bumps the publisher's `spec_hash` and produces a new
+    version — declared subscriptions are part of the contract, not
+    incidental configuration. Duplicate targets are rejected with
+    `WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET`; non-`Eval`/`Drift` targets
+    with `WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND`. `publishes_to`
+    also authorizes emit — a card enters a principal's emit scope when
+    it is reachable through the transitive card-ref graph, which
+    includes `publishes_to`. See §Registry lifecycle for the composite
+    registration wire that lands `publishes_to` refs.
 
 ## Client model
 
@@ -244,11 +267,12 @@ Dataset declaration with typed interface and schema.
 spec:
   interface: DataInterface       # Pandas | Polars | Arrow | Parquet | Numpy | Torch | Sql | Jsonl | Image | Text | Huggingface | Custom
   schema: DataSchema
-  card_refs: [CardRef]       # → Artifact
+  card_refs: [CardRef]           # → Artifact
   splits: { SplitName: DataSplit }
   target_columns: [ColumnName]
   sql?: SqlLogic
   stats: DataStats
+  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 ### Model
@@ -259,7 +283,8 @@ spec:
   task_type: TaskType            # BinaryClassification | MultiClassClassification | Regression | Generation | Embedding | Custom
   signature: ModelSignature
   sample_input?: SampleInput
-  card_refs: [CardRef]       # → Artifact
+  card_refs: [CardRef]           # → Artifact
+  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 ### Artifact
@@ -308,6 +333,7 @@ spec:
   prompt: PromptRef              # CardRef (→ Prompt) or inline PromptSpec
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
+  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 ### Workflow
@@ -345,6 +371,7 @@ spec:
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
+  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 Identity is derived from the Service's `card_ref` and bound on first deploy
@@ -542,11 +569,13 @@ Consequences, stated so they stop drifting:
   never a composite that encodes the card.
 - **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
-- **Subject ≠ emitter is deferred to produced kinds.** A monitor emitting Drift/
-  Eval about a card *outside* its own scope carries an explicit `subject_ref`
-  with its own authorization — distinct from the in-scope `card_ref` above. That
-  lands with `vala-drift`/`vala-eval`, against a real consumer — not on the
-  Stage-3 `Record` envelope.
+- **Publishers own subject identity.** Under pub/sub (Doctrine #3, #21),
+  the publisher's `card_ref` IS the subject on every observation row —
+  no separate `subject_ref` on the envelope, no monitor-emits-about-a-
+  different-card case. A publisher's declared `publishes_to` targets
+  enter its emit scope through the transitive card-ref graph
+  (Doctrine #18), so authorization reduces to the one `card_ref` on
+  the row.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -777,17 +806,18 @@ LineageEdge:
 fields in the locked spec model. A new card kind that introduces new
 typed refs is a versioned breaking change that adds variants.
 
-| Variant     | Source-card fields                                                |
-|-------------|-------------------------------------------------------------------|
-| `Subject`   | `Drift.subject_ref`, `Eval.subject_ref`                           |
-| `Component` | `Service.components[].ref`, `Workflow.steps[].target`             |
-| `Artifact`  | `Data.card_refs[]`, `Model.card_refs[]`                   |
-| `Prompt`    | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                 |
-| `Dataset`   | `Eval.dataset`                                                    |
-| `Source`    | `Eval.source_ref`, `Drift.signal.External.source_ref`             |
-| `Baseline`  | `Drift.signal.Distribution.baseline_ref`                          |
-| `Trigger`   | `Trigger.source.drift_ref \| eval_ref`                            |
-| `Operator`  | `Trigger.operator_ref`                                            |
+| Variant           | Source-card fields                                                          |
+|-------------------|-----------------------------------------------------------------------------|
+| `Publication`     | `Model.publishes_to`, `Data.publishes_to`, `Agent.publishes_to`, `Service.publishes_to` |
+| `SubjectFilter`   | `Trigger.source.*.subject_filter`                                           |
+| `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
+| `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
+| `Prompt`          | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                           |
+| `Dataset`         | `Eval.dataset`                                                              |
+| `Source`          | `Eval.source_ref`, `Drift.signal.External.source_ref`                       |
+| `Baseline`        | `Drift.signal.Distribution.baseline_ref`                                    |
+| `Trigger`         | `Trigger.source.drift_ref \| eval_ref`                                      |
+| `Operator`        | `Trigger.operator_ref`                                                      |
 | `Workflow`  | `Operator.action.workflow_ref`                                    |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
 
@@ -865,14 +895,14 @@ captures what *was* materialized at `snapshot_at`.
 - Multi-party `attestations` — deferred to v1.1; `details` may carry informally in v1.
 
 ### Drift
-Observation producer for a single subject. Envelope is orthogonal: subject +
-signal + condition + math. No scheduling, no dispatch. Scheduling is a
-`Trigger`; dispatch is an `Operator`.
+Subject-less observation definition. Envelope is orthogonal: signal +
+condition + math. Subject identity is supplied by the publisher at
+observation time (Doctrine #3, #21). No scheduling, no dispatch.
+Scheduling is a `Trigger`; dispatch is an `Operator`.
 ```yaml
 spec:
   description?: string
   method: DriftMethod            # Spc | Psi | Custom | External
-  subject_ref: CardRef           # → Model | Agent | Service | Data — singular
   signal: DriftSignal            # how the measurement enters the monitor
   condition: DriftCondition      # when a sample becomes an emittable observation
   profile?: DriftProfile         # method-specific math config (PSI bins, SPC window, etc.)
@@ -914,16 +944,16 @@ authoring; the card stores resolved bounds):
 | `Outside`       | `lower: f64`, `upper: f64`       | Sample < `lower` or > `upper` |
 
 ### Eval
-Behavioral assessment workflow for a single subject. Envelope is orthogonal:
-**what** is judged (`subject_ref`), **how** (`tasks` DAG), **where to read its
-observations from** (`source_ref`, deferred), and an optional **offline
-driver** (`dataset`). No scheduling, no dispatch, no fire condition — fire
-lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed task
-workflow, not a parallel mode/profile split.
+Subject-less behavioral assessment definition. Envelope is orthogonal:
+**how** to judge (`tasks` DAG), **where to read observations from**
+(`source_ref`, deferred), and an optional **offline driver** (`dataset`).
+Subject identity is supplied by the publisher at observation time
+(Doctrine #3, #21). No scheduling, no dispatch, no fire condition — fire
+lives on `Drift` with `DriftSignal::EvalScore`. Eval is a single typed
+task workflow, not a parallel mode/profile split.
 ```yaml
 spec:
   description?: string
-  subject_ref: CardRef           # → Agent | Workflow | Service | Model — WHAT is judged
   tasks: [EvalTask]              # evaluation workflow — DAG via depends_on
   dataset?: DatasetRef           # → Data — offline scenario driver
   source_ref?: CardRef           # DEFERRED — landing in §Eval online-mode commit; not implemented
@@ -946,17 +976,18 @@ of refs is the mode):
 
 | `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
-| set           | unset        | Offline batch. Engine invokes `subject_ref` against the Data card's scenario rows, captures traces inline. |
-| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by subject identity, samples records into the task workflow. |
+| set           | unset        | Offline batch. Engine invokes the publisher (declared by `publishes_to`) against the Data card's scenario rows, captures traces inline. |
+| unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by publisher `card_ref`, samples records into the task workflow. |
 | set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
-**Directional flow.** All three refs are `CardRef`s authored on `Eval`; nothing
-points back. At runtime: engine resolves `subject_ref` (identity filter),
-resolves `source_ref` (read location, deferred — see DESIGN.md §13), opens the
-Source, queries records, feeds them into the `tasks` workflow, aggregates
-per-task pass/fail into a score stream consumed downstream by a `Drift` card with
-`DriftSignal::EvalScore`.
+**Directional flow.** Publisher declares `publishes_to: [Eval]` and emits
+observations at runtime; each observation carries the publisher's
+`card_ref` as its subject identity. Engine resolves `source_ref` (read
+location, deferred — see DESIGN.md §13), opens the Source, queries records
+scoped to the publisher's identity, feeds them into the `tasks` workflow,
+aggregates per-task pass/fail into a score stream consumed downstream by
+a `Drift` card with `DriftSignal::EvalScore`.
 
 `EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
 `depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
@@ -1217,12 +1248,15 @@ spec:
   operator_ref: CardRef                      # → Operator (the only valid target kind)
 ```
 
-`TriggerSource` is a closed tagged union (snake_case `kind` discriminator):
+`TriggerSource` is a closed tagged union (snake_case `kind` discriminator).
+Each variant carries an optional `subject_filter: CardRef` that narrows
+the subscription to observations emitted by that publisher. `None` matches
+any publisher — the Trigger fires on any observation from that monitor.
 
-| Variant | Variant-specific carries        | Server does on each schedule tick                                              |
-|---------|---------------------------------|--------------------------------------------------------------------------------|
-| `Drift` | `drift_ref: CardRef` (→ Drift)  | Evaluates the Drift. Condition match → fire `operator_ref`. Else record metric. |
-| `Eval`  | `eval_ref: CardRef` (→ Eval)    | Runs the Eval. Any task failure → fire `operator_ref`. Else record scores.     |
+| Variant | Variant-specific carries                                                       | Server does on each schedule tick                                              |
+|---------|--------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| `DriftObservation` | `drift_ref: CardRef` (→ Drift), `subject_filter?: CardRef`          | Evaluates the Drift over observations passing `subject_filter`. Condition match → fire `operator_ref`. Else record metric. |
+| `EvalObservation`  | `eval_ref: CardRef` (→ Eval), `subject_filter?: CardRef`            | Runs the Eval over observations passing `subject_filter`. Any task failure → fire `operator_ref`. Else record scores.      |
 
 If `source` is omitted, the operator fires unconditionally on every schedule
 tick (cron-driven webhook or workflow dispatch with no monitor gate).
@@ -1235,18 +1269,18 @@ implementation.
 External pushes are deliberately not a Trigger source — Rule 7 ("Wyrd reads,
 it does not push") means external signals enter through a `Source`, are read
 by a `Drift` with `DriftSignal::External { source_ref }`, and fire through
-`source.Drift` like any other drift.
+`source.DriftObservation` like any other drift.
 
 ### Operator
 Fires when a Trigger references it. Performs exactly one action — a Workflow
-dispatch, a typed notification, or a generic HTTP call — gated by optional
-Policy hooks before and after.
+dispatch, a typed notification, or a generic HTTP call. Operator is a pure
+side-effect template with no `pre_invoke` / `post_invoke` hooks; policy
+gating on operator dispatch lives on the Trigger that references it
+(Doctrine #3, #4).
 ```yaml
 spec:
   description?: string
   action: OperatorAction          # closed tagged union — see below
-  pre_invoke?: [CardRef]          # → Policy, runs before action
-  post_invoke?: [CardRef]         # → Policy, runs on action result
   budget?: { max_wall_seconds?: u32, max_tool_calls?: u32 }
 ```
 
@@ -1287,11 +1321,141 @@ not in the card.
 applies to `Http.url` and to text fields in `NotifyChannel` variants.
 
 Templating context comes from the Trigger that fired the Operator:
-- `Trigger.source = Drift { drift_ref }`: `drift.{name, subject_ref.{kind, name, version}}`, `observation.{value, threshold, fired_at}`.
-- `Trigger.source = Eval { eval_ref }`: `eval.{name, subject_ref.*}`, `failures[]` (per-task failure entries).
+- `Trigger.source = DriftObservation { drift_ref, subject_filter? }`:
+  `drift.{name}`, `subject.{kind, name, version}` (the publisher whose
+  observation matched), `observation.{value, threshold, fired_at}`.
+- `Trigger.source = EvalObservation { eval_ref, subject_filter? }`:
+  `eval.{name}`, `subject.{kind, name, version}`,
+  `failures[]` (per-task failure entries).
 - `Trigger.source` absent: `schedule.fired_at` only.
 
 Exact field schema for each context lives in OpenAPI.
+
+---
+
+## Registry lifecycle
+
+How authored specs become durable cards. This section pins the wire
+shape of composite registration, the card blob state machine, and the
+idempotency contract. Implementation lives in `wyrd-registry` and its
+task packet under `.dev/plan/ongoing/07-card-lifecycle/CONTRACTS.md`.
+
+### Composite registration
+
+`POST /v1/cards` is a **composite** endpoint. One request may register
+one card or many, and the server derives the root from the DAG of
+submissions.
+
+```rust
+struct CreateCardRequest {
+    submissions: Vec<CardSubmission>,
+}
+
+struct CardSubmission {
+    api_version: ApiVersion,
+    kind: CardKind,
+    metadata: Metadata,
+    spec: Value,                                       // kind-specific spec body
+    artifacts: Vec<ArtifactManifestEntry>,             // heavy uploads; default empty
+}
+
+struct CreateCardResponse {
+    root: CardRef,                                     // server-derived, single no-in-degree node
+    outcomes: Vec<CardRegistrationOutcome>,           // one per submission
+    upload_plans: Vec<CardUploadPlan>,                // one per heavy submission (see §Heavy artifacts)
+}
+```
+
+**Server-derived root.** Clients never nominate a root. The server
+builds the DAG from `CardRef` edges (including `publishes_to`),
+topo-sorts, and picks the single node with no incoming edges. Multi-root
+DAGs are an SDK bug and surface as `WYRD_INTERNAL_500` — not a stable
+public error. Cycles surface as
+`WYRD_REGISTRY_400_DEPENDENCY_CYCLE`.
+
+**Wrapper structs are forbidden.** No `{card, dependencies[]}`, no
+`{primary, dependencies}`, no `PlanCardRequest`. Submissions are a flat
+`Vec<CardSubmission>`; edges live inside each `spec`.
+
+**Composite transaction.** Per-node inserts run in one Postgres
+transaction. Post-commit side effects (card blob write, presigned URL
+mint) are best-effort with reconcile — see below.
+
+### Card blob state
+
+Every card carries two columns on `wyrd.cards`:
+
+- `card_blob_uri: TEXT` — presence of a URI signals the fully-hydrated
+  card envelope has been written to durable object storage.
+- `blob_failed_at: TIMESTAMPTZ` — presence of a timestamp signals the
+  most recent write attempt failed; this row is the reconcile key.
+
+There is **no** `blob_status` enum column and no third state. Success
+and failure are exclusive: reconcile writes `card_blob_uri` and clears
+`blob_failed_at`; a failed write sets `blob_failed_at` and leaves
+`card_blob_uri` NULL. A card reaches `Active` only when its blob is
+written AND, for heavy cards, every declared artifact upload is
+verified.
+
+Reconcile sweep: pending rows past 24h since `blob_failed_at` are
+retried up to 3 times with exponential backoff, then dead-lettered
+with audit event `card.registration.dead_letter`.
+
+### Heavy artifacts
+
+A submission whose `artifacts` manifest is non-empty MUST be the sole
+submission in the request — enforced by
+`WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION`. Multiplexing
+`/upload/init` across N heavy submissions in one composite request
+complicates recovery for negligible authoring benefit, so v1 refuses
+it. Presigned upload URLs are tenant-scoped, `PUT`-only,
+single-artifact, and expire after 3600s.
+
+### Idempotency
+
+Idempotency is a client responsibility. The `Idempotency-Key` header is
+required on `POST /v1/cards`. Missing header →
+`WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED`.
+
+Key derivation (client-side):
+
+1. Canonicalize submissions by `(kind, space, name)`.
+2. For each submission, compute `spec_hash` = BLAKE3 hex over JCS
+   canonical bytes of the spec plus `artifact_manifest_hash` (BLAKE3
+   over the manifest, empty if no artifacts).
+3. `request_hash` = BLAKE3 hex over the concatenation of per-submission
+   `(spec_hash || artifact_manifest_hash)` pairs in canonical order.
+4. `Idempotency-Key` = BLAKE3 hex over `tenant_id || principal || request_hash`.
+
+Server-side behavior:
+
+- Same key, same `request_hash` → `IdempotentNoop` replay, returns the
+  original response.
+- Same key, different `request_hash` →
+  `WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`.
+- Key not seen → normal processing; key + hash stored on completion.
+
+Idempotency state lives in `wyrd.card_registration_operations` with a
+24h TTL. Expired records outside the retry window surface as
+`WYRD_REGISTRY_410_OPERATION_EXPIRED`.
+
+### Error catalog
+
+The public error catalog covering registration is fixed and versioned.
+Codes and semantics live in `crates/wyrd-spec/src/error.rs` behind the
+`WyrdError` derive. Codes referenced above:
+`WYRD_REGISTRY_400_DEPENDENCY_CYCLE`,
+`WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION`,
+`WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED`,
+`WYRD_REGISTRY_400_UNRESOLVED_PATH_REF`,
+`WYRD_REGISTRY_400_UNRESOLVED_INLINE_REFERENCE`,
+`WYRD_REGISTRY_409_IDEMPOTENCY_CONFLICT`,
+`WYRD_REGISTRY_410_OPERATION_EXPIRED`,
+`WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED`,
+`WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET`,
+`WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND`,
+`WYRD_INTERNAL_500`. The catalog is the source of truth for problem-json
+serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 
 ---
 
@@ -1398,7 +1562,9 @@ from it (they do not maintain parallel hand-written lists):
 - `Trigger.target`
 - `Workflow.steps[].target`
 - `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
-- `Drift.subject_ref`, `Drift.signal.eval_ref`, `Drift.signal.source_ref`
+- `Drift.signal.eval_ref`, `Drift.signal.source_ref`
+- `TriggerSource.*.subject_filter`
+- `Model.publishes_to`, `Data.publishes_to`, `Agent.publishes_to`, `Service.publishes_to`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
 A new reference-bearing field is added to this inventory in one place; it then
@@ -1580,18 +1746,18 @@ cross-tenant card import is a supported workflow.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`            | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs` |
-| Model   | `card_refs`                      | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, `Experiment.target_refs` |
-| Agent   | `prompt`, `tool_names`               | `Drift.subject_ref`, `Eval.subject_ref`, `Service.components.ref`, Agent prompts (sub-agent calls) |
-| Workflow| `steps.*.target`                     | `Eval.subject_ref`, `Service.components.ref`, `Operator.action.workflow_ref` |
+| Data    | `card_refs`, `splits`, `publishes_to` | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
+| Model   | `card_refs`, `publishes_to`          | `Service.components.ref`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
+| Agent   | `prompt`, `tool_names`, `publishes_to` | `Service.components.ref`, Agent prompts (sub-agent calls), `TriggerSource.*.subject_filter` |
+| Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.action.workflow_ref`, `TriggerSource.*.subject_filter` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
-| Drift   | `subject_ref`, `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `Trigger.source.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `subject_ref`, `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `Trigger.source.eval_ref` |
+| Drift   | `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `TriggerSource.DriftObservation.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
+| Eval    | `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `TriggerSource.EvalObservation.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
-| Service | `components[].ref`                   | `Drift.subject_ref` (service-level), `Eval.subject_ref` |
-| Policy  | `rules`                              | `Service.components.ref`, `Operator.pre_invoke`, `Operator.post_invoke` |
-| Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `operator_ref` | — |
-| Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`), `pre_invoke`, `post_invoke` | `Trigger.operator_ref` |
+| Service | `components[].ref`, `publishes_to`   | `TriggerSource.*.subject_filter` (service-level) |
+| Policy  | `rules`                              | `Service.components.ref` |
+| Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `source.subject_filter?`, `operator_ref` | — |
+| Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`) | `Trigger.operator_ref` |
 | Source  | `kind` (bucket), `connection` (vendor + `*_env`) | `Drift.signal.source_ref` (External variant), `Eval.source_ref` |
 
 `Service.components` accepts: Agent, Prompt, Model, Workflow, Mcp, Policy. No

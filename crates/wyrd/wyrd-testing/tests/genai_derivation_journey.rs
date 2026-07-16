@@ -3,12 +3,12 @@
 //!
 //! Source-first lifecycle assertions:
 //! - The source span is committed (visible via catalog scan) before the
-//! derivation worker runs.
+//!   derivation worker runs.
 //! - The derivation worker is the ONLY path that writes target rows — no inline
-//! derivation occurs in the collector.
+//!   derivation occurs in the collector.
 //! - After the worker tick the target row is visible.
 //! - A second export of the SAME span (same derived_batch_id) is a replay and
-//! produces no duplicate target rows.
+//!   produces no duplicate target rows.
 
 mod pg_tests {
     use std::time::{Duration, Instant};

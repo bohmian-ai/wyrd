@@ -9,10 +9,11 @@ use std::time::Instant;
 
 use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::seal_key::TableRef;
 use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::DataTenantId;
@@ -98,7 +99,7 @@ async fn main() {
 
             let req = ScribeAppend {
                 principal,
-                table: TableRef::new("vala".to_string(), "events".to_string()),
+                table: TableRef::new(BifrostNamespace::Bifrost, "events"),
                 rows: batch,
                 schema_fingerprint: SchemaFingerprint([0u8; 32]),
                 request_id: RequestId::now_v7(),

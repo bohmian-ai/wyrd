@@ -11,9 +11,11 @@ use chrono::NaiveDate;
 use std::sync::Arc;
 use wyrd_spec::ids::DataTenantId;
 
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::parquet_writer::write_frozen_to_parquet;
-use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey, TableRef};
+use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::vala::api::AuditEvent;
 
@@ -53,7 +55,7 @@ fn main() {
 
     let seal_key = SealKey::new(
         DataTenantId::SYSTEM_OWNER,
-        TableRef::new("vala.bifrost".to_string(), "bench".to_string()),
+        TableRef::new(BifrostNamespace::Bifrost, "bench"),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
     );
 

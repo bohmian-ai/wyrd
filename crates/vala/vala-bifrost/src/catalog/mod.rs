@@ -60,7 +60,7 @@ pub struct CreateTableRequest<'a> {
     pub name: &'a str,
     /// Arrow schema fields for the user payload (system columns are added by the catalog).
     pub user_fields: Vec<Field>,
-    /// Tenancy scope: SystemShared or TenantOwned.
+    /// Tenancy scope: `SystemShared` or `TenantOwned`.
     pub scope: TableScope,
     /// Registering tenant.
     pub tenant: wyrd_spec::ids::DataTenantId,

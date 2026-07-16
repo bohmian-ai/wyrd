@@ -104,7 +104,7 @@ impl Memtable {
         Ok(bucket.freeze())
     }
 
-    /// Get the current row count for a seal-key (for `ScribeInspect`).
+    /// Get the current row count for a seal-key.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
@@ -117,7 +117,7 @@ impl Memtable {
     }
 
     /// Snapshot every active seal-key currently held by the memtable whose
-    /// tenant equals `tenant`. Used by `ScribeInspect::force_seal` to drive a
+    /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
     /// per-tenant seal loop without exposing the private `MemtableBucket` type.
     ///
     /// # Errors
@@ -249,7 +249,9 @@ fn estimate_batch_bytes(batch: &RecordBatch) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scribe::seal_key::{EventDay, TableRef};
+    use crate::catalog::TableRef;
+    use crate::namespaces::BifrostNamespace;
+    use crate::scribe::seal_key::EventDay;
     use crate::scribe::wal::WalLsn;
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
@@ -296,7 +298,7 @@ mod tests {
     fn make_test_seal_key() -> SealKey {
         SealKey::new(
             DataTenantId::SYSTEM_OWNER,
-            TableRef::new("vala.bifrost".to_string(), "events".to_string()),
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
         )
     }
@@ -415,7 +417,7 @@ mod tests {
     fn memtable_per_seal_key_isolation() {
         let memtable = Memtable::new();
         let tenant = DataTenantId::SYSTEM_OWNER;
-        let table = TableRef::new("vala.bifrost".to_string(), "events".to_string());
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
 
         let key1 = SealKey::new(
             tenant,

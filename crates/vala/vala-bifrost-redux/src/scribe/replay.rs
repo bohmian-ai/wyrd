@@ -12,10 +12,11 @@ use chrono::NaiveDate;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
 
+use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
-use crate::scribe::seal_key::{EventDay, SealKey, TableRef};
+use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::wal::{WalLsn, WalReader, WalRecord};
 
 /// Replayed state for one seal-key.
@@ -169,7 +170,7 @@ fn extract_seal_key_from_path(_wal_dir: &Path) -> Result<SealKey, ScribeError> {
     // Placeholder — real path parsing pending
     Ok(SealKey::new(
         DataTenantId::SYSTEM_OWNER,
-        TableRef::new("vala.bifrost".to_string(), "events".to_string()),
+        TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
         EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
     ))
 }

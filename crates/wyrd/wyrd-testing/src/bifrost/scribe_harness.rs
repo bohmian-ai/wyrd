@@ -188,14 +188,13 @@ impl MultiScribeHarness {
             .map_err(|e| HarnessError::Internal(format!("tenant_conn: {e}")))
     }
 
-    /// Force-seal every pod and poll `ScribeInspect` until `wal_pending_bytes == 0`
-    /// AND `memtable_row_count == 0` for every seen key across every pod.
+    /// Force-seal every pod and poll pod inspection accessors until
+    /// `wal_pending_bytes == 0` AND `memtable_row_count == 0` for every seen key
+    /// across every pod.
     ///
     /// # Errors
     /// Returns an error if the drain does not complete within `timeout`.
     pub async fn wait_for_drain(&self, timeout: std::time::Duration) -> Result<(), HarnessError> {
-        use vala_bifrost_redux::inspect::ScribeInspect;
-
         let start = std::time::Instant::now();
 
         // Force-seal all pods per tenant

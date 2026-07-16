@@ -3,12 +3,7 @@
 //! These tests verify the full seal flow across multiple pods with real database
 //! verification. They are the primary contract tests per AGENTS.md §11.
 
-#[cfg(feature = "scribe-inspect")]
 mod journey_tests {
-    use std::time::Duration;
-    use wyrd_spec::ids::DataTenantId;
-    use wyrd_testing::bifrost::{HarnessConfig, MultiScribeHarness};
-
     #[tokio::test]
     #[ignore = "requires full DataFusion integration"]
     async fn multi_scribe_three_pods_parallel_ingest_e2e() {
@@ -150,10 +145,4 @@ mod journey_tests {
         //
         // Deferred until per-stream watermark query is formalized and tested.
     }
-}
-
-#[cfg(not(feature = "scribe-inspect"))]
-mod journey_tests {
-    // Journey tests require scribe-inspect feature.
-    // Compile-only stubs when feature is disabled.
 }

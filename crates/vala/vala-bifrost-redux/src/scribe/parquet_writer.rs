@@ -235,7 +235,9 @@ mod tests {
     use std::sync::Arc;
     use wyrd_spec::ids::DataTenantId;
 
-    use crate::scribe::seal_key::{EventDay, SealKey, TableRef};
+    use crate::catalog::TableRef;
+    use crate::namespaces::BifrostNamespace;
+    use crate::scribe::seal_key::{EventDay, SealKey};
 
     fn build_test_frozen(
         seal_day: NaiveDate,
@@ -262,7 +264,7 @@ mod tests {
 
         let seal_key = SealKey::new(
             DataTenantId::SYSTEM_OWNER,
-            TableRef::new("vala.bifrost".to_string(), "events".to_string()),
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(seal_day),
         );
 

@@ -5,7 +5,7 @@
 //!
 //! * Succeed at the gRPC / HTTP level (no server error).
 //! * Return `partial_success` with `rejected_spans == 1` and a non-empty
-//! `error_message` for the rejected span's rejection reason.
+//!   `error_message` for the rejected span's rejection reason.
 //! * Commit the valid span durably (queryable by `trace_id`).
 //!
 //! This exercises the collector's per-span rejection path in

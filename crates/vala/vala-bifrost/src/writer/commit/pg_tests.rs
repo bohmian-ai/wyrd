@@ -84,8 +84,7 @@ mod recovery {
 
         let fields = vec![Field::new("val", DataType::Int64, false)];
         let table_uid = catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: NS,
 
                 name: TABLE,
@@ -94,12 +93,11 @@ mod recovery {
 
                 scope: TableScope::TenantOwned,
 
-                tenant: tenant,
+                tenant,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();
@@ -598,8 +596,7 @@ mod recovery {
         let catalog = rebuild_catalog(&h).await;
         let fields = vec![Field::new("val", DataType::Int64, false)];
         let sys_uid = catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: NS,
 
                 name: "crash_test_sys",
@@ -613,7 +610,6 @@ mod recovery {
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();
@@ -1336,8 +1332,7 @@ mod group_commit {
 
         let catalog = build_catalog(&h).await;
         let table_uid: TableUid = catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: NS,
 
                 name: TABLE,
@@ -1346,12 +1341,11 @@ mod group_commit {
 
                 scope: TableScope::TenantOwned,
 
-                tenant: tenant,
+                tenant,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();
@@ -1451,8 +1445,7 @@ mod group_commit {
 
         let catalog = build_catalog(&h).await;
         let table_uid: TableUid = catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: NS,
 
                 name: TABLE,
@@ -1466,7 +1459,6 @@ mod group_commit {
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();
@@ -1706,22 +1698,20 @@ mod coordinator {
     ) -> TableUid {
         let catalog = build_catalog(h).await;
         catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: NS,
 
                 name: table,
 
                 user_fields: vec![Field::new("val", DataType::Int64, false)],
 
-                scope: scope,
+                scope,
 
                 tenant: owner,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap()

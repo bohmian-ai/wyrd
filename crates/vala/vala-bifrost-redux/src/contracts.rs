@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use wyrd_runtime::principal::Principal;
 use wyrd_spec::request_id::RequestId;
 
+use crate::catalog::TableRef;
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::seal_key::TableRef;
 
 /// Append request carrying batch data, schema fingerprint, and Principal.
 ///
@@ -27,7 +27,7 @@ pub struct ScribeAppend {
     /// Full runtime principal — carries subject, tenant, scopes without
     /// re-derivation. Server-verified upstream by Gate.
     pub principal: Principal,
-    /// (namespace, `table_name`) of the target Bifrost table.
+    /// Target Bifrost table: `(BifrostNamespace, name)` per CONTRACTS §13.
     pub table: TableRef,
     /// Arrow rows; column layout matches the table's registered schema.
     pub rows: RecordBatch,

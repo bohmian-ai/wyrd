@@ -25,10 +25,14 @@ use vala_sql::TenantConn;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use crate::contracts::{Scribe, ScribeAppend, ScribeError};
-#[cfg(feature = "scribe-inspect")]
-use crate::inspect::{MemtableKey, ScribeInspect};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::seal_key::{EventDay, SealKey};
+
+/// Memtable key for per-bucket row-count inspection.
+///
+/// Type alias for [`SealKey`] — memtable buckets are keyed by
+/// (`tenant`, `table`, `event_day`).
+pub type MemtableKey = SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
 /// Scribe implementation with WAL append, fsync, replay, memtable, and seal ().
@@ -303,23 +307,32 @@ impl Scribe for ScribeImpl {
     }
 }
 
-#[cfg(feature = "scribe-inspect")]
-#[async_trait]
-impl ScribeInspect for ScribeImpl {
-    fn wal_pending_bytes(&self) -> u64 {
+impl ScribeImpl {
+    /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
+    #[must_use]
+    pub fn wal_pending_bytes(&self) -> u64 {
         0 // TODO : Real WAL pending bytes
     }
 
-    fn memtable_row_count(&self, key: &MemtableKey) -> usize {
+    /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.
+    #[must_use]
+    pub fn memtable_row_count(&self, key: &MemtableKey) -> usize {
         self.memtable.row_count(key).unwrap_or(0)
     }
 
-    fn sealed_parquet_paths(&self) -> Vec<String> {
+    /// Every Parquet path this pod has sealed since boot.
+    #[must_use]
+    pub fn sealed_parquet_paths(&self) -> Vec<String> {
         // TODO : Query vala.file_list for sealed paths for this node
         vec![]
     }
 
-    async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError> {
+    /// Force-seal every non-empty memtable bucket on this pod and wait for the
+    /// seal tx to commit.
+    ///
+    /// # Errors
+    /// Returns `ScribeError` if any seal stage fails.
+    pub async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError> {
         // A `TenantConn` is bound to exactly one tenant. Seal only the
         // memtable buckets whose seal-key belongs to that tenant; the harness
         // iterates tenants and opens a fresh `TenantConn` per tenant.

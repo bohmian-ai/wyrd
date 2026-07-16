@@ -68,7 +68,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -111,7 +111,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -136,7 +136,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -188,7 +188,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -208,7 +208,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -254,7 +254,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -273,7 +273,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -319,7 +319,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -338,7 +338,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -384,7 +384,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -404,7 +404,7 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind: control_bind,
+                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {

@@ -166,7 +166,9 @@ pub fn read_manifest(path: impl AsRef<Path>) -> Result<Option<Manifest>, ScribeE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scribe::seal_key::{EventDay, TableRef};
+    use crate::catalog::TableRef;
+    use crate::namespaces::BifrostNamespace;
+    use crate::scribe::seal_key::EventDay;
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
     use chrono::NaiveDate;
     use tempfile::TempDir;
@@ -181,7 +183,7 @@ mod tests {
         let mut manifest = Manifest::new(identity);
 
         let tenant = DataTenantId::SYSTEM_OWNER;
-        let table = TableRef::new("vala.bifrost".to_string(), "events".to_string());
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
         let seal_key = SealKey::new(tenant, table, day);
 
@@ -207,7 +209,7 @@ mod tests {
 
         let mut manifest1 = Manifest::new(identity);
         let tenant = DataTenantId::SYSTEM_OWNER;
-        let table = TableRef::new("vala.bifrost".to_string(), "events".to_string());
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
         let seal_key = SealKey::new(tenant, table, day);
 

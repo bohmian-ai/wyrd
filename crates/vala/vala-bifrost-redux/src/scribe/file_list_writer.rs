@@ -110,7 +110,7 @@ pub fn build_insert<'a>(
 
     Ok(FileListInsert {
         id: Uuid::now_v7(),
-        namespace: &frozen.seal_key.table.namespace,
+        namespace: frozen.seal_key.table.namespace.as_str(),
         table_name: &frozen.seal_key.table.name,
         file_path,
         file_size,

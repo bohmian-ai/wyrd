@@ -15,18 +15,16 @@ mod pg_tests {
     use opendal::services::Memory;
     use sqlx::types::Uuid;
     use std::sync::Arc;
+    use vala_bifrost_redux::catalog::TableRef;
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::ScribeImpl;
-    use vala_bifrost_redux::scribe::seal_key::TableRef;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
-
-    #[cfg(feature = "scribe-inspect")]
-    use vala_bifrost_redux::inspect::ScribeInspect;
 
     async fn setup() -> (PgFixture, DataTenantId, ScribeImpl) {
         let fixture = PgFixture::start().await.expect("fixture");
@@ -117,11 +115,10 @@ mod pg_tests {
     }
 
     fn events_table() -> TableRef {
-        TableRef::new("vala".to_string(), "events".to_string())
+        TableRef::new(BifrostNamespace::Bifrost, "events")
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_append_seal_file_list() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -180,7 +177,7 @@ mod pg_tests {
                    partition_day::text, wal_lsn_min, wal_lsn_max, tenant_bucket,
                    node_id, writer_epoch, min_event_time, max_event_time
             FROM vala.file_list
-            WHERE namespace = 'vala' AND table_name = 'events'
+            WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ",
         )
         .fetch_all(&mut **tx)
@@ -206,7 +203,7 @@ mod pg_tests {
         ) = &rows[0];
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
-        assert_eq!(namespace, "vala");
+        assert_eq!(namespace, BifrostNamespace::Bifrost.as_str());
         assert_eq!(table_name, "events");
         assert!(
             file_path.starts_with("bifrost/"),
@@ -235,7 +232,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -351,7 +347,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_cross_day_batch_produces_two_files() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -430,7 +425,7 @@ mod pg_tests {
             r"
             SELECT partition_day::text, row_count
             FROM vala.file_list
-            WHERE namespace = 'vala' AND table_name = 'events'
+            WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ORDER BY partition_day
             ",
         )
@@ -446,7 +441,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     #[ignore = "requires fault injection infrastructure"]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         // This test would verify that if the seal transaction fails between

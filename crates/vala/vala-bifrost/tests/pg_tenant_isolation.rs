@@ -146,7 +146,6 @@ mod pg_tests {
         // and B must be real platform tenants (the `data_tenant_id` FK).
         catalog
             .create_table(vala_bifrost::catalog::CreateTableRequest {
-
                 ns: NS,
 
                 name: TABLE,
@@ -160,7 +159,6 @@ mod pg_tests {
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();

@@ -26,9 +26,6 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
 
-    #[cfg(feature = "scribe-inspect")]
-    use vala_bifrost_redux::inspect::ScribeInspect;
-
     async fn setup() -> (PgFixture, DataTenantId, ScribeImpl) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
@@ -122,7 +119,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_append_seal_file_list() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -236,7 +232,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -352,7 +347,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     async fn pg_scribe_cross_day_batch_produces_two_files() {
         let (fixture, tenant, scribe) = setup().await;
 
@@ -447,7 +441,6 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[cfg(feature = "scribe-inspect")]
     #[ignore = "requires fault injection infrastructure"]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
         // This test would verify that if the seal transaction fails between

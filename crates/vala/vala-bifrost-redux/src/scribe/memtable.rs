@@ -104,7 +104,7 @@ impl Memtable {
         Ok(bucket.freeze())
     }
 
-    /// Get the current row count for a seal-key (for `ScribeInspect`).
+    /// Get the current row count for a seal-key.
     ///
     /// # Errors
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned.
@@ -117,7 +117,7 @@ impl Memtable {
     }
 
     /// Snapshot every active seal-key currently held by the memtable whose
-    /// tenant equals `tenant`. Used by `ScribeInspect::force_seal` to drive a
+    /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
     /// per-tenant seal loop without exposing the private `MemtableBucket` type.
     ///
     /// # Errors

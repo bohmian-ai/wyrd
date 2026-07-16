@@ -74,21 +74,19 @@ impl BenchFixture {
         match self
             .catalog
             .create_table(vala_bifrost::catalog::CreateTableRequest {
+                ns,
 
-                ns: ns,
-
-                name: name,
+                name,
 
                 user_fields: extra_fields.clone(),
 
-                scope: scope,
+                scope,
 
                 tenant: self.tenant,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
         {
@@ -99,7 +97,15 @@ impl BenchFixture {
                     .await
                     .expect("drop stale bench table");
                 self.catalog
-                    .create_table(ns, name, extra_fields, scope, self.tenant, &[], None)
+                    .create_table(vala_bifrost::catalog::CreateTableRequest {
+                        ns,
+                        name,
+                        user_fields: extra_fields,
+                        scope,
+                        tenant: self.tenant,
+                        partition_columns: &[],
+                        audit: None,
+                    })
                     .await
                     .expect("recreate bench table after drop");
             }

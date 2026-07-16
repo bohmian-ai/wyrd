@@ -7,10 +7,6 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-[features]
-default = []
-scribe-inspect = []
-
 [dependencies]
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }

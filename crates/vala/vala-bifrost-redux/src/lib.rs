@@ -9,8 +9,6 @@
 
 pub mod catalog;
 pub mod contracts;
-#[cfg(feature = "scribe-inspect")]
-pub mod inspect;
 pub mod namespaces;
 pub mod parquet;
 pub mod provider;

@@ -502,9 +502,7 @@ impl GroupCommitActor {
 /// commit tests. Production catalog writers use
 /// [`spawn_group_commit_coordinator_with_notifier`].
 #[cfg(test)]
-pub(crate) fn spawn_group_commit_coordinator(
-    inputs: GroupCoordinatorInputs,
-) -> GroupCommitHandle {
+pub(crate) fn spawn_group_commit_coordinator(inputs: GroupCoordinatorInputs) -> GroupCommitHandle {
     spawn_group_commit_coordinator_with_notifier(
         inputs,
         Arc::new(crate::writer::NoOpCommitNotifier),
@@ -686,8 +684,7 @@ mod pg_tests {
         let tenant = fixture.data_tenant_id();
         let table_name = "coordinator_notify";
         let table_uid = catalog
-            .create_table(vala_bifrost::catalog::CreateTableRequest {
-
+            .create_table(crate::catalog::CreateTableRequest {
                 ns: BifrostNamespace::Bifrost,
 
                 name: table_name,
@@ -696,12 +693,11 @@ mod pg_tests {
 
                 scope: TableScope::TenantOwned,
 
-                tenant: tenant,
+                tenant,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .expect("test table");

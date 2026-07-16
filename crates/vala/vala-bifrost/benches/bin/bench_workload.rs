@@ -101,27 +101,22 @@ async fn run(args: Args) {
 
     catalog
         .create_table(vala_bifrost::catalog::CreateTableRequest {
-
-            ns: ns,
+            ns,
 
             name: "bench_wl",
 
             user_fields: vec![
-
-                            arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
-
-                            arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
-
-                        ],
+                arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new("payload", arrow::datatypes::DataType::Utf8, false),
+            ],
 
             scope: TableScope::TenantOwned,
 
-            tenant: tenant,
+            tenant,
 
             partition_columns: &[],
 
             audit: None,
-
         })
         .await
         .expect("create bench table");

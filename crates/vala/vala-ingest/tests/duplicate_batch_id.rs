@@ -127,7 +127,6 @@ mod pg_tests {
 
         catalog
             .create_table(vala_bifrost::catalog::CreateTableRequest {
-
                 ns: BifrostNamespace::Bifrost,
 
                 name: "dup_test",
@@ -136,12 +135,11 @@ mod pg_tests {
 
                 scope: TableScope::TenantOwned,
 
-                tenant: tenant,
+                tenant,
 
                 partition_columns: &[],
 
                 audit: None,
-
             })
             .await
             .unwrap();

@@ -16,11 +16,14 @@ mod pg_tests {
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+    use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::ScribeImpl;
+    use vala_bifrost_redux::scribe::seal_key::TableRef;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
 
     #[cfg(feature = "scribe-inspect")]
     use vala_bifrost_redux::inspect::ScribeInspect;
@@ -99,17 +102,6 @@ mod pg_tests {
         .expect("batch")
     }
 
-    fn encode_batch(batch: &RecordBatch) -> Vec<u8> {
-        use arrow::ipc::writer::StreamWriter;
-        let mut buf = Vec::new();
-        {
-            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).expect("writer");
-            writer.write(batch).expect("write");
-            writer.finish().expect("finish");
-        }
-        buf
-    }
-
     fn principal_for_tenant(tenant: DataTenantId) -> Principal {
         Principal {
             id: PrincipalId::new(Uuid::now_v7()),
@@ -120,8 +112,12 @@ mod pg_tests {
         }
     }
 
-    fn stub_schema_fingerprint() -> [u8; 32] {
-        [0u8; 32]
+    fn stub_schema_fingerprint() -> SchemaFingerprint {
+        SchemaFingerprint([0u8; 32])
+    }
+
+    fn events_table() -> TableRef {
+        TableRef::new("vala".to_string(), "events".to_string())
     }
 
     #[tokio::test]
@@ -134,14 +130,15 @@ mod pg_tests {
             .unwrap()
             .timestamp_micros();
         let batch = make_batch(50_000, base_time, tenant);
-        let batch_data = encode_batch(&batch);
         let principal = principal_for_tenant(tenant);
 
         let req = ScribeAppend {
-            table_fqn: "vala.events".to_string(),
-            schema_fingerprint: stub_schema_fingerprint(),
-            batch_data,
             principal,
+            table: events_table(),
+            rows: batch,
+            schema_fingerprint: stub_schema_fingerprint(),
+            request_id: RequestId::now_v7(),
+            batch_id: uuid::Uuid::now_v7(),
         };
 
         scribe.append(req).await.expect("append");
@@ -249,15 +246,16 @@ mod pg_tests {
 
         for i in 0..3 {
             let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
-            let batch_data = encode_batch(&batch);
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7()); // Unique principal per append
 
             let req = ScribeAppend {
-                table_fqn: "vala.events".to_string(),
-                schema_fingerprint: stub_schema_fingerprint(),
-                batch_data,
                 principal,
+                table: events_table(),
+                rows: batch,
+                schema_fingerprint: stub_schema_fingerprint(),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
             };
 
             scribe.append(req).await.expect("append");
@@ -401,14 +399,15 @@ mod pg_tests {
         )
         .expect("batch");
 
-        let batch_data = encode_batch(&batch);
         let principal = principal_for_tenant(tenant);
 
         let req = ScribeAppend {
-            table_fqn: "vala.events".to_string(),
-            schema_fingerprint: stub_schema_fingerprint(),
-            batch_data,
             principal,
+            table: events_table(),
+            rows: batch,
+            schema_fingerprint: stub_schema_fingerprint(),
+            request_id: RequestId::now_v7(),
+            batch_id: uuid::Uuid::now_v7(),
         };
 
         scribe.append(req).await.expect("append");

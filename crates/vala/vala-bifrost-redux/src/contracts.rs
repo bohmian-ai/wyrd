@@ -1,26 +1,43 @@
 //! Scribe contracts per CONTRACTS §5.
 //!
-//! The `Scribe` trait is the boundary between the Gate (dispatch) and the Scribe
-//! (WAL + memtable + seal). Every method is async; every error is `ScribeError`.
+//! The `Scribe` trait is the boundary between the Gate (dispatch) and the
+//! Scribe (WAL + memtable + seal). Every method is async; every error is
+//! `ScribeError`.
+//!
+//! `Scribe::append` returns `Result<(), ScribeError>` — a durable ack is
+//! signaled by `Ok(())`. Idempotency lives on the request via `batch_id`
+//! (client-supplied v7 UUID); the 2PC recovery path in `catalog::recovery`
+//! keys off it, so there is no `AppendAck` payload to plumb through Gate.
 
+use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use wyrd_runtime::principal::Principal;
-use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
+
+use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::seal_key::TableRef;
 
 /// Append request carrying batch data, schema fingerprint, and Principal.
+///
+/// Tenant is not a top-level field — it lives on `principal.tenant_id` and
+/// Scribe reads it there. Duplicating it on the wire risks a mismatch
+/// between the two.
 #[derive(Debug, Clone)]
 pub struct ScribeAppend {
-    pub table_fqn: String,
-    pub schema_fingerprint: [u8; 32],
+    /// Full runtime principal — carries subject, tenant, scopes without
+    /// re-derivation. Server-verified upstream by Gate.
     pub principal: Principal,
-    pub batch_data: Vec<u8>, // Placeholder for Arrow IPC bytes
-}
-
-/// Append acknowledgment.
-#[derive(Debug, Clone)]
-pub struct AppendAck {
-    pub batch_id: [u8; 16],
-    pub tenant: DataTenantId,
+    /// (namespace, `table_name`) of the target Bifrost table.
+    pub table: TableRef,
+    /// Arrow rows; column layout matches the table's registered schema.
+    pub rows: RecordBatch,
+    /// Client-computed fingerprint of the source Arrow schema; Scribe
+    /// rejects with `FingerprintMismatch` when the catalog value differs.
+    pub schema_fingerprint: SchemaFingerprint,
+    /// Server-assigned per-request id (Gate mints it on the way in).
+    pub request_id: RequestId,
+    /// Client-supplied v7 UUID for idempotency. 2PC recovery keys off this.
+    pub batch_id: uuid::Uuid,
 }
 
 /// Scribe-layer errors per CONTRACTS §10.
@@ -73,11 +90,12 @@ impl From<vala_sql::SqlError> for ScribeError {
 }
 
 /// Scribe trait — the durable write boundary.
+///
+/// `Ok(())` signals durable-ack (WAL fsynced). Idempotency lives on
+/// `req.batch_id`; the 2PC recovery path uses it to dedupe replays.
 #[async_trait]
 pub trait Scribe: Send + Sync {
-    /// Append one batch to the WAL. Returns when the batch is durably recorded
-    /// in the WAL (not yet sealed to Parquet).
-    async fn append(&self, req: ScribeAppend) -> Result<AppendAck, ScribeError>;
+    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError>;
 }
 
 #[cfg(test)]
@@ -98,7 +116,6 @@ mod tests {
         let wal_bifrost = wal_full.to_bifrost_error();
         let mismatch_bifrost = mismatch.to_bifrost_error();
 
-        // Verify the mapping produces the expected BifrostError variants
         match busy_bifrost {
             wyrd_spec::vala::error::BifrostError::IngestBusy { table } => {
                 assert_eq!(table, "test.table");

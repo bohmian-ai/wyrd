@@ -53,7 +53,7 @@ pub struct CardRow {
     /// Free-form annotations JSONB (lazy decode).
     #[sqlx(json)]
     pub annotations: serde_json::Value,
-    /// Lifecycle status literal (`"active"`, `"deprecated"`, `"deleted"`).
+    /// Lifecycle status literal from the card registration state machine.
     pub status: String,
     /// Creating principal UUID, if known.
     pub created_by: Option<Uuid>,
@@ -157,12 +157,18 @@ impl TryFrom<CardRow> for ParsedCardRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CardStatus {
+    /// Card is waiting for artifact upload and verification.
+    Pending,
     /// Card is registered and discoverable.
     Active,
     /// Card is retained but hidden from default queries.
     Deprecated,
     /// Card is tombstoned for audit retention.
     Deleted,
+    /// Registration failed and is terminal for this card UID.
+    Failed,
+    /// Registration expired and is terminal for this card UID.
+    Expired,
 }
 
 impl CardStatus {
@@ -170,9 +176,12 @@ impl CardStatus {
     #[must_use]
     pub fn as_db_str(&self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Active => "active",
             Self::Deprecated => "deprecated",
             Self::Deleted => "deleted",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
         }
     }
 
@@ -182,9 +191,12 @@ impl CardStatus {
     /// Returns [`SqlError::InvariantViolation`] when the literal does not match a known variant.
     pub fn from_db_str(value: &str) -> Result<Self, SqlError> {
         match value {
+            "pending" => Ok(Self::Pending),
             "active" => Ok(Self::Active),
             "deprecated" => Ok(Self::Deprecated),
             "deleted" => Ok(Self::Deleted),
+            "failed" => Ok(Self::Failed),
+            "expired" => Ok(Self::Expired),
             other => Err(SqlError::InvariantViolation {
                 detail: format!("cards.status has invalid value {other:?}"),
             }),
@@ -199,9 +211,12 @@ mod tests {
     #[test]
     fn card_status_db_roundtrip() {
         for (variant, literal) in [
+            (CardStatus::Pending, "pending"),
             (CardStatus::Active, "active"),
             (CardStatus::Deprecated, "deprecated"),
             (CardStatus::Deleted, "deleted"),
+            (CardStatus::Failed, "failed"),
+            (CardStatus::Expired, "expired"),
         ] {
             assert_eq!(variant.as_db_str(), literal);
             assert_eq!(CardStatus::from_db_str(literal).unwrap(), variant);

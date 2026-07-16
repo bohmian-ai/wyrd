@@ -16,6 +16,7 @@ use crate::bifrost::routes::router as bifrost_router;
 use crate::components::admin::admin_router;
 use crate::components::auth::auth_router;
 use crate::components::authz::authz_router;
+use crate::components::cards::cards_router;
 use crate::components::eval::eval_router;
 use crate::components::health::health_router;
 use crate::components::storage::storage_router;
@@ -46,6 +47,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(storage_router(&state))
         .merge(eval_router())
         .merge(authz_router())
+        .merge(cards_router())
         .merge(admin_router())
         .merge(bifrost_router())
         .merge(query_router())

@@ -112,6 +112,14 @@ hide = true
 description = "Run wyrd family tests (unit tests only — pg_tests skipped without docker); package list in scripts/test-families.sh"
 run = "bash scripts/run-family-tests.sh wyrd"
 
+[tasks."test:cards:unit"]
+hide = true
+description = "Run the card registration SQL and server unit slices"
+run = """
+cargo test --locked -p wyrd-sql --lib queries::cards::register
+cargo test --locked -p wyrd-server --lib components::cards
+"""
+
 [tasks."test:skald"]
 hide = true
 description = "Run skald family tests (no DB required); package list in scripts/test-families.sh"

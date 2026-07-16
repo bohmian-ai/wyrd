@@ -19,6 +19,13 @@ pub use list::{
     get_unique_spaces, query_cards,
 };
 pub use register::{
-    RegisterCardOutcome, RegisterCardOutcomeKind, RegisterCardRequest, register_card,
+    CardArtifactManifestRow, CardRegistrationOperationRow, NewCardRow, NewRegistrationOperation,
+    RegisterCardOutcome, RegisterCardOutcomeKind, RegisterCardRequest, RegisteredCardRow,
+    artifact_manifest_hash, build_create_response, insert_artifact_manifest_rows, insert_card_row,
+    insert_registration_operation, lookup_existing_operation, manifest_rows_for_init,
+    mark_manifest_upload_initialized, operation_outcome, operation_status, register_card,
+    registration_request_hash, select_card_uids_by_ref_batch, update_registration_operation_plans,
+    upload_plans_json,
 };
 pub use version_query::{get_latest_card_by_range, list_versions};
+pub use version_resolve::{Resolution, resolve_version};

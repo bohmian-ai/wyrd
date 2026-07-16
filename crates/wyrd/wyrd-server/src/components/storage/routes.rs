@@ -234,7 +234,7 @@ fn authorize(
         .map_err(WyrdErrorResponse::from)
 }
 
-fn storage_caller(caller: &Caller) -> StorageCaller {
+pub(crate) fn storage_caller(caller: &Caller) -> StorageCaller {
     StorageCaller {
         data_tenant_id: caller.data_tenant_id,
         subject: StorageSubject {

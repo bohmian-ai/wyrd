@@ -11,7 +11,7 @@ use crate::queries::cards::version_sql::push_bounds;
 use crate::tenant_conn::TenantConn;
 
 /// Outcome of resolving the authored version against existing rows.
-pub(crate) enum Resolution {
+pub enum Resolution {
     /// Insert at this concrete version.
     Fresh(VersionBlock),
     /// Content matches the latest-in-line row; return it, do not insert.
@@ -71,7 +71,7 @@ async fn latest_stable_in_line(
 /// Returns `WYRD_REG_400_INVALID_VERSION_BLOCK` for invalid bounds, overflow,
 /// stored-version parse failures, or a scoped bump that leaves the authored
 /// range. Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
-pub(crate) async fn resolve_version(
+pub async fn resolve_version(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
     space: &SpaceName,

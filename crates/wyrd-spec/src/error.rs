@@ -980,6 +980,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A submitted card reference was not found in the caller's tenant.
+    #[error("[WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY",
+        status = 422,
+        title = "Card reference could not be resolved",
+        remediation = "Register the referenced card in the current tenant before submitting this card."
+    )]
+    RegistryUnresolvedDependency {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Defense-in-depth: an existing card with the same identity has a different uid.
     #[error("[WYRD_REG_500_VERSION_CONFLICT] {message}")]
     #[wyrd_error(
@@ -2498,6 +2512,7 @@ impl WyrdError {
             | Self::RegistryCardRefUidNotResolvableHere { message, details }
             | Self::RegistryRequirementNotResolvableHere { message, details }
             | Self::RegistryCardNotFound { message, details }
+            | Self::RegistryUnresolvedDependency { message, details }
             | Self::RegistryVersionConflict { message, details }
             | Self::RegistrySpecDrift { message, details }
             | Self::RegistryUnavailable { message, details }

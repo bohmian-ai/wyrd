@@ -1,4 +1,9 @@
 //! Axum adapter for card registration.
+//!
+//! Authentication is enforced by the `/v1` middleware layer. The route keeps
+//! the `card_write` permission check local because it is a capability decision
+//! specific to this write operation, not an authentication decision shared by
+//! every protected route.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
@@ -40,12 +45,22 @@ pub fn cards_router() -> Router<AppState> {
     skip(state, caller, headers, body),
     fields(operation = "card.registration.create")
 )]
+/// Accept a card registration request and return its durable registration result.
+///
+/// The required `Idempotency-Key` lets a caller safely retry after a lost
+/// response. The service binds that key to the authenticated principal and
+/// canonical request content, so an exact replay is safe while reuse for a
+/// different request is rejected.
 pub(crate) async fn register_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,
     Json(body): Json<CreateCardRequest>,
 ) -> Result<(StatusCode, Json<wyrd_spec::registry::CreateCardResponse>), WyrdErrorResponse> {
+    // `require_authenticated` on the `/v1` router has already verified the
+    // access token and the `Caller` extractor has materialized its principal.
+    // This check is intentionally route-local: authentication answers "who is
+    // calling?" while this capability check answers "may they register cards?".
     state
         .authz
         .permission_check
@@ -59,6 +74,12 @@ pub(crate) async fn register_card_http(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Extract and validate the required registration idempotency key.
+///
+/// Registration requires a caller-supplied key because the server cannot infer
+/// whether two otherwise identical requests are a retry or an intentional new
+/// operation. The service combines this key with the principal and canonical
+/// request hash to provide exactly-once registration semantics.
 fn extract_required_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<IdempotencyKey, WyrdErrorResponse> {

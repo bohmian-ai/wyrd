@@ -28,12 +28,9 @@ pub struct SubmissionMetadata {
     /// Version bump requested when version is omitted or scoped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bump: Option<VersionBump>,
-    /// Optional workspace.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub space: Option<SpaceName>,
-    /// Optional client-provided UID, used only where the server permits it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub uid: Option<CardUid>,
+    /// Registration workspace. The loader supplies the configured default
+    /// before this submission crosses the HTTP boundary.
+    pub space: SpaceName,
     /// Display labels.
     #[serde(default, skip_serializing_if = "Labels::is_empty")]
     pub labels: Labels,
@@ -170,6 +167,7 @@ mod submission_tests {
             "kind": "Audit",
             "metadata": {
                 "name": "audit-a",
+                "space": "default",
             },
             "spec": {}
         });
@@ -185,7 +183,7 @@ mod submission_tests {
         let body = json!({
             "apiVersion": "wyrd/v1",
             "kind": "Audit",
-            "metadata": { "name": "audit-a" },
+            "metadata": { "name": "audit-a", "space": "default" },
             "spec": {},
             "status": "active",
         });
@@ -201,10 +199,23 @@ mod submission_tests {
     fn submission_metadata_rejects_server_managed_fields() {
         let body = json!({
             "name": "greeter",
-            "card_uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00",
+            "space": "default",
+            "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00",
         });
         serde_json::from_value::<SubmissionMetadata>(body)
-            .expect_err("card_uid is server-derived and must not appear in submission metadata");
+            .expect_err("uid is server-derived and must not appear in submission metadata");
+    }
+
+    #[test]
+    fn card_submission_requires_space() {
+        let body = json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Audit",
+            "metadata": { "name": "audit-a" },
+            "spec": {},
+        });
+        serde_json::from_value::<CardSubmission>(body)
+            .expect_err("registration submissions require metadata.space");
     }
 
     #[test]

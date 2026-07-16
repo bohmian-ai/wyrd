@@ -4,7 +4,8 @@
   "description": "Metadata accepted on a registration submission.",
   "type": "object",
   "required": [
-    "name"
+    "name",
+    "space"
   ],
   "properties": {
     "annotations": {
@@ -41,24 +42,10 @@
       ]
     },
     "space": {
-      "description": "Optional workspace.",
-      "anyOf": [
+      "description": "Registration workspace. The loader supplies the configured default before this submission crosses the HTTP boundary.",
+      "allOf": [
         {
           "$ref": "#/definitions/SpaceName"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "uid": {
-      "description": "Optional client-provided UID, used only where the server permits it.",
-      "anyOf": [
-        {
-          "$ref": "#/definitions/CardUid"
-        },
-        {
-          "type": "null"
         }
       ]
     },
@@ -82,10 +69,6 @@
     },
     "CardName": {
       "description": "Human-visible Card name.",
-      "type": "string"
-    },
-    "CardUid": {
-      "description": "Resolved immutable Card UID.",
       "type": "string"
     },
     "LabelValue": {

@@ -931,7 +931,13 @@ pub async fn update_registration_operation_plans(
     Ok(())
 }
 
-/// Resolve a batch of exact card identities inside the caller-owned tenant transaction.
+/// Resolve references to cards that must already exist in the tenant registry.
+///
+/// This is used for card specs that point at other registered cards. Inline
+/// light-card definitions do not appear in `refs` and therefore do not need a
+/// lookup. The query preserves every requested identity, including misses, so
+/// the server can return one unresolved-dependency error instead of silently
+/// dropping a reference.
 pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],
@@ -939,6 +945,24 @@ pub async fn select_card_uids_by_ref_batch(
     if refs.is_empty() {
         return Ok(Vec::new());
     }
+    let rows = fetch_card_ref_rows(conn, refs).await?;
+    let mut resolved = Vec::with_capacity(rows.len());
+    for row in rows {
+        if let Some(card) = map_card_ref_row(refs, row)? {
+            resolved.push(card);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Row shape returned by the set-based reference lookup.
+type CardRefLookupRow = (String, String, String, String, Option<Uuid>);
+
+/// Fetch requested reference identities and optional matching UIDs in one query.
+async fn fetch_card_ref_rows(
+    conn: &mut TenantConn<'_>,
+    refs: &[CardRef],
+) -> Result<Vec<CardRefLookupRow>, WyrdError> {
     let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
         "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid \
          FROM (VALUES ",
@@ -961,30 +985,34 @@ pub async fn select_card_uids_by_ref_batch(
           AND cards.status NOT IN ('deleted', 'failed', 'expired')",
     );
     let rows = query
-        .build_query_as::<(String, String, String, String, Option<Uuid>)>()
+        .build_query_as::<CardRefLookupRow>()
         .fetch_all(&mut **conn.transaction())
         .await
         .map_err(|_| WyrdError::registry_unavailable("card registry unavailable"))?;
-    rows.into_iter()
-        .filter_map(|(kind, space, name, version, uid)| {
-            uid.map(|uid| (kind, space, name, version, uid))
+    Ok(rows)
+}
+
+/// Convert one SQL row back to its typed request reference when it matched.
+fn map_card_ref_row(
+    refs: &[CardRef],
+    (kind, space, name, version, uid): CardRefLookupRow,
+) -> Result<Option<(CardRef, CardUid)>, WyrdError> {
+    let Some(uid) = uid else {
+        return Ok(None);
+    };
+    let card_ref = refs
+        .iter()
+        .find(|card_ref| {
+            card_ref.kind.wire_name() == kind
+                && card_ref.space.as_str() == space
+                && card_ref.name.as_str() == name
+                && card_ref.version.as_str() == version
         })
-        .map(|(kind, space, name, version, uid)| {
-            let card_ref = refs
-                .iter()
-                .find(|card_ref| {
-                    card_ref.kind.wire_name() == kind
-                        && card_ref.space.as_str() == space
-                        && card_ref.name.as_str() == name
-                        && card_ref.version.as_str() == version
-                })
-                .expect("VALUES relation only contains requested card references");
-            Ok((
-                card_ref.clone(),
-                CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
-            ))
-        })
-        .collect()
+        .ok_or_else(|| WyrdError::registry_unavailable("card registry unavailable"))?;
+    Ok(Some((
+        card_ref.clone(),
+        CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
+    )))
 }
 
 #[cfg(test)]

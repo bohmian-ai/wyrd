@@ -23,7 +23,12 @@ pub struct CardRef {
     pub version: VersionBlock,
     /// Space pinning identity together with `name` and `version`.
     pub space: SpaceName,
-    /// Optional resolved UID.
+    /// Optional server-resolved durable UID.
+    ///
+    /// Authors identify a dependency with `(kind, space, name, version)` and
+    /// may omit this field. The server resolves that reference to a [`CardUid`]
+    /// before registration; the UID is then used for durable authorization and
+    /// lineage without changing the authored reference identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<CardUid>,
 }
@@ -249,7 +254,9 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
 /// Bind server-resolved UIDs to the card references discovered by
 /// [`scope_child_card_refs`]. The input pairs are authoritative; JSON values
 /// are used only as the serialization boundary for the already typed spec and
-/// are matched against the complete serialized `CardRef` shape.
+/// are matched against the complete serialized `CardRef` identity shape. Any
+/// existing `uid` is ignored because the server must replace authored values
+/// with the UID it resolved.
 pub fn bind_scoped_card_ref_uids(
     kind: &CardKind,
     spec: Spec,
@@ -264,13 +271,24 @@ pub fn bind_scoped_card_ref_uids(
             message: error.to_string(),
         })?;
     for (card_ref, uid) in resolved {
-        let target = serde_json::to_value(card_ref).expect("CardRef serialization is infallible");
+        let mut target =
+            serde_json::to_value(card_ref).expect("CardRef serialization is infallible");
+        if let serde_json::Value::Object(object) = &mut target {
+            object.remove("uid");
+        }
         let uid_value = serde_json::to_value(uid).expect("CardUid serialization is infallible");
         bind_serialized_ref(&mut value, &target, &uid_value);
     }
     Spec::from_kind_and_value(kind, value)
 }
 
+/// Walk a serialized spec and add one resolved UID to exact `CardRef` objects.
+///
+/// Matching the complete serialized reference identity prevents a short generic
+/// object with the same four identity fields from being rewritten accidentally.
+/// The optional UID is excluded from the comparison so stale authored UIDs are
+/// replaced. The traversal visits nested arrays and objects because references
+/// can appear in several kind-specific spec shapes.
 fn bind_serialized_ref(
     value: &mut serde_json::Value,
     target: &serde_json::Value,
@@ -283,7 +301,9 @@ fn bind_serialized_ref(
             }
         }
         serde_json::Value::Object(object) => {
-            if serde_json::Value::Object(object.clone()) == *target {
+            let mut identity = object.clone();
+            identity.remove("uid");
+            if serde_json::Value::Object(identity) == *target {
                 object.insert("uid".to_owned(), uid.clone());
             }
             for value in object.values_mut() {
@@ -410,6 +430,7 @@ pub enum CardRefParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::card::mcp::McpSpec;
 
     fn sample_ref() -> CardRef {
         CardRef {
@@ -515,6 +536,39 @@ mod tests {
             "space must serialize"
         );
         assert!(!json.contains("uid"), "uid=None must skip");
+    }
+
+    #[test]
+    fn binding_replaces_an_authored_uid_with_the_server_uid() {
+        let authored_uid =
+            CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid");
+        let resolved_uid =
+            CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b12").expect("static uid is valid");
+        let authored_ref = CardRef {
+            kind: CardKind::Prompt,
+            name: CardName::new("system-prompt").expect("static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("default").expect("static space is valid"),
+            uid: Some(authored_uid),
+        };
+        let lookup_ref = CardRef {
+            uid: None,
+            ..authored_ref.clone()
+        };
+        let spec = Spec::Mcp(McpSpec {
+            server_name: "tools".to_owned(),
+            tool_refs: vec![authored_ref],
+            ..McpSpec::default()
+        });
+
+        let bound =
+            bind_scoped_card_ref_uids(&CardKind::Mcp, spec, &[(lookup_ref, resolved_uid.clone())])
+                .expect("MCP spec remains valid after UID binding");
+
+        let Spec::Mcp(bound) = bound else {
+            panic!("expected an MCP spec");
+        };
+        assert_eq!(bound.tool_refs[0].uid, Some(resolved_uid));
     }
 
     #[test]

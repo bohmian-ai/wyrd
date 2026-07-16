@@ -1,4 +1,9 @@
 //! Axum adapters for storage service functions.
+//!
+//! Authentication is applied once to the whole `/v1` router by HTTP
+//! middleware. These handlers add the operation-specific `card_read` or
+//! `card_write` permission before calling storage services; keeping that check
+//! beside the route makes the capability required by each operation explicit.
 
 use std::str::FromStr;
 
@@ -42,6 +47,7 @@ pub fn storage_router(state: &AppState) -> Router<AppState> {
     }
 }
 
+/// Create or replay a storage upload initialization.
 async fn init(
     State(state): State<AppState>,
     caller: Caller,
@@ -65,9 +71,11 @@ async fn init(
 
 #[derive(Debug, Deserialize)]
 struct PartUrlQuery {
+    /// One-based multipart part number requested by the client.
     part_number: u32,
 }
 
+/// Mint a URL or equivalent protocol data for one upload part.
 async fn part_url(
     State(state): State<AppState>,
     caller: Caller,
@@ -89,6 +97,7 @@ async fn part_url(
     .map_err(WyrdErrorResponse::from)
 }
 
+/// Complete an initialized multipart or single-part upload.
 async fn complete(
     State(state): State<AppState>,
     caller: Caller,
@@ -110,6 +119,7 @@ async fn complete(
     .map_err(WyrdErrorResponse::from)
 }
 
+/// Abort an upload and release its pending storage state.
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,
@@ -129,6 +139,7 @@ async fn abort(
     .map_err(WyrdErrorResponse::from)
 }
 
+/// Store bytes for the local development backend.
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
@@ -142,6 +153,7 @@ async fn local_blob(
     Ok(Json(LocalBlobUploadResponse { uploaded: true }))
 }
 
+/// Create a signed or local download plan for a stored artifact.
 async fn download_init(
     State(state): State<AppState>,
     caller: Caller,
@@ -155,6 +167,7 @@ async fn download_init(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Stream bytes from the local development backend.
 async fn download_local_blob(
     State(state): State<AppState>,
     caller: Caller,
@@ -177,12 +190,17 @@ async fn download_local_blob(
         .into_response())
 }
 
+/// Parse the route upload identifier and map malformed values to the HTTP error.
 fn parse_upload_id(value: &str) -> Result<UploadId, WyrdErrorResponse> {
     UploadId::from_str(value)
         .map_err(|error| service::invalid_upload_id(&error))
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Parse the optional storage idempotency header.
+///
+/// Storage initialization permits the header to be omitted, while a supplied
+/// value must be valid UTF-8 and satisfy the shared `IdempotencyKey` contract.
 fn extract_idempotency_key(
     headers: &HeaderMap,
 ) -> Result<Option<IdempotencyKey>, WyrdErrorResponse> {
@@ -209,6 +227,7 @@ fn extract_idempotency_key(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Require the card-write permission for storage mutations.
 fn authorize_card_write(
     check: &dyn PermissionCheck,
     caller: &Caller,
@@ -216,6 +235,7 @@ fn authorize_card_write(
     authorize(check, caller, Permission::card_write())
 }
 
+/// Require the card-read permission for storage reads.
 fn authorize_card_read(
     check: &dyn PermissionCheck,
     caller: &Caller,
@@ -223,6 +243,7 @@ fn authorize_card_read(
     authorize(check, caller, Permission::card_read())
 }
 
+/// Evaluate one route capability against the already authenticated principal.
 fn authorize(
     check: &dyn PermissionCheck,
     caller: &Caller,
@@ -234,6 +255,11 @@ fn authorize(
         .map_err(WyrdErrorResponse::from)
 }
 
+/// Convert the authenticated caller into the storage service's typed subject.
+///
+/// The principal UUID is passed directly. Storage does not infer identity from
+/// a string prefix, and the caller's tenant and request ID are preserved for
+/// row-level isolation and audit attribution.
 pub(crate) fn storage_caller(caller: &Caller) -> StorageCaller {
     StorageCaller {
         data_tenant_id: caller.data_tenant_id,

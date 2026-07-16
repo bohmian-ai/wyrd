@@ -11,6 +11,15 @@ use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
 const STORAGE_INIT_ADVISORY_CLASS: i32 = 0x0C_A2_D0_02;
 
 /// Serialize initialization for one tenant-scoped idempotency or artifact key.
+///
+/// The lock is transaction-scoped, so it is released automatically on commit or
+/// rollback. The surrounding [`TenantConn`] supplies the tenant binding; the
+/// advisory class keeps these locks separate from registry version-line locks.
+/// Callers take this lock before checking the cache or performing the external
+/// storage initialization so concurrent retries cannot mint duplicate uploads.
+///
+/// # Errors
+/// Returns [`SqlError`] when PostgreSQL cannot acquire the advisory lock.
 pub async fn lock_init(conn: &mut TenantConn<'_>, identity: &str) -> Result<(), SqlError> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
         .bind(STORAGE_INIT_ADVISORY_CLASS)

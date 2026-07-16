@@ -149,7 +149,7 @@
           ]
         },
         "uid": {
-          "description": "Optional resolved UID.",
+          "description": "Optional server-resolved durable UID.\n\nAuthors identify a dependency with `(kind, space, name, version)` and may omit this field. The server resolves that reference to a [`CardUid`] before registration; the UID is then used for durable authorization and lineage without changing the authored reference identity.",
           "anyOf": [
             {
               "$ref": "#/definitions/CardUid"

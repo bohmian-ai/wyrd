@@ -42,6 +42,7 @@ rand = { workspace = true }
 secrecy = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 sqlx = { workspace = true }
 subtle = { workspace = true }
@@ -63,9 +64,10 @@ tower = { workspace = true, features = ["util", "timeout", "limit", "load-shed"]
 tower-http = { workspace = true, features = ["trace", "catch-panic"] }
 tower_governor = { workspace = true }
 http-body-util = "0.1"
-wyrd-spec = { workspace = true }
+wyrd-spec = { workspace = true, features = ["server"] }
 wyrd-semver = { workspace = true }
 wyrd-storage = { workspace = true }
+utoipa = { workspace = true, features = ["yaml"] }
 
 [dev-dependencies]
 insta = { workspace = true }
@@ -109,3 +111,6 @@ name = "pg_eval_v1_protocol"
 [[test]]
 name = "storage_e2e"
 required-features = ["storage-emulator"]
+
+[[test]]
+name = "pg_card_registration_route"

@@ -246,6 +246,57 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
     }
 }
 
+/// Bind server-resolved UIDs to the card references discovered by
+/// [`scope_child_card_refs`]. The input pairs are authoritative; JSON values
+/// are used only as the serialization boundary for the already typed spec and
+/// are matched against the complete serialized `CardRef` shape.
+pub fn bind_scoped_card_ref_uids(
+    kind: &CardKind,
+    spec: Spec,
+    resolved: &[(CardRef, CardUid)],
+) -> Result<Spec, crate::envelope::SpecDecodeError> {
+    if resolved.is_empty() {
+        return Ok(spec);
+    }
+    let mut value =
+        serde_json::to_value(spec).map_err(|error| crate::envelope::SpecDecodeError {
+            kind: kind.wire_name().to_owned(),
+            message: error.to_string(),
+        })?;
+    for (card_ref, uid) in resolved {
+        let target = serde_json::to_value(card_ref).expect("CardRef serialization is infallible");
+        let uid_value = serde_json::to_value(uid).expect("CardUid serialization is infallible");
+        bind_serialized_ref(&mut value, &target, &uid_value);
+    }
+    Spec::from_kind_and_value(kind, value)
+}
+
+fn bind_serialized_ref(
+    value: &mut serde_json::Value,
+    target: &serde_json::Value,
+    uid: &serde_json::Value,
+) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                bind_serialized_ref(value, target, uid);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if serde_json::Value::Object(object.clone()) == *target {
+                object.insert("uid".to_owned(), uid.clone());
+            }
+            for value in object.values_mut() {
+                bind_serialized_ref(value, target, uid);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
 impl From<AgentSpec> for AgentRef {
     fn from(spec: AgentSpec) -> Self {
         Self::Inline(Box::new(spec))

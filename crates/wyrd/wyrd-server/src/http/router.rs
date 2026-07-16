@@ -10,6 +10,7 @@ use tower::load_shed::LoadShedLayer;
 use tower::timeout::TimeoutLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::trace::TraceLayer;
+use utoipa::OpenApi;
 use wyrd_spec::error::WyrdError;
 
 use crate::bifrost::routes::router as bifrost_router;
@@ -22,6 +23,7 @@ use crate::components::health::health_router;
 use crate::components::storage::storage_router;
 use crate::http::error::WyrdErrorResponse;
 use crate::http::middleware::authenticate::require_authenticated;
+use crate::http::openapi::WyrdApiDoc;
 use crate::http::otlp::router as otlp_router;
 use crate::query::routes::router as query_router;
 use crate::state::AppState;
@@ -66,6 +68,20 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .merge(unprotected)
+        .route(
+            "/openapi.json",
+            axum::routing::get(|| async { axum::Json(WyrdApiDoc::openapi()) }),
+        )
+        .route(
+            "/openapi.yaml",
+            axum::routing::get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/yaml")],
+                    serde_yaml::to_string(&WyrdApiDoc::openapi())
+                        .expect("OpenAPI document serializes"),
+                )
+            }),
+        )
         .merge(protected)
         .with_state(state)
         .layer(axum::middleware::from_fn(

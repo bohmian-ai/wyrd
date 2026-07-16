@@ -1,12 +1,559 @@
 openapi: 3.1.0
 info:
   title: Wyrd API
-  version: 0.0.1
+  description: ''
+  contact:
+    name: Thorrester
+    email: sjforrester32@gmail.com
   license:
     name: Apache-2.0
-    identifier: Apache-2.0
-servers:
-  - url: http://localhost:8080
-paths: {}
+  version: 0.0.1
+paths:
+  /v1/cards:
+    post:
+      tags:
+      - crate::components::cards::routes
+      operationId: register_card_http
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        description: Stable key reused for retries
+        required: true
+        schema:
+          type: string
+        example: card-register-001
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCardRequest'
+        required: true
+      responses:
+        '201':
+          description: Card registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCardResponse'
+        '400':
+          description: Invalid request
+        '401':
+          description: Authentication required
+        '403':
+          description: Card write permission required
+        '409':
+          description: Idempotency or version conflict
+        '503':
+          description: Registry unavailable
 components:
-  schemas: {}
+  schemas:
+    ApiVersion:
+      type: string
+      description: Canonical Wyrd API version.
+    ArtifactManifestEntry:
+      type: object
+      description: One artifact expected by a registration.
+      required:
+      - relative_path
+      - expected_sha256
+      - expected_size_bytes
+      properties:
+        content_type:
+          type:
+          - string
+          - 'null'
+          description: Optional MIME type.
+        expected_sha256:
+          type: string
+          description: Base64-encoded SHA-256 digest.
+        expected_size_bytes:
+          type: integer
+          format: int64
+          description: Expected byte length.
+        relative_path:
+          $ref: '#/components/schemas/RelativeArtifactPath'
+          description: Relative artifact path.
+      additionalProperties: false
+    BTreeMap:
+      type: object
+      additionalProperties:
+        type: string
+        description: Validated value for free-form Card annotations.
+      propertyNames:
+        type: string
+        description: Validated key for free-form Card annotations.
+    CardKind:
+      type: string
+      description: Native Wyrd Card kind plus forward-compatible external catch-all.
+      enum:
+      - Data
+      - Model
+      - Experiment
+      - Prompt
+      - Agent
+      - Workflow
+      - Eval
+      - Drift
+      - Service
+      - Policy
+      - Mcp
+      - Audit
+      - Artifact
+      - Trigger
+      - Operator
+      - Source
+      - External
+    CardLifecycleStatus:
+      type: string
+      description: Server-managed lifecycle state for a Card.
+      enum:
+      - pending
+      - active
+      - deprecated
+      - failed
+      - expired
+      - deleted
+    CardName:
+      type: string
+      description: Human-visible Card name.
+    CardSubmission:
+      type: object
+      description: Card envelope submitted for registration, without server-managed fields.
+      required:
+      - apiVersion
+      - kind
+      - metadata
+      - spec
+      properties:
+        apiVersion:
+          $ref: '#/components/schemas/ApiVersion'
+          description: API version.
+        kind:
+          $ref: '#/components/schemas/CardKind'
+          description: Card kind.
+        metadata:
+          $ref: '#/components/schemas/SubmissionMetadata'
+          description: Author-supplied metadata.
+        spec:
+          description: Kind-specific spec.
+      additionalProperties: false
+    CardUid:
+      type: string
+      description: Resolved immutable Card UID.
+    CreateCardRequest:
+      type: object
+      description: Create-card request.
+      required:
+      - card
+      properties:
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtifactManifestEntry'
+          description: Artifact manifest, empty for metadata-only cards.
+        card:
+          $ref: '#/components/schemas/CardSubmission'
+          description: Submitted card data.
+      additionalProperties: false
+    CreateCardResponse:
+      type: object
+      description: Server response to card creation.
+      required:
+      - card_uid
+      - kind
+      - space
+      - name
+      - version
+      - spec_hash
+      - outcome
+      - status
+      - created_at
+      properties:
+        artifact_hash:
+          type:
+          - string
+          - 'null'
+          description: BLAKE3-hex hash of the JCS canonical manifest.
+        card_uid:
+          $ref: '#/components/schemas/CardUid'
+          description: Resolved card UID.
+        created_at:
+          type: string
+          format: date-time
+          description: Creation timestamp.
+        kind:
+          $ref: '#/components/schemas/CardKind'
+          description: Resolved kind.
+        name:
+          $ref: '#/components/schemas/CardName'
+          description: Resolved name.
+        operation_id:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RegistrationOperationId'
+            description: Pending operation id.
+        outcome:
+          $ref: '#/components/schemas/RegisterOutcome'
+          description: Registration result.
+        principal_id:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PrincipalId'
+            description: Principal attributed to the operation.
+        space:
+          $ref: '#/components/schemas/SpaceName'
+          description: Resolved workspace.
+        spec_hash:
+          type: string
+          description: BLAKE3-hex hash of JCS canonical spec bytes.
+        status:
+          $ref: '#/components/schemas/CardLifecycleStatus'
+          description: Server-managed lifecycle status.
+        uploads:
+          type: array
+          items:
+            $ref: '#/components/schemas/UploadInitResponse'
+          description: Upload plans for artifacts that still need bytes.
+        version:
+          $ref: '#/components/schemas/VersionBlock'
+          description: Resolved version.
+      additionalProperties: false
+    HeaderPair:
+      type: object
+      description: Required HTTP header for a client upload request.
+      required:
+      - name
+      - value
+      properties:
+        name:
+          type: string
+          description: Header name.
+        value:
+          type: string
+          description: Header value.
+      additionalProperties: false
+    PrincipalId:
+      type: string
+      format: uuid
+      description: Stable principal id on auth wire contracts.
+    RegisterOutcome:
+      type: string
+      description: Result of a registration write.
+      enum:
+      - created
+      - idempotent_noop
+      - deduplicated
+    RegistrationOperationId:
+      type: string
+      format: uuid
+      description: Opaque server handle for an in-flight registration operation.
+    RelativeArtifactPath:
+      type: string
+      description: A validated relative path inside a card's artifact manifest.
+    SpaceName:
+      type: string
+      description: Human-visible namespace for Cards and Runs.
+    StorageBackendKind:
+      type: string
+      description: Object-storage backend configured for artifact bytes.
+      enum:
+      - local
+      - s3
+      - gcs
+      - azure
+    SubmissionMetadata:
+      type: object
+      description: Metadata accepted on a registration submission.
+      required:
+      - name
+      properties:
+        annotations:
+          $ref: '#/components/schemas/BTreeMap'
+          description: Free-form annotations.
+        bump:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/VersionBump'
+            description: Version bump requested when version is omitted or scoped.
+        labels:
+          $ref: '#/components/schemas/BTreeMap'
+          description: Display labels.
+        name:
+          $ref: '#/components/schemas/CardName'
+          description: Card name.
+        space:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SpaceName'
+            description: Optional workspace.
+        uid:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/CardUid'
+            description: Optional client-provided UID, used only where the server permits it.
+        version:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/VersionSpec'
+            description: Requested version or version scope.
+      additionalProperties: false
+    UploadId:
+      type: string
+      description: Typed upload identifier displayed as `wyu_{uuid_v7}`.
+    UploadInitResponse:
+      type: object
+      description: Server response to an upload-init request.
+      required:
+      - upload_id
+      - backend
+      - plan
+      - storage_path
+      properties:
+        backend:
+          $ref: '#/components/schemas/StorageBackendKind'
+          description: Configured storage backend.
+        plan:
+          $ref: '#/components/schemas/UploadPlan'
+          description: Backend-specific upload plan.
+        storage_path:
+          type: string
+          description: Full tenant-scoped storage path.
+        upload_id:
+          $ref: '#/components/schemas/UploadId'
+          description: Durable upload identifier.
+      additionalProperties: false
+    UploadPlan:
+      oneOf:
+      - type: object
+        description: Single PUT to a presigned URL.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Single PUT to a presigned URL.
+            required:
+            - put_url
+            - ttl_secs
+            properties:
+              put_url:
+                type: string
+                description: Presigned PUT URL.
+              required_headers:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HeaderPair'
+                description: Headers the client must include on the PUT.
+              ttl_secs:
+                type: integer
+                format: int32
+                description: URL time-to-live in seconds.
+                minimum: 0
+          protocol:
+            type: string
+            enum:
+            - single_put
+      - type: object
+        description: |-
+          Local filesystem auth-gated upload.
+
+          Signals that the upload URL is an auth-gated server route, not a
+          presigned PUT. SDK clients must include `Authorization: Bearer` and
+          `x-wyrd-data-tenant-id` on the PUT request.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: |-
+              Local filesystem auth-gated upload.
+
+              Signals that the upload URL is an auth-gated server route, not a
+              presigned PUT. SDK clients must include `Authorization: Bearer` and
+              `x-wyrd-data-tenant-id` on the PUT request.
+            required:
+            - put_url
+            - ttl_secs
+            properties:
+              put_url:
+                type: string
+                description: Server route PUT URL.
+              ttl_secs:
+                type: integer
+                format: int32
+                description: URL time-to-live in seconds.
+                minimum: 0
+          protocol:
+            type: string
+            enum:
+            - local_fs
+      - type: object
+        description: AWS S3 multipart upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: AWS S3 multipart upload.
+            required:
+            - part_count
+            - part_size_bytes
+            - part_url_ttl_secs
+            properties:
+              part_count:
+                type: integer
+                format: int32
+                description: Number of parts planned.
+                minimum: 0
+              part_size_bytes:
+                type: integer
+                format: int64
+                description: Size of each non-final part.
+                minimum: 0
+              part_url_ttl_secs:
+                type: integer
+                format: int32
+                description: Time-to-live for per-part URLs in seconds.
+                minimum: 0
+              required_headers:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HeaderPair'
+                description: Headers the client must include on each part PUT.
+          protocol:
+            type: string
+            enum:
+            - s3_multipart
+      - type: object
+        description: Google Cloud Storage resumable upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Google Cloud Storage resumable upload.
+            required:
+            - session_uri
+            - chunk_size_bytes
+            properties:
+              chunk_size_bytes:
+                type: integer
+                format: int64
+                description: Recommended chunk size in bytes.
+                minimum: 0
+              session_uri:
+                type: string
+                description: Resumable session URI returned once to the client.
+          protocol:
+            type: string
+            enum:
+            - gcs_resumable
+      - type: object
+        description: Azure block blob upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Azure block blob upload.
+            required:
+            - sas_url
+            - block_size_bytes
+            - block_count_planned
+            properties:
+              block_count_planned:
+                type: integer
+                format: int32
+                description: Number of blocks the server expects to commit.
+                minimum: 0
+              block_size_bytes:
+                type: integer
+                format: int64
+                description: Recommended block size in bytes.
+                minimum: 0
+              sas_url:
+                type: string
+                description: SAS URL returned once to the client.
+          protocol:
+            type: string
+            enum:
+            - azure_block_blob
+      description: Tagged union describing how the client uploads bytes.
+    VersionBlock:
+      type: string
+      description: Semver-compatible version string.
+    VersionBump:
+      oneOf:
+      - type: string
+        description: Increment major and reset minor, patch, pre-release, and build metadata.
+        enum:
+        - major
+      - type: string
+        description: Increment minor and reset patch, pre-release, and build metadata.
+        enum:
+        - minor
+      - type: string
+        description: Increment patch and reset pre-release and build metadata.
+        enum:
+        - patch
+      - type: object
+        description: Set the pre-release identifier on the current triple (e.g. "rc.1").
+        required:
+        - pre
+        properties:
+          pre:
+            type: object
+            description: Set the pre-release identifier on the current triple (e.g. "rc.1").
+            required:
+            - identifier
+            properties:
+              identifier:
+                type: string
+                description: Pre-release identifier as defined by SemVer 2.0 §9.
+      - type: object
+        description: Set the build metadata on the current triple (e.g. "001", "sha-abc123").
+        required:
+        - build
+        properties:
+          build:
+            type: object
+            description: Set the build metadata on the current triple (e.g. "001", "sha-abc123").
+            required:
+            - metadata
+            properties:
+              metadata:
+                type: string
+                description: Build metadata as defined by SemVer 2.0 §10.
+      - type: object
+        description: Set both pre-release and build metadata on the current triple.
+        required:
+        - pre_build
+        properties:
+          pre_build:
+            type: object
+            description: Set both pre-release and build metadata on the current triple.
+            required:
+            - pre
+            - build
+            properties:
+              build:
+                type: string
+                description: Build metadata.
+              pre:
+                type: string
+                description: Pre-release identifier.
+      description: |-
+        Semantic version bump level.
+
+        `Major`, `Minor`, and `Patch` perform a conventional semver bump and clear
+        any pre-release / build metadata. `Pre`, `Build`, and `PreBuild` are
+        additive: they apply the requested pre-release or build metadata to the
+        existing triple without resetting it.
+    VersionSpec:
+      type: string
+      description: Authored version on the card-registration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.

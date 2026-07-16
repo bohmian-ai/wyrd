@@ -8,6 +8,19 @@ use sqlx::types::JsonValue;
 use std::time::Duration;
 use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
 
+const STORAGE_INIT_ADVISORY_CLASS: i32 = 0x0C_A2_D0_02;
+
+/// Serialize initialization for one tenant-scoped idempotency or artifact key.
+pub async fn lock_init(conn: &mut TenantConn<'_>, identity: &str) -> Result<(), SqlError> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(STORAGE_INIT_ADVISORY_CLASS)
+        .bind(identity)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+    Ok(())
+}
+
 /// Non-bearer replay seed cached for upload initialization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -118,7 +131,11 @@ pub async fn store(
             $4,
             now() + ($5::text || ' seconds')::interval
         )
-        ON CONFLICT (data_tenant_id, idempotency_key) DO NOTHING
+        ON CONFLICT (data_tenant_id, idempotency_key) DO UPDATE SET
+            body_sha256 = EXCLUDED.body_sha256,
+            response_status = EXCLUDED.response_status,
+            response_body = EXCLUDED.response_body,
+            expires_at = EXCLUDED.expires_at
         "#,
     )
     .bind(idempotency_key)

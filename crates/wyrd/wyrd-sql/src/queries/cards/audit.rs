@@ -4,6 +4,8 @@
 //! in the same tenant transaction as the card write. The append is deliberately
 //! fail-closed: a failed chain update aborts the caller's transaction.
 #![deny(missing_docs)]
+// raw-query grep allowlist: audit writes use a typed TenantConn transaction;
+// sqlx macros cannot cover the append-only hash-chain payload shape.
 
 use sha2::{Digest, Sha256};
 use wyrd_runtime::principal::Principal;
@@ -138,7 +140,8 @@ fn spec_hash(value: &str) -> SpecHash {
 }
 
 fn audit_error(error: sqlx::Error, stage: &str) -> WyrdError {
-    WyrdError::registry_unavailable(format!("card audit {stage}: {error}"))
+    tracing::error!(error = %error, stage, "card registration audit operation failed");
+    WyrdError::registry_unavailable("card registry unavailable")
 }
 
 #[expect(

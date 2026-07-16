@@ -88,6 +88,17 @@ struct FailureContext<'a> {
     error_code: Option<&'a str>,
 }
 
+struct PersistUploadInit<'a> {
+    upload_uuid: Uuid,
+    upload_id: &'a UploadId,
+    validated: &'a ValidatedPath,
+    backend: StorageBackendKind,
+    wire_protocol: WireProtocol,
+    backend_upload_id: &'a str,
+    idempotency_key: Option<&'a IdempotencyKey>,
+    body_sha: &'a [u8; 32],
+}
+
 /// Initialize an artifact upload.
 #[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id))]
 pub async fn upload_init(
@@ -114,19 +125,27 @@ pub async fn upload_init(
     })?;
     let wire_protocol = derive_wire_protocol(backend, planned);
 
+    let (claim_conn, replay) = claim_upload_init(
+        state.postgres,
+        caller,
+        idempotency_key.as_ref(),
+        &body,
+        &body_sha,
+    )
+    .await?;
+    if let Some(response) = replay {
+        claim_conn
+            .commit()
+            .await
+            .map_err(|error| map_sql_error(&error))?;
+        return remint_replayed_upload_init(&state, response).await;
+    }
+
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(|error| map_sql_error(&error))?;
-    if let Some(key) = idempotency_key.as_ref()
-        && let Some(response) =
-            try_replay_idempotent_init(caller, &mut conn, key, &body_sha).await?
-    {
-        conn.commit().await.map_err(|error| map_sql_error(&error))?;
-        return remint_replayed_upload_init(&state, response).await;
-    }
-
     let prior_abort = find_and_mark_prior_pending(&mut conn, &body).await?;
 
     let upload_id = UploadId::new();
@@ -158,33 +177,25 @@ pub async fn upload_init(
     )
     .await?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
-    persist_s3_upload_id_and_audit(
-        &mut conn,
+    persist_upload_init(
+        state.postgres,
         caller,
-        upload_uuid,
-        &validated,
-        backend,
-        &init.backend_upload_id,
-    )
-    .await?;
-    if let Some(key) = idempotency_key.as_ref() {
-        cache_init_seed(
-            &mut conn,
-            key,
-            &body_sha,
-            &upload_id,
-            &validated,
+        PersistUploadInit {
+            upload_uuid,
+            upload_id: &upload_id,
+            validated: &validated,
             backend,
             wire_protocol,
-        )
-        .await?;
-    }
-    conn.commit().await.map_err(|error| map_sql_error(&error))?;
+            backend_upload_id: &init.backend_upload_id,
+            idempotency_key: idempotency_key.as_ref(),
+            body_sha: &body_sha,
+        },
+    )
+    .await?;
+    claim_conn
+        .commit()
+        .await
+        .map_err(|error| map_sql_error(&error))?;
 
     Ok(UploadInitResponse {
         upload_id,
@@ -192,6 +203,70 @@ pub async fn upload_init(
         plan: init.plan,
         storage_path: validated.full,
     })
+}
+
+async fn persist_upload_init(
+    postgres: &WyrdPostgres,
+    caller: &StorageCaller,
+    input: PersistUploadInit<'_>,
+) -> Result<(), WyrdError> {
+    let mut conn = postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    persist_s3_upload_id_and_audit(
+        &mut conn,
+        caller,
+        input.upload_uuid,
+        input.validated,
+        input.backend,
+        input.backend_upload_id,
+    )
+    .await?;
+    if let Some(key) = input.idempotency_key {
+        cache_init_seed(
+            &mut conn,
+            key,
+            input.body_sha,
+            input.upload_id,
+            input.validated,
+            input.backend,
+            input.wire_protocol,
+        )
+        .await?;
+    }
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
+    Ok(())
+}
+
+async fn claim_upload_init<'a>(
+    postgres: &'a WyrdPostgres,
+    caller: &StorageCaller,
+    idempotency_key: Option<&IdempotencyKey>,
+    body: &UploadInitRequest,
+    body_sha: &[u8; 32],
+) -> Result<(TenantConn<'a>, Option<InitReplay>), WyrdError> {
+    let lock_identity = idempotency_key.map_or_else(
+        || {
+            format!(
+                "artifact:{}:{}:{}",
+                body.card_uid, body.relative_path, body.expected_sha256
+            )
+        },
+        |key| format!("idempotency:{key}"),
+    );
+    let mut conn = postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    wyrd_sql::queries::storage::idempotency::lock_init(&mut conn, &lock_identity)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    let replay = match idempotency_key {
+        Some(key) => try_replay_idempotent_init(caller, &mut conn, key, body_sha).await?,
+        None => None,
+    };
+    Ok((conn, replay))
 }
 
 /// Return one S3 multipart part URL.
@@ -531,6 +606,7 @@ async fn find_and_mark_prior_pending(
     let prior = multipart_uploads::find_pending_for_dedupe(
         conn,
         body.card_uid.as_str(),
+        body.relative_path.as_str(),
         &body.expected_sha256,
     )
     .await

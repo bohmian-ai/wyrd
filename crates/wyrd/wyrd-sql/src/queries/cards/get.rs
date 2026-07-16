@@ -42,7 +42,10 @@ pub async fn get_card_by_uid(
         .bind(uid.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?
+        .map_err(|e| {
+            tracing::error!(error = %e, "card registry lookup failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?
         .ok_or_else(|| WyrdError::registry_card_not_found(format!("no card with uid {uid}")))?;
     ParsedCardRow::try_from(row).map_err(|e| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
@@ -77,7 +80,10 @@ pub async fn get_card_by_ref(
         .bind(version.as_str())
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?
+        .map_err(|e| {
+            tracing::error!(error = %e, "card registry lookup failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?
         .ok_or_else(|| {
             WyrdError::registry_card_not_found(format!(
                 "no card {}/{}/{} @ {}",
@@ -88,6 +94,30 @@ pub async fn get_card_by_ref(
             ))
         })?;
     ParsedCardRow::try_from(row).map_err(|e| {
+        WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
+    })
+}
+
+/// Find a card by identity without turning an absent row into a public 404.
+pub async fn find_card_by_ref(
+    conn: &mut TenantConn<'_>,
+    kind: CardKind,
+    space: &SpaceName,
+    name: &CardName,
+    version: &VersionBlock,
+) -> Result<Option<ParsedCardRow>, WyrdError> {
+    let row = sqlx::query_as::<_, CardRow>(SELECT_BY_REF)
+        .bind(kind.wire_name())
+        .bind(space.as_str())
+        .bind(name.as_str())
+        .bind(version.as_str())
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "card registry lookup failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?;
+    row.map(ParsedCardRow::try_from).transpose().map_err(|e| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
     })
 }

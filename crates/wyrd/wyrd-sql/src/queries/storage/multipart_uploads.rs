@@ -347,6 +347,7 @@ pub async fn find_by_id(
 pub async fn find_pending_for_dedupe(
     conn: &mut TenantConn<'_>,
     card_uid: &str,
+    relative_path: &str,
     expected_sha256: &str,
 ) -> Result<Option<MultipartUploadRow>, SqlError> {
     let row = sqlx::query_as::<_, MultipartUploadRowDb>(
@@ -374,12 +375,14 @@ pub async fn find_pending_for_dedupe(
             expires_at
         FROM wyrd.storage_multipart_uploads
         WHERE card_uid = $1
-          AND expected_sha256 = $2
+          AND relative_path = $2
+          AND expected_sha256 = $3
           AND status = 'pending'
         FOR UPDATE
         "#,
     )
     .bind(card_uid)
+    .bind(relative_path)
     .bind(expected_sha256)
     .fetch_optional(&mut **conn.transaction())
     .await

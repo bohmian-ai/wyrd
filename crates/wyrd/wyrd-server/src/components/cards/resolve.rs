@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::{CardRef, scope_child_card_refs};
+use wyrd_spec::reference::{CardRef, bind_scoped_card_ref_uids, scope_child_card_refs};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
 
@@ -14,7 +14,12 @@ pub async fn resolve_submission(
     conn: &mut TenantConn<'_>,
     mut submission: CardSubmission,
 ) -> Result<CardSubmission, WyrdError> {
-    let refs = deduplicate_refs(scope_child_card_refs(&submission.spec));
+    let refs = deduplicate_refs(
+        scope_child_card_refs(&submission.spec)
+            .into_iter()
+            .filter(|card_ref| card_ref.uid.is_none())
+            .collect(),
+    );
     if refs.is_empty() {
         return Ok(submission);
     }
@@ -36,13 +41,7 @@ pub async fn resolve_submission(
         });
     }
 
-    let values =
-        serde_json::to_value(&submission.spec).map_err(WyrdError::from_spec_serialization)?;
-    let mut values = values;
-    for (card_ref, uid) in resolved {
-        bind_uid(&mut values, &card_ref, &uid)?;
-    }
-    submission.spec = wyrd_spec::envelope::Spec::from_kind_and_value(&submission.kind, values)
+    submission.spec = bind_scoped_card_ref_uids(&submission.kind, submission.spec, &resolved)
         .map_err(|error| WyrdError::RegistryInvalidCardSpec {
             message: format!("resolved card spec failed to decode: {error}"),
             details: serde_json::json!({}),
@@ -71,50 +70,4 @@ fn identity_key(card_ref: &CardRef) -> String {
         card_ref.name,
         card_ref.version
     )
-}
-
-fn bind_uid(
-    value: &mut serde_json::Value,
-    card_ref: &CardRef,
-    uid: &wyrd_spec::ids::CardUid,
-) -> Result<(), WyrdError> {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                bind_uid(value, card_ref, uid)?;
-            }
-        }
-        serde_json::Value::Object(object) => {
-            let matches = object
-                .get("kind")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|kind| kind == card_ref.kind.wire_name())
-                && object
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|name| name == card_ref.name.as_str())
-                && object
-                    .get("version")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|version| version == card_ref.version.as_str())
-                && object
-                    .get("space")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|space| space == card_ref.space.as_str());
-            if matches {
-                object.insert(
-                    "uid".to_owned(),
-                    serde_json::to_value(uid).map_err(WyrdError::from_spec_serialization)?,
-                );
-            }
-            for value in object.values_mut() {
-                bind_uid(value, card_ref, uid)?;
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-    Ok(())
 }

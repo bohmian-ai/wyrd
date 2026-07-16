@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::fmt::Display;
 use uuid::Uuid;
 
 use wyrd_runtime::principal::{Principal, PrincipalId};
@@ -17,18 +18,14 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{
-    ArtifactManifestEntry, CardLifecycleStatus, CreateCardResponse, RegisterOutcome,
-    RegistrationOperationId,
-};
+use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::storage::UploadInitResponse;
 
 use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
 use crate::queries::cards::auth_projection::{
     lookup_existing_principal_id, upsert_service_account_from_card,
 };
-use crate::queries::cards::version_resolve::{Resolution, resolve_version};
+use crate::queries::cards::version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};
 use crate::queries::cards::version_sql::lock_version_line;
 use crate::row_types::cards::CardStatus;
 use crate::tenant_conn::TenantConn;
@@ -36,6 +33,11 @@ use wyrd_spec::vala::audit_detail::{CardRegistrationOperation, CardRegistrationO
 
 /// Maximum canonical-JSON byte size for a single `Spec`.
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
+
+fn registry_db_error(error: impl Display) -> WyrdError {
+    tracing::error!(error = %error, "card registry database operation failed");
+    WyrdError::registry_unavailable("card registry unavailable")
+}
 
 struct PreparedCardData<'a> {
     spec_hash: &'a str,
@@ -276,7 +278,10 @@ async fn register_auto(
         name,
         version,
         bump,
-        data.spec_hash,
+        SubmittedCardIdentity {
+            spec_hash: data.spec_hash,
+            artifact_hash: req.card.metadata.artifact_hash.as_deref(),
+        },
     )
     .await?
     {
@@ -360,7 +365,8 @@ async fn insert_legacy_card_row(
             $6, $7, $8, $9, $10,
             'active', $11
         )
-        ON CONFLICT (data_tenant_id, kind, space, name, version) WHERE status <> 'deleted' DO NOTHING
+        ON CONFLICT (data_tenant_id, kind, space, name, version)
+            WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
         RETURNING card_uid
         "#,
     )
@@ -377,7 +383,7 @@ async fn insert_legacy_card_row(
     .bind(req.actor.id.as_uuid())
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+    .map_err(registry_db_error)?;
 
     inserted
         .map(|(uid,)| CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error))
@@ -403,7 +409,7 @@ async fn lookup_uid_by_ref(
         "SELECT card_uid FROM wyrd.cards \
          WHERE data_tenant_id = wyrd.current_tenant() \
            AND kind = $1 AND space = $2 AND name = $3 AND version = $4 \
-           AND status <> 'deleted'",
+           AND status = 'active'",
     )
     .bind(kind.wire_name())
     .bind(space.as_str())
@@ -411,7 +417,7 @@ async fn lookup_uid_by_ref(
     .bind(version.as_str())
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+    .map_err(registry_db_error)?;
 
     let (uid,) = uid.ok_or_else(|| {
         WyrdError::registry_unavailable("resolved version row vanished before uid lookup")
@@ -444,7 +450,7 @@ async fn handle_conflict(
         r#"SELECT card_uid, spec_hash FROM wyrd.cards
            WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
              AND data_tenant_id = wyrd.current_tenant()
-             AND status <> 'deleted'"#,
+             AND status = 'active'"#,
     )
     .bind(card.kind.wire_name())
     .bind(space.as_str())
@@ -452,7 +458,7 @@ async fn handle_conflict(
     .bind(version_block.as_str())
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+    .map_err(registry_db_error)?;
 
     let (existing_uid, existing_hash) = existing.ok_or_else(|| {
         WyrdError::registry_unavailable("conflict row vanished between INSERT and SELECT")
@@ -674,7 +680,7 @@ pub async fn lookup_existing_operation(
     .bind(idempotency_key)
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))
+    .map_err(registry_db_error)
 }
 
 /// Insert the operation row that reserves an idempotency key.
@@ -708,7 +714,7 @@ pub async fn insert_registration_operation(
     .bind(operation.status)
     .execute(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
     Ok(inserted.rows_affected() == 1)
 }
 
@@ -775,7 +781,7 @@ pub async fn insert_card_row(
     .bind(pending_since)
     .fetch_one(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
 
     Ok(RegisteredCardRow {
         card_uid: CardUid::from_uuid(row.0).map_err(WyrdError::from_card_uid_error)?,
@@ -820,7 +826,7 @@ pub async fn insert_artifact_manifest_rows(
         .bind(&artifact.content_type)
         .execute(&mut **conn.transaction())
         .await
-        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+        .map_err(registry_db_error)?;
     }
     Ok(())
 }
@@ -850,7 +856,7 @@ pub async fn manifest_rows_for_init(
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))
+    .map_err(registry_db_error)
 }
 
 /// Mark one manifest row ready for client upload after successful init.
@@ -881,7 +887,7 @@ pub async fn mark_manifest_upload_initialized(
     .bind(upload_id)
     .execute(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
     Ok(())
 }
 
@@ -894,52 +900,13 @@ pub fn operation_outcome(value: &str) -> Result<wyrd_spec::registry::RegisterOut
         "created" => Ok(wyrd_spec::registry::RegisterOutcome::Created),
         "idempotent_noop" => Ok(wyrd_spec::registry::RegisterOutcome::IdempotentNoop),
         "deduplicated" => Ok(wyrd_spec::registry::RegisterOutcome::Deduplicated),
-        other => Err(WyrdError::registry_unavailable(format!(
-            "card registration operation has invalid outcome {other:?}"
-        ))),
+        _ => Err(WyrdError::registry_unavailable("card registry unavailable")),
     }
 }
 
 /// Map a stored operation status literal to the SQL card lifecycle enum.
 pub fn operation_status(value: &str) -> Result<CardStatus, WyrdError> {
-    CardStatus::from_db_str(value)
-        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))
-}
-
-/// Convert one upload response to JSON for the operation inventory.
-pub fn upload_plans_json(uploads: &[UploadInitResponse]) -> Result<JsonValue, WyrdError> {
-    serde_json::to_value(uploads).map_err(WyrdError::from_spec_serialization)
-}
-
-/// Project persisted registration values into the flat create-card response.
-#[must_use]
-pub fn build_create_response(
-    row: &RegisteredCardRow,
-    outcome: RegisterOutcome,
-    uploads: Vec<UploadInitResponse>,
-) -> CreateCardResponse {
-    CreateCardResponse {
-        card_uid: row.card_uid.clone(),
-        kind: row.kind.clone(),
-        space: row.space.clone(),
-        name: row.name.clone(),
-        version: row.version.clone(),
-        spec_hash: row.spec_hash.clone(),
-        artifact_hash: row.artifact_hash.clone(),
-        outcome,
-        status: match row.status {
-            CardStatus::Pending => CardLifecycleStatus::Pending,
-            CardStatus::Active => CardLifecycleStatus::Active,
-            CardStatus::Deprecated => CardLifecycleStatus::Deprecated,
-            CardStatus::Deleted => CardLifecycleStatus::Deleted,
-            CardStatus::Failed => CardLifecycleStatus::Failed,
-            CardStatus::Expired => CardLifecycleStatus::Expired,
-        },
-        created_at: row.created_at,
-        principal_id: Some(row.principal_id),
-        operation_id: Some(row.operation_id),
-        uploads,
-    }
+    CardStatus::from_db_str(value).map_err(registry_db_error)
 }
 
 /// Update the replay inventory after post-commit upload initialization.
@@ -960,7 +927,7 @@ pub async fn update_registration_operation_plans(
     .bind(operation_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
     Ok(())
 }
 
@@ -969,36 +936,55 @@ pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],
 ) -> Result<Vec<(CardRef, CardUid)>, WyrdError> {
-    let mut resolved = Vec::with_capacity(refs.len());
-    for card_ref in refs {
-        let uid = sqlx::query_scalar::<_, Uuid>(
-            r#"
-            SELECT card_uid
-              FROM wyrd.cards
-             WHERE data_tenant_id = wyrd.current_tenant()
-               AND kind = $1
-               AND space = $2
-               AND name = $3
-               AND version = $4
-               AND status NOT IN ('deleted', 'failed', 'expired')
-            "#,
-        )
-        .bind(card_ref.kind.wire_name())
-        .bind(card_ref.space.as_str())
-        .bind(card_ref.name.as_str())
-        .bind(card_ref.version.as_str())
-        .fetch_optional(&mut **conn.transaction())
+    if refs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid \
+         FROM (VALUES ",
+    );
+    query.push_values(refs.iter(), |mut values, card_ref| {
+        values
+            .push_bind(card_ref.kind.wire_name())
+            .push_bind(card_ref.space.as_str())
+            .push_bind(card_ref.name.as_str())
+            .push_bind(card_ref.version.as_str());
+    });
+    query.push(
+        ") AS refs(kind, space, name, version) \
+         LEFT JOIN wyrd.cards cards \
+           ON cards.data_tenant_id = wyrd.current_tenant() \
+          AND cards.kind = refs.kind \
+          AND cards.space = refs.space \
+          AND cards.name = refs.name \
+          AND cards.version = refs.version \
+          AND cards.status NOT IN ('deleted', 'failed', 'expired')",
+    );
+    let rows = query
+        .build_query_as::<(String, String, String, String, Option<Uuid>)>()
+        .fetch_all(&mut **conn.transaction())
         .await
-        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
-
-        if let Some(uid) = uid {
-            resolved.push((
+        .map_err(|_| WyrdError::registry_unavailable("card registry unavailable"))?;
+    rows.into_iter()
+        .filter_map(|(kind, space, name, version, uid)| {
+            uid.map(|uid| (kind, space, name, version, uid))
+        })
+        .map(|(kind, space, name, version, uid)| {
+            let card_ref = refs
+                .iter()
+                .find(|card_ref| {
+                    card_ref.kind.wire_name() == kind
+                        && card_ref.space.as_str() == space
+                        && card_ref.name.as_str() == name
+                        && card_ref.version.as_str() == version
+                })
+                .expect("VALUES relation only contains requested card references");
+            Ok((
                 card_ref.clone(),
                 CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
-            ));
-        }
-    }
-    Ok(resolved)
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1014,6 +1000,10 @@ mod tests {
         assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(hash, registration_request_hash(&"a".repeat(64), None));
         assert_ne!(hash, registration_request_hash(&"b".repeat(64), None));
+        assert_ne!(
+            hash,
+            registration_request_hash(&"a".repeat(64), Some(&"b".repeat(64)))
+        );
     }
 
     #[test]

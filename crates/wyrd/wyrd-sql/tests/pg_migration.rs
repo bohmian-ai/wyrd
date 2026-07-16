@@ -482,11 +482,15 @@ mod pg_tests {
             .await
             .expect("upload marks pending");
 
-            let pending =
-                storage::multipart_uploads::find_pending_for_dedupe(&mut conn, &card_uid, &sha)
-                    .await
-                    .expect("pending lookup succeeds")
-                    .expect("pending row found");
+            let pending = storage::multipart_uploads::find_pending_for_dedupe(
+                &mut conn,
+                &card_uid,
+                "model.bin",
+                &sha,
+            )
+            .await
+            .expect("pending lookup succeeds")
+            .expect("pending row found");
             assert_eq!(pending.backend, StorageBackendKind::S3);
             assert_eq!(pending.wire_protocol, WireProtocol::S3MultipartV1);
 

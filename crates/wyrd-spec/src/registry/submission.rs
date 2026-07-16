@@ -56,6 +56,7 @@ pub struct CardSubmission {
     pub metadata: SubmissionMetadata,
     /// Kind-specific spec.
     #[schemars(with = "serde_json::Value")]
+    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     pub spec: Spec,
 }
 

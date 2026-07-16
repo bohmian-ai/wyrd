@@ -21,9 +21,18 @@ pub enum Resolution {
     },
 }
 
+/// Canonical identities used for artifact-aware deduplication.
+pub struct SubmittedCardIdentity<'a> {
+    /// Canonical spec hash.
+    pub spec_hash: &'a str,
+    /// Canonical artifact-manifest hash, when the submission is heavy.
+    pub artifact_hash: Option<&'a str>,
+}
+
 struct LatestInLine {
     version: VersionBlock,
     spec_hash: String,
+    artifact_hash: Option<String>,
 }
 
 // No statement_timeout on version-resolve reads: they hit idx_cards_version_latest
@@ -37,9 +46,9 @@ async fn latest_stable_in_line(
     bounds: Option<&wyrd_semver::VersionBounds>,
 ) -> Result<Option<LatestInLine>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT version, spec_hash FROM wyrd.cards \
+        "SELECT version, spec_hash, artifact_hash FROM wyrd.cards \
          WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status <> 'deleted' AND NOT version_is_prerelease AND kind = ",
+           AND status = 'active' AND NOT version_is_prerelease AND kind = ",
     );
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
@@ -50,14 +59,21 @@ async fn latest_stable_in_line(
     qb.push(" ORDER BY version_major DESC, version_minor DESC, version_patch DESC LIMIT 1");
 
     let row = qb
-        .build_query_as::<(String, String)>()
+        .build_query_as::<(String, String, Option<String>)>()
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "card registry version query failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?;
 
-    row.map(|(version, spec_hash)| {
+    row.map(|(version, spec_hash, artifact_hash)| {
         VersionBlock::parse(version)
-            .map(|version| LatestInLine { version, spec_hash })
+            .map(|version| LatestInLine {
+                version,
+                spec_hash,
+                artifact_hash,
+            })
             .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))
     })
     .transpose()
@@ -78,7 +94,7 @@ pub async fn resolve_version(
     name: &CardName,
     version: Option<&VersionSpec>,
     bump: Option<&VersionBump>,
-    submitted_hash: &str,
+    submitted: SubmittedCardIdentity<'_>,
 ) -> Result<Resolution, WyrdError> {
     let bump = bump.cloned().unwrap_or(VersionBump::Patch);
     match version {
@@ -86,9 +102,14 @@ pub async fn resolve_version(
             unreachable!("resolve_version is only called on the auto/scope path")
         }
         None => match latest_stable_in_line(conn, kind, space, name, None).await? {
-            Some(latest) if latest.spec_hash == submitted_hash => Ok(Resolution::Deduplicated {
-                version: latest.version,
-            }),
+            Some(latest)
+                if latest.spec_hash == submitted.spec_hash
+                    && latest.artifact_hash.as_deref() == submitted.artifact_hash =>
+            {
+                Ok(Resolution::Deduplicated {
+                    version: latest.version,
+                })
+            }
             Some(latest) => {
                 let next = latest
                     .version
@@ -103,7 +124,10 @@ pub async fn resolve_version(
                 .to_bounds()
                 .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
             match latest_stable_in_line(conn, kind, space, name, Some(&bounds)).await? {
-                Some(latest) if latest.spec_hash == submitted_hash => {
+                Some(latest)
+                    if latest.spec_hash == submitted.spec_hash
+                        && latest.artifact_hash.as_deref() == submitted.artifact_hash =>
+                {
                     Ok(Resolution::Deduplicated {
                         version: latest.version,
                     })

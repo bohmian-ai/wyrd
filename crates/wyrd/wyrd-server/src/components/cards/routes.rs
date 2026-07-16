@@ -20,11 +20,27 @@ pub fn cards_router() -> Router<AppState> {
     Router::new().route("/cards", post(register_card_http))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/cards",
+    request_body = CreateCardRequest,
+    params(
+        ("Idempotency-Key" = String, Header, description = "Stable key reused for retries", example = "card-register-001")
+    ),
+    responses(
+        (status = 201, description = "Card registered", body = wyrd_spec::registry::CreateCardResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Card write permission required"),
+        (status = 409, description = "Idempotency or version conflict"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
 #[tracing::instrument(
     skip(state, caller, headers, body),
     fields(operation = "card.registration.create")
 )]
-async fn register_card_http(
+pub(crate) async fn register_card_http(
     State(state): State<AppState>,
     caller: Caller,
     headers: HeaderMap,

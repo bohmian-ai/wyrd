@@ -49,15 +49,17 @@ under `path/data/`. Nothing leaves your machine.
 The saved `card.json` is the envelope you register over HTTP:
 
 ```bash
-curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
+curl -X POST "$WYRD_SERVER_URL/v1/cards" \
   -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
-  --data @churn-card/card.json
+  -H "Idempotency-Key: churn-card-register-001" \
+  --data @churn-card/register-request.json
 ```
 
-Registration is idempotent on identity: re-posting the same `(space, name,
-version)` with the same spec is a no-op; a changed spec at the same version is
-rejected. There is no Python registry client yet.
+`register-request.json` wraps the authored `CardSubmission` as
+`{"card": <CardSubmission>, "artifacts": []}`. Retry the exact request with the
+same `Idempotency-Key` to receive `idempotent_noop`; reusing the key for changed
+content is rejected with `409`.
 
 ## Reference
 

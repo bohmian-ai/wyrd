@@ -60,7 +60,7 @@ fn triple_i64(t: SemverTriple) -> Result<(i64, i64, i64), WyrdError> {
 ///
 /// # Errors
 /// Returns `WYRD_REG_503_REGISTRY_UNAVAILABLE` on database errors.
-pub(crate) async fn lock_version_line(
+pub async fn lock_version_line(
     conn: &mut TenantConn<'_>,
     kind: CardKind,
     space: &SpaceName,
@@ -78,7 +78,10 @@ pub(crate) async fn lock_version_line(
         .bind(objid_key)
         .execute(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "card registry version lock failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?;
     Ok(())
 }
 

@@ -24,7 +24,7 @@ step is deterministic and idempotent.
 Cards are addressed by their `(space, name, version)` identity:
 
 ```bash
-curl -sf "$WYRD_SERVER_URL/api/v1/cards/default/my-dataset/0.1.0" \
+curl -sf "$WYRD_SERVER_URL/v1/cards/default/my-dataset/0.1.0" \
   -H "Authorization: Bearer $WYRD_ACCESS_TOKEN"
 ```
 
@@ -55,15 +55,17 @@ card.save(Path("./my-dataset"))
 ### 3. Register the saved envelope
 
 ```bash
-curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
+curl -X POST "$WYRD_SERVER_URL/v1/cards" \
   -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
   -H "Content-Type: application/json" \
-  --data @my-dataset/card.json
+  -H "Idempotency-Key: my-dataset-register-001" \
+  --data @my-dataset/register-request.json
 ```
 
-Registration is idempotent on identity: re-posting the same `(space, name,
-version)` with the same spec is a no-op. The same identity with a different spec
-returns `409` with code `WYRD_REG_409_SPEC_DRIFT` — bump the version.
+`register-request.json` has the shape `{"card": <CardSubmission>, "artifacts": []}`.
+Registration is idempotent on the `(Idempotency-Key, request)` pair: retry the
+same request with the same key to receive `idempotent_noop`. A changed request
+with the same key returns `409` with the idempotency-conflict code.
 
 ### 4. Handle errors
 
@@ -74,9 +76,12 @@ never on `title` or `detail`:
 import httpx
 
 resp = httpx.post(
-    f"{server_url}/api/v1/cards",
-    headers={"Authorization": f"Bearer {token}"},
-    content=(Path("./my-dataset") / "card.json").read_bytes(),
+    f"{server_url}/v1/cards",
+    headers={
+        "Authorization": f"Bearer {token}",
+        "Idempotency-Key": "my-dataset-register-001",
+    },
+    json={"card": card_submission, "artifacts": []},
 )
 if resp.status_code >= 400:
     problem = resp.json()

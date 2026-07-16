@@ -118,7 +118,14 @@ description = "Run the card registration SQL and server unit slices"
 run = """
 cargo test --locked -p wyrd-sql --lib queries::cards::register
 cargo test --locked -p wyrd-server --lib components::cards
+cargo test --locked -p wyrd-server --lib http::openapi
 """
+
+[tasks."test:cards:integration"]
+description = "Run the durable card registration Postgres suite"
+depends = ["setup:postgres"]
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo test --locked -p wyrd-sql --test pg_cards -- --nocapture --test-threads=1 && cargo test --locked -p wyrd-server --test pg_card_registration_route -- --nocapture --test-threads=1"
 
 [tasks."test:skald"]
 hide = true

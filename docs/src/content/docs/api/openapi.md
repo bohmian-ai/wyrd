@@ -12,7 +12,7 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 
 ## Routes
 
-No HTTP routes are published in the current OpenAPI document.
+- `/v1/cards`
 
 ## Refresh
 

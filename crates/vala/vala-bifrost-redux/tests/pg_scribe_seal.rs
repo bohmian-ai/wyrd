@@ -15,10 +15,11 @@ mod pg_tests {
     use opendal::services::Memory;
     use sqlx::types::Uuid;
     use std::sync::Arc;
+    use vala_bifrost_redux::catalog::TableRef;
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::ScribeImpl;
-    use vala_bifrost_redux::scribe::seal_key::TableRef;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
@@ -117,7 +118,7 @@ mod pg_tests {
     }
 
     fn events_table() -> TableRef {
-        TableRef::new("vala".to_string(), "events".to_string())
+        TableRef::new(BifrostNamespace::Bifrost, "events")
     }
 
     #[tokio::test]
@@ -180,7 +181,7 @@ mod pg_tests {
                    partition_day::text, wal_lsn_min, wal_lsn_max, tenant_bucket,
                    node_id, writer_epoch, min_event_time, max_event_time
             FROM vala.file_list
-            WHERE namespace = 'vala' AND table_name = 'events'
+            WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ",
         )
         .fetch_all(&mut **tx)
@@ -206,7 +207,7 @@ mod pg_tests {
         ) = &rows[0];
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
-        assert_eq!(namespace, "vala");
+        assert_eq!(namespace, BifrostNamespace::Bifrost.as_str());
         assert_eq!(table_name, "events");
         assert!(
             file_path.starts_with("bifrost/"),
@@ -430,7 +431,7 @@ mod pg_tests {
             r"
             SELECT partition_day::text, row_count
             FROM vala.file_list
-            WHERE namespace = 'vala' AND table_name = 'events'
+            WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ORDER BY partition_day
             ",
         )

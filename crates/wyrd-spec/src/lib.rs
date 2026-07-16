@@ -15,6 +15,7 @@ pub mod card;
 pub mod envelope;
 pub mod error;
 pub mod format;
+pub mod graph;
 pub mod ids;
 pub mod intel;
 pub mod metadata;

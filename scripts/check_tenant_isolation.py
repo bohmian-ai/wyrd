@@ -76,6 +76,8 @@ RAW_QUERY_ALLOWLIST_MARKERS = [
     "SQLx offline bundle",
 ]
 
+TENANT_QUERY_EXCEPTION_MARKER = "tenant-isolation: cross-tenant OperatorPool"
+
 SERVER_POOL_ALLOWLIST_PREFIXES = (
     "crates/wyrd/wyrd-server/src/boot/",
     "crates/wyrd/wyrd-server/src/boot.rs",
@@ -270,6 +272,10 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
 
     for fn_name, params in public_async_fns(code):
         if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
+            if has_tenant_query_exception(body, fn_name) and re.search(
+                r"&\s*OperatorPool\b", params
+            ):
+                continue
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
     if references_tenant_schema(code) and not (
@@ -431,6 +437,15 @@ def has_platform_executor(code: str) -> bool:
 
 def has_raw_query_marker(body: str) -> bool:
     return any(marker in body for marker in RAW_QUERY_ALLOWLIST_MARKERS)
+
+
+def has_tenant_query_exception(body: str, fn_name: str) -> bool:
+    marker = re.escape(TENANT_QUERY_EXCEPTION_MARKER)
+    return re.search(
+        rf"^\s*//\s*{marker}[^\n]*\n\s*pub\s+async\s+fn\s+{re.escape(fn_name)}\s*\(",
+        body,
+        re.MULTILINE,
+    ) is not None
 
 
 def rust_files(path: Path) -> list[Path]:

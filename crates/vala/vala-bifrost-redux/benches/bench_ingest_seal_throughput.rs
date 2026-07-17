@@ -45,7 +45,7 @@ fn build_test_batch(rows: usize) -> RecordBatch {
             Arc::new(TimestampMicrosecondArray::from(timestamps)),
         ],
     )
-    .unwrap()
+    .expect("benchmark record batch schema is valid")
 }
 
 fn main() {
@@ -56,7 +56,7 @@ fn main() {
     let seal_key = SealKey::new(
         DataTenantId::SYSTEM_OWNER,
         TableRef::new(BifrostNamespace::Bifrost, "bench"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("benchmark event day is valid")),
     );
 
     let memtable = Memtable::new();
@@ -95,9 +95,11 @@ fn main() {
     for _ in 0..3 {
         memtable
             .insert(&seal_key, event.clone(), meta.clone(), batch.clone())
-            .unwrap();
-        let frozen = memtable.freeze(&seal_key).unwrap();
-        let _ = write_frozen_to_parquet(&frozen).unwrap();
+            .expect("benchmark memtable insert succeeds");
+        let frozen = memtable
+            .freeze(&seal_key)
+            .expect("benchmark memtable freeze succeeds");
+        let _ = write_frozen_to_parquet(&frozen).expect("benchmark parquet encoding succeeds");
     }
 
     // Actual benchmark
@@ -105,9 +107,12 @@ fn main() {
     for _ in 0..ITERATIONS {
         memtable
             .insert(&seal_key, event.clone(), meta.clone(), batch.clone())
-            .unwrap();
-        let frozen = memtable.freeze(&seal_key).unwrap();
-        let encoded = write_frozen_to_parquet(&frozen).unwrap();
+            .expect("benchmark memtable insert succeeds");
+        let frozen = memtable
+            .freeze(&seal_key)
+            .expect("benchmark memtable freeze succeeds");
+        let encoded =
+            write_frozen_to_parquet(&frozen).expect("benchmark parquet encoding succeeds");
         let _ = encoded.bytes.len(); // Prevent optimizer from removing encoding
     }
     let elapsed = start.elapsed();

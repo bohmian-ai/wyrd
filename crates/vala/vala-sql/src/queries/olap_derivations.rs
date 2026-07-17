@@ -10,8 +10,8 @@
 //! the worker replays from the registered/earliest position rather than an
 //! undefined start.
 //!
-//! All callers pass a [`TenantConn`]; the wyrd-sql RLS bind enforces tenant
-//! scope for the wyrd_app role alongside the explicit predicates below.
+//! Tenant-scoped callers pass a [`TenantConn`]; the wyrd-sql RLS bind enforces
+//! tenant scope for the wyrd_app role alongside the explicit predicates below.
 // raw-query grep allowlist: olap_derivations post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote to macros.
 
 use sqlx::types::Uuid;
@@ -39,6 +39,7 @@ pub struct CommittedSourceBatch {
 ///
 /// # Errors
 /// Returns [`SqlError`] when the query fails.
+// tenant-isolation: cross-tenant OperatorPool; discovery is restricted to the derivation worker.
 pub async fn list_source_commit_tenants(
     op: &OperatorPool,
     source_table_uid: &[u8; 16],
@@ -81,48 +82,6 @@ pub async fn list_tenant_committed_batches(
     )
     .bind(source_table_uid.as_slice())
     .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)
-    .map(|rows| {
-        rows.into_iter()
-            .map(|(batch_id,)| CommittedSourceBatch { batch_id })
-            .collect()
-    })
-}
-
-/// Enumerate every `committed` source commit position for `source_table_uid`,
-/// across ALL tenants, in commit order.
-///
-/// Uses the operator pool (BYPASSRLS `wyrd_platform_admin`) because a source
-/// table is `SystemShared`: its `vala.olap_commits` rows carry per-tenant
-/// `data_tenant_id` values, and the derivation must consume the whole
-/// cross-tenant commit stream (it re-partitions the derived rows back onto each
-/// source row's own tenant at write time). This mirrors the audit relay's
-/// cross-tenant enumeration and is never called on a tenant request path.
-///
-/// This is the commit-identity delta mechanism: the derivation worker maps
-/// "commits since watermark" onto this ordered ledger by opaque `batch_id`,
-/// never by numeric snapshot-id comparison.
-///
-/// # Errors
-/// Returns [`SqlError`] when the query fails.
-pub async fn list_committed_source_batches(
-    op: &OperatorPool,
-    source_table_uid: &[u8; 16],
-) -> Result<Vec<CommittedSourceBatch>, SqlError> {
-    // Dynamic query is intentional: this reads the SystemShared source table's
-    // commit ledger across every tenant via the operator pool (BYPASSRLS).
-    sqlx::query_as::<_, (Vec<u8>,)>(
-        r#"
-        SELECT batch_id
-          FROM vala.olap_commits
-         WHERE table_uid = $1
-           AND state = 'committed'
-         ORDER BY committed_at, batch_id
-        "#,
-    )
-    .bind(source_table_uid.as_slice())
-    .fetch_all(op.pool())
     .await
     .map_err(SqlError::from)
     .map(|rows| {

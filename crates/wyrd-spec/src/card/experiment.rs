@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::{MetricEntry, NonSecretValue, ParameterValue};
-use crate::reference::CardRef;
+use crate::reference::Ref;
 use crate::run::RunRef;
 
 /// Grouping and comparison context for related runs.
@@ -20,7 +20,7 @@ pub struct ExperimentSpec {
     pub description: Option<String>,
     /// Primary target Cards.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub target_refs: Vec<CardRef>,
+    pub target_refs: Vec<Ref>,
     /// Default parameters applied to runs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub default_parameters: BTreeMap<String, ParameterValue>,
@@ -35,7 +35,7 @@ pub struct ExperimentSpec {
     pub best_run_ref: Option<RunRef>,
     /// Artifact references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub card_refs: Vec<CardRef>,
+    pub card_refs: Vec<Ref>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, NonSecretValue>,

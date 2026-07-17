@@ -9,6 +9,7 @@ use std::hash::{Hash, Hasher};
 use crate::envelope::{ReferenceSlotVisitor, Spec};
 use crate::reference::CardRef;
 use crate::registry::CardSubmission;
+use wyrd_semver::{VersionBlock, VersionSpec};
 
 mod canonical;
 mod root;
@@ -69,6 +70,42 @@ pub struct TopoOrder {
 pub struct RootPick {
     /// The node with no incoming edges from another submission.
     pub root: CardRef,
+}
+
+/// Prepare submissions for the pure graph operations.
+///
+/// Graph identity is `(kind, space, name)`, but [`CardRef`] also requires a
+/// concrete version. Auto and range version requests therefore receive a
+/// graph-only placeholder. The authored submissions are cloned and never
+/// mutated; registration keeps their original version selection.
+pub fn graph_ready_submissions(
+    submissions: &[CardSubmission],
+) -> Result<Vec<CardSubmission>, GraphError> {
+    if submissions.is_empty() {
+        return Err(GraphError::Empty);
+    }
+
+    let placeholder = VersionBlock::parse("0.0.0").map_err(|error| GraphError::InvalidSpec {
+        message: format!("invalid graph placeholder: {error}"),
+    })?;
+    submissions
+        .iter()
+        .cloned()
+        .map(|mut submission| {
+            if submission.metadata.space.is_none() {
+                return Err(GraphError::MissingSpace);
+            }
+            if !submission
+                .metadata
+                .version
+                .as_ref()
+                .is_some_and(VersionSpec::is_pin)
+            {
+                submission.metadata.version = Some(VersionSpec::Pin(placeholder.clone()));
+            }
+            Ok(submission)
+        })
+        .collect()
 }
 
 /// Build the submission graph from CardRef-shaped objects in each spec.
@@ -170,7 +207,7 @@ impl ReferenceSlotVisitor for RefCollector {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Node, build, identity_key};
+    use super::{Edge, Node, build, graph_ready_submissions, identity_key};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::reference::CardRef;
@@ -256,6 +293,24 @@ mod tests {
         let mut second = first.clone();
         second.version = VersionBlock::parse("2.0.0").expect("test version is valid");
         assert_eq!(identity_key(&first), identity_key(&second));
+    }
+
+    #[test]
+    fn graph_ready_submissions_preserves_authored_version_selection() {
+        let card = card_ref(CardKind::Prompt, "prompt");
+        let mut authored = submission(
+            &card,
+            json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+        );
+        authored.metadata.version = None;
+
+        let ready = graph_ready_submissions(&[authored.clone()]).expect("graph projection");
+
+        assert!(authored.metadata.version.is_none());
+        assert_eq!(
+            ready[0].metadata.resolved_pin().map(ToString::to_string),
+            Some("0.0.0".to_owned())
+        );
     }
 
     #[test]

@@ -10666,6 +10666,7 @@ dependencies = [
  "vala-sql",
  "wiremock",
  "wyrd-auth-issue",
+ "wyrd-config",
  "wyrd-dev-fixtures",
  "wyrd-error-derive",
  "wyrd-semver",

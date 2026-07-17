@@ -13,7 +13,7 @@ use wyrd_spec::{
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
-    reference::{CardRef, PromptRef},
+    reference::{CardRef, InlineableRef},
 };
 
 use crate::callbacks::{
@@ -33,11 +33,11 @@ pub trait PromptResolver: Send + Sync {
     ///
     /// # Errors
     /// Returns a Wyrd error when a referenced Prompt Card cannot be resolved.
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError>;
+    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError>;
 }
 
 impl<T: PromptResolver + ?Sized> PromptResolver for &T {
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
         (**self).resolve(prompt_ref)
     }
 }
@@ -47,10 +47,10 @@ impl<T: PromptResolver + ?Sized> PromptResolver for &T {
 pub struct LocalPromptResolver;
 
 impl PromptResolver for LocalPromptResolver {
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
-            PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-            PromptRef::Card(card_ref) => prompt_registry()
+            InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+            InlineableRef::Ref(card_ref) => prompt_registry()
                 .read()
                 .map_err(|error| {
                     WyrdError::from(AgentCardError::validation(format!(
@@ -65,6 +65,7 @@ impl PromptResolver for LocalPromptResolver {
                     }
                     .into()
                 }),
+            InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
         }
     }
 }
@@ -167,7 +168,7 @@ pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
     /// Preserved durable prompt reference.
-    pub(crate) prompt_ref: PromptRef,
+    pub(crate) prompt_ref: InlineableRef<skald_spec::Prompt>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -217,7 +218,7 @@ impl Agent {
     /// run.
     #[must_use]
     pub fn new(prompt: Prompt) -> Self {
-        let prompt_ref = PromptRef::from(prompt.clone().into_native());
+        let prompt_ref = InlineableRef::from(prompt.clone().into_native());
         Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
     }
 
@@ -227,11 +228,11 @@ impl Agent {
     /// prompt handle.
     #[must_use]
     pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
-        let prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
+        let prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
         Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
     }
 
-    /// Build an Agent from a PromptRef and resolver.
+    /// Build an Agent from a prompt reference and resolver.
     ///
     /// Use this fallible constructor when the prompt may be a durable Prompt
     /// Card reference.
@@ -239,7 +240,7 @@ impl Agent {
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_from_ref(
-        prompt_ref: PromptRef,
+        prompt_ref: InlineableRef<skald_spec::Prompt>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
@@ -261,18 +262,18 @@ impl Agent {
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
         let prompt = prompt.into();
-        self.prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
+        self.prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
         self.prompt = prompt;
         self
     }
 
-    /// Return a copy retargeted through a PromptRef and resolver.
+    /// Return a copy retargeted through a prompt reference and resolver.
     ///
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_with_prompt(
         mut self,
-        prompt_ref: PromptRef,
+        prompt_ref: InlineableRef<skald_spec::Prompt>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
@@ -487,7 +488,7 @@ impl Agent {
 
     /// Return the preserved prompt reference.
     #[must_use]
-    pub fn prompt_ref(&self) -> &PromptRef {
+    pub fn prompt_ref(&self) -> &InlineableRef<skald_spec::Prompt> {
         &self.prompt_ref
     }
 
@@ -690,11 +691,19 @@ impl Agent {
         crate::loop_runtime::run_prompt(self, providers, prompt, vars, parent_run_id).await
     }
 
-    fn from_resolved_parts(id: String, prompt_ref: PromptRef, prompt: Prompt) -> Self {
+    fn from_resolved_parts(
+        id: String,
+        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt: Prompt,
+    ) -> Self {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
-    fn from_resolved_arc_parts(id: String, prompt_ref: PromptRef, prompt: Arc<Prompt>) -> Self {
+    fn from_resolved_arc_parts(
+        id: String,
+        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt: Arc<Prompt>,
+    ) -> Self {
         Self {
             meta: CardMetadata::default(),
             prompt_ref,
@@ -794,19 +803,25 @@ pub fn run_config_from_agent_run_config_spec(spec: &AgentRunConfigSpec) -> RunCo
 /// Derive `CardRef` cascade children from an Agent spec.
 #[must_use]
 pub fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
-    match &spec.prompt {
-        PromptRef::Card(card_ref) => vec![card_ref.clone()],
-        PromptRef::Inline(_) => Vec::new(),
-    }
+    spec.prompt.as_card_ref().cloned().into_iter().collect()
 }
 
 fn resolve_prompt_ref(
-    prompt_ref: &PromptRef,
+    prompt_ref: &InlineableRef<skald_spec::Prompt>,
     resolver: &dyn PromptResolver,
 ) -> Result<Prompt, WyrdError> {
     match prompt_ref {
-        PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-        PromptRef::Card(_) => resolver.resolve(prompt_ref),
+        InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+        InlineableRef::Ref(_) => resolver.resolve(prompt_ref),
+        InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
+    }
+}
+
+/// Return the stable error for an unresolved loader-only prompt path.
+fn unresolved_prompt_path_error() -> WyrdError {
+    WyrdError::RegistryUnresolvedPathRef {
+        message: "prompt path must be rewritten by the loader before runtime resolution".to_owned(),
+        details: serde_json::json!({"field": "prompt"}),
     }
 }
 

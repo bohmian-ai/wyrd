@@ -151,7 +151,7 @@ impl PySplit {
     #[staticmethod]
     fn materialized(card_ref: &Bound<'_, PyAny>) -> CardPyResult<Self> {
         Ok(Self::from_inner(SplitStrategy::Materialized(
-            card_ref_from_py(card_ref)?,
+            card_ref_from_py(card_ref)?.into(),
         )))
     }
 

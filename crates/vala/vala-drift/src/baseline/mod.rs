@@ -215,7 +215,7 @@ mod dispatch_errors {
             DriftMethod::External,
             model_ref("subject"),
             DriftSignal::External {
-                source_ref: data_ref("source"),
+                source_ref: data_ref("source").into(),
             },
             DriftCondition::Above { limit: 1.0 },
             None,
@@ -239,7 +239,8 @@ mod dispatch_errors {
                     version: VersionBlock::parse("1.0.0").expect("valid version"),
                     space: SpaceName::new("default").expect("valid space"),
                     uid: None,
-                },
+                }
+                .into(),
             },
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(SpcProfile {
@@ -259,7 +260,7 @@ mod dispatch_errors {
             DriftMethod::Psi,
             model_ref("subject"),
             DriftSignal::Distribution {
-                baseline_ref: data_ref("baseline"),
+                baseline_ref: data_ref("baseline").into(),
                 features: vec![feature],
             },
             DriftCondition::Statistical,
@@ -383,7 +384,7 @@ mod end_to_end {
             DriftMethod::Psi,
             model_ref("subject-model")?,
             DriftSignal::Distribution {
-                baseline_ref: data_ref("baseline-data")?,
+                baseline_ref: data_ref("baseline-data")?.into(),
                 features: vec![feature.clone()],
             },
             DriftCondition::Statistical,
@@ -402,7 +403,7 @@ mod end_to_end {
             DriftMethod::Spc,
             model_ref("subject-model")?,
             DriftSignal::Distribution {
-                baseline_ref: data_ref("baseline-data")?,
+                baseline_ref: data_ref("baseline-data")?.into(),
                 features: vec![feature.clone()],
             },
             DriftCondition::Statistical,

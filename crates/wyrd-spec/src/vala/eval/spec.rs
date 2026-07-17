@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
-use crate::reference::CardRef;
+use crate::reference::{CardRef, Ref};
 
 use super::ids::{JsonPath, TaskId};
 use super::operator::{ComparisonOperator, validate_regex_pattern};
@@ -60,7 +60,7 @@ pub struct EvalSpec {
     /// field documents the rule the validator enforces, consistent with the
     /// kind-restriction note on `validate()` below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_ref: Option<CardRef>,
+    pub subject_ref: Option<Ref>,
 
     /// Source data for offline runs.
     ///
@@ -244,12 +244,12 @@ fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdErro
 /// [`super::ids::JsonPath`].
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
-pub struct DatasetRef(pub CardRef);
+pub struct DatasetRef(pub Ref);
 
 impl<'de> Deserialize<'de> for DatasetRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let card_ref = CardRef::deserialize(deserializer)?;
-        Self::new(card_ref).map_err(serde::de::Error::custom)
+        let reference = Ref::deserialize(deserializer)?;
+        Self::new(reference).map_err(serde::de::Error::custom)
     }
 }
 
@@ -259,11 +259,13 @@ impl DatasetRef {
     /// # Errors
     /// Returns [`WyrdError::Validation`] when `card_ref.kind` is not
     /// [`CardKind::Data`].
-    pub fn new(card_ref: CardRef) -> Result<Self, WyrdError> {
-        if card_ref.kind != CardKind::Data {
+    pub fn new(reference: Ref) -> Result<Self, WyrdError> {
+        if let Some(card_ref) = reference.as_card_ref()
+            && card_ref.kind != CardKind::Data
+        {
             return Err(Self::kind_mismatch(&card_ref.kind));
         }
-        Ok(Self(card_ref))
+        Ok(Self(reference))
     }
 
     /// Re-validate after deserialization.
@@ -272,16 +274,18 @@ impl DatasetRef {
     /// Returns [`WyrdError::Validation`] when the wrapped reference is not a
     /// `Data` card reference.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        if self.0.kind != CardKind::Data {
-            return Err(Self::kind_mismatch(&self.0.kind));
+        if let Some(card_ref) = self.0.as_card_ref()
+            && card_ref.kind != CardKind::Data
+        {
+            return Err(Self::kind_mismatch(&card_ref.kind));
         }
         Ok(())
     }
 
     /// Borrow the wrapped card reference.
     #[must_use]
-    pub fn as_card_ref(&self) -> &CardRef {
-        &self.0
+    pub fn as_card_ref(&self) -> Option<&CardRef> {
+        self.0.as_card_ref()
     }
 
     fn kind_mismatch(kind: &CardKind) -> WyrdError {

@@ -92,7 +92,7 @@ pub fn assertion_task(id: &str) -> EvalTask {
 pub fn judge_task(id: &str) -> EvalTask {
     EvalTask::LlmJudge(LlmJudgeTask {
         id: tid(id),
-        judge_ref: judge_ref(),
+        judge_ref: judge_ref().into(),
         context_path: None,
         expected: json!({"passed": true}),
         operator: ComparisonOperator::Equals,
@@ -108,7 +108,7 @@ pub fn spec(tasks: Vec<EvalTask>) -> EvalSpec {
         .map(|task| (task.id().clone(), task))
         .collect::<BTreeMap<_, _>>();
     EvalSpec {
-        subject_ref: Some(subject_ref()),
+        subject_ref: Some(subject_ref().into()),
         dataset: None,
         tasks,
         workflow: None,

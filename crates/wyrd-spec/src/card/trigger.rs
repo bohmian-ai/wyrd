@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::NonSecretValue;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// Declarative trigger that invokes an Operator when its source condition fires.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -16,7 +16,7 @@ pub struct TriggerSpec {
     /// Trigger source.
     pub source: TriggerSource,
     /// Target Operator Card reference.
-    pub target: CardRef,
+    pub target: Ref,
     /// Minimum cooldown between firings, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_seconds: Option<u32>,
@@ -34,12 +34,12 @@ pub enum TriggerSource {
     /// Drift observation emitted by a Drift Card.
     DriftObservation {
         /// Source Drift Card reference.
-        card: CardRef,
+        card: Ref,
     },
     /// Evaluation observation emitted by an Eval Card.
     EvalObservation {
         /// Source Eval Card reference.
-        card: CardRef,
+        card: Ref,
     },
     /// Cron schedule.
     Schedule {

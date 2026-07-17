@@ -13,7 +13,7 @@ use pyo3::types::{PyAny, PyDict, PyList, PyModule, PyString};
 use skald_prompt::{Prompt, PyProviderRequest};
 use skald_spec::{ProviderRequest, ProviderResponse};
 use wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue};
-use wyrd_spec::reference::PromptRef;
+use wyrd_spec::reference::InlineableRef;
 
 use crate::py_error::{AgentPyError, AgentPyResult};
 use crate::{
@@ -27,7 +27,7 @@ impl Agent {
     /// Build a runnable, savable Agent.
     ///
     /// Args:
-    ///     prompt (Prompt | dict): Resolved prompt or PromptRef-like mapping.
+    ///     prompt (Prompt | dict): Resolved prompt or prompt-reference-like mapping.
     ///     name (str | None): Optional envelope name.
     ///     version (str | None): Optional envelope version.
     ///     space (str | None): Optional envelope space.
@@ -702,7 +702,9 @@ fn prompt_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<Prompt> {
         .clone())
 }
 
-fn prompt_ref_from_py(value: &Bound<'_, PyAny>) -> AgentPyResult<PromptRef> {
+fn prompt_ref_from_py(
+    value: &Bound<'_, PyAny>,
+) -> AgentPyResult<InlineableRef<skald_spec::Prompt>> {
     if let Ok(json) = value.call_method0("model_dump_json") {
         let data = json.extract::<String>()?;
         return Ok(serde_json::from_str(&data)?);

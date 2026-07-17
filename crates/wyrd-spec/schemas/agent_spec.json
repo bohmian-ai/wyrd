@@ -11,7 +11,7 @@
       "description": "Prompt reference preserved on disk and resolved by `skald-agent`.",
       "allOf": [
         {
-          "$ref": "#/definitions/PromptRef"
+          "$ref": "#/definitions/InlineableRef_for_Prompt"
         }
       ]
     },
@@ -1705,6 +1705,31 @@
         }
       },
       "additionalProperties": false
+    },
+    "InlineableRef_for_Prompt": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
     },
     "OpenAiAllowedTools": {
       "type": "object",
@@ -3913,27 +3938,6 @@
           ]
         }
       }
-    },
-    "PromptRef": {
-      "description": "Reference to an agent prompt, either inline or by Prompt Card reference.",
-      "anyOf": [
-        {
-          "description": "Inline native prompt payload.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Prompt"
-            }
-          ]
-        },
-        {
-          "description": "Reference to a registered Prompt Card.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ]
-        }
-      ]
     },
     "ProviderName": {
       "description": "Which provider a request targets.",

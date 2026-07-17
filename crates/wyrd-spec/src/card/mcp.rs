@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::NonSecretValue;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// MCP server or tool catalog metadata.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -21,7 +21,7 @@ pub struct McpSpec {
     pub transport: Option<String>,
     /// Tool references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tool_refs: Vec<CardRef>,
+    pub tool_refs: Vec<Ref>,
     /// Required scopes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,

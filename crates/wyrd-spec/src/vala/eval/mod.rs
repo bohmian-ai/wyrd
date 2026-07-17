@@ -753,9 +753,9 @@ mod llm_judge_tests {
     use crate::vala::eval::operator::ComparisonOperator;
     use wyrd_semver::VersionBlock;
 
-    fn prompt_ref(name: &str) -> CardRef {
+    fn agent_ref(name: &str) -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
             space: SpaceName::new("default").unwrap(),
@@ -774,20 +774,20 @@ mod llm_judge_tests {
     }
 
     #[test]
-    fn new_accepts_prompt_kind() {
+    fn new_accepts_agent_kind() {
         let task = LlmJudgeTask::new(
             TaskId::new("judge_one").unwrap(),
-            prompt_ref("factuality-judge"),
+            agent_ref("factuality-judge"),
             ComparisonOperator::Equals,
             serde_json::json!("pass"),
         )
-        .expect("prompt-kind ref is valid");
+        .expect("agent-kind ref is valid");
 
         assert_eq!(task.max_retries, 2);
     }
 
     #[test]
-    fn new_rejects_non_prompt_kind() {
+    fn new_rejects_non_agent_kind() {
         let result = LlmJudgeTask::new(
             TaskId::new("judge_two").unwrap(),
             data_ref("dataset"),
@@ -802,7 +802,7 @@ mod llm_judge_tests {
     fn validate_catches_deserialized_kind_mismatch() {
         let task = LlmJudgeTask::new(
             TaskId::new("judge").unwrap(),
-            prompt_ref("prompt"),
+            agent_ref("prompt"),
             ComparisonOperator::Equals,
             serde_json::json!("ok"),
         )
@@ -819,7 +819,7 @@ mod llm_judge_tests {
     fn round_trip() {
         let task = LlmJudgeTask::new(
             TaskId::new("judge").unwrap(),
-            prompt_ref("prompt"),
+            agent_ref("prompt"),
             ComparisonOperator::ContainsIgnoreCase,
             serde_json::json!("paris"),
         )
@@ -1864,6 +1864,16 @@ mod spec_tests {
         }
     }
 
+    fn agent_ref(name: &str) -> CardRef {
+        CardRef {
+            kind: CardKind::Agent,
+            name: CardName::new(name).unwrap(),
+            version: VersionBlock::parse("1.0.0").unwrap(),
+            space: SpaceName::new("default").unwrap(),
+            uid: None,
+        }
+    }
+
     fn one_task_map() -> BTreeMap<TaskId, EvalTask> {
         let mut tasks = BTreeMap::new();
         let id = TaskId::new("a").unwrap();
@@ -1898,8 +1908,8 @@ mod spec_tests {
     #[test]
     fn spec_with_full_fields_round_trip() {
         let mut spec = EvalSpec::new(one_task_map()).unwrap();
-        spec.subject_ref = Some(prompt_ref("retriever-quality"));
-        spec.dataset = Some(DatasetRef::new(data_ref("eval-set")).unwrap());
+        spec.subject_ref = Some(prompt_ref("retriever-quality").into());
+        spec.dataset = Some(DatasetRef::new(data_ref("eval-set").into()).unwrap());
         spec.sampling = Some(EvalSampling::Ratio { ratio: 0.1 });
         spec.pass_gate = Some(EvalPassGate::OverallPassRate { threshold: 0.9 });
 
@@ -1910,7 +1920,7 @@ mod spec_tests {
 
     #[test]
     fn dataset_ref_rejects_non_data_kind() {
-        let err = DatasetRef::new(prompt_ref("prompt")).unwrap_err();
+        let err = DatasetRef::new(prompt_ref("prompt").into()).unwrap_err();
         assert_eq!(err.code(), "WYRD_VALA_400_EVAL_REF_KIND_MISMATCH");
     }
 
@@ -2032,7 +2042,7 @@ mod spec_tests {
         let judge_id = TaskId::new("judge").unwrap();
         let mut judge = LlmJudgeTask::new(
             judge_id.clone(),
-            prompt_ref("judge-prompt"),
+            agent_ref("judge-agent"),
             ComparisonOperator::ContainsIgnoreCase,
             serde_json::json!("pass"),
         )

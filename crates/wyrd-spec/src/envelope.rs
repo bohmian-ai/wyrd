@@ -28,7 +28,7 @@ use crate::card::trigger::TriggerSpec;
 use crate::card::workflow::{WorkflowAction, WorkflowSpec};
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::reference::{AgentRef, CardRef, PromptRef};
+use crate::reference::{CardRef, InlineableRef, Ref};
 use crate::vala::eval::EvalTask;
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 
@@ -337,7 +337,7 @@ impl Spec {
                 visit_refs(&spec.card_refs, visitor);
                 for split in spec.splits.values() {
                     if let SplitStrategy::Materialized(card_ref) = &split.strategy {
-                        visitor.visit_ref(card_ref);
+                        visit_ref(Some(card_ref), visitor);
                     }
                 }
                 match &spec.interface {
@@ -352,33 +352,33 @@ impl Spec {
                 visit_refs(&spec.card_refs, visitor);
             }
             Self::Prompt(_) => {}
-            Self::Agent(spec) => visit_prompt_ref(&spec.prompt, visitor),
+            Self::Agent(spec) => visit_inlineable_ref(&spec.prompt, visitor),
             Self::Workflow(spec) => walk_workflow(spec, visitor),
             Self::Eval(spec) => {
                 visit_ref(spec.subject_ref.as_ref(), visitor);
                 if let Some(dataset) = &spec.dataset {
-                    visitor.visit_ref(dataset.as_card_ref());
+                    visit_ref(Some(&dataset.0), visitor);
                 }
                 for task in spec.tasks.values() {
                     if let EvalTask::LlmJudge(task) = task {
-                        visitor.visit_ref(&task.judge_ref);
+                        visit_inlineable_ref(&task.judge_ref, visitor);
                     }
                 }
             }
             Self::Drift(spec) => {
-                visitor.visit_ref(&spec.subject_ref);
+                visit_ref(Some(&spec.subject_ref), visitor);
                 match &spec.signal {
                     DriftSignal::Distribution { baseline_ref, .. } => {
-                        visitor.visit_ref(baseline_ref)
+                        visit_ref(Some(baseline_ref), visitor)
                     }
-                    DriftSignal::EvalScore { eval_ref } => visitor.visit_ref(eval_ref),
-                    DriftSignal::External { source_ref } => visitor.visit_ref(source_ref),
+                    DriftSignal::EvalScore { eval_ref } => visit_ref(Some(eval_ref), visitor),
+                    DriftSignal::External { source_ref } => visit_ref(Some(source_ref), visitor),
                     DriftSignal::Metric { .. } => {}
                 }
             }
             Self::Service(spec) => {
                 for component in &spec.components {
-                    visitor.visit_ref(&component.card_ref);
+                    visit_ref(Some(&component.card_ref), visitor);
                 }
             }
             Self::Policy(_) => {}
@@ -391,7 +391,7 @@ impl Spec {
             Self::Artifact(spec) => visit_ref(spec.schema_ref.as_ref(), visitor),
             Self::Trigger(spec) => {
                 visit_trigger_source(&spec.source, visitor);
-                visitor.visit_ref(&spec.target);
+                visit_ref(Some(&spec.target), visitor);
             }
             Self::Operator(spec) => {
                 visit_refs(&spec.pre_invoke, visitor);
@@ -408,7 +408,7 @@ impl Spec {
                 visit_refs_mut(&mut spec.card_refs, visitor);
                 for split in spec.splits.values_mut() {
                     if let SplitStrategy::Materialized(card_ref) = &mut split.strategy {
-                        visitor.visit_ref_mut(card_ref);
+                        visit_ref_mut(Some(card_ref), visitor);
                     }
                 }
                 match &mut spec.interface {
@@ -425,33 +425,35 @@ impl Spec {
                 visit_refs_mut(&mut spec.card_refs, visitor);
             }
             Self::Prompt(_) => {}
-            Self::Agent(spec) => visit_prompt_ref_mut(&mut spec.prompt, visitor),
+            Self::Agent(spec) => visit_inlineable_ref_mut(&mut spec.prompt, visitor),
             Self::Workflow(spec) => walk_workflow_mut(spec, visitor),
             Self::Eval(spec) => {
                 visit_ref_mut(spec.subject_ref.as_mut(), visitor);
                 if let Some(dataset) = &mut spec.dataset {
-                    visitor.visit_ref_mut(&mut dataset.0);
+                    visit_ref_mut(Some(&mut dataset.0), visitor);
                 }
                 for task in spec.tasks.values_mut() {
                     if let EvalTask::LlmJudge(task) = task {
-                        visitor.visit_ref_mut(&mut task.judge_ref);
+                        visit_inlineable_ref_mut(&mut task.judge_ref, visitor);
                     }
                 }
             }
             Self::Drift(spec) => {
-                visitor.visit_ref_mut(&mut spec.subject_ref);
+                visit_ref_mut(Some(&mut spec.subject_ref), visitor);
                 match &mut spec.signal {
                     DriftSignal::Distribution { baseline_ref, .. } => {
-                        visitor.visit_ref_mut(baseline_ref)
+                        visit_ref_mut(Some(baseline_ref), visitor)
                     }
-                    DriftSignal::EvalScore { eval_ref } => visitor.visit_ref_mut(eval_ref),
-                    DriftSignal::External { source_ref } => visitor.visit_ref_mut(source_ref),
+                    DriftSignal::EvalScore { eval_ref } => visit_ref_mut(Some(eval_ref), visitor),
+                    DriftSignal::External { source_ref } => {
+                        visit_ref_mut(Some(source_ref), visitor)
+                    }
                     DriftSignal::Metric { .. } => {}
                 }
             }
             Self::Service(spec) => {
                 for component in &mut spec.components {
-                    visitor.visit_ref_mut(&mut component.card_ref);
+                    visit_ref_mut(Some(&mut component.card_ref), visitor);
                 }
             }
             Self::Policy(_) => {}
@@ -464,7 +466,7 @@ impl Spec {
             Self::Artifact(spec) => visit_ref_mut(spec.schema_ref.as_mut(), visitor),
             Self::Trigger(spec) => {
                 visit_trigger_source_mut(&mut spec.source, visitor);
-                visitor.visit_ref_mut(&mut spec.target);
+                visit_ref_mut(Some(&mut spec.target), visitor);
             }
             Self::Operator(spec) => {
                 visit_refs_mut(&mut spec.pre_invoke, visitor);
@@ -483,57 +485,87 @@ pub trait ReferenceSlotVisitor {
     fn visit_ref_mut(&mut self, card_ref: &mut CardRef);
 }
 
-fn visit_ref<V: ReferenceSlotVisitor>(card_ref: Option<&CardRef>, visitor: &mut V) {
+fn visit_ref<V: ReferenceSlotVisitor>(reference: Option<&Ref>, visitor: &mut V) {
+    if let Some(card_ref) = reference.and_then(Ref::as_card_ref) {
+        visitor.visit_ref(card_ref);
+    }
+}
+
+fn visit_ref_mut<V: ReferenceSlotVisitor>(reference: Option<&mut Ref>, visitor: &mut V) {
+    if let Some(card_ref) = reference.and_then(Ref::as_card_ref_mut) {
+        visitor.visit_ref_mut(card_ref);
+    }
+}
+
+fn visit_refs<V: ReferenceSlotVisitor>(refs: &[Ref], visitor: &mut V) {
+    for reference in refs {
+        visit_ref(Some(reference), visitor);
+    }
+}
+
+fn visit_refs_mut<V: ReferenceSlotVisitor>(refs: &mut [Ref], visitor: &mut V) {
+    for reference in refs {
+        visit_ref_mut(Some(reference), visitor);
+    }
+}
+
+fn visit_card_ref<V: ReferenceSlotVisitor>(card_ref: Option<&CardRef>, visitor: &mut V) {
     if let Some(card_ref) = card_ref {
         visitor.visit_ref(card_ref);
     }
 }
 
-fn visit_ref_mut<V: ReferenceSlotVisitor>(card_ref: Option<&mut CardRef>, visitor: &mut V) {
+fn visit_card_ref_mut<V: ReferenceSlotVisitor>(card_ref: Option<&mut CardRef>, visitor: &mut V) {
     if let Some(card_ref) = card_ref {
         visitor.visit_ref_mut(card_ref);
     }
 }
 
-fn visit_refs<V: ReferenceSlotVisitor>(refs: &[CardRef], visitor: &mut V) {
+fn visit_card_refs<V: ReferenceSlotVisitor>(refs: &[CardRef], visitor: &mut V) {
     for card_ref in refs {
+        visit_card_ref(Some(card_ref), visitor);
+    }
+}
+
+fn visit_card_refs_mut<V: ReferenceSlotVisitor>(refs: &mut [CardRef], visitor: &mut V) {
+    for card_ref in refs {
+        visit_card_ref_mut(Some(card_ref), visitor);
+    }
+}
+
+fn visit_inlineable_ref<T, V: ReferenceSlotVisitor>(reference: &InlineableRef<T>, visitor: &mut V) {
+    if let Some(card_ref) = reference.as_card_ref() {
         visitor.visit_ref(card_ref);
     }
 }
 
-fn visit_refs_mut<V: ReferenceSlotVisitor>(refs: &mut [CardRef], visitor: &mut V) {
-    for card_ref in refs {
-        visitor.visit_ref_mut(card_ref);
-    }
-}
-
-fn visit_prompt_ref<V: ReferenceSlotVisitor>(prompt: &PromptRef, visitor: &mut V) {
-    if let PromptRef::Card(card_ref) = prompt {
-        visitor.visit_ref(card_ref);
-    }
-}
-
-fn visit_prompt_ref_mut<V: ReferenceSlotVisitor>(prompt: &mut PromptRef, visitor: &mut V) {
-    if let PromptRef::Card(card_ref) = prompt {
+fn visit_inlineable_ref_mut<T, V: ReferenceSlotVisitor>(
+    reference: &mut InlineableRef<T>,
+    visitor: &mut V,
+) {
+    if let Some(card_ref) = reference.as_card_ref_mut() {
         visitor.visit_ref_mut(card_ref);
     }
 }
 
 fn walk_workflow<V: ReferenceSlotVisitor>(spec: &WorkflowSpec, visitor: &mut V) {
     if let Some(governance) = &spec.governance {
-        visit_refs(&governance.policy_refs, visitor);
-        visit_ref(governance.audit_ref.as_ref(), visitor);
+        visit_card_refs(&governance.policy_refs, visitor);
+        visit_card_ref(governance.audit_ref.as_ref(), visitor);
     }
     if let Some(hooks) = &spec.observation_hooks {
-        visit_refs(&hooks.route_refs, visitor);
+        visit_card_refs(&hooks.route_refs, visitor);
     }
     for step in &spec.steps {
         match &step.action {
-            WorkflowAction::Agent(AgentRef::Card(card_ref))
-            | WorkflowAction::Mcp(card_ref)
-            | WorkflowAction::Prompt(card_ref) => visitor.visit_ref(card_ref),
-            WorkflowAction::Agent(AgentRef::Inline(agent)) => {
-                visit_prompt_ref(&agent.prompt, visitor)
+            WorkflowAction::Agent(agent_ref) => {
+                visit_inlineable_ref(agent_ref, visitor);
+                if let Some(agent) = agent_ref.as_inline() {
+                    visit_inlineable_ref(&agent.prompt, visitor);
+                }
+            }
+            WorkflowAction::Mcp(card_ref) | WorkflowAction::Prompt(card_ref) => {
+                visit_ref(Some(card_ref), visitor)
             }
         }
     }
@@ -541,19 +573,22 @@ fn walk_workflow<V: ReferenceSlotVisitor>(spec: &WorkflowSpec, visitor: &mut V) 
 
 fn walk_workflow_mut<V: ReferenceSlotVisitor>(spec: &mut WorkflowSpec, visitor: &mut V) {
     if let Some(governance) = &mut spec.governance {
-        visit_refs_mut(&mut governance.policy_refs, visitor);
-        visit_ref_mut(governance.audit_ref.as_mut(), visitor);
+        visit_card_refs_mut(&mut governance.policy_refs, visitor);
+        visit_card_ref_mut(governance.audit_ref.as_mut(), visitor);
     }
     if let Some(hooks) = &mut spec.observation_hooks {
-        visit_refs_mut(&mut hooks.route_refs, visitor);
+        visit_card_refs_mut(&mut hooks.route_refs, visitor);
     }
     for step in &mut spec.steps {
         match &mut step.action {
-            WorkflowAction::Agent(AgentRef::Card(card_ref))
-            | WorkflowAction::Mcp(card_ref)
-            | WorkflowAction::Prompt(card_ref) => visitor.visit_ref_mut(card_ref),
-            WorkflowAction::Agent(AgentRef::Inline(agent)) => {
-                visit_prompt_ref_mut(&mut agent.prompt, visitor)
+            WorkflowAction::Agent(agent_ref) => {
+                visit_inlineable_ref_mut(agent_ref, visitor);
+                if let Some(agent) = agent_ref.as_inline_mut() {
+                    visit_inlineable_ref_mut(&mut agent.prompt, visitor);
+                }
+            }
+            WorkflowAction::Mcp(card_ref) | WorkflowAction::Prompt(card_ref) => {
+                visit_ref_mut(Some(card_ref), visitor)
             }
         }
     }
@@ -565,7 +600,9 @@ fn visit_trigger_source<V: ReferenceSlotVisitor>(
 ) {
     match source {
         crate::card::trigger::TriggerSource::DriftObservation { card }
-        | crate::card::trigger::TriggerSource::EvalObservation { card } => visitor.visit_ref(card),
+        | crate::card::trigger::TriggerSource::EvalObservation { card } => {
+            visit_ref(Some(card), visitor)
+        }
         crate::card::trigger::TriggerSource::Schedule { .. } => {}
     }
 }
@@ -577,7 +614,7 @@ fn visit_trigger_source_mut<V: ReferenceSlotVisitor>(
     match source {
         crate::card::trigger::TriggerSource::DriftObservation { card }
         | crate::card::trigger::TriggerSource::EvalObservation { card } => {
-            visitor.visit_ref_mut(card)
+            visit_ref_mut(Some(card), visitor)
         }
         crate::card::trigger::TriggerSource::Schedule { .. } => {}
     }

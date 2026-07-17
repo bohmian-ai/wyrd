@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
 use wyrd_spec::envelope::Spec;
-use wyrd_spec::reference::PromptRef;
+use wyrd_spec::reference::InlineableRef;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -322,7 +322,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
     let Spec::Agent(agent) = stored.spec else {
         panic!("persisted card is not an Agent");
     };
-    let PromptRef::Card(child_ref) = agent.prompt else {
+    let InlineableRef::Ref(child_ref) = agent.prompt else {
         panic!("persisted agent prompt is not a card reference");
     };
     assert_eq!(child_ref.name.as_str(), "resolved-prompt");

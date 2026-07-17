@@ -107,7 +107,7 @@ mod media_binding {
     fn judge_task() -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid("judge"),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected: json!("pass"),
             operator: ComparisonOperator::Equals,

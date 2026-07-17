@@ -14,6 +14,7 @@ use wyrd_spec::card::data::{
     ArrowMeta, DataInterface as RustDataInterface, HuggingfaceMeta, ImageMeta, JsonlMeta,
     NumpyMeta, PandasMeta, ParquetMeta, PolarsMeta, SqlMeta, TextMeta, TorchMeta,
 };
+use wyrd_spec::reference::Ref;
 
 #[cfg(feature = "python")]
 use {crate::data::dtype, pyo3::prelude::*, wyrd_utils::py::module_version};
@@ -252,7 +253,7 @@ impl_to_spec!(
     |value: &ImageInterface, _py| {
         Ok(ImageMeta {
             format: parse_image_format(&value.format)?,
-            manifest_ref: value.manifest_ref.clone(),
+            manifest_ref: value.manifest_ref.clone().map(Ref::Ref),
             color_mode: parse_color_mode(&value.color_mode)?,
         })
     }
@@ -264,7 +265,11 @@ impl ImageInterface {
             data: None,
             format: image_format_token(meta.format).to_string(),
             color_mode: color_mode_token(meta.color_mode).to_string(),
-            manifest_ref: meta.manifest_ref.clone(),
+            manifest_ref: meta
+                .manifest_ref
+                .as_ref()
+                .and_then(Ref::as_card_ref)
+                .cloned(),
         }
     }
 }
@@ -277,7 +282,7 @@ impl_to_spec!(
     |value: &TextInterface, _py| {
         Ok(TextMeta {
             encoding: value.encoding.clone(),
-            manifest_ref: value.manifest_ref.clone(),
+            manifest_ref: value.manifest_ref.clone().map(Ref::Ref),
         })
     }
 );
@@ -287,7 +292,11 @@ impl TextInterface {
         Self {
             data: None,
             encoding: meta.encoding.clone(),
-            manifest_ref: meta.manifest_ref.clone(),
+            manifest_ref: meta
+                .manifest_ref
+                .as_ref()
+                .and_then(Ref::as_card_ref)
+                .cloned(),
         }
     }
 }

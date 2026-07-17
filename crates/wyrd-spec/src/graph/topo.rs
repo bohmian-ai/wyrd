@@ -21,6 +21,9 @@ pub enum GraphError {
     /// No submissions were supplied.
     #[error("empty submission set")]
     Empty,
+    /// A submission has no resolved space identity.
+    #[error("submission metadata.space is required for graph operations")]
+    MissingSpace,
     /// A submission identity was repeated within one request.
     #[error("duplicate submission identity: {candidates:?}")]
     DuplicateIdentity {

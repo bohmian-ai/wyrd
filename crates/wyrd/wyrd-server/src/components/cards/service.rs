@@ -7,11 +7,12 @@ use std::time::Duration as StdDuration;
 use chrono::{Duration, Utc};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
-use wyrd_semver::{VersionBlock, VersionSpec};
+use wyrd_semver::VersionSpec;
 use wyrd_spec::envelope::{Card, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::{
-    GraphError, RootPick, TopoOrder, build, canonical_order, pick_root, topo_sort,
+    GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
+    topo_sort,
 };
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
@@ -421,7 +422,7 @@ fn plan_registration(
     request_hash: String,
     external_refs: ResolvedRefs,
 ) -> Result<RegistrationPlan, WyrdError> {
-    let graph_submissions = graph_ready_submissions(&request.submissions)?;
+    let graph_submissions = graph_ready_submissions(&request.submissions).map_err(graph_error)?;
     let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
     let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
     let root = pick_root(&order).map_err(graph_error)?;
@@ -723,34 +724,6 @@ fn replay_seed(
     })
 }
 
-/// Supply concrete placeholder versions only to the pure graph builder.
-fn graph_ready_submissions(
-    submissions: &[CardSubmission],
-) -> Result<Vec<CardSubmission>, WyrdError> {
-    let placeholder = VersionBlock::parse("0.0.0")
-        .map_err(|error| WyrdError::internal(format!("invalid graph placeholder: {error}")))?;
-    submissions
-        .iter()
-        .cloned()
-        .map(|mut submission| {
-            if submission.metadata.space.is_none() {
-                return Err(WyrdError::registry_invalid_card_spec(
-                    "metadata.space is required",
-                ));
-            }
-            if !submission
-                .metadata
-                .version
-                .as_ref()
-                .is_some_and(VersionSpec::is_pin)
-            {
-                submission.metadata.version = Some(VersionSpec::Pin(placeholder.clone()));
-            }
-            Ok(submission)
-        })
-        .collect()
-}
-
 /// Decode one submission into the typed card envelope persisted by SQL.
 fn submission_card(submission: &CardSubmission) -> Result<Card, WyrdError> {
     let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
@@ -807,6 +780,9 @@ fn graph_error(error: GraphError) -> WyrdError {
             details: serde_json::json!({ "cycle": cycle }),
         },
         GraphError::Empty => WyrdError::registry_invalid_card_spec("submissions must not be empty"),
+        GraphError::MissingSpace => {
+            WyrdError::registry_invalid_card_spec("metadata.space is required")
+        }
         GraphError::MultipleRoots { candidates } => {
             WyrdError::internal(format!("multiple graph roots: {candidates:?}"))
         }

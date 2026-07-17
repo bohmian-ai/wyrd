@@ -17,7 +17,7 @@ use wyrd_spec::card::workflow::{
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, CardMetadata, Labels};
-use wyrd_spec::reference::{AgentRef, CardRef, PromptRef};
+use wyrd_spec::reference::{CardRef, InlineableRef};
 
 use crate::context::Context;
 use crate::def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
@@ -308,8 +308,8 @@ impl Workflow {
 
     /// Reconstruct a workflow from a `WorkflowCard` envelope.
     ///
-    /// Inline `AgentRef::Inline` steps populate the resolved-agents map
-    /// eagerly; `AgentRef::Card` steps require runtime resolution before
+    /// Inline agent steps populate the resolved-agents map eagerly; referenced
+    /// agent steps require runtime resolution before
     /// `.run()` can drive them.
     ///
     /// # Errors
@@ -322,7 +322,7 @@ impl Workflow {
     ) -> Result<Self, WyrdError> {
         let mut resolved = HashMap::new();
         for step in &card.spec.steps {
-            if let WorkflowAction::Agent(AgentRef::Inline(spec)) = &step.action {
+            if let WorkflowAction::Agent(InlineableRef::Inline(spec)) = &step.action {
                 let card = wyrd_spec::AgentCard {
                     space: card.space.clone(),
                     name: format!("{}-{}", card.name, step.id),
@@ -468,13 +468,13 @@ impl Workflow {
             .map_err(|error| WorkflowError::Other(error.to_string()))?
         {
             self.cascade_children.push(card_ref.clone());
-            WorkflowAction::Agent(AgentRef::Card(card_ref))
+            WorkflowAction::Agent(InlineableRef::Ref(card_ref))
         } else {
             let spec = agent.to_spec();
-            if let PromptRef::Card(prompt_ref) = &spec.prompt {
+            if let Some(prompt_ref) = spec.prompt.as_card_ref() {
                 self.cascade_children.push(prompt_ref.clone());
             }
-            WorkflowAction::Agent(AgentRef::from(spec))
+            WorkflowAction::Agent(InlineableRef::from(spec))
         };
         self.spec.steps.push(WorkflowStep {
             id: step_id.clone(),

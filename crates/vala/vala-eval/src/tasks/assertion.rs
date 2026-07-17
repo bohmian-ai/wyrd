@@ -245,7 +245,7 @@ mod assertion_stage {
     fn llm_judge(id: &str, expected: Value, op: ComparisonOperator, deps: &[&str]) -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid(id),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected,
             operator: op,

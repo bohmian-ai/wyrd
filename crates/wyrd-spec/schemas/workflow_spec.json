@@ -61,27 +61,6 @@
     }
   },
   "definitions": {
-    "AgentRef": {
-      "description": "Reference to a workflow step's agent, either inline or by Agent Card reference.",
-      "anyOf": [
-        {
-          "description": "Inline agent spec body.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/AgentSpec"
-            }
-          ]
-        },
-        {
-          "description": "Reference to a registered Agent Card.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ]
-        }
-      ]
-    },
     "AgentRunConfigSpec": {
       "description": "Pure-serde mirror of the Skald agent run configuration.",
       "type": "object",
@@ -135,7 +114,7 @@
           "description": "Prompt reference preserved on disk and resolved by `skald-agent`.",
           "allOf": [
             {
-              "$ref": "#/definitions/PromptRef"
+              "$ref": "#/definitions/InlineableRef_for_Prompt"
             }
           ]
         },
@@ -1825,6 +1804,56 @@
           }
         }
       }
+    },
+    "InlineableRef_for_AgentSpec": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentSpec"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
+    "InlineableRef_for_Prompt": {
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "An embedded child spec.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",
@@ -4261,27 +4290,6 @@
         }
       }
     },
-    "PromptRef": {
-      "description": "Reference to an agent prompt, either inline or by Prompt Card reference.",
-      "anyOf": [
-        {
-          "description": "Inline native prompt payload.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Prompt"
-            }
-          ]
-        },
-        {
-          "description": "Reference to a registered Prompt Card.",
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ]
-        }
-      ]
-    },
     "ProviderName": {
       "description": "Which provider a request targets.",
       "oneOf": [
@@ -4444,6 +4452,23 @@
         }
       ]
     },
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
     "ResponseType": {
       "description": "Expected response shape for a rendered prompt.",
       "oneOf": [
@@ -4570,7 +4595,7 @@
           ],
           "properties": {
             "target": {
-              "$ref": "#/definitions/AgentRef"
+              "$ref": "#/definitions/InlineableRef_for_AgentSpec"
             },
             "type": {
               "type": "string",
@@ -4589,7 +4614,7 @@
           ],
           "properties": {
             "target": {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             "type": {
               "type": "string",
@@ -4608,7 +4633,7 @@
           ],
           "properties": {
             "target": {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             "type": {
               "type": "string",

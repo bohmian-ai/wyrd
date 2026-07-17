@@ -15,7 +15,7 @@
           "description": "Source Drift Card reference.",
           "allOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             }
           ]
         },
@@ -39,7 +39,7 @@
           "description": "Source Eval Card reference.",
           "allOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             }
           ]
         },
@@ -158,6 +158,23 @@
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
+    },
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",

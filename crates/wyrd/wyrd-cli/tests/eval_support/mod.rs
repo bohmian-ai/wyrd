@@ -86,7 +86,7 @@ pub fn assertion_task() -> EvalTask {
 pub fn judge_task() -> EvalTask {
     EvalTask::LlmJudge(LlmJudgeTask {
         id: tid("judge_check"),
-        judge_ref: card_ref(CardKind::Prompt, "judge"),
+        judge_ref: card_ref(CardKind::Prompt, "judge").into(),
         context_path: None,
         expected: json!({"passed": true}),
         operator: ComparisonOperator::Equals,
@@ -102,7 +102,7 @@ pub fn spec(tasks: Vec<EvalTask>, pass_gate: Option<EvalPassGate>) -> EvalSpec {
         .map(|task| (task.id().clone(), task))
         .collect::<BTreeMap<_, _>>();
     EvalSpec {
-        subject_ref: Some(subject_ref()),
+        subject_ref: Some(subject_ref().into()),
         dataset: None,
         tasks,
         workflow: None,

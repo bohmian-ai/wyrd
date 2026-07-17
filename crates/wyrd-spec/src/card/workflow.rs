@@ -9,12 +9,13 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::api_version::ApiVersion;
+use crate::card::agent::AgentSpec;
 use crate::card::common::{Governance, NonSecretValue, ObservationHooks, ParameterValue};
 use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::reference::{AgentRef, CardRef, PromptRef};
+use crate::reference::{CardRef, InlineableRef, Ref};
 use wyrd_semver::VersionBlock;
 
 /// Declarative workflow definition.
@@ -143,11 +144,11 @@ pub struct WorkflowRetryPolicy {
 #[serde(tag = "type", content = "target", rename_all = "snake_case")]
 pub enum WorkflowAction {
     /// Agent action — inline body or Agent Card reference.
-    Agent(AgentRef),
+    Agent(InlineableRef<AgentSpec>),
     /// MCP server action.
-    Mcp(CardRef),
+    Mcp(Ref),
     /// Prompt action.
-    Prompt(CardRef),
+    Prompt(Ref),
 }
 
 /// Workflow validation failures.
@@ -426,14 +427,12 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     for step in &spec.steps {
         match &step.action {
             WorkflowAction::Mcp(card_ref) | WorkflowAction::Prompt(card_ref) => {
-                out.push(card_ref.clone());
+                out.extend(card_ref.as_card_ref().cloned());
             }
-            WorkflowAction::Agent(AgentRef::Card(card_ref)) => {
-                out.push(card_ref.clone());
-            }
-            WorkflowAction::Agent(AgentRef::Inline(agent_spec)) => {
-                if let PromptRef::Card(prompt_ref) = &agent_spec.prompt {
-                    out.push(prompt_ref.clone());
+            WorkflowAction::Agent(agent_ref) => {
+                out.extend(agent_ref.as_card_ref().cloned());
+                if let Some(agent_spec) = agent_ref.as_inline() {
+                    out.extend(agent_spec.prompt.as_card_ref().cloned());
                 }
             }
         }
@@ -507,7 +506,7 @@ mod workflow_spec_tests {
     use crate::error::WyrdError;
     use crate::ids::SpaceName;
     use crate::metadata::{Annotations, Labels};
-    use crate::reference::{AgentRef, CardRef, PromptRef};
+    use crate::reference::{CardRef, InlineableRef};
 
     fn prompt() -> skald_spec::Prompt {
         skald_spec::Prompt::new(
@@ -543,8 +542,8 @@ mod workflow_spec_tests {
     fn inline_agent_step(id: &str) -> WorkflowStep {
         WorkflowStep {
             id: id.to_owned(),
-            action: WorkflowAction::Agent(AgentRef::from(AgentSpec {
-                prompt: PromptRef::from(prompt()),
+            action: WorkflowAction::Agent(InlineableRef::from(AgentSpec {
+                prompt: InlineableRef::from(prompt()),
                 tool_names: vec![],
                 run_config: AgentRunConfigSpec::default(),
             })),
@@ -560,7 +559,7 @@ mod workflow_spec_tests {
     fn card_ref_agent_step(id: &str, agent_name: &str) -> WorkflowStep {
         WorkflowStep {
             id: id.to_owned(),
-            action: WorkflowAction::Agent(AgentRef::from(CardRef {
+            action: WorkflowAction::Agent(InlineableRef::from(CardRef {
                 kind: CardKind::Agent,
                 name: agent_name.parse().expect("valid card name"),
                 version: "0.1.0".parse().expect("valid version"),
@@ -633,7 +632,7 @@ mod workflow_spec_tests {
     #[test]
     fn workflow_card_cascade_inline_agent_with_card_prompt() {
         let inline_with_prompt_ref = AgentSpec {
-            prompt: PromptRef::from(CardRef {
+            prompt: InlineableRef::from(CardRef {
                 kind: CardKind::Prompt,
                 name: "planner-prompt".parse().expect("valid card name"),
                 version: "0.3.0".parse().expect("valid version"),
@@ -645,7 +644,7 @@ mod workflow_spec_tests {
         };
         let step = WorkflowStep {
             id: "planner".to_owned(),
-            action: WorkflowAction::Agent(AgentRef::from(inline_with_prompt_ref)),
+            action: WorkflowAction::Agent(InlineableRef::from(inline_with_prompt_ref)),
             depends_on: vec![],
             inputs: BTreeMap::new(),
             condition: None,

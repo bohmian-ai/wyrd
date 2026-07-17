@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::Value;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, Ref};
 use wyrd_spec::vala::eval::record::EvalRecordObservation;
 use wyrd_spec::vala::eval::{EvalSpec, ScenarioId};
 
@@ -109,8 +109,10 @@ impl ScenarioScoring {
         cursor: &ScenarioCursor,
         result: &ScenarioExecutionResults,
     ) -> Result<ScenarioAggregationInput, OrchestratorError> {
-        let mechanic_results =
-            mechanic_by_subject(self.spec.subject_ref.as_ref(), &result.mechanic)?;
+        let mechanic_results = mechanic_by_subject(
+            self.spec.subject_ref.as_ref().and_then(Ref::as_card_ref),
+            &result.mechanic,
+        )?;
         let passenger_tasks = result
             .passenger
             .iter()
@@ -225,7 +227,7 @@ impl ScenarioScoring {
         let aggregation = ScenarioAggregationInput {
             scenario_id,
             mechanic_results: mechanic_by_subject(
-                self.spec.subject_ref.as_ref(),
+                self.spec.subject_ref.as_ref().and_then(Ref::as_card_ref),
                 &scenario.mechanic,
             )?,
             passenger_tasks: Vec::new(),

@@ -815,7 +815,7 @@ mod end_to_end {
         });
         let judge_response = EvalTask::LlmJudge(LlmJudgeTask {
             id: tid("judge_response"),
-            judge_ref: judge_ref(),
+            judge_ref: judge_ref().into(),
             context_path: None,
             operator: ComparisonOperator::Equals,
             expected: json!({"passed": true}),
@@ -868,7 +868,7 @@ mod end_to_end {
             tasks.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: Some(subject_ref()),
+            subject_ref: Some(subject_ref().into()),
             dataset: None,
             tasks,
             workflow: None,

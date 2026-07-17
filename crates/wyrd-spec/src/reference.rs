@@ -6,7 +6,6 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::agent::AgentSpec;
 use crate::card::drift::DriftSignal;
 use crate::envelope::{CardKind, Spec};
 use crate::ids::{CardName, CardUid, SpaceName};
@@ -39,24 +38,122 @@ pub struct CardRef {
 /// Loaders rewrite `Path` values to `Ref` values before submitting a request;
 /// the server rejects unresolved paths at the wire boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum Ref {
-    /// A local authored path awaiting loader resolution.
-    Path(PathBuf),
     /// A direct reference to a registered Card.
     Ref(CardRef),
+    /// A local authored path awaiting loader resolution.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    Path(PathBuf),
+}
+
+impl Ref {
+    /// Return the resolved [`CardRef`] when this ref carries durable identity.
+    ///
+    /// Returns `None` for [`Ref::Path`] values that a loader has not yet
+    /// rewritten. Server code that observes `None` on the wire must reject
+    /// with `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF`.
+    #[must_use]
+    pub fn as_card_ref(&self) -> Option<&CardRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Path(_) => None,
+        }
+    }
+
+    /// Mutable variant of [`Ref::as_card_ref`].
+    #[must_use]
+    pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Path(_) => None,
+        }
+    }
+}
+
+impl From<CardRef> for Ref {
+    fn from(card_ref: CardRef) -> Self {
+        Self::Ref(card_ref)
+    }
 }
 
 /// A reference position that may carry an embedded child spec.
+///
+/// Loaders rewrite `Path` values to `Ref` values before submitting a request;
+/// the server rejects unresolved paths at the wire boundary. `Inline`
+/// bodies are authored, not synthesized by the loader.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum InlineableRef<T> {
-    /// A local authored path awaiting loader resolution.
-    Path(PathBuf),
     /// A direct reference to a registered Card.
     Ref(CardRef),
     /// An embedded child spec.
     Inline(Box<T>),
+    /// A local authored path awaiting loader resolution.
+    #[cfg_attr(feature = "server", schema(value_type = String))]
+    Path(PathBuf),
+}
+
+impl<T> InlineableRef<T> {
+    /// Return the resolved [`CardRef`] when this ref carries durable identity.
+    ///
+    /// Returns `None` for [`InlineableRef::Path`] (loader has not resolved
+    /// it yet) and [`InlineableRef::Inline`] (the body is embedded, not
+    /// referenced).
+    #[must_use]
+    pub fn as_card_ref(&self) -> Option<&CardRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Inline(_) | Self::Path(_) => None,
+        }
+    }
+
+    /// Mutable variant of [`InlineableRef::as_card_ref`].
+    #[must_use]
+    pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
+        match self {
+            Self::Ref(card_ref) => Some(card_ref),
+            Self::Inline(_) | Self::Path(_) => None,
+        }
+    }
+
+    /// Return the embedded child body when authored inline.
+    #[must_use]
+    pub fn as_inline(&self) -> Option<&T> {
+        match self {
+            Self::Inline(body) => Some(body),
+            Self::Ref(_) | Self::Path(_) => None,
+        }
+    }
+
+    /// Return the embedded child body mutably when authored inline.
+    #[must_use]
+    pub fn as_inline_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Inline(body) => Some(body),
+            Self::Ref(_) | Self::Path(_) => None,
+        }
+    }
+}
+
+impl<T> From<CardRef> for InlineableRef<T> {
+    fn from(card_ref: CardRef) -> Self {
+        Self::Ref(card_ref)
+    }
+}
+
+impl From<skald_spec::Prompt> for InlineableRef<skald_spec::Prompt> {
+    fn from(prompt: skald_spec::Prompt) -> Self {
+        Self::Inline(Box::new(prompt))
+    }
+}
+
+impl From<crate::card::agent::AgentSpec> for InlineableRef<crate::card::agent::AgentSpec> {
+    fn from(spec: crate::card::agent::AgentSpec) -> Self {
+        Self::Inline(Box::new(spec))
+    }
 }
 
 impl CardRef {
@@ -71,39 +168,6 @@ impl CardRef {
             && self.version == other.version
             && self.space == other.space
     }
-}
-
-/// Reference to an agent prompt, either inline or by Prompt Card reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-pub enum PromptRef {
-    /// Inline native prompt payload.
-    Inline(Box<skald_spec::Prompt>),
-    /// Reference to a registered Prompt Card.
-    Card(CardRef),
-}
-
-impl From<skald_spec::Prompt> for PromptRef {
-    fn from(prompt: skald_spec::Prompt) -> Self {
-        Self::Inline(Box::new(prompt))
-    }
-}
-
-impl From<CardRef> for PromptRef {
-    fn from(card_ref: CardRef) -> Self {
-        Self::Card(card_ref)
-    }
-}
-
-/// Reference to a workflow step's agent, either inline or by Agent Card reference.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(untagged)]
-pub enum AgentRef {
-    /// Inline agent spec body.
-    Inline(Box<AgentSpec>),
-    /// Reference to a registered Agent Card.
-    Card(CardRef),
 }
 
 /// A principal's card authorization set.
@@ -214,13 +278,19 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
             .card_refs()
             .chain(data.materialized_split_refs())
             .chain(data.interface.manifest_ref())
+            .filter_map(Ref::as_card_ref)
             .cloned()
             .collect(),
-        Spec::Model(model) => model.card_refs().cloned().collect(),
+        Spec::Model(model) => model
+            .card_refs()
+            .filter_map(Ref::as_card_ref)
+            .cloned()
+            .collect(),
         Spec::Experiment(experiment) => experiment
             .target_refs
             .iter()
             .chain(experiment.card_refs.iter())
+            .filter_map(Ref::as_card_ref)
             .cloned()
             .collect(),
         Spec::Prompt(_) => Vec::new(),
@@ -229,15 +299,33 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
         Spec::Eval(eval) => eval
             .subject_ref
             .iter()
-            .chain(eval.dataset.iter().map(|dataset| dataset.as_card_ref()))
+            .filter_map(Ref::as_card_ref)
+            .chain(
+                eval.dataset
+                    .iter()
+                    .filter_map(|dataset| dataset.as_card_ref()),
+            )
+            .chain(eval.tasks.values().filter_map(|task| match task {
+                crate::vala::eval::EvalTask::LlmJudge(task) => task.judge_ref.as_card_ref(),
+                _ => None,
+            }))
             .cloned()
             .collect(),
         Spec::Drift(drift) => {
-            let mut out = vec![drift.subject_ref.clone()];
+            let mut out: Vec<CardRef> = drift
+                .subject_ref
+                .as_card_ref()
+                .cloned()
+                .into_iter()
+                .collect();
             match &drift.signal {
-                DriftSignal::Distribution { baseline_ref, .. } => out.push(baseline_ref.clone()),
-                DriftSignal::EvalScore { eval_ref } => out.push(eval_ref.clone()),
-                DriftSignal::External { source_ref } => out.push(source_ref.clone()),
+                DriftSignal::Distribution { baseline_ref, .. } => {
+                    out.extend(baseline_ref.as_card_ref().cloned())
+                }
+                DriftSignal::EvalScore { eval_ref } => out.extend(eval_ref.as_card_ref().cloned()),
+                DriftSignal::External { source_ref } => {
+                    out.extend(source_ref.as_card_ref().cloned())
+                }
                 DriftSignal::Metric { .. } => {}
             }
             out
@@ -245,32 +333,48 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
         Spec::Service(service) => service
             .components
             .iter()
-            .map(|component| component.card_ref.clone())
+            .filter_map(|component| component.card_ref.as_card_ref())
+            .cloned()
             .collect(),
         Spec::Policy(_) => Vec::new(),
-        Spec::Mcp(mcp) => mcp.tool_refs.clone(),
+        Spec::Mcp(mcp) => mcp
+            .tool_refs
+            .iter()
+            .filter_map(Ref::as_card_ref)
+            .cloned()
+            .collect(),
         Spec::Audit(audit) => audit
             .subject_refs
             .iter()
             .chain(audit.policy_refs.iter())
             .chain(audit.evidence_refs.iter())
+            .filter_map(Ref::as_card_ref)
             .cloned()
             .collect(),
-        Spec::Artifact(artifact) => artifact.schema_ref.iter().cloned().collect(),
+        Spec::Artifact(artifact) => artifact
+            .schema_ref
+            .iter()
+            .filter_map(Ref::as_card_ref)
+            .cloned()
+            .collect(),
         Spec::Trigger(trigger) => {
             let source = match &trigger.source {
                 crate::card::trigger::TriggerSource::DriftObservation { card }
                 | crate::card::trigger::TriggerSource::EvalObservation { card } => {
-                    Some(card.clone())
+                    card.as_card_ref().cloned()
                 }
                 crate::card::trigger::TriggerSource::Schedule { .. } => None,
             };
-            source.into_iter().chain([trigger.target.clone()]).collect()
+            source
+                .into_iter()
+                .chain(trigger.target.as_card_ref().cloned())
+                .collect()
         }
         Spec::Operator(operator) => operator
             .pre_invoke
             .iter()
             .chain(operator.post_invoke.iter())
+            .filter_map(Ref::as_card_ref)
             .cloned()
             .collect(),
         Spec::Source(_) => Vec::new(),
@@ -340,18 +444,6 @@ fn bind_serialized_ref(
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
         | serde_json::Value::String(_) => {}
-    }
-}
-
-impl From<AgentSpec> for AgentRef {
-    fn from(spec: AgentSpec) -> Self {
-        Self::Inline(Box::new(spec))
-    }
-}
-
-impl From<CardRef> for AgentRef {
-    fn from(card_ref: CardRef) -> Self {
-        Self::Card(card_ref)
     }
 }
 
@@ -583,7 +675,7 @@ mod tests {
         };
         let spec = Spec::Mcp(McpSpec {
             server_name: "tools".to_owned(),
-            tool_refs: vec![authored_ref],
+            tool_refs: vec![authored_ref.into()],
             ..McpSpec::default()
         });
 
@@ -594,7 +686,12 @@ mod tests {
         let Spec::Mcp(bound) = bound else {
             panic!("expected an MCP spec");
         };
-        assert_eq!(bound.tool_refs[0].uid, Some(resolved_uid));
+        assert_eq!(
+            bound.tool_refs[0]
+                .as_card_ref()
+                .and_then(|card_ref| card_ref.uid.clone()),
+            Some(resolved_uid)
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
+use wyrd_spec::reference::InlineableRef;
 
 use wyrd_spec::vala::eval::{AssertionResult, EvalTask, LlmJudgeTask};
 
@@ -115,11 +116,31 @@ async fn invoke_with_retries(
     task: &LlmJudgeTask,
     context: Value,
 ) -> Result<Value, EvalExecError> {
+    let judge_ref = match &task.judge_ref {
+        InlineableRef::Ref(card_ref) => card_ref,
+        InlineableRef::Inline(_) => {
+            return Err(EvalExecError::JudgeRetriesExhausted {
+                task_id: task.id.clone(),
+                attempts: 0,
+                last_error:
+                    "inline Agent judge execution is not available at this invoker boundary"
+                        .to_owned(),
+            });
+        }
+        InlineableRef::Path(_) => {
+            return Err(EvalExecError::JudgeRetriesExhausted {
+                task_id: task.id.clone(),
+                attempts: 0,
+                last_error: "judge path must be rewritten by the loader before execution"
+                    .to_owned(),
+            });
+        }
+    };
     let max_attempts = task.max_retries.saturating_add(1);
     let mut last_error = String::from("no attempt made");
 
     for attempt in 0..max_attempts {
-        match invoker.invoke(&task.judge_ref, context.clone()).await {
+        match invoker.invoke(judge_ref, context.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if error.is_retryable() && attempt + 1 < max_attempts => {
                 last_error = error.to_string();
@@ -203,7 +224,7 @@ mod llm_judge_executor {
     ) -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid(id),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected,
             operator: op,

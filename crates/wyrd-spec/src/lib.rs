@@ -23,6 +23,7 @@ pub mod origin;
 pub mod query;
 pub mod redaction;
 pub mod reference;
+pub mod refs;
 pub mod registry;
 pub mod request_id;
 pub mod run;
@@ -57,7 +58,6 @@ pub use metadata::{
 };
 pub use origin::{CommitSha, Origin, OriginValidationError};
 pub use query::{FieldRef, MetadataQuery, Operator, Predicate, QueryFieldErrorDetail, Value};
-pub use reference::AgentRef;
 #[cfg(any(test, feature = "test-utils"))]
 pub use security::InlineSecret;
 pub use security::{SecretRef, SecretRefError, TlsConfig};

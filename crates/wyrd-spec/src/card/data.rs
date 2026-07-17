@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::card::field::FieldSpec;
 use crate::ids::{ColumnName, QueryName, SplitName};
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// Locked DataCard validation rules.
 pub mod validate;
@@ -24,7 +24,7 @@ pub struct DataSpec {
     pub schema: DataSchema,
     /// Durable Artifact card references linked to this data card.
     #[serde(default)]
-    pub card_refs: Vec<CardRef>,
+    pub card_refs: Vec<Ref>,
     /// Declared split strategies by stable split label.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub splits: HashMap<SplitName, DataSplit>,
@@ -60,7 +60,7 @@ impl DataSpec {
     }
 
     /// Iterate durable Artifact card references linked to this data card.
-    pub fn card_refs(&self) -> impl Iterator<Item = &CardRef> {
+    pub fn card_refs(&self) -> impl Iterator<Item = &Ref> {
         self.card_refs.iter()
     }
 
@@ -82,7 +82,7 @@ impl DataSpec {
     }
 
     /// Iterate materialized Artifact card refs declared by split strategies.
-    pub fn materialized_split_refs(&self) -> impl Iterator<Item = &CardRef> {
+    pub fn materialized_split_refs(&self) -> impl Iterator<Item = &Ref> {
         self.splits.values().filter_map(DataSplit::card_ref)
     }
 }
@@ -187,7 +187,7 @@ impl DataInterface {
 
     /// Return image/text manifest refs when the interface carries one.
     #[must_use]
-    pub fn manifest_ref(&self) -> Option<&CardRef> {
+    pub fn manifest_ref(&self) -> Option<&Ref> {
         match self {
             Self::Image(meta) => meta.manifest_ref.as_ref(),
             Self::Text(meta) => meta.manifest_ref.as_ref(),
@@ -276,7 +276,7 @@ pub struct DataSplit {
 impl DataSplit {
     /// Build a split that points at a pre-materialized Artifact card.
     #[must_use]
-    pub fn materialized(label: SplitName, card_ref: CardRef) -> Self {
+    pub fn materialized(label: SplitName, card_ref: Ref) -> Self {
         Self {
             label,
             strategy: SplitStrategy::Materialized(card_ref),
@@ -312,7 +312,7 @@ impl DataSplit {
 
     /// Return the Artifact card reference when this is a materialized split.
     #[must_use]
-    pub fn card_ref(&self) -> Option<&CardRef> {
+    pub fn card_ref(&self) -> Option<&Ref> {
         self.strategy.materialized_card_ref()
     }
 
@@ -329,7 +329,7 @@ impl DataSplit {
 #[serde(tag = "kind", content = "value")]
 pub enum SplitStrategy {
     /// Reference to an already materialized split artifact.
-    Materialized(CardRef),
+    Materialized(Ref),
     /// Predicate over a schema column.
     Column {
         /// Schema column referenced by the predicate.
@@ -353,7 +353,7 @@ pub enum SplitStrategy {
 impl SplitStrategy {
     /// Return the Artifact card reference carried by a materialized split.
     #[must_use]
-    pub fn materialized_card_ref(&self) -> Option<&CardRef> {
+    pub fn materialized_card_ref(&self) -> Option<&Ref> {
         match self {
             Self::Materialized(card_ref) => Some(card_ref),
             _ => None,
@@ -544,7 +544,7 @@ pub struct ImageMeta {
     pub format: ImageFormat,
     /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_ref: Option<CardRef>,
+    pub manifest_ref: Option<Ref>,
     /// Image color mode.
     pub color_mode: ColorMode,
 }
@@ -558,7 +558,7 @@ pub struct TextMeta {
     pub encoding: String,
     /// Optional manifest Artifact card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub manifest_ref: Option<CardRef>,
+    pub manifest_ref: Option<Ref>,
 }
 
 /// Hugging Face dataset interface metadata.

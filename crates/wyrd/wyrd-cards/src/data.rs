@@ -16,7 +16,7 @@ use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, Ref};
 
 #[cfg(feature = "python")]
 use {
@@ -671,7 +671,18 @@ impl DataCard {
                 metadata: DataCardMetadata {
                     interface: envelope.spec.interface,
                     schema: envelope.spec.schema,
-                    card_refs: envelope.spec.card_refs,
+                    card_refs: envelope
+                        .spec
+                        .card_refs
+                        .into_iter()
+                        .map(|reference| match reference {
+                            Ref::Ref(card_ref) => Ok(card_ref),
+                            Ref::Path(path) => Err(WyrdPyError::validation(format!(
+                                "DataCard contains unresolved card reference path: {}",
+                                path.display()
+                            ))),
+                        })
+                        .collect::<CardPyResult<Vec<_>>>()?,
                     splits: envelope.spec.splits,
                     target_columns: envelope.spec.target_columns,
                     sql: envelope.spec.sql,
@@ -886,7 +897,7 @@ fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInter
     DataSpec {
         interface,
         schema: metadata.schema.clone(),
-        card_refs: metadata.card_refs.clone(),
+        card_refs: metadata.card_refs.iter().cloned().map(Ref::Ref).collect(),
         splits: metadata.splits.clone(),
         target_columns: metadata.target_columns.clone(),
         sql: metadata.sql.clone(),

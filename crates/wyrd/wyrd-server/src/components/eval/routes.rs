@@ -82,7 +82,10 @@ async fn open(
         .map_err(|error| WyrdErrorResponse::from(map_card_resolution_error(&error)))?;
 
     let dataset = resolver::dataset_ref(&eval_card).map_err(WyrdErrorResponse::from)?;
-    let data_card = resolver::resolve_card(&mut conn, CardKind::Data, dataset.as_card_ref())
+    let dataset_ref = dataset.as_card_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(eval_internal_error("eval dataset is not a card reference"))
+    })?;
+    let data_card = resolver::resolve_card(&mut conn, CardKind::Data, dataset_ref)
         .await
         .map_err(|error| WyrdErrorResponse::from(map_card_resolution_error(&error)))?;
     conn.commit().await.map_err(|error| {

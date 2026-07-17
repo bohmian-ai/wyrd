@@ -404,7 +404,7 @@ mod scenario_execution {
     fn judge_task() -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid("judge_response"),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected: json!({"passed": true}),
             operator: ComparisonOperator::Equals,

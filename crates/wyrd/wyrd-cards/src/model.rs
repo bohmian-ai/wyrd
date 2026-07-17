@@ -15,7 +15,7 @@ use wyrd_spec::card::model::{
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, Ref};
 
 #[cfg(feature = "python")]
 use {
@@ -661,7 +661,18 @@ impl ModelCard {
                     task_type: envelope.spec.task_type,
                     signature: envelope.spec.signature,
                     sample_input: envelope.spec.sample_input,
-                    card_refs: envelope.spec.card_refs,
+                    card_refs: envelope
+                        .spec
+                        .card_refs
+                        .into_iter()
+                        .map(|reference| match reference {
+                            Ref::Ref(card_ref) => Ok(card_ref),
+                            Ref::Path(path) => Err(WyrdPyError::model_validation(format!(
+                                "ModelCard contains unresolved card reference path: {}",
+                                path.display()
+                            ))),
+                        })
+                        .collect::<CardPyResult<Vec<_>>>()?,
                 },
                 created_at: utc_now(),
                 is_card: true,
@@ -1007,7 +1018,7 @@ fn model_spec_from_metadata(
         task_type: metadata.task_type,
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
-        card_refs: metadata.card_refs.clone(),
+        card_refs: metadata.card_refs.iter().cloned().map(Ref::Ref).collect(),
     }
 }
 

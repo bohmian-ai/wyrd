@@ -2,7 +2,7 @@ use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
 use skald_workflow::Workflow;
 use wyrd_spec::card::workflow::WorkflowAction;
-use wyrd_spec::reference::AgentRef;
+use wyrd_spec::reference::InlineableRef;
 
 fn build_agent(name: &str) -> Agent {
     let prompt = openai_chat(
@@ -46,7 +46,7 @@ fn workflow_sequential_chains_named_agents_with_card_ref_cascade() {
     assert!(names.contains(&"writer"));
     for step in &wf.spec().steps {
         match &step.action {
-            WorkflowAction::Agent(AgentRef::Card(_)) => {}
+            WorkflowAction::Agent(InlineableRef::Ref(_)) => {}
             other => panic!("expected Agent::Card variant, got {other:?}"),
         }
     }
@@ -59,7 +59,7 @@ fn workflow_sequential_anonymous_agents_get_inline_action() {
     assert!(wf.cascade_children().is_empty());
     for step in &wf.spec().steps {
         match &step.action {
-            WorkflowAction::Agent(AgentRef::Inline(_)) => {}
+            WorkflowAction::Agent(InlineableRef::Inline(_)) => {}
             other => panic!("expected Agent::Inline variant, got {other:?}"),
         }
     }

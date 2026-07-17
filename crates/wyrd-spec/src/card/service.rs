@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::{CredentialRef, NonSecretValue};
-use crate::reference::CardRef;
+use crate::reference::{CardRef, Ref};
 
 /// Composition of cards used by an application or deployment.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -116,7 +116,7 @@ pub struct ServiceComponent {
     pub alias: String,
     /// Canonical Card reference.
     #[serde(rename = "ref")]
-    pub card_ref: CardRef,
+    pub card_ref: Ref,
     /// Optional development-time source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ComponentSource>,

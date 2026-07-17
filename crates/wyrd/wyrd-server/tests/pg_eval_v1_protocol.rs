@@ -222,7 +222,7 @@ mod pg_tests {
 
     fn eval_spec_with_dataset(data_ref: CardRef) -> Spec {
         let mut spec = EvalSpec::new(BTreeMap::new()).expect("eval spec");
-        spec.dataset = Some(DatasetRef::new(data_ref).expect("dataset ref"));
+        spec.dataset = Some(DatasetRef::new(data_ref.into()).expect("dataset ref"));
         Spec::Eval(spec)
     }
 

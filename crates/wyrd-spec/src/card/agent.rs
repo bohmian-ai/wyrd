@@ -10,7 +10,7 @@ use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationship
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::reference::{CardRef, PromptRef};
+use crate::reference::{CardRef, InlineableRef};
 use wyrd_semver::VersionBlock;
 
 /// Pure-serde mirror of the Skald agent run configuration.
@@ -37,7 +37,7 @@ pub struct AgentRunConfigSpec {
 pub struct AgentSpec {
     /// Prompt reference preserved on disk and resolved by `skald-agent`.
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
-    pub prompt: PromptRef,
+    pub prompt: InlineableRef<skald_spec::Prompt>,
     /// Runtime-local tool names resolved from a local Skald tool registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
@@ -321,10 +321,7 @@ impl From<AgentCardError> for WyrdError {
 
 /// Return card refs declared by an agent for cascade and scope traversal.
 fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
-    match &spec.prompt {
-        PromptRef::Card(card_ref) => vec![card_ref.clone()],
-        PromptRef::Inline(_) => Vec::new(),
-    }
+    spec.prompt.as_card_ref().cloned().into_iter().collect()
 }
 
 /// Return card refs declared by an agent for card-ref scope traversal.
@@ -378,7 +375,7 @@ fn card_ref_display(card_ref: &CardRef) -> String {
 mod agent_spec_tests {
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::envelope::CardKind;
-    use crate::reference::{CardRef, PromptRef};
+    use crate::reference::{CardRef, InlineableRef};
 
     fn prompt() -> skald_spec::Prompt {
         skald_spec::Prompt::new(
@@ -414,7 +411,7 @@ mod agent_spec_tests {
     #[test]
     fn agent_spec_inline_prompt_roundtrips() {
         let spec = AgentSpec {
-            prompt: PromptRef::from(prompt()),
+            prompt: InlineableRef::from(prompt()),
             tool_names: vec!["search_docs".to_owned()],
             run_config: AgentRunConfigSpec {
                 max_iterations: Some(7),
@@ -436,7 +433,7 @@ mod agent_spec_tests {
     #[test]
     fn agent_spec_card_prompt_uses_single_version_field() {
         let spec = AgentSpec {
-            prompt: PromptRef::from(CardRef {
+            prompt: InlineableRef::from(CardRef {
                 kind: CardKind::Prompt,
                 name: "planner-prompt".parse().expect("valid card name"),
                 version: "0.3.0".parse().expect("valid version"),

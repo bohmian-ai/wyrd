@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use wyrd_spec::envelope::{ReferenceSlotVisitor, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
@@ -10,37 +11,27 @@ use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::select_card_uids_by_ref_batch;
 
 /// Identity key used to look up a resolved external reference.
-///
-/// Sibling refs (whose `(kind, space, name)` match a submission in the current
-/// composite request) are NOT resolved here. Sibling UIDs are minted during
-/// topo iteration inside the composite transaction, and the caller looks them
-/// up from the running write map.
 pub type ResolvedRefs = Vec<(CardRef, CardUid)>;
 
 /// Resolve every external (non-sibling) `CardRef` to its `CardUid` under RLS.
-///
-/// Sibling references are excluded from the database read and left for the
-/// composite tx to bind from its running write map. Missing external refs
-/// surface as `WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY`, naming the offending
-/// `kind/space/name/version` in the problem-json `detail`.
 pub async fn resolve_card_references(
     conn: &mut TenantConn<'_>,
     submissions: &[CardSubmission],
 ) -> Result<ResolvedRefs, WyrdError> {
-    let siblings = sibling_identities(submissions);
-
+    let siblings = sibling_identities(submissions)?;
     let mut refs = Vec::new();
+
     for submission in submissions {
-        collect_card_refs(&submission.spec, &mut refs);
+        let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+        collect_card_refs(&spec, &mut refs);
     }
 
     refs.retain(|card_ref| !siblings.contains(&sibling_key(card_ref)));
     refs.sort_by_key(display_ref);
-    refs.dedup_by(|left, right| display_ref(left) == display_ref(right));
+    refs.dedup_by(|left, right| left.same_identity(right));
 
-    let resolved = select_card_uids_by_ref_batch(conn, &refs).await?;
-    let resolved_refs = resolved;
-
+    let resolved_refs = select_card_uids_by_ref_batch(conn, &refs).await?;
     if let Some(missing) = refs.iter().find(|card_ref| {
         !resolved_refs
             .iter()
@@ -56,21 +47,74 @@ pub async fn resolve_card_references(
     Ok(resolved_refs)
 }
 
+/// Collect the typed `CardRef` fields from one decoded spec.
+fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
+    let mut collector = RefCollector { output };
+    spec.walk_refs(&mut collector);
+}
+
+/// Bind external and already-minted sibling UIDs into every embedded reference.
+pub fn bind_card_references(
+    spec: &mut Spec,
+    external: &ResolvedRefs,
+    siblings: &HashMap<(String, String, String), CardUid>,
+) -> Result<(), WyrdError> {
+    let mut binder = RefBinder { external, siblings };
+    spec.walk_refs_mut(&mut binder);
+    Ok(())
+}
+
+/// Collects immutable typed reference slots.
+struct RefCollector<'a> {
+    output: &'a mut Vec<CardRef>,
+}
+
+impl ReferenceSlotVisitor for RefCollector<'_> {
+    fn visit_ref(&mut self, card_ref: &CardRef) {
+        self.output.push(card_ref.clone());
+    }
+
+    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
+}
+
+/// Binds a reference slot to a sibling or external UID when one is available.
+struct RefBinder<'a> {
+    external: &'a ResolvedRefs,
+    siblings: &'a HashMap<(String, String, String), CardUid>,
+}
+
+impl ReferenceSlotVisitor for RefBinder<'_> {
+    fn visit_ref(&mut self, _card_ref: &CardRef) {}
+
+    fn visit_ref_mut(&mut self, card_ref: &mut CardRef) {
+        card_ref.uid = self
+            .siblings
+            .get(&sibling_key(card_ref))
+            .or_else(|| {
+                self.external
+                    .iter()
+                    .find(|(resolved, _)| resolved.same_identity(card_ref))
+                    .map(|(_, uid)| uid)
+            })
+            .cloned();
+    }
+}
+
 /// Collect the `(kind, space, name)` identities that appear as siblings.
-fn sibling_identities(submissions: &[CardSubmission]) -> BTreeSet<(String, String, String)> {
+fn sibling_identities(
+    submissions: &[CardSubmission],
+) -> Result<BTreeSet<(String, String, String)>, WyrdError> {
     submissions
         .iter()
         .map(|submission| {
-            (
+            let space = submission.metadata.space.as_ref().ok_or_else(|| {
+                WyrdError::registry_invalid_card_spec("metadata.space is required")
+            })?;
+            Ok((
                 submission.kind.wire_name().to_owned(),
-                submission
-                    .metadata
-                    .space
-                    .as_ref()
-                    .map_or("", |space| space.as_str())
-                    .to_owned(),
+                space.as_str().to_owned(),
                 submission.metadata.name.as_str().to_owned(),
-            )
+            ))
         })
         .collect()
 }
@@ -95,139 +139,100 @@ fn display_ref(card_ref: &CardRef) -> String {
     )
 }
 
-/// Recursively collect exact `CardRef` objects embedded in a JSON spec.
-fn collect_card_refs(value: &serde_json::Value, output: &mut Vec<CardRef>) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_card_refs(value, output);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            if let Ok(card_ref) =
-                serde_json::from_value::<CardRef>(serde_json::Value::Object(object.clone()))
-            {
-                output.push(card_ref);
-            }
-            for value in object.values() {
-                collect_card_refs(value, output);
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-}
-
-/// Bind external and already-minted sibling UIDs into every embedded reference.
-pub fn bind_card_references(
-    value: &mut serde_json::Value,
-    external: &ResolvedRefs,
-    siblings: &HashMap<(String, String, String), CardUid>,
-) -> Result<(), WyrdError> {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                bind_card_references(value, external, siblings)?;
-            }
-        }
-        serde_json::Value::Object(object) => {
-            if let Ok(mut card_ref) =
-                serde_json::from_value::<CardRef>(serde_json::Value::Object(object.clone()))
-            {
-                card_ref.uid = siblings
-                    .get(&sibling_key(&card_ref))
-                    .or_else(|| {
-                        external
-                            .iter()
-                            .find(|(resolved, _)| resolved.same_identity(&card_ref))
-                            .map(|(_, uid)| uid)
-                    })
-                    .cloned();
-                *value =
-                    serde_json::to_value(card_ref).map_err(WyrdError::from_spec_serialization)?;
-                return Ok(());
-            }
-            for value in object.values_mut() {
-                bind_card_references(value, external, siblings)?;
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use uuid::Uuid;
+    use wyrd_semver::{VersionBlock, VersionSpec};
+    use wyrd_spec::api_version::ApiVersion;
+    use wyrd_spec::envelope::{CardKind, Metadata, Spec};
     use wyrd_spec::ids::CardUid;
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::CardSubmission;
 
     use super::{bind_card_references, collect_card_refs, sibling_identities};
 
-    /// Decode one compact submission fixture.
-    fn submission(value: serde_json::Value) -> CardSubmission {
-        serde_json::from_value(value).expect("submission fixture must deserialize")
-    }
-
-    /// Build an exact Prompt reference fixture.
     fn prompt_ref(name: &str) -> CardRef {
-        serde_json::from_value(serde_json::json!({
-            "kind": "Prompt",
-            "name": name,
-            "version": "1.0.0",
-            "space": "default"
-        }))
-        .expect("reference fixture must deserialize")
+        CardRef {
+            kind: CardKind::Prompt,
+            name: name.parse().expect("test_setup: reference name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("test_setup: reference version is valid"),
+            space: "default"
+                .parse()
+                .expect("test_setup: reference space is valid"),
+            uid: None,
+        }
     }
 
-    /// Treat sibling identity as kind, space, and name without a redundant wrapper type.
-    #[test]
-    fn sibling_identity_ignores_version_and_uid() {
-        let child = submission(serde_json::json!({
-            "apiVersion": "wyrd/v1",
-            "kind": "Prompt",
-            "metadata": { "name": "child", "version": "2.0.0", "space": "default" },
-            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
-            "artifacts": []
-        }));
-        let identities = sibling_identities(&[child]);
-
-        assert!(identities.contains(&(
-            "Prompt".to_owned(),
-            "default".to_owned(),
-            "child".to_owned()
-        )));
+    fn submission(name: &str) -> CardSubmission {
+        CardSubmission {
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Prompt,
+            metadata: Metadata {
+                name: name.parse().expect("test_setup: submission name is valid"),
+                version: Some(VersionSpec::Pin(
+                    VersionBlock::parse("1.0.0").expect("test_setup: submission version is valid"),
+                )),
+                bump: None,
+                space: Some(
+                    "default"
+                        .parse()
+                        .expect("test_setup: submission space is valid"),
+                ),
+                uid: None,
+                labels: Default::default(),
+                annotations: Default::default(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
+            },
+            spec: serde_json::json!({
+                "provider": "openai",
+                "model": "gpt-4o",
+                "messages": ["hello"]
+            }),
+            artifacts: Vec::new(),
+        }
     }
 
-    /// Collect nested card references without treating ordinary objects as references.
+    fn service_spec(card_ref: CardRef) -> Spec {
+        Spec::from_kind_and_value(
+            &CardKind::Service,
+            serde_json::json!({
+                "components": [{"alias": "child", "ref": card_ref}]
+            }),
+        )
+        .expect("test_setup: service spec is valid")
+    }
+
     #[test]
-    fn collect_nested_card_refs() {
+    fn sibling_identity_requires_space() {
+        let mut child = submission("child");
+        child.metadata.space = None;
+
+        let error =
+            sibling_identities(&[child]).expect_err("test_setup: missing space must be rejected");
+
+        assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+    }
+
+    #[test]
+    fn collect_typed_card_refs() {
         let expected = prompt_ref("child");
-        let value = serde_json::json!({
-            "prompt": expected,
-            "config": { "kind": "not-a-card", "name": "ignored" }
-        });
+        let spec = service_spec(expected.clone());
         let mut refs = Vec::new();
 
-        collect_card_refs(&value, &mut refs);
+        collect_card_refs(&spec, &mut refs);
 
         assert_eq!(refs, vec![expected]);
     }
 
-    /// Bind a sibling UID directly into the durable CardRef wire shape.
     #[test]
-    fn bind_sibling_uid_without_card_ref_identity() {
-        let card_ref = prompt_ref("child");
-        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
-        let mut value = serde_json::to_value(&card_ref).expect("reference serializes");
+    fn bind_sibling_uid_without_json_shape_sniffing() {
+        let expected = prompt_ref("child");
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
+        let mut spec = service_spec(expected.clone());
         let siblings = HashMap::from([(
             (
                 "Prompt".to_owned(),
@@ -237,27 +242,29 @@ mod tests {
             uid.clone(),
         )]);
 
-        bind_card_references(&mut value, &Vec::new(), &siblings).expect("binding succeeds");
-        let bound: CardRef = serde_json::from_value(value).expect("bound reference deserializes");
+        bind_card_references(&mut spec, &Vec::new(), &siblings)
+            .expect("test_setup: binding succeeds");
 
-        assert_eq!(bound.uid, Some(uid));
+        let mut refs = Vec::new();
+        collect_card_refs(&spec, &mut refs);
+        assert_eq!(refs[0].uid, Some(uid));
     }
 
-    /// Bind an externally resolved UID using CardRef identity comparison.
     #[test]
     fn bind_external_uid_for_exact_reference() {
-        let card_ref = prompt_ref("external");
-        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
-        let mut value = serde_json::to_value(&card_ref).expect("reference serializes");
+        let expected = prompt_ref("external");
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
+        let mut spec = service_spec(expected.clone());
 
         bind_card_references(
-            &mut value,
-            &vec![(card_ref.clone(), uid.clone())],
+            &mut spec,
+            &vec![(expected.clone(), uid.clone())],
             &HashMap::new(),
         )
-        .expect("binding succeeds");
-        let bound: CardRef = serde_json::from_value(value).expect("bound reference deserializes");
+        .expect("test_setup: binding succeeds");
 
-        assert_eq!(bound.uid, Some(uid));
+        let mut refs = Vec::new();
+        collect_card_refs(&spec, &mut refs);
+        assert_eq!(refs[0].uid, Some(uid));
     }
 }

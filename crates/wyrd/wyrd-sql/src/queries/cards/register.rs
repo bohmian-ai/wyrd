@@ -7,13 +7,11 @@ use sqlx::QueryBuilder;
 use uuid::Uuid;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_semver::{VersionBlock, VersionSpec};
-use wyrd_spec::envelope::{Card, CardKind};
+use wyrd_spec::envelope::{Card, CardKind, SpecCanonicalizationError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{
-    ArtifactManifestEntry, CardSubmission, CreateCardResponse, RegistrationOperationId,
-};
+use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, RegistrationOperationId};
 
 use crate::row_types::cards::CardStatus;
 use crate::tenant_conn::TenantConn;
@@ -80,12 +78,14 @@ pub struct NewCardRow<'a> {
 pub struct CardArtifactManifestRow {
     /// Owning card identifier.
     pub card_uid: Uuid,
+    /// Server-minted manifest identifier.
+    pub manifest_id: Uuid,
     /// Validated relative artifact path.
     pub relative_path: String,
     /// Expected base64 SHA-256 digest.
     pub expected_sha256: String,
     /// Expected artifact size.
-    pub expected_size_bytes: i64,
+    pub size_bytes: i64,
     /// Optional content type.
     pub content_type: Option<String>,
     /// Current post-commit initialization state.
@@ -122,27 +122,31 @@ pub struct RegisteredCardRow {
 }
 
 /// Compute the canonical BLAKE3/JCS hash for a submitted artifact manifest.
-#[must_use]
-pub fn artifact_manifest_hash(artifacts: &[ArtifactManifestEntry]) -> Option<String> {
+pub fn artifact_manifest_hash(
+    artifacts: &[ArtifactManifestEntry],
+) -> Result<Option<String>, WyrdError> {
     if artifacts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let bytes = serde_jcs::to_vec(artifacts).expect("artifact manifest is serializable");
-    Some(blake3::hash(&bytes).to_hex().to_string())
+    let bytes = serde_jcs::to_vec(artifacts).map_err(|error| {
+        WyrdError::from_spec_canonicalization(SpecCanonicalizationError::Serialize(error))
+    })?;
+    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
 }
 
 /// Compute the canonical request hash from ordered submissions and manifest hashes.
-#[must_use]
 pub fn registration_request_hash(
     canonical_submissions: &[&CardSubmission],
     artifact_hashes: &[Option<String>],
-) -> String {
+) -> Result<String, WyrdError> {
     let payload = serde_json::json!({
         "submissions": canonical_submissions,
         "artifact_manifest_hashes": artifact_hashes,
     });
-    let bytes = serde_jcs::to_vec(&payload).expect("registration request is serializable");
-    blake3::hash(&bytes).to_hex().to_string()
+    let bytes = serde_jcs::to_vec(&payload).map_err(|error| {
+        WyrdError::from_spec_canonicalization(SpecCanonicalizationError::Serialize(error))
+    })?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// Find an operation by tenant-scoped principal and idempotency key.
@@ -157,6 +161,29 @@ pub async fn lookup_existing_operation(
                   created_at, updated_at
              FROM wyrd.card_registration_operations
             WHERE data_tenant_id = wyrd.current_tenant()
+              AND status <> 'expired'
+              AND principal_id = $1 AND idempotency_key = $2"#,
+    )
+    .bind(principal_id.as_uuid())
+    .bind(idempotency_key)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(registry_db_error)
+}
+
+/// Find an expired operation so the caller receives a stable terminal error.
+pub async fn lookup_expired_operation(
+    conn: &mut TenantConn<'_>,
+    principal_id: PrincipalId,
+    idempotency_key: &str,
+) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
+    sqlx::query_as::<_, CardRegistrationOperationRow>(
+        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+                  request_hash, stored_response, status,
+                  created_at, updated_at
+             FROM wyrd.card_registration_operations
+            WHERE data_tenant_id = wyrd.current_tenant()
+              AND status = 'expired'
               AND principal_id = $1 AND idempotency_key = $2"#,
     )
     .bind(principal_id.as_uuid())
@@ -261,25 +288,39 @@ pub async fn insert_artifact_manifest_rows(
     card_uid: &CardUid,
     artifacts: &[ArtifactManifestEntry],
 ) -> Result<(), WyrdError> {
-    for artifact in artifacts {
-        let size = i64::try_from(artifact.size_bytes).map_err(|_| {
-            WyrdError::registry_spec_too_large(artifact.size_bytes as usize, i64::MAX as usize)
-        })?;
-        sqlx::query(
-            r#"INSERT INTO wyrd.card_artifact_manifest
-                   (card_uid, relative_path, expected_sha256, expected_size_bytes,
-                    content_type, upload_status, data_tenant_id)
-               VALUES ($1, $2, $3, $4, $5, 'awaiting_init', wyrd.current_tenant())"#,
-        )
-        .bind(card_uid.as_uuid())
-        .bind(artifact.relative_path.as_str())
-        .bind(&artifact.sha256)
-        .bind(size)
-        .bind(&artifact.content_type)
+    if artifacts.is_empty() {
+        return Ok(());
+    }
+    let rows = artifacts
+        .iter()
+        .map(|artifact| {
+            let size = i64::try_from(artifact.size_bytes).map_err(|_| {
+                WyrdError::registry_spec_too_large(artifact.size_bytes as usize, i64::MAX as usize)
+            })?;
+            Ok((artifact, size))
+        })
+        .collect::<Result<Vec<_>, WyrdError>>()?;
+    let mut query = QueryBuilder::<sqlx::Postgres>::new(
+        "INSERT INTO wyrd.card_artifact_manifest \
+         (manifest_id, data_tenant_id, card_uid, relative_path, expected_sha256, size_bytes, \
+          content_type, upload_status) ",
+    );
+    query.push_values(rows, |mut values, (artifact, size)| {
+        values
+            .push_bind(Uuid::now_v7())
+            .push("wyrd.current_tenant()")
+            .push_bind(card_uid.as_uuid())
+            .push_bind(artifact.relative_path.as_str())
+            .push_bind(&artifact.sha256)
+            .push_bind(size)
+            .push_bind(&artifact.content_type)
+            .push_bind("awaiting_init");
+    });
+    query
+        .build()
         .execute(&mut **conn.transaction())
         .await
         .map_err(registry_db_error)?;
-    }
     Ok(())
 }
 
@@ -289,7 +330,7 @@ pub async fn manifest_rows_for_init(
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
     sqlx::query_as::<_, CardArtifactManifestRow>(
-        r#"SELECT card_uid, relative_path, expected_sha256, expected_size_bytes,
+        r#"SELECT card_uid, manifest_id, relative_path, expected_sha256, size_bytes,
                   content_type, upload_status, upload_id
              FROM wyrd.card_artifact_manifest
             WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1
@@ -328,20 +369,26 @@ pub async fn mark_manifest_upload_initialized(
 pub async fn commit_registration_operation(
     conn: &mut TenantConn<'_>,
     operation_id: RegistrationOperationId,
-    response: &CreateCardResponse,
+    seed: &wyrd_spec::registry::RegistrationReplaySeed,
 ) -> Result<(), WyrdError> {
-    let stored_response =
-        serde_json::to_value(response).map_err(WyrdError::from_spec_serialization)?;
-    sqlx::query(
+    let stored_response = serde_json::to_value(seed).map_err(WyrdError::from_spec_serialization)?;
+    let result = sqlx::query(
         r#"UPDATE wyrd.card_registration_operations
               SET stored_response = $1, status = 'committed', updated_at = now()
-            WHERE operation_id = $2 AND data_tenant_id = wyrd.current_tenant()"#,
+            WHERE operation_id = $2 AND data_tenant_id = wyrd.current_tenant()
+              AND status = 'pending'"#,
     )
     .bind(stored_response)
     .bind(operation_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
+    if result.rows_affected() == 0 {
+        return Err(WyrdError::RegistryOperationExpired {
+            message: "registration operation is no longer pending".to_owned(),
+            details: serde_json::json!({ "operation_id": operation_id }),
+        });
+    }
     Ok(())
 }
 
@@ -367,7 +414,7 @@ pub async fn select_card_uids_by_ref_batch(
         ") AS refs(kind, space, name, version) LEFT JOIN wyrd.cards cards \
          ON cards.data_tenant_id = wyrd.current_tenant() AND cards.kind = refs.kind \
          AND cards.space = refs.space AND cards.name = refs.name AND cards.version = refs.version \
-         AND cards.status NOT IN ('deleted', 'failed', 'expired')",
+              AND cards.status = 'active'",
     );
     let rows = query
         .build_query_as::<(String, String, String, String, Option<Uuid>)>()

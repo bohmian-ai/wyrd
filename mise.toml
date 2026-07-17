@@ -488,7 +488,9 @@ run = "bash scripts/checks/storage-drift.sh"
 hide = true
 description = "Card registry writes must stay inside the caller's TenantConn tx; no tokio::spawn / emit_async / raw PgPool"
 run = """
-rg -n 'tokio::spawn|emit_async|sqlx::PgPool' crates/wyrd/wyrd-sql/src/queries/cards/ && exit 1 || exit 0
+rg -n 'tokio::spawn|emit_async|sqlx::PgPool' \
+  crates/wyrd/wyrd-sql/src/queries/cards/ \
+  crates/wyrd/wyrd-server/src/components/cards/ && exit 1 || exit 0
 """
 
 [tasks."check:registry-immutable-spec-hash"]

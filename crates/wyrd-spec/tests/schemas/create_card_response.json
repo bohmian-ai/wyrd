@@ -5,7 +5,8 @@
   "type": "object",
   "required": [
     "outcomes",
-    "root"
+    "root",
+    "upload_plans"
   ],
   "properties": {
     "outcomes": {
@@ -25,7 +26,6 @@
     },
     "upload_plans": {
       "description": "Upload plans for artifact-bearing submissions.",
-      "default": [],
       "type": "array",
       "items": {
         "$ref": "#/definitions/CardUploadPlan"

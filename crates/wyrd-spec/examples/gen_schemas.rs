@@ -43,7 +43,7 @@ use wyrd_spec::registry::{
     CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadPlan, CreateCardRequest,
     CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
     ListVersionsResponse, PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind,
-    RegistrationReceipt, RelativeArtifactPath, StoredArtifactEntry,
+    RegistrationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
 use wyrd_spec::security::{SecretRef, TlsConfig};
@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<PresignedUpload>(out, golden, "presigned_upload")?;
     write::<CreateCardRequest>(out, golden, "create_card_request")?;
     write::<CreateCardResponse>(out, golden, "create_card_response")?;
-    write::<RegistrationReceipt>(out, golden, "registration_receipt")?;
+    write::<RegistrationReplaySeed>(out, golden, "registration_replay_seed")?;
     write::<RegistrationOperationId>(out, golden, "registration_operation_id")?;
     write::<RelativeArtifactPath>(out, golden, "relative_artifact_path")?;
     write::<CardLifecycleStatus>(out, golden, "card_lifecycle_status")?;

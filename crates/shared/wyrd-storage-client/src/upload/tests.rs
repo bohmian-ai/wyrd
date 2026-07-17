@@ -1,11 +1,10 @@
 use std::sync::Arc;
 
 use wyrd_client::WyrdClient;
-use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
+use wyrd_client::testing::test_auth_middleware;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
-use wyrd_client::transport::credential::ResolvedCredential;
 
 use super::{UploadHooks, UploadOutcome, validate_plan};
 use crate::WyrdStorageClient;
@@ -14,11 +13,7 @@ use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
 
 fn client() -> WyrdClient {
     let config = ClientConfig::default();
-    let auth = AuthMiddleware::new(
-        &config,
-        ResolvedCredential::BearerToken("test-bearer".to_owned().into()),
-    )
-    .expect("auth builds");
+    let auth = test_auth_middleware().expect("test_setup: auth builds");
     let http = HttpTransport::new(&HttpConfig::default(), Arc::clone(&auth)).expect("transport");
     WyrdClient::from_parts(auth, http, config.grpc)
 }

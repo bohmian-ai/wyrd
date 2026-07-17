@@ -1,5 +1,6 @@
 //! Projections from registry rows into composite registration responses.
 
+use wyrd_spec::envelope::{Relationships, Spec};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::RegisteredCardRow;
@@ -45,7 +46,19 @@ pub fn existing_row_to_response(
         artifact_hash: row.artifact_hash.clone(),
         status: lifecycle_status(row.status),
         outcome,
-        card_blob_uri: None,
+        card_blob_uri: row
+            .card_blob_uri
+            .as_deref()
+            .and_then(|uri| uri.parse().ok()),
+    }
+}
+
+/// Project row-derived relationships with a concrete empty shape until the
+/// registry relationship projection is implemented.
+pub(crate) fn relationships_from_spec(_spec: &Spec) -> Relationships {
+    Relationships {
+        outbound: Vec::new(),
+        inbound: Vec::new(),
     }
 }
 
@@ -80,11 +93,12 @@ mod tests {
     /// Build one deterministic durable row for response projection tests.
     fn row(status: CardStatus) -> RegisteredCardRow {
         RegisteredCardRow {
-            card_uid: CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID"),
+            card_uid: CardUid::from_uuid(Uuid::now_v7())
+                .expect("test_setup: UUIDv7 is a valid card UID"),
             kind: CardKind::Prompt,
-            space: SpaceName::new("default").expect("static space is valid"),
-            name: CardName::new("projection").expect("static name is valid"),
-            version: VersionBlock::parse("1.0.0").expect("static version is valid"),
+            space: SpaceName::new("default").expect("test_setup: static space is valid"),
+            name: CardName::new("projection").expect("test_setup: static name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("test_setup: static version is valid"),
             spec_hash: "spec-hash".to_owned(),
             artifact_hash: None,
             status,

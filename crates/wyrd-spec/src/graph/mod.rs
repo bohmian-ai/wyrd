@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
+use crate::envelope::{ReferenceSlotVisitor, Spec};
 use crate::reference::CardRef;
 use crate::registry::CardSubmission;
 
@@ -100,16 +101,27 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
     let mut nodes = Vec::with_capacity(submission_refs.len());
     for card_ref in submission_refs {
         let key = identity_key(&card_ref);
-        siblings.insert(key, card_ref.clone());
+        if let Some(existing) = siblings.insert(key, card_ref.clone()) {
+            return Err(GraphError::DuplicateIdentity {
+                candidates: vec![existing, card_ref],
+            });
+        }
         nodes.push(Node { card_ref });
     }
 
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
     for (submission, parent) in submissions.iter().zip(nodes.iter()) {
-        let mut references = Vec::new();
-        collect_card_refs(&submission.spec, &mut references);
-        for child in references {
+        let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone()).map_err(
+            |error| GraphError::InvalidSpec {
+                message: error.to_string(),
+            },
+        )?;
+        let mut collector = RefCollector {
+            references: Vec::new(),
+        };
+        spec.walk_refs(&mut collector);
+        for child in collector.references {
             let Some(target) = siblings.get(&identity_key(&child)) else {
                 continue;
             };
@@ -144,28 +156,16 @@ fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
     })
 }
 
-fn collect_card_refs(value: &serde_json::Value, output: &mut Vec<CardRef>) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_card_refs(value, output);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            if let Ok(card_ref) =
-                serde_json::from_value::<CardRef>(serde_json::Value::Object(object.clone()))
-            {
-                output.push(card_ref);
-            }
-            for value in object.values() {
-                collect_card_refs(value, output);
-            }
-        }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
+struct RefCollector {
+    references: Vec<CardRef>,
+}
+
+impl ReferenceSlotVisitor for RefCollector {
+    fn visit_ref(&mut self, card_ref: &CardRef) {
+        self.references.push(card_ref.clone());
     }
+
+    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
 }
 
 #[cfg(test)]
@@ -215,7 +215,7 @@ mod tests {
         let external = card_ref(CardKind::Agent, "external");
         let (nodes, edges) = build(&[submission(
             &parent,
-            json!({"components": [{"ref": serde_json::to_value(external).expect("ref serializes")}] }),
+            json!({"components": [{"alias": "external", "ref": serde_json::to_value(external).expect("ref serializes")}] }),
         )])
         .expect("resolved submission builds");
 
@@ -226,11 +226,17 @@ mod tests {
     #[test]
     fn build_derives_sibling_edges_from_nested_refs() {
         let parent = card_ref(CardKind::Service, "service");
-        let child = card_ref(CardKind::Agent, "agent");
+        let child = card_ref(CardKind::Prompt, "prompt");
         let child_value = serde_json::to_value(&child).expect("ref serializes");
         let (nodes, edges) = build(&[
-            submission(&parent, json!({"components": [{"ref": child_value}]})),
-            submission(&child, json!({})),
+            submission(
+                &parent,
+                json!({"components": [{"alias": "prompt", "ref": child_value}]}),
+            ),
+            submission(
+                &child,
+                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            ),
         ])
         .expect("resolved submissions build");
 
@@ -250,5 +256,23 @@ mod tests {
         let mut second = first.clone();
         second.version = VersionBlock::parse("2.0.0").expect("test version is valid");
         assert_eq!(identity_key(&first), identity_key(&second));
+    }
+
+    #[test]
+    fn duplicate_submission_identity_is_rejected() {
+        let first = card_ref(CardKind::Prompt, "duplicate");
+        let error = build(&[
+            submission(
+                &first,
+                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            ),
+            submission(
+                &first,
+                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            ),
+        ])
+        .expect_err("duplicate identities must be rejected");
+
+        assert!(matches!(error, super::GraphError::DuplicateIdentity { .. }));
     }
 }

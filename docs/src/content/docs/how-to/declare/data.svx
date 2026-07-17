@@ -56,8 +56,8 @@ curl -X POST "$WYRD_SERVER_URL/v1/cards" \
   --data @churn-card/register-request.json
 ```
 
-`register-request.json` wraps the authored `CardSubmission` as
-`{"card": <CardSubmission>, "artifacts": []}`. Retry the exact request with the
+`register-request.json` contains the authored submission in a flat
+`{"submissions": [<CardSubmission>]}` list. Retry the exact request with the
 same `Idempotency-Key` to receive `idempotent_noop`; reusing the key for changed
 content is rejected with `409`.
 

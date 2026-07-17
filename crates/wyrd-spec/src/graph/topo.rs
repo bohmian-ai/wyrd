@@ -21,6 +21,18 @@ pub enum GraphError {
     /// No submissions were supplied.
     #[error("empty submission set")]
     Empty,
+    /// A submission identity was repeated within one request.
+    #[error("duplicate submission identity: {candidates:?}")]
+    DuplicateIdentity {
+        /// Repeated submission references.
+        candidates: Vec<CardRef>,
+    },
+    /// A submission spec could not be decoded for typed reference traversal.
+    #[error("invalid submission spec: {message}")]
+    InvalidSpec {
+        /// Decode failure detail.
+        message: String,
+    },
 }
 
 /// Sort a graph with Kahn's algorithm, emitting leaves before their parents.
@@ -29,10 +41,6 @@ pub enum GraphError {
 /// removes zero-outdegree leaves, which is the reverse of the usual Kahn
 /// emission direction and gives the composite registration pipeline its
 /// dependency-first order. Ready leaves are selected by `(kind, space, name)`.
-///
-/// Note: May move this to another crate in the future. wyrd-spec is a contract crate
-/// however, given the small size of the implementation and the fact that it is used in multiple crates, it is
-/// currently located here.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] for an empty node set and

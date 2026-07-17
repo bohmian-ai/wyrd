@@ -10,6 +10,8 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod error;
+#[cfg(feature = "test-util")]
+pub mod testing;
 pub mod transport;
 
 pub use client::WyrdClient;

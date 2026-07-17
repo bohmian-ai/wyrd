@@ -1,15 +1,36 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "RegistrationReceipt",
-  "description": "SDK-facing projection of a composite registration response.",
+  "title": "RegistrationReplaySeed",
+  "description": "Durable registration replay data used to mint upload URLs on demand.",
   "type": "object",
   "required": [
+    "artifact_manifest_paths",
     "outcomes",
     "root"
   ],
   "properties": {
+    "artifact_manifest_paths": {
+      "description": "Artifact paths grouped by their resolved card reference.",
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": [
+          {
+            "$ref": "#/definitions/CardRef"
+          },
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        ],
+        "maxItems": 2,
+        "minItems": 2
+      }
+    },
     "outcomes": {
-      "description": "Per-submission registration outcomes.",
+      "description": "Stable per-card outcomes.",
       "type": "array",
       "items": {
         "$ref": "#/definitions/CardRegistrationOutcome"

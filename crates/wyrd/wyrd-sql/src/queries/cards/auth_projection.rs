@@ -26,6 +26,7 @@ RETURNING id
 "#;
 
 /// Upsert the principal row backing a newly registered Service or Agent card.
+#[tracing::instrument(skip(conn), fields(operation = "card.service_account.upsert"))]
 pub async fn upsert_service_account_from_card(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,

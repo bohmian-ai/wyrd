@@ -1106,6 +1106,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// The supplied registration idempotency key is malformed.
+    #[error("[WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID] {message}")]
+    #[wyrd_error(
+        code = "WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID",
+        status = 400,
+        title = "Invalid idempotency key",
+        remediation = "Provide an 8-256 character Idempotency-Key without whitespace."
+    )]
+    RegistryIdempotencyKeyInvalid {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Two submissions have the same graph identity.
+    #[error("[WYRD_SPEC_400_DUPLICATE_SUBMISSION] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_DUPLICATE_SUBMISSION",
+        status = 400,
+        title = "Duplicate card submission",
+        remediation = "Submit each (kind, space, name) identity at most once per request."
+    )]
+    SpecDuplicateSubmission {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The supplied artifact manifest hash did not match the server hash.
     #[error("[WYRD_REGISTRY_400_MANIFEST_HASH_MISMATCH] {message}")]
     #[wyrd_error(
@@ -2619,6 +2647,7 @@ impl WyrdError {
             | Self::RegistryHeavyArtifactNotSoleSubmission { message, details }
             | Self::RegistryUnresolvedPathRef { message, details }
             | Self::RegistryIdempotencyKeyRequired { message, details }
+            | Self::RegistryIdempotencyKeyInvalid { message, details }
             | Self::RegistryManifestHashMismatch { message, details }
             | Self::RegistryInvalidArtifactPath { message, details }
             | Self::RegistryUploadInterrupted { message, details }
@@ -2627,6 +2656,7 @@ impl WyrdError {
             | Self::RegistryOperationExpired { message, details }
             | Self::RegistryArtifactVerifyFailed { message, details }
             | Self::SpecDuplicatePublishTarget { message, details }
+            | Self::SpecDuplicateSubmission { message, details }
             | Self::SpecInvalidPublishTargetKind { message, details }
             | Self::TsHeavyUploadDeferred { message, details }
             | Self::PrincipalOrphaned { message, details }

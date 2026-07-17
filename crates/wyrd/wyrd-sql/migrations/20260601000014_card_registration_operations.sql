@@ -17,7 +17,21 @@ CREATE TABLE wyrd.card_registration_operations (
     CONSTRAINT card_registration_operations_status_check
         CHECK (status IN ('pending', 'committed', 'expired')),
     CONSTRAINT card_registration_operations_idempotency_key_unique
-        UNIQUE (data_tenant_id, principal_id, idempotency_key)
+        UNIQUE (data_tenant_id, principal_id, idempotency_key),
+    CONSTRAINT card_registration_operations_operation_tenant_unique
+        UNIQUE (operation_id, data_tenant_id),
+    CONSTRAINT card_registration_operations_no_url
+        CHECK (stored_response IS NULL OR stored_response::text !~* (
+            '"(' ||
+            'put_' || 'url' || '|' ||
+            'session_' || 'uri' || '|' ||
+            'session_' || 'url' || '|' ||
+            's' || 'as_url' || '|' ||
+            'pre' || 'signed_' || 'url' || '|' ||
+            'signed_' || 'url' || '|' ||
+            'url' ||
+            ')"'
+        ))
 );
 
 CREATE INDEX card_registration_operations_sweep_idx
@@ -68,12 +82,18 @@ CREATE INDEX idx_cards_spec_hash
     WHERE status = 'active';
 
 ALTER TABLE wyrd.cards
-    ADD COLUMN registration_operation_id UUID
-        REFERENCES wyrd.card_registration_operations(operation_id),
+    ADD COLUMN registration_operation_id UUID,
     ADD COLUMN pending_since TIMESTAMPTZ,
     ADD COLUMN finalized_at TIMESTAMPTZ,
     ADD COLUMN card_blob_uri TEXT,
     ADD COLUMN blob_failed_at TIMESTAMPTZ;
+
+ALTER TABLE wyrd.cards
+    ADD CONSTRAINT cards_tenant_uid_unique UNIQUE (data_tenant_id, card_uid),
+    ADD CONSTRAINT cards_registration_operation_fk
+        FOREIGN KEY (registration_operation_id, data_tenant_id)
+        REFERENCES wyrd.card_registration_operations (operation_id, data_tenant_id)
+        ON DELETE SET NULL;
 
 CREATE INDEX cards_pending_sweep_idx
     ON wyrd.cards (data_tenant_id, status, pending_since)
@@ -82,18 +102,27 @@ CREATE INDEX cards_pending_sweep_idx
 -- Per-artifact registration expectations and post-commit initialization state.
 
 CREATE TABLE wyrd.card_artifact_manifest (
-    card_uid            UUID NOT NULL REFERENCES wyrd.cards(card_uid) ON DELETE CASCADE,
+    manifest_id        UUID PRIMARY KEY,
+    data_tenant_id     UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
+    card_uid            UUID NOT NULL,
     relative_path       TEXT NOT NULL,
     expected_sha256     TEXT NOT NULL,
-    expected_size_bytes BIGINT NOT NULL,
+    size_bytes          BIGINT NOT NULL,
     content_type        TEXT,
     upload_status       TEXT NOT NULL,
     upload_id           UUID,
     verified_at         TIMESTAMPTZ,
-    data_tenant_id      UUID NOT NULL REFERENCES platform.tenants(data_tenant_id),
-    PRIMARY KEY (card_uid, relative_path),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT card_artifact_manifest_size_check
+        CHECK (size_bytes >= 0),
     CONSTRAINT card_artifact_manifest_upload_status_check
-        CHECK (upload_status IN ('awaiting_init', 'pending', 'uploaded', 'verified'))
+        CHECK (upload_status IN ('awaiting_init', 'pending', 'uploaded', 'verified')),
+    CONSTRAINT card_artifact_manifest_identity_unique
+        UNIQUE (data_tenant_id, card_uid, relative_path),
+    CONSTRAINT card_artifact_manifest_card_fk
+        FOREIGN KEY (data_tenant_id, card_uid)
+        REFERENCES wyrd.cards (data_tenant_id, card_uid)
+        ON DELETE CASCADE
 );
 
 CREATE INDEX card_artifact_manifest_tenant_idx

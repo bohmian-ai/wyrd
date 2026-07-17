@@ -140,11 +140,7 @@ pub async fn store(
             $4,
             now() + ($5::text || ' seconds')::interval
         )
-        ON CONFLICT (data_tenant_id, idempotency_key) DO UPDATE SET
-            body_sha256 = EXCLUDED.body_sha256,
-            response_status = EXCLUDED.response_status,
-            response_body = EXCLUDED.response_body,
-            expires_at = EXCLUDED.expires_at
+        ON CONFLICT (data_tenant_id, idempotency_key) DO NOTHING
         "#,
     )
     .bind(idempotency_key)

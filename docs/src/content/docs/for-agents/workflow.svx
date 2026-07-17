@@ -62,7 +62,7 @@ curl -X POST "$WYRD_SERVER_URL/v1/cards" \
   --data @my-dataset/register-request.json
 ```
 
-`register-request.json` has the shape `{"card": <CardSubmission>, "artifacts": []}`.
+`register-request.json` has the shape `{"submissions": [<CardSubmission>, ...]}`.
 Registration is idempotent on the `(Idempotency-Key, request)` pair: retry the
 same request with the same key to receive `idempotent_noop`. A changed request
 with the same key returns `409` with the idempotency-conflict code.
@@ -81,7 +81,7 @@ resp = httpx.post(
         "Authorization": f"Bearer {token}",
         "Idempotency-Key": "my-dataset-register-001",
     },
-    json={"card": card_submission, "artifacts": []},
+    json={"submissions": [card_submission]},
 )
 if resp.status_code >= 400:
     problem = resp.json()

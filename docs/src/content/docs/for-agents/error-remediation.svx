@@ -109,6 +109,9 @@ Retries are only safe for idempotent operations. The `code` field is the signal 
 
 - Safe to retry: read operations (card lookup, schema inspection, run query, policy list). These have no side effects.
 - Unsafe to retry without idempotency key: card registration, run creation, policy writes. Re-sending these without a stable idempotency key may produce duplicate records.
+- For `WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID`, send a new non-empty opaque `Idempotency-Key` header.
+- For `WYRD_SPEC_400_DUPLICATE_SUBMISSION`, remove the repeated `(kind, space, name)` submission from the request.
+- For `WYRD_REGISTRY_410_OPERATION_EXPIRED`, start a new registration with a fresh idempotency key.
 - Not retryable: policy denials, audit failures, authorization errors. These require a corrective action before a retry will succeed.
 
 If the error response does not include a `code`, treat the operation as non-retryable until the cause is identified.

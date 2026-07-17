@@ -19,7 +19,7 @@ use crate::error::SqlError;
 /// Must stay in lockstep with the positional `FromRow` decode order on [`CardRow`].
 pub const CARD_ROW_COLUMNS: &str = "card_uid, data_tenant_id, kind, space, name, version, \
      spec, spec_hash, artifact_hash, labels, annotations, \
-     status, created_by, created_at, updated_at";
+     status, created_by, created_at, updated_at, card_blob_uri";
 
 /// Live `wyrd.cards` row, decoded for handler return.
 ///
@@ -61,6 +61,8 @@ pub struct CardRow {
     pub created_at: DateTime<Utc>,
     /// Row update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// URI of the hydrated card blob, when it has been written.
+    pub card_blob_uri: Option<String>,
 }
 
 impl CardRow {
@@ -107,6 +109,8 @@ pub struct ParsedCardRow {
     pub created_at: DateTime<Utc>,
     /// Row update timestamp.
     pub updated_at: DateTime<Utc>,
+    /// URI of the hydrated card blob, when it has been written.
+    pub card_blob_uri: Option<String>,
 }
 
 impl TryFrom<CardRow> for ParsedCardRow {
@@ -149,6 +153,7 @@ impl TryFrom<CardRow> for ParsedCardRow {
             created_by,
             created_at: row.created_at,
             updated_at: row.updated_at,
+            card_blob_uri: row.card_blob_uri,
         })
     }
 }

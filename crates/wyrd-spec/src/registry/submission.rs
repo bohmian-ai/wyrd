@@ -6,7 +6,9 @@ use url::Url;
 use crate::api_version::ApiVersion;
 use crate::envelope::{CardKind, Metadata};
 use crate::reference::CardRef;
-use crate::registry::{CardLifecycleStatus, PresignedUpload, RegistrationOutcomeKind};
+use crate::registry::{
+    CardLifecycleStatus, PresignedUpload, RegistrationOutcomeKind, RelativeArtifactPath,
+};
 
 /// One card submitted for registration.
 ///
@@ -99,19 +101,20 @@ pub struct CreateCardResponse {
     /// Per-submission outcomes in server topo order.
     pub outcomes: Vec<CardRegistrationOutcome>,
     /// Upload plans for artifact-bearing submissions.
-    #[serde(default)]
     pub upload_plans: Vec<CardUploadPlan>,
 }
 
-/// SDK-facing projection of a composite registration response.
+/// Durable registration replay data used to mint upload URLs on demand.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
-pub struct RegistrationReceipt {
+pub struct RegistrationReplaySeed {
     /// Server-derived graph root.
     pub root: CardRef,
-    /// Per-submission registration outcomes.
+    /// Stable per-card outcomes.
     pub outcomes: Vec<CardRegistrationOutcome>,
+    /// Artifact paths grouped by their resolved card reference.
+    pub artifact_manifest_paths: Vec<(CardRef, Vec<RelativeArtifactPath>)>,
 }
 
 #[cfg(test)]

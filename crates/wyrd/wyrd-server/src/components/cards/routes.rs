@@ -89,13 +89,15 @@ fn extract_required_idempotency_key(
             message: "Idempotency-Key header is required for card registration".to_owned(),
             details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
         })?;
-    let value = value.to_str().map_err(|_| WyrdError::Validation {
-        message: "idempotency key header is not valid UTF-8".to_owned(),
-        details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
-    })?;
-    IdempotencyKey::new(value).map_err(|error| WyrdError::Validation {
+    let value = value
+        .to_str()
+        .map_err(|_| WyrdError::RegistryIdempotencyKeyInvalid {
+            message: "idempotency key header is not valid UTF-8".to_owned(),
+            details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
+        })?;
+    IdempotencyKey::new(value).map_err(|error| WyrdError::RegistryIdempotencyKeyInvalid {
         message: "idempotency key is invalid".to_owned(),
-        details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER, "source": error.to_string() }),
+        details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER, "reason": error.to_string() }),
     })
     .map_err(WyrdErrorResponse::from)
 }
@@ -112,6 +114,22 @@ mod tests {
             .expect_err("registration must require an idempotency key");
 
         assert_eq!(error.0.code(), "WYRD_REGISTRY_400_IDEMPOTENCY_KEY_REQUIRED");
+        assert_eq!(error.0.status(), 400);
+    }
+
+    /// Reject malformed idempotency keys with a dedicated catalog code.
+    #[test]
+    fn registration_rejects_malformed_idempotency_key() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "Idempotency-Key",
+            "".parse().expect("test_setup: header parses"),
+        );
+
+        let error = extract_required_idempotency_key(&headers)
+            .expect_err("test_setup: empty idempotency key must be rejected");
+
+        assert_eq!(error.0.code(), "WYRD_REGISTRY_400_IDEMPOTENCY_KEY_INVALID");
         assert_eq!(error.0.status(), 400);
     }
 }

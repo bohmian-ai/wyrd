@@ -23,6 +23,7 @@ wyrd-client = { workspace = true }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
+wyrd-client = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }

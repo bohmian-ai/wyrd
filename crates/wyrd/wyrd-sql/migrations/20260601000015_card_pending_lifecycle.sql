@@ -28,7 +28,9 @@ ALTER TABLE wyrd.cards
     ADD COLUMN IF NOT EXISTS registration_operation_id UUID
         REFERENCES wyrd.card_registration_operations(operation_id),
     ADD COLUMN IF NOT EXISTS pending_since TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS card_blob_uri TEXT,
+    ADD COLUMN IF NOT EXISTS blob_failed_at TIMESTAMPTZ;
 
 CREATE INDEX cards_pending_sweep_idx
     ON wyrd.cards (data_tenant_id, status, pending_since)

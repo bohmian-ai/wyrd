@@ -11,6 +11,13 @@ use serde_json::Value as JsonValue;
 use std::fmt::Display;
 use uuid::Uuid;
 
+use crate::queries::cards::auth_projection::{
+    lookup_existing_principal_id, upsert_service_account_from_card,
+};
+use crate::queries::cards::version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};
+use crate::queries::cards::version_sql::lock_version_line;
+use crate::row_types::cards::CardStatus;
+use crate::tenant_conn::TenantConn;
 use wyrd_runtime::principal::{Principal, PrincipalId};
 use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
@@ -19,17 +26,6 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
-use wyrd_spec::request_id::RequestId;
-
-use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
-use crate::queries::cards::auth_projection::{
-    lookup_existing_principal_id, upsert_service_account_from_card,
-};
-use crate::queries::cards::version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};
-use crate::queries::cards::version_sql::lock_version_line;
-use crate::row_types::cards::CardStatus;
-use crate::tenant_conn::TenantConn;
-use wyrd_spec::vala::audit_detail::{CardRegistrationOperation, CardRegistrationOutcome};
 
 /// Maximum canonical-JSON byte size for a single `Spec`.
 pub const MAX_SPEC_BYTES: usize = 256 * 1024;
@@ -52,8 +48,8 @@ pub struct RegisterCardRequest<'a> {
     pub card: &'a Card,
     /// Verified actor for audit and projection writes.
     pub actor: &'a Principal,
-    /// Optional correlation id from the originating request.
-    pub request_id: Option<&'a RequestId>,
+    /// Lifecycle state assigned by the composite registration boundary.
+    pub status: CardStatus,
 }
 
 /// Classification of the registration outcome.
@@ -215,7 +211,7 @@ async fn insert_pin(
 
     let uid_for_writes = match inserted {
         Some(uid) => uid,
-        None => return handle_conflict(conn, req.card, space, block, data.spec_hash, req).await,
+        None => return handle_conflict(conn, req.card, space, block, data.spec_hash).await,
     };
 
     // Service and Agent cards project a durable service account on first
@@ -228,15 +224,6 @@ async fn insert_pin(
         }
         _ => None,
     };
-
-    record_registration_audit(
-        conn,
-        req,
-        &uid_for_writes,
-        data.spec_hash,
-        CardRegistrationOutcome::Created,
-    )
-    .await?;
 
     Ok(RegisterCardOutcome {
         card_uid: uid_for_writes,
@@ -287,14 +274,6 @@ async fn register_auto(
     {
         Resolution::Deduplicated { version } => {
             let uid = lookup_uid_by_ref(conn, req.card.kind.clone(), space, name, &version).await?;
-            record_registration_audit(
-                conn,
-                req,
-                &uid,
-                data.spec_hash,
-                CardRegistrationOutcome::Deduplicated,
-            )
-            .await?;
             Ok(RegisterCardOutcome {
                 card_uid: uid,
                 kind: RegisterCardOutcomeKind::Deduplicated,
@@ -309,14 +288,6 @@ async fn register_auto(
                         "auto-version insert conflicted under advisory lock",
                     )
                 })?;
-            record_registration_audit(
-                conn,
-                req,
-                &uid,
-                data.spec_hash,
-                CardRegistrationOutcome::Created,
-            )
-            .await?;
             Ok(RegisterCardOutcome {
                 card_uid: uid,
                 kind: RegisterCardOutcomeKind::Created,
@@ -363,7 +334,7 @@ async fn insert_legacy_card_row(
         ) VALUES (
             $1, wyrd.current_tenant(), $2, $3, $4, $5,
             $6, $7, $8, $9, $10,
-            'active', $11
+            $11, $12
         )
         ON CONFLICT (data_tenant_id, kind, space, name, version)
             WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
@@ -380,6 +351,7 @@ async fn insert_legacy_card_row(
     .bind(req.card.metadata.artifact_hash.as_deref())
     .bind(data.labels_json)
     .bind(data.annotations_json)
+    .bind(req.status.as_db_str())
     .bind(req.actor.id.as_uuid())
     .fetch_optional(&mut **conn.transaction())
     .await
@@ -444,7 +416,6 @@ async fn handle_conflict(
     space: &SpaceName,
     version_block: &VersionBlock,
     submitted_hash: &str,
-    req: &RegisterCardRequest<'_>,
 ) -> Result<RegisterCardOutcome, WyrdError> {
     let existing = sqlx::query_as::<_, (Uuid, String)>(
         r#"SELECT card_uid, spec_hash FROM wyrd.cards
@@ -480,44 +451,11 @@ async fn handle_conflict(
         _ => None,
     };
 
-    record_registration_audit(
-        conn,
-        req,
-        &card_uid,
-        submitted_hash,
-        CardRegistrationOutcome::IdempotentNoop,
-    )
-    .await?;
-
     Ok(RegisterCardOutcome {
         card_uid,
         kind: RegisterCardOutcomeKind::IdempotentNoop,
         principal_id,
     })
-}
-
-/// Build and write the typed audit event for a registration event.
-async fn record_registration_audit(
-    conn: &mut TenantConn<'_>,
-    req: &RegisterCardRequest<'_>,
-    card_uid: &CardUid,
-    spec_hash: &str,
-    outcome: CardRegistrationOutcome,
-) -> Result<(), WyrdError> {
-    record_card_registration_audit(
-        conn,
-        CardRegistrationAuditInput {
-            card_uid,
-            card_kind: req.card.kind.clone(),
-            operation: CardRegistrationOperation::Register,
-            outcome: Some(outcome),
-            actor: req.actor,
-            before_spec_hash: None,
-            after_spec_hash: Some(spec_hash),
-            request_id: req.request_id,
-        },
-    )
-    .await
 }
 
 /// Persisted registration operation used for request replay.

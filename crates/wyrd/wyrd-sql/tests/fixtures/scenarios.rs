@@ -42,7 +42,7 @@ pub async fn register_fresh(
         RegisterCardRequest {
             card,
             actor,
-            request_id: None,
+            status: wyrd_sql::CardStatus::Active,
         },
     )
     .await?;
@@ -108,7 +108,7 @@ pub async fn expect_register_error(
         RegisterCardRequest {
             card,
             actor,
-            request_id: None,
+            status: wyrd_sql::CardStatus::Active,
         },
     )
     .await

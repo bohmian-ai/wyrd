@@ -44,5 +44,5 @@ CREATE POLICY admin_cross_tenant ON wyrd.storage_idempotency_keys
 
 REVOKE ALL ON TABLE wyrd.storage_idempotency_keys FROM wyrd_app;
 REVOKE ALL ON TABLE wyrd.storage_idempotency_keys FROM wyrd_platform_admin;
-GRANT SELECT, INSERT ON wyrd.storage_idempotency_keys TO wyrd_app;
+GRANT SELECT, INSERT, UPDATE ON wyrd.storage_idempotency_keys TO wyrd_app;
 GRANT SELECT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_platform_admin;

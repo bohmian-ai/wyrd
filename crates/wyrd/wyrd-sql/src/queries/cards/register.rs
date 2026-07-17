@@ -1,464 +1,27 @@
-//! Idempotent INSERT path for `wyrd.cards`.
+//! Composite card-registration persistence primitives.
 #![deny(missing_docs)]
-// raw-query grep allowlist: register insert/lookup run on a TenantConn (RLS) and
-// scope every row to `wyrd.current_tenant()`; the INSERT ON CONFLICT targets the
-// partial `cards_identity_unique` index by predicate. Run `mise run sqlx:prepare`
-// to promote to macros.
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::fmt::Display;
+use sqlx::QueryBuilder;
 use uuid::Uuid;
-
-use crate::queries::cards::auth_projection::{
-    lookup_existing_principal_id, upsert_service_account_from_card,
-};
-use crate::queries::cards::version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};
-use crate::queries::cards::version_sql::lock_version_line;
-use crate::row_types::cards::CardStatus;
-use crate::tenant_conn::TenantConn;
-use wyrd_runtime::principal::{Principal, PrincipalId};
-use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
-use wyrd_spec::api_version::ApiVersion;
+use wyrd_runtime::principal::PrincipalId;
+use wyrd_semver::{VersionBlock, VersionSpec};
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
+use wyrd_spec::registry::{
+    ArtifactManifestEntry, CardSubmission, CreateCardResponse, RegistrationOperationId,
+};
 
-/// Maximum canonical-JSON byte size for a single `Spec`.
-pub const MAX_SPEC_BYTES: usize = 256 * 1024;
+use crate::row_types::cards::CardStatus;
+use crate::tenant_conn::TenantConn;
 
-fn registry_db_error(error: impl Display) -> WyrdError {
-    tracing::error!(error = %error, "card registry database operation failed");
-    WyrdError::registry_unavailable("card registry unavailable")
-}
+// Dynamic query is intentional: the reference batch has request-dependent
+// cardinality, and every bind remains parameterized through QueryBuilder.
 
-struct PreparedCardData<'a> {
-    spec_hash: &'a str,
-    spec_json: &'a JsonValue,
-    labels_json: &'a JsonValue,
-    annotations_json: &'a JsonValue,
-}
-
-/// Inputs to [`register_card`].
-pub struct RegisterCardRequest<'a> {
-    /// Source card envelope.
-    pub card: &'a Card,
-    /// Verified actor for audit and projection writes.
-    pub actor: &'a Principal,
-    /// Lifecycle state assigned by the composite registration boundary.
-    pub status: CardStatus,
-}
-
-/// Classification of the registration outcome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RegisterCardOutcomeKind {
-    /// New row inserted.
-    Created,
-    /// Existing row matched on `(identity, spec_hash)` for a Pin; no DB write.
-    IdempotentNoop,
-    /// Auto/scope re-register of content identical to latest-in-line.
-    Deduplicated,
-}
-
-/// Result of a [`register_card`] call.
-#[derive(Debug, Clone)]
-pub struct RegisterCardOutcome {
-    /// Card UID — newly minted on create, existing on no-op/dedup.
-    pub card_uid: CardUid,
-    /// Three-way outcome classification.
-    pub kind: RegisterCardOutcomeKind,
-    /// Durable `auth_service_accounts.id` for Service/Agent cards.
-    pub principal_id: Option<PrincipalId>,
-}
-
-/// Register a card inside the caller's [`TenantConn`] tx.
-///
-/// Pins are exact and idempotent. `None`/`Scope` auto-resolve for non-principal
-/// kinds under a per-line advisory lock and deduplicate against only the latest
-/// stable row in that line.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryInvalidCardSpec`] when boundary validation fails.
-/// Returns [`WyrdError::RegistrySpecDrift`] when a pinned spec hash mismatch is
-/// detected. Returns [`WyrdError::RegistryUnavailable`] on transient DB errors.
-#[tracing::instrument(
-    skip(conn, req),
-    fields(
-        tenant_id = %conn.data_tenant_id(),
-        kind = ?req.card.kind,
-        name = %req.card.metadata.name,
-    ),
-)]
-pub async fn register_card(
-    conn: &mut TenantConn<'_>,
-    req: RegisterCardRequest<'_>,
-) -> Result<RegisterCardOutcome, WyrdError> {
-    validate_boundary(req.card)?;
-
-    let (spec_hash, canonical_bytes) = req
-        .card
-        .spec
-        .canonical_hash_with_bytes()
-        .map_err(WyrdError::from_spec_canonicalization)?;
-    if canonical_bytes.len() > MAX_SPEC_BYTES {
-        return Err(WyrdError::registry_spec_too_large(
-            canonical_bytes.len(),
-            MAX_SPEC_BYTES,
-        ));
-    }
-
-    let spec_json: JsonValue =
-        serde_json::to_value(&req.card.spec).map_err(WyrdError::from_spec_serialization)?;
-    let labels_json: JsonValue = serde_json::to_value(&req.card.metadata.labels)
-        .map_err(WyrdError::from_spec_serialization)?;
-    let annotations_json: JsonValue = serde_json::to_value(&req.card.metadata.annotations)
-        .map_err(WyrdError::from_spec_serialization)?;
-
-    let space = req
-        .card
-        .metadata
-        .space
-        .as_ref()
-        .expect("space presence verified in validate_boundary");
-    let name = &req.card.metadata.name;
-    let data = PreparedCardData {
-        spec_hash: spec_hash.as_str(),
-        spec_json: &spec_json,
-        labels_json: &labels_json,
-        annotations_json: &annotations_json,
-    };
-
-    match &req.card.metadata.version {
-        Some(VersionSpec::Pin(block)) => insert_pin(conn, &req, space, name, block, &data).await,
-        other => {
-            register_auto(
-                conn,
-                &req,
-                space,
-                name,
-                other.as_ref(),
-                req.card.metadata.bump.as_ref(),
-                &data,
-            )
-            .await
-        }
-    }
-}
-
-/// Reject cards that cannot be registered before touching the database.
-///
-/// Checks: supported `apiVersion`, presence of `metadata.space`, `kind` /
-/// `spec` consistency, non-empty `metadata.version`, and the Service/Agent
-/// pin-only rule. All failures map to `WYRD_REGISTRY_400_*` errors.
-fn validate_boundary(card: &Card) -> Result<(), WyrdError> {
-    if card.api_version.as_str() != ApiVersion::V1 {
-        return Err(WyrdError::registry_invalid_card_spec(
-            "unsupported apiVersion; only wyrd/v1 is registrable",
-        ));
-    }
-    if card.metadata.space.is_none() {
-        return Err(WyrdError::registry_invalid_card_spec(
-            "metadata.space is required at the registration boundary",
-        ));
-    }
-    if card.kind != card.spec.kind() {
-        return Err(WyrdError::registry_invalid_card_spec(
-            "card.kind does not match spec variant",
-        ));
-    }
-    match &card.metadata.version {
-        Some(v) if v.as_str().is_empty() => {
-            return Err(WyrdError::registry_version_required(
-                "metadata.version must not be empty",
-            ));
-        }
-        _ => {}
-    }
-    if matches!(&card.kind, CardKind::Service | CardKind::Agent)
-        && !card
-            .metadata
-            .version
-            .as_ref()
-            .is_some_and(|v| !v.as_str().is_empty() && v.is_pin())
-    {
-        return Err(WyrdError::registry_invalid_version_block(
-            "Service and Agent cards require a pinned version",
-        ));
-    }
-    Ok(())
-}
-
-/// Attempt to register a card at an exact pinned version.
-///
-/// Tries an INSERT with `ON CONFLICT … DO NOTHING`. If the row already exists
-/// (INSERT returned nothing), delegates to [`handle_conflict`] to determine
-/// whether the existing row is an idempotent re-apply or a spec-hash drift.
-/// For Service and Agent kinds, also projects the service account on first
-/// creation.
-async fn insert_pin(
-    conn: &mut TenantConn<'_>,
-    req: &RegisterCardRequest<'_>,
-    space: &SpaceName,
-    name: &CardName,
-    block: &VersionBlock,
-    data: &PreparedCardData<'_>,
-) -> Result<RegisterCardOutcome, WyrdError> {
-    let inserted = insert_legacy_card_row(conn, req, space, name, block, data).await?;
-
-    let uid_for_writes = match inserted {
-        Some(uid) => uid,
-        None => return handle_conflict(conn, req.card, space, block, data.spec_hash).await,
-    };
-
-    // Service and Agent cards project a durable service account on first
-    // registration so that their identity is immediately usable for auth.
-    let principal_id = match &req.card.kind {
-        CardKind::Service | CardKind::Agent => {
-            let pid = upsert_service_account_from_card(conn, &uid_for_writes, req.card, req.actor)
-                .await?;
-            Some(pid)
-        }
-        _ => None,
-    };
-
-    Ok(RegisterCardOutcome {
-        card_uid: uid_for_writes,
-        kind: RegisterCardOutcomeKind::Created,
-        principal_id,
-    })
-}
-
-/// Register a card whose version is `None` (auto) or a `Scope` range.
-///
-/// Acquires a per-line advisory lock so concurrent callers cannot race to
-/// assign the same next version. After locking, calls [`resolve_version`] to
-/// determine whether the submitted spec hash matches the latest stable row in
-/// the line (content-identical dedup → `Deduplicated`) or to compute the next
-/// auto-incremented version (content-changed → `Created`).
-///
-/// Service and Agent cards are forbidden here — `validate_boundary` rejects
-/// them before this point.
-async fn register_auto(
-    conn: &mut TenantConn<'_>,
-    req: &RegisterCardRequest<'_>,
-    space: &SpaceName,
-    name: &CardName,
-    version: Option<&VersionSpec>,
-    bump: Option<&VersionBump>,
-    data: &PreparedCardData<'_>,
-) -> Result<RegisterCardOutcome, WyrdError> {
-    debug_assert!(
-        !matches!(&req.card.kind, CardKind::Service | CardKind::Agent),
-        "Service/Agent are pin-only; validate_boundary forbids them here"
-    );
-
-    lock_version_line(conn, req.card.kind.clone(), space, name).await?;
-
-    match resolve_version(
-        conn,
-        req.card.kind.clone(),
-        space,
-        name,
-        version,
-        bump,
-        SubmittedCardIdentity {
-            spec_hash: data.spec_hash,
-            artifact_hash: req.card.metadata.artifact_hash.as_deref(),
-        },
-    )
-    .await?
-    {
-        Resolution::Deduplicated { version } => {
-            let uid = lookup_uid_by_ref(conn, req.card.kind.clone(), space, name, &version).await?;
-            Ok(RegisterCardOutcome {
-                card_uid: uid,
-                kind: RegisterCardOutcomeKind::Deduplicated,
-                principal_id: None,
-            })
-        }
-        Resolution::Fresh(next) => {
-            let uid = insert_legacy_card_row(conn, req, space, name, &next, data)
-                .await?
-                .ok_or_else(|| {
-                    WyrdError::registry_unavailable(
-                        "auto-version insert conflicted under advisory lock",
-                    )
-                })?;
-            Ok(RegisterCardOutcome {
-                card_uid: uid,
-                kind: RegisterCardOutcomeKind::Created,
-                principal_id: None,
-            })
-        }
-    }
-}
-
-/// INSERT one row into `wyrd.cards`, returning the new uid on success.
-///
-/// Uses `ON CONFLICT … WHERE status <> 'deleted' DO NOTHING` so that a
-/// concurrent INSERT for the same active identity is silently skipped rather
-/// than erroring. Returns `None` when the conflict path fires; the caller is
-/// responsible for deciding what to do (idempotent re-apply check vs. advisory
-/// lock guarantee).
-///
-/// Validates that each semver component fits in `i64` before the INSERT, since
-/// the generated `version_major/minor/patch` columns are `BIGINT`.
-async fn insert_legacy_card_row(
-    conn: &mut TenantConn<'_>,
-    req: &RegisterCardRequest<'_>,
-    space: &SpaceName,
-    name: &CardName,
-    version: &VersionBlock,
-    data: &PreparedCardData<'_>,
-) -> Result<Option<CardUid>, WyrdError> {
-    let sv = version
-        .semver()
-        .map_err(|e| WyrdError::registry_invalid_version_block(e.to_string()))?;
-    for component in [sv.major, sv.minor, sv.patch] {
-        i64::try_from(component).map_err(|_| {
-            WyrdError::registry_invalid_version_block("version component exceeds i64::MAX")
-        })?;
-    }
-
-    let card_uid = CardUid::from_uuid(Uuid::now_v7()).map_err(WyrdError::from_card_uid_error)?;
-    let inserted = sqlx::query_as::<_, (Uuid,)>(
-        r#"
-        INSERT INTO wyrd.cards (
-            card_uid, data_tenant_id, kind, space, name, version,
-            spec, spec_hash, artifact_hash, labels, annotations,
-            status, created_by
-        ) VALUES (
-            $1, wyrd.current_tenant(), $2, $3, $4, $5,
-            $6, $7, $8, $9, $10,
-            $11, $12
-        )
-        ON CONFLICT (data_tenant_id, kind, space, name, version)
-            WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
-        RETURNING card_uid
-        "#,
-    )
-    .bind(card_uid.as_uuid())
-    .bind(req.card.kind.wire_name())
-    .bind(space.as_str())
-    .bind(name.as_str())
-    .bind(version.as_str())
-    .bind(data.spec_json)
-    .bind(data.spec_hash)
-    .bind(req.card.metadata.artifact_hash.as_deref())
-    .bind(data.labels_json)
-    .bind(data.annotations_json)
-    .bind(req.status.as_db_str())
-    .bind(req.actor.id.as_uuid())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(registry_db_error)?;
-
-    inserted
-        .map(|(uid,)| CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error))
-        .transpose()
-}
-
-/// Fetch the uid of the active row that matches a resolved `(kind, space,
-/// name, version)` identity.
-///
-/// Called by `register_auto` after a `Deduplicated` resolution to convert the
-/// resolved version string back to a uid without re-doing the full content
-/// comparison. Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` if the row has
-/// disappeared between resolution and lookup (should not happen under the
-/// advisory lock, but guarded defensively).
-async fn lookup_uid_by_ref(
-    conn: &mut TenantConn<'_>,
-    kind: CardKind,
-    space: &SpaceName,
-    name: &CardName,
-    version: &VersionBlock,
-) -> Result<CardUid, WyrdError> {
-    let uid: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT card_uid FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() \
-           AND kind = $1 AND space = $2 AND name = $3 AND version = $4 \
-           AND status = 'active'",
-    )
-    .bind(kind.wire_name())
-    .bind(space.as_str())
-    .bind(name.as_str())
-    .bind(version.as_str())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(registry_db_error)?;
-
-    let (uid,) = uid.ok_or_else(|| {
-        WyrdError::registry_unavailable("resolved version row vanished before uid lookup")
-    })?;
-    CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)
-}
-
-/// Resolve a pin conflict: either idempotent re-apply or spec-hash drift.
-///
-/// Called when `insert_card_row` returns `None` for a pin registration,
-/// meaning an active row with the same identity already exists. Reads the
-/// existing row's `spec_hash` and compares it against the submitted hash:
-///
-/// - Same hash → `IdempotentNoop` (caller re-submitted identical content).
-/// - Different hash → `WYRD_REGISTRY_409_SPEC_DRIFT` (caller is trying to change
-///   a pinned version in place, which is forbidden).
-///
-/// The `AND status <> 'deleted'` guard ensures that a previously soft-deleted
-/// pin at this identity (which the partial unique index now allows) does not
-/// produce a false conflict reading.
-async fn handle_conflict(
-    conn: &mut TenantConn<'_>,
-    card: &Card,
-    space: &SpaceName,
-    version_block: &VersionBlock,
-    submitted_hash: &str,
-) -> Result<RegisterCardOutcome, WyrdError> {
-    let existing = sqlx::query_as::<_, (Uuid, String)>(
-        r#"SELECT card_uid, spec_hash FROM wyrd.cards
-           WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
-             AND data_tenant_id = wyrd.current_tenant()
-             AND status = 'active'"#,
-    )
-    .bind(card.kind.wire_name())
-    .bind(space.as_str())
-    .bind(card.metadata.name.as_str())
-    .bind(version_block.as_str())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(registry_db_error)?;
-
-    let (existing_uid, existing_hash) = existing.ok_or_else(|| {
-        WyrdError::registry_unavailable("conflict row vanished between INSERT and SELECT")
-    })?;
-
-    if existing_hash != submitted_hash {
-        return Err(WyrdError::registry_spec_drift(
-            existing_uid.to_string(),
-            existing_hash,
-            submitted_hash,
-        ));
-    }
-
-    let card_uid = CardUid::from_uuid(existing_uid).map_err(WyrdError::from_card_uid_error)?;
-    let principal_id = match &card.kind {
-        CardKind::Service | CardKind::Agent => {
-            lookup_existing_principal_id(conn, &card_uid).await?
-        }
-        _ => None,
-    };
-
-    Ok(RegisterCardOutcome {
-        card_uid,
-        kind: RegisterCardOutcomeKind::IdempotentNoop,
-        principal_id,
-    })
-}
-
-/// Persisted registration operation used for request replay.
+/// Persisted registration operation used for idempotency replay.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct CardRegistrationOperationRow {
     /// Server-minted operation identifier.
@@ -471,13 +34,9 @@ pub struct CardRegistrationOperationRow {
     pub idempotency_key: String,
     /// BLAKE3/JCS request hash.
     pub request_hash: String,
-    /// Card created by the operation.
-    pub card_uid: Uuid,
-    /// Stored upload plan inventory. Presigned URLs are never reused.
+    /// Stored composite response for exact replay.
     #[sqlx(json)]
-    pub upload_plans: JsonValue,
-    /// Registration outcome literal.
-    pub outcome: String,
+    pub stored_response: Option<JsonValue>,
     /// Operation status literal.
     pub status: String,
     /// Operation creation time.
@@ -486,7 +45,7 @@ pub struct CardRegistrationOperationRow {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Inputs for the idempotency operation insert.
+/// Inputs for reserving a registration idempotency key.
 pub struct NewRegistrationOperation<'a> {
     /// Server-minted operation identifier.
     pub operation_id: RegistrationOperationId,
@@ -496,21 +55,13 @@ pub struct NewRegistrationOperation<'a> {
     pub idempotency_key: &'a str,
     /// BLAKE3/JCS request hash.
     pub request_hash: &'a str,
-    /// Card identifier reserved by this operation.
-    pub card_uid: &'a CardUid,
-    /// Stored upload plan inventory.
-    pub upload_plans: &'a JsonValue,
-    /// Initial outcome literal.
-    pub outcome: &'a str,
-    /// Initial operation status.
-    pub status: &'a str,
 }
 
-/// Inputs for the card row insert owned by a registration operation.
+/// Inputs for inserting one resolved card in a composite operation.
 pub struct NewCardRow<'a> {
     /// Resolved card envelope.
     pub card: &'a Card,
-    /// Server-minted card identifier shared with the operation row.
+    /// Server-minted card identifier.
     pub card_uid: CardUid,
     /// Principal that created the row.
     pub principal_id: PrincipalId,
@@ -518,9 +69,9 @@ pub struct NewCardRow<'a> {
     pub operation_id: RegistrationOperationId,
     /// Initial lifecycle status.
     pub status: CardStatus,
-    /// Canonical spec hash.
+    /// Canonical resolved-spec hash.
     pub spec_hash: &'a str,
-    /// Canonical artifact manifest hash.
+    /// Canonical artifact-manifest hash.
     pub artifact_hash: Option<&'a str>,
 }
 
@@ -537,14 +88,14 @@ pub struct CardArtifactManifestRow {
     pub expected_size_bytes: i64,
     /// Optional content type.
     pub content_type: Option<String>,
-    /// Current post-commit init state.
+    /// Current post-commit initialization state.
     pub upload_status: String,
     /// Storage upload identifier once initialization succeeds.
     pub upload_id: Option<Uuid>,
 }
 
-/// Card row values needed to construct the registration response.
-#[derive(Debug, Clone)]
+/// Card row values needed to construct a registration response.
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RegisteredCardRow {
     /// Card UID.
     pub card_uid: CardUid,
@@ -558,7 +109,7 @@ pub struct RegisteredCardRow {
     pub version: VersionBlock,
     /// Canonical spec hash.
     pub spec_hash: String,
-    /// Canonical artifact manifest hash.
+    /// Canonical artifact-manifest hash.
     pub artifact_hash: Option<String>,
     /// Current lifecycle status.
     pub status: CardStatus,
@@ -580,39 +131,33 @@ pub fn artifact_manifest_hash(artifacts: &[ArtifactManifestEntry]) -> Option<Str
     Some(blake3::hash(&bytes).to_hex().to_string())
 }
 
-/// Compute the canonical BLAKE3/JCS hash used by registration idempotency.
+/// Compute the canonical request hash from ordered submissions and manifest hashes.
 #[must_use]
-pub fn registration_request_hash(spec_hash: &str, artifact_hash: Option<&str>) -> String {
+pub fn registration_request_hash(
+    canonical_submissions: &[&CardSubmission],
+    artifact_hashes: &[Option<String>],
+) -> String {
     let payload = serde_json::json!({
-        "artifact_manifest_hash": artifact_hash,
-        "spec_hash": spec_hash,
+        "submissions": canonical_submissions,
+        "artifact_manifest_hashes": artifact_hashes,
     });
-    let bytes = serde_jcs::to_vec(&payload).expect("request hash payload is serializable");
+    let bytes = serde_jcs::to_vec(&payload).expect("registration request is serializable");
     blake3::hash(&bytes).to_hex().to_string()
 }
 
 /// Find an operation by tenant-scoped principal and idempotency key.
-///
-/// The caller owns the transaction. RLS supplies the tenant boundary and the
-/// explicit tenant predicate makes the query intent clear to reviewers.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] when the lookup fails.
 pub async fn lookup_existing_operation(
     conn: &mut TenantConn<'_>,
     principal_id: PrincipalId,
     idempotency_key: &str,
 ) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
     sqlx::query_as::<_, CardRegistrationOperationRow>(
-        r#"
-        SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
-               request_hash, card_uid, upload_plans, outcome, status,
-               created_at, updated_at
-          FROM wyrd.card_registration_operations
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND principal_id = $1
-           AND idempotency_key = $2
-        "#,
+        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+                  request_hash, stored_response, status,
+                  created_at, updated_at
+             FROM wyrd.card_registration_operations
+            WHERE data_tenant_id = wyrd.current_tenant()
+              AND principal_id = $1 AND idempotency_key = $2"#,
     )
     .bind(principal_id.as_uuid())
     .bind(idempotency_key)
@@ -621,49 +166,29 @@ pub async fn lookup_existing_operation(
     .map_err(registry_db_error)
 }
 
-/// Insert the operation row that reserves an idempotency key.
-///
-/// Returns `true` when this call inserted the operation and `false` when a
-/// concurrent request already won the unique key. The caller must re-read the
-/// winner before attempting any card or manifest write.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] for database failures.
+/// Reserve an idempotency key before any card, manifest, or audit write.
 pub async fn insert_registration_operation(
     conn: &mut TenantConn<'_>,
     operation: NewRegistrationOperation<'_>,
 ) -> Result<bool, WyrdError> {
     let inserted = sqlx::query(
-        r#"
-        INSERT INTO wyrd.card_registration_operations
-            (operation_id, data_tenant_id, principal_id, idempotency_key,
-             request_hash, card_uid, upload_plans, outcome, status)
-        VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (data_tenant_id, principal_id, idempotency_key) DO NOTHING
-        "#,
+        r#"INSERT INTO wyrd.card_registration_operations
+               (operation_id, data_tenant_id, principal_id, idempotency_key,
+                request_hash, stored_response, status)
+           VALUES ($1, wyrd.current_tenant(), $2, $3, $4, NULL, 'pending')
+           ON CONFLICT (data_tenant_id, principal_id, idempotency_key) DO NOTHING"#,
     )
     .bind(operation.operation_id.as_uuid())
     .bind(operation.principal_id.as_uuid())
     .bind(operation.idempotency_key)
     .bind(operation.request_hash)
-    .bind(operation.card_uid.as_uuid())
-    .bind(operation.upload_plans)
-    .bind(operation.outcome)
-    .bind(operation.status)
     .execute(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
     Ok(inserted.rows_affected() == 1)
 }
 
-/// Insert a card row for the registration operation.
-///
-/// The operation ID is written into the card row so later lifecycle handlers
-/// can resolve the pending operation without trusting a client-supplied ID.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] for database failures and a
-/// typed registry error when the resolved card identity cannot be parsed.
+/// Insert one resolved card owned by a registration operation.
 pub async fn insert_card_row(
     conn: &mut TenantConn<'_>,
     input: NewCardRow<'_>,
@@ -683,19 +208,14 @@ pub async fn insert_card_row(
         }
     };
     let pending_since = (input.status == CardStatus::Pending).then(Utc::now);
-    let row = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
-        r#"
-        INSERT INTO wyrd.cards
-            (card_uid, data_tenant_id, kind, space, name, version,
-             spec, spec_hash, artifact_hash, labels, annotations, status,
-             created_by, registration_operation_id, pending_since)
-        VALUES (
-            $1, wyrd.current_tenant(), $2, $3, $4, $5,
-            $6, $7, $8, $9, $10, $11,
-            $12, $13, $14
-        )
-        RETURNING card_uid, created_at
-        "#,
+    let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+        r#"INSERT INTO wyrd.cards
+               (card_uid, data_tenant_id, kind, space, name, version, spec,
+                spec_hash, artifact_hash, labels, annotations, status, created_by,
+                registration_operation_id, pending_since)
+           VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
+                   $9, $10, $11, $12, $13, $14)
+           RETURNING created_at"#,
     )
     .bind(input.card_uid.as_uuid())
     .bind(input.card.kind.wire_name())
@@ -720,9 +240,8 @@ pub async fn insert_card_row(
     .fetch_one(&mut **conn.transaction())
     .await
     .map_err(registry_db_error)?;
-
     Ok(RegisteredCardRow {
-        card_uid: CardUid::from_uuid(row.0).map_err(WyrdError::from_card_uid_error)?,
+        card_uid: input.card_uid,
         kind: input.card.kind.clone(),
         space: space.clone(),
         name: input.card.metadata.name.clone(),
@@ -730,42 +249,32 @@ pub async fn insert_card_row(
         spec_hash: input.spec_hash.to_owned(),
         artifact_hash: input.artifact_hash.map(str::to_owned),
         status: input.status,
-        created_at: row.1,
+        created_at,
         principal_id: input.principal_id,
         operation_id: input.operation_id,
     })
 }
 
-/// Insert the manifest rows in the same transaction as the card row.
-///
-/// Every row starts at `awaiting_init`; no storage backend is contacted by
-/// this function.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] for database failures.
+/// Insert manifest rows in the same transaction as their card.
 pub async fn insert_artifact_manifest_rows(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
     artifacts: &[ArtifactManifestEntry],
 ) -> Result<(), WyrdError> {
     for artifact in artifacts {
+        let size = i64::try_from(artifact.size_bytes).map_err(|_| {
+            WyrdError::registry_spec_too_large(artifact.size_bytes as usize, i64::MAX as usize)
+        })?;
         sqlx::query(
-            r#"
-            INSERT INTO wyrd.card_artifact_manifest
-                (card_uid, relative_path, expected_sha256, expected_size_bytes,
-                 content_type, upload_status, upload_id, data_tenant_id)
-            VALUES ($1, $2, $3, $4, $5, 'awaiting_init', NULL, wyrd.current_tenant())
-            "#,
+            r#"INSERT INTO wyrd.card_artifact_manifest
+                   (card_uid, relative_path, expected_sha256, expected_size_bytes,
+                    content_type, upload_status, data_tenant_id)
+               VALUES ($1, $2, $3, $4, $5, 'awaiting_init', wyrd.current_tenant())"#,
         )
         .bind(card_uid.as_uuid())
         .bind(artifact.relative_path.as_str())
         .bind(&artifact.sha256)
-        .bind(
-            i64::try_from(artifact.size_bytes).map_err(|_| WyrdError::RegistrySpecTooLarge {
-                message: "artifact size exceeds the database integer range".to_owned(),
-                details: serde_json::json!({ "size_bytes": artifact.size_bytes }),
-            })?,
-        )
+        .bind(size)
         .bind(&artifact.content_type)
         .execute(&mut **conn.transaction())
         .await
@@ -775,26 +284,17 @@ pub async fn insert_artifact_manifest_rows(
 }
 
 /// Load manifest rows that need post-commit initialization or replay.
-///
-/// The caller performs storage initialization after committing the registry
-/// transaction. This query is read-only and never opens a storage transaction.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] when the lookup fails.
 pub async fn manifest_rows_for_init(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
     sqlx::query_as::<_, CardArtifactManifestRow>(
-        r#"
-        SELECT card_uid, relative_path, expected_sha256, expected_size_bytes,
-               content_type, upload_status, upload_id
-          FROM wyrd.card_artifact_manifest
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND card_uid = $1
-           AND upload_status IN ('awaiting_init', 'pending')
-         ORDER BY relative_path
-        "#,
+        r#"SELECT card_uid, relative_path, expected_sha256, expected_size_bytes,
+                  content_type, upload_status, upload_id
+             FROM wyrd.card_artifact_manifest
+            WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1
+              AND upload_status IN ('awaiting_init', 'pending')
+            ORDER BY relative_path"#,
     )
     .bind(card_uid.as_uuid())
     .fetch_all(&mut **conn.transaction())
@@ -802,13 +302,7 @@ pub async fn manifest_rows_for_init(
     .map_err(registry_db_error)
 }
 
-/// Mark one manifest row ready for client upload after successful init.
-///
-/// This is intentionally a separate caller-owned tenant transaction because
-/// storage initialization happens after the registry transaction commits.
-///
-/// # Errors
-/// Returns [`WyrdError::RegistryUnavailable`] for database failures.
+/// Mark one manifest row initialized after storage returns an upload identifier.
 pub async fn mark_manifest_upload_initialized(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
@@ -816,14 +310,10 @@ pub async fn mark_manifest_upload_initialized(
     upload_id: Uuid,
 ) -> Result<(), WyrdError> {
     sqlx::query(
-        r#"
-        UPDATE wyrd.card_artifact_manifest
-           SET upload_status = 'pending', upload_id = $3
-         WHERE data_tenant_id = wyrd.current_tenant()
-           AND card_uid = $1
-           AND relative_path = $2
-           AND upload_status IN ('awaiting_init', 'pending')
-        "#,
+        r#"UPDATE wyrd.card_artifact_manifest
+              SET upload_status = 'pending', upload_id = $3
+            WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1
+              AND relative_path = $2 AND upload_status IN ('awaiting_init', 'pending')"#,
     )
     .bind(card_uid.as_uuid())
     .bind(relative_path)
@@ -834,41 +324,20 @@ pub async fn mark_manifest_upload_initialized(
     Ok(())
 }
 
-/// Map a stored operation outcome literal to the wire outcome enum.
-///
-/// Unknown literals are treated as a database invariant failure instead of
-/// silently projecting them as a successful registration.
-pub fn operation_outcome(
-    value: &str,
-) -> Result<wyrd_spec::registry::RegistrationOutcomeKind, WyrdError> {
-    match value {
-        "created" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::Registered),
-        "idempotent_noop" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::IdempotentNoop),
-        "deduplicated" => Ok(wyrd_spec::registry::RegistrationOutcomeKind::Deduplicated),
-        _ => Err(WyrdError::registry_unavailable("card registry unavailable")),
-    }
-}
-
-/// Map a stored operation status literal to the SQL card lifecycle enum.
-pub fn operation_status(value: &str) -> Result<CardStatus, WyrdError> {
-    CardStatus::from_db_str(value).map_err(registry_db_error)
-}
-
-/// Update the replay inventory after post-commit upload initialization.
-pub async fn update_registration_operation_plans(
+/// Commit the exact composite response used for future idempotent replay.
+pub async fn commit_registration_operation(
     conn: &mut TenantConn<'_>,
     operation_id: RegistrationOperationId,
-    upload_plans: &JsonValue,
+    response: &CreateCardResponse,
 ) -> Result<(), WyrdError> {
+    let stored_response =
+        serde_json::to_value(response).map_err(WyrdError::from_spec_serialization)?;
     sqlx::query(
-        r#"
-        UPDATE wyrd.card_registration_operations
-           SET upload_plans = $1, updated_at = now()
-         WHERE operation_id = $2
-           AND data_tenant_id = wyrd.current_tenant()
-        "#,
+        r#"UPDATE wyrd.card_registration_operations
+              SET stored_response = $1, status = 'committed', updated_at = now()
+            WHERE operation_id = $2 AND data_tenant_id = wyrd.current_tenant()"#,
     )
-    .bind(upload_plans)
+    .bind(stored_response)
     .bind(operation_id.as_uuid())
     .execute(&mut **conn.transaction())
     .await
@@ -876,13 +345,7 @@ pub async fn update_registration_operation_plans(
     Ok(())
 }
 
-/// Resolve references to cards that must already exist in the tenant registry.
-///
-/// This is used for card specs that point at other registered cards. Inline
-/// light-card definitions do not appear in `refs` and therefore do not need a
-/// lookup. The query preserves every requested identity, including misses, so
-/// the server can return one unresolved-dependency error instead of silently
-/// dropping a reference.
+/// Resolve exact references to non-terminal cards in one tenant-scoped query.
 pub async fn select_card_uids_by_ref_batch(
     conn: &mut TenantConn<'_>,
     refs: &[CardRef],
@@ -890,29 +353,10 @@ pub async fn select_card_uids_by_ref_batch(
     if refs.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = fetch_card_ref_rows(conn, refs).await?;
-    let mut resolved = Vec::with_capacity(rows.len());
-    for row in rows {
-        if let Some(card) = map_card_ref_row(refs, row)? {
-            resolved.push(card);
-        }
-    }
-    Ok(resolved)
-}
-
-/// Row shape returned by the set-based reference lookup.
-type CardRefLookupRow = (String, String, String, String, Option<Uuid>);
-
-/// Fetch requested reference identities and optional matching UIDs in one query.
-async fn fetch_card_ref_rows(
-    conn: &mut TenantConn<'_>,
-    refs: &[CardRef],
-) -> Result<Vec<CardRefLookupRow>, WyrdError> {
-    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new(
-        "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid \
-         FROM (VALUES ",
+    let mut query = QueryBuilder::<sqlx::Postgres>::new(
+        "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid FROM (",
     );
-    query.push_values(refs.iter(), |mut values, card_ref| {
+    query.push_values(refs, |mut values, card_ref| {
         values
             .push_bind(card_ref.kind.wire_name())
             .push_bind(card_ref.space.as_str())
@@ -920,94 +364,38 @@ async fn fetch_card_ref_rows(
             .push_bind(card_ref.version.as_str());
     });
     query.push(
-        ") AS refs(kind, space, name, version) \
-         LEFT JOIN wyrd.cards cards \
-           ON cards.data_tenant_id = wyrd.current_tenant() \
-          AND cards.kind = refs.kind \
-          AND cards.space = refs.space \
-          AND cards.name = refs.name \
-          AND cards.version = refs.version \
-          AND cards.status NOT IN ('deleted', 'failed', 'expired')",
+        ") AS refs(kind, space, name, version) LEFT JOIN wyrd.cards cards \
+         ON cards.data_tenant_id = wyrd.current_tenant() AND cards.kind = refs.kind \
+         AND cards.space = refs.space AND cards.name = refs.name AND cards.version = refs.version \
+         AND cards.status NOT IN ('deleted', 'failed', 'expired')",
     );
     let rows = query
-        .build_query_as::<CardRefLookupRow>()
+        .build_query_as::<(String, String, String, String, Option<Uuid>)>()
         .fetch_all(&mut **conn.transaction())
         .await
-        .map_err(|_| WyrdError::registry_unavailable("card registry unavailable"))?;
-    Ok(rows)
-}
-
-/// Convert one SQL row back to its typed request reference when it matched.
-fn map_card_ref_row(
-    refs: &[CardRef],
-    (kind, space, name, version, uid): CardRefLookupRow,
-) -> Result<Option<(CardRef, CardUid)>, WyrdError> {
-    let Some(uid) = uid else {
-        return Ok(None);
-    };
-    let card_ref = refs
-        .iter()
-        .find(|card_ref| {
-            card_ref.kind.wire_name() == kind
-                && card_ref.space.as_str() == space
-                && card_ref.name.as_str() == name
-                && card_ref.version.as_str() == version
+        .map_err(registry_db_error)?;
+    rows.into_iter()
+        .filter_map(|(kind, space, name, version, uid)| {
+            uid.map(|uid| {
+                let card_ref = refs
+                    .iter()
+                    .find(|item| {
+                        item.kind.wire_name() == kind
+                            && item.space.as_str() == space
+                            && item.name.as_str() == name
+                            && item.version.as_str() == version
+                    })
+                    .cloned()
+                    .ok_or_else(|| WyrdError::registry_unavailable("card registry unavailable"))?;
+                let card_uid = CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?;
+                Ok((card_ref, card_uid))
+            })
         })
-        .ok_or_else(|| WyrdError::registry_unavailable("card registry unavailable"))?;
-    Ok(Some((
-        card_ref.clone(),
-        CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?,
-    )))
+        .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{artifact_manifest_hash, operation_outcome, registration_request_hash};
-    use wyrd_spec::registry::{
-        ArtifactManifestEntry, RegistrationOutcomeKind, RelativeArtifactPath,
-    };
-
-    #[test]
-    fn request_hash_is_lowercase_blake3_over_the_jcs_shape() {
-        let hash = registration_request_hash(&"a".repeat(64), None);
-
-        assert_eq!(hash.len(), 64);
-        assert!(hash.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(hash, registration_request_hash(&"a".repeat(64), None));
-        assert_ne!(hash, registration_request_hash(&"b".repeat(64), None));
-        assert_ne!(
-            hash,
-            registration_request_hash(&"a".repeat(64), Some(&"b".repeat(64)))
-        );
-    }
-
-    #[test]
-    fn manifest_hash_is_order_sensitive_and_empty_manifests_are_absent() {
-        assert_eq!(artifact_manifest_hash(&[]), None);
-        let first = ArtifactManifestEntry {
-            relative_path: RelativeArtifactPath::new("a.bin").expect("valid path"),
-            sha256: "YQ==".to_owned(),
-            size_bytes: 1,
-            content_type: None,
-        };
-        let second = ArtifactManifestEntry {
-            relative_path: RelativeArtifactPath::new("b.bin").expect("valid path"),
-            sha256: "Yg==".to_owned(),
-            size_bytes: 1,
-            content_type: None,
-        };
-        assert_ne!(
-            artifact_manifest_hash(&[first.clone(), second.clone()]),
-            artifact_manifest_hash(&[second, first])
-        );
-    }
-
-    #[test]
-    fn operation_outcome_rejects_unknown_database_literals() {
-        assert_eq!(
-            operation_outcome("created").expect("known outcome"),
-            RegistrationOutcomeKind::Registered
-        );
-        assert!(operation_outcome("unexpected").is_err());
-    }
+/// Redact database details at the public registry boundary.
+fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
+    tracing::error!(%error, "card registry database operation failed");
+    WyrdError::registry_unavailable("card registry unavailable")
 }

@@ -1,5 +1,6 @@
 //! Card registration HTTP surface and its server-owned orchestration.
 
+mod compose;
 mod mapping;
 mod resolve;
 pub(crate) mod routes;

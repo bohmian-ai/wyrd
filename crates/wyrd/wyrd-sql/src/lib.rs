@@ -506,7 +506,7 @@ mod tests {
             ),
             (
                 "wyrd.storage_idempotency_keys",
-                "GRANT SELECT, INSERT ON wyrd.storage_idempotency_keys TO wyrd_app;",
+                "GRANT SELECT, INSERT, UPDATE ON wyrd.storage_idempotency_keys TO wyrd_app;",
                 "GRANT SELECT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_platform_admin;",
             ),
         ] {
@@ -533,7 +533,7 @@ mod tests {
         for forbidden in [
             "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_multipart_uploads",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata",
-            "GRANT SELECT, INSERT, DELETE ON wyrd.storage_idempotency_keys TO wyrd_app",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_idempotency_keys TO wyrd_app",
         ] {
             assert!(
                 !migrations.contains(forbidden),

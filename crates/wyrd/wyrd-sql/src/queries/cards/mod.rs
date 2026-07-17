@@ -12,6 +12,7 @@ mod version_query;
 mod version_resolve;
 mod version_sql;
 
+pub use auth_projection::upsert_service_account_from_card;
 pub use delete::soft_delete_card;
 pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid};
 pub use list::{
@@ -20,11 +21,10 @@ pub use list::{
 };
 pub use register::{
     CardArtifactManifestRow, CardRegistrationOperationRow, NewCardRow, NewRegistrationOperation,
-    RegisterCardOutcome, RegisterCardOutcomeKind, RegisterCardRequest, RegisteredCardRow,
-    artifact_manifest_hash, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation, lookup_existing_operation, manifest_rows_for_init,
-    mark_manifest_upload_initialized, operation_outcome, operation_status, register_card,
-    registration_request_hash, select_card_uids_by_ref_batch, update_registration_operation_plans,
+    RegisteredCardRow, artifact_manifest_hash, commit_registration_operation,
+    insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
+    lookup_existing_operation, manifest_rows_for_init, mark_manifest_upload_initialized,
+    registration_request_hash, select_card_uids_by_ref_batch,
 };
 pub use version_query::{get_latest_card_by_range, list_versions};
 pub use version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};

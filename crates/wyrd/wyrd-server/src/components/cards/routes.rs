@@ -105,6 +105,7 @@ mod tests {
     use super::extract_required_idempotency_key;
     use axum::http::HeaderMap;
 
+    /// Reject registration requests that omit the idempotency key header.
     #[test]
     fn registration_requires_idempotency_key() {
         let error = extract_required_idempotency_key(&HeaderMap::new())

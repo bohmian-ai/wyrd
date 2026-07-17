@@ -76,6 +76,7 @@ done
 
 if rg -n 'wyrd_spec|wyrd-' crates/skald \
   --glob '!crates/skald/skald-prompt/**' \
+  --glob '!crates/skald/skald-observer/**' \
   --glob '!crates/skald/skald-agent/**' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
   --glob '!crates/skald/skald-tool/Cargo.toml' \

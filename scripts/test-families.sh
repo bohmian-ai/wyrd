@@ -50,7 +50,6 @@ FAMILY_SHARED=(
   wyrd-crypt
   wyrd-dev-fixtures
   wyrd-error-derive
-  wyrd-observe
   wyrd-queue
   wyrd-runtime
   wyrd-semver

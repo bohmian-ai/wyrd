@@ -86,6 +86,8 @@ thiserror = "2.0"
 base64 = "0.22"
 bytes = "1"
 futures-util = "0.3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+hdrhistogram = "7.5"
 blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"

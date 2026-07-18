@@ -113,7 +113,7 @@ Do not assume these paths exist when writing code today.
 Twelve crates enable a `python` feature (enforced by
 `check:pyo3-scope`):
 
-`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `wyrd-observe`,
+`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `skald-observer`,
 `wyrd-testing` (dev-only), `wyrd-utils`, `skald-agent`, `skald-prompt`,
 `skald-runtime`, `skald-tool`, `skald-workflow`, `vala-sdk`.
 

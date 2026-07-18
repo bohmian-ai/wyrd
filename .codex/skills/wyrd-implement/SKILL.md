@@ -121,7 +121,7 @@ short:
   `wyrd-server`, `wyrd-sql`, `wyrd-storage`, `wyrd-testing`,
   `wyrd-tonic`.
 - `crates/shared/*` — auth-*, `wyrd-client`, `wyrd-crypt`,
-  `wyrd-observe`, `wyrd-queue`, `wyrd-runtime`, `wyrd-semver`,
+  `skald-observer`, `wyrd-queue`, `wyrd-runtime`, `wyrd-semver`,
   `wyrd-telemetry`, `wyrd-utils`, `wyrd-version`, `*-derive`/`*-macros`,
   test infra.
 - `crates/skald/*` — `skald-spec`, `skald-providers`, `skald-runtime`,
@@ -134,7 +134,7 @@ short:
   `testing` (dev-only feature).
 
 **Approved Python-owner crates (12 today, enable `python` feature):**
-`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `wyrd-observe`,
+`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `skald-observer`,
 `wyrd-testing`, `wyrd-utils`, `skald-agent`, `skald-prompt`,
 `skald-runtime`, `skald-tool`, `skald-workflow`, `vala-sdk`. Enforced by
 `check:pyo3-scope`.
@@ -381,6 +381,16 @@ generator, then run codegen.
 **Three tiers** (priority order): user-journey (primary), integration,
 unit. Every new user/agent-facing capability ships a user-journey test.
 Lower tiers never substitute for a missing higher one.
+
+### Bifrost six-tier extension
+
+Bifrost task contracts also declare coverage for the following six tiers:
+unit, integration, journey, interleaving matrix, SLO-gated bench, and
+sustained-load journey. The last three use the shared infrastructure in
+`wyrd-testing` and `wyrd-bench`; they run only in their gated mise lanes.
+For every omitted tier, the contract records why it is not applicable or
+names the follow-up that owns it. This extension does not change the Wyrd-wide
+three-tier default.
 
 Run verification for the code you changed. Use the narrowest `mise` task
 that covers the touched surface:

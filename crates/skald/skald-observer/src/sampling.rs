@@ -50,7 +50,7 @@ impl SamplingPolicy {
     /// # Examples
     ///
     /// ```rust
-    /// use wyrd_observe::{RunId, SamplingPolicy};
+    /// use skald_observer::{RunId, SamplingPolicy};
     ///
     /// let run_id = RunId::from_string("run-1".to_owned());
     /// let Some(policy) = SamplingPolicy::one_of(2) else {
@@ -77,7 +77,7 @@ impl SamplingPolicy {
     /// # Examples
     ///
     /// ```rust
-    /// use wyrd_observe::{RunId, SamplingPolicy};
+    /// use skald_observer::{RunId, SamplingPolicy};
     ///
     /// let run_id = RunId::from_string("run-1".to_owned());
     /// let Some(policy) = SamplingPolicy::bucket(10, 0) else {

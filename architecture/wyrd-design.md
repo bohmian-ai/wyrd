@@ -1104,15 +1104,22 @@ semantics.
 
 **Everything is a Bifrost table.** One table shape underlies every internal
 analytical table, with four reserved system columns: `wyrd_event_time`,
-`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. Each table carries a
-`scope`:
+`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. The physical identity
+is always the authenticated organization plus the logical table:
 
-- **TenantOwned** — one physical table per tenant; isolation is structural
-  (per-tenant Iceberg namespace / path). No `data_tenant_id` column.
-- **SystemShared** — one physical table shared across tenants (used for
-  high-tenant-count, low-per-tenant-volume data where one table per tenant would
-  fragment into millions of small files); rows carry `data_tenant_id` and tenant
-  isolation is enforced on read from the authenticated principal's tenant.
+```text
+(organization_id, logical_table) → one physical Iceberg table
+```
+
+The logical `TableRef` remains tenant-free and carries the table namespace and
+local name. The Bifrost catalog derives the organization-qualified Iceberg
+namespace, object-store prefix, and physical table from the authenticated
+organization and `TableRef`. Every physical Parquet file carries the
+server-stamped `data_tenant_id`. Gate and Scribe reject a binding whose tenant
+does not match the authenticated organization; Oracle adds the plan-root
+`TenantTripwireExec` and fails closed with `WYRD_VALA_500_TENANT_TRIPWIRE` on a
+row mismatch. There is no shared physical table layout and no deployment-
+specific storage mode.
 
 The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
 as the Iceberg catalog and control plane and DataFusion as the query engine —
@@ -1152,16 +1159,16 @@ The public contract includes:
 - gRPC ingest through `wyrd.v1.BifrostIngestService` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - The `wyrd.bifrost` Python SDK submodule.
 - Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,
-  register-table types, query request/response types, and table scope/status
-  enums.
+  register-table types, and query request/response types. Physical table
+  identity is server-derived from the authenticated organization and logical
+  table; it is not a caller-selected scope.
 - The `WYRD_VALA_*_BIFROST_*` error catalog crossing HTTP, MCP, Python, and
   generated documentation boundaries.
 
 Bifrost permissions are resource-scoped through `BifrostTable`, `BifrostRecord`,
-and `BifrostQuery`. Caller-selected `SystemShared` tables require explicit
-administrative install permission, and generic record writes must not write
-reserved or system-managed Bifrost tables. There is no `wyrd.warehouse` submodule
-and no `WarehouseCard`.
+and `BifrostQuery`. Generic record writes must not write reserved or
+system-managed Bifrost tables. There is no `wyrd.warehouse` submodule and no
+`WarehouseCard`.
 
 **`ValaQueryService` — typed observability query surface (accepted, Stage 4).** `wyrd-server`
 exposes `wyrd.v1.ValaQueryService` (gRPC-first) with an axum HTTP projection as the
@@ -1183,10 +1190,11 @@ The accepted domain namespaces and tables:
 | `vala.dev` | `agent_traces` | High-fidelity coding-harness traces; carries the code axis |
 | `vala.system` | `audit_log` | Transactional audit log (relay-written) |
 
-All domain tables are `SystemShared` scope — server-stamped `data_tenant_id` isolation via
-provider `FilterExec` (primary) and scoped analyzer predicate (secondary). Typed query
-routes build bound DataFusion `LogicalPlan`s (never `ctx.sql`); a query-admission gate
-rejects plans missing the tenant predicate or a bounded time window before execution.
+All domain tables use the organization-qualified physical-table rule above.
+Typed query routes build bound DataFusion `LogicalPlan`s (never `ctx.sql`); a
+query-admission gate requires the authenticated organization/table binding and
+a bounded time window before execution. Oracle's provider applies the
+tenant-tripwire boundary before execution.
 
 **Elevated payload-read permissions.** Four payload-bearing table families are
 `PayloadClass::Sensitive` and gate their sensitive columns on an elevated read permission

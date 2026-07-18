@@ -123,15 +123,15 @@ boundaries.
   rewrites.
 - **Compacted files** are Parquet (Iceberg snapshot): sorted by
   `(data_tenant_id, wyrd_event_time)`, Bifrost writer properties.
-- **Partition spec**: `Day(wyrd_event_time) + Bucket(data_tenant_id, 64)`.
-  Bucket partitioning is a performance prune only; `FilterExec(tenant)`
-  is authoritative isolation.
+- **Partition spec**: `Day(wyrd_event_time)` for every organization-qualified
+  physical table. The organization is encoded in the Iceberg namespace and
+  object-store prefix, not in a shared-table bucket.
 - **No Delta Lake.** Iceberg is the sole snapshot format.
 
 ## Object Store
 
 - Parquet paths:
-  `{s3_prefix}/{namespace}/{table_name}/day=YYYY-MM-DD/tenant_bucket={N}/{pod_id}-{ulid}.parquet`.
+  `{s3_prefix}/tenants/{tenant_uuid}/{logical_namespace}/{table_name}/day=YYYY-MM-DD/{pod_id}-{ulid}.parquet`.
 - Scribe writes staging; Forge writes compacted big files and deletes
   orphans (via ORPHAN_GC, 24h TTL safety window).
 - All reads go through `WyrdObjectStore` (OpenDAL-backed), cached through
@@ -157,8 +157,8 @@ boundaries.
 - Prefer append-oriented writes with bounded batching. Avoid
   one-file-per-event or one-Iceberg-commit-per-record paths.
 - Stamp reserved Bifrost system columns at the engine boundary, not in
-  user payloads: event time, ingested-at time, batch ID, and tenant ID
-  when the table scope requires it.
+  user payloads: event time, ingested-at time, batch ID, and the
+  server-authenticated organization tenant ID on every physical table.
 - Reject user writes to reserved system columns with a typed Wyrd error.
 - Use deterministic batch IDs or idempotency keys so retries can be
   detected.
@@ -182,9 +182,9 @@ boundaries.
 - Report filter pushdown honestly. Tenant and partition predicates can
   be `Exact` only when the provider truly enforces them at scan
   planning; file / manifest pruning is often `Inexact`.
-- For `SystemShared` tables, inject or require the tenant predicate
-  before optimization and test that it cannot be removed by query
-  rewrites.
+- For every physical table, resolve the authenticated organization and logical
+  table before optimization. Add the plan-root tenant tripwire and test that a
+  wrong `data_tenant_id` cannot be returned or silently filtered.
 - Avoid unbounded `collect()` in service paths. Stream Arrow
   `RecordBatch` or page through a bounded API.
 - Expose query diagnostics when useful: logical/physical plan, bytes

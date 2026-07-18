@@ -66,7 +66,7 @@ fi
 for crate in skald-agent skald-workflow skald-tool skald-runtime; do
   forbidden_skald_member=$(cargo tree -p "$crate" --all-features -e normal | \
     rg '(^|[ ─└├])(wyrd-|vala-)' | \
-    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive|wyrd-observe)' || true)
+    rg -v '(^|[ ─└├])(wyrd-spec|wyrd-semver|wyrd-interfaces|wyrd-utils|wyrd-runtime|wyrd-error-derive)' || true)
   if [ -n "$forbidden_skald_member" ]; then
     echo "FAIL: $crate pulls forbidden Wyrd/Vala deps outside the locked foundation set:"
     echo "$forbidden_skald_member"
@@ -76,6 +76,7 @@ done
 
 if rg -n 'wyrd_spec|wyrd-' crates/skald \
   --glob '!crates/skald/skald-prompt/**' \
+  --glob '!crates/skald/skald-observer/**' \
   --glob '!crates/skald/skald-agent/**' \
   --glob '!crates/skald/skald-agent/Cargo.toml' \
   --glob '!crates/skald/skald-tool/Cargo.toml' \

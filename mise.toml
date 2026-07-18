@@ -159,6 +159,26 @@ cargo test --locked -p wyrd-cli --test audit_verify_e2e -- --ignored --test-thre
 cargo test --locked -p wyrd-mcp --test query_tools_journey -- --ignored --test-threads=1
 """
 
+[tasks."test:fuzz:bifrost"]
+description = "Run the deterministic Bifrost interleaving matrix smoke tests"
+run = "cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1"
+
+[tasks."test:bifrost:sustained"]
+description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test-threads=1"
+
+[tasks."bench:bifrost:slo"]
+description = "Run the gated Bifrost Criterion benches and validate the shared SLO gate"
+depends = ["setup:postgres", "db:migrate"]
+env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd" }
+run = """
+rm -rf /tmp/vala-bifrost-bench
+cargo bench --locked -p vala-bifrost --features bench-bin
+cargo test --locked -p wyrd-bench
+"""
+
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
@@ -934,6 +954,11 @@ hide = true
 description = "Reject tonic-family dep declarations outside wyrd-tonic + workspace pins"
 run = "bash scripts/checks/no-tonic-outside-wyrd-tonic.sh"
 
+[tasks."check:no-testing-in-prod-deps"]
+hide = true
+description = "Reject normal production dependencies on test-tier wyrd-testing or wyrd-bench crates"
+run = "bash scripts/checks/no-testing-in-prod-deps.sh"
+
 [tasks."check:proto-drift"]
 hide = true
 description = "Fail if the checked-in wyrd.v1 FileDescriptorSet drifts from the .proto"
@@ -989,6 +1014,7 @@ depends = [
   "check:no-tonic-outside-wyrd-tonic",
   "check:from-pools-allowlist",
   "check:fixtures-no-server",
+  "check:no-testing-in-prod-deps",
   "check:test-coverage"]
 
 [tasks."setup:db-roles"]

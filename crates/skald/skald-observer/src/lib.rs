@@ -28,7 +28,6 @@ pub use scoped::with_observer;
 
 /// Initialize the Wyrd observer bridge.
 ///
-/// This is a no-op after the `wyrd-observe-impl` consolidation. Kept for
-/// backward compatibility with call sites that called `wyrd_observe_impl::init()`
-/// or `wyrd::init()`.
+/// This is intentionally a no-op because observer registration is handled by
+/// the current/global observer setup.
 pub fn init() {}

@@ -15,7 +15,7 @@ mod pg_tests {
     use opendal::services::Memory;
     use sqlx::types::Uuid;
     use std::sync::Arc;
-    use vala_bifrost_redux::catalog::TableRef;
+    use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
     use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
@@ -121,6 +121,7 @@ mod pg_tests {
     #[tokio::test]
     async fn pg_scribe_append_seal_file_list() {
         let (fixture, tenant, scribe) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
 
         // 1. Append 50k rows to trigger seal predicate
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
@@ -149,7 +150,7 @@ mod pg_tests {
         scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
 
-        // 3. Verify file_list row - assert all 14 columns per plan
+        // 3. Verify file_list row and its organization-qualified object identity
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
@@ -158,6 +159,7 @@ mod pg_tests {
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             Uuid,                  // id
+            Uuid,                  // data_tenant_id
             String,                // namespace
             String,                // table_name
             String,                // file_path
@@ -166,15 +168,14 @@ mod pg_tests {
             String,                // partition_day
             i64,                   // wal_lsn_min
             i64,                   // wal_lsn_max
-            i32,                   // tenant_bucket
             Uuid,                  // node_id
             i64,                   // writer_epoch
             DateTime<chrono::Utc>, // min_event_time
             DateTime<chrono::Utc>, // max_event_time
         )> = sqlx::query_as(
             r"
-            SELECT id, namespace, table_name, file_path, row_count, file_size,
-                   partition_day::text, wal_lsn_min, wal_lsn_max, tenant_bucket,
+            SELECT id, data_tenant_id, namespace, table_name, file_path, row_count, file_size,
+                   partition_day::text, wal_lsn_min, wal_lsn_max,
                    node_id, writer_epoch, min_event_time, max_event_time
             FROM vala.file_list
             WHERE namespace = 'vala.bifrost' AND table_name = 'events'
@@ -187,6 +188,7 @@ mod pg_tests {
         assert_eq!(rows.len(), 1, "expected exactly one file_list row");
         let (
             id,
+            data_tenant_id,
             namespace,
             table_name,
             file_path,
@@ -195,7 +197,6 @@ mod pg_tests {
             partition_day,
             wal_lsn_min,
             wal_lsn_max,
-            tenant_bucket,
             node_id,
             writer_epoch,
             min_event_time,
@@ -203,11 +204,12 @@ mod pg_tests {
         ) = &rows[0];
 
         assert_ne!(*id, Uuid::nil(), "id should be non-nil UUID");
+        assert_eq!(*data_tenant_id, tenant.as_uuid());
         assert_eq!(namespace, BifrostNamespace::Bifrost.as_str());
         assert_eq!(table_name, "events");
         assert!(
-            file_path.starts_with("bifrost/"),
-            "file_path should start with bifrost/"
+            file_path.starts_with(&binding.object_prefix),
+            "file_path should start with the tenant-qualified object prefix"
         );
         assert!(
             file_path.ends_with(".parquet"),
@@ -219,10 +221,6 @@ mod pg_tests {
         assert!(*wal_lsn_min >= 0, "wal_lsn_min should be non-negative");
         assert!(*wal_lsn_max >= 0, "wal_lsn_max should be non-negative");
         assert!(*wal_lsn_min <= *wal_lsn_max, "LSN range should be valid");
-        assert!(
-            *tenant_bucket >= 0 && *tenant_bucket < 1024,
-            "tenant_bucket should be in [0, 1024)"
-        );
         assert_ne!(*node_id, Uuid::nil(), "node_id should be non-nil");
         assert_eq!(*writer_epoch, 1);
         assert!(

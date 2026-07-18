@@ -301,14 +301,16 @@ mod pg_tests {
             "INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path, file_size,
                 row_count, min_event_time, max_event_time, partition_day,
-                tenant_bucket, node_id, writer_epoch, wal_lsn_min, wal_lsn_max
+                node_id, writer_epoch, wal_lsn_min, wal_lsn_max
              ) VALUES (
-                $1, $2, 'vala', 'events', $3, 128, 2, $4, $4, $5, 0, $6, $7, $8, $9
+                $1, $2, 'vala.bifrost', 'events', $3, 128, 2, $4, $4, $5, $6, $7, $8, $9
              )",
         )
         .bind(Uuid::now_v7())
         .bind(tenant.as_uuid())
-        .bind(format!("sealed/{min_lsn}-{max_lsn}.parquet"))
+        .bind(format!(
+            "tenants/{tenant}/bifrost/events/sealed/{min_lsn}-{max_lsn}.parquet"
+        ))
         .bind(event_time)
         .bind(event_time.date_naive())
         .bind(stream.node_id.as_uuid())

@@ -60,6 +60,16 @@ VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
 }
 
+# These functions intentionally enumerate the SystemShared source commit
+# ledger across tenants through OperatorPool. The rest of their mixed query
+# module remains subject to the tenant-scoped TenantConn checks below.
+VALA_OPERATOR_FUNCTION_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/olap_derivations.rs": {
+        "list_source_commit_tenants",
+        "list_committed_source_batches",
+    },
+}
+
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
 # tenant column and NO RLS (accessed only via the OperatorPool). They are
 # exempt from the RLS-triple requirement because there is no `data_tenant_id`
@@ -268,7 +278,14 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
     if re.search(r"\.begin\s*\(", code):
         failures.append(f"{relative}: tenant query module must not open transactions")
 
+    operator_functions = VALA_OPERATOR_FUNCTION_ALLOWLIST.get(relative, set())
     for fn_name, params in public_async_fns(code):
+        if fn_name in operator_functions:
+            if not has_operator_pool(params):
+                failures.append(
+                    f"{relative}: allowlisted operator fn {fn_name} must take &OperatorPool"
+                )
+            continue
         if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
@@ -427,6 +444,10 @@ def public_async_fns(code: str) -> list[tuple[str, str]]:
 
 def has_platform_executor(code: str) -> bool:
     return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_|&\s*OperatorPool\b", code) is not None
+
+
+def has_operator_pool(params: str) -> bool:
+    return re.search(r"&\s*OperatorPool\b", params) is not None
 
 
 def has_raw_query_marker(body: str) -> bool:

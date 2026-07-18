@@ -24,6 +24,7 @@ use std::sync::Arc;
 use vala_sql::TenantConn;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+use crate::catalog::TenantTableBinding;
 use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::seal_key::{EventDay, SealKey};
@@ -130,22 +131,22 @@ impl ScribeImpl {
     ) -> Result<seal::SealCommit, ScribeError> {
         use crate::scribe::seal::SealDriver;
 
-        // Cross-tenant guard: seal_key.tenant must match conn.data_tenant_id()
-        let conn_tenant = conn.data_tenant_id();
-        if seal_key.tenant != conn_tenant {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "tenant mismatch: seal_key.tenant={} vs conn.data_tenant_id={}",
-                    seal_key.tenant, conn_tenant
-                ),
-            });
-        }
+        let binding = TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        binding
+            .validate_authenticated_tenant(conn.data_tenant_id())
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
 
         let driver = SealDriver::new(self.operator.clone());
         driver
             .pre_commit(
                 &self.memtable,
                 seal_key,
+                &binding,
                 conn,
                 &self.node_id,
                 self.writer_epoch,

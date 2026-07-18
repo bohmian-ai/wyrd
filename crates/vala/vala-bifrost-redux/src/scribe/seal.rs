@@ -7,10 +7,11 @@ use tracing::{info, warn};
 use vala_sql::TenantConn;
 use wyrd_spec::ids::PodId;
 
+use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::scribe::file_list_writer;
 use crate::scribe::filename::seal_filename;
-use crate::scribe::memtable::{FrozenMemtable, Memtable};
+use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, write_frozen_to_parquet};
 use crate::scribe::seal_key::SealKey;
 
@@ -19,6 +20,7 @@ use crate::scribe::seal_key::SealKey;
 #[derive(Debug, Clone)]
 pub struct SealCommit {
     pub seal_key: SealKey,
+    pub binding: TenantTableBinding,
     pub wal_lsn_max: u64,
     pub parquet_path: String,
 }
@@ -50,10 +52,25 @@ impl SealDriver {
         &self,
         memtable: &Memtable,
         seal_key: &SealKey,
+        binding: &TenantTableBinding,
         conn: &mut TenantConn<'_>,
         node_id: &str,
         writer_epoch: i64,
     ) -> Result<SealCommit, ScribeError> {
+        binding
+            .validate_authenticated_tenant(conn.data_tenant_id())
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        if binding.table_ref != seal_key.table || binding.tenant != seal_key.tenant {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "tenant-table binding does not match seal key: binding tenant/table=({},{}) seal tenant/table=({},{})",
+                    binding.tenant, binding.table_ref, seal_key.tenant, seal_key.table
+                ),
+            });
+        }
+
         // 1. Freeze
         info!("seal stage: Freeze");
         let frozen = memtable.freeze(seal_key)?;
@@ -69,13 +86,14 @@ impl SealDriver {
 
         // 3. PutObject
         info!("seal stage: PutObject");
-        let parquet_path = self.put_object(&frozen, &encoded, node_id).await?;
+        let parquet_path = self.put_object(binding, &encoded, node_id).await?;
 
         // 4. AtomicPgTx
         info!("seal stage: AtomicPgTx");
         let row = file_list_writer::build_insert(
             &frozen,
             &encoded,
+            binding,
             node_id,
             writer_epoch,
             &parquet_path,
@@ -95,6 +113,7 @@ impl SealDriver {
         // Return handle for post-commit stages
         Ok(SealCommit {
             seal_key: seal_key.clone(),
+            binding: binding.clone(),
             wal_lsn_max,
             parquet_path,
         })
@@ -124,7 +143,7 @@ impl SealDriver {
     /// Returns [`ScribeError::ObjectStorePutFailed`] on non-transient failures.
     async fn put_object(
         &self,
-        frozen: &FrozenMemtable,
+        binding: &TenantTableBinding,
         encoded: &ParquetEncoded,
         node_id: &str,
     ) -> Result<String, ScribeError> {
@@ -132,13 +151,7 @@ impl SealDriver {
             detail: format!("node_id is not a valid PodId: {e}"),
         })?;
         let filename = seal_filename(&pod_id);
-        let path = format!(
-            "bifrost/{}/{}/{}/{}",
-            frozen.seal_key.tenant,
-            frozen.seal_key.table.namespace,
-            frozen.seal_key.table.name,
-            filename
-        );
+        let path = format!("{}/{}", binding.object_prefix, filename);
 
         // Retry policy: base 100 ms, cap 5 s, 5 attempts max, jitter enabled
         let mut attempt = 0;

@@ -20,7 +20,7 @@
 //! - `workflow` — `Workflow`, `WorkflowFieldType` (optional declared shape).
 //! - `condition` — `EvalCondition` gate predicates shared by tasks.
 //! - `assertion` — `AssertionTask` programmatic assertions.
-//! - `llm_judge` — `LlmJudgeTask` prompt-backed judge task.
+//! - `llm_judge` — `LlmJudgeTask` Agent-backed judge task.
 //! - `trace` — `TraceAssertionTask` trace document assertions.
 //! - `agent` — `AgentAssertionTask` workflow envelope assertions.
 //! - `task` — `EvalTask` executable task enum.

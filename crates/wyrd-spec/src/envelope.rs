@@ -509,30 +509,6 @@ fn visit_refs_mut<V: ReferenceSlotVisitor>(refs: &mut [Ref], visitor: &mut V) {
     }
 }
 
-fn visit_card_ref<V: ReferenceSlotVisitor>(card_ref: Option<&CardRef>, visitor: &mut V) {
-    if let Some(card_ref) = card_ref {
-        visitor.visit_ref(card_ref);
-    }
-}
-
-fn visit_card_ref_mut<V: ReferenceSlotVisitor>(card_ref: Option<&mut CardRef>, visitor: &mut V) {
-    if let Some(card_ref) = card_ref {
-        visitor.visit_ref_mut(card_ref);
-    }
-}
-
-fn visit_card_refs<V: ReferenceSlotVisitor>(refs: &[CardRef], visitor: &mut V) {
-    for card_ref in refs {
-        visit_card_ref(Some(card_ref), visitor);
-    }
-}
-
-fn visit_card_refs_mut<V: ReferenceSlotVisitor>(refs: &mut [CardRef], visitor: &mut V) {
-    for card_ref in refs {
-        visit_card_ref_mut(Some(card_ref), visitor);
-    }
-}
-
 fn visit_inlineable_ref<T, V: ReferenceSlotVisitor>(reference: &InlineableRef<T>, visitor: &mut V) {
     if let Some(card_ref) = reference.as_card_ref() {
         visitor.visit_ref(card_ref);
@@ -550,11 +526,11 @@ fn visit_inlineable_ref_mut<T, V: ReferenceSlotVisitor>(
 
 fn walk_workflow<V: ReferenceSlotVisitor>(spec: &WorkflowSpec, visitor: &mut V) {
     if let Some(governance) = &spec.governance {
-        visit_card_refs(&governance.policy_refs, visitor);
-        visit_card_ref(governance.audit_ref.as_ref(), visitor);
+        visit_refs(&governance.policy_refs, visitor);
+        visit_ref(governance.audit_ref.as_ref(), visitor);
     }
     if let Some(hooks) = &spec.observation_hooks {
-        visit_card_refs(&hooks.route_refs, visitor);
+        visit_refs(&hooks.route_refs, visitor);
     }
     for step in &spec.steps {
         match &step.action {
@@ -573,11 +549,11 @@ fn walk_workflow<V: ReferenceSlotVisitor>(spec: &WorkflowSpec, visitor: &mut V) 
 
 fn walk_workflow_mut<V: ReferenceSlotVisitor>(spec: &mut WorkflowSpec, visitor: &mut V) {
     if let Some(governance) = &mut spec.governance {
-        visit_card_refs_mut(&mut governance.policy_refs, visitor);
-        visit_card_ref_mut(governance.audit_ref.as_mut(), visitor);
+        visit_refs_mut(&mut governance.policy_refs, visitor);
+        visit_ref_mut(governance.audit_ref.as_mut(), visitor);
     }
     if let Some(hooks) = &mut spec.observation_hooks {
-        visit_card_refs_mut(&mut hooks.route_refs, visitor);
+        visit_refs_mut(&mut hooks.route_refs, visitor);
     }
     for step in &mut spec.steps {
         match &mut step.action {

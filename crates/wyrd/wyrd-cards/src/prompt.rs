@@ -8,13 +8,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::card::prompt::{PromptRef as NativePromptRef, PromptSpec};
+use wyrd_spec::card::prompt::PromptSpec;
 use wyrd_spec::envelope::{
     Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec, SpecHash,
 };
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, InlineableRef};
 
 use crate::identity::{card_name, optional_card_uid, space_name, validation_error, version_block};
 
@@ -45,26 +45,26 @@ pub struct PromptCardMetadata {
     pub prompt: skald_spec::Prompt,
 }
 
-/// Python-facing Wyrd prompt reference.
+/// Python-facing inlineable prompt reference.
 ///
-/// A prompt reference points at either a registered Prompt Card or an inline
-/// Prompt spec.
+/// This is the Python authoring surface for an Agent's prompt slot. It points
+/// at a registered Prompt Card or carries a native inline prompt.
 #[cfg_attr(
     feature = "python",
-    pyclass(module = "wyrd.prompt", name = "PromptRef", skip_from_py_object)
+    pyclass(module = "wyrd.prompt", name = "PromptReference", skip_from_py_object)
 )]
 // justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PromptRef {
-    /// Wrapped native prompt reference.
-    pub inner: NativePromptRef,
+pub struct PromptReference {
+    /// Wrapped inlineable prompt reference.
+    pub inner: InlineableRef<skald_spec::Prompt>,
 }
 
-impl PromptRef {
-    /// Wrap a native prompt reference.
+impl PromptReference {
+    /// Wrap a native inlineable prompt reference.
     #[must_use]
-    pub const fn from_native(inner: NativePromptRef) -> Self {
+    pub const fn from_native(inner: InlineableRef<skald_spec::Prompt>) -> Self {
         Self { inner }
     }
 }
@@ -273,8 +273,8 @@ impl PromptCard {
 
 #[cfg(feature = "python")]
 #[pymethods]
-impl PromptRef {
-    /// Build a `PromptRef` that points at a registered Prompt Card.
+impl PromptReference {
+    /// Build a prompt reference that points at a registered Prompt Card.
     ///
     /// # Errors
     /// Returns a Wyrd error when the card identity fields are invalid.
@@ -288,25 +288,27 @@ impl PromptRef {
             space: space_name(space)?,
             uid: uid.map_or(Ok(None), optional_card_uid)?,
         };
-        Ok(Self::from_native(NativePromptRef::Card(card_ref)))
+        Ok(Self::from_native(InlineableRef::Ref(card_ref)))
     }
 
-    /// Build an inline `PromptRef` from a Python `Prompt`.
+    /// Build an inline prompt reference from a Python `Prompt`.
     ///
     /// # Errors
     /// Returns a Wyrd error when the prompt is invalid.
     #[staticmethod]
     pub fn inline(prompt: &Bound<'_, PyAny>) -> CardPyResult<Self> {
-        let spec = PromptSpec::new(native_prompt_from_py(prompt)?)?;
-        Ok(Self::from_native(NativePromptRef::Inline(Box::new(spec))))
+        Ok(Self::from_native(InlineableRef::Inline(Box::new(
+            native_prompt_from_py(prompt)?,
+        ))))
     }
 
     /// Return `card` or `inline`.
     #[getter]
     pub fn kind(&self) -> &'static str {
         match self.inner {
-            NativePromptRef::Card(_) => "card",
-            NativePromptRef::Inline(_) => "inline",
+            InlineableRef::Ref(_) => "card",
+            InlineableRef::Inline(_) => "inline",
+            InlineableRef::Path(_) => "path",
         }
     }
 
@@ -327,7 +329,7 @@ impl PromptRef {
         Ok(serde_json::to_string(&self.inner)?)
     }
 
-    /// Rebuild a `PromptRef` from JSON.
+    /// Rebuild a prompt reference from JSON.
     ///
     /// # Errors
     /// Returns a Wyrd error when JSON parsing or validation fails.
@@ -338,7 +340,7 @@ impl PromptRef {
 
     /// Return a concise Python representation.
     pub fn __repr__(&self) -> String {
-        format!("PromptRef(kind={:?})", self.kind())
+        format!("PromptReference(kind={:?})", self.kind())
     }
 }
 

@@ -379,7 +379,7 @@ mod scenario_execution {
 
     fn judge_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new("scenario-judge").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
             space: SpaceName::new("default").expect("valid space"),

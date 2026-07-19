@@ -728,7 +728,7 @@ mod end_to_end {
     }
 
     fn judge_ref() -> CardRef {
-        card_ref(CardKind::Prompt, "judge")
+        card_ref(CardKind::Agent, "judge")
     }
 
     fn trace_id() -> TraceId {

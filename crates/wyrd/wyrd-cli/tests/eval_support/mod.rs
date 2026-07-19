@@ -86,7 +86,7 @@ pub fn assertion_task() -> EvalTask {
 pub fn judge_task() -> EvalTask {
     EvalTask::LlmJudge(LlmJudgeTask {
         id: tid("judge_check"),
-        judge_ref: card_ref(CardKind::Prompt, "judge").into(),
+        judge_ref: card_ref(CardKind::Agent, "judge").into(),
         context_path: None,
         expected: json!({"passed": true}),
         operator: ComparisonOperator::Equals,

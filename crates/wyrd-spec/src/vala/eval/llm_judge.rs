@@ -13,9 +13,10 @@ use super::operator::ComparisonOperator;
 
 /// LLM-as-judge task.
 ///
-/// `judge_ref` must point at a `Prompt` card. The runtime renders the prompt
-/// with workflow context, dispatches it through the approved runtime boundary,
-/// and applies `operator` and `expected` to the response.
+/// `judge_ref` must point at an `Agent` card or carry an inline Agent spec.
+/// The Agent resolves its Prompt child, runs one constrained structured-output
+/// turn with workflow context, and the Eval applies `operator` and `expected`
+/// to the response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LlmJudgeTask {

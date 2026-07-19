@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::reference::CardRef;
+use crate::reference::{CardRef, Ref};
 
 /// Typed parameter value for experiments, runs, workflows, and tools.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -108,10 +108,10 @@ pub enum NonSecretValue {
 pub struct Governance {
     /// Policy Card references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub policy_refs: Vec<CardRef>,
+    pub policy_refs: Vec<Ref>,
     /// Audit Card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub audit_ref: Option<CardRef>,
+    pub audit_ref: Option<Ref>,
     /// Required approval labels or scopes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approval_requirements: Vec<String>,
@@ -126,7 +126,7 @@ pub struct Governance {
 pub struct ObservationHooks {
     /// Observation route Card references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub route_refs: Vec<CardRef>,
+    pub route_refs: Vec<Ref>,
     /// Event names to observe.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<String>,

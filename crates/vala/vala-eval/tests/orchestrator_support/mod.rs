@@ -51,7 +51,7 @@ pub fn subject_ref() -> CardRef {
 }
 
 pub fn judge_ref() -> CardRef {
-    card_ref(CardKind::Prompt, "judge")
+    card_ref(CardKind::Agent, "judge")
 }
 
 pub fn scenario(

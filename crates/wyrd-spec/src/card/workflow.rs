@@ -424,6 +424,31 @@ impl From<WorkflowValidationError> for WyrdError {
 
 fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     let mut out: Vec<CardRef> = Vec::new();
+    if let Some(governance) = &spec.governance {
+        out.extend(
+            governance
+                .policy_refs
+                .iter()
+                .filter_map(Ref::as_card_ref)
+                .cloned(),
+        );
+        out.extend(
+            governance
+                .audit_ref
+                .as_ref()
+                .and_then(Ref::as_card_ref)
+                .cloned(),
+        );
+    }
+    if let Some(observation_hooks) = &spec.observation_hooks {
+        out.extend(
+            observation_hooks
+                .route_refs
+                .iter()
+                .filter_map(Ref::as_card_ref)
+                .cloned(),
+        );
+    }
     for step in &spec.steps {
         match &step.action {
             WorkflowAction::Mcp(card_ref) | WorkflowAction::Prompt(card_ref) => {
@@ -497,8 +522,10 @@ fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
 #[cfg(test)]
 mod workflow_spec_tests {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
 
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
+    use crate::card::common::{Governance, ObservationHooks};
     use crate::card::workflow::{
         WorkflowAction, WorkflowCard, WorkflowSpec, WorkflowStep, WorkflowValidationError,
     };
@@ -506,7 +533,17 @@ mod workflow_spec_tests {
     use crate::error::WyrdError;
     use crate::ids::SpaceName;
     use crate::metadata::{Annotations, Labels};
-    use crate::reference::{CardRef, InlineableRef};
+    use crate::reference::{CardRef, InlineableRef, Ref};
+
+    fn card_ref(kind: CardKind, name: &str) -> CardRef {
+        CardRef {
+            kind,
+            name: name.parse().expect("valid card name"),
+            version: "0.1.0".parse().expect("valid version"),
+            space: SpaceName::new("default").expect("static space is valid"),
+            uid: None,
+        }
+    }
 
     fn prompt() -> skald_spec::Prompt {
         skald_spec::Prompt::new(
@@ -699,6 +736,45 @@ mod workflow_spec_tests {
             reloaded.cascade_children[0].name.as_str(),
             "research-planner"
         );
+    }
+
+    #[test]
+    fn workflow_card_cascade_includes_governance_and_observation_refs() {
+        let spec = WorkflowSpec {
+            governance: Some(Governance {
+                policy_refs: vec![Ref::from(card_ref(CardKind::Policy, "policy"))],
+                audit_ref: Some(Ref::from(card_ref(CardKind::Audit, "audit"))),
+                ..Governance::default()
+            }),
+            observation_hooks: Some(ObservationHooks {
+                route_refs: vec![Ref::from(card_ref(CardKind::Service, "route"))],
+                ..ObservationHooks::default()
+            }),
+            ..WorkflowSpec::default()
+        };
+        let card = WorkflowCard {
+            space: "default".to_owned(),
+            name: "research".to_owned(),
+            version: "0.1.0".to_owned(),
+            uid: String::new(),
+            labels: Labels::default(),
+            annotations: Annotations::default(),
+            spec,
+            cascade_children: vec![],
+            created_at: chrono::Utc::now(),
+        };
+
+        let envelope = card.to_envelope().expect("to_envelope");
+        let reloaded = WorkflowCard::from_envelope(envelope).expect("from_envelope");
+        let children: BTreeSet<_> = reloaded
+            .cascade_children
+            .iter()
+            .map(|child| (child.kind.clone(), child.name.as_str().to_owned()))
+            .collect();
+        assert_eq!(children.len(), 3);
+        assert!(children.contains(&(CardKind::Policy, "policy".to_owned())));
+        assert!(children.contains(&(CardKind::Audit, "audit".to_owned())));
+        assert!(children.contains(&(CardKind::Service, "route".to_owned())));
     }
 
     #[test]

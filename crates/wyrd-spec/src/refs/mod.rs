@@ -160,6 +160,29 @@ impl Visit for crate::card::workflow::WorkflowSpec {
     {
         use crate::card::workflow::WorkflowAction;
 
+        if let Some(governance) = &mut self.governance {
+            for (index, policy_ref) in governance.policy_refs.iter_mut().enumerate() {
+                f(SlotEntry {
+                    path: format!("spec.governance.policy_refs[{}]", index),
+                    value: SlotValue::Durable(policy_ref),
+                });
+            }
+            if let Some(audit_ref) = &mut governance.audit_ref {
+                f(SlotEntry {
+                    path: "spec.governance.audit_ref".to_owned(),
+                    value: SlotValue::Durable(audit_ref),
+                });
+            }
+        }
+        if let Some(observation_hooks) = &mut self.observation_hooks {
+            for (index, route_ref) in observation_hooks.route_refs.iter_mut().enumerate() {
+                f(SlotEntry {
+                    path: format!("spec.observation_hooks.route_refs[{}]", index),
+                    value: SlotValue::Durable(route_ref),
+                });
+            }
+        }
+
         for (step_idx, step) in self.steps.iter_mut().enumerate() {
             match &mut step.action {
                 WorkflowAction::Agent(agent_ref) => {
@@ -370,5 +393,365 @@ impl Visit for crate::card::operator::OperatorSpec {
                 value: SlotValue::Durable(card_ref),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod completeness_tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use serde_json::json;
+
+    use super::{ReferenceSlotVisitor, SlotValue};
+    use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
+    use crate::card::artifact::ArtifactSpec;
+    use crate::card::artifact::FrameworkAdapterRef;
+    use crate::card::audit::AuditSpec;
+    use crate::card::common::{Governance, ObservationHooks};
+    use crate::card::data::{
+        ColorMode, DataInterface, DataSchema, DataSpec, DataStats, ImageFormat, ImageMeta,
+        PandasMeta, ParquetCompression, SplitStrategy, TextMeta,
+    };
+    use crate::card::drift::{DriftCondition, DriftMethod, DriftSignal, DriftSpec};
+    use crate::card::experiment::ExperimentSpec;
+    use crate::card::field::FieldSpec;
+    use crate::card::mcp::McpSpec;
+    use crate::card::model::{ModelInterface, ModelSignature, ModelSpec, SklearnMeta, TaskType};
+    use crate::card::operator::OperatorSpec;
+    use crate::card::service::{ServiceComponent, ServiceSpec};
+    use crate::card::trigger::{TriggerSource, TriggerSpec};
+    use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
+    use crate::envelope::{CardKind, Spec};
+    use crate::ids::{CardName, ColumnName, SpaceName};
+    use crate::reference::{CardRef, InlineableRef, Ref};
+    use crate::vala::eval::ids::TaskId;
+    use crate::vala::eval::{ComparisonOperator, DatasetRef, EvalSpec, EvalTask, LlmJudgeTask};
+    use wyrd_semver::VersionBlock;
+
+    fn card_ref(kind: CardKind, name: &str) -> CardRef {
+        CardRef {
+            kind,
+            name: CardName::new(name).expect("fixture card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("fixture version is valid"),
+            space: SpaceName::new("default").expect("fixture space is valid"),
+            uid: None,
+        }
+    }
+
+    fn prompt() -> skald_spec::Prompt {
+        skald_spec::Prompt::new(
+            skald_spec::ProviderRequest::OpenAiChatCompletion(skald_spec::OpenAiChatRequest {
+                model: "gpt-test".to_owned(),
+                messages: vec![skald_spec::OpenAiChatMessage {
+                    role: "user".to_owned(),
+                    content: Some(skald_spec::wire::openai_chat::OpenAiMessageContent::Text(
+                        "judge ${context}".to_owned(),
+                    )),
+                    ..Default::default()
+                }],
+                response_format: None,
+                stream: None,
+                stream_options: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                settings: skald_spec::OpenAiChatSettings::default(),
+            }),
+            "gpt-test",
+            None,
+            skald_spec::ResponseType::JsonSchema {
+                name: "judge_result".to_owned(),
+                schema: json!({"type": "object"}),
+            },
+        )
+        .expect("fixture prompt is valid")
+    }
+
+    fn agent() -> AgentSpec {
+        AgentSpec {
+            prompt: InlineableRef::Inline(Box::new(prompt())),
+            tool_names: Vec::new(),
+            run_config: AgentRunConfigSpec {
+                max_iterations: Some(1),
+                ..AgentRunConfigSpec::default()
+            },
+        }
+    }
+
+    fn data(interface: DataInterface) -> DataSpec {
+        DataSpec {
+            interface,
+            schema: DataSchema::new(vec![FieldSpec::new(
+                ColumnName::new("value").expect("fixture column is valid"),
+                "int64",
+            )]),
+            card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "data-artifact"))],
+            splits: HashMap::from([(
+                crate::ids::SplitName::new("train").expect("fixture split is valid"),
+                crate::card::data::DataSplit {
+                    label: crate::ids::SplitName::new("train").expect("fixture split is valid"),
+                    strategy: SplitStrategy::Materialized(Ref::Ref(card_ref(
+                        CardKind::Artifact,
+                        "split-artifact",
+                    ))),
+                },
+            )]),
+            target_columns: Vec::new(),
+            sql: None,
+            stats: DataStats {
+                row_count: Some(1),
+                col_count: Some(1),
+                byte_count: 1,
+                sha256: "a".repeat(64),
+            },
+        }
+    }
+
+    fn model() -> ModelSpec {
+        ModelSpec {
+            interface: ModelInterface::Sklearn(SklearnMeta {
+                framework_version: "1.0".to_owned(),
+                model_subtype: None,
+            }),
+            task_type: TaskType::Regression,
+            signature: ModelSignature::new(
+                vec![FieldSpec::new(
+                    ColumnName::new("input").expect("fixture column is valid"),
+                    "float32",
+                )],
+                vec![FieldSpec::new(
+                    ColumnName::new("output").expect("fixture column is valid"),
+                    "float32",
+                )],
+            ),
+            sample_input: None,
+            card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "model-artifact"))],
+        }
+    }
+
+    fn workflow() -> WorkflowSpec {
+        WorkflowSpec {
+            governance: Some(Governance {
+                policy_refs: vec![Ref::Ref(card_ref(CardKind::Policy, "policy"))],
+                audit_ref: Some(Ref::Ref(card_ref(CardKind::Audit, "audit"))),
+                ..Governance::default()
+            }),
+            observation_hooks: Some(ObservationHooks {
+                route_refs: vec![Ref::Ref(card_ref(CardKind::Service, "route"))],
+                ..ObservationHooks::default()
+            }),
+            steps: vec![
+                WorkflowStep {
+                    id: "agent".to_owned(),
+                    action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(agent()))),
+                    depends_on: Vec::new(),
+                    inputs: BTreeMap::new(),
+                    condition: None,
+                    timeout_seconds: None,
+                    retry: None,
+                    display: BTreeMap::new(),
+                },
+                WorkflowStep {
+                    id: "mcp".to_owned(),
+                    action: WorkflowAction::Mcp(Ref::Ref(card_ref(CardKind::Mcp, "mcp"))),
+                    depends_on: Vec::new(),
+                    inputs: BTreeMap::new(),
+                    condition: None,
+                    timeout_seconds: None,
+                    retry: None,
+                    display: BTreeMap::new(),
+                },
+                WorkflowStep {
+                    id: "prompt".to_owned(),
+                    action: WorkflowAction::Prompt(Ref::Ref(card_ref(CardKind::Prompt, "prompt"))),
+                    depends_on: Vec::new(),
+                    inputs: BTreeMap::new(),
+                    condition: None,
+                    timeout_seconds: None,
+                    retry: None,
+                    display: BTreeMap::new(),
+                },
+            ],
+            ..WorkflowSpec::default()
+        }
+    }
+
+    fn eval() -> EvalSpec {
+        let task_id = TaskId::new("judge").expect("fixture task id is valid");
+        let judge = LlmJudgeTask::new(
+            task_id.clone(),
+            agent(),
+            ComparisonOperator::Equals,
+            json!(true),
+        )
+        .expect("fixture judge is valid");
+        let mut eval = EvalSpec::new(BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]))
+            .expect("fixture eval is valid");
+        eval.subject_ref = Some(Ref::Ref(card_ref(CardKind::Model, "subject")));
+        eval.dataset = Some(DatasetRef(Ref::Ref(card_ref(CardKind::Data, "dataset"))));
+        eval
+    }
+
+    fn visit_paths(mut spec: Spec) -> Vec<(String, &'static str)> {
+        let mut paths = Vec::new();
+        ReferenceSlotVisitor::visit(&mut spec, |entry| {
+            let kind = match entry.value {
+                SlotValue::Durable(_) => "durable",
+                SlotValue::InlineablePrompt(_) => "inlineable_prompt",
+                SlotValue::InlineableAgent(_) => "inlineable_agent",
+            };
+            paths.push((entry.path, kind));
+        });
+        paths
+    }
+
+    #[test]
+    fn every_spec_ref_field_is_ref_or_inlineable_ref() {
+        let image = data(DataInterface::Image(ImageMeta {
+            format: ImageFormat::Png,
+            manifest_ref: Some(Ref::Ref(card_ref(CardKind::Artifact, "manifest"))),
+            color_mode: ColorMode::Rgb,
+        }));
+        let text = data(DataInterface::Text(TextMeta {
+            encoding: "utf-8".to_owned(),
+            manifest_ref: Some(Ref::Ref(card_ref(CardKind::Artifact, "text-manifest"))),
+        }));
+        let mut experiment = ExperimentSpec {
+            target_refs: vec![Ref::Ref(card_ref(CardKind::Model, "target"))],
+            card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "artifact"))],
+            ..ExperimentSpec::default()
+        };
+        let mut artifact = ArtifactSpec {
+            artifact_kind: "file".to_owned(),
+            schema_ref: Some(Ref::Ref(card_ref(CardKind::Data, "schema"))),
+            ..ArtifactSpec::default()
+        };
+        let mut audit = AuditSpec {
+            subject_refs: vec![Ref::Ref(card_ref(CardKind::Model, "subject"))],
+            policy_refs: vec![Ref::Ref(card_ref(CardKind::Policy, "policy"))],
+            evidence_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "evidence"))],
+            ..AuditSpec::default()
+        };
+        let mut mcp = McpSpec {
+            server_name: "fixture".to_owned(),
+            tool_refs: vec![Ref::Ref(card_ref(CardKind::Service, "tool"))],
+            ..McpSpec::default()
+        };
+        let mut service = ServiceSpec {
+            components: vec![ServiceComponent {
+                alias: "model".to_owned(),
+                card_ref: Ref::Ref(card_ref(CardKind::Model, "component")),
+                source: None,
+                config: BTreeMap::new(),
+                credential_refs: Vec::new(),
+            }],
+            ..ServiceSpec::default()
+        };
+        let mut trigger = TriggerSpec {
+            source: TriggerSource::DriftObservation {
+                card: Ref::Ref(card_ref(CardKind::Drift, "drift")),
+            },
+            target: Ref::Ref(card_ref(CardKind::Operator, "operator")),
+            cooldown_seconds: None,
+            config: BTreeMap::new(),
+        };
+        let mut operator = OperatorSpec {
+            adapter: FrameworkAdapterRef {
+                name: "fixture".to_owned(),
+                version: "1".to_owned(),
+                config: BTreeMap::new(),
+            },
+            inputs: Vec::new(),
+            pre_invoke: vec![Ref::Ref(card_ref(CardKind::Policy, "pre"))],
+            post_invoke: vec![Ref::Ref(card_ref(CardKind::Policy, "post"))],
+            budget: None,
+        };
+        let mut drift = DriftSpec {
+            description: None,
+            method: DriftMethod::External,
+            subject_ref: Ref::Ref(card_ref(CardKind::Model, "subject")),
+            signal: DriftSignal::External {
+                source_ref: Ref::Ref(card_ref(CardKind::Source, "source")),
+            },
+            condition: DriftCondition::Statistical,
+            profile: None,
+            details: BTreeMap::new(),
+        };
+        let mut workflow = workflow();
+        let mut eval = eval();
+        let mut image = image;
+        let mut text = text;
+        let mut model = model();
+        let mut agent = agent();
+
+        let mut count = 0;
+        for spec in [
+            Spec::Data(image.clone()),
+            Spec::Data(text.clone()),
+            Spec::Model(model.clone()),
+            Spec::Experiment(experiment.clone()),
+            Spec::Agent(agent.clone()),
+            Spec::Workflow(workflow.clone()),
+            Spec::Eval(eval.clone()),
+            Spec::Drift(drift.clone()),
+            Spec::Service(service.clone()),
+            Spec::Mcp(mcp.clone()),
+            Spec::Audit(audit.clone()),
+            Spec::Artifact(artifact.clone()),
+            Spec::Trigger(trigger.clone()),
+            Spec::Operator(operator.clone()),
+        ] {
+            count += visit_paths(spec).len();
+        }
+        assert_eq!(count, 31);
+
+        let _ = (
+            &mut image,
+            &mut text,
+            &mut model,
+            &mut experiment,
+            &mut agent,
+        );
+        let _ = (&mut workflow, &mut eval, &mut drift, &mut service, &mut mcp);
+        let _ = (&mut audit, &mut artifact, &mut trigger, &mut operator);
+    }
+
+    #[test]
+    fn visitor_covers_every_slot_in_the_migration_table() {
+        let expected = vec![
+            ("spec.card_refs[0]".to_owned(), "durable"),
+            (
+                "spec.splits[train].strategy.Materialized".to_owned(),
+                "durable",
+            ),
+        ];
+        let actual = visit_paths(Spec::Data(data(DataInterface::Pandas(PandasMeta {
+            framework_version: "2".to_owned(),
+            compression: ParquetCompression::Snappy,
+        }))));
+        assert_eq!(actual, expected);
+
+        assert_eq!(
+            visit_paths(Spec::Workflow(workflow())),
+            vec![
+                ("spec.governance.policy_refs[0]".to_owned(), "durable"),
+                ("spec.governance.audit_ref".to_owned(), "durable"),
+                ("spec.observation_hooks.route_refs[0]".to_owned(), "durable"),
+                ("spec.steps[0].action.Agent".to_owned(), "inlineable_agent"),
+                ("spec.steps[1].action.Mcp".to_owned(), "durable"),
+                ("spec.steps[2].action.Prompt".to_owned(), "durable"),
+            ]
+        );
+        assert_eq!(
+            visit_paths(Spec::Eval(eval())),
+            vec![
+                ("spec.dataset".to_owned(), "durable"),
+                ("spec.subject_ref".to_owned(), "durable"),
+                (
+                    "spec.tasks[judge].LlmJudge.judge_ref".to_owned(),
+                    "inlineable_agent"
+                ),
+            ]
+        );
     }
 }

@@ -12,7 +12,7 @@ pub mod simulator;
 pub mod state;
 
 pub use error::OrchestratorError;
-pub use judge::{PromptCardResolver, SkaldJudgeInvoker};
+pub use judge::{AgentCardResolver, PromptCardResolver, SkaldJudgeInvoker};
 pub use scoring::ScenarioScoring;
 pub use simulator::{SIMULATOR_PROMPT_TEMPLATE, ServerSimulatedUser, SimulatorPrompt};
 pub use state::{NextDirective, RunState, RunStatus, ScenarioCursor, SharedRun, SubmissionOutcome};

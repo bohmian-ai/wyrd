@@ -17,7 +17,7 @@ use crate::operators;
 use crate::store::JudgeOutcome;
 use crate::tasks::media::{MediaBindings, bindings_as_context};
 
-/// Executor for prompt-backed LLM judge tasks.
+/// Executor for Agent-backed LLM judge tasks.
 pub struct JudgeTaskExecutor {
     invoker: Arc<dyn JudgeInvoker>,
 }
@@ -88,6 +88,7 @@ impl TaskExecutor for JudgeTaskExecutor {
         let outcome = JudgeOutcome {
             raw: context_for_invoker,
             parsed,
+            judge_ref: judge.judge_ref.as_card_ref().cloned(),
         };
         Ok(TaskOutput::Judge { result, outcome })
     }
@@ -116,31 +117,18 @@ async fn invoke_with_retries(
     task: &LlmJudgeTask,
     context: Value,
 ) -> Result<Value, EvalExecError> {
-    let judge_ref = match &task.judge_ref {
-        InlineableRef::Ref(card_ref) => card_ref,
-        InlineableRef::Inline(_) => {
-            return Err(EvalExecError::JudgeRetriesExhausted {
+    if matches!(&task.judge_ref, InlineableRef::Path(_)) {
+        return Err(EvalExecError::JudgeRetriesExhausted {
                 task_id: task.id.clone(),
                 attempts: 0,
-                last_error:
-                    "inline Agent judge execution is not available at this invoker boundary"
-                        .to_owned(),
+                last_error: "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: judge Agent path must be rewritten by the loader before execution".to_owned(),
             });
-        }
-        InlineableRef::Path(_) => {
-            return Err(EvalExecError::JudgeRetriesExhausted {
-                task_id: task.id.clone(),
-                attempts: 0,
-                last_error: "judge path must be rewritten by the loader before execution"
-                    .to_owned(),
-            });
-        }
-    };
+    }
     let max_attempts = task.max_retries.saturating_add(1);
     let mut last_error = String::from("no attempt made");
 
     for attempt in 0..max_attempts {
-        match invoker.invoke(judge_ref, context.clone()).await {
+        match invoker.invoke(&task.judge_ref, context.clone()).await {
             Ok(value) => return Ok(value),
             Err(error) if error.is_retryable() && attempt + 1 < max_attempts => {
                 last_error = error.to_string();
@@ -207,7 +195,7 @@ mod llm_judge_executor {
 
     fn judge_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new("eval-judge").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
             space: SpaceName::new("default").expect("valid space"),

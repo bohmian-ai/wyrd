@@ -87,17 +87,12 @@ Downstream artifacts are brought up to this version in a sync pass.
     Workflow, Audit, Service) is spec-only: `wyrd apply -f file.yaml` reads
     and registers in one move. No separate storage step, no programmatic
     registration prerequisite.
-17. **Light cards may inline in place of a `CardRef`.** Wherever a `CardRef`
-    points at a light card and the inline target has no need for cross-spec
-    identity, the parent spec MAY embed the full definition instead. Today
-    `Agent.prompt` accepts `PromptRef = CardRef | Inline`. Inline definitions
-    have no card identity, are not registered
-    standalone, and cannot be referenced from outside their parent. To reuse,
-    register as a card and reference by `CardRef`. Heavy refs
-    (`Eval.dataset`, `Model.card_refs`, `Data.card_refs`,
-    `Service.components.ref`, `Workflow.steps.target`, `publishes_to`,
-    `TriggerSource.*.subject_filter`) stay `CardRef`-only — identity is
-    the point.
+17. **Light cards may inline in place of a `CardRef`.** Wherever a spec slot
+    permits an embedded child, it uses `InlineableRef<T>`. Inline definitions
+    have no card identity, are not registered standalone, and cannot be
+    referenced from outside their parent. To reuse a child, register it as a
+    card and reference it with `Ref::Ref(CardRef)`. Durable-only slots use
+    `Ref`.
 18. **Auth and Policy are two distinct planes.** Emit is **not** a third
     plane: a deployed service's observation/ingest writes are ordinary
     Auth-plane routes, authorized by the same JWT and a
@@ -158,30 +153,13 @@ Downstream artifacts are brought up to this version in a sync pass.
     and `X-Original-*` to `/v1/authz/check`; the body is empty. Both caller
     and callee identities are server-verified from one signed delegated
     JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
-19. **Reference slots accept `ref | select | path | inline`.** Wherever a
-    card spec references another card — light or heavy (Prompt, Agent,
-    Workflow, Mcp, Policy, Eval, Trigger, Operator, Source, Audit, Service,
-    Model, Data, Experiment, Artifact) — the slot is a tagged-by-key union,
-    mutually exclusive. The key IS the discriminator:
-    - `ref:`    — a `CardRef` with exact identity: `kind`, `name`, `version`,
-                  optional `space`, optional `uid`. The only durable form that
-                  crosses the wire. `CardRef` never carries `labels` or
-                  `annotations`.
-    - `select:` — client-side authoring sugar. A `CardSelector` that matches on
-                  target-card **metadata** (`kind`, optional `name`, `version`,
-                  `space`, `labels`, `annotations`, `latest`). `wyrd plan` /
-                  `wyrd apply` resolves it to exactly one `uid`-bearing
-                  `CardRef` before registration, relationship derivation,
-                  hydration, or any runtime observation. Zero matches →
-                  `CARD_SELECTOR_NOT_FOUND`; more than one →
-                  `CARD_SELECTOR_AMBIGUOUS`. Never on the wire.
-    - `path:`   — client-side authoring sugar. Targets a **full card envelope**
-                  on disk (`apiVersion` + `kind` + `metadata` + `spec`). The
-                  loader registers it as an independent card and rewrites the
-                  parent slot to `ref: CardRef`. Never on the wire.
-    - `inline:` — spec body embedded in the parent, prefixed with `kind:`. No
-                  card identity; not addressable from outside the parent. Light
-                  cards only.
+19. **Reference slots use exactly `Ref` or `InlineableRef<T>`.** `Ref` carries
+    durable identity or an authored `Path`; `InlineableRef<T>` additionally
+    permits an inline child body. `Path` is loader-only: the loader resolves a
+    path relative to the authored file, registers the referenced full Card
+    envelope, and rewrites the slot to a durable `Ref` before the wire
+    request. There is no selector form and no third reference enum. The
+    server, registry, and evaluator reject unresolved paths.
 
     `select` and `path` resolve to `ref` before send; only `ref` and `inline`
     cross the wire. Heavy cards (Model, Data, Experiment, Artifact) accept
@@ -330,7 +308,7 @@ runtime tool registry (host tools + MCP server registrations). Approval,
 per-tool blocks, and hook gates live on `Policy`, not here.
 ```yaml
 spec:
-  prompt: PromptRef              # CardRef (→ Prompt) or inline PromptSpec
+  prompt: InlineableRef<Prompt>  # Ref (→ Prompt), authored Path, or inline Prompt
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
   publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
@@ -367,7 +345,7 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref | select | path | inline }
+  components: [ServiceComponent] # { alias, ref | path }
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
@@ -812,7 +790,7 @@ typed refs is a versioned breaking change that adds variants.
 | `SubjectFilter`   | `Trigger.source.*.subject_filter`                                           |
 | `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
-| `Prompt`          | `Agent.prompt`, `Eval.tasks[].LlmJudge.judge_ref`                           |
+| `Prompt`          | `Agent.prompt`                                                              |
 | `Dataset`         | `Eval.dataset`                                                              |
 | `Source`          | `Eval.source_ref`, `Drift.signal.External.source_ref`                       |
 | `Baseline`        | `Drift.signal.Distribution.baseline_ref`                                    |
@@ -996,7 +974,7 @@ a `Drift` card with `DriftSignal::EvalScore`.
 | Variant          | Variant-specific carries                                                                          | Use |
 |------------------|---------------------------------------------------------------------------------------------------|-----|
 | `Assertion`      | `context_path?: string`, `operator: ComparisonOperator`, `expected: ParameterValue`, `description?: string` | Deterministic check on a dot-path into a record |
-| `LlmJudge` (`llm_judge`) | `judge_ref: CardRef` (→ Prompt card), `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge: one Prompt card per task, judge response compared to expected value |
+| `LlmJudge` (`llm_judge`) | `judge_ref: InlineableRef<AgentSpec>`, `operator: ComparisonOperator`, `expected: ParameterValue`, `max_retries: u32` | LLM judge composed as Eval → Agent → Prompt; the Agent runs one constrained structured-output turn |
 | `TraceAssertion` | `span_selector: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`             | OTel span selector (tokens, duration_ms, retry_count, etc.) read via `source_ref` (deferred — see DESIGN.md §13) |
 | `AgentAssertion` | `workflow_field_path: JsonPath`, `operator: ComparisonOperator`, `expected: ParameterValue`       | Tool-call / response-shape check read via `source_ref` (deferred — see DESIGN.md §13) |
 
@@ -1462,10 +1440,9 @@ serialization across HTTP, Python, TypeScript, MCP, and CLI surfaces.
 ## Spec-file authoring
 
 Two complementary mechanisms — `wyrd apply -f file.yaml` reads + registers in
-one move, and reference slots accept `ref | select | path | inline` so a card
-can be pinned by identity, matched by metadata, split into its own file, or
-inlined where its own identity isn't needed. `select` and `path` are authoring
-sugar the loader resolves to `ref` before send.
+one move, and reference slots accept `Ref` or `InlineableRef<T>`. A `path:` is
+loader-only authoring syntax resolved to a durable `ref:` before send; inline
+is available only at `InlineableRef<T>` slots.
 
 ### Pre-registration matrix (Rule 16)
 
@@ -1475,8 +1452,8 @@ sugar the loader resolves to `ref` before send.
 | `Data`         | **Yes** (unless used purely as inline eval scenarios, which v1 does not support — `dataset` is `DatasetRef`-only) | Carries dataset bytes; lineage anchor. |
 | `Experiment`   | **Yes** | Carries run history. |
 | `Artifact`     | **Yes** (typically derived from heavy cards) | Pointer to durable bytes. |
-| `Prompt`       | Optional | Light. Inlineable as `PromptRef` inside `Agent.prompt`; referenced by `EvalTask::LlmJudge.judge_ref`. |
-| `Agent`        | Optional | Light. Spec-only; `apply` registers it. No v1 field accepts inline `AgentRef` (see Q11). |
+| `Prompt`       | Optional | Light. Inlineable as `InlineableRef<Prompt>` inside `Agent.prompt`. |
+| `Agent`        | Optional | Light. Spec-only; `apply` registers it. `LlmJudgeTask.judge_ref` is `InlineableRef<AgentSpec>`. |
 | `Eval`, `Policy`, `Trigger`, `Operator`, `Source`, `Mcp`, `Workflow`, `Audit`, `Service` | Optional | Light. Spec-only; `apply` registers each card as it's read. |
 
 A single YAML file may contain many `---`-separated card documents — `wyrd
@@ -1486,31 +1463,21 @@ ship in one file.
 
 ### Reference forms
 
-A reference slot accepts exactly one of four keys: `ref`, `select`, `path`,
-or `inline`. The key IS the discriminator; there is no separate `kind:` tag
-for the variant. Two of the four are durable wire forms (`ref`, `inline`);
-the other two (`select`, `path`) are client-side authoring sugar that the
-loader resolves to `ref` before anything leaves the client. The four forms in
-isolation:
+A reference slot accepts `ref` or `path`; an inlineable slot also accepts
+`inline`. The key is the discriminator. `path` and `inline` are authored
+locally; only `ref` and inline child bodies cross the wire.
 
 ```yaml
 # 1. ref — points at a registered card by exact identity.
 #    kind, name, version, space, optional uid. No labels/annotations here.
 ref: { kind: Policy, name: pii-redaction, version: "1.0.0", space: prod }
 
-# 2. select — authoring sugar. Match a registered card by metadata; the loader
-#    resolves it to exactly one uid-bearing ref before send.
-select:
-  kind: Model
-  name: churn-classifier
-  labels: { environment: production, stage: champion }
-
-# 3. path — authoring sugar. Targets a FULL card envelope on disk
+# 2. path — authoring sugar. Targets a FULL card envelope on disk
 #    (apiVersion + kind + metadata + spec). The loader registers it as an
 #    independent card and rewrites this slot to `ref: CardRef`.
 path: ./policies/pii-redaction.yaml
 
-# 4. inline — full spec body embedded in the parent. No card identity.
+# 3. inline — full spec body embedded in the parent. No card identity.
 inline:
   kind: Policy
   rules:
@@ -1527,17 +1494,14 @@ that has crossed an API boundary always carries `space` verbatim. `CardRef` is
 exact identity only — it never carries `labels` or `annotations`. Metadata
 matching is the job of `select`, not `ref`.
 
-In context — `Service.components[]` mixing all four forms plus a heavy-card ref:
+In context — `Service.components[]` mixing durable and loader-local forms plus a heavy-card ref:
 
 ```yaml
 components:
   - alias: agent
     ref:  { kind: Agent, name: support-triage,   version: "1.0.0", space: prod }
   - alias: model
-    select:                       # heavy card resolved by metadata, then pinned
-      kind: Model
-      name: churn-classifier
-      labels: { environment: production, stage: champion }
+    ref: { kind: Model, name: churn-classifier, version: "1.0.0", space: prod }
   - alias: prompt
     path: ./prompts/triage-system.yaml
   - alias: pii-policy
@@ -1552,10 +1516,9 @@ components:
 
 ### Reference-slot inventory
 
-The four-key shape applies at **every** reference slot, light or heavy — not a
-per-surface subset. There is one canonical slot inventory, and the loader,
-`$service.*` sugar rewrite, diagnostics, and relationship tests all project
-from it (they do not maintain parallel hand-written lists):
+The same two reference types apply at **every** reference slot, light or
+heavy. There is one canonical slot inventory, and the loader, diagnostics, and
+relationship tests all project from it:
 
 - `Service.components[]` (light and heavy targets)
 - `Agent.prompt`
@@ -1567,29 +1530,9 @@ from it (they do not maintain parallel hand-written lists):
 - `Model.publishes_to`, `Data.publishes_to`, `Agent.publishes_to`, `Service.publishes_to`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
-A new reference-bearing field is added to this inventory in one place; it then
-participates in path rewrite, select resolution, and relationship derivation
-without a second edit. This is the single-source rule for reference slots.
-
-### Selector resolution rules (loader contract)
-
-`select:` is **client-side authoring sugar**, not a wire variant. It matches a
-registered card by metadata and resolves to a concrete `ref`. Use it when the
-referrer and the target carry independent metadata — e.g. a `Service` that
-wants "the production champion Model" without hard-coding the Model's version.
-
-- `CardSelector { kind, name?, version?, space?, labels?, annotations?,
-  latest? }`. `kind` is required; every other field narrows the match.
-- `wyrd plan` / `wyrd apply` resolves `select` against target-card metadata to
-  exactly one `uid`-bearing `CardRef` **before** durable registration,
-  relationship derivation, hydration, or any runtime observation.
-- Zero matches is the stable error `CARD_SELECTOR_NOT_FOUND`; more than one is
-  `CARD_SELECTOR_AMBIGUOUS`. `latest: true` breaks a version tie by newest
-  registered version but never resolves a `labels`/`annotations` ambiguity.
-- Environment and stage are selected here, over `labels`/`annotations` — never
-  over `space`. `space` is team/workspace scope.
-- After resolution the durable payload carries only the pinned `ref`; the
-  registry, relationships, and `vala` never see a `select:` value.
+ A new reference-bearing field is added to this inventory in one place; it then
+ participates in path rewrite and relationship derivation without a second
+ edit. This is the single-source rule for reference slots.
 
 ### Path resolution rules (loader contract)
 
@@ -1752,7 +1695,7 @@ cross-tenant card import is a supported workflow.
 | Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.action.workflow_ref`, `TriggerSource.*.subject_filter` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `TriggerSource.DriftObservation.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
-| Eval    | `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Prompt card ref) | `Drift.signal.eval_ref`, `TriggerSource.EvalObservation.eval_ref` |
+| Eval    | `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Agent ref) | `Drift.signal.eval_ref`, `TriggerSource.EvalObservation.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
 | Service | `components[].ref`, `publishes_to`   | `TriggerSource.*.subject_filter` (service-level) |
 | Policy  | `rules`                              | `Service.components.ref` |
@@ -1781,7 +1724,8 @@ services/ops-copilot/
 ├── prompts/
 │   ├── triage.yaml
 │   ├── runbook.yaml
-│   └── judge.yaml
+│   ├── judge-agent.yaml
+│   └── judge-prompt.yaml
 ├── policies/
 │   ├── triage-policy.yaml
 │   ├── runbook-policy.yaml

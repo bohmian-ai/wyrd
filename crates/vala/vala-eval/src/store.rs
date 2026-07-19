@@ -9,6 +9,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use serde_json::Value;
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::eval::ids::TaskId;
 use wyrd_spec::vala::eval::plan::ExecutionPlan;
 use wyrd_spec::vala::eval::task::EvalTask;
@@ -169,6 +170,8 @@ pub struct JudgeOutcome {
     pub raw: Value,
     /// Structured projection the judge executor extracted from `raw`.
     pub parsed: Value,
+    /// Durable Agent identity when this judge was registered.
+    pub judge_ref: Option<CardRef>,
 }
 
 #[cfg(test)]
@@ -256,6 +259,7 @@ mod tests {
         let outcome = JudgeOutcome {
             raw: json!({"choices": [{"verdict": "pass"}]}),
             parsed: json!({"verdict": "pass"}),
+            judge_ref: None,
         };
         let cloned = outcome.clone();
         assert_eq!(outcome, cloned);

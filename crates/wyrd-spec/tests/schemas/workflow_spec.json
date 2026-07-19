@@ -1782,7 +1782,7 @@
           "description": "Audit Card reference.",
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"
@@ -1800,7 +1800,7 @@
           "description": "Policy Card references.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "$ref": "#/definitions/Ref"
           }
         }
       }
@@ -1977,7 +1977,7 @@
           "description": "Observation route Card references.",
           "type": "array",
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "$ref": "#/definitions/Ref"
           }
         }
       }

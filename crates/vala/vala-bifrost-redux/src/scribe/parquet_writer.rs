@@ -1,19 +1,26 @@
-//! Parquet writer for frozen memtable snapshots — .
+//! Parquet writer for frozen memtable snapshots.
 //!
-//! `write_frozen_to_parquet` encodes a `FrozenMemtable` snapshot (a per-seal-key,
-//! per-day slice from ) to Parquet bytes using the copied `bifrost_writer_properties`
-//! (), with sort order `(data_tenant_id, wyrd_event_time)` and partition day = the
-//! seal-key's `event_day` (never derived from row min/max).
+//! `encode_batch` stamps the authenticated tenant before encoding a
+//! `FrozenMemtable` snapshot to Parquet. Every file uses sort order
+//! `(data_tenant_id, wyrd_event_time)` and takes its partition day from the
+//! seal-key (never from row min/max).
 
+use std::io::Cursor;
+use std::sync::Arc;
+
+use arrow::array::{Array, StringArray};
 use arrow::compute::SortColumn;
 use arrow::compute::lexsort_to_indices;
 use arrow::compute::take;
+use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
-use std::io::Cursor;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
+use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
 
+use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::parquet::writer_properties::bifrost_writer_properties;
 use crate::scribe::memtable::FrozenMemtable;
@@ -46,21 +53,45 @@ pub struct RowGroupStats {
     pub max_event_time: Option<i64>,
 }
 
-/// Encode a frozen memtable snapshot to Parquet bytes.
+/// Encode a frozen memtable snapshot to Parquet bytes after stamping its tenant.
 ///
 /// Returns encoded bytes, row-group stats, `partition_day` (from seal-key), and the paired
 /// `AuditEvent` + `ScribeAppendMeta` lists unmodified (threaded forward for 's seal
 /// transaction).
 ///
 /// # Errors
-/// Returns [`ScribeError::Internal`] if Arrow sorting or Parquet encoding fails.
-pub fn write_frozen_to_parquet(frozen: &FrozenMemtable) -> Result<ParquetEncoded, ScribeError> {
-    // 1. Sort the batch by (data_tenant_id, wyrd_event_time)
-    let sorted_batch = sort_batch(&frozen.batch)?;
+/// Returns [`ScribeError::Internal`] when the binding, tenant column, tenant
+/// values, sort keys, or Parquet encoding is invalid.
+pub fn encode_batch(
+    frozen: &FrozenMemtable,
+    binding: &TenantTableBinding,
+    seal_tenant: DataTenantId,
+) -> Result<ParquetEncoded, ScribeError> {
+    if binding.tenant != seal_tenant || binding.tenant != frozen.seal_key.tenant {
+        return Err(ScribeError::Internal {
+            detail: format!(
+                "tenant-table binding mismatch before encoding: binding tenant `{}`; seal tenant `{}`; frozen tenant `{}`",
+                binding.tenant, seal_tenant, frozen.seal_key.tenant
+            ),
+        });
+    }
+    if binding.table_ref != frozen.seal_key.table {
+        return Err(ScribeError::Internal {
+            detail: format!(
+                "tenant-table binding table mismatch before encoding: binding `{}`; seal table `{}`",
+                binding.table_ref, frozen.seal_key.table
+            ),
+        });
+    }
+
+    // 1. Validate and stamp the server-owned tenant column, then sort by the
+    // same two keys for every physical table.
+    let stamped_batch = stamp_tenant(&frozen.batch, seal_tenant)?;
+    let sorted_batch = sort_batch(&stamped_batch)?;
 
     // 2. Write to Parquet in-memory using bifrost_writer_properties
     let mut buf = Cursor::new(Vec::new());
-    let props = bifrost_writer_properties();
+    let props = bifrost_writer_properties(sorted_batch.num_rows());
 
     {
         let mut writer = ArrowWriter::try_new(&mut buf, sorted_batch.schema(), Some(props))
@@ -91,6 +122,58 @@ pub fn write_frozen_to_parquet(frozen: &FrozenMemtable) -> Result<ParquetEncoded
         partition_day: frozen.seal_key.day,
         audit_events: frozen.events.clone(),
         append_metas: frozen.metas.clone(),
+    })
+}
+
+fn stamp_tenant(
+    batch: &RecordBatch,
+    seal_tenant: DataTenantId,
+) -> Result<RecordBatch, ScribeError> {
+    let schema = batch.schema();
+    let tenant_idx = schema
+        .index_of(DATA_TENANT_ID)
+        .map_err(|_| ScribeError::Internal {
+            detail: format!("{DATA_TENANT_ID} column not found after system-column construction"),
+        })?;
+    let tenant_array = batch
+        .column(tenant_idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("{DATA_TENANT_ID} column must be Utf8"),
+        })?;
+    let expected = seal_tenant.to_string();
+
+    for row_index in 0..tenant_array.len() {
+        if !tenant_array.is_null(row_index) {
+            let observed = tenant_array.value(row_index);
+            if observed != expected {
+                return Err(ScribeError::Internal {
+                    detail: format!(
+                        "{DATA_TENANT_ID} mismatch at row {row_index}: expected `{expected}`, observed `{observed}`"
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut fields: Vec<_> = schema.fields.iter().cloned().collect();
+    fields[tenant_idx] = Arc::new(
+        fields[tenant_idx]
+            .as_ref()
+            .clone()
+            .with_data_type(DataType::Utf8)
+            .with_nullable(false),
+    );
+    let stamped_schema = Arc::new(Schema {
+        fields: fields.into(),
+        metadata: schema.metadata.clone(),
+    });
+    let mut columns = batch.columns().to_vec();
+    columns[tenant_idx] = Arc::new(StringArray::from(vec![expected; batch.num_rows()]));
+
+    RecordBatch::try_new(stamped_schema, columns).map_err(|error| ScribeError::Internal {
+        detail: format!("failed to stamp {DATA_TENANT_ID}: {error}"),
     })
 }
 
@@ -241,6 +324,7 @@ mod tests {
 
     fn build_test_frozen(
         seal_day: NaiveDate,
+        seal_tenant: DataTenantId,
         tenant_ids: Vec<&str>,
         timestamps: Vec<i64>,
     ) -> FrozenMemtable {
@@ -263,7 +347,7 @@ mod tests {
         .unwrap();
 
         let seal_key = SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            seal_tenant,
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(seal_day),
         );
@@ -281,32 +365,44 @@ mod tests {
     fn parquet_writer_partition_day_matches_seal_key() {
         // Regression test for C2: partition_day = seal_key.event_day, not row min/max
         let seal_day = NaiveDate::from_ymd_opt(2026, 7, 14).unwrap();
-        let tenant_a = DataTenantId::new_v7();
-        let tenant_b = DataTenantId::new_v7();
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             seal_day,
-            vec![tenant_a.to_string().as_str(), tenant_b.to_string().as_str()],
+            tenant,
+            vec![tenant_string.as_str(), tenant_string.as_str()],
             vec![1_000_000, 2_000_000], // timestamps don't matter for partition_day
         );
 
-        let encoded = write_frozen_to_parquet(&frozen).unwrap();
+        let binding =
+            TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
+                .unwrap();
+        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
         assert_eq!(encoded.partition_day.as_date(), &seal_day);
     }
 
     #[test]
     fn parquet_writer_honors_sort_order() {
         // Round-trip: write shuffled input, verify sort order in column stats
-        let t1 = DataTenantId::new_v7().to_string();
-        let t2 = DataTenantId::new_v7().to_string();
-        let t3 = DataTenantId::new_v7().to_string();
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
 
         let frozen = build_test_frozen(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
-            vec![t3.as_str(), t1.as_str(), t2.as_str(), t1.as_str()], // Shuffled tenant IDs
-            vec![400, 100, 300, 200],                                 // Shuffled timestamps
+            tenant,
+            vec![
+                tenant_string.as_str(),
+                tenant_string.as_str(),
+                tenant_string.as_str(),
+                tenant_string.as_str(),
+            ],
+            vec![400, 100, 300, 200], // Shuffled timestamps
         );
 
-        let encoded = write_frozen_to_parquet(&frozen).unwrap();
+        let binding =
+            TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
+                .unwrap();
+        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
 
         // Re-read and verify sorted order
         let bytes_copy = bytes::Bytes::from(encoded.bytes);
@@ -328,40 +424,56 @@ mod tests {
             .downcast_ref::<TimestampMicrosecondArray>()
             .unwrap();
 
-        // Expected sort: (tenant=t1, time=100), (tenant=t1, time=200), (tenant=t2, time=300), (tenant=t3, time=400)
-        assert_eq!(tenant_col.value(0), t1);
+        // Every row is stamped with the seal tenant; timestamps are the second sort key.
+        assert_eq!(tenant_col.value(0), tenant_string);
         assert_eq!(time_col.value(0), 100);
 
-        assert_eq!(tenant_col.value(1), t1);
+        assert_eq!(tenant_col.value(1), tenant_string);
         assert_eq!(time_col.value(1), 200);
 
-        assert_eq!(tenant_col.value(2), t2);
+        assert_eq!(tenant_col.value(2), tenant_string);
         assert_eq!(time_col.value(2), 300);
 
-        assert_eq!(tenant_col.value(3), t3);
+        assert_eq!(tenant_col.value(3), tenant_string);
         assert_eq!(time_col.value(3), 400);
     }
 
     #[test]
     fn parquet_writer_writes_bloom_and_page_index() {
-        // Note: bifrost_writer_properties intentionally has bloom filters OFF per its doc.
-        // This test verifies page index is present; bloom test removed per actual contract.
-        let t1 = DataTenantId::new_v7().to_string();
-        let t2 = DataTenantId::new_v7().to_string();
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
-            vec![t1.as_str(), t2.as_str()],
+            tenant,
+            vec![tenant_string.as_str(), tenant_string.as_str()],
             vec![1_000_000, 2_000_000],
         );
 
-        let encoded = write_frozen_to_parquet(&frozen).unwrap();
+        let binding =
+            TenantTableBinding::resolve((frozen.seal_key.tenant, frozen.seal_key.table.clone()))
+                .unwrap();
+        let encoded = encode_batch(&frozen, &binding, frozen.seal_key.tenant).unwrap();
 
         let reader = SerializedFileReader::new(bytes::Bytes::from(encoded.bytes)).unwrap();
         let metadata = reader.metadata();
 
         // Verify page index (offset index) is present
         let rg = metadata.row_groups().first().unwrap();
-        let col = rg.columns().first().unwrap();
+        let tenant_col = rg
+            .columns()
+            .iter()
+            .find(|column| column.column_descr().name() == DATA_TENANT_ID)
+            .unwrap();
+        assert!(
+            tenant_col.bloom_filter_offset().is_some(),
+            "allowlisted tenant column must have a bloom filter"
+        );
+
+        let col = rg
+            .columns()
+            .iter()
+            .find(|column| column.column_descr().name() == "wyrd_event_time")
+            .unwrap();
 
         // Page index presence is indicated by offset_index_offset being set
         assert!(
@@ -373,10 +485,12 @@ mod tests {
     #[test]
     fn parquet_writer_returns_envelopes_unmodified() {
         // Encoding does not touch either the `AuditEvent` list or `ScribeAppendMeta` list
-        let t1 = DataTenantId::new_v7().to_string();
+        let tenant = DataTenantId::new_v7();
+        let tenant_string = tenant.to_string();
         let frozen = build_test_frozen(
             NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
-            vec![t1.as_str()],
+            tenant,
+            vec![tenant_string.as_str()],
             vec![1_000_000],
         );
 
@@ -408,7 +522,17 @@ mod tests {
         frozen_with_envelopes.events = vec![event.clone()];
         frozen_with_envelopes.metas = vec![meta.clone()];
 
-        let encoded = write_frozen_to_parquet(&frozen_with_envelopes).unwrap();
+        let binding = TenantTableBinding::resolve((
+            frozen_with_envelopes.seal_key.tenant,
+            frozen_with_envelopes.seal_key.table.clone(),
+        ))
+        .unwrap();
+        let encoded = encode_batch(
+            &frozen_with_envelopes,
+            &binding,
+            frozen_with_envelopes.seal_key.tenant,
+        )
+        .unwrap();
 
         assert_eq!(encoded.audit_events.len(), 1);
         assert_eq!(encoded.append_metas.len(), 1);
@@ -416,5 +540,115 @@ mod tests {
         // Verify pairing preserved (index i ↔ index i)
         assert_eq!(encoded.audit_events[0].request_id, event.request_id);
         assert_eq!(encoded.append_metas[0].batch_id, meta.batch_id);
+    }
+
+    #[test]
+    fn sort_batch_uses_one_key_for_every_table() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow::datatypes::Field::new(DATA_TENANT_ID, DataType::Utf8, false),
+            arrow::datatypes::Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["tenant-b", "tenant-a", "tenant-a"])),
+                Arc::new(TimestampMicrosecondArray::from(vec![3, 2, 1])),
+            ],
+        )
+        .unwrap();
+
+        let sorted = sort_batch(&batch).unwrap();
+        let tenants = sorted
+            .column_by_name(DATA_TENANT_ID)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let times = sorted
+            .column_by_name("wyrd_event_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!((tenants.value(0), times.value(0)), ("tenant-a", 1));
+        assert_eq!((tenants.value(1), times.value(1)), ("tenant-a", 2));
+        assert_eq!((tenants.value(2), times.value(2)), ("tenant-b", 3));
+    }
+
+    #[test]
+    fn missing_tenant_column_fails_closed() {
+        let tenant = DataTenantId::new_v7();
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))],
+        )
+        .unwrap();
+        let frozen = FrozenMemtable {
+            seal_key: SealKey::new(
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "events"),
+                EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
+            ),
+            schema,
+            batch,
+            events: vec![],
+            metas: vec![],
+        };
+        let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
+
+        let error = encode_batch(&frozen, &binding, tenant).unwrap_err();
+        assert!(
+            matches!(error, ScribeError::Internal { detail } if detail.contains(DATA_TENANT_ID))
+        );
+    }
+
+    #[test]
+    fn mismatched_tenant_value_fails_closed() {
+        let expected = DataTenantId::new_v7();
+        let observed = DataTenantId::new_v7();
+        let expected_string = expected.to_string();
+        let observed_string = observed.to_string();
+        let frozen = build_test_frozen(
+            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            expected,
+            vec![expected_string.as_str(), observed_string.as_str()],
+            vec![1, 2],
+        );
+        let binding =
+            TenantTableBinding::resolve((expected, frozen.seal_key.table.clone())).unwrap();
+
+        let error = encode_batch(&frozen, &binding, expected).unwrap_err();
+        assert!(matches!(error, ScribeError::Internal { detail }
+            if detail.contains("row 1")
+                && detail.contains(&expected.to_string())
+                && detail.contains(&observed.to_string())));
+    }
+
+    #[test]
+    fn tenant_binding_mismatch_fails_before_encoding() {
+        let seal_tenant = DataTenantId::new_v7();
+        let binding_tenant = DataTenantId::new_v7();
+        let frozen = build_test_frozen(
+            NaiveDate::from_ymd_opt(2026, 7, 14).unwrap(),
+            seal_tenant,
+            vec![seal_tenant.to_string().as_str()],
+            vec![1],
+        );
+        let binding =
+            TenantTableBinding::resolve((binding_tenant, frozen.seal_key.table.clone())).unwrap();
+
+        let error = encode_batch(&frozen, &binding, seal_tenant).unwrap_err();
+        assert!(
+            matches!(error, ScribeError::Internal { detail } if detail.contains("binding mismatch"))
+        );
     }
 }

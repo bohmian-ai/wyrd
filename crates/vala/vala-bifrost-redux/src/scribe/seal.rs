@@ -12,7 +12,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::file_list_writer;
 use crate::scribe::filename::seal_filename;
 use crate::scribe::memtable::Memtable;
-use crate::scribe::parquet_writer::{ParquetEncoded, write_frozen_to_parquet};
+use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::seal_key::SealKey;
 
 /// Handle returned by `pre_commit` to be passed to `post_commit` after the
@@ -78,11 +78,15 @@ impl SealDriver {
         // 2. WriteParquet (spawn_blocking to avoid blocking reactor)
         info!("seal stage: WriteParquet");
         let frozen_clone = frozen.clone();
-        let encoded = tokio::task::spawn_blocking(move || write_frozen_to_parquet(&frozen_clone))
-            .await
-            .map_err(|e| ScribeError::Internal {
-                detail: format!("Parquet encode task panic: {e}"),
-            })??;
+        let binding_clone = binding.clone();
+        let seal_tenant = seal_key.tenant;
+        let encoded = tokio::task::spawn_blocking(move || {
+            encode_batch(&frozen_clone, &binding_clone, seal_tenant)
+        })
+        .await
+        .map_err(|e| ScribeError::Internal {
+            detail: format!("Parquet encode task panic: {e}"),
+        })??;
 
         // 3. PutObject
         info!("seal stage: PutObject");

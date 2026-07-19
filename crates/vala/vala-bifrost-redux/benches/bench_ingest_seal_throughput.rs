@@ -11,10 +11,10 @@ use chrono::NaiveDate;
 use std::sync::Arc;
 use wyrd_spec::ids::DataTenantId;
 
-use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::memtable::Memtable;
-use vala_bifrost_redux::scribe::parquet_writer::write_frozen_to_parquet;
+use vala_bifrost_redux::scribe::parquet_writer::encode_batch;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::vala::api::AuditEvent;
@@ -29,11 +29,8 @@ fn build_test_batch(rows: usize) -> RecordBatch {
         ),
     ]));
 
-    // Generate tenant UUIDs once to reuse across rows
-    let tenants: Vec<String> = (0..10)
-        .map(|_| DataTenantId::new_v7().to_string())
-        .collect();
-    let tenant_ids: Vec<&str> = (0..rows).map(|i| tenants[i % 10].as_str()).collect();
+    let tenant = DataTenantId::SYSTEM_OWNER.to_string();
+    let tenant_ids = vec![tenant.as_str(); rows];
     let timestamps: Vec<i64> = (0..rows)
         .map(|i| i64::try_from(i).expect("bounded row index") * 1_000_000)
         .collect();
@@ -64,6 +61,8 @@ fn main() {
 
     let memtable = Memtable::new();
     let batch = build_test_batch(BATCH_SIZE);
+    let binding = TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+        .expect("benchmark table binding resolves");
 
     let event = AuditEvent {
         request_id: wyrd_spec::request_id::RequestId::now_v7(),
@@ -102,8 +101,8 @@ fn main() {
         let frozen = memtable
             .freeze(&seal_key)
             .expect("benchmark warmup freeze succeeds");
-        let _ =
-            write_frozen_to_parquet(&frozen).expect("benchmark warmup parquet encoding succeeds");
+        let _ = encode_batch(&frozen, &binding, seal_key.tenant)
+            .expect("benchmark warmup parquet encoding succeeds");
     }
 
     // Actual benchmark
@@ -115,8 +114,8 @@ fn main() {
         let frozen = memtable
             .freeze(&seal_key)
             .expect("benchmark freeze succeeds");
-        let encoded =
-            write_frozen_to_parquet(&frozen).expect("benchmark parquet encoding succeeds");
+        let encoded = encode_batch(&frozen, &binding, seal_key.tenant)
+            .expect("benchmark parquet encoding succeeds");
         let _ = encoded.bytes.len(); // Prevent optimizer from removing encoding
     }
     let elapsed = start.elapsed();

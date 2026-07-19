@@ -142,13 +142,15 @@ mod pg_tests {
         scribe.append(req).await.expect("append");
 
         // 2. Force seal
-        let vala = vala_sql::ValaPostgres::from_pools(fixture.app_pool().clone(), None);
-        let pool = vala.pool();
+        let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
-        scribe.force_seal(&mut conn).await.expect("force_seal");
+        let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
+        scribe
+            .complete_post_commit(post_commit)
+            .expect("post_commit");
 
         // 3. Verify file_list row and its organization-qualified object identity
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -232,7 +234,6 @@ mod pg_tests {
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe) = setup().await;
-
         // 1. Three appends from three distinct principals
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
@@ -241,7 +242,7 @@ mod pg_tests {
         for i in 0..3 {
             let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
             let mut principal = principal_for_tenant(tenant);
-            principal.id = PrincipalId::new(Uuid::now_v7()); // Unique principal per append
+            principal.id = PrincipalId::new(Uuid::now_v7());
 
             let req = ScribeAppend {
                 principal,
@@ -256,13 +257,15 @@ mod pg_tests {
         }
 
         // 2. Force seal
-        let vala = vala_sql::ValaPostgres::from_pools(fixture.app_pool().clone(), None);
-        let pool = vala.pool();
+        let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
-        scribe.force_seal(&mut conn).await.expect("force_seal");
+        let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
+        scribe
+            .complete_post_commit(post_commit)
+            .expect("post_commit");
 
         // 3. Verify audit_outbox has 3 rows with all 13 AuditEvent fields
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -411,8 +414,11 @@ mod pg_tests {
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
-        scribe.force_seal(&mut conn).await.expect("force_seal");
+        let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
+        scribe
+            .complete_post_commit(post_commit)
+            .expect("post_commit");
 
         // Verify two file_list rows with distinct partition_day
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)

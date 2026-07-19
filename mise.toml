@@ -144,19 +144,13 @@ env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:5543
 run = "cargo test --locked -p vala-bifrost-redux --tests -- --test-threads=1"
 
 [tasks."test:bifrost:journey"]
-description = """Run the Stage-5 closeout Rust user-journey tests (marked #[ignore] so they
-stay out of the fast lane) against a live Postgres-backed WyrdTestServer. Covers the
-Bifrost read journeys J1-J8: sync/async query + cache-hit audit, presigned result fetch,
-admission floor, audit seal/verify/tamper, group-commit fan-in fairness + drain, and
-maintenance-health transitions. Companion to `py:test:integration` (Python journeys).
-"""
+description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
+so they stay out of the fast lane) against live Postgres."""
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
-cargo test --locked -p vala-sdk --test bifrost_e2e -- --ignored --test-threads=1
-cargo test --locked -p wyrd-server --test query_journey_e2e --test maintenance_journey_e2e -- --ignored --test-threads=1
-cargo test --locked -p wyrd-cli --test audit_verify_e2e -- --ignored --test-threads=1
-cargo test --locked -p wyrd-mcp --test query_tools_journey -- --ignored --test-threads=1
+cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test pg_bifrost_scribe_multipod_journey -- --ignored --test-threads=1
 """
 
 [tasks."test:fuzz:bifrost"]
@@ -170,14 +164,8 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyr
 run = "cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test-threads=1"
 
 [tasks."bench:bifrost:slo"]
-description = "Run the gated Bifrost Criterion benches and validate the shared SLO gate"
-depends = ["setup:postgres", "db:migrate"]
-env = { BIFROST_TEST_DB_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd" }
-run = """
-rm -rf /tmp/vala-bifrost-bench
-cargo bench --locked -p vala-bifrost --features bench-bin
-cargo test --locked -p wyrd-bench
-"""
+description = "Run the Redux WAL-tail p99 SLO benchmark"
+run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
@@ -348,9 +336,20 @@ run = "bash scripts/checks/pyo3-scope.sh"
 
 [tasks."check:redux-isolation"]
 hide = true
-description = "Assert vala-bifrost-redux has zero dependency on vala-bifrost (CONTRACTS §13)"
+description = "Assert Redux has no legacy Bifrost, server, transport, or auth dependencies"
 run = """
-grep -E '\\bvala-bifrost\\b' crates/vala/vala-bifrost-redux/Cargo.toml | grep -v 'vala-bifrost-redux' && exit 1 || exit 0
+if rg -n --glob 'Cargo.toml' --glob '*.rs' \\
+  -e 'vala-bifrost' \\
+  -e '\\bwyrd-auth-verify\\b' \\
+  -e '\\bwyrd-tonic\\b' \\
+  -e '\\btonic::' \\
+  -e '\\baxum::' \\
+  -e '\\bhyper::' \\
+  -e '\\bwyrd-server\\b' \\
+  crates/vala/vala-bifrost-redux/Cargo.toml crates/vala/vala-bifrost-redux/src | \\
+  grep -v 'vala-bifrost-redux'; then
+  exit 1
+fi
 """
 
 [tasks."check:mocks-scope"]

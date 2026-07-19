@@ -200,14 +200,21 @@ impl MultiScribeHarness {
         // Force-seal all pods per tenant
         for tenant in &self.tenants {
             let mut conn = self.tenant_conn(*tenant).await?;
+            let mut post_commit_batches = Vec::with_capacity(self.pods.len());
             for pod in &self.pods {
-                pod.force_seal(&mut conn)
-                    .await
-                    .map_err(|e| HarnessError::Internal(format!("force_seal: {e}")))?;
+                post_commit_batches.push(
+                    pod.force_seal(&mut conn)
+                        .await
+                        .map_err(|e| HarnessError::Internal(format!("force_seal: {e}")))?,
+                );
             }
             conn.commit()
                 .await
                 .map_err(|e| HarnessError::Internal(format!("commit: {e}")))?;
+            for (pod, post_commit) in self.pods.iter().zip(post_commit_batches) {
+                pod.complete_post_commit(post_commit)
+                    .map_err(|e| HarnessError::Internal(format!("post_commit: {e}")))?;
+            }
         }
 
         // Poll until drained

@@ -4,24 +4,55 @@ use std::sync::Arc;
 
 use opendal::{ErrorKind, Operator};
 use tracing::{info, warn};
+use uuid::Uuid;
 use vala_sql::TenantConn;
 use wyrd_spec::ids::PodId;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::scribe::file_list_writer;
+use crate::scribe::file_list_writer::FileListCommitKey;
 use crate::scribe::filename::seal_filename;
 use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::wal::WalLsn;
 
-/// Handle returned by `pre_commit` to be passed to `post_commit` after the
-/// caller commits the seal transaction.
+/// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
+#[derive(Debug, Clone)]
+pub struct PostCommitToken {
+    /// Local immutable generation identity.
+    pub seal_id: u64,
+    /// Seal scope represented by the generation.
+    pub seal_key: SealKey,
+    /// Exact durable file-list identity.
+    pub file_list_key: FileListCommitKey,
+    /// Durable file-list row identity.
+    pub file_list_row_id: Uuid,
+    /// Inclusive minimum WAL LSN in the generation.
+    pub wal_lsn_min: WalLsn,
+    /// Inclusive maximum WAL LSN in the generation.
+    pub wal_lsn_max: WalLsn,
+}
+
+/// A set of post-commit capabilities produced by one force-seal call.
+#[derive(Debug, Clone)]
+pub struct PostCommitBatch(pub Vec<PostCommitToken>);
+
+impl From<PostCommitToken> for PostCommitBatch {
+    fn from(token: PostCommitToken) -> Self {
+        Self(vec![token])
+    }
+}
+
+/// Handle returned by `pre_commit` to be completed after the caller commits.
 #[derive(Debug, Clone)]
 pub struct SealCommit {
-    pub seal_key: SealKey,
+    /// Post-commit lifecycle capability.
+    pub token: PostCommitToken,
+    /// Canonical binding used by the seal.
     pub binding: TenantTableBinding,
-    pub wal_lsn_max: u64,
+    /// Object-store path written during pre-commit.
     pub parquet_path: String,
 }
 
@@ -41,9 +72,8 @@ impl SealDriver {
     }
 
     /// Execute seal stages 1-4 (Freeze → Parquet → PUT → PG tx) and return a
-    /// commit handle. The caller must commit the transaction, then call
-    /// `post_commit` with the handle to complete stages 5-6 (manifest + WAL
-    /// retirement).
+    /// post-commit capability. The caller owns commit/rollback and must
+    /// explicitly complete or abort the capability afterward.
     ///
     /// # Errors
     /// Returns [`ScribeError`] if any pre-commit stage fails.
@@ -102,43 +132,35 @@ impl SealDriver {
             writer_epoch,
             &parquet_path,
         )?;
-        file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
+        let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
             .await
             .map_err(ScribeError::from)?;
 
-        // Extract max WAL LSN from append metas
+        let wal_lsn_min = encoded
+            .append_metas
+            .iter()
+            .map(|meta| meta.wal_lsn_min)
+            .min()
+            .unwrap_or_else(|| WalLsn::new(0));
         let wal_lsn_max = encoded
             .append_metas
             .iter()
-            .map(|m| m.wal_lsn_max.as_u64())
+            .map(|meta| meta.wal_lsn_max)
             .max()
-            .unwrap_or(0);
+            .unwrap_or_else(|| WalLsn::new(0));
 
-        // Return handle for post-commit stages
         Ok(SealCommit {
-            seal_key: seal_key.clone(),
+            token: PostCommitToken {
+                seal_id: frozen.seal_id,
+                seal_key: seal_key.clone(),
+                file_list_key: insert_outcome.commit_key,
+                file_list_row_id: insert_outcome.id,
+                wal_lsn_min,
+                wal_lsn_max,
+            },
             binding: binding.clone(),
-            wal_lsn_max,
             parquet_path,
         })
-    }
-
-    /// Complete seal stages 5-6 (manifest + WAL retirement) after the caller
-    /// commits the seal transaction.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] if any post-commit stage fails.
-    #[tracing::instrument(skip(self), fields(seal_key = %handle.seal_key))]
-    pub async fn post_commit(&self, handle: SealCommit) -> Result<(), ScribeError> {
-        // 5. ManifestUpdate
-        info!("seal stage: ManifestUpdate (stub)");
-        // TODO: Update manifest sealed_lsn[K] and retire WAL bytes
-
-        // 6. RetireWal
-        info!("seal stage: RetireWal (stub)");
-        // TODO: Retire WAL bytes at or below the new watermark
-
-        Ok(())
     }
 
     /// PUT the Parquet object to storage with retry on transient failures.

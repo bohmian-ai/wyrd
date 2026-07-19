@@ -353,8 +353,10 @@ mod tests {
         );
 
         FrozenMemtable {
+            seal_id: 0,
             seal_key,
             schema,
+            batches: vec![batch.clone()],
             batch,
             events: vec![],
             metas: vec![],
@@ -593,12 +595,14 @@ mod tests {
         )
         .unwrap();
         let frozen = FrozenMemtable {
+            seal_id: 0,
             seal_key: SealKey::new(
                 tenant,
                 TableRef::new(BifrostNamespace::Bifrost, "events"),
                 EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
             ),
             schema,
+            batches: vec![batch.clone()],
             batch,
             events: vec![],
             metas: vec![],

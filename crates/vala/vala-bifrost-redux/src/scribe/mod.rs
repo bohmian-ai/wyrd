@@ -28,6 +28,7 @@ use crate::catalog::TenantTableBinding;
 use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 
 /// Memtable key for per-bucket row-count inspection.
 ///
@@ -116,8 +117,8 @@ impl ScribeImpl {
     /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
     /// specific seal-key on the caller's tenant-scoped transaction.
     ///
-    /// Returns a `SealCommit` handle that the caller must pass to `seal_one_post_commit`
-    /// after committing the transaction. The caller owns commit/rollback.
+    /// Returns a `SealCommit` handle whose post-commit token must be completed
+    /// only after the caller commits the transaction. The caller owns commit/rollback.
     ///
     /// Repo rule (`check:from-pools-allowlist`): this signature MUST take
     /// `&mut vala_sql::TenantConn<'_>` and MUST NOT accept `sqlx::PgPool`.
@@ -152,17 +153,6 @@ impl ScribeImpl {
                 self.writer_epoch,
             )
             .await
-    }
-
-    /// Complete seal post-commit stages (manifest + WAL retirement) after the
-    /// caller commits the seal transaction.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError`] if any post-commit stage fails.
-    pub async fn seal_one_post_commit(&self, handle: seal::SealCommit) -> Result<(), ScribeError> {
-        use crate::scribe::seal::SealDriver;
-        let driver = SealDriver::new(self.operator.clone());
-        driver.post_commit(handle).await
     }
 }
 
@@ -328,33 +318,155 @@ impl ScribeImpl {
         vec![]
     }
 
-    /// Force-seal every non-empty memtable bucket on this pod and wait for the
-    /// seal tx to commit.
+    /// Force-seal every non-empty writable or pending bucket on this pod.
+    ///
+    /// The returned batch is only a set of post-commit capabilities. The
+    /// caller must commit its `TenantConn` first, then pass the batch to
+    /// [`Self::complete_post_commit`].
     ///
     /// # Errors
     /// Returns `ScribeError` if any seal stage fails.
-    pub async fn force_seal(&self, conn: &mut TenantConn<'_>) -> Result<(), ScribeError> {
+    pub async fn force_seal(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<seal::PostCommitBatch, ScribeError> {
         // A `TenantConn` is bound to exactly one tenant. Seal only the
         // memtable buckets whose seal-key belongs to that tenant; the harness
         // iterates tenants and opens a fresh `TenantConn` per tenant.
         //
-        // Pre-commit stages only — caller owns commit and post_commit.
-        // This simplified implementation runs post_commit immediately after,
-        // but real production usage would separate them.
         let tenant = conn.data_tenant_id();
-        let keys = self.memtable.active_seal_keys_for_tenant(tenant)?;
+        let keys = self.memtable.seal_keys_for_tenant(tenant)?;
 
-        let mut handles = Vec::with_capacity(keys.len());
+        let mut tokens = Vec::with_capacity(keys.len());
         for key in keys {
-            let handle = self.seal_one(&key, conn).await?;
-            handles.push(handle);
+            match self.seal_one(&key, conn).await {
+                Ok(handle) => tokens.push(handle.token),
+                Err(error) => {
+                    for token in tokens {
+                        let _ = self.abort_post_commit(token);
+                    }
+                    return Err(error);
+                }
+            }
         }
 
-        // Post-commit stages (simplified: run immediately without waiting for commit)
-        for handle in handles {
-            self.seal_one_post_commit(handle).await?;
-        }
+        Ok(seal::PostCommitBatch(tokens))
+    }
 
+    /// Complete one or more seal generations after the caller commits SQL.
+    pub fn complete_post_commit<T>(&self, post_commit: T) -> Result<(), ScribeError>
+    where
+        T: Into<seal::PostCommitBatch>,
+    {
+        for token in post_commit.into().0 {
+            self.memtable
+                .complete_post_commit(token.seal_id, token.file_list_key)?;
+        }
         Ok(())
+    }
+
+    /// Abort one or more post-commit capabilities after SQL rollback.
+    pub fn abort_post_commit<T>(&self, post_commit: T) -> Result<(), ScribeError>
+    where
+        T: Into<seal::PostCommitBatch>,
+    {
+        for token in post_commit.into().0 {
+            self.memtable.abort_post_commit(token.seal_id)?;
+        }
+        Ok(())
+    }
+
+    /// Reconcile a pending generation against the exact durable file-list row.
+    ///
+    /// The lookup runs through the caller's tenant-bound connection. A found
+    /// row completes the generation; a missing row deliberately leaves it
+    /// pending so WAL replay can retry the seal.
+    pub async fn reconcile_post_commit(
+        &self,
+        token: &seal::PostCommitToken,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<bool, ScribeError> {
+        let key = &token.file_list_key;
+        if conn.data_tenant_id() != key.data_tenant_id {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "post-commit reconciliation tenant mismatch: key={} connection={}",
+                    key.data_tenant_id,
+                    conn.data_tenant_id()
+                ),
+            });
+        }
+        let row: Option<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id
+               FROM vala.file_list
+              WHERE data_tenant_id = $1
+                AND namespace = $2
+                AND table_name = $3
+                AND node_id = $4
+                AND writer_epoch = $5
+                AND wal_lsn_min = $6
+                AND wal_lsn_max = $7",
+        )
+        .bind(key.data_tenant_id.as_uuid())
+        .bind(&key.namespace)
+        .bind(&key.table_name)
+        .bind(key.node_id)
+        .bind(key.writer_epoch)
+        .bind(key.wal_lsn_min)
+        .bind(key.wal_lsn_max)
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(|error| ScribeError::Internal {
+            detail: format!("file-list post-commit reconciliation failed: {error}"),
+        })?;
+
+        if row.is_some() {
+            self.memtable
+                .complete_post_commit(token.seal_id, key.clone())?;
+            Ok(true)
+        } else {
+            self.memtable.abort_post_commit(token.seal_id)?;
+            Ok(false)
+        }
+    }
+
+    /// Restore one replayed WAL range as a pending immutable generation.
+    pub fn restore_replayed(
+        &self,
+        replayed: &replay::ReplayedSealKey,
+    ) -> Result<memtable::FrozenMemtable, ScribeError> {
+        self.memtable.restore_replayed(replayed)
+    }
+
+    /// Sweep committed immutable generations whose grace period elapsed.
+    pub fn sweep_once_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Result<Vec<(SealKey, memtable::WalRange)>, ScribeError> {
+        self.memtable.sweep_once_at(now)
+    }
+
+    /// Construct the pod-local typed tail reader.
+    pub fn tail_service(&self) -> Result<FetchLiveTailService, ScribeError> {
+        let node_id =
+            uuid::Uuid::parse_str(&self.node_id).map_err(|error| ScribeError::Internal {
+                detail: format!("invalid Scribe node_id: {error}"),
+            })?;
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(node_id),
+            stream_identity::WriterEpoch::new(self.writer_epoch),
+        );
+        Ok(FetchLiveTailService::new(
+            stream,
+            Arc::clone(&self.memtable),
+        ))
+    }
+
+    /// Fetch the typed live tail from this pod's memtable.
+    pub async fn fetch_live_tail(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<Vec<TailFrame>, ScribeError> {
+        self.tail_service()?.fetch_live_tail(request).await
     }
 }

@@ -1,365 +1,241 @@
-//! `FetchLiveTail` server tests.
-//!
-//! Covers the four invariants called out in the plan:
-//!
-//! 1. A request targeting a different `(node_id, writer_epoch)` returns
-//!    `WYRD_VALA_409_STREAM_MISMATCH` without touching WAL state.
-//! 2. Only WAL data records with `LSN > after_lsn` on the current stream flow
-//!    through the response.
-//! 3. Records covered by a stream-scoped sealed range are excluded so the
-//!    union of `file_list` + live-tail response covers each source row exactly
-//!    once, at pre-freeze / mid-seal / post-retire phases.
-//! 4. `SealedRangeIndex` scopes exclusion per stream — ranges from another
-//!    `(node_id, writer_epoch)` never suppress this stream's rows (C4).
-
 use std::sync::Arc;
 
-use tempfile::TempDir;
+use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use chrono::NaiveDate;
 use uuid::Uuid;
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::memtable::Memtable;
+use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailRequest, FetchLiveTailService, SealedRange, SealedRangeIndex,
+    FetchLiveTailRequest, FetchLiveTailService, LiveTailShard, TailFrame,
 };
-use vala_bifrost_redux::scribe::wal::{WalLsn, WalWriter};
+use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-fn stream(seed: u8, epoch: i64) -> StreamIdentity {
-    StreamIdentity::new(
-        NodeId::new(Uuid::from_bytes([seed; 16])),
-        WriterEpoch::new(epoch),
-    )
-}
-
-fn make_wal(dir: &TempDir, stream: StreamIdentity) -> WalWriter {
-    WalWriter::new(
-        dir.path(),
-        *stream.node_id.as_uuid().as_bytes(),
-        stream.writer_epoch.as_i64(),
-        DataTenantId::SYSTEM_OWNER,
-        None,
-    )
-    .expect("WAL writer")
-}
-
-fn append(wal: &WalWriter, seed: u8) -> WalLsn {
-    wal.append_and_fsync(
-        [seed; 16],
-        format!("audit-{seed}").into_bytes(),
-        format!("data-{seed}").into_bytes(),
-    )
-    .expect("WAL append")
-}
-
-#[tokio::test]
-async fn live_tail_rejects_wrong_stream() {
-    let dir = TempDir::new().expect("temp dir");
-    let this = stream(1, 1);
-    let wal = make_wal(&dir, this);
-    append(&wal, 0);
-
-    let service = FetchLiveTailService::new(
-        this,
-        dir.path().to_path_buf(),
-        Arc::new(SealedRangeIndex::new()),
-    );
-
-    // Different node → mismatch.
-    let other_node = stream(2, 1);
-    let err = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: other_node,
-            after_lsn: None,
-        })
-        .await
-        .expect_err("mismatch");
-    assert_eq!(
-        err.code(),
-        "WYRD_VALA_409_STREAM_MISMATCH",
-        "different node_id returns stream mismatch"
-    );
-
-    // Same node, different epoch → still mismatch.
-    let other_epoch = stream(1, 2);
-    let err = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: other_epoch,
-            after_lsn: None,
-        })
-        .await
-        .expect_err("mismatch");
-    assert_eq!(
-        err.code(),
-        "WYRD_VALA_409_STREAM_MISMATCH",
-        "different writer_epoch returns stream mismatch"
-    );
-
-    // Sanity: correct stream returns data.
-    let ok = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: None,
-        })
-        .await
-        .expect("match");
-    assert_eq!(ok.len(), 1, "one data record on WAL");
-}
-
-#[tokio::test]
-async fn live_tail_returns_only_rows_above_after_lsn() {
-    let dir = TempDir::new().expect("temp dir");
-    let this = stream(3, 1);
-    let wal = make_wal(&dir, this);
-
-    let lsns: Vec<WalLsn> = (0u8..5).map(|i| append(&wal, i)).collect();
-    let cutoff = lsns[1]; // after_lsn = LSN of the second append (LSN 1)
-
-    let service = FetchLiveTailService::new(
-        this,
-        dir.path().to_path_buf(),
-        Arc::new(SealedRangeIndex::new()),
-    );
-
-    let out = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: Some(cutoff),
-        })
-        .await
-        .expect("tail");
-
-    assert!(
-        out.iter().all(|b| b.lsn > cutoff),
-        "no row with LSN ≤ {cutoff} may be returned; got {:?}",
-        out.iter().map(|b| b.lsn).collect::<Vec<_>>()
-    );
-    // LSNs 2, 3, 4 are strictly greater than cutoff (=1), so exactly three rows.
-    assert_eq!(out.len(), 3, "expected 3 records past the cutoff");
-}
-
-#[tokio::test]
-async fn live_tail_during_mid_seal_does_not_double_count() {
-    let dir = TempDir::new().expect("temp dir");
-    let this = stream(4, 1);
-    let wal = make_wal(&dir, this);
-
-    let lsns: Vec<WalLsn> = (0u8..5).map(|i| append(&wal, i)).collect();
-
-    // Split the WAL into a "sealed" portion (first three) and a "live tail"
-    // portion (last two). At each phase, the union of file_list + live-tail
-    // must cover every source LSN exactly once.
-
-    // Phase 1 — pre-freeze: nothing sealed yet. Live tail carries all rows.
-    let pre = FetchLiveTailService::new(
-        this,
-        dir.path().to_path_buf(),
-        Arc::new(SealedRangeIndex::new()),
-    );
-    let pre_out = pre
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: None,
-        })
-        .await
-        .expect("pre-freeze tail");
-    let pre_seen: Vec<WalLsn> = pre_out.iter().map(|b| b.lsn).collect();
-    assert_eq!(pre_seen, lsns, "pre-freeze: live tail covers every row");
-
-    // Phase 2 — mid-seal: LSNs [0..=2] are covered by a sealed range.
-    let sealed = Arc::new(SealedRangeIndex::from_ranges([SealedRange {
-        stream: this,
-        wal_lsn_min: lsns[0],
-        wal_lsn_max: lsns[2],
-    }]));
-    let file_list_mid: Vec<WalLsn> = lsns[0..=2].to_vec();
-    let mid_service =
-        FetchLiveTailService::new(this, dir.path().to_path_buf(), Arc::clone(&sealed));
-    let mid_out = mid_service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: None,
-        })
-        .await
-        .expect("mid-seal tail");
-    let mid_seen: Vec<WalLsn> = mid_out.iter().map(|b| b.lsn).collect();
-    assert_eq!(
-        mid_seen,
-        lsns[3..].to_vec(),
-        "mid-seal: live tail excludes sealed range"
-    );
-    let mut mid_union: Vec<WalLsn> = file_list_mid.iter().copied().chain(mid_seen).collect();
-    mid_union.sort();
-    assert_eq!(
-        mid_union, lsns,
-        "mid-seal: union covers every row exactly once"
-    );
-
-    // Phase 3 — post-retire: every LSN is covered by a sealed range.
-    let sealed_all = Arc::new(SealedRangeIndex::from_ranges([SealedRange {
-        stream: this,
-        wal_lsn_min: lsns[0],
-        wal_lsn_max: *lsns.last().expect("nonempty"),
-    }]));
-    let file_list_all: Vec<WalLsn> = lsns.clone();
-    let post_service =
-        FetchLiveTailService::new(this, dir.path().to_path_buf(), Arc::clone(&sealed_all));
-    let post_out = post_service
-        .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: None,
-        })
-        .await
-        .expect("post-retire tail");
-    assert!(post_out.is_empty(), "post-retire: live tail is empty");
-    let mut post_union: Vec<WalLsn> = file_list_all
-        .into_iter()
-        .chain(post_out.iter().map(|b| b.lsn))
-        .collect();
-    post_union.sort();
-    assert_eq!(
-        post_union, lsns,
-        "post-retire: union covers every row exactly once"
-    );
-}
-
-#[tokio::test]
-async fn live_tail_sealed_range_index_ignores_other_streams() {
-    let dir = TempDir::new().expect("temp dir");
-    let this = stream(5, 1);
-    let other = stream(6, 1);
-    let wal = make_wal(&dir, this);
-
-    let lsns: Vec<WalLsn> = (0u8..3).map(|i| append(&wal, i)).collect();
-
-    // Simulate a `file_list` snapshot containing rows from two producing
-    // streams: one attributed to `this` (covers LSN[0]) and one attributed to
-    // `other` that happens to name the same LSN space. C4 was the collision
-    // bug where the "other" range could suppress this stream's LSN 1.
-    let sealed = Arc::new(SealedRangeIndex::from_ranges([
-        SealedRange {
-            stream: this,
-            wal_lsn_min: lsns[0],
-            wal_lsn_max: lsns[0],
-        },
-        SealedRange {
-            stream: other,
-            wal_lsn_min: lsns[1],
-            wal_lsn_max: lsns[2],
-        },
+fn batch(tenant: DataTenantId, value: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("data_tenant_id", DataType::Utf8, false),
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("value", DataType::Int64, false),
     ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![tenant.to_string()])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1_000_000i64])),
+            Arc::new(arrow::array::Int64Array::from(vec![value])),
+        ],
+    )
+    .expect("tail test batch")
+}
 
-    // Sanity — `contains` scopes per stream.
-    assert!(
-        sealed.contains(this, lsns[0]),
-        "this-stream LSN 0 is sealed"
-    );
-    assert!(
-        !sealed.contains(this, lsns[1]),
-        "other-stream range must not suppress this-stream LSN 1"
-    );
-    assert!(
-        !sealed.contains(this, lsns[2]),
-        "other-stream range must not suppress this-stream LSN 2"
-    );
-    assert!(
-        sealed.contains(other, lsns[1]),
-        "other-stream LSN 1 is sealed for other"
-    );
+fn event() -> AuditEvent {
+    AuditEvent {
+        request_id: wyrd_spec::request_id::RequestId::now_v7(),
+        trace_id: None,
+        operation: "tail.test".to_owned(),
+        resource: "vala.bifrost.events".to_owned(),
+        card_ref: None,
+        principal_id: wyrd_spec::auth::PrincipalId::new(Uuid::now_v7()),
+        principal_kind: wyrd_spec::auth::PrincipalKindTag::Service,
+        auth_method: AuthMethod::Jwt,
+        permission: "tail.test".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "tail".to_owned(),
+        detail: None,
+    }
+}
 
-    let service = FetchLiveTailService::new(this, dir.path().to_path_buf(), sealed);
-    let out = service
+fn setup() -> (
+    Arc<Memtable>,
+    StreamIdentity,
+    DataTenantId,
+    TableRef,
+    LiveTailShard,
+) {
+    let tenant = DataTenantId::new_v7();
+    let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+    let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
+    let stream = StreamIdentity::new(NodeId::new(Uuid::now_v7()), WriterEpoch::new(7));
+    let shard = LiveTailShard {
+        tenant_table: binding,
+        table: table.clone(),
+        tenant,
+    };
+    (Arc::new(Memtable::new()), stream, tenant, table, shard)
+}
+
+fn append(memtable: &Memtable, tenant: DataTenantId, table: &TableRef, lsn: u64, value: i64) {
+    let key = SealKey::new(
+        tenant,
+        table.clone(),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+    );
+    memtable
+        .insert(
+            &key,
+            event(),
+            ScribeAppendMeta {
+                batch_id: [u8::try_from(lsn).expect("test lsn"); 16],
+                rows_accepted: 1,
+                wal_lsn_min: WalLsn::new(lsn),
+                wal_lsn_max: WalLsn::new(lsn),
+                seal_key: key.as_path_components(),
+            },
+            batch(tenant, value),
+        )
+        .expect("append");
+}
+
+fn append_without_tenant(memtable: &Memtable, tenant: DataTenantId, table: &TableRef) {
+    let key = SealKey::new(
+        tenant,
+        table.clone(),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        arrow::datatypes::DataType::Int64,
+        false,
+    )]));
+    let rows = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(arrow::array::Int64Array::from(vec![1]))],
+    )
+    .expect("batch");
+    memtable
+        .insert(
+            &key,
+            event(),
+            ScribeAppendMeta {
+                batch_id: [9; 16],
+                rows_accepted: 1,
+                wal_lsn_min: WalLsn::new(1),
+                wal_lsn_max: WalLsn::new(1),
+                seal_key: key.as_path_components(),
+            },
+            rows,
+        )
+        .expect("append");
+}
+
+#[tokio::test]
+async fn tail_filters_strictly_after_lsn_and_emits_one_terminal() {
+    let (memtable, stream, tenant, table, shard) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    append(&memtable, tenant, &table, 2, 2);
+    let service = FetchLiveTailService::new(stream, memtable);
+
+    let frames = service
         .fetch_live_tail(FetchLiveTailRequest {
-            target_stream: this,
-            after_lsn: None,
+            shard,
+            target_stream: stream,
+            after_lsn: WalLsn::new(1),
         })
         .await
         .expect("tail");
 
-    let seen: Vec<WalLsn> = out.iter().map(|b| b.lsn).collect();
+    assert!(matches!(frames.first(), Some(TailFrame::Batch(batch)) if batch.lsn == WalLsn::new(2)));
+    assert!(matches!(frames.last(), Some(TailFrame::Complete)));
     assert_eq!(
-        seen,
-        vec![lsns[1], lsns[2]],
-        "only this-stream's sealed range excludes rows; other-stream range must not"
+        frames
+            .iter()
+            .filter(|frame| matches!(frame, TailFrame::Complete | TailFrame::Exhausted { .. }))
+            .count(),
+        1
     );
 }
 
-mod pg_tests {
-    use super::*;
-    use chrono::Utc;
-    use sqlx::types::Uuid;
-    use vala_sql::OperatorPool;
-    use wyrd_dev_fixtures::pg::PgFixture;
+#[tokio::test]
+async fn stream_mismatch_rejects_before_memtable_read() {
+    let (memtable, stream, tenant, table, shard) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    let requested = StreamIdentity::new(NodeId::new(Uuid::now_v7()), WriterEpoch::new(8));
+    let service = FetchLiveTailService::new(stream, memtable);
 
-    async fn insert_file_list_range(
-        pool: &OperatorPool,
-        tenant: DataTenantId,
-        stream: StreamIdentity,
-        min_lsn: i64,
-        max_lsn: i64,
-    ) {
-        let event_time = Utc::now();
-        sqlx::query(
-            "INSERT INTO vala.file_list (
-                id, data_tenant_id, namespace, table_name, file_path, file_size,
-                row_count, min_event_time, max_event_time, partition_day,
-                node_id, writer_epoch, wal_lsn_min, wal_lsn_max
-             ) VALUES (
-                $1, $2, 'vala.bifrost', 'events', $3, 128, 2, $4, $4, $5, $6, $7, $8, $9
-             )",
-        )
-        .bind(Uuid::now_v7())
-        .bind(tenant.as_uuid())
-        .bind(format!(
-            "tenants/{tenant}/bifrost/events/sealed/{min_lsn}-{max_lsn}.parquet"
-        ))
-        .bind(event_time)
-        .bind(event_time.date_naive())
-        .bind(stream.node_id.as_uuid())
-        .bind(stream.writer_epoch.as_i64())
-        .bind(min_lsn)
-        .bind(max_lsn)
-        .execute(pool.pool())
+    let error = service
+        .fetch_live_tail(FetchLiveTailRequest {
+            shard,
+            target_stream: requested,
+            after_lsn: WalLsn::new(0),
+        })
         .await
-        .expect("insert file_list range");
-    }
+        .expect_err("mismatch");
+    assert!(matches!(
+        error,
+        vala_bifrost_redux::contracts::ScribeError::StreamMismatch { .. }
+    ));
+}
 
-    #[tokio::test]
-    async fn sealed_range_index_hydrates_from_file_list() {
-        let fixture = PgFixture::start().await.expect("fixture");
-        let pool = OperatorPool::from(fixture.platform_admin_pool().clone());
-        let tenant_a = DataTenantId::new_v7();
-        let tenant_b = DataTenantId::new_v7();
-        fixture
-            .seed_additional_tenant_with_uuid(
-                tenant_a,
-                &format!("test-{}", tenant_a.as_uuid().simple()),
-            )
-            .await
-            .expect("seed tenant A");
-        fixture
-            .seed_additional_tenant_with_uuid(
-                tenant_b,
-                &format!("test-{}", tenant_b.as_uuid().simple()),
-            )
-            .await
-            .expect("seed tenant B");
+#[tokio::test]
+async fn tail_is_scoped_to_exact_tenant_and_table() {
+    let (memtable, stream, tenant, table, shard) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    append(&memtable, DataTenantId::new_v7(), &table, 2, 2);
+    append(
+        &memtable,
+        tenant,
+        &TableRef::new(BifrostNamespace::Bifrost, "other"),
+        3,
+        3,
+    );
+    let service = FetchLiveTailService::new(stream, memtable);
+    let frames = service
+        .fetch_live_tail(FetchLiveTailRequest {
+            shard,
+            target_stream: stream,
+            after_lsn: WalLsn::new(0),
+        })
+        .await
+        .expect("tail");
+    let lsns: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            TailFrame::Batch(batch) => Some(batch.lsn),
+            TailFrame::Complete | TailFrame::Exhausted { .. } => None,
+        })
+        .collect();
+    assert_eq!(lsns, vec![WalLsn::new(1)]);
+}
 
-        let this = stream(7, 3);
-        let other = stream(8, 3);
-        insert_file_list_range(&pool, tenant_a, this, 40, 60).await;
-        insert_file_list_range(&pool, tenant_b, this, 80, 100).await;
-        insert_file_list_range(&pool, tenant_a, other, 120, 140).await;
+#[tokio::test]
+async fn empty_tail_has_exactly_one_complete_frame() {
+    let (memtable, stream, _tenant, _table, shard) = setup();
+    let frames = FetchLiveTailService::new(stream, memtable)
+        .fetch_live_tail(FetchLiveTailRequest {
+            shard,
+            target_stream: stream,
+            after_lsn: WalLsn::new(0),
+        })
+        .await
+        .expect("empty tail");
+    assert_eq!(frames, vec![TailFrame::Complete]);
+}
 
-        let index = SealedRangeIndex::hydrate_from_file_list(&pool, this)
-            .await
-            .expect("hydrate sealed ranges");
-
-        assert!(index.contains(this, WalLsn::new(40)));
-        assert!(index.contains(this, WalLsn::new(50)));
-        assert!(index.contains(this, WalLsn::new(60)));
-        assert!(!index.contains(this, WalLsn::new(70)));
-        assert!(index.contains(this, WalLsn::new(80)));
-        assert!(index.contains(this, WalLsn::new(100)));
-        assert!(!index.contains(this, WalLsn::new(110)));
-        assert!(!index.contains(other, WalLsn::new(120)));
-    }
+#[tokio::test]
+async fn missing_data_tenant_column_is_internal_error() {
+    let (memtable, stream, tenant, table, shard) = setup();
+    append_without_tenant(&memtable, tenant, &table);
+    let error = FetchLiveTailService::new(stream, memtable)
+        .fetch_live_tail(FetchLiveTailRequest {
+            shard,
+            target_stream: stream,
+            after_lsn: WalLsn::new(0),
+        })
+        .await
+        .expect_err("missing tenant column");
+    assert!(matches!(
+        error,
+        vala_bifrost_redux::contracts::ScribeError::Internal { detail }
+            if detail.contains("data_tenant_id")
+    ));
 }

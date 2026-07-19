@@ -49,5 +49,9 @@ harness = false
 name = "bench_ingest_multi_tenant_fairness"
 harness = false
 
+[[bench]]
+name = "bench_wal_tail_p99"
+harness = false
+
 [lints]
 workspace = true

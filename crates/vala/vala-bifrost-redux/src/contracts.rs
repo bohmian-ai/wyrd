@@ -16,6 +16,7 @@ use wyrd_spec::request_id::RequestId;
 
 use crate::catalog::TableRef;
 use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::stream_identity::StreamIdentity;
 
 /// Append request carrying batch data, schema fingerprint, and Principal.
 ///
@@ -55,6 +56,12 @@ pub enum ScribeError {
     #[error("object store PUT failed")]
     ObjectStorePutFailed(#[source] opendal::Error),
 
+    #[error("live-tail stream mismatch: requested={requested}, actual={actual}")]
+    StreamMismatch {
+        requested: StreamIdentity,
+        actual: StreamIdentity,
+    },
+
     #[error("internal scribe failure: {detail}")]
     Internal { detail: String },
 }
@@ -73,6 +80,10 @@ impl ScribeError {
             },
             Self::ObjectStorePutFailed(e) => BifrostError::Internal {
                 detail: format!("object store PUT failed: {e}"),
+            },
+            Self::StreamMismatch { requested, actual } => BifrostError::StreamMismatch {
+                requested: requested.to_string(),
+                actual: actual.to_string(),
             },
             Self::Internal { detail } => BifrostError::Internal {
                 detail: detail.clone(),

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use wyrd_cli::load::{build_submissions, load};
+use wyrd_loader::{build_submissions, load};
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::reference::{InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
@@ -39,12 +39,24 @@ fn load_end_to_end_reference_tree() {
             Spec::from_kind_and_value(&loaded.submission.kind, loaded.submission.spec.clone())
                 .expect("loaded submission must retain a typed spec");
         ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-            SlotValue::Durable(reference) => assert!(matches!(reference, Ref::Ref(_))),
+            SlotValue::Durable(reference) => {
+                assert!(matches!(reference, Ref::Ref(_) | Ref::Sibling { .. }));
+            }
             SlotValue::InlineablePrompt(reference) => {
-                assert!(!matches!(reference, InlineableRef::Path(_)));
+                assert!(matches!(
+                    reference,
+                    InlineableRef::Ref(_)
+                        | InlineableRef::Sibling { .. }
+                        | InlineableRef::Inline(_)
+                ));
             }
             SlotValue::InlineableAgent(reference) => {
-                assert!(!matches!(reference, InlineableRef::Path(_)));
+                assert!(matches!(
+                    reference,
+                    InlineableRef::Ref(_)
+                        | InlineableRef::Sibling { .. }
+                        | InlineableRef::Inline(_)
+                ));
             }
         });
         if loaded.submission.metadata.name.as_str() == "retention-runbook" {
@@ -64,12 +76,15 @@ fn load_end_to_end_reference_tree() {
             let Spec::Trigger(trigger) = &spec else {
                 panic!("eval failure trigger must remain a Trigger spec");
             };
-            assert!(matches!(&trigger.operator_ref, Ref::Ref(_)));
+            assert!(matches!(
+                &trigger.operator_ref,
+                Ref::Ref(_) | Ref::Sibling { .. }
+            ));
             assert!(matches!(
                 &trigger.source,
                 Some(wyrd_spec::card::trigger::TriggerSource::EvalObservation {
-                    eval_ref: Ref::Ref(_),
-                    subject_filter: Some(Ref::Ref(_)),
+                    eval_ref: Ref::Sibling { .. },
+                    subject_filter: Some(Ref::Sibling { .. }),
                 })
             ));
         }

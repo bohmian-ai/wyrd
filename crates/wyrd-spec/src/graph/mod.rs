@@ -109,12 +109,12 @@ pub fn graph_ready_submissions(
         .collect()
 }
 
-/// Build the submission graph from CardRef-shaped objects in each spec.
+/// Build the submission graph from typed sibling references in each spec.
 ///
-/// A reference becomes an edge only when its `(kind, space, name, version)` identity
-/// matches another submission in the same request. References to cards outside
-/// the request are deliberately ignored; external resolution belongs to the
-/// server registry boundary.
+/// A sibling reference becomes an edge only when its `(kind, space, name, version)`
+/// identity matches another submission in the same request. External references are
+/// deliberately ignored, even when they happen to have the same identity as a
+/// submission; external resolution belongs to the server registry boundary.
 ///
 /// The register boundary supplies resolved metadata before calling this helper:
 /// each submission must have a concrete version and space. The graph itself
@@ -159,13 +159,13 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
         let mut references = Vec::new();
         ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
             SlotValue::Durable(reference) => {
-                references.extend(reference.as_card_ref().cloned());
+                references.extend(reference.as_sibling().cloned());
             }
             SlotValue::InlineablePrompt(reference) => {
-                references.extend(reference.as_card_ref().cloned());
+                references.extend(reference.as_sibling().cloned());
             }
             SlotValue::InlineableAgent(reference) => {
-                references.extend(reference.as_card_ref().cloned());
+                references.extend(reference.as_sibling().cloned());
             }
         });
         for child in references {
@@ -201,7 +201,7 @@ fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Node, build, graph_ready_submissions, identity_key};
+    use super::{Edge, build, graph_ready_submissions, identity_key};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::reference::CardRef;
@@ -243,14 +243,20 @@ mod tests {
     #[test]
     fn build_ignores_external_refs() {
         let parent = card_ref(CardKind::Service, "service");
-        let external = card_ref(CardKind::Agent, "external");
-        let (nodes, edges) = build(&[submission(
-            &parent,
-            json!({"components": [{"alias": "external", "ref": serde_json::to_value(external).expect("ref serializes")}] }),
-        )])
+        let external = card_ref(CardKind::Prompt, "external");
+        let (nodes, edges) = build(&[
+            submission(
+                &parent,
+                json!({"components": [{"alias": "external", "ref": serde_json::to_value(external.clone()).expect("ref serializes")}] }),
+            ),
+            submission(
+                &external,
+                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            ),
+        ])
         .expect("resolved submission builds");
 
-        assert_eq!(nodes, vec![Node { card_ref: parent }]);
+        assert_eq!(nodes.len(), 2);
         assert!(edges.is_empty());
     }
 
@@ -258,7 +264,9 @@ mod tests {
     fn build_derives_sibling_edges_from_nested_refs() {
         let parent = card_ref(CardKind::Service, "service");
         let child = card_ref(CardKind::Prompt, "prompt");
-        let child_value = serde_json::to_value(&child).expect("ref serializes");
+        let child_value = json!({
+            "sibling": serde_json::to_value(&child).expect("ref serializes")
+        });
         let (nodes, edges) = build(&[
             submission(
                 &parent,

@@ -52,6 +52,7 @@ FAMILY_SHARED=(
   wyrd-error-derive
   wyrd-queue
   wyrd-runtime
+  wyrd-loader
   wyrd-semver
   wyrd-telemetry
   wyrd-test-contract-macros

@@ -81,6 +81,11 @@ impl SkaldJudgeInvoker {
                     ),
                 });
             }
+            InlineableRef::Sibling { .. } => {
+                return Err(JudgeError::Terminal {
+                    reason: "WYRD_REGISTRY_400_UNRESOLVED_SIBLING_REF: judge Agent sibling reference must be bound by the registry before execution".to_owned(),
+                });
+            }
         };
         validate_judge_agent(&spec)?;
 
@@ -93,6 +98,11 @@ impl SkaldJudgeInvoker {
                         "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: judge Prompt path `{}` must be resolved by the loader",
                         path.display()
                     ),
+                });
+            }
+            InlineableRef::Sibling { .. } => {
+                return Err(JudgeError::Terminal {
+                    reason: "WYRD_REGISTRY_400_UNRESOLVED_SIBLING_REF: judge Prompt sibling reference must be bound by the registry before execution".to_owned(),
                 });
             }
         };

@@ -667,6 +667,7 @@ impl ModelCard {
                         .into_iter()
                         .map(|reference| match reference {
                             Ref::Ref(card_ref) => Ok(card_ref),
+                            Ref::Sibling { sibling } => Ok(sibling),
                             Ref::Path(path) => Err(WyrdPyError::model_validation(format!(
                                 "ModelCard contains unresolved card reference path: {}",
                                 path.display()

@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::{CardRef, Ref};
+use wyrd_spec::reference::Ref;
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
 use super::error::{Diagnostic, Severity};
@@ -20,6 +20,7 @@ pub fn validate_tree(cards: &[AuthoredCard]) -> Vec<Diagnostic> {
         check_resolved_references(card, &mut diagnostics);
     }
     check_heavy_artifact_constraint(cards, &mut diagnostics);
+    check_duplicate_artifact_paths(cards, &mut diagnostics);
     diagnostics
 }
 
@@ -28,12 +29,15 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
     for card in cards {
         let identity = (
             &card.kind,
-            card.metadata.space.as_ref().map(|space| space.as_str()),
+            card.metadata
+                .space
+                .as_ref()
+                .map(wyrd_spec::ids::SpaceName::as_str),
             card.metadata.name.as_str(),
             card.metadata
                 .version
                 .as_ref()
-                .map(|version| version.as_str()),
+                .map(ToString::to_string),
         );
         if let Some(first_path) = seen.get(&identity) {
             diagnostics.push(Diagnostic::invalid_envelope(
@@ -63,12 +67,12 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
         Spec::Service(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
         Spec::Eval(spec) => {
             if let Err(error) = spec.validate() {
-                diagnostics.push(catalog_error(card, error.into()));
+                diagnostics.push(catalog_error(card, &error.into()));
             }
         }
         Spec::Drift(spec) => {
             if let Err(error) = spec.validate() {
-                diagnostics.push(catalog_error(card, error.into()));
+                diagnostics.push(catalog_error(card, &error.into()));
             }
         }
         Spec::Trigger(spec) => validate_trigger(spec, card, diagnostics),
@@ -97,7 +101,7 @@ fn validate_publications(
         if !matches!(target.kind, CardKind::Eval | CardKind::Drift) {
             diagnostics.push(catalog_error(
                 card,
-                WyrdError::SpecInvalidPublishTargetKind {
+                &WyrdError::SpecInvalidPublishTargetKind {
                     message: format!(
                         "publishes_to target {} has kind {}",
                         target.name,
@@ -114,7 +118,7 @@ fn validate_publications(
         if !seen.insert(identity.clone()) {
             diagnostics.push(catalog_error(
                 card,
-                WyrdError::SpecDuplicatePublishTarget {
+                &WyrdError::SpecDuplicatePublishTarget {
                     message: format!("duplicate publishes_to target {identity}"),
                     details: serde_json::json!({ "target": target }),
                 },
@@ -165,35 +169,62 @@ fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnost
     let mut spec = card.spec.clone();
     ReferenceSlotVisitor::visit(&mut spec, |slot| {
         let diagnostic = match slot.value {
-            SlotValue::Durable(Ref::Path(_))
-            | SlotValue::InlineablePrompt(wyrd_spec::reference::InlineableRef::Path(_))
-            | SlotValue::InlineableAgent(wyrd_spec::reference::InlineableRef::Path(_)) => {
-                Some(catalog_error(
-                    card,
-                    WyrdError::RegistryUnresolvedPathRef {
-                        message: format!("unresolved path reference at {}", slot.path),
-                        details: serde_json::json!({ "field": slot.path }),
-                    },
-                ))
-            }
-            SlotValue::Durable(Ref::Ref(CardRef { space: None, .. }))
-            | SlotValue::InlineablePrompt(wyrd_spec::reference::InlineableRef::Ref(CardRef {
-                space: None,
-                ..
-            }))
-            | SlotValue::InlineableAgent(wyrd_spec::reference::InlineableRef::Ref(CardRef {
-                space: None,
-                ..
-            })) => Some(Diagnostic::invalid_envelope(
-                card.source_path.clone(),
-                format!("reference has no resolved space at {}", slot.path),
-            )),
-            _ => None,
+            SlotValue::Durable(reference) => match reference {
+                Ref::Path(_) => Some(unresolved_path_diagnostic(card, &slot.path)),
+                _ if reference
+                    .as_card_ref()
+                    .is_some_and(|reference| reference.space.is_none()) =>
+                {
+                    Some(missing_space_diagnostic(card, &slot.path))
+                }
+                _ => None,
+            },
+            SlotValue::InlineablePrompt(reference) => match reference {
+                wyrd_spec::reference::InlineableRef::Path(_) => {
+                    Some(unresolved_path_diagnostic(card, &slot.path))
+                }
+                _ if reference
+                    .as_card_ref()
+                    .is_some_and(|reference| reference.space.is_none()) =>
+                {
+                    Some(missing_space_diagnostic(card, &slot.path))
+                }
+                _ => None,
+            },
+            SlotValue::InlineableAgent(reference) => match reference {
+                wyrd_spec::reference::InlineableRef::Path(_) => {
+                    Some(unresolved_path_diagnostic(card, &slot.path))
+                }
+                _ if reference
+                    .as_card_ref()
+                    .is_some_and(|reference| reference.space.is_none()) =>
+                {
+                    Some(missing_space_diagnostic(card, &slot.path))
+                }
+                _ => None,
+            },
         };
         if let Some(diagnostic) = diagnostic {
             diagnostics.push(diagnostic);
         }
     });
+}
+
+fn unresolved_path_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
+    catalog_error(
+        card,
+        &WyrdError::RegistryUnresolvedPathRef {
+            message: format!("unresolved path reference at {field}"),
+            details: serde_json::json!({ "field": field }),
+        },
+    )
+}
+
+fn missing_space_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
+    Diagnostic::invalid_envelope(
+        card.source_path.clone(),
+        format!("reference has no resolved space at {field}"),
+    )
 }
 
 fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
@@ -203,7 +234,7 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
     for card in cards.iter().filter(|card| !card.artifacts.is_empty()) {
         diagnostics.push(catalog_error(
             card,
-            WyrdError::RegistryHeavyArtifactNotSoleSubmission {
+            &WyrdError::RegistryHeavyArtifactNotSoleSubmission {
                 message: "a submission with artifacts must be loaded alone".to_owned(),
                 details: serde_json::json!({
                     "artifact_count": card.artifacts.len(),
@@ -214,16 +245,35 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
     }
 }
 
-fn catalog_error(card: &AuthoredCard, error: WyrdError) -> Diagnostic {
+fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen = HashMap::new();
+    for card in cards {
+        for artifact in &card.artifacts {
+            if let Some(first_path) = seen.insert(&artifact.relative_path, &card.source_path) {
+                diagnostics.push(Diagnostic::invalid_envelope(
+                    card.source_path.clone(),
+                    format!(
+                        "duplicate artifact path {} (first authored at {})",
+                        artifact.relative_path,
+                        first_path.display()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn catalog_error(card: &AuthoredCard, error: &WyrdError) -> Diagnostic {
     Diagnostic::from_wyrd_error(card.source_path.clone(), Severity::Error, None, error)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use super::validate_tree;
-    use crate::load::parse::AuthoredCard;
+    use crate::parse::AuthoredCard;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
@@ -247,8 +297,8 @@ mod tests {
                 bump: None,
                 space: Some(SpaceName::new("default").expect("test space is valid")),
                 uid: None,
-                labels: Default::default(),
-                annotations: Default::default(),
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
                 spec_hash: None,
                 artifact_hash: None,
                 origin: None,
@@ -264,7 +314,7 @@ mod tests {
                         uid: None,
                     }),
                     source: None,
-                    config: Default::default(),
+                    config: BTreeMap::new(),
                     credential_refs: Vec::new(),
                 }],
                 ..Default::default()

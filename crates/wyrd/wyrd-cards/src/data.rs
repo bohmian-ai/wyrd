@@ -677,6 +677,7 @@ impl DataCard {
                         .into_iter()
                         .map(|reference| match reference {
                             Ref::Ref(card_ref) => Ok(card_ref),
+                            Ref::Sibling { sibling } => Ok(sibling),
                             Ref::Path(path) => Err(WyrdPyError::validation(format!(
                                 "DataCard contains unresolved card reference path: {}",
                                 path.display()

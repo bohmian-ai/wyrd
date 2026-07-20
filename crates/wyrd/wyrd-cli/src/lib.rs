@@ -13,6 +13,6 @@ pub mod load;
 
 // Re-export the public loader API
 pub use load::{
-    CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, Severity, SourceSpan,
-    build_submissions, emit_json, load,
+    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, RegistrationInput,
+    Severity, SourceSpan, build_registration_input, build_submissions, emit_json, load,
 };

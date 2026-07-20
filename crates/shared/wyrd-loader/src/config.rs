@@ -42,6 +42,11 @@ pub fn discover(entry_path: &Path) -> Result<wyrd_config::WyrdConfig, LoadError>
 /// 4. System fallback (lowest)
 ///
 /// Runs before resolve/validate/order.
+///
+/// # Panics
+///
+/// Panics only if the hard-coded system fallback space violates the `SpaceName`
+/// invariant.
 pub fn apply_defaults(cards: &mut [AuthoredCard], config: &wyrd_config::WyrdConfig) {
     for card in cards {
         wyrd_config::apply_defaults(&mut card.metadata, &card.kind, config);

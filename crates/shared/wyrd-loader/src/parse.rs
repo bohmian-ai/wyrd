@@ -51,12 +51,12 @@ struct RawCardEnvelope {
 /// Collects every envelope violation across all docs; does not short-circuit.
 pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     let bytes =
-        std::fs::read(path).map_err(|e| LoadError::single(Diagnostic::io(path.into(), e)))?;
+        std::fs::read(path).map_err(|e| LoadError::single(Diagnostic::io(path.into(), &e)))?;
 
     let content = std::str::from_utf8(&bytes).map_err(|e| {
         LoadError::single(Diagnostic::yaml_syntax(
             path.into(),
-            serde_yaml::Error::custom(format!("invalid UTF-8: {}", e)),
+            &serde_yaml::Error::custom(format!("invalid UTF-8: {e}")),
         ))
     })?;
 
@@ -75,7 +75,7 @@ pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
                     Err(diagnostic) => diagnostics.push(diagnostic),
                 }
             }
-            Err(error) => diagnostics.push(Diagnostic::yaml_syntax(path.into(), error)),
+            Err(error) => diagnostics.push(Diagnostic::yaml_syntax(path.into(), &error)),
         }
     }
 
@@ -99,7 +99,10 @@ pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
             std::io::ErrorKind::NotFound,
             "loader entry is neither a file nor a directory",
         );
-        return Err(LoadError::single(Diagnostic::io(path.to_path_buf(), error)));
+        return Err(LoadError::single(Diagnostic::io(
+            path.to_path_buf(),
+            &error,
+        )));
     }
 
     let mut files = Vec::new();
@@ -122,10 +125,10 @@ pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
 
 fn collect_yaml_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoadError> {
     let entries = std::fs::read_dir(path)
-        .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), error)))?;
+        .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
     for entry in entries {
         let entry =
-            entry.map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), error)))?;
+            entry.map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
         let entry_path = entry.path();
         if entry_path.is_dir() {
             collect_yaml_files(&entry_path, files)?;
@@ -159,7 +162,7 @@ fn parse_single_envelope(path: &Path, raw: serde_yaml::Value) -> Result<Authored
         } else if error_msg.contains("spec") {
             Diagnostic::invalid_envelope(path.into(), "Missing required field: spec".to_string())
         } else {
-            Diagnostic::yaml_syntax(path.into(), e)
+            Diagnostic::yaml_syntax(path.into(), &e)
         }
     })?;
 
@@ -226,7 +229,7 @@ fn materialize_inline_files(
             {
                 return Err(Diagnostic::path_escape(
                     source_path.to_path_buf(),
-                    relative_path.to_path_buf(),
+                    relative_path,
                 ));
             }
             let base = source_path.parent().ok_or_else(|| {
@@ -236,7 +239,7 @@ fn materialize_inline_files(
                 )
             })?;
             let content = std::fs::read_to_string(base.join(relative_path))
-                .map_err(|error| Diagnostic::io(source_path.to_path_buf(), error))?;
+                .map_err(|error| Diagnostic::io(source_path.to_path_buf(), &error))?;
             *value = serde_yaml::Value::String(content);
         }
         serde_yaml::Value::Tagged(tagged) => {

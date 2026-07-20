@@ -1137,7 +1137,7 @@
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "type": "object",
       "required": [
         "kind",
@@ -2373,7 +2373,7 @@
       "additionalProperties": false
     },
     "InlineableRef_for_AgentSpec": {
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
       "anyOf": [
         {
           "description": "A direct reference to a registered Card.",
@@ -2382,6 +2382,23 @@
               "$ref": "#/definitions/CardRef"
             }
           ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
         },
         {
           "description": "An embedded child spec.",
@@ -2398,7 +2415,7 @@
       ]
     },
     "InlineableRef_for_Prompt": {
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader.",
       "anyOf": [
         {
           "description": "A direct reference to a registered Card.",
@@ -2407,6 +2424,23 @@
               "$ref": "#/definitions/CardRef"
             }
           ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
         },
         {
           "description": "An embedded child spec.",
@@ -5273,7 +5307,7 @@
       ]
     },
     "Ref": {
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary.",
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card.",
       "anyOf": [
         {
           "description": "A direct reference to a registered Card.",
@@ -5282,6 +5316,23 @@
               "$ref": "#/definitions/CardRef"
             }
           ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
         },
         {
           "description": "A local authored path awaiting loader resolution.",

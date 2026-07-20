@@ -25,9 +25,9 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
     // construction and sorting. The loader only projects the returned nodes
     // back to its local provenance IDs.
     let graph_submissions = wyrd_spec::graph::graph_ready_submissions(&submissions)
-        .map_err(|error| vec![graph_diagnostic(error, cards, &[])])?;
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
     let (nodes, edges) = wyrd_spec::graph::build(&graph_submissions)
-        .map_err(|error| vec![graph_diagnostic(error, cards, &[])])?;
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &[])])?;
     let card_refs = nodes
         .iter()
         .map(|node| node.card_ref.clone())
@@ -35,7 +35,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
 
     let order = wyrd_spec::graph::topo_sort(&nodes, &edges)
         .and_then(wyrd_spec::graph::root_last)
-        .map_err(|error| vec![graph_diagnostic(error, cards, &card_refs)])?;
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
 
     order
         .nodes
@@ -80,7 +80,7 @@ pub(crate) fn submission_for(card: &AuthoredCard) -> Result<CardSubmission, Diag
 }
 
 fn graph_diagnostic(
-    error: GraphError,
+    error: &GraphError,
     cards: &[AuthoredCard],
     card_refs: &[wyrd_spec::reference::CardRef],
 ) -> Diagnostic {
@@ -98,7 +98,7 @@ fn graph_diagnostic(
     .unwrap_or_else(|| "<loader>".into());
 
     let message = error.to_string();
-    let error = match &error {
+    let error = match error {
         GraphError::Cycle { cycle } => WyrdError::RegistryDependencyCycle {
             message,
             details: serde_json::json!({ "participants": cycle }),
@@ -112,12 +112,13 @@ fn graph_diagnostic(
             details: serde_json::json!({ "graph_error": error.to_string() }),
         },
     };
-    Diagnostic::from_wyrd_error(path, super::Severity::Error, None, error)
+    Diagnostic::from_wyrd_error(path, super::Severity::Error, None, &error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use wyrd_semver::VersionBlock;
     use wyrd_spec::api_version::ApiVersion;
@@ -133,8 +134,8 @@ mod tests {
             bump: None,
             space: Some(SpaceName::new("default").unwrap()),
             uid: None,
-            labels: Default::default(),
-            annotations: Default::default(),
+            labels: BTreeMap::new(),
+            annotations: BTreeMap::new(),
             spec_hash: None,
             artifact_hash: None,
             origin: None,
@@ -146,15 +147,17 @@ mod tests {
             .map(|dependency| {
                 vec![ServiceComponent {
                     alias: dependency.to_string(),
-                    card_ref: Ref::Ref(wyrd_spec::reference::CardRef {
-                        kind: CardKind::Service,
-                        name: CardName::new(dependency).unwrap(),
-                        version: VersionBlock::parse("1.0.0").unwrap(),
-                        space: Some(SpaceName::new("default").unwrap()),
-                        uid: None,
-                    }),
+                    card_ref: Ref::Sibling {
+                        sibling: wyrd_spec::reference::CardRef {
+                            kind: CardKind::Service,
+                            name: CardName::new(dependency).unwrap(),
+                            version: VersionBlock::parse("1.0.0").unwrap(),
+                            space: Some(SpaceName::new("default").unwrap()),
+                            uid: None,
+                        },
+                    },
                     source: None,
-                    config: Default::default(),
+                    config: BTreeMap::new(),
                     credential_refs: Vec::new(),
                 }]
             })

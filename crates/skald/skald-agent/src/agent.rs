@@ -66,6 +66,7 @@ impl PromptResolver for LocalPromptResolver {
                     .into()
                 }),
             InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
+            InlineableRef::Sibling { .. } => Err(unresolved_prompt_path_error()),
         }
     }
 }
@@ -815,6 +816,7 @@ fn resolve_prompt_ref(
         InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
         InlineableRef::Ref(_) => resolver.resolve(prompt_ref),
         InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
+        InlineableRef::Sibling { .. } => Err(unresolved_prompt_path_error()),
     }
 }
 

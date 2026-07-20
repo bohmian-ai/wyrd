@@ -39,6 +39,8 @@ vala-sql = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-error-derive = { workspace = true }
+
+wyrd-loader = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-sql = { workspace = true, features = ["embedded-postgres"] }

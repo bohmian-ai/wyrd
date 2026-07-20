@@ -77,7 +77,7 @@ impl Diagnostic {
         path: PathBuf,
         severity: Severity,
         span: Option<SourceSpan>,
-        error: WyrdError,
+        error: &WyrdError,
     ) -> Self {
         let problem = error.as_problem_json();
         let context = problem
@@ -98,13 +98,13 @@ impl Diagnostic {
 
     /// Create an IO diagnostic.
     #[must_use]
-    pub fn io(path: PathBuf, source: std::io::Error) -> Self {
+    pub fn io(path: PathBuf, source: &std::io::Error) -> Self {
         let message = source.to_string();
         Self::from_wyrd_error(
             path,
             Severity::Error,
             None,
-            WyrdError::LoaderIo {
+            &WyrdError::LoaderIo {
                 message,
                 details: serde_json::Value::Null,
             },
@@ -113,7 +113,7 @@ impl Diagnostic {
 
     /// Create a YAML syntax diagnostic with parser location when available.
     #[must_use]
-    pub fn yaml_syntax(path: PathBuf, source: serde_yaml::Error) -> Self {
+    pub fn yaml_syntax(path: PathBuf, source: &serde_yaml::Error) -> Self {
         let span = source.location().map(|location| SourceSpan {
             line: location.line(),
             column: location.column(),
@@ -123,7 +123,7 @@ impl Diagnostic {
             path,
             Severity::Error,
             span,
-            WyrdError::LoaderYamlSyntax {
+            &WyrdError::LoaderYamlSyntax {
                 message,
                 details: serde_json::Value::Null,
             },
@@ -137,7 +137,7 @@ impl Diagnostic {
             path,
             Severity::Error,
             None,
-            WyrdError::LoaderInvalidEnvelope {
+            &WyrdError::LoaderInvalidEnvelope {
                 message,
                 details: serde_json::Value::Null,
             },
@@ -146,12 +146,12 @@ impl Diagnostic {
 
     /// Create a path escape diagnostic.
     #[must_use]
-    pub fn path_escape(path: PathBuf, escaped_path: PathBuf) -> Self {
+    pub fn path_escape(path: PathBuf, escaped_path: &std::path::Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Error,
             None,
-            WyrdError::LoaderPathEscape {
+            &WyrdError::LoaderPathEscape {
                 message: format!(
                     "path reference escapes workspace: {}",
                     escaped_path.display()
@@ -163,12 +163,12 @@ impl Diagnostic {
 
     /// Create an absolute-path portability warning.
     #[must_use]
-    pub fn path_absolute_advisory(path: PathBuf, absolute_path: PathBuf) -> Self {
+    pub fn path_absolute_advisory(path: PathBuf, absolute_path: &std::path::Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Warning,
             None,
-            WyrdError::LoaderPathAbsoluteAdvisory {
+            &WyrdError::LoaderPathAbsoluteAdvisory {
                 message: format!(
                     "absolute path breaks portability: {}",
                     absolute_path.display()
@@ -185,7 +185,7 @@ impl Diagnostic {
             path,
             Severity::Error,
             None,
-            WyrdError::LoaderConfigLoadFailed {
+            &WyrdError::LoaderConfigLoadFailed {
                 message,
                 details: serde_json::Value::Null,
             },

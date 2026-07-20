@@ -117,7 +117,10 @@ async fn invoke_with_retries(
     task: &LlmJudgeTask,
     context: Value,
 ) -> Result<Value, EvalExecError> {
-    if matches!(&task.judge_ref, InlineableRef::Path(_)) {
+    if matches!(
+        &task.judge_ref,
+        InlineableRef::Path(_) | InlineableRef::Sibling { .. }
+    ) {
         return Err(EvalExecError::JudgeRetriesExhausted {
                 task_id: task.id.clone(),
                 attempts: 0,

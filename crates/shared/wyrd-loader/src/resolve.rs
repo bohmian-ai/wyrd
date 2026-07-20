@@ -10,9 +10,9 @@ use super::error::{Diagnostic, LoadError};
 use super::parse::{AuthoredCard, card_ref_for, parse_file};
 use super::path::PathSandbox;
 
-/// Resolve all path references in the tree, rewriting them to `Ref` variants.
+/// Resolve all path references in the tree, rewriting them to sibling variants.
 ///
-/// Every `Ref::Path` becomes `Ref::Ref(CardRef)` bound to a sibling
+/// Every `Ref::Path` becomes `Ref::Sibling { sibling: CardRef }` bound to a sibling
 /// submission. Path-loaded cards are appended to `cards` so transitive paths
 /// participate in validation and topological ordering.
 pub fn resolve_tree(
@@ -54,7 +54,7 @@ pub fn resolve_tree(
                 inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let Ref::Path(path) = ref_slot {
                     match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
-                        Ok(card_ref) => *ref_slot = Ref::Ref(card_ref),
+                        Ok(card_ref) => *ref_slot = Ref::Sibling { sibling: card_ref },
                         Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
@@ -63,7 +63,7 @@ pub fn resolve_tree(
                 inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let InlineableRef::Path(path) = ref_slot {
                     match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
-                        Ok(card_ref) => *ref_slot = InlineableRef::Ref(card_ref),
+                        Ok(card_ref) => *ref_slot = InlineableRef::Sibling { sibling: card_ref },
                         Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
@@ -72,7 +72,7 @@ pub fn resolve_tree(
                 inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let InlineableRef::Path(path) = ref_slot {
                     match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
-                        Ok(card_ref) => *ref_slot = InlineableRef::Ref(card_ref),
+                        Ok(card_ref) => *ref_slot = InlineableRef::Sibling { sibling: card_ref },
                         Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
@@ -199,7 +199,7 @@ mod tests {
         let mut cards = parse_file(&entry).unwrap();
         let diagnostics = resolve_tree(
             &mut cards,
-            &PathSandbox::new(root.to_path_buf()).unwrap(),
+            &PathSandbox::new(root).unwrap(),
             &wyrd_config::WyrdConfig::empty(),
         )
         .unwrap();

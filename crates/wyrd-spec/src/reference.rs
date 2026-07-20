@@ -11,7 +11,7 @@ use crate::ids::{CardName, CardUid, SpaceName};
 use crate::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_semver::VersionBlock;
 
-/// Reference to a registered Card by kind, name, version, space, and optional UID.
+/// Reference to a registered Card by kind, name, version, optional space, and optional UID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct CardRef {
@@ -56,14 +56,20 @@ pub struct CardRefIdentity {
 
 /// A reference position that requires durable identity.
 ///
-/// Loaders rewrite `Path` values to `Ref` values before submitting a request;
-/// the server rejects unresolved paths at the wire boundary.
+/// Loaders rewrite `Path` values to `Sibling` values before submitting a request;
+/// the server rejects unresolved paths at the wire boundary. Authored `Ref`
+/// values remain external references even when they identify a submitted card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", untagged)]
 pub enum Ref {
     /// A direct reference to a registered Card.
     Ref(CardRef),
+    /// A loader-projected reference to another submission in the same request.
+    Sibling {
+        /// Exact identity of the sibling submission.
+        sibling: CardRef,
+    },
     /// A local authored path awaiting loader resolution.
     #[cfg_attr(feature = "server", schema(value_type = String))]
     Path(PathBuf),
@@ -73,12 +79,11 @@ impl Ref {
     /// Return the resolved [`CardRef`] when this ref carries durable identity.
     ///
     /// Returns `None` for [`Ref::Path`] values that a loader has not yet
-    /// rewritten. Server code that observes `None` on the wire must reject
-    /// with `WYRD_REGISTRY_400_UNRESOLVED_PATH_REF`.
+    /// rewritten. Both [`Ref::Ref`] and [`Ref::Sibling`] carry durable identity.
     #[must_use]
     pub fn as_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Ref(card_ref) => Some(card_ref),
+            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
             Self::Path(_) => None,
         }
     }
@@ -87,8 +92,17 @@ impl Ref {
     #[must_use]
     pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
         match self {
-            Self::Ref(card_ref) => Some(card_ref),
+            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
             Self::Path(_) => None,
+        }
+    }
+
+    /// Return the exact identity when this is a loader-projected sibling.
+    #[must_use]
+    pub fn as_sibling(&self) -> Option<&CardRef> {
+        match self {
+            Self::Sibling { sibling } => Some(sibling),
+            Self::Ref(_) | Self::Path(_) => None,
         }
     }
 }
@@ -101,7 +115,7 @@ impl From<CardRef> for Ref {
 
 /// A reference position that may carry an embedded child spec.
 ///
-/// Loaders rewrite `Path` values to `Ref` values before submitting a request;
+/// Loaders rewrite `Path` values to `Sibling` values before submitting a request;
 /// the server rejects unresolved paths at the wire boundary. `Inline`
 /// bodies are authored, not synthesized by the loader.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -110,6 +124,11 @@ impl From<CardRef> for Ref {
 pub enum InlineableRef<T> {
     /// A direct reference to a registered Card.
     Ref(CardRef),
+    /// A loader-projected reference to another submission in the same request.
+    Sibling {
+        /// Exact identity of the sibling submission.
+        sibling: CardRef,
+    },
     /// An embedded child spec.
     Inline(Box<T>),
     /// A local authored path awaiting loader resolution.
@@ -122,11 +141,11 @@ impl<T> InlineableRef<T> {
     ///
     /// Returns `None` for [`InlineableRef::Path`] (loader has not resolved
     /// it yet) and [`InlineableRef::Inline`] (the body is embedded, not
-    /// referenced).
+    /// referenced). Both card-reference variants carry durable identity.
     #[must_use]
     pub fn as_card_ref(&self) -> Option<&CardRef> {
         match self {
-            Self::Ref(card_ref) => Some(card_ref),
+            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
             Self::Inline(_) | Self::Path(_) => None,
         }
     }
@@ -135,7 +154,7 @@ impl<T> InlineableRef<T> {
     #[must_use]
     pub fn as_card_ref_mut(&mut self) -> Option<&mut CardRef> {
         match self {
-            Self::Ref(card_ref) => Some(card_ref),
+            Self::Ref(card_ref) | Self::Sibling { sibling: card_ref } => Some(card_ref),
             Self::Inline(_) | Self::Path(_) => None,
         }
     }
@@ -145,7 +164,7 @@ impl<T> InlineableRef<T> {
     pub fn as_inline(&self) -> Option<&T> {
         match self {
             Self::Inline(body) => Some(body),
-            Self::Ref(_) | Self::Path(_) => None,
+            Self::Ref(_) | Self::Sibling { .. } | Self::Path(_) => None,
         }
     }
 
@@ -154,7 +173,16 @@ impl<T> InlineableRef<T> {
     pub fn as_inline_mut(&mut self) -> Option<&mut T> {
         match self {
             Self::Inline(body) => Some(body),
-            Self::Ref(_) | Self::Path(_) => None,
+            Self::Ref(_) | Self::Sibling { .. } | Self::Path(_) => None,
+        }
+    }
+
+    /// Return the exact identity when this is a loader-projected sibling.
+    #[must_use]
+    pub fn as_sibling(&self) -> Option<&CardRef> {
+        match self {
+            Self::Sibling { sibling } => Some(sibling),
+            Self::Ref(_) | Self::Inline(_) | Self::Path(_) => None,
         }
     }
 }
@@ -579,6 +607,17 @@ mod tests {
         let json = serde_json::to_string(&card_ref).expect("serialize");
         let parsed: CardRef = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(card_ref, parsed);
+    }
+
+    #[test]
+    fn sibling_ref_uses_explicit_wire_wrapper() {
+        let reference = Ref::Sibling {
+            sibling: sample_ref(),
+        };
+        let json = serde_json::to_value(&reference).expect("sibling ref serializes");
+        assert_eq!(json, serde_json::json!({"sibling": sample_ref()}));
+        let parsed: Ref = serde_json::from_value(json).expect("sibling ref deserializes");
+        assert_eq!(parsed, reference);
     }
 
     #[test]

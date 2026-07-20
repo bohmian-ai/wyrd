@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CardRef",
-  "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+  "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
   "type": "object",
   "required": [
     "kind",

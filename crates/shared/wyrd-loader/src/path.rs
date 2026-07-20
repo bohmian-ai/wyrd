@@ -12,10 +12,10 @@ pub struct PathSandbox {
 
 impl PathSandbox {
     /// Create a new sandbox rooted at the given path.
-    pub fn new(root: PathBuf) -> Result<Self, Diagnostic> {
+    pub fn new(root: &Path) -> Result<Self, Diagnostic> {
         let canonical = root
             .canonicalize()
-            .map_err(|error| Diagnostic::io(root.clone(), error))?;
+            .map_err(|error| Diagnostic::io(root.to_path_buf(), &error))?;
         Ok(Self { root: canonical })
     }
 
@@ -32,9 +32,9 @@ impl PathSandbox {
         if ref_path.is_absolute() {
             let canonical = ref_path
                 .canonicalize()
-                .map_err(|e| Diagnostic::io(base_file.into(), e))?;
+                .map_err(|e| Diagnostic::io(base_file.into(), &e))?;
 
-            let advisory = Diagnostic::path_absolute_advisory(base_file.into(), canonical.clone());
+            let advisory = Diagnostic::path_absolute_advisory(base_file.into(), &canonical);
             return Ok((canonical, Some(advisory)));
         }
 
@@ -48,20 +48,20 @@ impl PathSandbox {
 
         let base_dir = base_dir
             .canonicalize()
-            .map_err(|e| Diagnostic::io(base_file.into(), e))?;
+            .map_err(|e| Diagnostic::io(base_file.into(), &e))?;
         let resolved = normalize_relative_path(&base_dir, ref_path);
 
         if !resolved.starts_with(&self.root) {
-            return Err(Diagnostic::path_escape(base_file.into(), resolved));
+            return Err(Diagnostic::path_escape(base_file.into(), &resolved));
         }
 
         let canonical = resolved
             .canonicalize()
-            .map_err(|e| Diagnostic::io(base_file.into(), e))?;
+            .map_err(|e| Diagnostic::io(base_file.into(), &e))?;
 
         // Check that the canonical path is within the root
         if !canonical.starts_with(&self.root) {
-            return Err(Diagnostic::path_escape(base_file.into(), canonical));
+            return Err(Diagnostic::path_escape(base_file.into(), &canonical));
         }
 
         Ok((canonical, None))
@@ -72,12 +72,13 @@ fn normalize_relative_path(base: &Path, relative: &Path) -> PathBuf {
     let mut normalized = base.to_path_buf();
     for component in relative.components() {
         match component {
-            std::path::Component::CurDir => {}
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
             std::path::Component::ParentDir => {
                 normalized.pop();
             }
             std::path::Component::Normal(part) => normalized.push(part),
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {}
         }
     }
     normalized
@@ -92,7 +93,7 @@ mod tests {
     fn path_sandbox_accepts_valid_relative() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().to_path_buf();
-        let sandbox = PathSandbox::new(root.clone()).unwrap();
+        let sandbox = PathSandbox::new(&root).unwrap();
 
         // Create a subdirectory
         let subdir = root.join("agents");
@@ -118,7 +119,7 @@ mod tests {
     fn path_sandbox_accepts_absolute_with_advisory() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().to_path_buf();
-        let sandbox = PathSandbox::new(root.clone()).unwrap();
+        let sandbox = PathSandbox::new(&root).unwrap();
 
         let base = root.join("service.yaml");
         std::fs::write(&base, "").unwrap();
@@ -139,7 +140,7 @@ mod tests {
         let root = temp.path().join("workspace");
         std::fs::create_dir(&root).unwrap();
 
-        let sandbox = PathSandbox::new(root.clone()).unwrap();
+        let sandbox = PathSandbox::new(&root).unwrap();
 
         let base = root.join("service.yaml");
         std::fs::write(&base, "").unwrap();

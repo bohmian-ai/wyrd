@@ -307,6 +307,7 @@ impl PromptReference {
     pub fn kind(&self) -> &'static str {
         match self.inner {
             InlineableRef::Ref(_) => "card",
+            InlineableRef::Sibling { .. } => "sibling",
             InlineableRef::Inline(_) => "inline",
             InlineableRef::Path(_) => "path",
         }

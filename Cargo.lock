@@ -10669,6 +10669,7 @@ dependencies = [
  "wyrd-config",
  "wyrd-dev-fixtures",
  "wyrd-error-derive",
+ "wyrd-loader",
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-sql",
@@ -10762,6 +10763,20 @@ dependencies = [
  "wyrd-spec",
  "wyrd-utils",
  "zstd",
+]
+
+[[package]]
+name = "wyrd-loader"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wyrd-config",
+ "wyrd-semver",
+ "wyrd-spec",
 ]
 
 [[package]]

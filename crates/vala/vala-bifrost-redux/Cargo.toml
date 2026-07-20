@@ -53,5 +53,9 @@ harness = false
 name = "bench_wal_tail_p99"
 harness = false
 
+[[bench]]
+name = "bench_forge_compaction_throughput"
+harness = false
+
 [lints]
 workspace = true

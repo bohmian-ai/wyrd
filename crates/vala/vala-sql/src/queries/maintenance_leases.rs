@@ -65,6 +65,38 @@ pub async fn renew_lease_fenced(
     Ok(result.rows_affected() > 0)
 }
 
+/// Release a maintenance lease only when the caller still owns its fence.
+///
+/// A stale worker cannot delete a successor's lease because all three identity
+/// columns are part of the conditional predicate. The boolean result is false
+/// when the row was already reclaimed or the supplied fence is stale.
+///
+/// # Errors
+/// Returns [`SqlError`] when the conditional delete cannot be executed.
+pub async fn release_lease_fenced(
+    op: &OperatorPool,
+    lease_key: &str,
+    owner: Uuid,
+    fencing_token: i64,
+) -> Result<bool, SqlError> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM vala.maintenance_leases
+         WHERE lease_key = $1
+           AND owner = $2
+           AND fencing_token = $3
+        "#,
+    )
+    .bind(lease_key)
+    .bind(owner)
+    .bind(fencing_token)
+    .execute(op.pool())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(result.rows_affected() == 1)
+}
+
 /// Try to acquire a maintenance lease, returning the fencing token on success.
 ///
 /// Uses `INSERT … ON CONFLICT` so only one caller wins the race: a brand-new

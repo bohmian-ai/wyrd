@@ -38,7 +38,7 @@ pub mod system_columns;
 pub mod trace;
 
 pub use audit_detail::{
-    AuditDetail, AuditDetailValueError, BatchId, ScopeHash, StoragePath,
+    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ScopeHash, StoragePath,
     audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};

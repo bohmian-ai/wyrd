@@ -212,6 +212,25 @@ pub enum CardScopeMintKind {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditDetail {
+    /// A Forge compaction operation and its external Iceberg boundary.
+    ForgeCompaction {
+        /// Deterministic identifier shared by prepared and terminal rows.
+        operation_id: uuid::Uuid,
+        /// Durable phase represented by this audit row.
+        phase: ForgeCompactionPhase,
+        /// Canonical tenant/table/day group identity.
+        group: String,
+        /// Exact staging rows transitioned by the operation.
+        input_file_ids: Vec<uuid::Uuid>,
+        /// Exact staging paths consumed by the operation.
+        input_paths: Vec<StoragePath>,
+        /// Deterministic compacted output path.
+        output_path: StoragePath,
+        /// Iceberg snapshot returned by a committed operation, when known.
+        snapshot_id: Option<i64>,
+        /// Writer recipe identifier used to create the output.
+        writer_recipe_version: String,
+    },
     /// Authentication failure metadata; credentials are never representable here.
     AuthFailure {
         /// Stable reason for the authentication refusal.
@@ -317,6 +336,21 @@ pub enum AuditDetail {
         /// Ingest authorization decision.
         decision: AuditDecision,
     },
+}
+
+/// Durable phase recorded for a Forge compaction operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeCompactionPhase {
+    /// Inputs were hidden before the external Iceberg commit.
+    Prepared,
+    /// The external Iceberg commit completed.
+    Committed,
+    /// Reconciliation recovered a previously completed external commit.
+    Recovered,
+    /// Reconciliation made the exact inputs visible again after expiry.
+    Reset,
 }
 
 /// Closed storage backend identifiers.

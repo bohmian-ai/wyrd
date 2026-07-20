@@ -151,21 +151,23 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyr
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_scribe_multipod_journey -- --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test journey_forge_single_pod -- --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test pg_bifrost_forge_multipod_journey -- --ignored --test-threads=1
 """
 
 [tasks."test:fuzz:bifrost"]
 description = "Run the deterministic Bifrost interleaving matrix smoke tests"
-run = "cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1 && cargo test --locked -p wyrd-testing --test forge_compaction_interleaving -- --test-threads=1"
 
 [tasks."test:bifrost:sustained"]
 description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test-threads=1 && cargo test --locked -p wyrd-testing --test pg_bifrost_forge_sustained_journey -- --ignored --test-threads=1"
 
 [tasks."bench:bifrost:slo"]
-description = "Run the Redux WAL-tail p99 SLO benchmark"
-run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99"
+description = "Run the Redux WAL-tail and Forge compaction SLO benchmarks"
+run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99 && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_compaction_throughput"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.

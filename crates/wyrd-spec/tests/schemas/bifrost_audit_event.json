@@ -131,6 +131,76 @@
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
         {
+          "description": "A Forge compaction operation and its external Iceberg boundary.",
+          "type": "object",
+          "required": [
+            "group",
+            "input_file_ids",
+            "input_paths",
+            "kind",
+            "operation_id",
+            "output_path",
+            "phase",
+            "writer_recipe_version"
+          ],
+          "properties": {
+            "group": {
+              "description": "Canonical tenant/table/day group identity.",
+              "type": "string"
+            },
+            "input_file_ids": {
+              "description": "Exact staging rows transitioned by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "format": "uuid"
+              }
+            },
+            "input_paths": {
+              "description": "Exact staging paths consumed by the operation.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_compaction"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_path": {
+              "description": "Deterministic compacted output path.",
+              "type": "string"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeCompactionPhase"
+                }
+              ]
+            },
+            "snapshot_id": {
+              "description": "Iceberg snapshot returned by a committed operation, when known.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "writer_recipe_version": {
+              "description": "Writer recipe identifier used to create the output.",
+              "type": "string"
+            }
+          }
+        },
+        {
           "description": "Authentication failure metadata; credentials are never representable here.",
           "type": "object",
           "required": [
@@ -832,6 +902,39 @@
       "maxLength": 40,
       "minLength": 7,
       "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "ForgeCompactionPhase": {
+      "description": "Durable phase recorded for a Forge compaction operation.",
+      "oneOf": [
+        {
+          "description": "Inputs were hidden before the external Iceberg commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The external Iceberg commit completed.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation recovered a previously completed external commit.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation made the exact inputs visible again after expiry.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
     },
     "Origin": {
       "description": "Code-origin provenance for a card: the repository commit it was declared from, plus the in-repo path for monorepo disambiguation.",

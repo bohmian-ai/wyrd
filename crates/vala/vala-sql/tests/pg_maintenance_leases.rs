@@ -7,7 +7,9 @@ mod pg_tests {
 
     use sqlx::types::Uuid;
     use vala_sql::OperatorPool;
-    use vala_sql::queries::maintenance_leases::{renew_lease_fenced, try_acquire_lease};
+    use vala_sql::queries::maintenance_leases::{
+        release_lease_fenced, renew_lease_fenced, try_acquire_lease,
+    };
     use wyrd_dev_fixtures::pg::PgFixture;
 
     async fn operator(fixture: &PgFixture) -> OperatorPool {
@@ -80,6 +82,71 @@ mod pg_tests {
         assert!(
             second.is_none(),
             "a live lease held by another owner must not be re-acquired"
+        );
+    }
+
+    #[tokio::test]
+    async fn release_requires_the_current_fence() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let op = operator(&fixture).await;
+        let owner = Uuid::now_v7();
+        let key = "forge:table:release";
+
+        let token = try_acquire_lease(&op, key, owner, 30)
+            .await
+            .expect("acquire")
+            .expect("acquired");
+        assert!(
+            !release_lease_fenced(&op, key, owner, token + 1)
+                .await
+                .expect("stale release")
+        );
+        assert!(
+            release_lease_fenced(&op, key, owner, token)
+                .await
+                .expect("release")
+        );
+        assert!(
+            !release_lease_fenced(&op, key, owner, token)
+                .await
+                .expect("repeat release")
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_can_be_reacquired_with_a_new_token() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let op = operator(&fixture).await;
+        let key = "forge:table:expiry";
+        let first_owner = Uuid::now_v7();
+        let second_owner = Uuid::now_v7();
+
+        let first = try_acquire_lease(&op, key, first_owner, 30)
+            .await
+            .expect("acquire")
+            .expect("acquired");
+        sqlx::query(
+            "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' WHERE lease_key = $1",
+        )
+        .bind(key)
+        .execute(op.pool())
+        .await
+        .expect("expire lease");
+
+        let second = try_acquire_lease(&op, key, second_owner, 30)
+            .await
+            .expect("reacquire")
+            .expect("expired lease is reclaimable");
+        assert!(second > first);
+        assert!(
+            !renew_lease_fenced(&op, key, first_owner, first, 30)
+                .await
+                .expect("stale renew")
+        );
+        assert!(
+            release_lease_fenced(&op, key, second_owner, second)
+                .await
+                .expect("successor release")
         );
     }
 }

@@ -16,7 +16,7 @@ use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
-    AuditDetail, AuditDetailValueError, BatchId, ScopeHash, StoragePath,
+    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ScopeHash, StoragePath,
     audit_detail_canonical_json,
 };
 

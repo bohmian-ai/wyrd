@@ -14,7 +14,39 @@
 
 use sqlx::types::Uuid;
 
-use crate::{OperatorPool, SqlError};
+use crate::{OperatorPool, SqlError, TenantConn};
+
+/// Assert the exact lease fence inside an already-open tenant transaction.
+///
+/// The check locks the lease row until the surrounding transaction commits or
+/// rolls back. This makes the final ownership check part of the same atomic
+/// operation as the tenant mutation and its audit event.
+///
+/// # Errors
+/// Returns [`SqlError::InvariantViolation`] when the lease is no longer owned
+/// by the supplied owner and fencing token, or [`SqlError`] for query errors.
+pub async fn assert_fence(
+    conn: &mut TenantConn<'_>,
+    lease_key: &str,
+    owner: Uuid,
+    fencing_token: i64,
+) -> Result<(), SqlError> {
+    let owned: bool = sqlx::query_scalar("SELECT vala.assert_maintenance_lease_fence($1, $2, $3)")
+        .bind(lease_key)
+        .bind(owner)
+        .bind(fencing_token)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+
+    if owned {
+        Ok(())
+    } else {
+        Err(SqlError::InvariantViolation {
+            detail: format!("maintenance lease fence lost for `{lease_key}`"),
+        })
+    }
+}
 
 /// Extend a named maintenance lease by `lease_secs` seconds, fenced by
 /// `(owner, fencing_token)`.

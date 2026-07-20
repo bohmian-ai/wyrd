@@ -11107,6 +11107,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-bench",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-runtime",

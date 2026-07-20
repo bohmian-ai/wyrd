@@ -3,6 +3,7 @@ use uuid::Uuid;
 use wyrd_spec::DataTenantId;
 
 use vala_sql::OperatorPool;
+use vala_sql::TenantConn;
 
 use super::error::ForgeError;
 
@@ -96,6 +97,26 @@ impl ForgeLease {
             });
         }
         Ok(())
+    }
+
+    pub async fn assert_transaction_fence(
+        &self,
+        conn: &mut TenantConn<'_>,
+    ) -> Result<(), ForgeError> {
+        match vala_sql::queries::maintenance_leases::assert_fence(
+            conn,
+            &self.lease_key,
+            self.owner,
+            self.fencing_token,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(vala_sql::SqlError::InvariantViolation { .. }) => Err(ForgeError::FenceLost {
+                lease_key: self.lease_key.clone(),
+            }),
+            Err(error) => Err(ForgeError::Sql(error)),
+        }
     }
 }
 

@@ -120,7 +120,7 @@ mod pg_tests {
                 .expect("tenant table");
 
             let context = ForgeContext::new(
-                pg.app_pool().clone(),
+                pg.vala_postgres().clone(),
                 OperatorPool::from(pg.platform_admin_pool().clone()),
                 catalog,
                 staging,
@@ -236,7 +236,7 @@ mod pg_tests {
 
         fn context_with_config(&self, config: ForgeConfig) -> ForgeContext {
             ForgeContext::new(
-                self.pg.app_pool().clone(),
+                self.pg.vala_postgres().clone(),
                 self.context.operator_pool.clone(),
                 self.context.catalog.clone(),
                 self.context.staging.clone(),
@@ -494,6 +494,135 @@ mod pg_tests {
             .await
             .expect("lease release")
         );
+    }
+
+    async fn commit_successor_audit(
+        fixture: &Fixture,
+        tenant: DataTenantId,
+        lease_key: &str,
+        owner: uuid::Uuid,
+        token: i64,
+    ) -> i64 {
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "forge.test.successor".to_owned(),
+            resource: format!("bifrost://{tenant}/test"),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::nil()),
+            principal_kind: PrincipalKindTag::Service,
+            auth_method: AuthMethod::Internal,
+            permission: "bifrost:forge".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "successor fence".to_owned(),
+            detail: None,
+        };
+        let mut conn = fixture
+            .context
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .expect("successor tenant transaction");
+        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
+            .await
+            .expect("successor audit");
+        vala_sql::queries::maintenance_leases::assert_fence(&mut conn, lease_key, owner, token)
+            .await
+            .expect("successor fence");
+        conn.commit().await.expect("successor commit");
+        sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.test.successor'",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_one(fixture.context.operator_pool.pool())
+        .await
+        .expect("successor audit count")
+    }
+
+    #[tokio::test]
+    /// Proves the final lease fence is checked in the tenant transaction.
+    async fn forge_stale_owner_cannot_commit_after_successor_takeover() {
+        let fixture = Fixture::new().await;
+        let tenant_b = fixture
+            .pg
+            .seed_additional_tenant("test-tenant-2")
+            .await
+            .expect("second tenant");
+        let lease_key = format!(
+            "forge:table:{}:{}:{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+        );
+        let owner_a = uuid::Uuid::now_v7();
+        let token_a = vala_sql::queries::maintenance_leases::try_acquire_lease(
+            &fixture.context.operator_pool,
+            &lease_key,
+            owner_a,
+            900,
+        )
+        .await
+        .expect("owner A acquisition")
+        .expect("owner A lease");
+
+        let mut stale_conn = fixture
+            .context
+            .vala
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("stale tenant transaction");
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = true WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .execute(&mut **stale_conn.transaction())
+        .await
+        .expect("stale uncommitted mutation");
+
+        sqlx::query(
+            "UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' WHERE lease_key = $1",
+        )
+        .bind(&lease_key)
+        .execute(fixture.context.operator_pool.pool())
+        .await
+        .expect("expire owner A lease");
+        let owner_b = uuid::Uuid::now_v7();
+        let token_b = vala_sql::queries::maintenance_leases::try_acquire_lease(
+            &fixture.context.operator_pool,
+            &lease_key,
+            owner_b,
+            900,
+        )
+        .await
+        .expect("owner B acquisition")
+        .expect("owner B lease");
+        assert!(token_b > token_a);
+
+        let stale_error = vala_sql::queries::maintenance_leases::assert_fence(
+            &mut stale_conn,
+            &lease_key,
+            owner_a,
+            token_a,
+        )
+        .await
+        .expect_err("stale owner must lose its fence");
+        assert!(matches!(
+            stale_error,
+            vala_sql::SqlError::InvariantViolation { .. }
+        ));
+        drop(stale_conn);
+
+        let state_a = fixture.file_state().await;
+        assert!(state_a.iter().all(|(compacted, _)| !compacted));
+        assert_eq!(
+            fixture.operation_count("forge.file_compact.prepared").await,
+            0
+        );
+
+        let count_b =
+            commit_successor_audit(&fixture, tenant_b, &lease_key, owner_b, token_b).await;
+        assert_eq!(count_b, 1);
     }
 
     #[tokio::test]

@@ -68,7 +68,9 @@ async fn seed_forge_group(
     let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
         .expect("timestamp")
         .timestamp_micros();
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(tenant)
         .await
         .expect("tenant connection");
     for file_number in 0..2_i64 {

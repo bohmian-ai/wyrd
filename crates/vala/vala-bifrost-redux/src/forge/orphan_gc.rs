@@ -64,11 +64,11 @@ pub(crate) async fn run_orphan_gc_for_table(
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
     live_set: &ProtectedLiveSet,
-) -> Result<usize, ForgeError> {
-    let mut recovered = reconcile_gc(context, lease, key, binding).await?;
+) -> Result<OrphanGcOutcome, ForgeError> {
+    let mut outcome = reconcile_gc(context, lease, key, binding).await?;
     let candidates = list_gc_candidates(context, binding, live_set).await?;
     if candidates.is_empty() {
-        return Ok(recovered);
+        return Ok(outcome);
     }
     let detail = gc_detail(key, candidates)?;
     append_gc_audit(
@@ -79,9 +79,18 @@ pub(crate) async fn run_orphan_gc_for_table(
         "forge.orphan_gc.prepared",
     )
     .await?;
-    delete_gc_batch(context, lease, key, binding, &detail, false).await?;
-    recovered += 1;
-    Ok(recovered)
+    let (deleted, skipped) = delete_gc_batch(context, lease, key, binding, &detail, false).await?;
+    outcome.recovered += 1;
+    outcome.deleted += deleted;
+    outcome.skipped += skipped;
+    Ok(outcome)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct OrphanGcOutcome {
+    pub(crate) recovered: usize,
+    pub(crate) deleted: usize,
+    pub(crate) skipped: usize,
 }
 
 /// Build the live set from every retained Iceberg snapshot and every pending
@@ -136,7 +145,9 @@ pub(crate) async fn build_live_set(
         }
     }
 
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let rows = sqlx::query(
@@ -197,7 +208,7 @@ async fn delete_gc_batch(
     binding: &TenantTableBinding,
     detail: &AuditDetail,
     recovered: bool,
-) -> Result<(), ForgeError> {
+) -> Result<(usize, usize), ForgeError> {
     let AuditDetail::ForgeOrphanGc {
         candidate_paths,
         group,
@@ -264,6 +275,8 @@ async fn delete_gc_batch(
         }
     }
     lease.require_fence(&context.operator_pool).await?;
+    let deleted_count = deleted.len();
+    let skipped_count = skipped.len();
     let terminal = terminal_gc_detail(
         detail,
         deleted,
@@ -285,7 +298,8 @@ async fn delete_gc_batch(
             "forge.orphan_gc.committed"
         },
     )
-    .await
+    .await?;
+    Ok((deleted_count, skipped_count))
 }
 
 /// Recheck one candidate against the latest Iceberg metadata and SQL rows.
@@ -354,7 +368,9 @@ async fn path_is_referenced(
         }
     }
 
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let count: i64 = sqlx::query_scalar(
@@ -376,17 +392,20 @@ async fn reconcile_gc(
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
-) -> Result<usize, ForgeError> {
+) -> Result<OrphanGcOutcome, ForgeError> {
     let (prepared, terminal) = load_gc_audits(context, key).await?;
-    let mut recovered = 0;
+    let mut outcome = OrphanGcOutcome::default();
     for (operation_id, (detail, _created_at)) in prepared {
         if terminal.contains(&operation_id) {
             continue;
         }
-        delete_gc_batch(context, lease, key, binding, &detail, true).await?;
-        recovered += 1;
+        let (deleted, skipped) =
+            delete_gc_batch(context, lease, key, binding, &detail, true).await?;
+        outcome.recovered += 1;
+        outcome.deleted += deleted;
+        outcome.skipped += skipped;
     }
-    Ok(recovered)
+    Ok(outcome)
 }
 
 async fn load_gc_audits(
@@ -399,7 +418,9 @@ async fn load_gc_audits(
     ),
     ForgeError,
 > {
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let mut after_seq = 0_i64;
@@ -541,13 +562,15 @@ async fn append_gc_audit(
         detail: Some(detail.clone()),
     };
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(tenant)
         .await
         .map_err(ForgeError::Sql)?;
     vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
         .await
         .map_err(ForgeError::Sql)?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -563,6 +586,13 @@ fn normalize_path(prefix: &str, path: &str) -> Option<String> {
     let prefix = prefix.trim_end_matches('/');
     let prefixed = format!("{prefix}/");
     if path == prefix || path.starts_with(&prefixed) {
+        if path.contains('\\')
+            || path
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return None;
+        }
         return Some(path.to_owned());
     }
     path.match_indices(prefix).find_map(|(index, _)| {
@@ -570,6 +600,13 @@ fn normalize_path(prefix: &str, path: &str) -> Option<String> {
             return None;
         }
         let candidate = &path[index..];
+        if candidate.contains('\\')
+            || candidate
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return None;
+        }
         (candidate == prefix || candidate.starts_with(&prefixed)).then_some(candidate.to_owned())
     })
 }

@@ -10,9 +10,10 @@ use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::PgPool;
+use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::{PoolConfig, SqlError};
+use wyrd_sql::{PoolConfig, SqlError, TenantConn};
 
 /// Optional password env var for the `vala_recovery` role.
 pub const VALA_RECOVERY_PASSWORD_ENV: &str = "VALA_RECOVERY_PASSWORD";
@@ -89,6 +90,21 @@ impl ValaPostgres {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Open a tenant-scoped transaction through the Vala application pool.
+    ///
+    /// Forge uses this owner boundary for every tenant mutation. The caller
+    /// owns the transaction and must commit it explicitly.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the transaction cannot be opened or the
+    /// tenant binding cannot be applied.
+    pub async fn tenant_conn(
+        &self,
+        data_tenant_id: DataTenantId,
+    ) -> Result<TenantConn<'_>, SqlError> {
+        TenantConn::acquire(&self.pool, data_tenant_id).await
     }
 
     /// Borrow the optional Vala recovery pool.

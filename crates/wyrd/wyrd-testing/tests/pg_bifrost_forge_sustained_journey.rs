@@ -2,9 +2,10 @@
 
 use std::time::Duration;
 
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use vala_bifrost_redux::forge::run_maintenance_tick;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group};
+use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group, seed_forge_group_for_tenant};
 
 #[tokio::test]
 #[ignore = "gated journey: bound Wyrd server plus durable multi-table workload"]
@@ -32,10 +33,15 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         .start_bound()
         .await
         .expect("real test server");
+    let tenant_b = server
+        .seed_tenant("forge-sustained-tenant-b")
+        .await
+        .expect("second sustained tenant");
     let fixtures = vec![
         seed_forge_group(&server, "sustained_rows_a").await,
         seed_forge_group(&server, "sustained_rows_b").await,
-        seed_forge_group(&server, "sustained_rows_c").await,
+        seed_forge_group_for_tenant(&server, tenant_b, "sustained_rows_c").await,
+        seed_forge_group_for_tenant(&server, tenant_b, "sustained_rows_d").await,
     ];
     let producer_fixtures = fixtures.clone();
     let producers = producer_fixtures
@@ -55,8 +61,23 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
             })
         })
         .collect::<Vec<_>>();
+    let readers = fixtures
+        .iter()
+        .cloned()
+        .map(|fixture| {
+            tokio::spawn(async move {
+                for _ in 0..40 {
+                    let _ = pending_file_count(&fixture).await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        })
+        .collect::<Vec<_>>();
     for producer in producers {
         producer.await.expect("producer task");
+    }
+    for reader in readers {
+        reader.await.expect("reader task");
     }
 
     for _ in 0..20 {
@@ -68,6 +89,7 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         if pending_file_count(&fixtures[0]).await == 0
             && pending_file_count(&fixtures[1]).await == 0
             && pending_file_count(&fixtures[2]).await == 0
+            && pending_file_count(&fixtures[3]).await == 0
         {
             break;
         }
@@ -86,6 +108,7 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         .await
         .expect("durable row count");
         assert_eq!(rows, 24);
+        assert_eq!(read_staged_parquet_rows(fixture).await, 24);
         let committed: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed' AND resource = $2",
         )
@@ -150,4 +173,33 @@ async fn pending_file_count(fixture: &ForgeFixture) -> i64 {
     .fetch_one(fixture.context.operator_pool.pool())
     .await
     .expect("pending file count")
+}
+
+async fn read_staged_parquet_rows(fixture: &ForgeFixture) -> usize {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT file_path FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 ORDER BY file_path",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_all(fixture.context.operator_pool.pool())
+    .await
+    .expect("staged file paths");
+    let mut rows = 0_usize;
+    for path in paths {
+        let bytes = fixture
+            .context
+            .staging
+            .read(&path)
+            .await
+            .expect("staged Parquet read");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
+            .expect("staged Parquet reader")
+            .build()
+            .expect("staged Parquet batch reader");
+        for batch in reader {
+            rows += batch.expect("staged Parquet batch").num_rows();
+        }
+    }
+    rows
 }

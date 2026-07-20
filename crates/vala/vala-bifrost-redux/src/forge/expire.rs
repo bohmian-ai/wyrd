@@ -407,7 +407,9 @@ async fn load_expiry_audits(
     context: &ForgeContext,
     key: &ForgeTableKey,
 ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let mut after_seq = 0_i64;
@@ -499,13 +501,15 @@ async fn append_expiry_audit(
         detail: Some(detail.clone()),
     };
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(tenant)
         .await
         .map_err(ForgeError::Sql)?;
     vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
         .await
         .map_err(ForgeError::Sql)?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 

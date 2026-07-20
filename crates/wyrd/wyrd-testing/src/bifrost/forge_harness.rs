@@ -384,7 +384,7 @@ impl ForgeFixture {
     #[must_use]
     pub fn context_with_config(&self, config: ForgeConfig) -> ForgeContext {
         ForgeContext::new(
-            self.context.app_pool.clone(),
+            self.context.vala.clone(),
             self.context.operator_pool.clone(),
             Arc::clone(&self.context.catalog),
             Arc::clone(&self.context.staging),
@@ -401,7 +401,7 @@ impl ForgeFixture {
         catalog: Arc<dyn Catalog>,
     ) -> ForgeContext {
         ForgeContext::new(
-            self.context.app_pool.clone(),
+            self.context.vala.clone(),
             self.context.operator_pool.clone(),
             catalog,
             Arc::clone(&self.context.staging),
@@ -421,7 +421,7 @@ impl ForgeFixture {
         S: ForgeObjectStore + 'static,
     {
         ForgeContext::new(
-            self.context.app_pool.clone(),
+            self.context.vala.clone(),
             self.context.operator_pool.clone(),
             Arc::clone(&self.context.catalog),
             Arc::clone(&self.context.staging),
@@ -646,7 +646,9 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         .await
         .expect("Forge fixture table");
 
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(tenant)
         .await
         .expect("Forge fixture tenant connection");
     for (day_index, partition_day) in partition_days.iter().enumerate() {

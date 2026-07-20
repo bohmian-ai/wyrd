@@ -1121,7 +1121,7 @@ impl WyrdTestServerBuilder {
             )
         })?;
         let forge_context = ForgeContext::new(
-            postgres.app_pool().clone(),
+            postgres.vala().clone(),
             operator_pool,
             bifrost.iceberg_catalog(),
             Arc::new(storage.operator().clone()),

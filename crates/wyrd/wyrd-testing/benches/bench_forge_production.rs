@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use vala_bifrost_redux::forge::run_maintenance_tick;
+use wyrd_bench::{SloGate, SloMeasurement};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::seed_forge_group;
 
@@ -25,10 +26,16 @@ async fn main() {
         completed += 1;
     }
     let elapsed = start.elapsed();
-    println!(
-        "forge_production_ticks_per_sec={:.2}",
-        completed as f64 / elapsed.as_secs_f64()
-    );
+    let ticks_per_sec = completed as f64 / elapsed.as_secs_f64();
+    println!("forge_production_ticks_per_sec={ticks_per_sec:.2}");
     println!("forge_production_ticks={completed}");
+    SloGate::from_toml(include_str!("../../../../benches/thresholds.toml"))
+        .expect("Forge production threshold must parse")
+        .check(&SloMeasurement {
+            group: "bifrost.forge_production".to_owned(),
+            metric: "ticks_per_sec".to_owned(),
+            value: ticks_per_sec,
+        })
+        .expect("Forge production SLO regressed");
     server.shutdown().await.expect("benchmark server shutdown");
 }

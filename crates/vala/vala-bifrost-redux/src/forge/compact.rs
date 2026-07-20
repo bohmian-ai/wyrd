@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,7 +167,8 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
 
 #[derive(Clone)]
 pub struct ForgeContext {
-    pub app_pool: sqlx::PgPool,
+    /// Vala-owned application SQL handle used to open tenant transactions.
+    pub vala: vala_sql::ValaPostgres,
     pub operator_pool: vala_sql::OperatorPool,
     pub catalog: Arc<dyn Catalog>,
     pub staging: Arc<Operator>,
@@ -184,7 +185,7 @@ pub(crate) struct ForgeTableKey {
 
 impl ForgeContext {
     pub fn new(
-        app_pool: sqlx::PgPool,
+        vala: vala_sql::ValaPostgres,
         operator_pool: vala_sql::OperatorPool,
         catalog: Arc<dyn Catalog>,
         staging: Arc<Operator>,
@@ -192,7 +193,7 @@ impl ForgeContext {
     ) -> Result<Self, ForgeError> {
         config.validate()?;
         Ok(Self {
-            app_pool,
+            vala,
             operator_pool,
             catalog,
             object_store: Arc::new(OpenDalForgeObjectStore {
@@ -221,6 +222,15 @@ pub struct ForgeTickOutcome {
     pub tables_succeeded: usize,
     pub tables_skipped: usize,
     pub tables_failed: usize,
+    pub reconciliation_recovered: usize,
+    pub expiry_reconciled: usize,
+    pub gc_reconciled: usize,
+    pub gc_deleted: usize,
+    pub gc_skipped: usize,
+    pub budget_skips: usize,
+    pub lease_contention: usize,
+    pub fence_losses: usize,
+    pub stage_failures: usize,
 }
 
 pub(crate) async fn load_table(
@@ -261,28 +271,27 @@ pub(crate) async fn run_compaction_bins_for_table(
     binding: &TenantTableBinding,
 ) -> Result<ForgeTickOutcome, ForgeError> {
     let mut outcome = ForgeTickOutcome::default();
-    let rows = select_candidate_groups(&context.operator_pool, &context.config)
-        .await?
-        .into_iter()
-        .filter(|row| {
-            row.key.tenant == table_key.tenant && row.key.table_ref == table_key.table_ref
-        })
-        .collect::<Vec<_>>();
-    for row in rows {
+    let rows = select_candidate_groups(&context.operator_pool, table_key, &context.config).await?;
+    let mut file_budget = 0_usize;
+    let mut byte_budget = 0_u64;
+    let mut bin_budget = 0_usize;
+    'groups: for row in rows {
         outcome.groups_seen += 1;
         let bins = stable_pack(
             row.files,
             context.config.target_bin_bytes,
             context.config.max_files_per_bin,
         );
-        let mut file_budget = 0_usize;
-        let mut byte_budget = 0_u64;
-        for bin in bins.into_iter().take(context.config.max_bins_per_tick) {
+        for bin in bins {
+            if bin_budget >= context.config.max_bins_per_tick {
+                break;
+            }
             if file_budget.saturating_add(bin.files.len()) > context.config.max_files_per_tick
                 || byte_budget.saturating_add(bin.total_bytes) > context.config.max_bytes_per_tick
             {
                 outcome.bins_skipped += 1;
-                continue;
+                outcome.budget_skips += 1;
+                break 'groups;
             }
             if !lease.renew(&context.operator_pool).await? {
                 return Err(ForgeError::FenceLost {
@@ -291,12 +300,20 @@ pub(crate) async fn run_compaction_bins_for_table(
             }
             if !lease.commit_window_fits(context.config.commit_window()) {
                 outcome.bins_skipped += 1;
-                break;
+                outcome.budget_skips += 1;
+                break 'groups;
             }
             compact_bin(context, lease, &row.key, binding, &bin).await?;
             file_budget += bin.files.len();
             byte_budget = byte_budget.saturating_add(bin.total_bytes);
+            bin_budget += 1;
             outcome.bins_committed += 1;
+        }
+        if bin_budget >= context.config.max_bins_per_tick
+            || file_budget >= context.config.max_files_per_tick
+            || byte_budget >= context.config.max_bytes_per_tick
+        {
+            break;
         }
     }
     Ok(outcome)
@@ -310,36 +327,98 @@ pub(crate) struct CandidateRow {
 
 pub(crate) async fn select_candidate_groups(
     operator_pool: &vala_sql::OperatorPool,
+    table_key: &ForgeTableKey,
     config: &ForgeConfig,
 ) -> Result<Vec<CandidateRow>, ForgeError> {
     let rows = sqlx::query(
         r"
-        SELECT data_tenant_id, namespace, table_name, partition_day,
-               array_agg(id ORDER BY id) AS file_ids,
-               array_agg(file_path ORDER BY id) AS paths,
-               array_agg(file_size ORDER BY id) AS sizes,
-               array_agg(min_event_time ORDER BY id) AS min_event_times,
-               array_agg(max_event_time ORDER BY id) AS max_event_times,
-               COUNT(*) AS n_files, SUM(file_size) AS total_bytes
+        SELECT id, file_path, file_size, min_event_time, max_event_time,
+               partition_day
           FROM vala.file_list
-         WHERE NOT compacted
+         WHERE data_tenant_id = $1
+           AND namespace = $2
+           AND table_name = $3
+           AND NOT compacted
            AND created_at < now() - interval '2 min'
-         GROUP BY data_tenant_id, namespace, table_name, partition_day
-        HAVING COUNT(*) >= $1 OR SUM(file_size) < $2
-         ORDER BY data_tenant_id, namespace, table_name, partition_day
+         ORDER BY partition_day, min_event_time, max_event_time, id
+         LIMIT $4
         ",
     )
-    .bind(config.min_files)
+    .bind(table_key.tenant.as_uuid())
+    .bind(table_key.table_ref.namespace.as_str())
+    .bind(&table_key.table_ref.name)
     .bind(
-        i64::try_from(config.target_bin_bytes).map_err(|_| ForgeError::InvalidConfig {
-            detail: "target_bin_bytes exceeds PostgreSQL bigint".to_owned(),
+        i64::try_from(config.max_files_per_tick).map_err(|_| ForgeError::InvalidConfig {
+            detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
         })?,
     )
     .fetch_all(operator_pool.pool())
     .await
     .map_err(|error| ForgeError::Sql(error.into()))?;
 
-    rows.iter().map(decode_candidate_row).collect()
+    let mut groups = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
+    for row in rows {
+        let id: Uuid = row.try_get("id").map_err(|error| ForgeError::Group {
+            detail: error.to_string(),
+        })?;
+        let path: String = row
+            .try_get("file_path")
+            .map_err(|error| ForgeError::Group {
+                detail: error.to_string(),
+            })?;
+        let file_size: i64 = row
+            .try_get("file_size")
+            .map_err(|error| ForgeError::Group {
+                detail: error.to_string(),
+            })?;
+        let min_event_time: DateTime<Utc> =
+            row.try_get("min_event_time")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+        let max_event_time: DateTime<Utc> =
+            row.try_get("max_event_time")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+        let partition_day: NaiveDate =
+            row.try_get("partition_day")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+        groups
+            .entry(partition_day)
+            .or_default()
+            .push(CandidateFile {
+                id,
+                path,
+                size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
+                    detail: "negative file size".to_owned(),
+                })?,
+                min_event_time,
+                max_event_time,
+            });
+    }
+
+    Ok(groups
+        .into_iter()
+        .filter(|(_, files)| {
+            files.len() >= usize::try_from(config.min_files).unwrap_or(usize::MAX)
+                || files
+                    .iter()
+                    .map(|file| file.size)
+                    .fold(0_u64, u64::saturating_add)
+                    < config.target_bin_bytes
+        })
+        .map(|(partition_day, files)| CandidateRow {
+            key: ForgeGroupKey {
+                tenant: table_key.tenant,
+                table_ref: table_key.table_ref.clone(),
+                partition_day,
+            },
+            files,
+        })
+        .collect())
 }
 
 async fn load_reconciliation_keys(
@@ -383,79 +462,6 @@ async fn load_reconciliation_keys(
         .collect()
 }
 
-fn decode_candidate_row(row: &sqlx::postgres::PgRow) -> Result<CandidateRow, ForgeError> {
-    let tenant_uuid: uuid::Uuid =
-        row.try_get("data_tenant_id")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-    let tenant = data_tenant_from_uuid(tenant_uuid)?;
-    let namespace: String = row
-        .try_get("namespace")
-        .map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })?;
-    let table_name: String = row
-        .try_get("table_name")
-        .map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })?;
-    let partition_day: NaiveDate =
-        row.try_get("partition_day")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-    let key = ForgeGroupKey::from_sql(tenant, &namespace, &table_name, partition_day)
-        .map_err(|detail| ForgeError::Group { detail })?;
-    let ids: Vec<Uuid> = row.try_get("file_ids").map_err(|error| ForgeError::Group {
-        detail: error.to_string(),
-    })?;
-    let paths: Vec<String> = row.try_get("paths").map_err(|error| ForgeError::Group {
-        detail: error.to_string(),
-    })?;
-    let sizes: Vec<i64> = row.try_get("sizes").map_err(|error| ForgeError::Group {
-        detail: error.to_string(),
-    })?;
-    let mins: Vec<DateTime<Utc>> =
-        row.try_get("min_event_times")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-    let maxes: Vec<DateTime<Utc>> =
-        row.try_get("max_event_times")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-    if ids.len() != paths.len()
-        || ids.len() != sizes.len()
-        || ids.len() != mins.len()
-        || ids.len() != maxes.len()
-    {
-        return Err(ForgeError::Group {
-            detail: "candidate aggregate arrays have different lengths".to_owned(),
-        });
-    }
-    let files = ids
-        .into_iter()
-        .zip(paths)
-        .zip(sizes)
-        .zip(mins)
-        .zip(maxes)
-        .map(|((((id, path), size), min_event_time), max_event_time)| {
-            Ok(CandidateFile {
-                id,
-                path,
-                size: u64::try_from(size).map_err(|_| ForgeError::Group {
-                    detail: "negative file size".to_owned(),
-                })?,
-                min_event_time,
-                max_event_time,
-            })
-        })
-        .collect::<Result<Vec<_>, ForgeError>>()?;
-    Ok(CandidateRow { key, files })
-}
-
 fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
     if value.is_nil() {
         Ok(DataTenantId::SYSTEM_OWNER)
@@ -475,7 +481,7 @@ async fn compact_bin(
 ) -> Result<(), ForgeError> {
     let operation_id = operation_id(key, bin);
     let table = load_table(context, &binding.table_ident()).await?;
-    let batch = read_and_project_staging(context, &table, key, bin).await?;
+    let batch = read_and_project_staging(context, &table, key, binding, bin).await?;
     lease.require_fence(&context.operator_pool).await?;
     let output = write_output(&table, binding, operation_id, key.partition_day, &batch).await?;
     lease.require_fence(&context.operator_pool).await?;
@@ -557,14 +563,26 @@ async fn read_and_project_staging(
     context: &ForgeContext,
     table: &iceberg::table::Table,
     key: &ForgeGroupKey,
+    binding: &TenantTableBinding,
     bin: &RewriteBin,
 ) -> Result<RecordBatch, ForgeError> {
+    let paths = bin
+        .files
+        .iter()
+        .map(|file| {
+            binding
+                .validate_object_path(&file.path)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: format!("Forge staging input escaped table prefix: {}", file.path),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut batches = Vec::new();
     let mut source_schema = None;
-    for file in &bin.files {
+    for path in paths {
         let bytes = context
             .object_store
-            .read(&file.path)
+            .read(&path)
             .await
             .map_err(ForgeError::ObjectStore)?
             .to_bytes();
@@ -791,10 +809,18 @@ async fn write_output(
 
 fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
-    path == prefix
-        || path
-            .match_indices(prefix)
-            .any(|(index, _)| index == 0 || path[..index].ends_with('/'))
+    let prefixed = format!("{prefix}/");
+    path.match_indices(prefix).any(|(index, _)| {
+        if index > 0 && !path[..index].ends_with('/') {
+            return false;
+        }
+        let candidate = &path[index..];
+        (candidate == prefix || candidate.starts_with(&prefixed))
+            && !candidate.contains('\\')
+            && !candidate
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    })
 }
 
 async fn prepare_inputs(
@@ -809,7 +835,9 @@ async fn prepare_inputs(
             lease_key: lease.lease_key.clone(),
         });
     }
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -834,7 +862,7 @@ async fn prepare_inputs(
     }
     lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail).await?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -848,7 +876,9 @@ async fn stamp_committed(
     snapshot_id: i64,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -883,7 +913,7 @@ async fn stamp_committed(
     )?;
     lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.committed", detail).await?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -896,7 +926,9 @@ async fn reset_inputs(
     operation_id: Uuid,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -930,7 +962,7 @@ async fn reset_inputs(
     )?;
     lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.reset", detail).await?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -941,10 +973,16 @@ async fn reconcile_group(
     binding: &TenantTableBinding,
 ) -> Result<usize, ForgeError> {
     let resource = key.audit_resource();
-    let (prepared, terminal) = load_reconciliation_audits(context, key, &resource).await?;
+    let latest = load_reconciliation_audits(context, key, &resource).await?;
     let mut recovered = 0;
-    for (operation_id, (detail, created_at)) in prepared {
-        if terminal.contains(&operation_id) {
+    for (_operation_id, (detail, created_at)) in latest {
+        if !matches!(
+            &detail,
+            AuditDetail::ForgeCompaction {
+                phase: ForgeCompactionPhase::Prepared,
+                ..
+            }
+        ) {
             continue;
         }
         let AuditDetail::ForgeCompaction {
@@ -1013,14 +1051,15 @@ async fn load_reconciliation_audits(
     context: &ForgeContext,
     key: &ForgeGroupKey,
     resource: &str,
-) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
+) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
     let mut after_seq = 0_i64;
-    let mut prepared = HashMap::new();
-    let mut terminal = HashSet::new();
+    let mut latest = HashMap::new();
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
+        .await
+        .map_err(ForgeError::Sql)?;
     loop {
-        let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
         let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
             &mut conn,
             resource,
@@ -1029,7 +1068,6 @@ async fn load_reconciliation_audits(
         )
         .await
         .map_err(ForgeError::Sql)?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
         let page_len = page.len();
         for row in page {
             after_seq = row.seq;
@@ -1040,30 +1078,17 @@ async fn load_reconciliation_audits(
                 }
             })?;
             validate_reconciliation_detail(&detail, resource)?;
-            let AuditDetail::ForgeCompaction {
-                operation_id,
-                phase,
-                ..
-            } = &detail
-            else {
+            let AuditDetail::ForgeCompaction { operation_id, .. } = &detail else {
                 continue;
             };
-            match phase {
-                ForgeCompactionPhase::Prepared => {
-                    prepared.insert(*operation_id, (detail, row.created_at));
-                }
-                ForgeCompactionPhase::Committed
-                | ForgeCompactionPhase::Recovered
-                | ForgeCompactionPhase::Reset => {
-                    terminal.insert(*operation_id);
-                }
-            }
+            latest.insert(*operation_id, (detail, row.created_at));
         }
         if page_len < usize::try_from(context.config.audit_page_size).unwrap_or(usize::MAX) {
             break;
         }
     }
-    Ok((prepared, terminal))
+    conn.commit().await.map_err(ForgeError::Sql)?;
+    Ok(latest)
 }
 
 fn validate_reconciliation_detail(detail: &AuditDetail, resource: &str) -> Result<(), ForgeError> {
@@ -1143,7 +1168,9 @@ async fn verify_hidden_inputs(
             detail: "prepared audit detail has unpaired input IDs and paths".to_owned(),
         });
     }
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let rows = sqlx::query(
@@ -1203,7 +1230,9 @@ async fn stamp_reconciled(
     snapshot_id: i64,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let result = sqlx::query(
@@ -1234,7 +1263,7 @@ async fn stamp_reconciled(
         terminal_detail(detail, ForgeCompactionPhase::Recovered, Some(snapshot_id)),
     )
     .await?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -1246,7 +1275,9 @@ async fn reset_reconciled(
     detail: &AuditDetail,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+    let mut conn = context
+        .vala
+        .tenant_conn(key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let result = sqlx::query(
@@ -1276,7 +1307,7 @@ async fn reset_reconciled(
         terminal_detail(detail, ForgeCompactionPhase::Reset, None),
     )
     .await?;
-    lease.require_fence(&context.operator_pool).await?;
+    lease.assert_transaction_fence(&mut conn).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 

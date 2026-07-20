@@ -231,7 +231,7 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
     let forge_context = ForgeContext::new(
-        postgres.app_pool().clone(),
+        postgres.vala().clone(),
         operator_pool,
         bifrost.iceberg_catalog(),
         Arc::new(storage.operator().clone()),

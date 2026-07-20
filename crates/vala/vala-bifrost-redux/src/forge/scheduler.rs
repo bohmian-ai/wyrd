@@ -41,6 +41,15 @@ impl ForgeScheduler {
                         Ok(outcome) => tracing::debug!(
                             groups_seen = outcome.groups_seen,
                             bins_committed = outcome.bins_committed,
+                            reconciliation_recovered = outcome.reconciliation_recovered,
+                            expiry_reconciled = outcome.expiry_reconciled,
+                            gc_reconciled = outcome.gc_reconciled,
+                            gc_deleted = outcome.gc_deleted,
+                            gc_skipped = outcome.gc_skipped,
+                            budget_skips = outcome.budget_skips,
+                            lease_contention = outcome.lease_contention,
+                            fence_losses = outcome.fence_losses,
+                            stage_failures = outcome.stage_failures,
                             tables_succeeded = outcome.tables_succeeded,
                             tables_skipped = outcome.tables_skipped,
                             tables_failed = outcome.tables_failed,
@@ -139,7 +148,10 @@ async fn process_table(
     .await
     {
         Ok(Some(lease)) => lease,
-        Ok(None) => return TableRunStatus::Skipped,
+        Ok(None) => {
+            outcome.lease_contention += 1;
+            return TableRunStatus::Skipped;
+        }
         Err(error) => {
             tracing::error!(
                 tenant = %key.tenant,
@@ -153,7 +165,10 @@ async fn process_table(
 
     // Keep release outside the stage future so every post-acquisition path
     // converges through the same cleanup decision.
-    let table_result = run_table_stages(context, &mut lease, key, &binding, stopped, outcome).await;
+    let table_result = tokio::select! {
+        result = run_table_stages(context, &mut lease, key, &binding, stopped, outcome) => result,
+        () = stopped.cancelled() => Err(ForgeError::Shutdown),
+    };
     let release_result = release_lease(context, &lease).await;
     match (table_result, release_result) {
         (Ok(stop_after), Ok(())) => {
@@ -163,7 +178,12 @@ async fn process_table(
                 TableRunStatus::Succeeded
             }
         }
+        (Err(ForgeError::Shutdown), Ok(())) => TableRunStatus::Skipped,
         (Err(error), Ok(())) => {
+            outcome.stage_failures += 1;
+            if matches!(error, ForgeError::FenceLost { .. }) {
+                outcome.fence_losses += 1;
+            }
             tracing::error!(
                 tenant = %key.tenant,
                 table = %key.table_ref.fqn(),
@@ -182,6 +202,10 @@ async fn process_table(
             TableRunStatus::Failed
         }
         (Err(error), Err(release_error)) => {
+            outcome.stage_failures += 1;
+            if matches!(error, ForgeError::FenceLost { .. }) {
+                outcome.fence_losses += 1;
+            }
             tracing::warn!(
                 error = %release_error,
                 lease_key = %lease.lease_key,
@@ -214,8 +238,10 @@ async fn run_table_stages(
 ) -> Result<bool, ForgeError> {
     // One fence covers reconciliation -> compaction -> expiry -> live-set
     // rebuild -> GC for this physical table.
-    outcome.reconciled +=
+    let reconciliation =
         run_compaction_reconciliation_for_table(context, lease, key, binding).await?;
+    outcome.reconciliation_recovered += reconciliation;
+    outcome.reconciled += reconciliation;
     if stopped.is_cancelled() {
         return Ok(true);
     }
@@ -224,12 +250,15 @@ async fn run_table_stages(
     outcome.groups_seen += compaction.groups_seen;
     outcome.bins_committed += compaction.bins_committed;
     outcome.bins_skipped += compaction.bins_skipped;
+    outcome.budget_skips += compaction.budget_skips;
     outcome.reconciled += compaction.reconciled;
     if stopped.is_cancelled() {
         return Ok(true);
     }
 
-    outcome.reconciled += run_snapshot_expiry_for_table(context, lease, key, binding).await?;
+    let expiry = run_snapshot_expiry_for_table(context, lease, key, binding).await?;
+    outcome.expiry_reconciled += expiry;
+    outcome.reconciled += expiry;
     if stopped.is_cancelled() {
         return Ok(true);
     }
@@ -239,12 +268,24 @@ async fn run_table_stages(
     if stopped.is_cancelled() {
         return Ok(true);
     }
-    outcome.reconciled += run_orphan_gc_for_table(context, lease, key, binding, &live_set).await?;
+    let gc = run_orphan_gc_for_table(context, lease, key, binding, &live_set).await?;
+    outcome.gc_reconciled += gc.recovered;
+    outcome.gc_deleted += gc.deleted;
+    outcome.gc_skipped += gc.skipped;
+    outcome.reconciled += gc.recovered;
     Ok(false)
 }
 
 async fn release_lease(context: &ForgeContext, lease: &ForgeLease) -> Result<(), ForgeError> {
-    if !lease.release(&context.operator_pool).await? {
+    let released = tokio::time::timeout(
+        context.config.catalog_request_timeout,
+        lease.release(&context.operator_pool),
+    )
+    .await
+    .map_err(|_| ForgeError::Timeout {
+        operation: "Forge lease release",
+    })??;
+    if !released {
         tracing::warn!(lease_key = %lease.lease_key, "Forge lease release lost its fence");
     }
     Ok(())

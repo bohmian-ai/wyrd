@@ -2,7 +2,7 @@
 
 use crate::registry::CardSubmission;
 
-/// Return submission indices sorted by `(kind, space, name)`.
+/// Return submission indices sorted by `(kind, space, name, version)`.
 ///
 /// The kind key is its stable wire name. Missing authored spaces sort before
 /// named spaces; normal registration requests have a resolved space. The
@@ -32,6 +32,18 @@ pub fn canonical_order(submissions: &[CardSubmission]) -> Vec<usize> {
                     .map_or("", |space| space.as_str()),
                 right_submission.metadata.name.as_str(),
             ))
+            .then_with(|| {
+                left_submission
+                    .metadata
+                    .resolved_pin()
+                    .map_or("", |version| version.as_str())
+                    .cmp(
+                        right_submission
+                            .metadata
+                            .resolved_pin()
+                            .map_or("", |version| version.as_str()),
+                    )
+            })
             .then_with(|| left.cmp(right))
     });
     indices
@@ -66,7 +78,7 @@ mod tests {
         }
     }
 
-    fn key(submission: &CardSubmission) -> (&str, &str, &str) {
+    fn key(submission: &CardSubmission) -> (&str, &str, &str, &str) {
         (
             submission.kind.wire_name(),
             submission
@@ -75,6 +87,10 @@ mod tests {
                 .as_ref()
                 .map_or("", |space| space.as_str()),
             submission.metadata.name.as_str(),
+            submission
+                .metadata
+                .resolved_pin()
+                .map_or("", |version| version.as_str()),
         )
     }
 
@@ -110,10 +126,10 @@ mod tests {
         ];
         let permutations = [vec![0, 1, 2, 3], vec![3, 2, 1, 0], vec![1, 3, 0, 2]];
         let expected = vec![
-            ("Agent", "prod", "triage"),
-            ("Agent", "shared", "triage"),
-            ("Prompt", "prod", "system"),
-            ("Service", "prod", "gateway"),
+            ("Agent", "prod", "triage", ""),
+            ("Agent", "shared", "triage", ""),
+            ("Prompt", "prod", "system", ""),
+            ("Service", "prod", "gateway", ""),
         ];
 
         for permutation in permutations {

@@ -16,7 +16,7 @@ use wyrd_spec::graph::{
 };
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::{
     CardSubmission, CardUploadPlan, CreateCardRequest, CreateCardResponse, HttpMethod,
     PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed,
@@ -758,23 +758,14 @@ fn find_submission<'a>(
         .ok_or_else(|| WyrdError::internal("graph node lost its submission"))
 }
 
-/// Build the version-independent sibling identity key.
-fn graph_identity(card_ref: &CardRef) -> (String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref
-            .space
-            .as_ref()
-            .expect("graph nodes must have resolved spaces")
-            .as_str()
-            .to_owned(),
-        card_ref.name.as_str().to_owned(),
-    )
+/// Build the exact sibling identity key.
+fn graph_identity(card_ref: &CardRef) -> CardRefIdentity {
+    card_ref.identity_key()
 }
 
-/// Compare two graph identities without server-derived UID or version.
+/// Compare two graph identities without the server-derived UID.
 fn same_identity(left: &CardRef, right: &CardRef) -> bool {
-    left.kind == right.kind && left.space == right.space && left.name == right.name
+    left.same_identity(right)
 }
 
 /// Map graph failures to the stable registry error catalog.

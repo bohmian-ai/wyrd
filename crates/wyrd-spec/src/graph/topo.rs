@@ -43,7 +43,8 @@ pub enum GraphError {
 /// Edges are represented from parent to referenced child. The implementation
 /// removes zero-outdegree leaves, which is the reverse of the usual Kahn
 /// emission direction and gives the composite registration pipeline its
-/// dependency-first order. Ready leaves are selected by `(kind, space, name)`.
+/// dependency-first order. Ready leaves are selected by
+/// `(kind, space, name, version)`.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] for an empty node set and

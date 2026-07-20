@@ -37,6 +37,23 @@ pub struct CardRef {
     pub uid: Option<CardUid>,
 }
 
+/// Exact named identity for a [`CardRef`], excluding its server-resolved UID.
+///
+/// This is an in-memory key for matching authored, graph, and registry
+/// references. It is not a wire shape. The version is kept as its canonical
+/// string because identity equality is exact rather than semver-ordered.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CardRefIdentity {
+    /// Card kind.
+    pub kind: CardKind,
+    /// Optional authored space; resolved references must carry one.
+    pub space: Option<SpaceName>,
+    /// Card name.
+    pub name: CardName,
+    /// Exact version string.
+    pub version: String,
+}
+
 /// A reference position that requires durable identity.
 ///
 /// Loaders rewrite `Path` values to `Ref` values before submitting a request;
@@ -161,16 +178,27 @@ impl From<crate::card::agent::AgentSpec> for InlineableRef<crate::card::agent::A
 }
 
 impl CardRef {
-    /// True when two card refs share the authorization identity tuple.
+    /// Return the exact named identity key for this reference.
+    #[must_use]
+    pub fn identity_key(&self) -> CardRefIdentity {
+        CardRefIdentity {
+            kind: self.kind.clone(),
+            space: self.space.clone(),
+            name: self.name.clone(),
+            version: self.version.as_str().to_owned(),
+        }
+    }
+
+    /// True when two card refs share the exact named identity tuple.
     ///
     /// The optional `uid` is ignored — authorization is identity-based on
-    /// `(kind, name, version, space)` only.
+    /// `(kind, space, name, version)` only.
     #[must_use]
     pub fn same_identity(&self, other: &CardRef) -> bool {
         self.kind == other.kind
+            && self.space == other.space
             && self.name == other.name
             && self.version == other.version
-            && self.space == other.space
     }
 }
 
@@ -614,5 +642,29 @@ mod tests {
         let card_ref =
             serde_json::from_str::<CardRef>(json).expect("space is optional while authored");
         assert!(card_ref.space.is_none());
+    }
+
+    #[test]
+    fn card_ref_identity_ignores_uid_but_includes_version_and_space() {
+        let first = sample_ref();
+        let with_uid = CardRef {
+            uid: Some(
+                CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11").expect("static uid is valid"),
+            ),
+            ..first.clone()
+        };
+        assert!(first.same_identity(&with_uid));
+
+        let different_version = CardRef {
+            version: VersionBlock::parse("2.0.0").expect("static version is valid"),
+            ..first.clone()
+        };
+        assert!(!first.same_identity(&different_version));
+
+        let different_space = CardRef {
+            space: Some(SpaceName::new("staging").expect("static space is valid")),
+            ..first
+        };
+        assert!(!with_uid.same_identity(&different_space));
     }
 }

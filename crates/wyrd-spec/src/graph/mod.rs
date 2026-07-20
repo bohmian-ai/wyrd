@@ -7,8 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
 use crate::envelope::Spec;
-use crate::ids::SpaceName;
-use crate::reference::CardRef;
+use crate::reference::{CardRef, CardRefIdentity};
 use crate::refs::{ReferenceSlotVisitor, SlotValue};
 use crate::registry::CardSubmission;
 use wyrd_semver::{VersionBlock, VersionSpec};
@@ -76,8 +75,8 @@ pub struct RootPick {
 
 /// Prepare submissions for the pure graph operations.
 ///
-/// Graph identity is `(kind, space, name)`, but [`CardRef`] also requires a
-/// concrete version. Auto and range version requests therefore receive a
+/// Graph identity is `(kind, space, name, version)`. Auto and range version
+/// requests therefore receive a
 /// graph-only placeholder. The authored submissions are cloned and never
 /// mutated; registration keeps their original version selection.
 pub fn graph_ready_submissions(
@@ -112,15 +111,15 @@ pub fn graph_ready_submissions(
 
 /// Build the submission graph from CardRef-shaped objects in each spec.
 ///
-/// A reference becomes an edge only when its `(kind, space, name)` identity
+/// A reference becomes an edge only when its `(kind, space, name, version)` identity
 /// matches another submission in the same request. References to cards outside
 /// the request are deliberately ignored; external resolution belongs to the
 /// server registry boundary.
 ///
 /// The register boundary supplies resolved metadata before calling this helper:
 /// each submission must have a concrete version and space. The graph itself
-/// compares nodes by `(kind, space, name)`, so version and UID do not affect
-/// sibling matching.
+/// compares nodes by `(kind, space, name, version)`, so only the server UID
+/// does not affect sibling matching.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] when the request is empty or contains a
@@ -186,17 +185,8 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
     Ok((nodes, edges))
 }
 
-pub(crate) fn identity_key(card_ref: &CardRef) -> (String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref
-            .space
-            .as_ref()
-            .map(SpaceName::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        card_ref.name.as_str().to_owned(),
-    )
+pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
+    card_ref.identity_key()
 }
 
 fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
@@ -292,10 +282,17 @@ mod tests {
     }
 
     #[test]
-    fn identity_key_excludes_version_and_uid() {
+    fn identity_key_includes_version_but_excludes_uid() {
         let first = card_ref(CardKind::Agent, "agent");
         let mut second = first.clone();
         second.version = VersionBlock::parse("2.0.0").expect("test version is valid");
+        assert_ne!(identity_key(&first), identity_key(&second));
+
+        second.version = first.version.clone();
+        second.uid = Some(
+            crate::ids::CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11")
+                .expect("test uid is valid"),
+        );
         assert_eq!(identity_key(&first), identity_key(&second));
     }
 

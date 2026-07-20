@@ -1210,7 +1210,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_DUPLICATE_SUBMISSION",
         status = 400,
         title = "Duplicate card submission",
-        remediation = "Submit each (kind, space, name) identity at most once per request."
+        remediation = "Submit each (kind, space, name, version) identity at most once per request."
     )]
     SpecDuplicateSubmission {
         /// Human-readable error message.

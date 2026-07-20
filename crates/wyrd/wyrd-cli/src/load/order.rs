@@ -43,7 +43,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
         .map(|node| {
             card_refs
                 .iter()
-                .position(|card_ref| same_graph_identity(card_ref, &node.card_ref))
+                .position(|card_ref| card_ref.same_identity(&node.card_ref))
                 .ok_or_else(|| {
                     Diagnostic::invalid_envelope(
                         "<loader>".into(),
@@ -79,13 +79,6 @@ pub(crate) fn submission_for(card: &AuthoredCard) -> Result<CardSubmission, Diag
     })
 }
 
-fn same_graph_identity(
-    left: &wyrd_spec::reference::CardRef,
-    right: &wyrd_spec::reference::CardRef,
-) -> bool {
-    left.kind == right.kind && left.name == right.name && left.space == right.space
-}
-
 fn graph_diagnostic(
     error: GraphError,
     cards: &[AuthoredCard],
@@ -97,7 +90,7 @@ fn graph_diagnostic(
             .and_then(|card_ref| {
                 card_refs
                     .iter()
-                    .position(|candidate| same_graph_identity(candidate, card_ref))
+                    .position(|candidate| candidate.same_identity(card_ref))
             })
             .map(|index| cards[index].source_path.clone()),
         _ => None,
@@ -193,5 +186,16 @@ mod tests {
         let diagnostics = order_cards(&cards).unwrap_err();
 
         assert_eq!(diagnostics[0].code, "WYRD_REGISTRY_400_DEPENDENCY_CYCLE");
+    }
+
+    #[test]
+    fn order_keeps_same_named_versions_as_distinct_nodes() {
+        let v1 = service("service", None);
+        let mut v2 = service("service", Some("service"));
+        v2.metadata.version = Some(VersionBlock::parse("2.0.0").unwrap().into());
+
+        let order = order_cards(&[v2, v1]).expect("different versions form one graph");
+
+        assert_eq!(order, vec![1, 0]);
     }
 }

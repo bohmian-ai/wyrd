@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::reference::Ref;
+use wyrd_spec::reference::{CardRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
 use super::error::{Diagnostic, Severity};
@@ -164,23 +164,34 @@ fn validate_trigger(
 fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     let mut spec = card.spec.clone();
     ReferenceSlotVisitor::visit(&mut spec, |slot| {
-        let unresolved = match slot.value {
-            SlotValue::Durable(reference) => matches!(reference, Ref::Path(_)),
-            SlotValue::InlineablePrompt(reference) => {
-                matches!(reference, wyrd_spec::reference::InlineableRef::Path(_))
+        let diagnostic = match slot.value {
+            SlotValue::Durable(Ref::Path(_))
+            | SlotValue::InlineablePrompt(wyrd_spec::reference::InlineableRef::Path(_))
+            | SlotValue::InlineableAgent(wyrd_spec::reference::InlineableRef::Path(_)) => {
+                Some(catalog_error(
+                    card,
+                    WyrdError::RegistryUnresolvedPathRef {
+                        message: format!("unresolved path reference at {}", slot.path),
+                        details: serde_json::json!({ "field": slot.path }),
+                    },
+                ))
             }
-            SlotValue::InlineableAgent(reference) => {
-                matches!(reference, wyrd_spec::reference::InlineableRef::Path(_))
-            }
+            SlotValue::Durable(Ref::Ref(CardRef { space: None, .. }))
+            | SlotValue::InlineablePrompt(wyrd_spec::reference::InlineableRef::Ref(CardRef {
+                space: None,
+                ..
+            }))
+            | SlotValue::InlineableAgent(wyrd_spec::reference::InlineableRef::Ref(CardRef {
+                space: None,
+                ..
+            })) => Some(Diagnostic::invalid_envelope(
+                card.source_path.clone(),
+                format!("reference has no resolved space at {}", slot.path),
+            )),
+            _ => None,
         };
-        if unresolved {
-            diagnostics.push(catalog_error(
-                card,
-                WyrdError::RegistryUnresolvedPathRef {
-                    message: format!("unresolved path reference at {}", slot.path),
-                    details: serde_json::json!({ "field": slot.path }),
-                },
-            ));
+        if let Some(diagnostic) = diagnostic {
+            diagnostics.push(diagnostic);
         }
     });
 }
@@ -205,4 +216,67 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
 
 fn catalog_error(card: &AuthoredCard, error: WyrdError) -> Diagnostic {
     Diagnostic::from_wyrd_error(card.source_path.clone(), Severity::Error, None, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::validate_tree;
+    use crate::load::parse::AuthoredCard;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::api_version::ApiVersion;
+    use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
+    use wyrd_spec::envelope::{CardKind, Metadata, Spec};
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::{CardRef, Ref};
+
+    #[test]
+    fn validate_rejects_reference_without_resolved_space() {
+        let card = AuthoredCard {
+            source_path: PathBuf::from("service.yaml"),
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Service,
+            metadata: Metadata {
+                name: CardName::new("service").expect("test card name is valid"),
+                version: Some(
+                    VersionBlock::parse("1.0.0")
+                        .expect("test version is valid")
+                        .into(),
+                ),
+                bump: None,
+                space: Some(SpaceName::new("default").expect("test space is valid")),
+                uid: None,
+                labels: Default::default(),
+                annotations: Default::default(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
+            },
+            spec: Spec::Service(ServiceSpec {
+                components: vec![ServiceComponent {
+                    alias: "child".to_owned(),
+                    card_ref: Ref::Ref(CardRef {
+                        kind: CardKind::Prompt,
+                        name: CardName::new("child").expect("test card name is valid"),
+                        version: VersionBlock::parse("1.0.0").expect("test version is valid"),
+                        space: None,
+                        uid: None,
+                    }),
+                    source: None,
+                    config: Default::default(),
+                    credential_refs: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            artifacts: Vec::new(),
+        };
+
+        let diagnostics = validate_tree(&[card]);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("no resolved space") })
+        );
+    }
 }

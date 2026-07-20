@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
@@ -66,7 +66,7 @@ fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
 pub fn bind_card_references(
     spec: &mut Spec,
     external: &ResolvedRefs,
-    siblings: &HashMap<(String, String, String), CardUid>,
+    siblings: &HashMap<CardRefIdentity, CardUid>,
 ) -> Result<(), WyrdError> {
     ReferenceSlotVisitor::visit(spec, |slot| {
         let card_ref = match slot.value {
@@ -89,36 +89,36 @@ pub fn bind_card_references(
     Ok(())
 }
 
-/// Collect the `(kind, space, name)` identities that appear as siblings.
+/// Collect the exact `(kind, space, name, version)` identities that appear as siblings.
 fn sibling_identities(
     submissions: &[CardSubmission],
-) -> Result<BTreeSet<(String, String, String)>, WyrdError> {
+) -> Result<BTreeSet<CardRefIdentity>, WyrdError> {
     submissions
         .iter()
         .map(|submission| {
             let space = submission.metadata.space.as_ref().ok_or_else(|| {
                 WyrdError::registry_invalid_card_spec("metadata.space is required")
             })?;
-            Ok((
-                submission.kind.wire_name().to_owned(),
-                space.as_str().to_owned(),
-                submission.metadata.name.as_str().to_owned(),
-            ))
+            let version = submission.metadata.resolved_pin().cloned().ok_or_else(|| {
+                WyrdError::registry_invalid_card_spec(
+                    "metadata.version must resolve to an exact pin at the registry boundary",
+                )
+            })?;
+            Ok(CardRef {
+                kind: submission.kind.clone(),
+                name: submission.metadata.name.clone(),
+                version,
+                space: Some(space.clone()),
+                uid: None,
+            }
+            .identity_key())
         })
         .collect()
 }
 
-/// Return the version-independent identity used only for sibling matching.
-fn sibling_key(card_ref: &CardRef) -> (String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref
-            .space
-            .as_ref()
-            .map_or("", |space| space.as_str())
-            .to_owned(),
-        card_ref.name.as_str().to_owned(),
-    )
+/// Return the exact identity used for sibling matching and UID binding.
+fn sibling_key(card_ref: &CardRef) -> CardRefIdentity {
+    card_ref.identity_key()
 }
 
 /// Format a reference for deterministic comparison and actionable errors.
@@ -231,14 +231,7 @@ mod tests {
         let expected = prompt_ref("child");
         let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
         let mut spec = service_spec(expected.clone());
-        let siblings = HashMap::from([(
-            (
-                "Prompt".to_owned(),
-                "default".to_owned(),
-                "child".to_owned(),
-            ),
-            uid.clone(),
-        )]);
+        let siblings = HashMap::from([(expected.identity_key(), uid.clone())]);
 
         bind_card_references(&mut spec, &Vec::new(), &siblings)
             .expect("test_setup: binding succeeds");
@@ -264,5 +257,33 @@ mod tests {
         let mut refs = Vec::new();
         collect_card_refs(&spec, &mut refs);
         assert_eq!(refs[0].uid, Some(uid));
+    }
+
+    #[test]
+    fn sibling_identity_includes_version() {
+        let first = submission("child");
+        let mut second = submission("child");
+        second.metadata.version = Some(VersionSpec::Pin(
+            VersionBlock::parse("2.0.0").expect("test_setup: version is valid"),
+        ));
+
+        let identities = sibling_identities(&[first, second]).expect("identities resolve");
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
+    fn sibling_binding_does_not_match_a_different_version() {
+        let expected = prompt_ref("child");
+        let mut other_version = expected.clone();
+        other_version.version = VersionBlock::parse("2.0.0").expect("version is valid");
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
+        let mut spec = service_spec(other_version);
+
+        bind_card_references(&mut spec, &vec![(expected, uid)], &HashMap::new())
+            .expect("test_setup: binding succeeds");
+
+        let mut refs = Vec::new();
+        collect_card_refs(&spec, &mut refs);
+        assert_eq!(refs[0].uid, None);
     }
 }

@@ -1,140 +1,215 @@
 ---
-title: Forge maintenance
-description: Compaction, snapshot expiry, lease fencing, and orphan garbage collection for Bifrost.
+title: Forge system overview
+description: How Forge maintains Bifrost data and connects Gate, Scribe, Oracle, Iceberg, Postgres, and object storage.
 pillar: wyrd
 group: Bifrost
 order: 8
 ---
 
-# Forge maintenance
+# Forge system overview
 
-Forge is Bifrost's background maintenance plane. Scribe writes sealed Parquet
-files to object storage and registers them in `vala.file_list`; Forge folds
-those staged files into Iceberg snapshots, expires safe historical snapshots,
-and removes objects that are no longer referenced.
+Forge is Bifrost's post-ingest maintenance system. Gate accepts and authorizes
+the write, Scribe makes the write durable and produces staged Parquet, Oracle
+reads both staged and compacted data, and Forge moves data between those two
+storage states. Forge also expires old Iceberg snapshots and removes objects
+that no longer belong to a live table state.
 
-Forge does not sit on the ingest or query path. A failed tick leaves the staged
-file list and Iceberg metadata available for the next tick to reconcile.
+The important boundary is ownership: Scribe owns ingest durability, Oracle
+owns query assembly, and Forge owns maintenance after Scribe has sealed a file.
+Forge is the only Bifrost component that commits the maintenance Iceberg
+transactions described here.
 
-## One maintenance tick
+## Where Forge fits in Bifrost
 
-Each Forge worker discovers tenant/table pairs from `vala.file_list`, sorts them
-deterministically, and tries to acquire a lease for one table. The lease key is
-scoped to the tenant, logical namespace, and table name:
+<WyrdBifrostSystem />
+
+| Component | Owns | Relationship to Forge |
+| --- | --- | --- |
+| Gate | Authentication, tenant resolution, table resolution, and request dispatch | Supplies Scribe and Oracle with an authenticated tenant/table context. It does not choose or commit Forge work. |
+| Scribe | Per-pod WAL, memtables, Parquet sealing, and `vala.file_list` registration | Produces Forge's input files. Scribe does not write Iceberg snapshots. |
+| Oracle | DataFusion query planning and the read surface | Reads compacted Iceberg data and un-compacted staged files. Queries do not wait for Forge to compact a file. |
+| Forge | Compaction, snapshot expiry, orphan GC, audit recovery, and lease fencing | Maintains the transition from staged Parquet to Iceberg-backed data. |
+
+The durable surfaces have different roles:
+
+| Surface | What it represents | Forge's use |
+| --- | --- | --- |
+| Object store | Staged Parquet, Iceberg data files, metadata, manifests, and statistics | Reads inputs, writes compacted data, and deletes unreferenced objects. |
+| `vala.file_list` | Postgres index of sealed files and their compaction state | Selects candidates and records prepared/committed input state. |
+| `vala.maintenance_leases` | Cross-tenant lease ownership and fencing tokens | Ensures one Forge owner processes a tenant/table at a time. |
+| Audit outbox | Durable record of Forge state transitions | Reconstructs the outcome when Postgres and Iceberg cannot commit atomically. |
+| Iceberg catalog | Table metadata and snapshot history | Loads table state and commits compacted data or snapshot expiry. |
+
+## Data path: Gate to Oracle
+
+Forge makes sense only in the context of the Bifrost write and read paths.
+
+1. **Gate** authenticates the caller, resolves the tenant and `TableRef`,
+   validates the registered schema, and dispatches the batch to a Scribe.
+2. **Scribe** appends the batch to its local WAL and acknowledges it after
+   `fsync`. It accumulates rows in a memtable keyed by tenant, table, and event
+   day.
+3. **Scribe seals** a memtable into Parquet, writes the object, then commits a
+   `vala.file_list` row and the batch audit rows in one Postgres transaction.
+   The file is now durable staged data.
+4. **Oracle** reads the staged file through `vala.file_list` while
+   `compacted = false`. It also reads the table's Iceberg snapshots. A recent
+   write can therefore be queryable before Forge has processed it.
+5. **Forge** later folds eligible staged files into an Iceberg snapshot and
+   records the snapshot ID on the corresponding `vala.file_list` rows.
+
+Scribe and Forge deliberately have different durability boundaries. Scribe's
+Postgres transaction makes a staged file visible. Forge's Iceberg transaction
+makes the compacted representation visible. Neither component tries to make
+the other transaction part of its own commit.
+
+## The Forge scheduler
+
+The production scheduler runs a maintenance tick at a fixed interval. Each tick
+does the following:
+
+1. Discover tenant/table pairs from `vala.file_list` using the operator pool.
+2. Sort the work by tenant and fully qualified table name so repeated ticks are
+   predictable.
+3. Resolve the table binding and acquire the lease for that tenant/table.
+4. Run the stages in order: compaction reconciliation, compaction, snapshot
+   expiry, live-set construction, and orphan GC.
+5. Release the lease even when a stage fails or shutdown cancels the tick.
+
+The lease scope is:
 
 ```text
 forge:table:{tenant}:{logical_namespace}:{table_name}
 ```
 
-Only the lease holder runs the stages below for that table. Multiple Forge pods
-can process different tables at the same time.
-
-```text
-reconcile prepared audits
-        ↓
-select staged files → bin-pack → read, validate, sort
-        ↓
-write Iceberg data file → commit snapshot → stamp file_list
-        ↓
-expire old snapshots → build live set → delete old orphans
-```
-
-The stages share one table lease, but each durable transition has its own audit
-record. The scheduler checks for cancellation between stages and releases the
-lease after success, failure, or shutdown.
+Multiple Forge pods can work at the same time when they hold leases for
+different tables. The lease is not a performance hint. Its fencing token is
+asserted before durable transitions so an old worker cannot commit after a new
+worker takes ownership.
 
 ## Compaction
 
-Compaction reduces the number of small staged Parquet files without widening a
-tenant or partition boundary.
+Compaction turns many staged Parquet files into one Iceberg data file for the
+same tenant, table, and partition day.
 
-1. Forge selects rows where `compacted = false`, scoped to the exact tenant and
-   table. Files younger than two minutes are left alone so a just-sealed file
-   has time to settle.
-2. It groups candidates by `partition_day` and packs them in event-time order.
-   A bin cannot exceed the configured byte or file-count limit, and singleton
-   bins are discarded.
-3. Forge reads each input through the table-owned object prefix. It requires a
-   `data_tenant_id` column, rejects foreign rows, projects columns by name into
-   the registered Iceberg schema, and sorts by tenant and event time.
-4. It writes one Parquet data file under the same table prefix. The output row
-   count and partition must match the input batch.
-5. A tenant transaction marks every input row as prepared and appends a
-   `forge.file_compact.prepared` audit event. The lease fence is checked before
-   that transaction commits.
-6. Forge commits the Iceberg transaction with a deterministic operation ID,
-   then reloads the table and stamps `committed_snapshot_id` on every input
-   row. The committed transition is audited in the same tenant transaction.
+### Candidate selection and file layout
 
-The work is bounded per tick by input file count, input bytes, and bin count.
-When a budget or the remaining lease window is exhausted, Forge stops and lets
-the next tick continue from durable state.
+Forge selects exact tenant/table matches where `compacted = false`. Files must
+also be at least two minutes old; that delay keeps a just-sealed file out of a
+maintenance race. Candidates are grouped by `partition_day` and passed to a
+deterministic bin-packer.
+
+The bin-packer sorts by event-time bounds and file ID, then applies the target
+byte size and maximum file-count limits. It drops singleton bins. Rewriting one
+file does not improve the staged file layout, so Forge only emits a bin with at
+least two inputs.
+
+### Input validation and output
+
+For each bin Forge:
+
+1. Validates every input path against the tenant/table object prefix.
+2. Reads the Parquet batches from object storage.
+3. Requires every row's `data_tenant_id` to match the leased tenant.
+4. Projects fields by name into the registered Iceberg schema. It does not rely
+   on column position when the schemas differ.
+5. Sorts the output by tenant and `wyrd_event_time`.
+6. Writes one Parquet data file under the same table prefix and checks its row
+   count and partition.
+
+These checks are part of the storage boundary. A path that escapes the table
+prefix, a foreign tenant row, a missing field, or a partition mismatch stops
+the operation before the catalog commit.
+
+### Durable compaction states
+
+Postgres and Iceberg cannot participate in one transaction. Forge makes that
+cross-system boundary explicit in `vala.file_list` and the audit outbox:
+
+| State | `compacted` | `committed_snapshot_id` | Meaning |
+| --- | --- | --- | --- |
+| Staged | `false` | `NULL` | Scribe registered an input; Oracle can read it from the staging path. |
+| Prepared | `true` | `NULL` | Forge claimed the input and wrote the output object, but the Iceberg commit is not known to be complete. |
+| Committed | `true` | snapshot ID | The output is live in Iceberg and the inputs point to the committed snapshot. |
+| Reset | `false` | `NULL` | Reconciliation found no live output after the uncertainty window; a later tick may retry the input. |
+
+The prepared state is why reconciliation runs before new compaction. A crash
+after the input transition but before the Iceberg commit can temporarily hide
+the input from the staging scan. The next worker checks the audit detail and
+Iceberg manifests: if the output is live, it stamps the snapshot; if the output
+is absent after the uncertainty window, it resets the input. Forge does not
+guess from a single failed network request.
 
 ## Snapshot expiry
 
-Expiry uses snapshot timestamps, not numeric snapshot IDs. Forge protects the
-current snapshot, every metadata reference head, and the configured number of
-ancestors behind each head. It selects only snapshots older than the retention
-cutoff and always retains at least one snapshot per ancestry walk.
+Compaction creates Iceberg snapshots. Snapshot expiry removes old versions
+without deleting a snapshot that the table still needs.
 
-Before committing expiry, Forge reloads Iceberg metadata and recomputes the
-selection. This prevents a stale prepared audit from deleting a snapshot that
-became current or referenced while the worker was away. The operation records
-prepared, committed, and recovered phases in the audit outbox.
+Forge selects by snapshot timestamp, not numeric snapshot ID. It protects the
+current snapshot, every metadata reference head, and the configured number of
+ancestors behind each head. The selection is written to a prepared audit event,
+then Forge reloads the table and recomputes eligibility before committing the
+expiry transaction. That second check matters when another process advances a
+reference while Forge is working.
+
+Expiry uses the same recovery shape as compaction. Prepared, committed, and
+recovered audit phases describe what happened at the Iceberg boundary.
 
 ## Orphan garbage collection
 
-Garbage collection starts by building a protected live set from:
+Forge GC removes objects left behind by a failed write or maintenance operation.
+It does not delete based on a filename age alone.
+
+For each table, Forge builds a protected live set from:
 
 - the current table metadata and metadata log;
-- every retained snapshot, manifest list, manifest, data file, and statistics
-  object; and
-- every pending path in `vala.file_list` for the exact tenant/table.
+- every retained snapshot's manifest list, manifests, data files, and statistics;
+- every pending object path in `vala.file_list` for the exact tenant/table.
 
-Forge lists files below the table prefix and considers only known Iceberg object
-paths that are older than the orphan TTL and absent from that live set. A batch
-size limit bounds the work. Before each delete, Forge rechecks the object's
-metadata, live references, and lease fence; a file that became live is skipped.
+It then lists files below the table prefix and considers only recognized
+Iceberg objects older than the configured orphan TTL and absent from the live
+set. Before each delete, Forge reloads the table, checks the current manifests
+and `vala.file_list` again, re-checks the object metadata, and confirms the
+lease fence. If the object became referenced, Forge records it as skipped.
 
-This handles the normal orphan case: Scribe or Forge wrote an object, then the
-process failed before the durable database or catalog transition committed.
+That final reference check is the important part. The initial live set is a
+planning snapshot; it is not treated as permission to delete forever.
 
-## Leases and recovery
+## Audit and fencing model
 
-The database lease returns a fencing token. Forge renews it before reads that
-lead to destructive work, before an Iceberg commit, and before each tenant
-transaction. The transaction itself asserts the same owner and token immediately
-before commit. A stale worker therefore fails closed instead of writing after a
-new owner takes over.
+Every Forge transition has a stable operation ID and an audit detail containing
+the tenant/table resource, input IDs, object paths, and lifecycle phase. The
+audit row is written in the same tenant transaction as the corresponding
+`file_list` transition.
 
-If a worker exits after writing a prepared audit, the next worker reconciles it:
+Lease coordination uses the cross-tenant operator pool because leases cover
+maintenance ownership rather than user data. The state transition uses a
+tenant-scoped connection. Forge checks the lease in two places:
 
-| Durable state | Next action |
+1. It renews the lease before work that can lead to a catalog commit or object
+   deletion.
+2. It asserts the owner and fencing token inside the tenant transaction before
+   commit.
+
+This is the failure rule to keep in mind when changing Forge: losing the lease
+must stop the operation. A stale worker must never complete a durable state
+transition after a replacement worker has taken over.
+
+## Code map
+
+The implementation follows the lifecycle described above:
+
+| File | Responsibility |
 | --- | --- |
-| Compaction output is live in Iceberg | Stamp the input rows and write a recovered audit event. |
-| Compaction output is absent after the uncertainty bound | Reset the input rows to `compacted = false`. |
-| All expiry targets are absent | Write a recovered expiry event. |
-| An orphan disappeared or became referenced | Skip deletion and continue. |
+| `forge/scheduler.rs` | Tick scheduling, table ordering, stage order, cancellation, and lease release. |
+| `forge/binpack.rs` | Tenant/table/day keys and deterministic rewrite-bin construction. |
+| `forge/compact.rs` | Candidate selection, staged-file validation, Iceberg compaction, audit transitions, and reconciliation. |
+| `forge/expire.rs` | Snapshot selection, expiry commit, and expiry recovery. |
+| `forge/orphan_gc.rs` | Live-set construction, candidate selection, final reference checks, deletion, and GC recovery. |
+| `forge/lease.rs` | Lease acquisition, renewal, release, and transaction fencing. |
+| `vala-sql` maintenance queries and migrations | Lease storage, audit paging, and database-side fence assertions. |
 
-The audit detail contains the input IDs, object paths, operation ID, and phase.
-That identity lets reconciliation validate what the original worker claimed
-before it changes the durable state.
-
-## Configuration and verification
-
-Forge configuration controls compaction budgets, lease timing, snapshot
-retention, and orphan TTL. The lease TTL must exceed the configured Iceberg
-retry timeout, catalog timeout, and uncertainty margin.
-
-The implementation and journeys live in
-`crates/vala/vala-bifrost-redux/src/forge/` and
-`crates/wyrd/wyrd-testing/tests/`. The relevant checks are:
-
-```sh
-mise run test:bifrost:journey
-mise run test:bifrost:sustained
-mise run bench:bifrost:slo
-```
-
-For the surrounding write and read paths, see [Bifrost architecture](/bifrost/architecture)
-and [Data plane internals](/bifrost/data-plane-internals).
+For the broader Bifrost storage model, see [Bifrost architecture](/bifrost/architecture)
+and [Data plane internals](/bifrost/data-plane-internals). For the client-facing
+write and read paths, see [Writing data](/bifrost/writing-data) and
+[Reading data](/bifrost/reading-data).

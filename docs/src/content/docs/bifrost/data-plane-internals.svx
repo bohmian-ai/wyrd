@@ -1,6 +1,6 @@
 ---
 title: Data plane internals
-description: Scribe WAL format, seal state machine, vala.file_list schema, Forge compaction, and audit chain sealing.
+description: Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit chain sealing.
 pillar: wyrd
 group: Bifrost
 order: 9
@@ -8,7 +8,7 @@ order: 9
 
 # Data plane internals
 
-This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, the Forge tick, and the audit sealing pipeline.
+This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, Forge's storage surfaces, and the audit sealing pipeline.
 
 The write surface is in [Writing data](/bifrost/writing-data); the overall system model is in [Architecture](/bifrost/architecture). This is the operator's view.
 
@@ -79,8 +79,8 @@ leases one tenant/table at a time, compacts bounded groups of staged files,
 expires snapshots that are outside the retained ancestry, and garbage-collects
 old objects absent from both Iceberg and `vala.file_list`.
 
-The complete stage order, fencing rules, recovery behavior, and configuration
-are documented in [Forge maintenance](/bifrost/forge). This page keeps the
+The complete stage order, fencing rules, recovery behavior, and component
+boundaries are documented in [Forge system overview](/bifrost/forge). This page keeps the
 storage and audit context; the Forge page is the operational reference.
 
 ## Audit sealing

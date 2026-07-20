@@ -1,3 +1,10 @@
+//! Deterministic candidate grouping for Forge compaction.
+//!
+//! Forge groups staged files by tenant, table, and partition day before it
+//! reads any object-store data. [`stable_pack`] keeps files in event-time order,
+//! respects both byte and file-count limits, and drops singleton bins because
+//! rewriting one file does not reduce file cardinality.
+
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
@@ -6,13 +13,23 @@ use crate::catalog::table_ref::{TableRef, is_safe_name};
 use crate::namespaces::BifrostNamespace;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// The tenant, table, and event day that define one compaction group.
 pub struct ForgeGroupKey {
+    /// Tenant that owns the staged files.
     pub tenant: DataTenantId,
+    /// Registered Bifrost table being compacted.
     pub table_ref: TableRef,
+    /// Day partition shared by every file in the group.
     pub partition_day: NaiveDate,
 }
 
 impl ForgeGroupKey {
+    /// Build a group key from the SQL representation of a Bifrost table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the namespace is unknown or the table name is
+    /// unsafe for use in a server-owned table reference.
     pub fn from_sql(
         tenant: DataTenantId,
         namespace: &str,
@@ -31,6 +48,7 @@ impl ForgeGroupKey {
         })
     }
 
+    /// Return the stable audit resource URI for this group.
     pub fn audit_resource(&self) -> String {
         format!(
             "bifrost://{}/{}/{}",
@@ -40,20 +58,34 @@ impl ForgeGroupKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A staged Parquet file that is eligible for compaction.
 pub struct CandidateFile {
+    /// Stable row identity from `vala.file_list`.
     pub id: Uuid,
+    /// Object-store path for the staged file.
     pub path: String,
+    /// File size in bytes.
     pub size: u64,
+    /// Earliest event time recorded in the file.
     pub min_event_time: DateTime<Utc>,
+    /// Latest event time recorded in the file.
     pub max_event_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A bounded set of staged files written as one compacted output.
 pub struct RewriteBin {
+    /// Files included in the rewrite, ordered by event-time bounds and ID.
     pub files: Vec<CandidateFile>,
+    /// Sum of the input file sizes in bytes.
     pub total_bytes: u64,
 }
 
+/// Pack candidate files into deterministic bins without exceeding either limit.
+///
+/// Files larger than `target_bytes` are skipped. A partial bin is emitted only
+/// when it contains at least two files, so the operation always reduces the
+/// number of staged objects it needs to manage.
 pub fn stable_pack(
     mut files: Vec<CandidateFile>,
     target_bytes: u64,

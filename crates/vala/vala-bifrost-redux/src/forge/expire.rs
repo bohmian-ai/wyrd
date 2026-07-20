@@ -75,7 +75,10 @@ pub fn select_expirable_snapshots(
     selected
 }
 
-/// Discovers physical Forge tables from the server-owned file list.
+/// Discover tenant/table pairs represented in the server-owned file list.
+///
+/// Invalid rows are counted and skipped so one malformed table identity does
+/// not prevent maintenance for the remaining tables.
 pub(crate) async fn discover_tables(
     context: &ForgeContext,
 ) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
@@ -134,6 +137,11 @@ pub(crate) async fn discover_tables(
     Ok((tables, failures))
 }
 
+/// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
+///
+/// Current and reference heads, plus their retained ancestry, are protected by
+/// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
+/// commit so a stale prepared selection cannot delete a newly protected head.
 pub(crate) async fn run_snapshot_expiry_for_table(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -168,6 +176,7 @@ pub(crate) async fn run_snapshot_expiry_for_table(
     Ok(recovered)
 }
 
+/// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
 fn expiry_cutoff_ms(retention: Duration) -> Result<i64, ForgeError> {
     let retention_ms =
         i64::try_from(retention.as_millis()).map_err(|_| ForgeError::InvalidConfig {
@@ -176,6 +185,7 @@ fn expiry_cutoff_ms(retention: Duration) -> Result<i64, ForgeError> {
     Ok(Utc::now().timestamp_millis().saturating_sub(retention_ms))
 }
 
+/// Extract snapshot timestamps, parent links, and metadata reference heads.
 fn snapshot_summaries(
     table: &iceberg::table::Table,
 ) -> Result<(Vec<SnapshotSummary>, Vec<i64>), ForgeError> {
@@ -209,6 +219,7 @@ fn snapshot_summaries(
     Ok((summaries, ref_heads))
 }
 
+/// Build canonical audit detail for a snapshot-expiry selection.
 fn expiry_detail(
     table: &iceberg::table::Table,
     key: &ForgeTableKey,
@@ -238,6 +249,10 @@ fn expiry_detail(
     })
 }
 
+/// Commit an expiry selection after rechecking metadata and the lease fence.
+///
+/// `recovered` selects the terminal audit phase used when completing a
+/// prepared operation left by an earlier Forge process.
 async fn complete_expiry(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -334,6 +349,7 @@ async fn complete_expiry(
     .await
 }
 
+/// Check that every selected snapshot is still eligible under current metadata.
 fn selected_ids_are_eligible(
     table: &iceberg::table::Table,
     selected: &[i64],
@@ -353,6 +369,11 @@ fn selected_ids_are_eligible(
     Ok(selected.iter().all(|id| expected.contains(id)))
 }
 
+/// Recover prepared expiry operations whose outcome is now knowable.
+///
+/// A selection already absent from Iceberg is recorded as recovered. A
+/// selection still present is retried only after the uncertainty bound has
+/// elapsed.
 async fn reconcile_expiry(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -403,6 +424,7 @@ async fn reconcile_expiry(
     Ok(recovered)
 }
 
+/// Read the latest prepared and terminal expiry audit state for one table.
 async fn load_expiry_audits(
     context: &ForgeContext,
     key: &ForgeTableKey,
@@ -470,6 +492,7 @@ async fn load_expiry_audits(
     Ok((prepared, terminal))
 }
 
+/// Append a fenced snapshot-expiry audit event in the tenant transaction.
 async fn append_expiry_audit(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -513,6 +536,7 @@ async fn append_expiry_audit(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Copy an expiry detail while replacing its lifecycle phase.
 fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase) -> AuditDetail {
     match detail {
         AuditDetail::ForgeSnapshotExpire {
@@ -538,6 +562,7 @@ fn terminal_expiry_detail(detail: &AuditDetail, phase: ForgeSnapshotExpirePhase)
     }
 }
 
+/// Return the stable audit resource URI for a Forge table.
 pub(crate) fn table_resource_for_key(key: &ForgeTableKey) -> String {
     format!(
         "bifrost://{}/{}/{}",
@@ -545,6 +570,7 @@ pub(crate) fn table_resource_for_key(key: &ForgeTableKey) -> String {
     )
 }
 
+/// Derive a stable operation ID from the table, cutoff, and sorted snapshot IDs.
 fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) -> Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

@@ -1,0 +1,140 @@
+---
+title: Forge maintenance
+description: Compaction, snapshot expiry, lease fencing, and orphan garbage collection for Bifrost.
+pillar: wyrd
+group: Bifrost
+order: 8
+---
+
+# Forge maintenance
+
+Forge is Bifrost's background maintenance plane. Scribe writes sealed Parquet
+files to object storage and registers them in `vala.file_list`; Forge folds
+those staged files into Iceberg snapshots, expires safe historical snapshots,
+and removes objects that are no longer referenced.
+
+Forge does not sit on the ingest or query path. A failed tick leaves the staged
+file list and Iceberg metadata available for the next tick to reconcile.
+
+## One maintenance tick
+
+Each Forge worker discovers tenant/table pairs from `vala.file_list`, sorts them
+deterministically, and tries to acquire a lease for one table. The lease key is
+scoped to the tenant, logical namespace, and table name:
+
+```text
+forge:table:{tenant}:{logical_namespace}:{table_name}
+```
+
+Only the lease holder runs the stages below for that table. Multiple Forge pods
+can process different tables at the same time.
+
+```text
+reconcile prepared audits
+        ↓
+select staged files → bin-pack → read, validate, sort
+        ↓
+write Iceberg data file → commit snapshot → stamp file_list
+        ↓
+expire old snapshots → build live set → delete old orphans
+```
+
+The stages share one table lease, but each durable transition has its own audit
+record. The scheduler checks for cancellation between stages and releases the
+lease after success, failure, or shutdown.
+
+## Compaction
+
+Compaction reduces the number of small staged Parquet files without widening a
+tenant or partition boundary.
+
+1. Forge selects rows where `compacted = false`, scoped to the exact tenant and
+   table. Files younger than two minutes are left alone so a just-sealed file
+   has time to settle.
+2. It groups candidates by `partition_day` and packs them in event-time order.
+   A bin cannot exceed the configured byte or file-count limit, and singleton
+   bins are discarded.
+3. Forge reads each input through the table-owned object prefix. It requires a
+   `data_tenant_id` column, rejects foreign rows, projects columns by name into
+   the registered Iceberg schema, and sorts by tenant and event time.
+4. It writes one Parquet data file under the same table prefix. The output row
+   count and partition must match the input batch.
+5. A tenant transaction marks every input row as prepared and appends a
+   `forge.file_compact.prepared` audit event. The lease fence is checked before
+   that transaction commits.
+6. Forge commits the Iceberg transaction with a deterministic operation ID,
+   then reloads the table and stamps `committed_snapshot_id` on every input
+   row. The committed transition is audited in the same tenant transaction.
+
+The work is bounded per tick by input file count, input bytes, and bin count.
+When a budget or the remaining lease window is exhausted, Forge stops and lets
+the next tick continue from durable state.
+
+## Snapshot expiry
+
+Expiry uses snapshot timestamps, not numeric snapshot IDs. Forge protects the
+current snapshot, every metadata reference head, and the configured number of
+ancestors behind each head. It selects only snapshots older than the retention
+cutoff and always retains at least one snapshot per ancestry walk.
+
+Before committing expiry, Forge reloads Iceberg metadata and recomputes the
+selection. This prevents a stale prepared audit from deleting a snapshot that
+became current or referenced while the worker was away. The operation records
+prepared, committed, and recovered phases in the audit outbox.
+
+## Orphan garbage collection
+
+Garbage collection starts by building a protected live set from:
+
+- the current table metadata and metadata log;
+- every retained snapshot, manifest list, manifest, data file, and statistics
+  object; and
+- every pending path in `vala.file_list` for the exact tenant/table.
+
+Forge lists files below the table prefix and considers only known Iceberg object
+paths that are older than the orphan TTL and absent from that live set. A batch
+size limit bounds the work. Before each delete, Forge rechecks the object's
+metadata, live references, and lease fence; a file that became live is skipped.
+
+This handles the normal orphan case: Scribe or Forge wrote an object, then the
+process failed before the durable database or catalog transition committed.
+
+## Leases and recovery
+
+The database lease returns a fencing token. Forge renews it before reads that
+lead to destructive work, before an Iceberg commit, and before each tenant
+transaction. The transaction itself asserts the same owner and token immediately
+before commit. A stale worker therefore fails closed instead of writing after a
+new owner takes over.
+
+If a worker exits after writing a prepared audit, the next worker reconciles it:
+
+| Durable state | Next action |
+| --- | --- |
+| Compaction output is live in Iceberg | Stamp the input rows and write a recovered audit event. |
+| Compaction output is absent after the uncertainty bound | Reset the input rows to `compacted = false`. |
+| All expiry targets are absent | Write a recovered expiry event. |
+| An orphan disappeared or became referenced | Skip deletion and continue. |
+
+The audit detail contains the input IDs, object paths, operation ID, and phase.
+That identity lets reconciliation validate what the original worker claimed
+before it changes the durable state.
+
+## Configuration and verification
+
+Forge configuration controls compaction budgets, lease timing, snapshot
+retention, and orphan TTL. The lease TTL must exceed the configured Iceberg
+retry timeout, catalog timeout, and uncertainty margin.
+
+The implementation and journeys live in
+`crates/vala/vala-bifrost-redux/src/forge/` and
+`crates/wyrd/wyrd-testing/tests/`. The relevant checks are:
+
+```sh
+mise run test:bifrost:journey
+mise run test:bifrost:sustained
+mise run bench:bifrost:slo
+```
+
+For the surrounding write and read paths, see [Bifrost architecture](/bifrost/architecture)
+and [Data plane internals](/bifrost/data-plane-internals).

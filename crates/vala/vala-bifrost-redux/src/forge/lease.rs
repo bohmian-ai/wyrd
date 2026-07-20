@@ -1,3 +1,9 @@
+//! Fenced leases for one Forge tenant/table maintenance scope.
+//!
+//! Lease ownership is coordinated through the operator pool. The fencing token
+//! is carried into tenant transactions so an expired or superseded owner cannot
+//! commit a durable state transition after another Forge process takes over.
+
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wyrd_spec::DataTenantId;
@@ -7,20 +13,31 @@ use vala_sql::TenantConn;
 
 use super::error::ForgeError;
 
+/// Build the shared lease namespace for all maintenance stages of a table.
 pub fn forge_lease_key(tenant: DataTenantId, logical_namespace: &str, table_name: &str) -> String {
     format!("forge:table:{tenant}:{logical_namespace}:{table_name}")
 }
 
 #[derive(Debug, Clone)]
+/// A Forge table lease and its database fencing token.
 pub struct ForgeLease {
+    /// Stable tenant/table lease namespace.
     pub lease_key: String,
+    /// UUID of the process that owns the lease.
     pub owner: Uuid,
+    /// Monotonic token asserted by every durable transition.
     pub fencing_token: i64,
     ttl: Duration,
     confirmed_at: Instant,
 }
 
 impl ForgeLease {
+    /// Try to acquire a lease, returning `None` when another owner holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease error when the operator query fails or the TTL cannot
+    /// be represented by the database interval.
     pub async fn acquire(
         operator_pool: &OperatorPool,
         lease_key: String,
@@ -47,6 +64,9 @@ impl ForgeLease {
         }))
     }
 
+    /// Renew this lease and refresh its local confirmation time.
+    ///
+    /// Returns `false` when the owner or fencing token no longer matches.
     pub async fn renew(&mut self, operator_pool: &OperatorPool) -> Result<bool, ForgeError> {
         let seconds = i64::try_from(self.ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
             detail: "lease TTL is too large".to_owned(),
@@ -66,6 +86,7 @@ impl ForgeLease {
         Ok(renewed)
     }
 
+    /// Release this lease only if the owner and fencing token still match.
     pub async fn release(&self, operator_pool: &OperatorPool) -> Result<bool, ForgeError> {
         vala_sql::queries::maintenance_leases::release_lease_fenced(
             operator_pool,
@@ -77,14 +98,17 @@ impl ForgeLease {
         .map_err(ForgeError::Lease)
     }
 
+    /// Return the locally estimated time remaining before the lease expires.
     pub fn remaining(&self) -> Duration {
         self.ttl.saturating_sub(self.confirmed_at.elapsed())
     }
 
+    /// Check whether the remaining lease covers a required commit window.
     pub fn commit_window_fits(&self, required: Duration) -> bool {
         self.remaining() > required
     }
 
+    /// Renew the lease and fail closed if its fence cannot be confirmed.
     pub async fn require_fence(&mut self, operator_pool: &OperatorPool) -> Result<(), ForgeError> {
         if self.remaining().is_zero() {
             return Err(ForgeError::FenceLost {
@@ -99,6 +123,10 @@ impl ForgeLease {
         Ok(())
     }
 
+    /// Assert this lease inside a tenant transaction immediately before commit.
+    ///
+    /// A lost lease is returned as [`ForgeError::FenceLost`], while other SQL
+    /// failures retain their original error classification.
     pub async fn assert_transaction_fence(
         &self,
         conn: &mut TenantConn<'_>,

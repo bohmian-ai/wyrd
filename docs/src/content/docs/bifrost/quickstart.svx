@@ -84,5 +84,5 @@ Response includes `spans`, `events`, and `links` nested under `trace`. Note: `ev
 3. **Scribe** appends the batch to its WAL, fsyncs, acks. The rows accumulate in a memtable keyed by `(data_tenant_id, vala.traces.spans, event_day)` until a seal trigger fires (50k rows, 1s, 128 MiB, or 5s inactivity).
 4. **Scribe** seals: freeze memtable, encode Parquet, PUT to object store, atomic Postgres tx to insert into `vala.file_list` and append audit rows. The row is now visible to Oracle.
 5. `QueryRecentTraces` routes through Gate to Oracle. Oracle builds a DataFusion `LogicalPlan` against `vala.traces.spans`. The `TenantPredicateRule` analyzer injects `data_tenant_id = $tenant` before execution. The route handler runs an in-Rust GROUP-BY over the collected spans to derive `TraceSummaryRow` values.
-6. **Forge** (async, later) bin-packs small Parquet files from `vala.file_list` and commits an Iceberg snapshot. Nothing in the read path changes.
+6. **Forge** runs asynchronously after ingest. It bin-packs small Parquet files from `vala.file_list`, commits an Iceberg snapshot, expires old snapshots, and removes unreferenced objects. Nothing in the read path changes.
 7. The response is paginated at `MAX_QUERY_PAGE_SIZE = 1000` rows. A `next_page_token` is returned when more rows exist; pass it back in `page_token` on the next request.

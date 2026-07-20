@@ -1,3 +1,12 @@
+//! Forge compaction from staged Scribe files into Iceberg snapshots.
+//!
+//! This module owns the compaction state machine. It selects bounded,
+//! tenant-scoped groups from `vala.file_list`, validates and sorts their Arrow
+//! rows, writes one Iceberg data file, and records each durable transition in
+//! the audit outbox. Prepared audit records make a crash between the SQL and
+//! Iceberg commits observable; the next Forge tick reconciles that state before
+//! selecting more files.
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,26 +50,44 @@ const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
+/// Limits and durability windows for one Forge maintenance loop.
 pub struct ForgeConfig {
+    /// Minimum number of staged files that makes a group eligible.
     pub min_files: i64,
+    /// Target byte size for one rewrite bin.
     pub target_bin_bytes: u64,
+    /// Maximum number of files in one rewrite bin.
     pub max_files_per_bin: usize,
+    /// Maximum number of input files processed by one tick.
     pub max_files_per_tick: usize,
+    /// Maximum input bytes processed by one tick.
     pub max_bytes_per_tick: u64,
+    /// Maximum bins committed by one tick.
     pub max_bins_per_tick: usize,
+    /// Lease duration used to fence one table's maintenance work.
     pub lease_ttl: Duration,
+    /// Total time reserved for a retried Iceberg commit.
     pub iceberg_total_retry_timeout: Duration,
+    /// Timeout for one catalog request.
     pub catalog_request_timeout: Duration,
+    /// Time reserved for clock and lease uncertainty around a commit.
     pub uncertainty_margin: Duration,
+    /// Minimum age before an uncertain prepared operation may be recovered.
     pub uncertainty_bound: Duration,
+    /// Number of audit rows read per reconciliation page.
     pub audit_page_size: i64,
+    /// Age after which old Iceberg snapshots become eligible for expiry.
     pub snapshot_retention: Duration,
+    /// Number of snapshots retained along each current/ref ancestry.
     pub retain_last: usize,
+    /// Age after which an unreferenced object may be deleted.
     pub orphan_gc_ttl: Duration,
+    /// Maximum orphan candidates considered in one GC batch.
     pub max_gc_candidates_per_batch: usize,
 }
 
 impl Default for ForgeConfig {
+    /// Return the production defaults for Forge maintenance limits.
     fn default() -> Self {
         Self {
             min_files: 2,
@@ -84,6 +111,13 @@ impl Default for ForgeConfig {
 }
 
 impl ForgeConfig {
+    /// Validate compaction, recovery, expiry, and garbage-collection limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when a limit is zero, a bin cannot
+    /// contain two files, or the lease cannot cover the configured commit
+    /// window.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.min_files < 2
             || self.target_bin_bytes == 0
@@ -113,6 +147,7 @@ impl ForgeConfig {
         Ok(())
     }
 
+    /// Return the time Forge must reserve for the Iceberg commit window.
     pub(crate) fn commit_window(&self) -> Duration {
         self.iceberg_total_retry_timeout
             .saturating_add(self.catalog_request_timeout)
@@ -148,18 +183,22 @@ struct OpenDalForgeObjectStore {
 
 #[async_trait]
 impl ForgeObjectStore for OpenDalForgeObjectStore {
+    /// Read one object through the configured `OpenDAL` operator.
     async fn read(&self, path: &str) -> opendal::Result<Buffer> {
         self.operator.read(path).await
     }
 
+    /// Recursively list objects below a table-owned prefix.
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
         self.operator.list_with(prefix).recursive(true).await
     }
 
+    /// Read metadata for one object before a deletion decision.
     async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
         self.operator.stat(path).await
     }
 
+    /// Delete one object through the configured `OpenDAL` operator.
     async fn delete(&self, path: &str) -> opendal::Result<()> {
         self.operator.delete(path).await
     }
@@ -169,8 +208,11 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
 pub struct ForgeContext {
     /// Vala-owned application SQL handle used to open tenant transactions.
     pub vala: vala_sql::ValaPostgres,
+    /// Operator pool used for cross-tenant lease and candidate discovery work.
     pub operator_pool: vala_sql::OperatorPool,
+    /// Iceberg catalog used to load tables and commit maintenance actions.
     pub catalog: Arc<dyn Catalog>,
+    /// Raw staging operator retained for producer fixtures and callers.
     pub staging: Arc<Operator>,
     /// Forge's read/list/stat/delete seam, backed by `staging` by default.
     pub object_store: Arc<dyn ForgeObjectStore>,
@@ -184,6 +226,13 @@ pub(crate) struct ForgeTableKey {
 }
 
 impl ForgeContext {
+    /// Build a validated Forge context using the staging operator as its object
+    /// store seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when the supplied configuration is
+    /// not safe to run.
     pub fn new(
         vala: vala_sql::ValaPostgres,
         operator_pool: vala_sql::OperatorPool,
@@ -214,25 +263,43 @@ impl ForgeContext {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// Counters collected from one Forge maintenance tick.
 pub struct ForgeTickOutcome {
+    /// Candidate groups discovered for compaction.
     pub groups_seen: usize,
+    /// Rewrite bins committed to Iceberg.
     pub bins_committed: usize,
+    /// Bins skipped because a budget or lease window was exhausted.
     pub bins_skipped: usize,
+    /// Durable operations recovered from audit state.
     pub reconciled: usize,
+    /// Tables whose stages completed successfully.
     pub tables_succeeded: usize,
+    /// Tables skipped due to lease contention or cancellation.
     pub tables_skipped: usize,
+    /// Tables that encountered a failure.
     pub tables_failed: usize,
+    /// Compaction operations recovered during reconciliation.
     pub reconciliation_recovered: usize,
+    /// Snapshot-expiry operations recovered or completed.
     pub expiry_reconciled: usize,
+    /// Orphan-GC operations recovered.
     pub gc_reconciled: usize,
+    /// Objects deleted by orphan GC.
     pub gc_deleted: usize,
+    /// Objects skipped after a live-set or fence recheck.
     pub gc_skipped: usize,
+    /// Work skipped because a per-tick budget was reached.
     pub budget_skips: usize,
+    /// Tables skipped because another Forge owner held the lease.
     pub lease_contention: usize,
+    /// Operations stopped after losing the table fence.
     pub fence_losses: usize,
+    /// Stage-level failures that did not abort discovery of other tables.
     pub stage_failures: usize,
 }
 
+/// Load one Iceberg table with the configured catalog request timeout.
 pub(crate) async fn load_table(
     context: &ForgeContext,
     ident: &iceberg::TableIdent,
@@ -248,6 +315,10 @@ pub(crate) async fn load_table(
     .map_err(ForgeError::Catalog)
 }
 
+/// Reconcile prepared compaction audits for one tenant/table before new work.
+///
+/// A prepared operation is marked committed when its output is still live in
+/// Iceberg, or reset when the output is absent after the uncertainty window.
 pub(crate) async fn run_compaction_reconciliation_for_table(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -264,6 +335,12 @@ pub(crate) async fn run_compaction_reconciliation_for_table(
     Ok(reconciled)
 }
 
+/// Select, bin-pack, and commit bounded compaction work for one table.
+///
+/// The table lease is renewed before each bin, and the remaining lease time is
+/// checked against the configured Iceberg commit window. Hitting any file,
+/// byte, or bin budget stops the table without treating the skipped work as a
+/// failure.
 pub(crate) async fn run_compaction_bins_for_table(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -321,10 +398,17 @@ pub(crate) async fn run_compaction_bins_for_table(
 
 #[derive(Debug, Clone)]
 pub(crate) struct CandidateRow {
+    /// Tenant/table/day identity shared by every file in the row.
     key: ForgeGroupKey,
+    /// Uncompacted files selected for this candidate group.
     files: Vec<CandidateFile>,
 }
 
+/// Load bounded, old-enough staging candidates for one tenant/table.
+///
+/// The query uses the operator pool because Forge discovers work across tenant
+/// rows. Results are grouped by partition day and ordered deterministically so
+/// repeated ticks make the same selection under the same durable state.
 pub(crate) async fn select_candidate_groups(
     operator_pool: &vala_sql::OperatorPool,
     table_key: &ForgeTableKey,
@@ -421,6 +505,7 @@ pub(crate) async fn select_candidate_groups(
         .collect())
 }
 
+/// Load groups whose prepared SQL transition has no committed snapshot ID.
 async fn load_reconciliation_keys(
     context: &ForgeContext,
 ) -> Result<Vec<ForgeGroupKey>, ForgeError> {
@@ -462,6 +547,7 @@ async fn load_reconciliation_keys(
         .collect()
 }
 
+/// Convert the database's system-owner UUID convention into a data-tenant ID.
 fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
     if value.is_nil() {
         Ok(DataTenantId::SYSTEM_OWNER)
@@ -472,6 +558,11 @@ fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
     }
 }
 
+/// Execute one fenced compaction operation from staged files to Iceberg.
+///
+/// The sequence is read and validate, write the output, mark inputs prepared,
+/// commit the Iceberg transaction, and stamp the committed snapshot. Every
+/// external boundary is fenced so a stale lease cannot finish the operation.
 async fn compact_bin(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -555,10 +646,13 @@ async fn compact_bin(
     stamp_committed(context, lease, key, bin, &output, operation_id, snapshot_id).await
 }
 
+/// Return whether Iceberg classified an error as safe to retry.
 fn is_retryable(error: &iceberg::Error) -> bool {
     error.retryable()
 }
 
+/// Read a rewrite bin, enforce tenant ownership, project by field name, and
+/// sort rows by tenant and event time for the Iceberg writer.
 async fn read_and_project_staging(
     context: &ForgeContext,
     table: &iceberg::table::Table,
@@ -630,6 +724,7 @@ async fn read_and_project_staging(
     sort_rows(&projected)
 }
 
+/// Reject a staging batch containing a missing, malformed, or foreign tenant.
 fn validate_tenant_column(batch: &RecordBatch, tenant: DataTenantId) -> Result<(), ForgeError> {
     let index = batch
         .schema()
@@ -653,6 +748,11 @@ fn validate_tenant_column(batch: &RecordBatch, tenant: DataTenantId) -> Result<(
     Ok(())
 }
 
+/// Project source columns into the registered Iceberg schema by field name.
+///
+/// Matching types are reused; compatible differences are cast through Arrow.
+/// Missing fields and failed casts are schema errors rather than positional
+/// guesses.
 fn project_by_name(
     source: &RecordBatch,
     target: Arc<arrow::datatypes::Schema>,
@@ -684,6 +784,7 @@ fn project_by_name(
     })
 }
 
+/// Sort a projected batch by tenant and event time before writing it.
 fn sort_rows(batch: &RecordBatch) -> Result<RecordBatch, ForgeError> {
     let tenant = batch
         .schema()
@@ -733,6 +834,11 @@ fn sort_rows(batch: &RecordBatch) -> Result<RecordBatch, ForgeError> {
     })
 }
 
+/// Write one compacted Parquet data file under the table's object prefix.
+///
+/// The output must contain one file, the same row count as the input batch, and
+/// the candidate partition. The prefix check prevents a catalog or storage
+/// configuration error from escaping the tenant/table boundary.
 async fn write_output(
     table: &iceberg::table::Table,
     binding: &TenantTableBinding,
@@ -807,6 +913,7 @@ async fn write_output(
     Ok(file)
 }
 
+/// Check that a path is a normalized descendant of a configured object prefix.
 fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
     let prefix = prefix.trim_end_matches('/');
     let prefixed = format!("{prefix}/");
@@ -823,6 +930,10 @@ fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
     })
 }
 
+/// Mark input rows prepared and append the matching prepared audit event.
+///
+/// The SQL transition and audit append share one tenant transaction, which is
+/// fenced immediately before commit.
 async fn prepare_inputs(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -866,6 +977,7 @@ async fn prepare_inputs(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
 async fn stamp_committed(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -917,6 +1029,8 @@ async fn stamp_committed(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Restore prepared input rows to the uncompacted state after a definite
+/// Iceberg failure.
 async fn reset_inputs(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -966,6 +1080,10 @@ async fn reset_inputs(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Reconcile the latest prepared audit transition for every group in a table.
+///
+/// A live output is stamped as recovered. An output absent after the
+/// uncertainty window resets the hidden inputs so a future tick can retry.
 async fn reconcile_group(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -1047,6 +1165,7 @@ async fn reconcile_group(
     Ok(recovered)
 }
 
+/// Load the latest audit detail for each compaction operation in a group.
 async fn load_reconciliation_audits(
     context: &ForgeContext,
     key: &ForgeGroupKey,
@@ -1091,6 +1210,7 @@ async fn load_reconciliation_audits(
     Ok(latest)
 }
 
+/// Validate the identity and ordering fields needed for compaction recovery.
 fn validate_reconciliation_detail(detail: &AuditDetail, resource: &str) -> Result<(), ForgeError> {
     let AuditDetail::ForgeCompaction {
         group,
@@ -1119,6 +1239,7 @@ fn validate_reconciliation_detail(detail: &AuditDetail, resource: &str) -> Resul
     Ok(())
 }
 
+/// Extract the group resource from a compaction audit detail.
 fn detail_group(detail: &AuditDetail) -> String {
     match detail {
         AuditDetail::ForgeCompaction { group, .. } => group.clone(),
@@ -1126,6 +1247,7 @@ fn detail_group(detail: &AuditDetail) -> String {
     }
 }
 
+/// Find the current Iceberg snapshot that contains a live data-file path.
 async fn live_snapshot_for_path(
     table: &iceberg::table::Table,
     path: &str,
@@ -1152,6 +1274,7 @@ async fn live_snapshot_for_path(
     Ok(None)
 }
 
+/// Confirm that prepared audit inputs still match hidden `file_list` rows.
 async fn verify_hidden_inputs(
     context: &ForgeContext,
     key: &ForgeGroupKey,
@@ -1221,6 +1344,8 @@ async fn verify_hidden_inputs(
     Ok(())
 }
 
+/// Stamp a recovered compaction with the snapshot that already contains its
+/// output.
 async fn stamp_reconciled(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -1267,6 +1392,7 @@ async fn stamp_reconciled(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Reset a recovered compaction whose output was never committed.
 async fn reset_reconciled(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -1311,6 +1437,7 @@ async fn reset_reconciled(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
+/// Convert a prepared compaction detail into a terminal audit phase.
 fn terminal_detail(
     detail: &AuditDetail,
     phase: ForgeCompactionPhase,
@@ -1339,6 +1466,7 @@ fn terminal_detail(
     }
 }
 
+/// Append a system-owned Forge audit event to the caller's tenant transaction.
 async fn append_system_audit(
     conn: &mut vala_sql::TenantConn<'_>,
     key: &ForgeGroupKey,
@@ -1366,6 +1494,7 @@ async fn append_system_audit(
         .map_err(ForgeError::Sql)
 }
 
+/// Build the canonical audit detail for one compaction operation.
 fn forge_detail(
     key: &ForgeGroupKey,
     bin: &RewriteBin,
@@ -1406,6 +1535,7 @@ fn forge_detail(
     })
 }
 
+/// Derive a stable operation ID from the group and ordered input identity.
 fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

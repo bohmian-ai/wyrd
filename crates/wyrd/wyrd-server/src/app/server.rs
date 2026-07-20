@@ -370,9 +370,10 @@ impl BoundServer {
             ));
         }
 
-        // Maintenance scheduler (slice 01): drives the commit-recovery sweep and
-        // maintenance-health tick every 60s.
-        let scheduler_handle = spawn_maintenance_scheduler(&self.state, shutdown.clone());
+        // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
+        // live-set rebuild, and orphan GC for this process.
+        let scheduler_handle = spawn_maintenance_scheduler(&self.state, shutdown.clone())
+            .map_err(|e| BootExit::Other(Box::new(e)))?;
         set.spawn(worker_task(
             TaskId::Worker("maintenance_scheduler"),
             async move {

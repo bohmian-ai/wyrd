@@ -121,6 +121,7 @@ impl ForgeConfig {
 
 #[derive(Clone)]
 pub struct ForgeContext {
+    pub app_pool: sqlx::PgPool,
     pub operator_pool: vala_sql::OperatorPool,
     pub catalog: Arc<dyn Catalog>,
     pub staging: Arc<Operator>,
@@ -135,6 +136,7 @@ pub(crate) struct ForgeTableKey {
 
 impl ForgeContext {
     pub fn new(
+        app_pool: sqlx::PgPool,
         operator_pool: vala_sql::OperatorPool,
         catalog: Arc<dyn Catalog>,
         staging: Arc<Operator>,
@@ -142,6 +144,7 @@ impl ForgeContext {
     ) -> Result<Self, ForgeError> {
         config.validate()?;
         Ok(Self {
+            app_pool,
             operator_pool,
             catalog,
             staging,
@@ -749,7 +752,10 @@ async fn write_output(
     let schema = table.metadata().current_schema().clone();
     let props = bifrost_writer_properties(batch.num_rows());
     let parquet = ParquetWriterBuilder::new(props, schema.clone());
-    let location = DefaultLocationGenerator::with_data_location(binding.object_prefix.clone());
+    // Iceberg DataFile locations must be absolute URLs. The table metadata
+    // location already carries the configured warehouse/backend, while the
+    // table binding keeps the tenant-qualified prefix in that location.
+    let location = DefaultLocationGenerator::new(table.metadata()).map_err(ForgeError::Catalog)?;
     let name = DefaultFileNameGenerator::new(
         format!("forge-{operation_id}"),
         None,
@@ -788,7 +794,7 @@ async fn write_output(
         .ok_or_else(|| ForgeError::Invariant {
             detail: "Forge writer returned no data file".to_owned(),
         })?;
-    if !file.file_path().starts_with(&binding.object_prefix) {
+    if !path_is_under_prefix(file.file_path(), &binding.object_prefix) {
         return Err(ForgeError::Invariant {
             detail: format!("Forge output escaped table prefix: {}", file.file_path()),
         });
@@ -810,6 +816,14 @@ async fn write_output(
     Ok(file)
 }
 
+fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    path == prefix
+        || path
+            .match_indices(prefix)
+            .any(|(index, _)| index == 0 || path[..index].ends_with('/'))
+}
+
 async fn prepare_inputs(
     context: &ForgeContext,
     lease: &mut ForgeLease,
@@ -822,9 +836,7 @@ async fn prepare_inputs(
             lease_key: lease.lease_key.clone(),
         });
     }
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -861,9 +873,7 @@ async fn stamp_committed(
     snapshot_id: i64,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -909,9 +919,7 @@ async fn reset_inputs(
     operation_id: Uuid,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
@@ -1031,9 +1039,7 @@ async fn load_reconciliation_audits(
     let mut prepared = HashMap::new();
     let mut terminal = HashSet::new();
     loop {
-        let mut conn = context
-            .operator_pool
-            .tenant_conn(key.tenant)
+        let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
         let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
@@ -1158,9 +1164,7 @@ async fn verify_hidden_inputs(
             detail: "prepared audit detail has unpaired input IDs and paths".to_owned(),
         });
     }
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let rows = sqlx::query(
@@ -1220,9 +1224,7 @@ async fn stamp_reconciled(
     snapshot_id: i64,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let result = sqlx::query(
@@ -1264,9 +1266,7 @@ async fn reset_reconciled(
     detail: &AuditDetail,
 ) -> Result<(), ForgeError> {
     lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let result = sqlx::query(

@@ -179,6 +179,15 @@ impl StorageHandle {
         &self.signer
     }
 
+    /// Borrow the active `OpenDAL` operator.
+    ///
+    /// Data-plane workers that share this storage handle must use this
+    /// operator so artifact and analytical paths retain one backend binding.
+    #[must_use]
+    pub fn operator(&self) -> &Operator {
+        &self.operator
+    }
+
     /// Whether upload completion must verify server-side encryption markers.
     #[must_use]
     pub fn require_encryption(&self) -> bool {

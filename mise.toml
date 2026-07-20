@@ -151,8 +151,8 @@ env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyr
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_scribe_multipod_journey -- --ignored --test-threads=1
-cargo test --locked -p wyrd-testing --test journey_forge_single_pod -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_forge_multipod_journey -- --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test pg_bifrost_forge_scheduler_closeout_journey -- --ignored --test-threads=1
 """
 
 [tasks."test:fuzz:bifrost"]

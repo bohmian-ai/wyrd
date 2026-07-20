@@ -37,6 +37,9 @@ tokio = { workspace = true }
 tempfile = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
+sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
 
 [[bench]]
 name = "bench_ingest_seal_throughput"

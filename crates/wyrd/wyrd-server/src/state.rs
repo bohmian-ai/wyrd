@@ -1,10 +1,12 @@
 //! Shared axum application state.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::forge::ForgeContext;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -58,6 +60,10 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
+    /// Shared Redux Forge context built from the process-wide catalog and storage.
+    pub forge_context: Option<Arc<ForgeContext>>,
+    /// Interval used by the supervised Forge worker.
+    pub forge_interval: Duration,
     /// Authentication handles: token issuance + verification + issuer/binding resolution.
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
@@ -93,6 +99,8 @@ impl AppState {
             postgres,
             storage,
             bifrost,
+            forge_context: None,
+            forge_interval: Duration::from_secs(60),
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
             deployment_profile: DeploymentProfile::Development,
@@ -175,6 +183,20 @@ impl AppState {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Attach the single production Forge context used by the supervised worker.
+    #[must_use]
+    pub fn with_forge_context(mut self, context: ForgeContext) -> Self {
+        self.forge_context = Some(Arc::new(context));
+        self
+    }
+
+    /// Set the supervised Forge worker interval.
+    #[must_use]
+    pub fn with_forge_interval(mut self, interval: Duration) -> Self {
+        self.forge_interval = interval;
         self
     }
 }

@@ -2,14 +2,27 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, watch};
+use tokio::sync::RwLock;
+use vala_bifrost_redux::forge::ForgeScheduler;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::load::{QueryResponse, SustainedLoadHarness, TenantWorkload};
 
 #[tokio::test]
 #[ignore = "requires the sustained Forge compaction lane"]
-async fn forge_sustained_maintenance_with_ingest_and_queries_has_zero_loss_or_leak() {
-    let server = WyrdTestServer::start_bound().await.expect("test server");
+async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_millis(10))
+        .start_bound()
+        .await
+        .expect("test server");
+    let forge_context = server
+        .state()
+        .forge_context
+        .as_ref()
+        .cloned()
+        .expect("Forge context");
+    let scheduler = ForgeScheduler::start((*forge_context).clone(), Duration::from_millis(10))
+        .expect("sustained scheduler");
     let tenant = server.data_tenant_id();
     let rows = Arc::new(RwLock::new(Vec::new()));
     let live_files = Arc::new(RwLock::new(BTreeSet::new()));
@@ -82,31 +95,9 @@ async fn forge_sustained_maintenance_with_ingest_and_queries_has_zero_loss_or_le
                 Ok(QueryResponse { rows })
             }
         });
-    let (maintenance_stop, mut stopped) = watch::channel(false);
-    let maintenance_live_files = Arc::clone(&live_files);
-    let maintenance_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                changed = stopped.changed() => {
-                    if changed.is_err() || *stopped.borrow() {
-                        break;
-                    }
-                }
-                _ = tokio::task::yield_now() => {
-                    let live_count = maintenance_live_files.read().await.len();
-                    if live_count > 0 {
-                        tracing::debug!(live_count, "sustained Forge maintenance protected live files");
-                    }
-                }
-            }
-        }
-    });
     let report = harness.run().await.expect("sustained Forge journey");
-    maintenance_stop
-        .send(true)
-        .expect("maintenance task is live");
-    maintenance_task.await.expect("maintenance task join");
     assert_eq!(report.missing_rows, 0);
     assert!(!live_files.read().await.is_empty());
+    scheduler.shutdown().await.expect("scheduler shutdown");
     harness.shutdown().await.expect("server shutdown");
 }

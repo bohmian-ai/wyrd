@@ -176,9 +176,7 @@ pub(crate) async fn build_live_set(
         }
     }
 
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let rows = sqlx::query(
@@ -355,9 +353,7 @@ async fn load_gc_audits(
     ),
     ForgeError,
 > {
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(key.tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
         .await
         .map_err(ForgeError::Sql)?;
     let mut after_seq = 0_i64;
@@ -497,9 +493,7 @@ async fn append_gc_audit(
         payload_summary: operation.to_owned(),
         detail: Some(detail.clone()),
     };
-    let mut conn = context
-        .operator_pool
-        .tenant_conn(tenant)
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
         .await
         .map_err(ForgeError::Sql)?;
     vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)

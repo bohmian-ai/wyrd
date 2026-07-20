@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -98,6 +99,7 @@ pub struct WyrdTestServerBuilder {
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
+    forge_interval: Duration,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -112,6 +114,7 @@ impl Default for WyrdTestServerBuilder {
             auth_verify_settings: None,
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
+            forge_interval: Duration::from_secs(60),
         }
     }
 }
@@ -985,6 +988,13 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Use a shorter Forge interval for scheduler-driven integration journeys.
+    #[must_use]
+    pub fn with_forge_interval(mut self, interval: Duration) -> Self {
+        self.forge_interval = interval;
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1105,8 +1115,23 @@ impl WyrdTestServerBuilder {
             fixture.wyrd_postgres().clone(),
             fixture.vala_postgres().clone(),
         ));
-        let mut state = AppState::new(postgres, storage, bifrost).with_auth(
-            wyrd_server::components::auth::ServerAuth {
+        let operator_pool = postgres.operator_pool().ok_or_else(|| {
+            WyrdTestServerError::Start(
+                "test server requires a platform-admin operator pool for Forge".to_owned(),
+            )
+        })?;
+        let forge_context = ForgeContext::new(
+            postgres.app_pool().clone(),
+            operator_pool,
+            bifrost.iceberg_catalog(),
+            Arc::new(storage.operator().clone()),
+            ForgeConfig::default(),
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let mut state = AppState::new(postgres, storage, bifrost)
+            .with_forge_context(forge_context)
+            .with_forge_interval(self.forge_interval)
+            .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
                 token_verifier: Some(Arc::clone(&verifier)),
@@ -1115,8 +1140,7 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
                 audit_seal_key: None,
-            },
-        );
+            });
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer

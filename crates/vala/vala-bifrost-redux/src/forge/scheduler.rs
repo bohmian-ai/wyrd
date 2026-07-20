@@ -99,39 +99,60 @@ async fn run_maintenance_tick_with_stop(
         };
 
         // One fence covers reconciliation -> compaction -> expiry -> live-set
-        // rebuild -> GC for this physical table.
-        outcome.reconciled +=
-            run_compaction_reconciliation_for_table(context, &mut lease, &key, &binding).await?;
-        if *stopped.borrow() {
-            release_lease(context, &lease).await?;
-            break;
-        }
+        // rebuild -> GC for this physical table. Keep the release outside the
+        // stage future so an external failure cannot strand the lease row.
+        let table_result: Result<bool, ForgeError> = async {
+            outcome.reconciled +=
+                run_compaction_reconciliation_for_table(context, &mut lease, &key, &binding)
+                    .await?;
+            if *stopped.borrow() {
+                return Ok(true);
+            }
 
-        let compaction = run_compaction_bins_for_table(context, &mut lease, &key, &binding).await?;
-        outcome.groups_seen += compaction.groups_seen;
-        outcome.bins_committed += compaction.bins_committed;
-        outcome.bins_skipped += compaction.bins_skipped;
-        outcome.reconciled += compaction.reconciled;
-        if *stopped.borrow() {
-            release_lease(context, &lease).await?;
-            break;
-        }
+            let compaction =
+                run_compaction_bins_for_table(context, &mut lease, &key, &binding).await?;
+            outcome.groups_seen += compaction.groups_seen;
+            outcome.bins_committed += compaction.bins_committed;
+            outcome.bins_skipped += compaction.bins_skipped;
+            outcome.reconciled += compaction.reconciled;
+            if *stopped.borrow() {
+                return Ok(true);
+            }
 
-        outcome.reconciled +=
-            run_snapshot_expiry_for_table(context, &mut lease, &key, &binding).await?;
-        if *stopped.borrow() {
-            release_lease(context, &lease).await?;
-            break;
-        }
+            outcome.reconciled +=
+                run_snapshot_expiry_for_table(context, &mut lease, &key, &binding).await?;
+            if *stopped.borrow() {
+                return Ok(true);
+            }
 
-        let table = super::compact::load_table(context, &binding.table_ident()).await?;
-        let _live_set = build_live_set(context, &key, &binding, &table).await?;
-        if *stopped.borrow() {
-            release_lease(context, &lease).await?;
-            break;
+            let table = super::compact::load_table(context, &binding.table_ident()).await?;
+            let _live_set = build_live_set(context, &key, &binding, &table).await?;
+            if *stopped.borrow() {
+                return Ok(true);
+            }
+            outcome.reconciled +=
+                run_orphan_gc_for_table(context, &mut lease, &key, &binding).await?;
+            Ok(false)
         }
-        outcome.reconciled += run_orphan_gc_for_table(context, &mut lease, &key, &binding).await?;
-        release_lease(context, &lease).await?;
+        .await;
+        let release_result = release_lease(context, &lease).await;
+        match (table_result, release_result) {
+            (Ok(stop_after), Ok(())) => {
+                if stop_after {
+                    break;
+                }
+            }
+            (Err(error), Ok(())) => return Err(error),
+            (Ok(_), Err(release_error)) => return Err(release_error),
+            (Err(error), Err(release_error)) => {
+                tracing::warn!(
+                    error = %release_error,
+                    lease_key = %lease.lease_key,
+                    "Forge stage failed and lease release also failed"
+                );
+                return Err(error);
+            }
+        }
     }
     Ok(outcome)
 }

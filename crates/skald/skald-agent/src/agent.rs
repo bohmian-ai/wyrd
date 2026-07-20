@@ -50,23 +50,24 @@ impl PromptResolver for LocalPromptResolver {
     fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
             InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-            InlineableRef::Ref(card_ref) => prompt_registry()
-                .read()
-                .map_err(|error| {
-                    WyrdError::from(AgentCardError::validation(format!(
-                        "Agent prompt registry lock poisoned: {error}"
-                    )))
-                })?
-                .get(&prompt_key(card_ref))
-                .map(|prompt| prompt.as_ref().clone())
-                .ok_or_else(|| {
-                    AgentCardError::PromptCardNotFound {
-                        card_ref: card_ref.clone(),
-                    }
-                    .into()
-                }),
+            InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
+                prompt_registry()
+                    .read()
+                    .map_err(|error| {
+                        WyrdError::from(AgentCardError::validation(format!(
+                            "Agent prompt registry lock poisoned: {error}"
+                        )))
+                    })?
+                    .get(&prompt_key(card_ref))
+                    .map(|prompt| prompt.as_ref().clone())
+                    .ok_or_else(|| {
+                        AgentCardError::PromptCardNotFound {
+                            card_ref: card_ref.clone(),
+                        }
+                        .into()
+                    })
+            }
             InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
-            InlineableRef::Sibling { .. } => Err(unresolved_prompt_path_error()),
         }
     }
 }
@@ -814,9 +815,8 @@ fn resolve_prompt_ref(
 ) -> Result<Prompt, WyrdError> {
     match prompt_ref {
         InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-        InlineableRef::Ref(_) => resolver.resolve(prompt_ref),
+        InlineableRef::Ref(_) | InlineableRef::Sibling { .. } => resolver.resolve(prompt_ref),
         InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
-        InlineableRef::Sibling { .. } => Err(unresolved_prompt_path_error()),
     }
 }
 

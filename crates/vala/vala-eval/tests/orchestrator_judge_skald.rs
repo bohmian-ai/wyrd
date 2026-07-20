@@ -67,6 +67,12 @@ fn judge_agent_ref() -> InlineableRef<AgentSpec> {
     judge_ref().into()
 }
 
+fn sibling_judge_agent_ref() -> InlineableRef<AgentSpec> {
+    InlineableRef::Sibling {
+        sibling: judge_ref(),
+    }
+}
+
 fn inline_agent_ref(prompt: skald_prompt::Prompt) -> InlineableRef<AgentSpec> {
     InlineableRef::Inline(Box::new(AgentSpec {
         prompt: InlineableRef::Inline(Box::new(prompt.into_native())),
@@ -87,6 +93,18 @@ async fn skald_judge_invoker_returns_structured_output() {
         .invoke(&judge_agent_ref(), json!({"response": "DONE"}))
         .await
         .expect("judge succeeds");
+
+    assert_eq!(value, json!({"passed": true}));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skald_judge_invoker_resolves_sibling_agent_and_prompt() {
+    let invoker = invoker_with_registry(registry_returning_text(r#"{"passed":true}"#));
+
+    let value = invoker
+        .invoke(&sibling_judge_agent_ref(), json!({"response": "DONE"}))
+        .await
+        .expect("sibling judge succeeds");
 
     assert_eq!(value, json!({"passed": true}));
 }

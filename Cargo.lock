@@ -10769,6 +10769,7 @@ dependencies = [
 name = "wyrd-loader"
 version = "0.0.1"
 dependencies = [
+ "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -10923,6 +10924,7 @@ dependencies = [
  "wyrd-client",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-loader",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",

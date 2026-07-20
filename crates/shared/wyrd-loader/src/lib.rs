@@ -34,6 +34,18 @@ pub struct RegistrationInput {
     pub artifact_sources: BTreeMap<RelativeArtifactPath, PathBuf>,
 }
 
+impl RegistrationInput {
+    /// Project the wire-safe portion into the existing 02a registration
+    /// request. Local artifact provenance remains available to the upload
+    /// phase and never enters the request body.
+    #[must_use]
+    pub fn to_create_card_request(&self) -> wyrd_spec::registry::CreateCardRequest {
+        wyrd_spec::registry::CreateCardRequest {
+            submissions: self.submissions.clone(),
+        }
+    }
+}
+
 /// The loaded tree with source provenance retained for diagnostics and local
 /// artifact upload mapping.
 #[derive(Debug, Clone)]
@@ -42,6 +54,7 @@ pub struct LoadedTree {
     pub cards: Vec<LoadedCard>,
     /// All diagnostics collected during load (warnings and errors).
     pub diagnostics: Vec<Diagnostic>,
+    pub(crate) sandbox_root: PathBuf,
 }
 
 /// A single loaded card ready for submission.
@@ -67,16 +80,10 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
         .canonicalize()
         .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
 
-    // 1. Parse the entry file or directory.
-    let mut cards = parse::parse_path(&entry_path)?;
-
-    // 2. Discover workspace config.
+    // 1. Discover workspace config.
     let config = config::discover(&entry_path)?;
 
-    // 3. Apply config defaults.
-    config::apply_defaults(&mut cards, &config);
-
-    // 4. Resolve path references.
+    // 2. Establish the single filesystem boundary before parsing.
     let sandbox_root = config
         .root_path
         .as_deref()
@@ -89,12 +96,20 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
             }
         });
     let sandbox = path::PathSandbox::new(sandbox_root).map_err(LoadError::single)?;
+
+    // 3. Parse the entry file or directory.
+    let mut cards = parse::parse_path_with_sandbox(&entry_path, &sandbox)?;
+
+    // 4. Apply config defaults.
+    config::apply_defaults(&mut cards, &config);
+
+    // 5. Resolve path references.
     let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config)?;
 
-    // 5. Validate.
+    // 6. Validate.
     diagnostics.extend(validate::validate_tree(&cards));
 
-    // 6. Topological sort.
+    // 7. Topological sort.
     let order = match order::order_cards(&cards) {
         Ok(order) => order,
         Err(cycle_diagnostics) => {
@@ -110,7 +125,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
         return Err(LoadError::multiple(diagnostics));
     }
 
-    // 7. Build loaded cards in topological order.
+    // 8. Build loaded cards in topological order.
     let mut loaded_cards = Vec::with_capacity(order.len());
     for index in order {
         let card = &cards[index];
@@ -123,6 +138,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     Ok(LoadedTree {
         cards: loaded_cards,
         diagnostics,
+        sandbox_root: sandbox.root().to_path_buf(),
     })
 }
 
@@ -158,12 +174,17 @@ pub fn build_registration_input(tree: LoadedTree) -> Result<RegistrationInput, L
         return Err(LoadError::multiple(tree.diagnostics));
     }
 
+    let sandbox = path::PathSandbox::new(&tree.sandbox_root).map_err(LoadError::single)?;
     let mut artifact_sources = BTreeMap::new();
     let mut submissions = Vec::with_capacity(tree.cards.len());
     for card in tree.cards {
-        let base = card.source_path.parent().unwrap_or(Path::new("."));
         for artifact in &card.submission.artifacts {
-            let source = base.join(artifact.relative_path.as_str());
+            let source = sandbox
+                .resolve_regular_file(
+                    &card.source_path,
+                    Path::new(artifact.relative_path.as_str()),
+                )
+                .map_err(LoadError::single)?;
             if artifact_sources
                 .insert(artifact.relative_path.clone(), source)
                 .is_some()
@@ -234,6 +255,10 @@ mod tests {
             .expect("registration input builds");
         assert_eq!(input.submissions.len(), 1);
         assert_eq!(input.artifact_sources.len(), 1);
+        assert_eq!(
+            input.to_create_card_request().submissions,
+            input.submissions
+        );
         let path = input
             .artifact_sources
             .values()
@@ -271,6 +296,72 @@ mod tests {
                 .diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.message.contains("duplicate artifact path"))
+        );
+    }
+
+    fn model_with_artifact(source: &std::path::Path, artifact_path: &str) {
+        std::fs::write(
+            source,
+            format!(
+                "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: model\n  space: default\n  version: \"1.0.0\"\nartifacts:\n  - relative_path: {artifact_path}\n    sha256: digest\n    size_bytes: 4\n    content_type: application/octet-stream\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\n"
+            ),
+        )
+        .expect("model writes");
+    }
+
+    #[test]
+    fn registration_input_rejects_missing_and_nonregular_artifacts() {
+        let temp = TempDir::new().expect("temp directory creates");
+        let source = temp.path().join("model.yaml");
+        model_with_artifact(&source, "weights.bin");
+
+        let missing = build_registration_input(load(&source).expect("model loads"))
+            .expect_err("missing artifact must fail before upload");
+        assert_eq!(missing.diagnostics[0].code, "WYRD_LOADER_400_IO");
+
+        std::fs::create_dir(temp.path().join("weights.bin")).expect("artifact directory creates");
+        let nonregular = build_registration_input(load(&source).expect("model loads"))
+            .expect_err("nonregular artifact must fail before upload");
+        assert_eq!(
+            nonregular.diagnostics[0].code,
+            "WYRD_LOADER_400_INVALID_ENVELOPE"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_input_rejects_artifact_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temp directory creates");
+        let outside = TempDir::new().expect("outside directory creates");
+        let outside_file = outside.path().join("weights.bin");
+        std::fs::write(&outside_file, b"data").expect("outside artifact writes");
+        let source = temp.path().join("model.yaml");
+        model_with_artifact(&source, "weights.bin");
+        symlink(&outside_file, temp.path().join("weights.bin")).expect("artifact symlink creates");
+
+        let error = build_registration_input(load(&source).expect("model loads"))
+            .expect_err("artifact symlink must remain contained");
+        assert_eq!(error.diagnostics[0].code, "WYRD_LOADER_400_PATH_ESCAPE");
+    }
+
+    #[test]
+    fn load_rejects_authored_reference_uid() {
+        let temp = TempDir::new().expect("temp directory creates");
+        std::fs::write(
+            temp.path().join("service.yaml"),
+            "apiVersion: wyrd/v1\nkind: Service\nmetadata:\n  name: service\n  space: default\n  version: \"1.0.0\"\nspec:\n  service_type: api\n  components:\n    - alias: prompt\n      ref:\n        kind: Prompt\n        name: prompt\n        space: default\n        version: \"1.0.0\"\n        uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00\n",
+        )
+        .expect("service writes");
+
+        let error = load(&temp.path().join("service.yaml"))
+            .expect_err("server-managed reference uid must not be authored");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.message.contains("must omit server-managed uid") })
         );
     }
 

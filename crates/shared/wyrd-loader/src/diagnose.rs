@@ -1,6 +1,6 @@
 //! Diagnostic serialization for loader consumers.
 
-pub use super::error::{Diagnostic, Severity, SourceSpan, emit_json};
+pub use super::error::{Diagnostic, Severity, SourceSpan, diagnostic_schema, emit_json};
 
 #[cfg(test)]
 mod tests {
@@ -27,5 +27,17 @@ mod tests {
         assert_eq!(values[1]["path"], "b.yaml");
         assert_eq!(values[2]["path"], "c.yaml");
         assert!(values.iter().all(|value| value["severity"] == "error"));
+        assert!(values.iter().all(|value| value["status"] == 400));
+    }
+
+    #[test]
+    fn diagnostic_schema_exposes_stable_status_and_context() {
+        let schema = super::diagnostic_schema();
+        let value = serde_json::to_value(schema).expect("schema serializes");
+        let properties = value["properties"]
+            .as_object()
+            .expect("diagnostic schema has properties");
+        assert!(properties.contains_key("status"));
+        assert!(properties.contains_key("context"));
     }
 }

@@ -34,6 +34,19 @@ pub enum WorkflowInput {
     Vars(Map<String, Value>),
 }
 
+/// Resolves durable Agent Card references into runtime agents.
+pub trait AgentResolver: Send + Sync {
+    /// Resolve a referenced Agent Card without performing filesystem or
+    /// network work in the workflow surface.
+    fn resolve(&self, agent_ref: &InlineableRef<wyrd_spec::AgentSpec>) -> Result<Agent, WyrdError>;
+}
+
+impl<T: AgentResolver + ?Sized> AgentResolver for &T {
+    fn resolve(&self, agent_ref: &InlineableRef<wyrd_spec::AgentSpec>) -> Result<Agent, WyrdError> {
+        (**self).resolve(agent_ref)
+    }
+}
+
 impl From<&str> for WorkflowInput {
     fn from(value: &str) -> Self {
         Self::Text(value.to_owned())
@@ -308,8 +321,8 @@ impl Workflow {
 
     /// Reconstruct a workflow from a `WorkflowCard` envelope.
     ///
-    /// Inline agent steps populate the resolved-agents map eagerly; referenced
-    /// agent steps require runtime resolution before
+    /// Inline agent steps populate the resolved-agents map eagerly. Referenced
+    /// agent steps require [`Self::from_card_with_agent_resolver`] before
     /// `.run()` can drive them.
     ///
     /// # Errors
@@ -320,22 +333,53 @@ impl Workflow {
         tool_resolver: &dyn skald_tool::ToolResolver,
         prompt_resolver: &dyn skald_agent::PromptResolver,
     ) -> Result<Self, WyrdError> {
+        Self::from_card_with_agent_resolver(card, tool_resolver, prompt_resolver, None)
+    }
+
+    /// Reconstruct a workflow and hydrate referenced Agent Card steps through
+    /// an explicit runtime resolver.
+    ///
+    /// `Sibling` is accepted here because the loader and registration engine
+    /// have already established its exact identity. The resolver owns the
+    /// durable-card lookup; this crate performs no filesystem or network IO.
+    ///
+    /// # Errors
+    /// Returns prompt, tool, or agent resolver errors.
+    pub fn from_card_with_agent_resolver(
+        card: WorkflowCard,
+        tool_resolver: &dyn skald_tool::ToolResolver,
+        prompt_resolver: &dyn skald_agent::PromptResolver,
+        agent_resolver: Option<&dyn AgentResolver>,
+    ) -> Result<Self, WyrdError> {
         let mut resolved = HashMap::new();
         for step in &card.spec.steps {
-            if let WorkflowAction::Agent(InlineableRef::Inline(spec)) = &step.action {
-                let card = wyrd_spec::AgentCard {
-                    space: card.space.clone(),
-                    name: format!("{}-{}", card.name, step.id),
-                    version: "0.0.0".to_owned(),
-                    uid: String::new(),
-                    labels: Labels::default(),
-                    annotations: Annotations::default(),
-                    spec: (**spec).clone(),
-                    cascade_children: Vec::new(),
-                    created_at: Utc::now(),
-                };
-                let agent = Agent::from_card(card, tool_resolver, prompt_resolver)?;
-                resolved.insert(step.id.clone(), Arc::new(agent));
+            match &step.action {
+                WorkflowAction::Agent(InlineableRef::Inline(spec)) => {
+                    let card = wyrd_spec::AgentCard {
+                        space: card.space.clone(),
+                        name: format!("{}-{}", card.name, step.id),
+                        version: "0.0.0".to_owned(),
+                        uid: String::new(),
+                        labels: Labels::default(),
+                        annotations: Annotations::default(),
+                        spec: (**spec).clone(),
+                        cascade_children: Vec::new(),
+                        created_at: Utc::now(),
+                    };
+                    let agent = Agent::from_card(card, tool_resolver, prompt_resolver)?;
+                    resolved.insert(step.id.clone(), Arc::new(agent));
+                }
+                WorkflowAction::Agent(
+                    agent_ref @ (InlineableRef::Ref(_) | InlineableRef::Sibling { .. }),
+                ) => {
+                    if let Some(agent_resolver) = agent_resolver {
+                        let agent = agent_resolver.resolve(agent_ref)?;
+                        resolved.insert(step.id.clone(), Arc::new(agent));
+                    }
+                }
+                WorkflowAction::Agent(InlineableRef::Path(_))
+                | WorkflowAction::Mcp(_)
+                | WorkflowAction::Prompt(_) => {}
             }
         }
         Ok(Self {

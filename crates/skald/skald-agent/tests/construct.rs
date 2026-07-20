@@ -141,6 +141,24 @@ fn agent_try_from_ref_card_succeeds_with_test_resolver() {
 }
 
 #[test]
+fn agent_try_from_sibling_resolves_against_test_resolver() {
+    let _guard = registry_lock();
+    clear_prompt_card_registry();
+    let card_ref = prompt_card_ref("sibling-prompt");
+    register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
+
+    let agent = Agent::try_from_ref(
+        InlineableRef::Sibling {
+            sibling: card_ref.clone(),
+        },
+        default_prompt_resolver(),
+    )
+    .expect("sibling prompt resolves");
+
+    assert_eq!(agent.cascade_children(), vec![card_ref]);
+}
+
+#[test]
 fn agent_try_from_ref_missing_card_errors() {
     let _guard = registry_lock();
     clear_prompt_card_registry();

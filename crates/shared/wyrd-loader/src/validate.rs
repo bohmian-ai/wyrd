@@ -24,6 +24,8 @@ pub fn validate_tree(cards: &[AuthoredCard]) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// Reject duplicate `(kind, space, name, version)` identities and report the
+/// first authored source path for each duplicate.
 fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
     let mut seen: HashMap<_, &std::path::PathBuf> = HashMap::new();
     for card in cards {
@@ -34,10 +36,7 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
                 .as_ref()
                 .map(wyrd_spec::ids::SpaceName::as_str),
             card.metadata.name.as_str(),
-            card.metadata
-                .version
-                .as_ref()
-                .map(ToString::to_string),
+            card.metadata.version.as_ref().map(ToString::to_string),
         );
         if let Some(first_path) = seen.get(&identity) {
             diagnostics.push(Diagnostic::invalid_envelope(
@@ -59,6 +58,8 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
     }
 }
 
+/// Run the kind-specific local validation that is not covered by envelope
+/// parsing or reference resolution.
 fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     match &card.spec {
         Spec::Data(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
@@ -88,6 +89,7 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     }
 }
 
+/// Validate publication target kinds and reject duplicate publication targets.
 fn validate_publications(
     publications: &[Ref],
     card: &AuthoredCard,
@@ -127,6 +129,7 @@ fn validate_publications(
     }
 }
 
+/// Validate the card kinds referenced by a trigger's operator and source.
 fn validate_trigger(
     trigger: &wyrd_spec::card::trigger::TriggerSpec,
     card: &AuthoredCard,
@@ -165,12 +168,20 @@ fn validate_trigger(
     }
 }
 
+/// Confirm that every reference is fully resolved and obeys authored-reference
+/// rules before the submission reaches the registration boundary.
 fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     let mut spec = card.spec.clone();
     ReferenceSlotVisitor::visit(&mut spec, |slot| {
         let diagnostic = match slot.value {
             SlotValue::Durable(reference) => match reference {
                 Ref::Path(_) => Some(unresolved_path_diagnostic(card, &slot.path)),
+                _ if reference
+                    .as_card_ref()
+                    .is_some_and(|reference| reference.uid.is_some()) =>
+                {
+                    Some(authored_uid_diagnostic(card, &slot.path))
+                }
                 _ if reference
                     .as_card_ref()
                     .is_some_and(|reference| reference.space.is_none()) =>
@@ -185,6 +196,12 @@ fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnost
                 }
                 _ if reference
                     .as_card_ref()
+                    .is_some_and(|reference| reference.uid.is_some()) =>
+                {
+                    Some(authored_uid_diagnostic(card, &slot.path))
+                }
+                _ if reference
+                    .as_card_ref()
                     .is_some_and(|reference| reference.space.is_none()) =>
                 {
                     Some(missing_space_diagnostic(card, &slot.path))
@@ -194,6 +211,12 @@ fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnost
             SlotValue::InlineableAgent(reference) => match reference {
                 wyrd_spec::reference::InlineableRef::Path(_) => {
                     Some(unresolved_path_diagnostic(card, &slot.path))
+                }
+                _ if reference
+                    .as_card_ref()
+                    .is_some_and(|reference| reference.uid.is_some()) =>
+                {
+                    Some(authored_uid_diagnostic(card, &slot.path))
                 }
                 _ if reference
                     .as_card_ref()
@@ -210,6 +233,7 @@ fn check_resolved_references(card: &AuthoredCard, diagnostics: &mut Vec<Diagnost
     });
 }
 
+/// Build the diagnostic emitted when a path reference survived resolution.
 fn unresolved_path_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
     catalog_error(
         card,
@@ -220,6 +244,8 @@ fn unresolved_path_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
     )
 }
 
+/// Build the diagnostic emitted when a reference still lacks its inherited
+/// registration space.
 fn missing_space_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
     Diagnostic::invalid_envelope(
         card.source_path.clone(),
@@ -227,6 +253,17 @@ fn missing_space_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
     )
 }
 
+/// Build the diagnostic emitted when authored input supplies a server-managed
+/// reference UID.
+fn authored_uid_diagnostic(card: &AuthoredCard, field: &str) -> Diagnostic {
+    Diagnostic::invalid_envelope(
+        card.source_path.clone(),
+        format!("reference at {field} must omit server-managed uid"),
+    )
+}
+
+/// Enforce the rule that a card carrying artifacts must be the only loaded
+/// submission.
 fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
     if cards.len() <= 1 {
         return;
@@ -245,6 +282,7 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
     }
 }
 
+/// Reject artifact manifests that reuse the same relative source path.
 fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
     let mut seen = HashMap::new();
     for card in cards {
@@ -263,6 +301,7 @@ fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<
     }
 }
 
+/// Convert a catalogued specification error into a source-aware diagnostic.
 fn catalog_error(card: &AuthoredCard, error: &WyrdError) -> Diagnostic {
     Diagnostic::from_wyrd_error(card.source_path.clone(), Severity::Error, None, error)
 }

@@ -31,7 +31,7 @@ impl LoadError {
 }
 
 /// Diagnostic severity used by human and machine-readable output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     /// The tree cannot be submitted.
@@ -41,7 +41,7 @@ pub enum Severity {
 }
 
 /// One-based source location when supplied by the YAML parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 pub struct SourceSpan {
     /// One-based source line.
     pub line: usize,
@@ -50,10 +50,12 @@ pub struct SourceSpan {
 }
 
 /// A single loader diagnostic.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Diagnostic {
     /// Stable public Wyrd error code.
     pub code: &'static str,
+    /// Canonical HTTP status associated with the error code.
+    pub status: u16,
     /// Severity of this occurrence.
     pub severity: Severity,
     /// Authored file this diagnostic concerns.
@@ -67,6 +69,7 @@ pub struct Diagnostic {
     pub remediation: &'static str,
     /// Optional structured context for tools.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
     pub context: Option<Box<serde_json::Value>>,
 }
 
@@ -87,6 +90,11 @@ impl Diagnostic {
             .map(Box::new);
         Self {
             code: error.code(),
+            status: problem
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|status| u16::try_from(status).ok())
+                .unwrap_or_else(|| error.status()),
             severity,
             path,
             span,
@@ -146,34 +154,28 @@ impl Diagnostic {
 
     /// Create a path escape diagnostic.
     #[must_use]
-    pub fn path_escape(path: PathBuf, escaped_path: &std::path::Path) -> Self {
+    pub fn path_escape(path: PathBuf, _escaped_path: &std::path::Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Error,
             None,
             &WyrdError::LoaderPathEscape {
-                message: format!(
-                    "path reference escapes workspace: {}",
-                    escaped_path.display()
-                ),
-                details: serde_json::json!({ "escaped_path": escaped_path }),
+                message: "path reference escapes workspace".to_owned(),
+                details: serde_json::json!({ "reason": "outside_workspace" }),
             },
         )
     }
 
     /// Create an absolute-path portability warning.
     #[must_use]
-    pub fn path_absolute_advisory(path: PathBuf, absolute_path: &std::path::Path) -> Self {
+    pub fn path_absolute_advisory(path: PathBuf, _absolute_path: &std::path::Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Warning,
             None,
             &WyrdError::LoaderPathAbsoluteAdvisory {
-                message: format!(
-                    "absolute path breaks portability: {}",
-                    absolute_path.display()
-                ),
-                details: serde_json::json!({ "absolute_path": absolute_path }),
+                message: "absolute path breaks portability".to_owned(),
+                details: serde_json::json!({ "absolute": true }),
             },
         )
     }
@@ -191,6 +193,12 @@ impl Diagnostic {
             },
         )
     }
+}
+
+/// Return the JSON Schema for the machine-readable diagnostic contract.
+#[must_use]
+pub fn diagnostic_schema() -> schemars::schema::RootSchema {
+    schemars::schema_for!(Diagnostic)
 }
 
 /// Serialize diagnostics in a stable order for agent and CLI consumption.

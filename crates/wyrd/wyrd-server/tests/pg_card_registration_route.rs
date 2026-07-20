@@ -5,7 +5,9 @@ use std::env;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
 use serde_json::{Value, json};
+use wyrd_loader::{build_registration_input, load};
 use wyrd_spec::envelope::Spec;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::InlineableRef;
 use wyrd_sql::queries::cards::get_card_by_uid;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
@@ -332,6 +334,82 @@ async fn registration_resolves_child_card_refs_before_persisting() {
             .as_str()
             .map(ToOwned::to_owned),
     );
+    conn.commit().await.expect("assertion transaction commits");
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// The offline loader hands its wire projection to the existing 02a route.
+async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
+    if !enabled() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("loader workspace creates");
+    let prompt_path = temp.path().join("prompt.yaml");
+    let agent_path = temp.path().join("agent.yaml");
+    std::fs::write(
+        &prompt_path,
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+    )
+    .expect("prompt card writes");
+    std::fs::write(
+        &agent_path,
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+    )
+    .expect("agent card writes");
+
+    let input = build_registration_input(load(&agent_path).expect("loader tree builds"))
+        .expect("registration input builds");
+    let request = request_with_body(
+        "loader-handoff-001",
+        serde_json::to_value(input.to_create_card_request()).expect("request serializes"),
+    );
+
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("loader-registry-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let response = server
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("loader registration responds");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    let agent_uid: CardUid = serde_json::from_value(
+        body["outcomes"]
+            .as_array()
+            .expect("outcomes are an array")
+            .iter()
+            .find(|outcome| outcome["card_ref"]["name"] == "loader-agent")
+            .expect("agent outcome exists")["card_ref"]["uid"]
+            .clone(),
+    )
+    .expect("agent outcome contains a UID");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored = get_card_by_uid(&mut conn, &agent_uid)
+        .await
+        .expect("persisted loader agent loads");
+    let Spec::Agent(agent) = stored.spec else {
+        panic!("persisted card is not an Agent");
+    };
+    let InlineableRef::Ref(prompt_ref) = agent.prompt else {
+        panic!("02a must bind the loader sibling before persistence");
+    };
+    assert_eq!(prompt_ref.name.as_str(), "loader-prompt");
+    assert!(prompt_ref.uid.is_some());
     conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");

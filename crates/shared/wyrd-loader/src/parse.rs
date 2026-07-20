@@ -9,6 +9,7 @@ use wyrd_spec::envelope::{CardKind, Metadata, Spec};
 use wyrd_spec::reference::CardRef;
 
 use super::error::{Diagnostic, LoadError};
+use super::path::PathSandbox;
 
 /// An authored card carrying its source path and parsed envelope.
 ///
@@ -50,12 +51,33 @@ struct RawCardEnvelope {
 /// Returns a vec of `AuthoredCard`s — one per `---`-separated document.
 /// Collects every envelope violation across all docs; does not short-circuit.
 pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
-    let bytes =
-        std::fs::read(path).map_err(|e| LoadError::single(Diagnostic::io(path.into(), &e)))?;
+    let root = path.parent().unwrap_or(Path::new("."));
+    let sandbox = PathSandbox::new(root).map_err(LoadError::single)?;
+    parse_file_with_sandbox(path, &sandbox)
+}
+
+pub(crate) fn parse_file_with_sandbox(
+    path: &Path,
+    sandbox: &PathSandbox,
+) -> Result<Vec<AuthoredCard>, LoadError> {
+    let source_path = path.to_path_buf();
+    let canonical_path = sandbox
+        .ensure_contained(path, path)
+        .map_err(LoadError::single)?;
+    let metadata = std::fs::metadata(&canonical_path)
+        .map_err(|error| LoadError::single(Diagnostic::io(source_path.clone(), &error)))?;
+    if !metadata.is_file() {
+        return Err(LoadError::single(Diagnostic::invalid_envelope(
+            source_path,
+            "loader entry is not a regular file".to_owned(),
+        )));
+    }
+    let bytes = std::fs::read(&canonical_path)
+        .map_err(|error| LoadError::single(Diagnostic::io(source_path.clone(), &error)))?;
 
     let content = std::str::from_utf8(&bytes).map_err(|e| {
         LoadError::single(Diagnostic::yaml_syntax(
-            path.into(),
+            source_path.clone(),
             &serde_yaml::Error::custom(format!("invalid UTF-8: {e}")),
         ))
     })?;
@@ -66,16 +88,18 @@ pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     for raw_doc in serde_yaml::Deserializer::from_str(content) {
         match serde_yaml::Value::deserialize(raw_doc) {
             Ok(mut value) => {
-                if let Err(diagnostic) = materialize_inline_files(&mut value, path, false) {
+                if let Err(diagnostic) =
+                    materialize_inline_files(&mut value, &source_path, false, sandbox)
+                {
                     diagnostics.push(diagnostic);
                     continue;
                 }
-                match parse_single_envelope(path, value) {
+                match parse_single_envelope(&source_path, value) {
                     Ok(card) => cards.push(card),
                     Err(diagnostic) => diagnostics.push(diagnostic),
                 }
             }
-            Err(error) => diagnostics.push(Diagnostic::yaml_syntax(path.into(), &error)),
+            Err(error) => diagnostics.push(Diagnostic::yaml_syntax(source_path.clone(), &error)),
         }
     }
 
@@ -91,8 +115,21 @@ pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
 /// Directory entries are sorted by path before parsing so repeated loads have
 /// identical input order on every supported filesystem.
 pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
+    let root = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(Path::new("."))
+    };
+    let sandbox = PathSandbox::new(root).map_err(LoadError::single)?;
+    parse_path_with_sandbox(path, &sandbox)
+}
+
+pub(crate) fn parse_path_with_sandbox(
+    path: &Path,
+    sandbox: &PathSandbox,
+) -> Result<Vec<AuthoredCard>, LoadError> {
     if path.is_file() {
-        return parse_file(path);
+        return parse_file_with_sandbox(path, sandbox);
     }
     if !path.is_dir() {
         let error = std::io::Error::new(
@@ -106,12 +143,12 @@ pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     }
 
     let mut files = Vec::new();
-    collect_yaml_files(path, &mut files)?;
+    collect_yaml_files(path, sandbox, &mut files)?;
     files.sort();
     let mut cards = Vec::new();
     let mut diagnostics = Vec::new();
     for file in files {
-        match parse_file(&file) {
+        match parse_file_with_sandbox(&file, sandbox) {
             Ok(mut parsed) => cards.append(&mut parsed),
             Err(error) => diagnostics.extend(error.diagnostics),
         }
@@ -123,21 +160,32 @@ pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     }
 }
 
-fn collect_yaml_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), LoadError> {
+fn collect_yaml_files(
+    path: &Path,
+    sandbox: &PathSandbox,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), LoadError> {
     let entries = std::fs::read_dir(path)
         .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
     for entry in entries {
         let entry =
             entry.map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), &error)))?;
         let entry_path = entry.path();
-        if entry_path.is_dir() {
-            collect_yaml_files(&entry_path, files)?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| LoadError::single(Diagnostic::io(entry_path.clone(), &error)))?;
+        if file_type.is_dir() {
+            collect_yaml_files(&entry_path, sandbox, files)?;
         } else if entry_path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| matches!(extension, "yaml" | "yml"))
         {
-            files.push(entry_path);
+            files.push(
+                sandbox
+                    .ensure_contained(&entry_path, &entry_path)
+                    .map_err(LoadError::single)?,
+            );
         }
     }
     Ok(())
@@ -187,11 +235,12 @@ fn materialize_inline_files(
     value: &mut serde_yaml::Value,
     source_path: &Path,
     inside_inline: bool,
+    sandbox: &PathSandbox,
 ) -> Result<(), Diagnostic> {
     match value {
         serde_yaml::Value::Sequence(values) => {
             for value in values {
-                materialize_inline_files(value, source_path, inside_inline)?;
+                materialize_inline_files(value, source_path, inside_inline, sandbox)?;
             }
         }
         serde_yaml::Value::Mapping(mapping) => {
@@ -205,7 +254,7 @@ fn materialize_inline_files(
                         key.eq_ignore_ascii_case("inline")
                             || is_inlineable_body(key, value, agent_action)
                     });
-                materialize_inline_files(value, source_path, nested_inline)?;
+                materialize_inline_files(value, source_path, nested_inline, sandbox)?;
             }
         }
         serde_yaml::Value::Tagged(tagged) if tagged.tag == "!file" => {
@@ -232,18 +281,21 @@ fn materialize_inline_files(
                     relative_path,
                 ));
             }
-            let base = source_path.parent().ok_or_else(|| {
-                Diagnostic::invalid_envelope(
+            let resolved = sandbox.resolve_contained(source_path, relative_path)?;
+            let metadata = std::fs::metadata(&resolved)
+                .map_err(|error| Diagnostic::io(source_path.to_path_buf(), &error))?;
+            if !metadata.is_file() {
+                return Err(Diagnostic::invalid_envelope(
                     source_path.to_path_buf(),
-                    "cannot resolve !file without a parent directory".to_owned(),
-                )
-            })?;
-            let content = std::fs::read_to_string(base.join(relative_path))
+                    format!("!file target is not a regular file: {relative}"),
+                ));
+            }
+            let content = std::fs::read_to_string(&resolved)
                 .map_err(|error| Diagnostic::io(source_path.to_path_buf(), &error))?;
             *value = serde_yaml::Value::String(content);
         }
         serde_yaml::Value::Tagged(tagged) => {
-            materialize_inline_files(&mut tagged.value, source_path, inside_inline)?;
+            materialize_inline_files(&mut tagged.value, source_path, inside_inline, sandbox)?;
         }
         serde_yaml::Value::Null
         | serde_yaml::Value::Bool(_)
@@ -463,5 +515,26 @@ spec:
         // Both docs have violations
         assert!(err.diagnostics[0].message.contains("apiVersion"));
         assert!(err.diagnostics[1].message.contains("kind"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_rejects_inline_file_symlink_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        std::fs::write(&outside_file, "secret").unwrap();
+        symlink(&outside_file, workspace.path().join("runbook.txt")).unwrap();
+        let source = workspace.path().join("agent.yaml");
+        std::fs::write(
+            &source,
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  space: default\n  version: 1.0.0\nspec:\n  prompt:\n    request:\n      contents: []\n      system_instruction:\n        role: system\n        parts:\n          - text: !file runbook.txt\n    model: gemini-flash-lite\n    variables: []\n    media_variables: []\n    response_type: text\n  tool_names: []\n  run_config: {}\n",
+        )
+        .unwrap();
+
+        let error = parse_file(&source).expect_err("inline file must remain contained");
+        assert_eq!(error.diagnostics[0].code, "WYRD_LOADER_400_PATH_ESCAPE");
     }
 }

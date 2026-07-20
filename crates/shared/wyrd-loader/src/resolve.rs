@@ -7,7 +7,7 @@ use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
 use super::error::{Diagnostic, LoadError};
-use super::parse::{AuthoredCard, card_ref_for, parse_file};
+use super::parse::{AuthoredCard, card_ref_for, parse_file_with_sandbox};
 use super::path::PathSandbox;
 
 /// Resolve all path references in the tree, rewriting them to sibling variants.
@@ -103,6 +103,11 @@ struct PathResolver<'a> {
 }
 
 impl PathResolver<'_> {
+    /// Resolve one authored path reference and register the discovered card.
+    ///
+    /// Resolution is bounded by the path-depth limit, uses the sandbox for
+    /// filesystem containment, reuses cached card identities, and accepts only
+    /// a single card from a referenced file.
     fn resolve(
         &mut self,
         base_file: &Path,
@@ -110,17 +115,8 @@ impl PathResolver<'_> {
         discovered: &mut Vec<AuthoredCard>,
         source_depth: usize,
     ) -> Result<CardRef, Diagnostic> {
-        if source_depth >= 8 {
-            return Err(Diagnostic::invalid_envelope(
-                base_file.to_path_buf(),
-                "Path reference depth exceeds the maximum of 8".to_owned(),
-            ));
-        }
-        let (resolved_path, advisory) = self.sandbox.resolve(base_file, ref_path)?;
-        if let Some(advisory) = advisory {
-            self.diagnostics.push(advisory);
-        }
-
+        Self::check_depth(base_file, source_depth)?;
+        let resolved_path = self.resolve_path(base_file, ref_path)?;
         if let Some(cached) = self.path_cache.get(&resolved_path) {
             return Ok(cached.clone());
         }
@@ -129,33 +125,7 @@ impl PathResolver<'_> {
             return Ok(card_ref.clone());
         }
 
-        let mut loaded_cards = parse_file(&resolved_path).map_err(|error| {
-            self.diagnostics.extend(error.diagnostics);
-            Diagnostic::invalid_envelope(
-                base_file.to_path_buf(),
-                format!(
-                    "referenced card failed to parse: {}",
-                    resolved_path.display()
-                ),
-            )
-        })?;
-        if loaded_cards.is_empty() {
-            return Err(Diagnostic::invalid_envelope(
-                base_file.to_path_buf(),
-                format!("Referenced file is empty: {}", ref_path.display()),
-            ));
-        }
-        if loaded_cards.len() > 1 {
-            return Err(Diagnostic::invalid_envelope(
-                base_file.to_path_buf(),
-                format!(
-                    "Referenced file contains multiple cards: {}",
-                    ref_path.display()
-                ),
-            ));
-        }
-
-        let mut loaded = loaded_cards.remove(0);
+        let mut loaded = self.load_single_card(base_file, ref_path, &resolved_path)?;
         super::config::apply_defaults(std::slice::from_mut(&mut loaded), self.config);
         let card_ref = card_ref_for(&loaded)?;
         self.known_cards
@@ -163,6 +133,61 @@ impl PathResolver<'_> {
         self.path_cache.insert(resolved_path, card_ref.clone());
         discovered.push(loaded);
         Ok(card_ref)
+    }
+
+    /// Reject references that would exceed the maximum supported import depth.
+    fn check_depth(base_file: &Path, source_depth: usize) -> Result<(), Diagnostic> {
+        if source_depth >= 8 {
+            return Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                "Path reference depth exceeds the maximum of 8".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolve a reference path through the sandbox and retain any advisory
+    /// produced for an allowed absolute path.
+    fn resolve_path(&mut self, base_file: &Path, ref_path: &Path) -> Result<PathBuf, Diagnostic> {
+        let (resolved_path, advisory) = self.sandbox.resolve(base_file, ref_path)?;
+        if let Some(advisory) = advisory {
+            self.diagnostics.push(advisory);
+        }
+        Ok(resolved_path)
+    }
+
+    /// Parse one referenced file and enforce the single-card path-import rule.
+    fn load_single_card(
+        &mut self,
+        base_file: &Path,
+        ref_path: &Path,
+        resolved_path: &Path,
+    ) -> Result<AuthoredCard, Diagnostic> {
+        let mut loaded_cards =
+            parse_file_with_sandbox(resolved_path, self.sandbox).map_err(|error| {
+                self.diagnostics.extend(error.diagnostics);
+                Diagnostic::invalid_envelope(
+                    base_file.to_path_buf(),
+                    format!(
+                        "referenced card failed to parse: {}",
+                        resolved_path.display()
+                    ),
+                )
+            })?;
+        match loaded_cards.len() {
+            0 => Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                format!("Referenced file is empty: {}", ref_path.display()),
+            )),
+            1 => Ok(loaded_cards.remove(0)),
+            _ => Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                format!(
+                    "Referenced file contains multiple cards: {}",
+                    ref_path.display()
+                ),
+            )),
+        }
     }
 }
 
@@ -177,6 +202,7 @@ fn inherit_space(card_ref: Option<&mut CardRef>, parent_space: Option<&wyrd_spec
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::parse_file;
     use tempfile::TempDir;
 
     #[test]
@@ -207,5 +233,29 @@ mod tests {
         assert!(diagnostics.is_empty());
         assert_eq!(cards.len(), 2);
         assert!(matches!(cards[0].spec, wyrd_spec::envelope::Spec::Agent(_)));
+    }
+
+    #[test]
+    fn resolve_rejects_multi_document_path_targets() {
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("prompts.yaml");
+        std::fs::write(
+            &target,
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: first\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n---\napiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: second\n  version: 1.0.0\n  space: default\nspec:\n  provider: anthropic\n  model: claude\n  messages: []\n",
+        )
+        .unwrap();
+        let entry = temp.path().join("agent.yaml");
+        std::fs::write(
+            &entry,
+            "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompts.yaml\n",
+        )
+        .unwrap();
+
+        let error = crate::load(&entry).expect_err("path target is a single-card import");
+        assert!(error.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Referenced file contains multiple cards")
+        }));
     }
 }

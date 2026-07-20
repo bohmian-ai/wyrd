@@ -1,8 +1,11 @@
 use skald_agent::Agent;
 use skald_prompt::{OpenAiChatOptions, openai_chat};
-use skald_workflow::Workflow;
-use wyrd_spec::card::workflow::WorkflowAction;
-use wyrd_spec::reference::InlineableRef;
+use skald_workflow::{AgentResolver, Workflow};
+use wyrd_spec::AgentSpec;
+use wyrd_spec::card::workflow::{WorkflowAction, WorkflowCard, WorkflowSpec, WorkflowStep};
+use wyrd_spec::envelope::CardKind;
+use wyrd_spec::metadata::{Annotations, Labels};
+use wyrd_spec::reference::{CardRef, InlineableRef};
 
 fn build_agent(name: &str) -> Agent {
     let prompt = openai_chat(
@@ -26,6 +29,19 @@ fn anonymous_agent() -> Agent {
     )
     .expect("static prompt is valid");
     Agent::new(prompt)
+}
+
+struct StaticAgentResolver {
+    agent: Agent,
+}
+
+impl AgentResolver for StaticAgentResolver {
+    fn resolve(
+        &self,
+        _agent_ref: &InlineableRef<AgentSpec>,
+    ) -> Result<Agent, wyrd_spec::error::WyrdError> {
+        Ok(self.agent.clone())
+    }
 }
 
 #[test]
@@ -102,4 +118,53 @@ fn workflow_to_yaml_round_trip_preserves_steps() {
     assert!(yaml.contains("research"));
     assert!(yaml.contains("planner"));
     assert!(yaml.contains("writer"));
+}
+
+#[test]
+fn workflow_hydrates_sibling_agent_with_explicit_resolver() {
+    let agent_ref = CardRef {
+        kind: CardKind::Agent,
+        name: "registered-agent".parse().expect("agent name is valid"),
+        version: "0.1.0".parse().expect("agent version is valid"),
+        space: Some("research".parse().expect("agent space is valid")),
+        uid: None,
+    };
+    let card = WorkflowCard {
+        space: "research".to_owned(),
+        name: "registered-workflow".to_owned(),
+        version: "0.1.0".to_owned(),
+        uid: String::new(),
+        labels: Labels::default(),
+        annotations: Annotations::default(),
+        spec: WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "registered-agent".to_owned(),
+                action: WorkflowAction::Agent(InlineableRef::Sibling {
+                    sibling: agent_ref.clone(),
+                }),
+                inputs: Default::default(),
+                depends_on: Vec::new(),
+                condition: None,
+                timeout_seconds: None,
+                retry: None,
+                display: Default::default(),
+            }],
+            ..Default::default()
+        },
+        cascade_children: vec![agent_ref],
+        created_at: chrono::Utc::now(),
+    };
+    let tool_resolver = skald_tool::ToolRegistry::default();
+    let resolver = StaticAgentResolver {
+        agent: build_agent("registered-agent"),
+    };
+
+    let workflow = Workflow::from_card_with_agent_resolver(
+        card,
+        &tool_resolver,
+        skald_agent::default_prompt_resolver(),
+        Some(&resolver),
+    )
+    .expect("sibling agent resolves");
+    assert_eq!(workflow.step_ids(), vec!["registered-agent"]);
 }

@@ -13,6 +13,7 @@ description = "Offline Wyrd card authoring loader."
 path = "src/lib.rs"
 
 [dependencies]
+schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

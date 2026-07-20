@@ -15,3 +15,7 @@ pod_count = 3
 [bench.bifrost.forge_compaction_throughput]
 metric = "mib_per_sec"
 min = 100.0
+
+[bench.bifrost.forge_maintenance]
+metric = "mib_per_sec"
+min = 1.0

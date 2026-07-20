@@ -231,6 +231,40 @@ pub enum AuditDetail {
         /// Writer recipe identifier used to create the output.
         writer_recipe_version: String,
     },
+    /// A Forge snapshot-expiry operation and its Iceberg metadata boundary.
+    ForgeSnapshotExpire {
+        /// Deterministic identifier shared by prepared and terminal rows.
+        operation_id: uuid::Uuid,
+        /// Durable phase represented by this audit row.
+        phase: ForgeSnapshotExpirePhase,
+        /// Canonical tenant/table resource identity.
+        group: String,
+        /// Metadata location observed before the expiry commit.
+        base_metadata_location: StoragePath,
+        /// Current snapshot observed before the expiry commit.
+        current_snapshot_id: Option<i64>,
+        /// Snapshot IDs at the heads of retained Iceberg refs.
+        retained_ref_heads: Vec<i64>,
+        /// Strict timestamp cutoff used for selection.
+        cutoff_ms: i64,
+        /// Exact snapshot IDs selected for expiry, sorted ascending.
+        selected_snapshot_ids: Vec<i64>,
+    },
+    /// A Forge orphan-GC operation and its bounded object batch.
+    ForgeOrphanGc {
+        /// Deterministic identifier shared by prepared and terminal rows.
+        operation_id: uuid::Uuid,
+        /// Durable phase represented by this audit row.
+        phase: ForgeOrphanGcPhase,
+        /// Canonical tenant/table resource identity.
+        group: String,
+        /// Exact sorted object candidates observed before deletion.
+        candidate_paths: Vec<StoragePath>,
+        /// Objects deleted by the terminal attempt.
+        deleted_paths: Vec<StoragePath>,
+        /// Objects skipped after the final live-set/age check.
+        skipped_paths: Vec<StoragePath>,
+    },
     /// Authentication failure metadata; credentials are never representable here.
     AuthFailure {
         /// Stable reason for the authentication refusal.
@@ -351,6 +385,32 @@ pub enum ForgeCompactionPhase {
     Recovered,
     /// Reconciliation made the exact inputs visible again after expiry.
     Reset,
+}
+
+/// Durable phase recorded for a Forge snapshot-expiry operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeSnapshotExpirePhase {
+    /// Snapshot IDs were selected and the external commit is about to start.
+    Prepared,
+    /// The external Iceberg commit completed.
+    Committed,
+    /// Reconciliation proved the external commit completed.
+    Recovered,
+}
+
+/// Durable phase recorded for a Forge orphan-GC operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeOrphanGcPhase {
+    /// A bounded candidate batch was prepared for deletion.
+    Prepared,
+    /// Every eligible candidate in the batch was handled.
+    Committed,
+    /// Reconciliation completed a previously prepared batch.
+    Recovered,
 }
 
 /// Closed storage backend identifiers.

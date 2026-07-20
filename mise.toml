@@ -157,7 +157,7 @@ cargo test --locked -p wyrd-testing --test pg_bifrost_forge_multipod_journey -- 
 
 [tasks."test:fuzz:bifrost"]
 description = "Run the deterministic Bifrost interleaving matrix smoke tests"
-run = "cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1 && cargo test --locked -p wyrd-testing --test forge_compaction_interleaving -- --test-threads=1"
+run = "cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1 && cargo test --locked -p wyrd-testing --test forge_compaction_interleaving -- --test-threads=1 && cargo test --locked -p wyrd-testing --test forge_maintenance_interleaving -- --test-threads=1"
 
 [tasks."test:bifrost:sustained"]
 description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
@@ -167,7 +167,7 @@ run = "cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test
 
 [tasks."bench:bifrost:slo"]
 description = "Run the Redux WAL-tail and Forge compaction SLO benchmarks"
-run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99 && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_compaction_throughput"
+run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99 && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_compaction_throughput && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_maintenance"
 
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.

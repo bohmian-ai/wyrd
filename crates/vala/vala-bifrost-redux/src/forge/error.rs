@@ -12,6 +12,14 @@ pub enum ForgeError {
     Catalog(#[source] iceberg::Error),
     #[error("Forge staging object read failed: {0}")]
     ObjectStore(#[source] opendal::Error),
+    #[error("Forge snapshot expiry failed: {detail}")]
+    SnapshotExpiry { detail: String },
+    #[error("Forge live-set construction failed: {detail}")]
+    LiveSet { detail: String },
+    #[error("Forge object listing failed: {0}")]
+    ObjectList(#[source] opendal::Error),
+    #[error("Forge object deletion failed: {0}")]
+    ObjectDelete(#[source] opendal::Error),
     #[error("Forge parquet operation failed: {detail}")]
     Parquet { detail: String },
     #[error("Forge schema validation failed: {detail}")]

@@ -36,6 +36,7 @@ tokio = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+wyrd-bench = { workspace = true }
 
 [[bench]]
 name = "bench_ingest_seal_throughput"
@@ -55,6 +56,10 @@ harness = false
 
 [[bench]]
 name = "bench_forge_compaction_throughput"
+harness = false
+
+[[bench]]
+name = "bench_forge_maintenance"
 harness = false
 
 [lints]

@@ -201,6 +201,137 @@
           }
         },
         {
+          "description": "A Forge snapshot-expiry operation and its Iceberg metadata boundary.",
+          "type": "object",
+          "required": [
+            "base_metadata_location",
+            "cutoff_ms",
+            "group",
+            "kind",
+            "operation_id",
+            "phase",
+            "retained_ref_heads",
+            "selected_snapshot_ids"
+          ],
+          "properties": {
+            "base_metadata_location": {
+              "description": "Metadata location observed before the expiry commit.",
+              "type": "string"
+            },
+            "current_snapshot_id": {
+              "description": "Current snapshot observed before the expiry commit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "cutoff_ms": {
+              "description": "Strict timestamp cutoff used for selection.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_snapshot_expire"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeSnapshotExpirePhase"
+                }
+              ]
+            },
+            "retained_ref_heads": {
+              "description": "Snapshot IDs at the heads of retained Iceberg refs.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "selected_snapshot_ids": {
+              "description": "Exact snapshot IDs selected for expiry, sorted ascending.",
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        },
+        {
+          "description": "A Forge orphan-GC operation and its bounded object batch.",
+          "type": "object",
+          "required": [
+            "candidate_paths",
+            "deleted_paths",
+            "group",
+            "kind",
+            "operation_id",
+            "phase",
+            "skipped_paths"
+          ],
+          "properties": {
+            "candidate_paths": {
+              "description": "Exact sorted object candidates observed before deletion.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deleted_paths": {
+              "description": "Objects deleted by the terminal attempt.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_orphan_gc"
+              ]
+            },
+            "operation_id": {
+              "description": "Deterministic identifier shared by prepared and terminal rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "phase": {
+              "description": "Durable phase represented by this audit row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeOrphanGcPhase"
+                }
+              ]
+            },
+            "skipped_paths": {
+              "description": "Objects skipped after the final live-set/age check.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
           "description": "Authentication failure metadata; credentials are never representable here.",
           "type": "object",
           "required": [
@@ -932,6 +1063,58 @@
           "type": "string",
           "enum": [
             "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeOrphanGcPhase": {
+      "description": "Durable phase recorded for a Forge orphan-GC operation.",
+      "oneOf": [
+        {
+          "description": "A bounded candidate batch was prepared for deletion.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "Every eligible candidate in the batch was handled.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation completed a previously prepared batch.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        }
+      ]
+    },
+    "ForgeSnapshotExpirePhase": {
+      "description": "Durable phase recorded for a Forge snapshot-expiry operation.",
+      "oneOf": [
+        {
+          "description": "Snapshot IDs were selected and the external commit is about to start.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The external Iceberg commit completed.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the external commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
           ]
         }
       ]

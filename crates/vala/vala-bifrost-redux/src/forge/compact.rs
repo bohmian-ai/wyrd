@@ -53,6 +53,10 @@ pub struct ForgeConfig {
     pub uncertainty_margin: Duration,
     pub uncertainty_bound: Duration,
     pub audit_page_size: i64,
+    pub snapshot_retention: Duration,
+    pub retain_last: usize,
+    pub orphan_gc_ttl: Duration,
+    pub max_gc_candidates_per_batch: usize,
 }
 
 impl Default for ForgeConfig {
@@ -70,6 +74,10 @@ impl Default for ForgeConfig {
             uncertainty_margin: Duration::from_secs(30),
             uncertainty_bound: Duration::from_mins(2),
             audit_page_size: 256,
+            snapshot_retention: Duration::from_hours(120),
+            retain_last: 1,
+            orphan_gc_ttl: Duration::from_hours(24),
+            max_gc_candidates_per_batch: 256,
         }
     }
 }
@@ -83,6 +91,10 @@ impl ForgeConfig {
             || self.max_bytes_per_tick == 0
             || self.max_bins_per_tick == 0
             || self.audit_page_size <= 0
+            || self.snapshot_retention.is_zero()
+            || self.retain_last == 0
+            || self.orphan_gc_ttl.is_zero()
+            || self.max_gc_candidates_per_batch == 0
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
@@ -100,7 +112,7 @@ impl ForgeConfig {
         Ok(())
     }
 
-    fn commit_window(&self) -> Duration {
+    pub(crate) fn commit_window(&self) -> Duration {
         self.iceberg_total_retry_timeout
             .saturating_add(self.catalog_request_timeout)
             .saturating_add(self.uncertainty_margin)
@@ -113,6 +125,12 @@ pub struct ForgeContext {
     pub catalog: Arc<dyn Catalog>,
     pub staging: Arc<Operator>,
     pub config: ForgeConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ForgeTableKey {
+    pub(crate) tenant: DataTenantId,
+    pub(crate) table_ref: crate::catalog::TableRef,
 }
 
 impl ForgeContext {
@@ -140,7 +158,7 @@ pub struct ForgeTickOutcome {
     pub reconciled: usize,
 }
 
-async fn load_table(
+pub(crate) async fn load_table(
     context: &ForgeContext,
     ident: &iceberg::TableIdent,
 ) -> Result<iceberg::table::Table, ForgeError> {
@@ -153,6 +171,70 @@ async fn load_table(
         operation: "catalog table load",
     })?
     .map_err(ForgeError::Catalog)
+}
+
+pub(crate) async fn run_compaction_reconciliation_for_table(
+    context: &ForgeContext,
+    lease: &mut ForgeLease,
+    table_key: &ForgeTableKey,
+    binding: &TenantTableBinding,
+) -> Result<usize, ForgeError> {
+    let mut reconciled = 0;
+    for key in load_reconciliation_keys(context).await? {
+        if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
+            continue;
+        }
+        reconciled += reconcile_group(context, lease, &key, binding).await?;
+    }
+    Ok(reconciled)
+}
+
+pub(crate) async fn run_compaction_bins_for_table(
+    context: &ForgeContext,
+    lease: &mut ForgeLease,
+    table_key: &ForgeTableKey,
+    binding: &TenantTableBinding,
+) -> Result<ForgeTickOutcome, ForgeError> {
+    let mut outcome = ForgeTickOutcome::default();
+    let rows = select_candidate_groups(&context.operator_pool, &context.config)
+        .await?
+        .into_iter()
+        .filter(|row| {
+            row.key.tenant == table_key.tenant && row.key.table_ref == table_key.table_ref
+        })
+        .collect::<Vec<_>>();
+    for row in rows {
+        outcome.groups_seen += 1;
+        let bins = stable_pack(
+            row.files,
+            context.config.target_bin_bytes,
+            context.config.max_files_per_bin,
+        );
+        let mut file_budget = 0_usize;
+        let mut byte_budget = 0_u64;
+        for bin in bins.into_iter().take(context.config.max_bins_per_tick) {
+            if file_budget.saturating_add(bin.files.len()) > context.config.max_files_per_tick
+                || byte_budget.saturating_add(bin.total_bytes) > context.config.max_bytes_per_tick
+            {
+                outcome.bins_skipped += 1;
+                continue;
+            }
+            if !lease.renew(&context.operator_pool).await? {
+                return Err(ForgeError::FenceLost {
+                    lease_key: lease.lease_key.clone(),
+                });
+            }
+            if !lease.commit_window_fits(context.config.commit_window()) {
+                outcome.bins_skipped += 1;
+                break;
+            }
+            compact_bin(context, lease, &row.key, binding, &bin).await?;
+            file_budget += bin.files.len();
+            byte_budget = byte_budget.saturating_add(bin.total_bytes);
+            outcome.bins_committed += 1;
+        }
+    }
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone)]

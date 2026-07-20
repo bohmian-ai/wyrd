@@ -12,4 +12,7 @@ pub mod error;
 pub mod load;
 
 // Re-export the public loader API
-pub use load::{CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, load};
+pub use load::{
+    CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, Severity, SourceSpan,
+    build_submissions, emit_json, load,
+};

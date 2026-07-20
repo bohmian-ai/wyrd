@@ -6,9 +6,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::drift::DriftSignal;
 use crate::envelope::{CardKind, Spec};
 use crate::ids::{CardName, CardUid, SpaceName};
+use crate::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_semver::VersionBlock;
 
 /// Reference to a registered Card by kind, name, version, space, and optional UID.
@@ -22,7 +22,11 @@ pub struct CardRef {
     /// Exact referenced Card version.
     pub version: VersionBlock,
     /// Space pinning identity together with `name` and `version`.
-    pub space: SpaceName,
+    ///
+    /// Authors may omit it; the loader inherits the enclosing card's resolved
+    /// metadata space before the reference crosses a wire boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<SpaceName>,
     /// Optional server-resolved durable UID.
     ///
     /// Authors identify a dependency with `(kind, space, name, version)` and
@@ -273,112 +277,20 @@ impl<'de> Deserialize<'de> for CardRefScope {
 /// Every card ref a spec declares, for auth-scope traversal.
 #[must_use]
 pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
-    match spec {
-        Spec::Data(data) => data
-            .card_refs()
-            .chain(data.materialized_split_refs())
-            .chain(data.interface.manifest_ref())
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Model(model) => model
-            .card_refs()
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Experiment(experiment) => experiment
-            .target_refs
-            .iter()
-            .chain(experiment.card_refs.iter())
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Prompt(_) => Vec::new(),
-        Spec::Agent(agent) => crate::card::agent::scope_child_card_refs(agent),
-        Spec::Workflow(workflow) => crate::card::workflow::scope_child_card_refs(workflow),
-        Spec::Eval(eval) => eval
-            .subject_ref
-            .iter()
-            .filter_map(Ref::as_card_ref)
-            .chain(
-                eval.dataset
-                    .iter()
-                    .filter_map(|dataset| dataset.as_card_ref()),
-            )
-            .chain(eval.tasks.values().filter_map(|task| match task {
-                crate::vala::eval::EvalTask::LlmJudge(task) => task.judge_ref.as_card_ref(),
-                _ => None,
-            }))
-            .cloned()
-            .collect(),
-        Spec::Drift(drift) => {
-            let mut out: Vec<CardRef> = drift
-                .subject_ref
-                .as_card_ref()
-                .cloned()
-                .into_iter()
-                .collect();
-            match &drift.signal {
-                DriftSignal::Distribution { baseline_ref, .. } => {
-                    out.extend(baseline_ref.as_card_ref().cloned())
-                }
-                DriftSignal::EvalScore { eval_ref } => out.extend(eval_ref.as_card_ref().cloned()),
-                DriftSignal::External { source_ref } => {
-                    out.extend(source_ref.as_card_ref().cloned())
-                }
-                DriftSignal::Metric { .. } => {}
-            }
-            out
+    let mut spec = spec.clone();
+    let mut references = Vec::new();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => {
+            references.extend(reference.as_card_ref().cloned());
         }
-        Spec::Service(service) => service
-            .components
-            .iter()
-            .filter_map(|component| component.card_ref.as_card_ref())
-            .cloned()
-            .collect(),
-        Spec::Policy(_) => Vec::new(),
-        Spec::Mcp(mcp) => mcp
-            .tool_refs
-            .iter()
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Audit(audit) => audit
-            .subject_refs
-            .iter()
-            .chain(audit.policy_refs.iter())
-            .chain(audit.evidence_refs.iter())
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Artifact(artifact) => artifact
-            .schema_ref
-            .iter()
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Trigger(trigger) => {
-            let source = match &trigger.source {
-                crate::card::trigger::TriggerSource::DriftObservation { card }
-                | crate::card::trigger::TriggerSource::EvalObservation { card } => {
-                    card.as_card_ref().cloned()
-                }
-                crate::card::trigger::TriggerSource::Schedule { .. } => None,
-            };
-            source
-                .into_iter()
-                .chain(trigger.target.as_card_ref().cloned())
-                .collect()
+        SlotValue::InlineablePrompt(reference) => {
+            references.extend(reference.as_card_ref().cloned());
         }
-        Spec::Operator(operator) => operator
-            .pre_invoke
-            .iter()
-            .chain(operator.post_invoke.iter())
-            .filter_map(Ref::as_card_ref)
-            .cloned()
-            .collect(),
-        Spec::Source(_) => Vec::new(),
-    }
+        SlotValue::InlineableAgent(reference) => {
+            references.extend(reference.as_card_ref().cloned());
+        }
+    });
+    references
 }
 
 /// Bind server-resolved UIDs to the card references discovered by
@@ -452,7 +364,9 @@ impl fmt::Display for CardRef {
         write!(
             f,
             "{}/{}/{}@{}",
-            self.space,
+            self.space
+                .as_ref()
+                .map_or("<missing-space>", SpaceName::as_str),
             self.kind.wire_name(),
             self.name,
             self.version
@@ -498,7 +412,7 @@ impl FromStr for CardRef {
             kind,
             name,
             version: version.parse().map_err(CardRefParseError::Version)?,
-            space,
+            space: Some(space),
             uid,
         })
     }
@@ -555,7 +469,7 @@ mod tests {
             kind: CardKind::Artifact,
             name: CardName::new("weights").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -566,7 +480,7 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new("billing").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
 
@@ -645,7 +559,7 @@ mod tests {
             kind: CardKind::Model,
             name: CardName::new("churn").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         };
         let json = serde_json::to_string(&card_ref).expect("serialize");
@@ -666,7 +580,7 @@ mod tests {
             kind: CardKind::Prompt,
             name: CardName::new("system-prompt").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: Some(authored_uid),
         };
         let lookup_ref = CardRef {
@@ -695,12 +609,10 @@ mod tests {
     }
 
     #[test]
-    fn card_ref_rejects_missing_space() {
+    fn card_ref_accepts_missing_authored_space() {
         let json = r#"{"kind":"Model","name":"churn","version":"1.0.0"}"#;
-        let err = serde_json::from_str::<CardRef>(json).expect_err("space is required");
-        assert!(
-            err.to_string().contains("space"),
-            "error must mention space: {err}"
-        );
+        let card_ref =
+            serde_json::from_str::<CardRef>(json).expect("space is optional while authored");
+        assert!(card_ref.space.is_none());
     }
 }

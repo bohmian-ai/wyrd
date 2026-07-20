@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HttpAuth",
+  "description": "Server-side authentication sources for an HTTP action.",
+  "oneOf": [
+    {
+      "description": "No authentication.",
+      "type": "object",
+      "required": [
+        "scheme"
+      ],
+      "properties": {
+        "scheme": {
+          "type": "string",
+          "enum": [
+            "none"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Bearer token loaded from an environment variable.",
+      "type": "object",
+      "required": [
+        "env",
+        "scheme"
+      ],
+      "properties": {
+        "env": {
+          "description": "Environment variable name.",
+          "type": "string"
+        },
+        "scheme": {
+          "type": "string",
+          "enum": [
+            "bearer"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "`user:password` loaded from an environment variable.",
+      "type": "object",
+      "required": [
+        "env",
+        "scheme"
+      ],
+      "properties": {
+        "env": {
+          "description": "Environment variable name.",
+          "type": "string"
+        },
+        "scheme": {
+          "type": "string",
+          "enum": [
+            "basic"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Custom header value loaded from an environment variable.",
+      "type": "object",
+      "required": [
+        "env",
+        "name",
+        "scheme"
+      ],
+      "properties": {
+        "env": {
+          "description": "Environment variable name.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Header name.",
+          "type": "string"
+        },
+        "scheme": {
+          "type": "string",
+          "enum": [
+            "header"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

@@ -439,7 +439,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("issue-key-target").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -523,7 +523,13 @@ mod pg_tests {
         .bind(tenant.as_uuid())
         .bind(Uuid::new_v4())
         .bind(SqlxJson(card_ref.clone()))
-        .bind(card_ref.space.as_str())
+        .bind(
+            card_ref
+                .space
+                .as_ref()
+                .expect("fixture service card ref has a resolved space")
+                .as_str(),
+        )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
         .bind(created_by)

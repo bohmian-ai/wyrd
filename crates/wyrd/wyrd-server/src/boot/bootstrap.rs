@@ -146,7 +146,7 @@ fn bootstrap_admin_card_ref() -> CardRef {
         kind: CardKind::Service,
         name: CardName::new("bootstrap-admin").expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: SpaceName::new("system").expect("static space name is valid"),
+        space: Some(SpaceName::new("system").expect("static space name is valid")),
         uid: None,
     }
 }

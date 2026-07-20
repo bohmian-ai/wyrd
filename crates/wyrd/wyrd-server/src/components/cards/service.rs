@@ -749,7 +749,7 @@ fn find_submission<'a>(
         .find(|submission| {
             submission.kind == node.kind
                 && submission.metadata.name == node.name
-                && submission.metadata.space.as_ref() == Some(&node.space)
+                && submission.metadata.space.as_ref() == node.space.as_ref()
                 && submission
                     .metadata
                     .resolved_pin()
@@ -762,7 +762,12 @@ fn find_submission<'a>(
 fn graph_identity(card_ref: &CardRef) -> (String, String, String) {
     (
         card_ref.kind.wire_name().to_owned(),
-        card_ref.space.as_str().to_owned(),
+        card_ref
+            .space
+            .as_ref()
+            .expect("graph nodes must have resolved spaces")
+            .as_str()
+            .to_owned(),
         card_ref.name.as_str().to_owned(),
     )
 }

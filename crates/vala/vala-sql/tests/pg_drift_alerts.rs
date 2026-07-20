@@ -20,7 +20,7 @@ mod pg_tests {
                 kind: CardKind::Data,
                 name: CardName::new("my-model").expect("valid card name"),
                 version: VersionBlock::parse("1.0.0").expect("valid version"),
-                space: SpaceName::new("default").expect("valid space"),
+                space: Some(SpaceName::new("default").expect("valid space")),
                 uid: None,
             }
         }

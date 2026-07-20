@@ -513,13 +513,13 @@ impl Workflow {
         self.cascade_children.sort_by(|a, b| {
             let a_key = (
                 a.kind.wire_name(),
-                a.space.as_str(),
+                a.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str),
                 a.name.as_str(),
                 a.version.to_string(),
             );
             let b_key = (
                 b.kind.wire_name(),
-                b.space.as_str(),
+                b.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str),
                 b.name.as_str(),
                 b.version.to_string(),
             );

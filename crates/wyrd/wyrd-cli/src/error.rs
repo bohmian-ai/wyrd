@@ -89,6 +89,16 @@ pub enum WyrdCliError {
     )]
     ServerRejectsRecords,
 
+    /// Local record replay requires the publisher's subject identity.
+    #[error("--records requires --subject <CARD_REF>")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_RECORDS_REQUIRE_SUBJECT",
+        status = 400,
+        title = "Record replay requires a subject",
+        remediation = "Pass the exact card reference of the publisher that emitted the records."
+    )]
+    RecordsRequireSubject,
+
     /// LLM judge tasks require the deterministic mock until provider wiring lands.
     #[error("LLM judge tasks require --judge-mock")]
     #[wyrd_error(

@@ -1,4 +1,4 @@
-# TriggerCard - fires when a DriftCard observation crosses thresholds.
+# Trigger Card - evaluates drift observations on a schedule.
 
 apiVersion: wyrd/v1
 kind: Trigger
@@ -8,23 +8,19 @@ metadata:
   version: 1.0.0
 
 spec:
+  schedule:
+    cron: "*/5 * * * *"
+    tz: UTC
   source:
     kind: drift_observation
-    card:
+    drift_ref:
       kind: Drift
       name: churn-input-drift
       space: retention
-      version: "^1"
+      version: 1.0.0
 
-  target:
+  operator_ref:
     kind: Operator
     name: churn-retrain-on-drift
     space: retention
-    version: "^1"
-
-  cooldown_seconds: 3600
-
-  config:
-    severity_min:
-      type: str
-      value: alert
+    version: 1.0.0

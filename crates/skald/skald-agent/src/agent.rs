@@ -728,6 +728,7 @@ impl Agent {
             prompt: self.prompt_ref.clone(),
             tool_names: self.tool_names.clone(),
             run_config: agent_run_config_spec_from_run_config(&self.run_config),
+            publishes_to: Vec::new(),
         }
     }
 
@@ -831,13 +832,7 @@ fn prompt_registry() -> &'static RwLock<HashMap<String, Arc<Prompt>>> {
 }
 
 fn prompt_key(card_ref: &CardRef) -> String {
-    format!(
-        "{}/{}:{}@{}",
-        card_ref.space,
-        card_ref.kind.wire_name(),
-        card_ref.name,
-        card_ref.version,
-    )
+    card_ref.to_string()
 }
 
 fn tool_resolution_error(error: ToolError) -> AgentCardError {

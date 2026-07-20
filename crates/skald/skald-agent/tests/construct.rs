@@ -93,7 +93,7 @@ fn prompt_card_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: name.parse().expect("valid prompt card name"),
         version: "0.3.0".parse().expect("valid prompt version"),
-        space: "research".parse().expect("valid space"),
+        space: Some("research".parse().expect("valid space")),
         uid: None,
     }
 }
@@ -296,6 +296,7 @@ fn unknown_runtime_local_tool_uses_wyrd_code() {
             prompt: InlineableRef::Inline(Box::new(prompt())),
             tool_names: vec!["missing_tool".to_owned()],
             run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
         },
         cascade_children: Vec::new(),
         created_at: chrono::Utc::now(),

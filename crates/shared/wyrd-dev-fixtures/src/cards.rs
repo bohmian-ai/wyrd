@@ -62,7 +62,13 @@ pub async fn seed_card_with_spec(
     )
     .bind(Uuid::now_v7())
     .bind(card_ref.kind.wire_name())
-    .bind(card_ref.space.as_str())
+    .bind(
+        card_ref
+            .space
+            .as_ref()
+            .expect("fixture card refs must have a resolved space")
+            .as_str(),
+    )
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .bind(spec_json)

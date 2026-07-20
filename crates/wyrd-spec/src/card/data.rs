@@ -17,6 +17,7 @@ use validate::DataCardError;
 /// Pure-data contract for a Data Card.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct DataSpec {
     /// Declared interface family and interface-specific metadata.
     pub interface: DataInterface,
@@ -25,6 +26,9 @@ pub struct DataSpec {
     /// Durable Artifact card references linked to this data card.
     #[serde(default)]
     pub card_refs: Vec<Ref>,
+    /// Eval and Drift cards that receive observations from this data card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes_to: Vec<Ref>,
     /// Declared split strategies by stable split label.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub splits: HashMap<SplitName, DataSplit>,

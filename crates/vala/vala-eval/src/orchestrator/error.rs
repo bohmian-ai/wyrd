@@ -46,8 +46,8 @@ pub enum OrchestratorError {
         scenario_id: ScenarioId,
     },
 
-    /// The eval spec has mechanic results but no subject_ref to aggregate under.
-    #[error("eval spec subject_ref is required to aggregate mechanic results")]
+    /// Mechanic results were produced without a publisher subject to aggregate under.
+    #[error("publisher subject_ref is required to aggregate mechanic results")]
     MissingSubjectForMechanicResults,
 
     /// Internal state invariant was violated.

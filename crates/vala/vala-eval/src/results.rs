@@ -35,7 +35,10 @@ impl SubjectKey {
     #[must_use]
     pub fn from_ref(card_ref: &CardRef) -> Self {
         let kind = format!("{:?}", card_ref.kind).to_lowercase();
-        let space = card_ref.space.as_str();
+        let space = card_ref
+            .space
+            .as_ref()
+            .map_or("<missing-space>", |space| space.as_str());
         Self(format!(
             "{kind}::{space}::{}::{}",
             card_ref.name.as_str(),
@@ -691,7 +694,7 @@ mod results_aggregation {
             kind: CardKind::Agent,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("tests").expect("static space is valid"),
+            space: Some(SpaceName::new("tests").expect("static space is valid")),
             uid: None,
         }
     }
@@ -701,7 +704,7 @@ mod results_aggregation {
             kind: CardKind::Eval,
             name: CardName::new("rubric").expect("static card name is valid"),
             version: VersionBlock::parse("0.1.0").expect("static version is valid"),
-            space: SpaceName::new("tests").expect("static space is valid"),
+            space: Some(SpaceName::new("tests").expect("static space is valid")),
             uid: None,
         }
     }

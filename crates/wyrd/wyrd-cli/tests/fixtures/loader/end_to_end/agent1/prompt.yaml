@@ -1,0 +1,19 @@
+apiVersion: wyrd/v1
+kind: Prompt
+metadata:
+  space: wyrd-team
+  name: churn-triage-prompt
+  version: "1.0.0"
+spec:
+  provider: openai
+  model: gpt-5-5
+  system: |
+    You triage customers scored as high churn risk by the churn-classifier
+    model. Classify the retention cohort (loyal_win_back, price_sensitive,
+    service_frustrated, unreachable), name the matched runbook, and cite
+    the top three churn drivers. Never recommend a discount above 20%
+    without human review.
+  messages:
+    - |
+      churn score + features:
+      ${customer}

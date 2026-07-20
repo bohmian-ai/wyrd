@@ -25,6 +25,13 @@
         }
       ]
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this model card.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      }
+    },
     "sample_input": {
       "description": "Optional canonical sample input description.",
       "anyOf": [
@@ -53,6 +60,7 @@
       ]
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "title": "CardKind",
@@ -87,7 +95,6 @@
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -108,10 +115,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },

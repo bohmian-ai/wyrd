@@ -384,7 +384,7 @@ mod tests {
             kind,
             name: CardName::new(name).expect("name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("prod").expect("space"),
+            space: Some(SpaceName::new("prod").expect("space")),
             uid: None,
         }
     }

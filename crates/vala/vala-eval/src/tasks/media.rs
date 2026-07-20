@@ -99,7 +99,7 @@ mod media_binding {
             kind: CardKind::Agent,
             name: CardName::new("media-judge").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -123,7 +123,6 @@ mod media_binding {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,

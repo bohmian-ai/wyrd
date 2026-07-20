@@ -85,13 +85,7 @@ pub async fn dispatch(args: IssueKeyArgs) -> Result<ExitCode, WyrdCliError> {
     println!("key_id:     {}", response.key_id);
     println!("key:        {}", response.key.expose());
     println!("prefix:     {}", response.prefix);
-    println!(
-        "card_ref:   {}/{}/{}@{}",
-        response.card_ref.space,
-        response.card_ref.kind.wire_name(),
-        response.card_ref.name,
-        response.card_ref.version,
-    );
+    println!("card_ref:   {}", response.card_ref);
     println!("created_at: {}", response.created_at);
     println!("expires_at: {}", response.expires_at);
 

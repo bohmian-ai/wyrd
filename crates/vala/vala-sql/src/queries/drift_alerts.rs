@@ -49,7 +49,7 @@ pub async fn upsert_drift_alert(
     .bind(ins.drift_ref.kind.wire_name())
     .bind(ins.drift_ref.name.as_str())
     .bind(ins.drift_ref.version.to_string())
-    .bind(ins.drift_ref.space.as_str())
+    .bind(resolved_space(ins.drift_ref))
     .bind(ins.drift_type)
     .bind(ins.series.unwrap_or(""))
     .bind(ins.alert)
@@ -85,7 +85,7 @@ pub async fn resolve_drift_alerts(
     .bind(drift_ref.kind.wire_name())
     .bind(drift_ref.name.as_str())
     .bind(drift_ref.version.to_string())
-    .bind(drift_ref.space.as_str())
+    .bind(resolved_space(drift_ref))
     .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
@@ -117,11 +117,19 @@ pub async fn acknowledge_drift_alert(
     .bind(drift_ref.kind.wire_name())
     .bind(drift_ref.name.as_str())
     .bind(drift_ref.version.to_string())
-    .bind(drift_ref.space.as_str())
+    .bind(resolved_space(drift_ref))
     .bind(drift_type)
     .bind(series)
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
     Ok(())
+}
+
+fn resolved_space(card_ref: &CardRef) -> &str {
+    card_ref
+        .space
+        .as_ref()
+        .map(|space| space.as_str())
+        .expect("invariant: persisted drift CardRef has resolved space")
 }

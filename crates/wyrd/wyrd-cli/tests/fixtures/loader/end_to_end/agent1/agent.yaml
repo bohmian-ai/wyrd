@@ -1,0 +1,21 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: wyrd-team
+  name: churn-triage
+  version: "1.0.0"
+spec:
+  # Prompt lives in a sibling file that has its own top-level kind+metadata.
+  # `path:` variant → registers as its own PromptCard; parent's ref is a
+  # CardRef bound at register time.
+  prompt: ./prompt.yaml
+
+  tool_names: [customer_lookup, crm_note_write]
+  run_config:
+    max_iterations: 5
+    timeout_ms: 45000
+
+  # Publishes to a sibling Eval card. `path:` variant — Team B's agent can
+  # publish to the same Eval without this Agent reversioning.
+  publishes_to:
+    - ./eval.yaml

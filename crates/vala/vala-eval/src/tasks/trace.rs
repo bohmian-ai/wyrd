@@ -214,7 +214,6 @@ mod trace_executor {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,

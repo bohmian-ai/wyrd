@@ -215,7 +215,7 @@ mod pg_tests {
             kind,
             name: CardName::new(name).expect("card name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new(space).expect("space"),
+            space: Some(SpaceName::new(space).expect("space")),
             uid: None,
         }
     }
@@ -246,6 +246,7 @@ mod pg_tests {
                 byte_count: 1,
                 sha256: "a".repeat(64),
             },
+            publishes_to: Vec::new(),
         })
     }
 

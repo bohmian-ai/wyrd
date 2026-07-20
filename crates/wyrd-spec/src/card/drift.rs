@@ -18,6 +18,7 @@ use crate::reference::Ref;
 /// DriftCard spec body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct DriftSpec {
     /// Free-text description authored on the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,10 +26,6 @@ pub struct DriftSpec {
 
     /// Drift detection method. Drives which `DriftProfile` variant is allowed.
     pub method: DriftMethod,
-
-    /// Singular subject of the monitor: the entity drift is observed against.
-    /// Allowed `subject_ref.kind`: `Model | Agent | Service | Data`.
-    pub subject_ref: Ref,
 
     /// How the measurement enters the monitor.
     pub signal: DriftSignal,
@@ -253,12 +250,6 @@ pub struct CustomProfile {
 /// [`WyrdError`] through the [`From<DriftValidationError>`] implementation.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum DriftValidationError {
-    /// `subject_ref.kind` was outside the allowed Drift subject set.
-    #[error("subject_ref.kind must be Model | Agent | Service | Data, got {got}")]
-    InvalidSubjectKind {
-        /// Actual Card kind.
-        got: String,
-    },
     /// `signal` was not compatible with `method`.
     #[error("signal {signal} is not compatible with method {method}")]
     SignalMethodMismatch {
@@ -383,9 +374,6 @@ impl DriftProfile {
 impl DriftValidationError {
     fn details(&self) -> serde_json::Value {
         match self {
-            Self::InvalidSubjectKind { got } => {
-                json!({ "field": "subject_ref.kind", "got": got })
-            }
             Self::SignalMethodMismatch { signal, method } => {
                 json!({ "signal": signal, "method": method })
             }
@@ -466,7 +454,6 @@ impl DriftSpec {
     /// Returns a [`DriftValidationError`] when any locked invariant fails.
     pub fn new(
         method: DriftMethod,
-        subject_ref: impl Into<Ref>,
         signal: DriftSignal,
         condition: DriftCondition,
         profile: Option<DriftProfile>,
@@ -476,7 +463,6 @@ impl DriftSpec {
         let spec = Self {
             description,
             method,
-            subject_ref: subject_ref.into(),
             signal,
             condition,
             profile,
@@ -491,7 +477,6 @@ impl DriftSpec {
     /// # Errors
     /// Returns the first [`DriftValidationError`] discovered.
     pub fn validate(&self) -> Result<(), DriftValidationError> {
-        validate_subject_ref(&self.subject_ref)?;
         validate_signal_method(&self.signal, self.method)?;
         validate_signal(&self.signal)?;
         validate_condition(&self.condition)?;
@@ -501,18 +486,6 @@ impl DriftSpec {
             validate_profile(profile)?;
         }
         Ok(())
-    }
-}
-
-fn validate_subject_ref(reference: &Ref) -> Result<(), DriftValidationError> {
-    let Some(card_ref) = reference.as_card_ref() else {
-        return Ok(());
-    };
-    match card_ref.kind {
-        CardKind::Model | CardKind::Agent | CardKind::Service | CardKind::Data => Ok(()),
-        _ => Err(DriftValidationError::InvalidSubjectKind {
-            got: format!("{:?}", card_ref.kind),
-        }),
     }
 }
 

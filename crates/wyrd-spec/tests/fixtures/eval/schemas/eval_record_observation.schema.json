@@ -19,7 +19,7 @@
       "format": "date-time"
     },
     "eval_ref": {
-      "description": "Reference to the Eval card this record feeds.\n\n`None` → the server fans the record to every Eval card whose `subject_ref` is the run's Target (the normal online-monitoring path, plan 04). `Some` → score against exactly this card (CLI/CI `--records` runs, targeted re-score). Per the D8 presence rule, an online (`None`) record is only scored against Eval cards that declared a `subject_ref`.",
+      "description": "Reference to the Eval card this record feeds.\n\n`None` lets the server route through the publisher's configured `publishes_to` targets. `Some` scores against exactly this card, as used by targeted CLI/CI replay.",
       "anyOf": [
         {
           "$ref": "#/definitions/CardRef"
@@ -114,7 +114,6 @@
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -135,10 +134,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },

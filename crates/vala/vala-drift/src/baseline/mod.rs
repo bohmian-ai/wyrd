@@ -187,17 +187,7 @@ mod dispatch_errors {
             kind: CardKind::Data,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: SpaceName::new("default").expect("valid space"),
-            uid: None,
-        }
-    }
-
-    fn model_ref(name: &str) -> CardRef {
-        CardRef {
-            kind: CardKind::Model,
-            name: CardName::new(name).expect("valid name"),
-            version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -213,7 +203,6 @@ mod dispatch_errors {
     fn external_spec() -> DriftSpec {
         DriftSpec::new(
             DriftMethod::External,
-            model_ref("subject"),
             DriftSignal::External {
                 source_ref: data_ref("source").into(),
             },
@@ -231,13 +220,12 @@ mod dispatch_errors {
         // fit_spc_baseline only handles Distribution and Metric signals.
         DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject"),
             DriftSignal::EvalScore {
                 eval_ref: CardRef {
                     kind: CardKind::Eval,
                     name: CardName::new("eval-card").expect("valid name"),
                     version: VersionBlock::parse("1.0.0").expect("valid version"),
-                    space: SpaceName::new("default").expect("valid space"),
+                    space: Some(SpaceName::new("default").expect("valid space")),
                     uid: None,
                 }
                 .into(),
@@ -258,7 +246,6 @@ mod dispatch_errors {
         let feature = FeatureName::new("x").expect("valid feature");
         DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject"),
             DriftSignal::Distribution {
                 baseline_ref: data_ref("baseline").into(),
                 features: vec![feature],
@@ -366,7 +353,7 @@ mod end_to_end {
             kind,
             name: CardName::new(name)?,
             version: VersionBlock::parse("1.0.0")?,
-            space: SpaceName::new("default")?,
+            space: Some(SpaceName::new("default")?),
             uid: None,
         })
     }
@@ -375,14 +362,9 @@ mod end_to_end {
         card_ref(CardKind::Data, name)
     }
 
-    fn model_ref(name: &str) -> Result<CardRef, Box<dyn Error>> {
-        card_ref(CardKind::Model, name)
-    }
-
     fn psi_spec(feature: &FeatureName) -> Result<DriftSpec, Box<dyn Error>> {
         Ok(DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model")?,
             DriftSignal::Distribution {
                 baseline_ref: data_ref("baseline-data")?.into(),
                 features: vec![feature.clone()],
@@ -401,7 +383,6 @@ mod end_to_end {
     fn spc_distribution_spec(feature: &FeatureName) -> Result<DriftSpec, Box<dyn Error>> {
         Ok(DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject-model")?,
             DriftSignal::Distribution {
                 baseline_ref: data_ref("baseline-data")?.into(),
                 features: vec![feature.clone()],
@@ -416,7 +397,6 @@ mod end_to_end {
     fn spc_metric_spec(name: &str) -> Result<DriftSpec, Box<dyn Error>> {
         Ok(DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject-model")?,
             DriftSignal::Metric {
                 name: name.to_string(),
             },
@@ -430,7 +410,6 @@ mod end_to_end {
     fn custom_spec(name: &str) -> Result<DriftSpec, Box<dyn Error>> {
         Ok(DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model")?,
             DriftSignal::Metric {
                 name: name.to_string(),
             },

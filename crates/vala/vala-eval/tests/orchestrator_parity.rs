@@ -95,7 +95,7 @@ async fn drive(
                     .expect("score scenario");
                 aggregation_inputs.push(
                     scoring
-                        .scenario_aggregation(&cursor, &result)
+                        .scenario_aggregation(&cursor, &result, Some(&subject_ref()))
                         .expect("scenario aggregation"),
                 );
                 scenario_results.push(result);

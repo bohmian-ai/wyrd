@@ -1,5 +1,6 @@
 //! Shared submission graph ordering for the loader.
 
+use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::GraphError;
 use wyrd_spec::registry::CardSubmission;
 
@@ -33,6 +34,7 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
         .collect::<Vec<_>>();
 
     let order = wyrd_spec::graph::topo_sort(&nodes, &edges)
+        .and_then(wyrd_spec::graph::root_last)
         .map_err(|error| vec![graph_diagnostic(error, cards, &card_refs)])?;
 
     order
@@ -103,21 +105,21 @@ fn graph_diagnostic(
     .unwrap_or_else(|| "<loader>".into());
 
     let message = error.to_string();
-    let code = match &error {
-        GraphError::Cycle { .. } => "WYRD_REGISTRY_400_DEPENDENCY_CYCLE",
-        GraphError::DuplicateIdentity { .. } => "WYRD_REGISTRY_400_DUPLICATE_CARD",
-        GraphError::Empty => "WYRD_REGISTRY_400_EMPTY_SUBMISSION",
-        GraphError::MissingSpace => "WYRD_REGISTRY_400_INVALID_CARD_SPEC",
-        GraphError::MultipleRoots { .. } => "WYRD_REGISTRY_400_MULTIPLE_ROOTS",
-        GraphError::InvalidSpec { .. } => "WYRD_REGISTRY_400_INVALID_SPEC",
+    let error = match &error {
+        GraphError::Cycle { cycle } => WyrdError::RegistryDependencyCycle {
+            message,
+            details: serde_json::json!({ "participants": cycle }),
+        },
+        GraphError::DuplicateIdentity { .. }
+        | GraphError::Empty
+        | GraphError::MissingSpace
+        | GraphError::MultipleRoots { .. }
+        | GraphError::InvalidSpec { .. } => WyrdError::LoaderInvalidEnvelope {
+            message,
+            details: serde_json::json!({ "graph_error": error.to_string() }),
+        },
     };
-
-    Diagnostic {
-        path,
-        code,
-        message: message.clone(),
-        context: Some(serde_json::json!({ "graph_error": message })),
-    }
+    Diagnostic::from_wyrd_error(path, super::Severity::Error, None, error)
 }
 
 #[cfg(test)]
@@ -155,7 +157,7 @@ mod tests {
                         kind: CardKind::Service,
                         name: CardName::new(dependency).unwrap(),
                         version: VersionBlock::parse("1.0.0").unwrap(),
-                        space: SpaceName::new("default").unwrap(),
+                        space: Some(SpaceName::new("default").unwrap()),
                         uid: None,
                     }),
                     source: None,

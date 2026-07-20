@@ -81,7 +81,7 @@ fn binding_card_ref(kind: CardKind, name: &str, space: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("version is valid"),
-        space: SpaceName::new(space).expect("space name is valid"),
+        space: Some(SpaceName::new(space).expect("space name is valid")),
         uid: None,
     }
 }

@@ -989,7 +989,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("my-model").expect("card name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("prod").expect("space"),
+            space: Some(SpaceName::new("prod").expect("space")),
             uid: None,
         }
     }

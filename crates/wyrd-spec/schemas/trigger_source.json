@@ -1,18 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TriggerSource",
-  "description": "Trigger source declaration.",
+  "description": "Observation source evaluated by a Trigger.",
   "oneOf": [
     {
-      "description": "Drift observation emitted by a Drift Card.",
+      "description": "Drift observations, optionally limited to one publisher.",
       "type": "object",
       "required": [
-        "card",
+        "drift_ref",
         "kind"
       ],
       "properties": {
-        "card": {
-          "description": "Source Drift Card reference.",
+        "drift_ref": {
+          "description": "Drift card to evaluate.",
           "allOf": [
             {
               "$ref": "#/definitions/Ref"
@@ -24,19 +24,31 @@
           "enum": [
             "drift_observation"
           ]
+        },
+        "subject_filter": {
+          "description": "Optional publisher restriction.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Ref"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
-      }
+      },
+      "additionalProperties": false
     },
     {
-      "description": "Evaluation observation emitted by an Eval Card.",
+      "description": "Eval observations, optionally limited to one publisher.",
       "type": "object",
       "required": [
-        "card",
+        "eval_ref",
         "kind"
       ],
       "properties": {
-        "card": {
-          "description": "Source Eval Card reference.",
+        "eval_ref": {
+          "description": "Eval card to evaluate.",
           "allOf": [
             {
               "$ref": "#/definitions/Ref"
@@ -48,28 +60,20 @@
           "enum": [
             "eval_observation"
           ]
-        }
-      }
-    },
-    {
-      "description": "Cron schedule.",
-      "type": "object",
-      "required": [
-        "cron",
-        "kind"
-      ],
-      "properties": {
-        "cron": {
-          "description": "Cron expression.",
-          "type": "string"
         },
-        "kind": {
-          "type": "string",
-          "enum": [
-            "schedule"
+        "subject_filter": {
+          "description": "Optional publisher restriction.",
+          "anyOf": [
+            {
+              "$ref": "#/definitions/Ref"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
-      }
+      },
+      "additionalProperties": false
     }
   ],
   "definitions": {
@@ -106,7 +110,6 @@
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -127,10 +130,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },

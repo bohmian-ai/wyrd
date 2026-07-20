@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use wyrd_spec::envelope::{ReferenceSlotVisitor, Spec};
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::select_card_uids_by_ref_batch;
@@ -49,8 +50,16 @@ pub async fn resolve_card_references(
 
 /// Collect the typed `CardRef` fields from one decoded spec.
 fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
-    let mut collector = RefCollector { output };
-    spec.walk_refs(&mut collector);
+    let mut spec = spec.clone();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => output.extend(reference.as_card_ref().cloned()),
+        SlotValue::InlineablePrompt(reference) => {
+            output.extend(reference.as_card_ref().cloned());
+        }
+        SlotValue::InlineableAgent(reference) => {
+            output.extend(reference.as_card_ref().cloned());
+        }
+    });
 }
 
 /// Bind external and already-minted sibling UIDs into every embedded reference.
@@ -59,45 +68,25 @@ pub fn bind_card_references(
     external: &ResolvedRefs,
     siblings: &HashMap<(String, String, String), CardUid>,
 ) -> Result<(), WyrdError> {
-    let mut binder = RefBinder { external, siblings };
-    spec.walk_refs_mut(&mut binder);
+    ReferenceSlotVisitor::visit(spec, |slot| {
+        let card_ref = match slot.value {
+            SlotValue::Durable(reference) => reference.as_card_ref_mut(),
+            SlotValue::InlineablePrompt(reference) => reference.as_card_ref_mut(),
+            SlotValue::InlineableAgent(reference) => reference.as_card_ref_mut(),
+        };
+        if let Some(card_ref) = card_ref {
+            card_ref.uid = siblings
+                .get(&sibling_key(card_ref))
+                .or_else(|| {
+                    external
+                        .iter()
+                        .find(|(resolved, _)| resolved.same_identity(card_ref))
+                        .map(|(_, uid)| uid)
+                })
+                .cloned();
+        }
+    });
     Ok(())
-}
-
-/// Collects immutable typed reference slots.
-struct RefCollector<'a> {
-    output: &'a mut Vec<CardRef>,
-}
-
-impl ReferenceSlotVisitor for RefCollector<'_> {
-    fn visit_ref(&mut self, card_ref: &CardRef) {
-        self.output.push(card_ref.clone());
-    }
-
-    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
-}
-
-/// Binds a reference slot to a sibling or external UID when one is available.
-struct RefBinder<'a> {
-    external: &'a ResolvedRefs,
-    siblings: &'a HashMap<(String, String, String), CardUid>,
-}
-
-impl ReferenceSlotVisitor for RefBinder<'_> {
-    fn visit_ref(&mut self, _card_ref: &CardRef) {}
-
-    fn visit_ref_mut(&mut self, card_ref: &mut CardRef) {
-        card_ref.uid = self
-            .siblings
-            .get(&sibling_key(card_ref))
-            .or_else(|| {
-                self.external
-                    .iter()
-                    .find(|(resolved, _)| resolved.same_identity(card_ref))
-                    .map(|(_, uid)| uid)
-            })
-            .cloned();
-    }
 }
 
 /// Collect the `(kind, space, name)` identities that appear as siblings.
@@ -123,7 +112,11 @@ fn sibling_identities(
 fn sibling_key(card_ref: &CardRef) -> (String, String, String) {
     (
         card_ref.kind.wire_name().to_owned(),
-        card_ref.space.as_str().to_owned(),
+        card_ref
+            .space
+            .as_ref()
+            .map_or("", |space| space.as_str())
+            .to_owned(),
         card_ref.name.as_str().to_owned(),
     )
 }
@@ -133,7 +126,10 @@ fn display_ref(card_ref: &CardRef) -> String {
     format!(
         "{}/{}/{}@{}",
         card_ref.kind.wire_name(),
-        card_ref.space,
+        card_ref
+            .space
+            .as_ref()
+            .map_or("<missing-space>", |space| space.as_str()),
         card_ref.name,
         card_ref.version
     )
@@ -158,9 +154,11 @@ mod tests {
             kind: CardKind::Prompt,
             name: name.parse().expect("test_setup: reference name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test_setup: reference version is valid"),
-            space: "default"
-                .parse()
-                .expect("test_setup: reference space is valid"),
+            space: Some(
+                "default"
+                    .parse()
+                    .expect("test_setup: reference space is valid"),
+            ),
             uid: None,
         }
     }

@@ -758,7 +758,7 @@ mod llm_judge_tests {
             kind: CardKind::Agent,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -768,7 +768,7 @@ mod llm_judge_tests {
             kind: CardKind::Data,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1231,7 +1231,7 @@ mod protocol_tests {
             kind: CardKind::Eval,
             name: CardName::new("rubric").unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1451,7 +1451,7 @@ mod record_tests {
             kind: CardKind::Eval,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1849,7 +1849,7 @@ mod spec_tests {
             kind: CardKind::Data,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1859,7 +1859,7 @@ mod spec_tests {
             kind: CardKind::Prompt,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1869,7 +1869,7 @@ mod spec_tests {
             kind: CardKind::Agent,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }
@@ -1908,7 +1908,6 @@ mod spec_tests {
     #[test]
     fn spec_with_full_fields_round_trip() {
         let mut spec = EvalSpec::new(one_task_map()).unwrap();
-        spec.subject_ref = Some(prompt_ref("retriever-quality").into());
         spec.dataset = Some(DatasetRef::new(data_ref("eval-set").into()).unwrap());
         spec.sampling = Some(EvalSampling::Ratio { ratio: 0.1 });
         spec.pass_gate = Some(EvalPassGate::OverallPassRate { threshold: 0.9 });

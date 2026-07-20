@@ -238,7 +238,7 @@ fn dev_card_ref() -> CardRef {
         kind: CardKind::Service,
         name: CardName::new(DEV_CARD_NAME).expect("static dev card name is valid"),
         version: VersionBlock::parse(DEV_CARD_VERSION).expect("static dev version is valid"),
-        space: SpaceName::new(DEV_CARD_SPACE).expect("static dev space is valid"),
+        space: Some(SpaceName::new(DEV_CARD_SPACE).expect("static dev space is valid")),
         uid: None,
     }
 }

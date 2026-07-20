@@ -193,7 +193,7 @@ impl PromptCard {
             kind: CardKind::Prompt,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -285,7 +285,7 @@ impl PromptReference {
             kind: CardKind::Prompt,
             name: card_name("name", name)?,
             version: version_block(version)?,
-            space: space_name(space)?,
+            space: Some(space_name(space)?),
             uid: uid.map_or(Ok(None), optional_card_uid)?,
         };
         Ok(Self::from_native(InlineableRef::Ref(card_ref)))
@@ -832,6 +832,9 @@ mod tests {
         assert_eq!(card_ref.kind, CardKind::Prompt);
         assert_eq!(card_ref.name.to_string(), "lead-scoring");
         assert_eq!(card_ref.version.to_string(), "1.2.3");
-        assert_eq!(card_ref.space.to_string(), "growth");
+        assert_eq!(
+            card_ref.space.as_ref().map(ToString::to_string).as_deref(),
+            Some("growth")
+        );
     }
 }

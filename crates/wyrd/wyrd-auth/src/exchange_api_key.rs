@@ -703,7 +703,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("test-service").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }
@@ -758,7 +758,13 @@ mod pg_tests {
         .bind(tenant_id.as_uuid())
         .bind(Uuid::now_v7())
         .bind(Json(card_ref.clone()))
-        .bind(card_ref.space.as_str())
+        .bind(
+            card_ref
+                .space
+                .as_ref()
+                .expect("fixture service card ref has a resolved space")
+                .as_str(),
+        )
         .bind(format!("svc-{sa_id}"))
         .bind(card_ref.version.as_str())
         .bind(created_by)
@@ -829,7 +835,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("static name"),
             version: VersionBlock::parse("1.0.0").expect("static version"),
-            space: SpaceName::new("prod").expect("static space"),
+            space: Some(SpaceName::new("prod").expect("static space")),
             uid: None,
         };
         let id_a: PrincipalId = "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02"
@@ -1121,7 +1127,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new("delegation-target").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
         let mut conn = fixture.tenant_conn().await.expect("tenant conn opens");

@@ -18,6 +18,7 @@ use super::path::PathSandbox;
 pub fn resolve_tree(
     cards: &mut Vec<AuthoredCard>,
     sandbox: &PathSandbox,
+    config: &wyrd_config::WyrdConfig,
 ) -> Result<Vec<Diagnostic>, LoadError> {
     let mut diagnostics = Vec::new();
     let mut path_cache: HashMap<PathBuf, CardRef> = HashMap::new();
@@ -29,58 +30,50 @@ pub fn resolve_tree(
                 .map(|card_ref| (card.source_path.clone(), card_ref))
         })
         .collect();
+    let mut depth_by_path = cards
+        .iter()
+        .map(|card| (card.source_path.clone(), 0usize))
+        .collect::<HashMap<_, _>>();
 
     let mut index = 0;
     while index < cards.len() {
         let source_path = cards[index].source_path.clone();
+        let source_depth = depth_by_path.get(&source_path).copied().unwrap_or(0);
+        let parent_space = cards[index].metadata.space.clone();
         let mut discovered = Vec::new();
+        let mut resolver = PathResolver {
+            sandbox,
+            known_cards: &mut card_refs_by_path,
+            path_cache: &mut path_cache,
+            diagnostics: &mut diagnostics,
+            config,
+        };
 
         ReferenceSlotVisitor::visit(&mut cards[index].spec, |entry| match entry.value {
             SlotValue::Durable(ref_slot) => {
+                inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let Ref::Path(path) = ref_slot {
-                    match resolve_path_to_ref(
-                        &source_path,
-                        path,
-                        sandbox,
-                        &mut card_refs_by_path,
-                        &mut path_cache,
-                        &mut discovered,
-                        &mut diagnostics,
-                    ) {
+                    match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
                         Ok(card_ref) => *ref_slot = Ref::Ref(card_ref),
-                        Err(diagnostic) => diagnostics.push(diagnostic),
+                        Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
             }
             SlotValue::InlineablePrompt(ref_slot) => {
+                inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let InlineableRef::Path(path) = ref_slot {
-                    match resolve_path_to_ref(
-                        &source_path,
-                        path,
-                        sandbox,
-                        &mut card_refs_by_path,
-                        &mut path_cache,
-                        &mut discovered,
-                        &mut diagnostics,
-                    ) {
+                    match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
                         Ok(card_ref) => *ref_slot = InlineableRef::Ref(card_ref),
-                        Err(diagnostic) => diagnostics.push(diagnostic),
+                        Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
             }
             SlotValue::InlineableAgent(ref_slot) => {
+                inherit_space(ref_slot.as_card_ref_mut(), parent_space.as_ref());
                 if let InlineableRef::Path(path) = ref_slot {
-                    match resolve_path_to_ref(
-                        &source_path,
-                        path,
-                        sandbox,
-                        &mut card_refs_by_path,
-                        &mut path_cache,
-                        &mut discovered,
-                        &mut diagnostics,
-                    ) {
+                    match resolver.resolve(&source_path, path, &mut discovered, source_depth) {
                         Ok(card_ref) => *ref_slot = InlineableRef::Ref(card_ref),
-                        Err(diagnostic) => diagnostics.push(diagnostic),
+                        Err(diagnostic) => resolver.diagnostics.push(diagnostic),
                     }
                 }
             }
@@ -91,6 +84,7 @@ pub fn resolve_tree(
                 .iter()
                 .any(|card| card.source_path == discovered_card.source_path)
             {
+                depth_by_path.insert(discovered_card.source_path.clone(), source_depth + 1);
                 cards.push(discovered_card);
             }
         }
@@ -100,51 +94,84 @@ pub fn resolve_tree(
     Ok(diagnostics)
 }
 
-fn resolve_path_to_ref(
-    base_file: &Path,
-    ref_path: &Path,
-    sandbox: &PathSandbox,
-    known_cards: &mut HashMap<PathBuf, CardRef>,
-    path_cache: &mut HashMap<PathBuf, CardRef>,
-    discovered: &mut Vec<AuthoredCard>,
-    diagnostics: &mut Vec<Diagnostic>,
-) -> Result<CardRef, Diagnostic> {
-    let (resolved_path, advisory) = sandbox.resolve(base_file, ref_path)?;
-    if let Some(advisory) = advisory {
-        diagnostics.push(advisory);
-    }
+struct PathResolver<'a> {
+    sandbox: &'a PathSandbox,
+    known_cards: &'a mut HashMap<PathBuf, CardRef>,
+    path_cache: &'a mut HashMap<PathBuf, CardRef>,
+    diagnostics: &'a mut Vec<Diagnostic>,
+    config: &'a wyrd_config::WyrdConfig,
+}
 
-    if let Some(cached) = path_cache.get(&resolved_path) {
-        return Ok(cached.clone());
-    }
-    if let Some(card_ref) = known_cards.get(&resolved_path) {
-        path_cache.insert(resolved_path, card_ref.clone());
-        return Ok(card_ref.clone());
-    }
+impl PathResolver<'_> {
+    fn resolve(
+        &mut self,
+        base_file: &Path,
+        ref_path: &Path,
+        discovered: &mut Vec<AuthoredCard>,
+        source_depth: usize,
+    ) -> Result<CardRef, Diagnostic> {
+        if source_depth >= 8 {
+            return Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                "Path reference depth exceeds the maximum of 8".to_owned(),
+            ));
+        }
+        let (resolved_path, advisory) = self.sandbox.resolve(base_file, ref_path)?;
+        if let Some(advisory) = advisory {
+            self.diagnostics.push(advisory);
+        }
 
-    let mut loaded_cards = parse_file(&resolved_path)?;
-    if loaded_cards.is_empty() {
-        return Err(Diagnostic::invalid_envelope(
-            base_file.to_path_buf(),
-            format!("Referenced file is empty: {}", ref_path.display()),
-        ));
-    }
-    if loaded_cards.len() > 1 {
-        return Err(Diagnostic::invalid_envelope(
-            base_file.to_path_buf(),
-            format!(
-                "Referenced file contains multiple cards: {}",
-                ref_path.display()
-            ),
-        ));
-    }
+        if let Some(cached) = self.path_cache.get(&resolved_path) {
+            return Ok(cached.clone());
+        }
+        if let Some(card_ref) = self.known_cards.get(&resolved_path) {
+            self.path_cache.insert(resolved_path, card_ref.clone());
+            return Ok(card_ref.clone());
+        }
 
-    let loaded = loaded_cards.remove(0);
-    let card_ref = card_ref_for(&loaded)?;
-    known_cards.insert(resolved_path.clone(), card_ref.clone());
-    path_cache.insert(resolved_path, card_ref.clone());
-    discovered.push(loaded);
-    Ok(card_ref)
+        let mut loaded_cards = parse_file(&resolved_path).map_err(|error| {
+            self.diagnostics.extend(error.diagnostics);
+            Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                format!(
+                    "referenced card failed to parse: {}",
+                    resolved_path.display()
+                ),
+            )
+        })?;
+        if loaded_cards.is_empty() {
+            return Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                format!("Referenced file is empty: {}", ref_path.display()),
+            ));
+        }
+        if loaded_cards.len() > 1 {
+            return Err(Diagnostic::invalid_envelope(
+                base_file.to_path_buf(),
+                format!(
+                    "Referenced file contains multiple cards: {}",
+                    ref_path.display()
+                ),
+            ));
+        }
+
+        let mut loaded = loaded_cards.remove(0);
+        super::config::apply_defaults(std::slice::from_mut(&mut loaded), self.config);
+        let card_ref = card_ref_for(&loaded)?;
+        self.known_cards
+            .insert(resolved_path.clone(), card_ref.clone());
+        self.path_cache.insert(resolved_path, card_ref.clone());
+        discovered.push(loaded);
+        Ok(card_ref)
+    }
+}
+
+fn inherit_space(card_ref: Option<&mut CardRef>, parent_space: Option<&wyrd_spec::ids::SpaceName>) {
+    if let Some(card_ref) = card_ref
+        && card_ref.space.is_none()
+    {
+        card_ref.space = parent_space.cloned();
+    }
 }
 
 #[cfg(test)]
@@ -170,7 +197,12 @@ mod tests {
         .unwrap();
 
         let mut cards = parse_file(&entry).unwrap();
-        let diagnostics = resolve_tree(&mut cards, &PathSandbox::new(root.to_path_buf())).unwrap();
+        let diagnostics = resolve_tree(
+            &mut cards,
+            &PathSandbox::new(root.to_path_buf()).unwrap(),
+            &wyrd_config::WyrdConfig::empty(),
+        )
+        .unwrap();
 
         assert!(diagnostics.is_empty());
         assert_eq!(cards.len(), 2);

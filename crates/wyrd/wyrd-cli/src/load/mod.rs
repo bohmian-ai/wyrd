@@ -9,7 +9,7 @@
 //! free of network, database, and cloud dependencies.
 
 pub mod config;
-pub mod discover_refs;
+pub mod diagnose;
 pub mod error;
 pub mod order;
 pub mod parse;
@@ -19,7 +19,8 @@ pub mod validate;
 
 use std::path::Path;
 
-pub use error::{Diagnostic, LoadError};
+pub use diagnose::{Diagnostic, Severity, SourceSpan, emit_json};
+pub use error::LoadError;
 pub use parse::AuthoredCard;
 pub use wyrd_spec::registry::CardSubmission;
 
@@ -44,25 +45,40 @@ pub struct LoadedCard {
 /// Load a card tree from the given path.
 ///
 /// This is the loader's single public surface. It performs the complete pipeline:
-/// parse → discover_refs → config → resolve → validate → order → diagnose.
+/// parse → config → resolve → validate → order → diagnose.
 ///
 /// # Errors
 ///
-/// Returns `LoadError` when the tree cannot be loaded due to IO failure or
-/// unrecoverable errors. Validation diagnostics are returned in `LoadedTree.diagnostics`.
+/// Returns `LoadError` containing every collected error-severity diagnostic.
+/// A successful tree contains warning diagnostics only.
 pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
-    // 1. Parse the entry file
-    let mut cards = parse::parse_file(path)?;
+    let entry_path = path
+        .canonicalize()
+        .map_err(|error| LoadError::single(Diagnostic::io(path.to_path_buf(), error)))?;
+
+    // 1. Parse the entry file or directory.
+    let mut cards = parse::parse_path(&entry_path)?;
 
     // 2. Discover workspace config
-    let config = config::discover(path)?;
+    let config = config::discover(&entry_path)?;
 
     // 3. Apply config defaults
     config::apply_defaults(&mut cards, &config);
 
     // 4. Resolve path references
-    let sandbox = path::PathSandbox::new(path.parent().unwrap_or(path).to_path_buf());
-    let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox)?;
+    let sandbox_root = config
+        .root_path
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| {
+            if entry_path.is_dir() {
+                entry_path.as_path()
+            } else {
+                entry_path.parent().unwrap_or(entry_path.as_path())
+            }
+        });
+    let sandbox = path::PathSandbox::new(sandbox_root.to_path_buf()).map_err(LoadError::single)?;
+    let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config)?;
 
     // 5. Validate
     let validation_diagnostics = validate::validate_tree(&cards);
@@ -73,13 +89,16 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
         Ok(o) => o,
         Err(cycle_diagnostics) => {
             diagnostics.extend(cycle_diagnostics);
-            // Return early with cycle errors
-            return Ok(LoadedTree {
-                cards: Vec::new(),
-                diagnostics,
-            });
+            Vec::new()
         }
     };
+
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        return Err(LoadError::multiple(diagnostics));
+    }
 
     // 7. Build loaded cards in topological order
     let mut loaded_cards = Vec::new();
@@ -95,4 +114,20 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
         cards: loaded_cards,
         diagnostics,
     })
+}
+
+/// Consume a loaded tree and return its wire-ready submissions.
+///
+/// # Errors
+/// Returns an error if an invalid caller-constructed tree contains an
+/// error-severity diagnostic.
+pub fn build_submissions(tree: LoadedTree) -> Result<Vec<CardSubmission>, LoadError> {
+    if tree
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        return Err(LoadError::multiple(tree.diagnostics));
+    }
+    Ok(tree.cards.into_iter().map(|card| card.submission).collect())
 }

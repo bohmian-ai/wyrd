@@ -87,7 +87,7 @@ mod tests {
             kind: CardKind::Eval,
             name: CardName::new("rubric").expect("name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("prod").expect("space"),
+            space: Some(SpaceName::new("prod").expect("space")),
             uid: None,
         };
         let run_state = RunState::open(card_ref, SimulatedUserMode::Client, Vec::new());

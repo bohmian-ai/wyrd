@@ -543,7 +543,7 @@ mod comparison_four_quadrant {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("tests").expect("static space is valid"),
+            space: Some(SpaceName::new("tests").expect("static space is valid")),
             uid: None,
         }
     }

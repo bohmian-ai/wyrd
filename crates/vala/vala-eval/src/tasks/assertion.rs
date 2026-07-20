@@ -237,7 +237,7 @@ mod assertion_stage {
             kind: CardKind::Agent,
             name: CardName::new("test-judge").expect("static name valid"),
             version: VersionBlock::parse("1.0.0").expect("static version valid"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -261,7 +261,6 @@ mod assertion_stage {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,

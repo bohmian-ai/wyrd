@@ -282,7 +282,7 @@ impl WorkflowCard {
             kind: CardKind::Workflow,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -465,13 +465,13 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     out.sort_by(|a, b| {
         let a_key = (
             a.kind.wire_name(),
-            a.space.as_str(),
+            a.space.as_ref().map(SpaceName::as_str),
             a.name.as_str(),
             a.version.to_string(),
         );
         let b_key = (
             b.kind.wire_name(),
-            b.space.as_str(),
+            b.space.as_ref().map(SpaceName::as_str),
             b.name.as_str(),
             b.version.to_string(),
         );
@@ -479,11 +479,6 @@ fn derive_cascade_children(spec: &WorkflowSpec) -> Vec<CardRef> {
     });
     out.dedup();
     out
-}
-
-/// Return card refs declared by a workflow for card-ref scope traversal.
-pub(crate) fn scope_child_card_refs(spec: &WorkflowSpec) -> Vec<CardRef> {
-    derive_cascade_children(spec)
 }
 
 fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
@@ -540,7 +535,7 @@ mod workflow_spec_tests {
             kind,
             name: name.parse().expect("valid card name"),
             version: "0.1.0".parse().expect("valid version"),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         }
     }
@@ -583,6 +578,7 @@ mod workflow_spec_tests {
                 prompt: InlineableRef::from(prompt()),
                 tool_names: vec![],
                 run_config: AgentRunConfigSpec::default(),
+                publishes_to: Vec::new(),
             })),
             depends_on: vec![],
             inputs: BTreeMap::new(),
@@ -600,7 +596,7 @@ mod workflow_spec_tests {
                 kind: CardKind::Agent,
                 name: agent_name.parse().expect("valid card name"),
                 version: "0.1.0".parse().expect("valid version"),
-                space: SpaceName::new("default").expect("static space is valid"),
+                space: Some(SpaceName::new("default").expect("static space is valid")),
                 uid: None,
             })),
             depends_on: vec![],
@@ -673,11 +669,12 @@ mod workflow_spec_tests {
                 kind: CardKind::Prompt,
                 name: "planner-prompt".parse().expect("valid card name"),
                 version: "0.3.0".parse().expect("valid version"),
-                space: SpaceName::new("default").expect("static space is valid"),
+                space: Some(SpaceName::new("default").expect("static space is valid")),
                 uid: None,
             }),
             tool_names: vec![],
             run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
         };
         let step = WorkflowStep {
             id: "planner".to_owned(),

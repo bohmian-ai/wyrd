@@ -101,7 +101,13 @@ pub async fn insert_service_account(
     .bind(card_kind)
     .bind(card_uid)
     .bind(Json(card_ref))
-    .bind(card_ref.space.as_str())
+    .bind(
+        card_ref
+            .space
+            .as_ref()
+            .expect("invariant: service-account CardRef has resolved space")
+            .as_str(),
+    )
     .bind(name)
     .bind(card_ref.version.as_str())
     .bind(description)
@@ -470,7 +476,7 @@ mod tests {
             kind: CardKind::Agent,
             name: CardName::new("runtime").expect("static name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         };
         let Json(bound) = Json(card_ref.clone());

@@ -15,6 +15,13 @@
         }
       ]
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this agent.",
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      }
+    },
     "run_config": {
       "description": "Agent run configuration.",
       "allOf": [
@@ -31,6 +38,7 @@
       }
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "AgentRunConfigSpec": {
       "description": "Pure-serde mirror of the Skald agent run configuration.",
@@ -1062,7 +1070,6 @@
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -1083,10 +1090,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -4098,6 +4108,23 @@
               ]
             }
           }
+        }
+      ]
+    },
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
         }
       ]
     },

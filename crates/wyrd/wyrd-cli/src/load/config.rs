@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use wyrd_spec::ids::SpaceName;
+
 use super::error::LoadError;
 use super::parse::AuthoredCard;
 
@@ -18,33 +20,17 @@ use super::parse::AuthoredCard;
 ///
 /// Returns diagnostic only when a `wyrd.toml` file exists but is malformed.
 pub fn discover(entry_path: &Path) -> Result<wyrd_config::WyrdConfig, LoadError> {
-    let start_dir = entry_path.parent().unwrap_or(entry_path);
-    let canonical_start = start_dir.canonicalize().map_err(|error| {
-        LoadError::single(super::error::Diagnostic::io(start_dir.to_path_buf(), error))
-    })?;
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .and_then(|path| path.canonicalize().ok());
-
-    for ancestor in canonical_start.ancestors() {
-        let candidate = ancestor.join("wyrd.toml");
-        if candidate.is_file() {
-            return wyrd_config::WyrdConfig::load(Some(&candidate)).map_err(|error| {
-                LoadError::single(super::error::Diagnostic::config_load_failed(
-                    candidate,
-                    error.to_string(),
-                ))
-            });
-        }
-        if ancestor == std::path::Path::new("/")
-            || ancestor.join(".git").exists()
-            || home.as_deref().is_some_and(|home| home == ancestor)
-        {
-            break;
-        }
-    }
-
-    Ok(wyrd_config::WyrdConfig::empty())
+    let start_dir = if entry_path.is_dir() {
+        entry_path
+    } else {
+        entry_path.parent().unwrap_or(entry_path)
+    };
+    wyrd_config::WyrdConfig::discover_from(start_dir).map_err(|error| {
+        LoadError::single(super::error::Diagnostic::config_load_failed(
+            start_dir.to_path_buf(),
+            error.to_string(),
+        ))
+    })
 }
 
 /// Apply workspace defaults to every authored card.
@@ -59,6 +45,12 @@ pub fn discover(entry_path: &Path) -> Result<wyrd_config::WyrdConfig, LoadError>
 pub fn apply_defaults(cards: &mut [AuthoredCard], config: &wyrd_config::WyrdConfig) {
     for card in cards {
         wyrd_config::apply_defaults(&mut card.metadata, &card.kind, config);
+        if card.metadata.space.is_none() {
+            card.metadata.space = Some(
+                SpaceName::new("default")
+                    .expect("invariant: system fallback space is a valid SpaceName"),
+            );
+        }
     }
 }
 

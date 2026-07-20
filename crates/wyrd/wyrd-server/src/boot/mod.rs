@@ -535,7 +535,7 @@ fn build_binding_card_ref(
         kind,
         name,
         version,
-        space,
+        space: Some(space),
         uid: None,
     })
 }

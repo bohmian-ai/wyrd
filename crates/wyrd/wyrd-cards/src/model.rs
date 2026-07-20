@@ -168,7 +168,7 @@ impl ModelCard {
             kind: CardKind::Model,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -1019,6 +1019,7 @@ fn model_spec_from_metadata(
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
         card_refs: metadata.card_refs.iter().cloned().map(Ref::Ref).collect(),
+        publishes_to: Vec::new(),
     }
 }
 

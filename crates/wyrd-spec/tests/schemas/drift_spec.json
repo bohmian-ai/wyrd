@@ -6,8 +6,7 @@
   "required": [
     "condition",
     "method",
-    "signal",
-    "subject_ref"
+    "signal"
   ],
   "properties": {
     "condition": {
@@ -58,16 +57,9 @@
           "$ref": "#/definitions/DriftSignal"
         }
       ]
-    },
-    "subject_ref": {
-      "description": "Singular subject of the monitor: the entity drift is observed against. Allowed `subject_ref.kind`: `Model | Agent | Service | Data`.",
-      "allOf": [
-        {
-          "$ref": "#/definitions/Ref"
-        }
-      ]
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "title": "CardKind",
@@ -102,7 +94,6 @@
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -123,10 +114,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },

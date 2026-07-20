@@ -68,14 +68,14 @@ pub(crate) async fn resolve_card(
     kind: CardKind,
     card_ref: &CardRef,
 ) -> Result<ParsedCardRow, WyrdError> {
-    get_card_by_ref(
-        conn,
-        kind,
-        &card_ref.space,
-        &card_ref.name,
-        &card_ref.version,
-    )
-    .await
+    let space = card_ref
+        .space
+        .as_ref()
+        .ok_or_else(|| WyrdError::Validation {
+            message: "resolved eval card reference is missing space".to_owned(),
+            details: serde_json::json!({ "card_ref": card_ref }),
+        })?;
+    get_card_by_ref(conn, kind, space, &card_ref.name, &card_ref.version).await
 }
 
 /// Resolve one card by reference under a fresh tenant-bound transaction.

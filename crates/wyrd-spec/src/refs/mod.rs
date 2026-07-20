@@ -77,6 +77,7 @@ impl Visit for crate::card::data::DataSpec {
                 value: SlotValue::Durable(card_ref),
             });
         }
+        visit_publishes_to(&mut self.publishes_to, f);
         for (label, split) in &mut self.splits {
             if let crate::card::data::SplitStrategy::Materialized(card_ref) = &mut split.strategy {
                 f(SlotEntry {
@@ -118,6 +119,7 @@ impl Visit for crate::card::model::ModelSpec {
                 value: SlotValue::Durable(card_ref),
             });
         }
+        visit_publishes_to(&mut self.publishes_to, f);
     }
 }
 
@@ -146,10 +148,7 @@ impl Visit for crate::card::agent::AgentSpec {
     where
         F: FnMut(SlotEntry<'_>),
     {
-        f(SlotEntry {
-            path: "spec.prompt".to_owned(),
-            value: SlotValue::InlineablePrompt(&mut self.prompt),
-        });
+        visit_agent(self, "spec", f);
     }
 }
 
@@ -186,10 +185,14 @@ impl Visit for crate::card::workflow::WorkflowSpec {
         for (step_idx, step) in self.steps.iter_mut().enumerate() {
             match &mut step.action {
                 WorkflowAction::Agent(agent_ref) => {
+                    let path = format!("spec.steps[{}].action.Agent", step_idx);
                     f(SlotEntry {
-                        path: format!("spec.steps[{}].action.Agent", step_idx),
+                        path: path.clone(),
                         value: SlotValue::InlineableAgent(agent_ref),
                     });
+                    if let InlineableRef::Inline(agent) = agent_ref {
+                        visit_agent(agent, &path, f);
+                    }
                 }
                 WorkflowAction::Mcp(card_ref) => {
                     f(SlotEntry {
@@ -222,19 +225,16 @@ impl Visit for crate::card::eval::EvalSpec {
             });
         }
 
-        if let Some(subject_ref) = &mut self.subject_ref {
-            f(SlotEntry {
-                path: "spec.subject_ref".to_owned(),
-                value: SlotValue::Durable(subject_ref),
-            });
-        }
-
         for (task_id, task) in self.tasks.iter_mut() {
             if let EvalTask::LlmJudge(llm_judge_task) = task {
+                let path = format!("spec.tasks[{}].LlmJudge.judge_ref", task_id.as_str());
                 f(SlotEntry {
-                    path: format!("spec.tasks[{}].LlmJudge.judge_ref", task_id.as_str()),
+                    path: path.clone(),
                     value: SlotValue::InlineableAgent(&mut llm_judge_task.judge_ref),
                 });
+                if let InlineableRef::Inline(agent) = &mut llm_judge_task.judge_ref {
+                    visit_agent(agent, &path, f);
+                }
             }
         }
     }
@@ -246,11 +246,6 @@ impl Visit for crate::card::drift::DriftSpec {
         F: FnMut(SlotEntry<'_>),
     {
         use crate::card::drift::DriftSignal;
-
-        f(SlotEntry {
-            path: "spec.subject_ref".to_owned(),
-            value: SlotValue::Durable(&mut self.subject_ref),
-        });
 
         match &mut self.signal {
             DriftSignal::Distribution { baseline_ref, .. } => {
@@ -287,6 +282,7 @@ impl Visit for crate::card::service::ServiceSpec {
                 value: SlotValue::Durable(&mut component.card_ref),
             });
         }
+        visit_publishes_to(&mut self.publishes_to, f);
     }
 }
 
@@ -352,24 +348,32 @@ impl Visit for crate::card::trigger::TriggerSpec {
         use crate::card::trigger::TriggerSource;
 
         f(SlotEntry {
-            path: "spec.target".to_owned(),
-            value: SlotValue::Durable(&mut self.target),
+            path: "spec.operator_ref".to_owned(),
+            value: SlotValue::Durable(&mut self.operator_ref),
         });
 
         match &mut self.source {
-            TriggerSource::DriftObservation { card } => {
+            Some(TriggerSource::DriftObservation {
+                drift_ref,
+                subject_filter,
+            }) => {
                 f(SlotEntry {
-                    path: "spec.source.DriftObservation.card".to_owned(),
-                    value: SlotValue::Durable(card),
+                    path: "spec.source.drift_observation.drift_ref".to_owned(),
+                    value: SlotValue::Durable(drift_ref),
                 });
+                visit_subject_filter(subject_filter, f);
             }
-            TriggerSource::EvalObservation { card } => {
+            Some(TriggerSource::EvalObservation {
+                eval_ref,
+                subject_filter,
+            }) => {
                 f(SlotEntry {
-                    path: "spec.source.EvalObservation.card".to_owned(),
-                    value: SlotValue::Durable(card),
+                    path: "spec.source.eval_observation.eval_ref".to_owned(),
+                    value: SlotValue::Durable(eval_ref),
                 });
+                visit_subject_filter(subject_filter, f);
             }
-            TriggerSource::Schedule { .. } => {}
+            None => {}
         }
     }
 }
@@ -379,20 +383,52 @@ impl Visit for crate::card::operator::OperatorSpec {
     where
         F: FnMut(SlotEntry<'_>),
     {
-        // pre_invoke and post_invoke are Policy refs
-        for (i, card_ref) in self.pre_invoke.iter_mut().enumerate() {
+        if let crate::card::operator::OperatorAction::Workflow { workflow_ref } = &mut self.action {
             f(SlotEntry {
-                path: format!("spec.pre_invoke[{}]", i),
-                value: SlotValue::Durable(card_ref),
+                path: "spec.action.workflow_ref".to_owned(),
+                value: SlotValue::Durable(workflow_ref),
             });
         }
+    }
+}
 
-        for (i, card_ref) in self.post_invoke.iter_mut().enumerate() {
-            f(SlotEntry {
-                path: format!("spec.post_invoke[{}]", i),
-                value: SlotValue::Durable(card_ref),
-            });
-        }
+fn visit_publishes_to<F>(publishes_to: &mut [Ref], f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    for (index, card_ref) in publishes_to.iter_mut().enumerate() {
+        f(SlotEntry {
+            path: format!("spec.publishes_to[{index}]"),
+            value: SlotValue::Durable(card_ref),
+        });
+    }
+}
+
+fn visit_agent<F>(agent: &mut crate::card::agent::AgentSpec, prefix: &str, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    f(SlotEntry {
+        path: format!("{prefix}.prompt"),
+        value: SlotValue::InlineablePrompt(&mut agent.prompt),
+    });
+    for (index, card_ref) in agent.publishes_to.iter_mut().enumerate() {
+        f(SlotEntry {
+            path: format!("{prefix}.publishes_to[{index}]"),
+            value: SlotValue::Durable(card_ref),
+        });
+    }
+}
+
+fn visit_subject_filter<F>(subject_filter: &mut Option<Ref>, f: &mut F)
+where
+    F: FnMut(SlotEntry<'_>),
+{
+    if let Some(subject_filter) = subject_filter {
+        f(SlotEntry {
+            path: "spec.source.subject_filter".to_owned(),
+            value: SlotValue::Durable(subject_filter),
+        });
     }
 }
 
@@ -405,7 +441,6 @@ mod completeness_tests {
     use super::{ReferenceSlotVisitor, SlotValue};
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::card::artifact::ArtifactSpec;
-    use crate::card::artifact::FrameworkAdapterRef;
     use crate::card::audit::AuditSpec;
     use crate::card::common::{Governance, ObservationHooks};
     use crate::card::data::{
@@ -417,9 +452,9 @@ mod completeness_tests {
     use crate::card::field::FieldSpec;
     use crate::card::mcp::McpSpec;
     use crate::card::model::{ModelInterface, ModelSignature, ModelSpec, SklearnMeta, TaskType};
-    use crate::card::operator::OperatorSpec;
+    use crate::card::operator::{OperatorAction, OperatorSpec};
     use crate::card::service::{ServiceComponent, ServiceSpec};
-    use crate::card::trigger::{TriggerSource, TriggerSpec};
+    use crate::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
     use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use crate::envelope::{CardKind, Spec};
     use crate::ids::{CardName, ColumnName, SpaceName};
@@ -433,7 +468,7 @@ mod completeness_tests {
             kind,
             name: CardName::new(name).expect("fixture card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("fixture version is valid"),
-            space: SpaceName::new("default").expect("fixture space is valid"),
+            space: Some(SpaceName::new("default").expect("fixture space is valid")),
             uid: None,
         }
     }
@@ -475,6 +510,7 @@ mod completeness_tests {
                 max_iterations: Some(1),
                 ..AgentRunConfigSpec::default()
             },
+            publishes_to: Vec::new(),
         }
     }
 
@@ -504,6 +540,7 @@ mod completeness_tests {
                 byte_count: 1,
                 sha256: "a".repeat(64),
             },
+            publishes_to: Vec::new(),
         }
     }
 
@@ -526,6 +563,7 @@ mod completeness_tests {
             ),
             sample_input: None,
             card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "model-artifact"))],
+            publishes_to: Vec::new(),
         }
     }
 
@@ -587,7 +625,6 @@ mod completeness_tests {
         .expect("fixture judge is valid");
         let mut eval = EvalSpec::new(BTreeMap::from([(task_id, EvalTask::LlmJudge(judge))]))
             .expect("fixture eval is valid");
-        eval.subject_ref = Some(Ref::Ref(card_ref(CardKind::Model, "subject")));
         eval.dataset = Some(DatasetRef(Ref::Ref(card_ref(CardKind::Data, "dataset"))));
         eval
     }
@@ -648,28 +685,27 @@ mod completeness_tests {
             ..ServiceSpec::default()
         };
         let mut trigger = TriggerSpec {
-            source: TriggerSource::DriftObservation {
-                card: Ref::Ref(card_ref(CardKind::Drift, "drift")),
+            description: None,
+            schedule: TriggerSchedule {
+                cron: "0 * * * *".to_owned(),
+                tz: None,
             },
-            target: Ref::Ref(card_ref(CardKind::Operator, "operator")),
-            cooldown_seconds: None,
-            config: BTreeMap::new(),
+            source: Some(TriggerSource::DriftObservation {
+                drift_ref: Ref::Ref(card_ref(CardKind::Drift, "drift")),
+                subject_filter: Some(Ref::Ref(card_ref(CardKind::Model, "subject"))),
+            }),
+            operator_ref: Ref::Ref(card_ref(CardKind::Operator, "operator")),
         };
         let mut operator = OperatorSpec {
-            adapter: FrameworkAdapterRef {
-                name: "fixture".to_owned(),
-                version: "1".to_owned(),
-                config: BTreeMap::new(),
+            description: None,
+            action: OperatorAction::Workflow {
+                workflow_ref: Ref::Ref(card_ref(CardKind::Workflow, "workflow")),
             },
-            inputs: Vec::new(),
-            pre_invoke: vec![Ref::Ref(card_ref(CardKind::Policy, "pre"))],
-            post_invoke: vec![Ref::Ref(card_ref(CardKind::Policy, "post"))],
             budget: None,
         };
         let mut drift = DriftSpec {
             description: None,
             method: DriftMethod::External,
-            subject_ref: Ref::Ref(card_ref(CardKind::Model, "subject")),
             signal: DriftSignal::External {
                 source_ref: Ref::Ref(card_ref(CardKind::Source, "source")),
             },
@@ -738,6 +774,10 @@ mod completeness_tests {
                 ("spec.governance.audit_ref".to_owned(), "durable"),
                 ("spec.observation_hooks.route_refs[0]".to_owned(), "durable"),
                 ("spec.steps[0].action.Agent".to_owned(), "inlineable_agent"),
+                (
+                    "spec.steps[0].action.Agent.prompt".to_owned(),
+                    "inlineable_prompt"
+                ),
                 ("spec.steps[1].action.Mcp".to_owned(), "durable"),
                 ("spec.steps[2].action.Prompt".to_owned(), "durable"),
             ]
@@ -746,10 +786,13 @@ mod completeness_tests {
             visit_paths(Spec::Eval(eval())),
             vec![
                 ("spec.dataset".to_owned(), "durable"),
-                ("spec.subject_ref".to_owned(), "durable"),
                 (
                     "spec.tasks[judge].LlmJudge.judge_ref".to_owned(),
                     "inlineable_agent"
+                ),
+                (
+                    "spec.tasks[judge].LlmJudge.judge_ref.prompt".to_owned(),
+                    "inlineable_prompt"
                 ),
             ]
         );

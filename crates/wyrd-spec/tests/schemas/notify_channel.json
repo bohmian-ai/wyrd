@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NotifyChannel",
+  "description": "Typed notification destinations.",
+  "oneOf": [
+    {
+      "description": "PagerDuty event payload.",
+      "type": "object",
+      "required": [
+        "kind",
+        "severity",
+        "summary"
+      ],
+      "properties": {
+        "dedup_key": {
+          "description": "Optional de-duplication key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "pager_duty"
+          ]
+        },
+        "severity": {
+          "description": "PagerDuty severity.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Human-readable event summary.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "description": "Slack message payload.",
+      "type": "object",
+      "required": [
+        "kind",
+        "text"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "slack"
+          ]
+        },
+        "text": {
+          "description": "Message text.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

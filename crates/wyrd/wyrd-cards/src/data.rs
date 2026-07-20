@@ -173,7 +173,7 @@ impl DataCard {
             kind: CardKind::Data,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -902,6 +902,7 @@ fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInter
         target_columns: metadata.target_columns.clone(),
         sql: metadata.sql.clone(),
         stats: metadata.stats.clone(),
+        publishes_to: Vec::new(),
     }
 }
 

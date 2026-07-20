@@ -1,0 +1,7 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: defaulted-service
+  version: 1.0.0
+spec:
+  components: []

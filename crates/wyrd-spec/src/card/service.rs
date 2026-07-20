@@ -10,6 +10,7 @@ use crate::reference::{CardRef, Ref};
 /// Composition of cards used by an application or deployment.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct ServiceSpec {
     /// Service description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -20,6 +21,9 @@ pub struct ServiceSpec {
     /// Alias-bound components.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<ServiceComponent>,
+    /// Eval and Drift cards that receive observations from this service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes_to: Vec<Ref>,
     /// Entry point descriptor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry_point: Option<String>,

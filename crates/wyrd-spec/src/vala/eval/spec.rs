@@ -31,8 +31,6 @@ pub const MAX_EVAL_TASKS: usize = 512;
 /// carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.
 ///
 /// Authors declare:
-/// - `subject_ref` — canonical card this rubric judges per doctrine #3 and
-///   the `ObservationCriteria.subject_refs` precedent.
 /// - `dataset` — source data, typically a `Data` card with eval scenarios.
 /// - `tasks` — the rubric DAG.
 /// - `workflow` — optional declared workflow shape.
@@ -46,22 +44,6 @@ pub const MAX_EVAL_TASKS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvalSpec {
-    /// Declarative subject — the card whose runs this rubric judges.
-    ///
-    /// When `Some`, registration can derive an `evaluates` relationship.
-    /// Runtime records may still supply the subject when this is `None`.
-    ///
-    /// **Presence rule (D8).** The struct keeps `Option<CardRef>`, but
-    /// registry validation at `wyrd apply` rejects an Eval card with
-    /// `subject_ref = None` whenever the card receives online observations
-    /// (`run.observe.eval(...)` needs the identity chain). It may be `None`
-    /// only for pure-offline rubric cards driven entirely by datasets and
-    /// scenarios. The validator itself ships with the registry surface; this
-    /// field documents the rule the validator enforces, consistent with the
-    /// kind-restriction note on `validate()` below.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_ref: Option<Ref>,
-
     /// Source data for offline runs.
     ///
     /// Validation enforces `dataset.kind == Data`.
@@ -115,7 +97,6 @@ impl EvalSpec {
         validate_task_keys(&tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&tasks).map_err(EvalSpecError::Dag)?;
         Ok(Self {
-            subject_ref: None,
             dataset: None,
             tasks,
             workflow: None,
@@ -127,12 +108,6 @@ impl EvalSpec {
 
     /// Validate the task DAG, task-level validators, dataset, pass gate, and
     /// sampling policy.
-    ///
-    /// `subject_ref` kind restrictions and the presence rule are intentionally
-    /// deferred to registry validators: the allowlist is not locked here, and
-    /// the D8 presence rule (online-observation Eval cards require
-    /// `subject_ref`) is enforced at `wyrd apply` against the registered card
-    /// graph, not in pure-spec validation.
     ///
     /// # Errors
     /// Returns [`EvalSpecError`] when DAG validation fails or a nested Wyrd

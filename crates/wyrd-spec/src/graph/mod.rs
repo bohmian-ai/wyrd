@@ -6,8 +6,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
-use crate::envelope::{ReferenceSlotVisitor, Spec};
+use crate::envelope::Spec;
+use crate::ids::SpaceName;
 use crate::reference::CardRef;
+use crate::refs::{ReferenceSlotVisitor, SlotValue};
 use crate::registry::CardSubmission;
 use wyrd_semver::{VersionBlock, VersionSpec};
 
@@ -16,7 +18,7 @@ mod root;
 mod topo;
 
 pub use canonical::canonical_order;
-pub use root::pick_root;
+pub use root::{pick_root, root_last};
 pub use topo::{GraphError, topo_sort};
 
 /// One vertex in the submission DAG.
@@ -154,11 +156,20 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
                 message: error.to_string(),
             },
         )?;
-        let mut collector = RefCollector {
-            references: Vec::new(),
-        };
-        spec.walk_refs(&mut collector);
-        for child in collector.references {
+        let mut spec = spec;
+        let mut references = Vec::new();
+        ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+            SlotValue::Durable(reference) => {
+                references.extend(reference.as_card_ref().cloned());
+            }
+            SlotValue::InlineablePrompt(reference) => {
+                references.extend(reference.as_card_ref().cloned());
+            }
+            SlotValue::InlineableAgent(reference) => {
+                references.extend(reference.as_card_ref().cloned());
+            }
+        });
+        for child in references {
             let Some(target) = siblings.get(&identity_key(&child)) else {
                 continue;
             };
@@ -178,7 +189,12 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
 pub(crate) fn identity_key(card_ref: &CardRef) -> (String, String, String) {
     (
         card_ref.kind.wire_name().to_owned(),
-        card_ref.space.as_str().to_owned(),
+        card_ref
+            .space
+            .as_ref()
+            .map(SpaceName::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         card_ref.name.as_str().to_owned(),
     )
 }
@@ -188,21 +204,9 @@ fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
         kind: submission.kind.clone(),
         name: submission.metadata.name.clone(),
         version: submission.metadata.resolved_pin()?.clone(),
-        space: submission.metadata.space.clone()?,
+        space: Some(submission.metadata.space.clone()?),
         uid: submission.metadata.uid.clone(),
     })
-}
-
-struct RefCollector {
-    references: Vec<CardRef>,
-}
-
-impl ReferenceSlotVisitor for RefCollector {
-    fn visit_ref(&mut self, card_ref: &CardRef) {
-        self.references.push(card_ref.clone());
-    }
-
-    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
 }
 
 #[cfg(test)]
@@ -220,7 +224,7 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: "default".parse().expect("test space is valid"),
+            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }
@@ -233,7 +237,7 @@ mod tests {
                 name: card_ref.name.clone(),
                 version: Some(VersionSpec::Pin(card_ref.version.clone())),
                 bump: None,
-                space: Some(card_ref.space.clone()),
+                space: card_ref.space.clone(),
                 uid: card_ref.uid.clone(),
                 labels: Default::default(),
                 annotations: Default::default(),

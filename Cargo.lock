@@ -9835,6 +9835,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "ulid",
  "uuid",
@@ -11071,6 +11072,7 @@ name = "wyrd-testing"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",

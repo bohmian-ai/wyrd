@@ -874,12 +874,11 @@ pub async fn spawn_audit_reconciler(
     Ok(Some(handle))
 }
 
-/// Spawn the single supervised Redux Forge maintenance scheduler.
+/// Build the single supervised Redux Forge maintenance scheduler future.
 ///
-/// The scheduler owns one bounded worker and uses the catalog, storage
-/// operator, and operator pool already composed into [`AppState`]. Its outer
-/// task converts the server cancellation token into `ForgeScheduler::shutdown`
-/// and joins the worker before returning.
+/// The returned future is the actual scheduler loop. The server inserts it
+/// directly into its supervised `JoinSet`, so an unexpected completion or
+/// panic cannot be hidden behind a detached shutdown waiter.
 ///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when the real server
@@ -887,7 +886,12 @@ pub async fn spawn_audit_reconciler(
 pub fn spawn_maintenance_scheduler(
     state: &AppState,
     shutdown: CancellationToken,
-) -> Result<tokio::task::JoinHandle<()>, ServerBootError> {
+) -> Result<
+    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
+    + Send
+    + 'static,
+    ServerBootError,
+> {
     let context = state.forge_context.as_ref().cloned().ok_or_else(|| {
         ServerBootError::ForgeSchedulerRequired {
             detail: "AppState has no shared ForgeContext".to_owned(),
@@ -895,13 +899,8 @@ pub fn spawn_maintenance_scheduler(
     })?;
 
     let scheduler =
-        vala_bifrost_redux::forge::ForgeScheduler::start((*context).clone(), state.forge_interval)?;
-    Ok(tokio::spawn(async move {
-        shutdown.cancelled().await;
-        if let Err(error) = scheduler.shutdown().await {
-            tracing::error!(error = %error, "Forge scheduler shutdown failed");
-        }
-    }))
+        vala_bifrost_redux::forge::ForgeScheduler::new((*context).clone(), state.forge_interval)?;
+    Ok(scheduler.run(shutdown))
 }
 
 /// Spawn the audit-seal worker (slice 12).

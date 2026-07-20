@@ -20,7 +20,7 @@ use crate::catalog::TenantTableBinding;
 
 use super::compact::{ForgeContext, ForgeTableKey, load_table};
 use super::error::ForgeError;
-use super::expire::{discover_tables, table_resource_for_key};
+use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
@@ -41,18 +41,6 @@ impl ProtectedLiveSet {
     #[must_use]
     pub fn contains(&self, path: &str) -> bool {
         self.paths.contains(path)
-    }
-
-    /// Number of protected paths.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.paths.len()
-    }
-
-    /// Whether the live set contains no paths.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
     }
 }
 
@@ -75,52 +63,24 @@ pub(crate) async fn run_orphan_gc_for_table(
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
+    live_set: &ProtectedLiveSet,
 ) -> Result<usize, ForgeError> {
     let mut recovered = reconcile_gc(context, lease, key, binding).await?;
-    let table = load_table(context, &binding.table_ident()).await?;
-    let live_set = build_live_set(context, key, binding, &table).await?;
-    let candidates = list_gc_candidates(context, binding, &live_set).await?;
+    let candidates = list_gc_candidates(context, binding, live_set).await?;
     if candidates.is_empty() {
         return Ok(recovered);
     }
     let detail = gc_detail(key, candidates)?;
-    append_gc_audit(context, key.tenant, &detail, "forge.orphan_gc.prepared").await?;
+    append_gc_audit(
+        context,
+        lease,
+        key.tenant,
+        &detail,
+        "forge.orphan_gc.prepared",
+    )
+    .await?;
     delete_gc_batch(context, lease, key, binding, &detail, false).await?;
     recovered += 1;
-    Ok(recovered)
-}
-
-/// Run orphan GC once across all server-discovered physical tables.
-pub async fn run_orphan_gc_tick(context: &ForgeContext) -> Result<usize, ForgeError> {
-    let owner = Uuid::now_v7();
-    let mut recovered = 0;
-    for key in discover_tables(context).await? {
-        let binding =
-            TenantTableBinding::resolve((key.tenant, key.table_ref.clone())).map_err(|error| {
-                ForgeError::Group {
-                    detail: error.to_string(),
-                }
-            })?;
-        let lease_key = super::lease::forge_lease_key(
-            key.tenant,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let Some(mut lease) = ForgeLease::acquire(
-            &context.operator_pool,
-            lease_key,
-            owner,
-            context.config.lease_ttl,
-        )
-        .await?
-        else {
-            continue;
-        };
-        recovered += run_orphan_gc_for_table(context, &mut lease, &key, &binding).await?;
-        if !lease.release(&context.operator_pool).await? {
-            tracing::warn!(lease_key = %lease.lease_key, "Forge lease release lost its fence");
-        }
-    }
     Ok(recovered)
 }
 
@@ -183,7 +143,6 @@ pub(crate) async fn build_live_set(
         r"SELECT file_path
              FROM vala.file_list
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND (NOT compacted OR committed_snapshot_id IS NULL)
             ORDER BY file_path",
     )
     .bind(key.tenant.as_uuid())
@@ -211,9 +170,8 @@ async fn list_gc_candidates(
 ) -> Result<Vec<String>, ForgeError> {
     let prefix = format!("{}/", binding.object_prefix.trim_end_matches('/'));
     let entries = context
-        .staging
-        .list_with(&prefix)
-        .recursive(true)
+        .object_store
+        .list(&prefix)
         .await
         .map_err(ForgeError::ObjectList)?;
     let now = Timestamp::now();
@@ -265,7 +223,6 @@ async fn delete_gc_batch(
     for path in candidate_paths {
         lease.require_fence(&context.operator_pool).await?;
         let table = load_table(context, &binding.table_ident()).await?;
-        let live_set = build_live_set(context, key, binding, &table).await?;
         let now = Timestamp::now();
         let normalized =
             normalize_path(&binding.object_prefix, path.as_str()).ok_or_else(|| {
@@ -273,7 +230,7 @@ async fn delete_gc_batch(
                     detail: format!("GC candidate escaped table prefix: {path}"),
                 }
             })?;
-        let metadata = match context.staging.stat(&normalized).await {
+        let metadata = match context.object_store.stat(&normalized).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 deleted.push(path.as_str().to_owned());
@@ -281,10 +238,14 @@ async fn delete_gc_batch(
             }
             Err(error) => return Err(ForgeError::ObjectDelete(error)),
         };
-        if metadata.mode() != EntryMode::FILE
+        if metadata.mode() != EntryMode::FILE {
+            skipped.push(path.as_str().to_owned());
+            continue;
+        }
+        if path_is_referenced(context, key, binding, &table, &normalized).await?
             || !is_gc_candidate(
                 &normalized,
-                &live_set,
+                &ProtectedLiveSet::default(),
                 metadata.last_modified(),
                 now,
                 context.config.orphan_gc_ttl,
@@ -293,7 +254,8 @@ async fn delete_gc_batch(
             skipped.push(path.as_str().to_owned());
             continue;
         }
-        match context.staging.delete(&normalized).await {
+        lease.require_fence(&context.operator_pool).await?;
+        match context.object_store.delete(&normalized).await {
             Ok(()) => deleted.push(path.as_str().to_owned()),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 deleted.push(path.as_str().to_owned());
@@ -314,6 +276,7 @@ async fn delete_gc_batch(
     );
     append_gc_audit(
         context,
+        lease,
         key.tenant,
         &terminal,
         if recovered {
@@ -323,6 +286,89 @@ async fn delete_gc_batch(
         },
     )
     .await
+}
+
+/// Recheck one candidate against the latest Iceberg metadata and SQL rows.
+///
+/// The scheduler builds one complete retained live set per table tick. This
+/// narrower lookup is the required final race check immediately before an
+/// object delete; it avoids rebuilding the complete set for every candidate
+/// while still protecting a reference that appeared after the initial list.
+async fn path_is_referenced(
+    context: &ForgeContext,
+    key: &ForgeTableKey,
+    binding: &TenantTableBinding,
+    table: &iceberg::table::Table,
+    path: &str,
+) -> Result<bool, ForgeError> {
+    let path = normalize_path(&binding.object_prefix, path).ok_or_else(|| ForgeError::LiveSet {
+        detail: format!("GC candidate escaped table prefix: {path}"),
+    })?;
+    if table
+        .metadata_location_result()
+        .map_err(ForgeError::Catalog)?
+        == path
+        || table
+            .metadata()
+            .metadata_log()
+            .iter()
+            .any(|entry| entry.metadata_file == path)
+    {
+        return Ok(true);
+    }
+    for snapshot in table.metadata().snapshots() {
+        if snapshot.manifest_list() == path {
+            return Ok(true);
+        }
+        let manifest_list = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .map_err(ForgeError::Catalog)?;
+        for manifest_file in manifest_list.entries() {
+            if manifest_file.manifest_path == path {
+                return Ok(true);
+            }
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            if manifest
+                .entries()
+                .iter()
+                .any(|entry| entry.data_file().file_path() == path)
+            {
+                return Ok(true);
+            }
+        }
+        if table
+            .metadata()
+            .statistics_for_snapshot(snapshot.snapshot_id())
+            .is_some_and(|statistics| statistics.statistics_path == path)
+            || table
+                .metadata()
+                .partition_statistics_for_snapshot(snapshot.snapshot_id())
+                .is_some_and(|statistics| statistics.statistics_path == path)
+        {
+            return Ok(true);
+        }
+    }
+
+    let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, key.tenant)
+        .await
+        .map_err(ForgeError::Sql)?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND file_path = $4",
+    )
+    .bind(key.tenant.as_uuid())
+    .bind(key.table_ref.namespace.as_str())
+    .bind(&key.table_ref.name)
+    .bind(&path)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .map_err(|error| ForgeError::Sql(error.into()))?;
+    conn.commit().await.map_err(ForgeError::Sql)?;
+    Ok(count > 0)
 }
 
 async fn reconcile_gc(
@@ -466,6 +512,7 @@ fn paths_to_storage(paths: Vec<String>) -> Vec<StoragePath> {
 
 async fn append_gc_audit(
     context: &ForgeContext,
+    lease: &mut ForgeLease,
     tenant: DataTenantId,
     detail: &AuditDetail,
     operation: &str,
@@ -493,12 +540,14 @@ async fn append_gc_audit(
         payload_summary: operation.to_owned(),
         detail: Some(detail.clone()),
     };
+    lease.require_fence(&context.operator_pool).await?;
     let mut conn = vala_sql::TenantConn::acquire(&context.app_pool, tenant)
         .await
         .map_err(ForgeError::Sql)?;
     vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
         .await
         .map_err(ForgeError::Sql)?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -582,7 +631,7 @@ mod tests {
         live.insert("tenants/t/traces/spans/metadata/v1.metadata.json");
         live.insert("tenants/t/traces/spans/metadata/snap-m0.avro");
         live.insert("tenants/t/traces/spans/metadata/snap-m1.avro");
-        assert_eq!(live.len(), 4);
+        assert_eq!(live.paths.len(), 4);
         assert!(live.contains("tenants/t/traces/spans/metadata/snap-m1.avro"));
     }
 

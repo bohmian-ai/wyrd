@@ -32,6 +32,7 @@ ulid = { workspace = true }
 bytes = "1"
 rand = "0.8"
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

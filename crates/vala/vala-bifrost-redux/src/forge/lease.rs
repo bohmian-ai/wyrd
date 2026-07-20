@@ -84,13 +84,6 @@ impl ForgeLease {
         self.remaining() > required
     }
 
-    pub fn renewal_interval(&self) -> Duration {
-        self.ttl
-            .checked_div(4)
-            .unwrap_or_else(|| Duration::from_millis(1))
-            .max(Duration::from_millis(1))
-    }
-
     pub async fn require_fence(&mut self, operator_pool: &OperatorPool) -> Result<(), ForgeError> {
         if self.remaining().is_zero() {
             return Err(ForgeError::FenceLost {

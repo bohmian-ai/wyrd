@@ -5,6 +5,7 @@ use std::time::Duration;
 use arrow::array::{Array, StringArray};
 use arrow::compute::{SortColumn, SortOptions, cast, lexsort_to_indices, take};
 use arrow::record_batch::RecordBatch;
+use async_trait::async_trait;
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use iceberg::Catalog;
 use iceberg::spec::{DataFile, DataFileFormat, Literal, PartitionKey, Struct};
@@ -17,7 +18,7 @@ use iceberg::writer::file_writer::{
     ParquetWriterBuilder, rolling_writer::RollingFileWriterBuilder,
 };
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use opendal::Operator;
+use opendal::{Buffer, Entry, Metadata, Operator};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use sqlx::Row;
 use uuid::Uuid;
@@ -34,7 +35,7 @@ use crate::parquet::writer_properties::bifrost_writer_properties;
 
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, stable_pack};
 use super::error::ForgeError;
-use super::lease::{ForgeLease, forge_lease_key};
+use super::lease::ForgeLease;
 
 const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
@@ -119,12 +120,59 @@ impl ForgeConfig {
     }
 }
 
+/// The object-store operations Forge performs after Scribe has staged a file.
+///
+/// Keeping this capability narrow lets production use the real `OpenDAL`
+/// operator while integration tests wrap the same seam with deterministic
+/// barriers and failures. Fixture code still uses [`ForgeContext::staging`]
+/// directly for producer writes.
+#[async_trait]
+pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
+    /// Read one staged or Iceberg-owned object.
+    async fn read(&self, path: &str) -> opendal::Result<Buffer>;
+
+    /// List all objects below a table-owned prefix.
+    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>>;
+
+    /// Read object metadata before a destructive decision.
+    async fn stat(&self, path: &str) -> opendal::Result<Metadata>;
+
+    /// Delete one object after the final live-set and fence checks.
+    async fn delete(&self, path: &str) -> opendal::Result<()>;
+}
+
+#[derive(Debug, Clone)]
+struct OpenDalForgeObjectStore {
+    operator: Arc<Operator>,
+}
+
+#[async_trait]
+impl ForgeObjectStore for OpenDalForgeObjectStore {
+    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+        self.operator.read(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+        self.operator.list_with(prefix).recursive(true).await
+    }
+
+    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+        self.operator.stat(path).await
+    }
+
+    async fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.operator.delete(path).await
+    }
+}
+
 #[derive(Clone)]
 pub struct ForgeContext {
     pub app_pool: sqlx::PgPool,
     pub operator_pool: vala_sql::OperatorPool,
     pub catalog: Arc<dyn Catalog>,
     pub staging: Arc<Operator>,
+    /// Forge's read/list/stat/delete seam, backed by `staging` by default.
+    pub object_store: Arc<dyn ForgeObjectStore>,
     pub config: ForgeConfig,
 }
 
@@ -147,9 +195,20 @@ impl ForgeContext {
             app_pool,
             operator_pool,
             catalog,
+            object_store: Arc::new(OpenDalForgeObjectStore {
+                operator: Arc::clone(&staging),
+            }),
             staging,
             config,
         })
+    }
+
+    /// Replace Forge's scoped object-store seam while retaining the raw
+    /// operator used by producer fixtures and ordinary callers.
+    #[must_use]
+    pub fn with_object_store(mut self, object_store: Arc<dyn ForgeObjectStore>) -> Self {
+        self.object_store = object_store;
+        self
     }
 }
 
@@ -159,6 +218,9 @@ pub struct ForgeTickOutcome {
     pub bins_committed: usize,
     pub bins_skipped: usize,
     pub reconciled: usize,
+    pub tables_succeeded: usize,
+    pub tables_skipped: usize,
+    pub tables_failed: usize,
 }
 
 pub(crate) async fn load_table(
@@ -244,99 +306,6 @@ pub(crate) async fn run_compaction_bins_for_table(
 pub(crate) struct CandidateRow {
     key: ForgeGroupKey,
     files: Vec<CandidateFile>,
-}
-
-pub async fn run_compaction_tick(context: &ForgeContext) -> Result<ForgeTickOutcome, ForgeError> {
-    let mut outcome = ForgeTickOutcome {
-        groups_seen: 0,
-        ..ForgeTickOutcome::default()
-    };
-    let owner = Uuid::now_v7();
-    for key in load_reconciliation_keys(context).await? {
-        outcome.groups_seen += 1;
-        let binding =
-            TenantTableBinding::resolve((key.tenant, key.table_ref.clone())).map_err(|error| {
-                ForgeError::Group {
-                    detail: error.to_string(),
-                }
-            })?;
-        let lease_key =
-            forge_lease_key(key.tenant, &binding.logical_namespace, &binding.table_name);
-        let Some(mut lease) = ForgeLease::acquire(
-            &context.operator_pool,
-            lease_key,
-            owner,
-            context.config.lease_ttl,
-        )
-        .await?
-        else {
-            outcome.bins_skipped += 1;
-            continue;
-        };
-        outcome.reconciled += reconcile_group(context, &mut lease, &key, &binding).await?;
-        if !lease.release(&context.operator_pool).await? {
-            tracing::warn!(lease_key = %lease.lease_key, "Forge lease release lost its fence");
-        }
-    }
-
-    let mut rows = select_candidate_groups(&context.operator_pool, &context.config).await?;
-    rows.sort_by_key(|left| left.key.audit_resource());
-    for row in rows {
-        outcome.groups_seen += 1;
-        let binding = TenantTableBinding::resolve((row.key.tenant, row.key.table_ref.clone()))
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-        let lease_key = forge_lease_key(
-            row.key.tenant,
-            &binding.logical_namespace,
-            &binding.table_name,
-        );
-        let Some(mut lease) = ForgeLease::acquire(
-            &context.operator_pool,
-            lease_key,
-            owner,
-            context.config.lease_ttl,
-        )
-        .await?
-        else {
-            outcome.bins_skipped += 1;
-            continue;
-        };
-
-        let bins = stable_pack(
-            row.files,
-            context.config.target_bin_bytes,
-            context.config.max_files_per_bin,
-        );
-        let mut file_budget = 0_usize;
-        let mut byte_budget = 0_u64;
-        for bin in bins.into_iter().take(context.config.max_bins_per_tick) {
-            if file_budget.saturating_add(bin.files.len()) > context.config.max_files_per_tick
-                || byte_budget.saturating_add(bin.total_bytes) > context.config.max_bytes_per_tick
-            {
-                outcome.bins_skipped += 1;
-                continue;
-            }
-            if !lease.renew(&context.operator_pool).await? {
-                return Err(ForgeError::FenceLost {
-                    lease_key: lease.lease_key.clone(),
-                });
-            }
-            if !lease.commit_window_fits(context.config.commit_window()) {
-                outcome.bins_skipped += 1;
-                break;
-            }
-            compact_bin(context, &mut lease, &row.key, &binding, &bin).await?;
-            file_budget += bin.files.len();
-            byte_budget = byte_budget.saturating_add(bin.total_bytes);
-            outcome.bins_committed += 1;
-        }
-        if !lease.release(&context.operator_pool).await? {
-            tracing::warn!(lease_key = %lease.lease_key, "Forge lease release lost its fence");
-        }
-    }
-    Ok(outcome)
 }
 
 pub(crate) async fn select_candidate_groups(
@@ -507,7 +476,9 @@ async fn compact_bin(
     let operation_id = operation_id(key, bin);
     let table = load_table(context, &binding.table_ident()).await?;
     let batch = read_and_project_staging(context, &table, key, bin).await?;
+    lease.require_fence(&context.operator_pool).await?;
     let output = write_output(&table, binding, operation_id, key.partition_day, &batch).await?;
+    lease.require_fence(&context.operator_pool).await?;
     let prepared = forge_detail(
         key,
         bin,
@@ -517,11 +488,7 @@ async fn compact_bin(
         None,
     )?;
     prepare_inputs(context, lease, key, bin, prepared).await?;
-    if !lease.renew(&context.operator_pool).await? {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
+    lease.require_fence(&context.operator_pool).await?;
     if !lease.commit_window_fits(context.config.commit_window()) {
         return Err(ForgeError::FenceLost {
             lease_key: lease.lease_key.clone(),
@@ -539,6 +506,12 @@ async fn compact_bin(
         .set_commit_uuid(operation_id)
         .set_snapshot_properties(properties);
     let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
+    lease.require_fence(&context.operator_pool).await?;
+    if !lease.commit_window_fits(context.config.commit_window()) {
+        return Err(ForgeError::FenceLost {
+            lease_key: lease.lease_key.clone(),
+        });
+    }
     match tokio::time::timeout(
         context.config.iceberg_total_retry_timeout,
         transaction.commit(context.catalog.as_ref()),
@@ -590,7 +563,7 @@ async fn read_and_project_staging(
     let mut source_schema = None;
     for file in &bin.files {
         let bytes = context
-            .staging
+            .object_store
             .read(&file.path)
             .await
             .map_err(ForgeError::ObjectStore)?
@@ -859,7 +832,9 @@ async fn prepare_inputs(
             detail: "prepared transition did not claim every input file".to_owned(),
         });
     }
+    lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail).await?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -906,7 +881,9 @@ async fn stamp_committed(
         ForgeCompactionPhase::Committed,
         Some(snapshot_id),
     )?;
+    lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.committed", detail).await?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -951,7 +928,9 @@ async fn reset_inputs(
         ForgeCompactionPhase::Reset,
         None,
     )?;
+    lease.require_fence(&context.operator_pool).await?;
     append_system_audit(&mut conn, key, "forge.file_compact.reset", detail).await?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -1255,6 +1234,7 @@ async fn stamp_reconciled(
         terminal_detail(detail, ForgeCompactionPhase::Recovered, Some(snapshot_id)),
     )
     .await?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -1296,6 +1276,7 @@ async fn reset_reconciled(
         terminal_detail(detail, ForgeCompactionPhase::Reset, None),
     )
     .await?;
+    lease.require_fence(&context.operator_pool).await?;
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
@@ -1404,7 +1385,9 @@ fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
         hasher.update(file.path.as_bytes());
     }
     let digest = hasher.finalize();
-    Uuid::from_bytes(digest[..16].try_into().expect("SHA-256 prefix is 16 bytes"))
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 #[cfg(test)]

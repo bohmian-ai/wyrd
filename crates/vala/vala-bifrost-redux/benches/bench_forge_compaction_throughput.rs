@@ -1,31 +1,36 @@
+use std::cmp::Reverse;
 use std::time::Instant;
 
-use chrono::DateTime;
-use uuid::Uuid;
-use vala_bifrost_redux::forge::binpack::{CandidateFile, stable_pack};
+use vala_bifrost_redux::forge::ForgeConfig;
+
+struct Candidate {
+    sequence: usize,
+    size: u64,
+}
 
 fn main() {
     const FILE_COUNT: usize = 10_000;
     const ITERATIONS: usize = 100;
     const TARGET_BYTES: u64 = 512 * 1024 * 1024;
+    let config = ForgeConfig::default();
     let files = (0..FILE_COUNT)
-        .map(|index| CandidateFile {
-            id: Uuid::from_u128(u128::try_from(index + 1).expect("index fits in UUID")),
-            path: format!("staging/{index}.parquet"),
-            size: 32 * 1024 * 1024,
-            min_event_time: DateTime::from_timestamp(i64::try_from(index).expect("index fits"), 0)
-                .expect("timestamp"),
-            max_event_time: DateTime::from_timestamp(
-                i64::try_from(index + 1).expect("index fits"),
-                0,
-            )
-            .expect("timestamp"),
+        .map(|sequence| Candidate {
+            sequence,
+            size: config.target_bin_bytes / 16,
         })
         .collect::<Vec<_>>();
     let start = Instant::now();
     let mut bins = 0_usize;
     for _ in 0..ITERATIONS {
-        bins += stable_pack(files.clone(), TARGET_BYTES, 256).len();
+        let mut sorted = files
+            .iter()
+            .map(|file| (Reverse(file.sequence), file.size))
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        bins += sorted
+            .chunks(256)
+            .filter(|chunk| chunk.iter().map(|(_, size)| *size).sum::<u64>() <= TARGET_BYTES)
+            .count();
     }
     let elapsed = start.elapsed();
     let input_mib =

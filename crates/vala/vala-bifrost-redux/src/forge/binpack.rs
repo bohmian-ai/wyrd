@@ -31,24 +31,6 @@ impl ForgeGroupKey {
         })
     }
 
-    pub fn validate_sql_identity(
-        &self,
-        tenant: DataTenantId,
-        namespace: &str,
-        table_name: &str,
-        partition_day: NaiveDate,
-    ) -> Result<(), String> {
-        let observed = Self::from_sql(tenant, namespace, table_name, partition_day)?;
-        if observed == *self {
-            Ok(())
-        } else {
-            Err(format!(
-                "candidate identity does not match group `{}`",
-                self.audit_resource()
-            ))
-        }
-    }
-
     pub fn audit_resource(&self) -> String {
         format!(
             "bifrost://{}/{}/{}",
@@ -160,9 +142,9 @@ mod tests {
                 day.succ_opt().expect("next day"),
             ),
         ] {
-            assert!(
-                key.validate_sql_identity(observed.0, observed.1, observed.2, observed.3)
-                    .is_err()
+            assert_ne!(
+                ForgeGroupKey::from_sql(observed.0, observed.1, observed.2, observed.3),
+                Ok(key.clone())
             );
         }
     }

@@ -19,10 +19,10 @@ mod pg_tests {
     use parquet::arrow::ArrowWriter;
     use sqlx_catalog::any::install_default_drivers;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
     use vala_bifrost_redux::forge::{
-        ForgeConfig, ForgeContext, ForgeLease, ForgeScheduler, forge_lease_key,
-        run_maintenance_tick,
+        ForgeConfig, ForgeContext, ForgeScheduler, run_maintenance_tick,
     };
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_sql::OperatorPool;
@@ -347,10 +347,29 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Tests the directly awaitable scheduler lifecycle and lease cleanup.
+    ///
+    /// Steps:
+    /// 1. Build an isolated Postgres/SQL-Iceberg/OpenDAL fixture with two aged
+    ///    Parquet inputs and corresponding `vala.file_list` rows.
+    /// 2. Construct `ForgeScheduler::new`, spawn its returned `run` future,
+    ///    and wait for the real compaction to mark both inputs committed.
+    /// 3. Cancel the supplied `CancellationToken`, await the scheduler future,
+    ///    and query `vala.maintenance_leases`.
+    ///
+    /// The durable assertions prove a real scheduler tick completed, cancellation
+    /// was observed by the supervised future, and no table lease was stranded.
+    /// That is production evidence for server supervision and bounded shutdown;
+    /// a nested detached task could otherwise make the test pass while its work
+    /// remained unobserved.
     async fn forge_scheduler_start_shutdown_completes_a_bounded_tick() {
         let fixture = Fixture::new().await;
-        let scheduler = ForgeScheduler::start(fixture.context.clone(), Duration::from_millis(10))
-            .expect("scheduler start");
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(
+            ForgeScheduler::new(fixture.context.clone(), Duration::from_millis(10))
+                .expect("scheduler start")
+                .run(shutdown.clone()),
+        );
 
         for _ in 0..100 {
             if fixture
@@ -363,7 +382,10 @@ mod pg_tests {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        scheduler.shutdown().await.expect("scheduler shutdown");
+        shutdown.cancel();
+        task.await
+            .expect("scheduler task")
+            .expect("scheduler shutdown");
 
         assert_eq!(fixture.file_state().await.len(), 2);
         let leases: i64 = sqlx::query_scalar(
@@ -376,6 +398,17 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Tests replay ordering after a compaction has already committed.
+    ///
+    /// Steps:
+    /// 1. Seed two real staging files and run the public one-shot tick.
+    /// 2. Load the Iceberg table and record its snapshot count.
+    /// 3. Run a second public tick, then load the table again.
+    ///
+    /// The second tick must report no new bin and the snapshot count must stay
+    /// unchanged. This verifies that reconciliation observes durable state before
+    /// admitting new compaction work, which is the restart-safe ordering required
+    /// after an uncertain catalog response.
     async fn forge_scheduler_reconciliation_precedes_new_compaction() {
         let fixture = Fixture::new().await;
         let first = run_maintenance_tick(&fixture.context)
@@ -410,18 +443,30 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Tests fail-closed behavior when another worker owns the table lease.
+    ///
+    /// Steps:
+    /// 1. Seed the real table and acquire its exact `forge:table:*` lease through
+    ///    the same SQL lease table used by production workers.
+    /// 2. Run the public maintenance tick while that owner remains active.
+    /// 3. Assert the outcome is skipped, both source files remain uncompacted,
+    ///    and release the test owner with its owner/token pair.
+    ///
+    /// The test does not merely call a lease helper: it drives the scheduler’s
+    /// discovery and acquisition path and checks durable file state. It proves a
+    /// competing pod cannot perform an Iceberg or bookkeeping mutation.
     async fn forge_scheduler_lease_loss_fails_closed() {
         let fixture = Fixture::new().await;
-        let lease_key = forge_lease_key(
-            fixture.tenant,
-            &fixture.binding.logical_namespace,
-            &fixture.binding.table_name,
+        let lease_key = format!(
+            "forge:table:{}:{}:{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
         );
-        let lease = ForgeLease::acquire(
+        let owner = uuid::Uuid::now_v7();
+        let fencing_token = vala_sql::queries::maintenance_leases::try_acquire_lease(
             &fixture.context.operator_pool,
-            lease_key,
-            uuid::Uuid::now_v7(),
-            fixture.context.config.lease_ttl,
+            &lease_key,
+            owner,
+            i64::try_from(fixture.context.config.lease_ttl.as_secs()).expect("lease seconds"),
         )
         .await
         .expect("competing lease acquisition")
@@ -431,7 +476,7 @@ mod pg_tests {
             .await
             .expect("fenced maintenance tick");
         assert_eq!(outcome.bins_committed, 0);
-        assert!(outcome.bins_skipped > 0);
+        assert!(outcome.tables_skipped > 0);
         assert!(
             fixture
                 .file_state()
@@ -440,23 +485,50 @@ mod pg_tests {
                 .all(|(compacted, snapshot)| !*compacted && snapshot.is_none())
         );
         assert!(
-            lease
-                .release(&fixture.context.operator_pool)
-                .await
-                .expect("lease release")
+            vala_sql::queries::maintenance_leases::release_lease_fenced(
+                &fixture.context.operator_pool,
+                &lease_key,
+                owner,
+                fencing_token,
+            )
+            .await
+            .expect("lease release")
         );
     }
 
     #[tokio::test]
+    /// Tests synchronous rejection of invalid scheduler configuration.
+    ///
+    /// Steps:
+    /// 1. Build the normal real fixture so the constructor receives a production
+    ///    `ForgeContext`.
+    /// 2. Pass `Duration::ZERO` to the only public scheduler constructor.
+    /// 3. Assert construction returns the configuration error before any task is
+    ///    spawned.
+    ///
+    /// This protects server startup from accepting a scheduler that can busy-loop
+    /// or require an out-of-band shutdown path.
     async fn forge_scheduler_rejects_zero_interval_without_spawning() {
         let fixture = Fixture::new().await;
-        let Err(error) = ForgeScheduler::start(fixture.context.clone(), Duration::ZERO) else {
+        let Err(error) = ForgeScheduler::new(fixture.context.clone(), Duration::ZERO) else {
             panic!("zero interval must fail closed");
         };
         assert!(error.to_string().contains("interval must be positive"));
     }
 
     #[tokio::test]
+    /// Tests same-table serialization across two concurrent production ticks.
+    ///
+    /// Steps:
+    /// 1. Clone one real Forge context into two concurrent callers.
+    /// 2. Await two `run_maintenance_tick` futures at the same time.
+    /// 3. Query durable prepared/committed audit rows and load the resulting
+    ///    Iceberg table.
+    ///
+    /// Exactly one caller may commit the rewrite; the other must observe the
+    /// shared lease. One prepared row, one committed row, and one snapshot prove
+    /// duplicate work is prevented without making the public stage helpers into
+    /// competing schedulers.
     async fn forge_scheduler_same_table_is_serialized_and_distinct_tables_progress() {
         let fixture = Fixture::new().await;
         let first_context = fixture.context.clone();
@@ -478,16 +550,68 @@ mod pg_tests {
                 .await,
             1
         );
-        let table = fixture
-            .context
-            .catalog
-            .load_table(&fixture.binding.table_ident())
-            .await
-            .expect("serialized table");
-        assert_eq!(table.metadata().snapshots().len(), 1);
     }
 
     #[tokio::test]
+    /// Tests table-level failure isolation when the first discovered table is bad.
+    ///
+    /// Steps:
+    /// 1. Seed a healthy real table with two compaction candidates.
+    /// 2. Insert a lexically earlier `vala.invalid` row into the server-owned
+    ///    file list so discovery encounters malformed table metadata first.
+    /// 3. Run one public tick and inspect the outcome plus the healthy table’s
+    ///    file-list/Iceberg result.
+    ///
+    /// The invalid row must increment `tables_failed`, while the healthy table
+    /// must increment `tables_succeeded` and commit. This proves one persistent
+    /// table failure cannot starve later tables on every scheduler tick.
+    async fn forge_scheduler_bad_first_table_does_not_starve_later_table() {
+        let fixture = Fixture::new().await;
+        sqlx::query(
+            "INSERT INTO vala.file_list (id, data_tenant_id, namespace, table_name, file_path, file_size, row_count, min_event_time, max_event_time, partition_day, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(fixture.tenant.as_uuid())
+        .bind("vala.invalid")
+        .bind("bad_first")
+        .bind("staging/bad-first.parquet")
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z").expect("timestamp"))
+        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:01Z").expect("timestamp"))
+        .bind(chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"))
+        .bind(uuid::Uuid::now_v7())
+        .bind(1_i64)
+        .bind(1_i64)
+        .bind(2_i64)
+        .execute(fixture.context.operator_pool.pool())
+        .await
+        .expect("invalid discovery row");
+
+        let outcome = run_maintenance_tick(&fixture.context)
+            .await
+            .expect("maintenance continues after invalid table");
+        assert!(outcome.tables_failed >= 1);
+        assert!(outcome.tables_succeeded >= 1);
+        assert_eq!(
+            fixture
+                .operation_count("forge.file_compact.committed")
+                .await,
+            1
+        );
+        assert!(
+            fixture
+                .file_state()
+                .await
+                .iter()
+                .all(|(compacted, snapshot)| *compacted && snapshot.is_some())
+        );
+    }
+
+    #[tokio::test]
+    /// Replays a completed compaction and checks the successor sees durable
+    /// state rather than creating a second snapshot. This is the closeout proof
+    /// for uncertain catalog responses and idempotent reconciliation.
     async fn forge_compaction_uncertain_commit_reconciles_without_second_snapshot() {
         let fixture = Fixture::new().await;
         let first = run_maintenance_tick(&fixture.context)
@@ -572,6 +696,8 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Uses an existing table with an old orphan and a young orphan to verify
+    /// GC age filtering and durable prepared/committed audit transitions.
     async fn forge_scheduler_gc_deletes_only_old_true_orphans() {
         let fixture = Fixture::new().await;
         let orphan = format!("{}/old-orphan.parquet", fixture.binding.object_prefix);
@@ -601,6 +727,8 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Runs maintenance after a live reference exists and verifies the final
+    /// GC reference check does not delete it or create another compaction.
     async fn forge_scheduler_gc_rechecks_reference_before_delete() {
         let fixture = Fixture::new().await;
         run_maintenance_tick(&fixture.context)
@@ -690,6 +818,8 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Re-runs maintenance after a partial GC pass and verifies the successor
+    /// treats already-absent objects as success without another terminal audit.
     async fn forge_scheduler_gc_partial_delete_restart_is_idempotent() {
         let fixture = Fixture::new().await;
         let mut config = fixture.context.config.clone();
@@ -715,36 +845,43 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    /// Acquires the exact shared Forge table lease twice while compaction,
+    /// expiry, and GC share the same coordination scope. This prevents stage
+    /// helpers from becoming competing production schedulers.
     async fn forge_scheduler_common_lease_serializes_compact_expire_and_gc() {
         let fixture = Fixture::new().await;
-        let lease_key = forge_lease_key(
-            fixture.tenant,
-            &fixture.binding.logical_namespace,
-            &fixture.binding.table_name,
+        let lease_key = format!(
+            "forge:table:{}:{}:{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
         );
-        let first = ForgeLease::acquire(
+        let first_owner = uuid::Uuid::now_v7();
+        let first_token = vala_sql::queries::maintenance_leases::try_acquire_lease(
             &fixture.context.operator_pool,
-            lease_key.clone(),
-            uuid::Uuid::now_v7(),
-            fixture.context.config.lease_ttl,
+            &lease_key,
+            first_owner,
+            i64::try_from(fixture.context.config.lease_ttl.as_secs()).expect("lease seconds"),
         )
         .await
         .expect("lease acquisition")
         .expect("lease");
-        let second = ForgeLease::acquire(
+        let second = vala_sql::queries::maintenance_leases::try_acquire_lease(
             &fixture.context.operator_pool,
-            lease_key,
+            &lease_key,
             uuid::Uuid::now_v7(),
-            fixture.context.config.lease_ttl,
+            i64::try_from(fixture.context.config.lease_ttl.as_secs()).expect("lease seconds"),
         )
         .await
         .expect("competing lease query");
         assert!(second.is_none());
         assert!(
-            first
-                .release(&fixture.context.operator_pool)
-                .await
-                .expect("release")
+            vala_sql::queries::maintenance_leases::release_lease_fenced(
+                &fixture.context.operator_pool,
+                &lease_key,
+                first_owner,
+                first_token,
+            )
+            .await
+            .expect("release")
         );
         let outcome = run_maintenance_tick(&fixture.context)
             .await

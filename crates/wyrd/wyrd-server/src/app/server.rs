@@ -372,17 +372,11 @@ impl BoundServer {
 
         // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
         // live-set rebuild, and orphan GC for this process.
-        let scheduler_handle = spawn_maintenance_scheduler(&self.state, shutdown.clone())
+        let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?;
-        set.spawn(worker_task(
+        set.spawn(fallible_task(
             TaskId::Worker("maintenance_scheduler"),
-            async move {
-                if let Err(join_error) = scheduler_handle.await
-                    && join_error.is_panic()
-                {
-                    std::panic::resume_unwind(join_error.into_panic());
-                }
-            },
+            scheduler,
         ));
 
         // Audit-seal worker (slice 12): seals shipped audit ranges into signed

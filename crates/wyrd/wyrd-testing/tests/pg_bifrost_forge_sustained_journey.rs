@@ -1,103 +1,153 @@
-use std::collections::BTreeSet;
-use std::sync::Arc;
+//! Gated sustained Forge journey over durable Scribe-shaped inputs.
+
 use std::time::Duration;
 
-use tokio::sync::RwLock;
-use vala_bifrost_redux::forge::ForgeScheduler;
+use vala_bifrost_redux::forge::run_maintenance_tick;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::load::{QueryResponse, SustainedLoadHarness, TenantWorkload};
+use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group};
 
 #[tokio::test]
-#[ignore = "requires the sustained Forge compaction lane"]
+#[ignore = "gated journey: bound Wyrd server plus durable multi-table workload"]
+/// Tests sustained production scheduling against durable Parquet, Iceberg, SQL,
+/// audit, and lease state.
+///
+/// Steps:
+/// 1. Start one bound Wyrd server, which starts its production Forge scheduler,
+///    and seed three physical tables through the shared Postgres/SQL-Iceberg/
+///    OpenDAL fixture.
+/// 2. Run three concurrent producer tasks. Each appends aged Scribe-shaped
+///    Parquet files and matching `vala.file_list` rows to one table for several
+///    cycles, while the server scheduler runs every 10 ms.
+/// 3. Drain with public one-shot ticks, then query durable `file_list` counts,
+///    committed snapshots, audit pairs, and maintenance leases.
+///
+/// The assertions verify exact durable row-count conservation, a readable
+/// committed snapshot per table, matched prepared/committed audit pairs,
+/// and no lease residue.
+/// This catches loss, duplicate bookkeeping, table starvation, and shutdown
+/// cleanup failures that a health endpoint or in-memory load callback cannot see.
 async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak() {
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_millis(10))
         .start_bound()
         .await
-        .expect("test server");
-    let forge_context = server
-        .state()
-        .forge_context
-        .as_ref()
-        .cloned()
-        .expect("Forge context");
-    let scheduler = ForgeScheduler::start((*forge_context).clone(), Duration::from_millis(10))
-        .expect("sustained scheduler");
-    let tenant = server.data_tenant_id();
-    let rows = Arc::new(RwLock::new(Vec::new()));
-    let live_files = Arc::new(RwLock::new(BTreeSet::new()));
-    let rows_for_ingest = Arc::clone(&rows);
-    let live_files_for_ingest = Arc::clone(&live_files);
-    let rows_for_query = Arc::clone(&rows);
-    let client = reqwest::Client::new();
-    let query_client = client.clone();
-    let base_url = server.base_url().expect("bound URL").to_owned();
-    let workload = TenantWorkload::simple(tenant, 1, 1, "SELECT row_id FROM forge_rows");
-    let workload_b = TenantWorkload::simple(
-        wyrd_spec::DataTenantId::new_v7(),
-        1,
-        1,
-        "SELECT row_id FROM forge_rows",
-    );
-    let workload_c = TenantWorkload::simple(
-        wyrd_spec::DataTenantId::new_v7(),
-        1,
-        1,
-        "SELECT row_id FROM forge_rows",
-    );
-    let harness = SustainedLoadHarness::new(server)
-        .with_duration(Duration::from_secs(30))
-        .with_workload(workload)
-        .with_workload(workload_b)
-        .with_workload(workload_c)
-        .with_ingest(move |request| {
-            let rows = Arc::clone(&rows_for_ingest);
-            let live_files = Arc::clone(&live_files_for_ingest);
-            async move {
-                rows.write().await.push(request.row);
-                live_files.write().await.insert(format!(
-                    "tenants/{}/forge/{}.parquet",
-                    request.tenant, request.row_id
-                ));
-                Ok(1)
-            }
+        .expect("real test server");
+    let fixtures = vec![
+        seed_forge_group(&server, "sustained_rows_a").await,
+        seed_forge_group(&server, "sustained_rows_b").await,
+        seed_forge_group(&server, "sustained_rows_c").await,
+    ];
+    let producer_fixtures = fixtures.clone();
+    let producers = producer_fixtures
+        .into_iter()
+        .enumerate()
+        .map(|(table_index, fixture)| {
+            tokio::spawn(async move {
+                for cycle in 0..10_i64 {
+                    fixture
+                        .append_forge_file(table_index as i64 * 100 + cycle * 2)
+                        .await;
+                    fixture
+                        .append_forge_file(table_index as i64 * 100 + cycle * 2 + 1)
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
         })
-        .with_query(move |request| {
-            let rows = Arc::clone(&rows_for_query);
-            let client = query_client.clone();
-            let url = format!("{base_url}/healthz");
-            async move {
-                client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|error| wyrd_testing::load::LoadError::Callback {
-                        tenant: request.tenant,
-                        message: error.to_string(),
-                    })?
-                    .error_for_status()
-                    .map_err(|error| wyrd_testing::load::LoadError::Callback {
-                        tenant: request.tenant,
-                        message: error.to_string(),
-                    })?;
-                let expected_tenant = request.tenant.to_string();
-                let rows = rows
-                    .read()
-                    .await
-                    .iter()
-                    .filter(|row| {
-                        row.get("data_tenant_id")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(expected_tenant.as_str())
-                    })
-                    .cloned()
-                    .collect();
-                Ok(QueryResponse { rows })
-            }
-        });
-    let report = harness.run().await.expect("sustained Forge journey");
-    assert_eq!(report.missing_rows, 0);
-    assert!(!live_files.read().await.is_empty());
-    scheduler.shutdown().await.expect("scheduler shutdown");
-    harness.shutdown().await.expect("server shutdown");
+        .collect::<Vec<_>>();
+    for producer in producers {
+        producer.await.expect("producer task");
+    }
+
+    for _ in 0..20 {
+        for fixture in &fixtures {
+            run_maintenance_tick(&fixture.context)
+                .await
+                .expect("durable Forge drain tick");
+        }
+        if pending_file_count(&fixtures[0]).await == 0
+            && pending_file_count(&fixtures[1]).await == 0
+            && pending_file_count(&fixtures[2]).await == 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    for fixture in &fixtures {
+        assert_eq!(pending_file_count(fixture).await, 0);
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(row_count), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_one(fixture.context.operator_pool.pool())
+        .await
+        .expect("durable row count");
+        assert_eq!(rows, 24);
+        let committed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed' AND resource = $2",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+        ))
+        .fetch_one(fixture.context.operator_pool.pool())
+        .await
+        .expect("durable committed audit count");
+        assert!(committed >= 1);
+        let prepared: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.prepared' AND resource = $2",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+        ))
+        .fetch_one(fixture.context.operator_pool.pool())
+        .await
+        .expect("durable prepared audit count");
+        assert_eq!(prepared, committed);
+        assert!(
+            fixture
+                .context
+                .catalog
+                .load_table(&fixture.binding.table_ident())
+                .await
+                .expect("durable catalog read")
+                .metadata()
+                .current_snapshot_id()
+                .is_some()
+        );
+    }
+    let operator_pool = fixtures[0].context.operator_pool.clone();
+    let mut leases = i64::MAX;
+    for _ in 0..100 {
+        leases = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE 'forge:table:%'",
+        )
+        .fetch_one(operator_pool.pool())
+        .await
+        .expect("durable lease count");
+        if leases == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(leases, 0);
+    server.shutdown().await.expect("server shutdown");
+}
+
+async fn pending_file_count(fixture: &ForgeFixture) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND NOT compacted",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.context.operator_pool.pool())
+    .await
+    .expect("pending file count")
 }

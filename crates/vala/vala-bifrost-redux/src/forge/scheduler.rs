@@ -1,11 +1,10 @@
 use std::time::Duration;
 
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::compact::{
-    ForgeContext, ForgeTickOutcome, run_compaction_bins_for_table,
+    ForgeContext, ForgeTableKey, ForgeTickOutcome, run_compaction_bins_for_table,
     run_compaction_reconciliation_for_table,
 };
 use super::error::ForgeError;
@@ -15,146 +14,233 @@ use super::orphan_gc::{build_live_set, run_orphan_gc_for_table};
 use crate::catalog::TenantTableBinding;
 
 pub struct ForgeScheduler {
-    stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    context: ForgeContext,
+    interval: Duration,
 }
 
 impl ForgeScheduler {
-    pub fn start(context: ForgeContext, interval: Duration) -> Result<Self, ForgeError> {
+    /// Construct the one production Forge scheduler surface.
+    pub fn new(context: ForgeContext, interval: Duration) -> Result<Self, ForgeError> {
         if interval.is_zero() {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge scheduler interval must be positive".to_owned(),
             });
         }
-        let (stop, mut stopped) = watch::channel(false);
-        let task = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        if let Err(error) = run_maintenance_tick_with_stop(&context, &stopped).await {
-                            tracing::error!(error = %error, "Forge maintenance tick failed");
-                        }
-                    }
-                    changed = stopped.changed() => {
-                        if changed.is_err() || *stopped.borrow() {
-                            break;
-                        }
+        Ok(Self { context, interval })
+    }
+
+    /// Run until `shutdown` is cancelled.
+    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+        let mut ticker = tokio::time::interval(self.interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                _ = ticker.tick() => {
+                    match run_maintenance_tick_with_stop(&self.context, &shutdown).await {
+                        Ok(outcome) => tracing::debug!(
+                            groups_seen = outcome.groups_seen,
+                            bins_committed = outcome.bins_committed,
+                            tables_succeeded = outcome.tables_succeeded,
+                            tables_skipped = outcome.tables_skipped,
+                            tables_failed = outcome.tables_failed,
+                            "Forge maintenance tick completed"
+                        ),
+                        Err(error) => tracing::error!(error = %error, "Forge maintenance tick failed"),
                     }
                 }
             }
-        });
-        Ok(Self { stop, task })
-    }
-
-    pub async fn shutdown(self) -> Result<(), ForgeError> {
-        self.stop.send(true).map_err(|_| ForgeError::Shutdown)?;
-        self.task.await.map_err(|error| ForgeError::Reconciliation {
-            detail: error.to_string(),
-        })
+        }
     }
 }
 
 /// Run all Forge maintenance stages once.
 pub async fn run_maintenance_tick(context: &ForgeContext) -> Result<ForgeTickOutcome, ForgeError> {
-    let (_sender, stopped) = watch::channel(false);
-    run_maintenance_tick_with_stop(context, &stopped).await
+    run_maintenance_tick_with_stop(context, &CancellationToken::new()).await
 }
 
+/// Discover and process one complete maintenance tick.
+///
+/// Discovery and deterministic ordering happen once per tick. Each discovered
+/// table is then handed to [`process_table`], so binding errors, lease
+/// contention, stage failures, and release failures affect only that table.
+/// A database failure while discovering the table set remains a tick-level
+/// error because no safe ordered work set exists in that case.
 async fn run_maintenance_tick_with_stop(
     context: &ForgeContext,
-    stopped: &watch::Receiver<bool>,
+    stopped: &CancellationToken,
 ) -> Result<ForgeTickOutcome, ForgeError> {
     let owner = Uuid::now_v7();
     let mut outcome = ForgeTickOutcome::default();
-    let mut tables = discover_tables(context).await?;
+    let (mut tables, discovery_failures) = discover_tables(context).await?;
+    outcome.tables_failed = outcome.tables_failed.saturating_add(discovery_failures);
     tables.sort_by(|left, right| {
         left.tenant
             .cmp(&right.tenant)
             .then_with(|| left.table_ref.fqn().cmp(&right.table_ref.fqn()))
     });
     for key in tables {
-        if *stopped.borrow() {
+        if stopped.is_cancelled() {
             break;
         }
-        let binding =
-            TenantTableBinding::resolve((key.tenant, key.table_ref.clone())).map_err(|error| {
-                ForgeError::Group {
-                    detail: error.to_string(),
-                }
-            })?;
-        let lease_key =
-            forge_lease_key(key.tenant, &binding.logical_namespace, &binding.table_name);
-        let Some(mut lease) = ForgeLease::acquire(
-            &context.operator_pool,
-            lease_key,
-            owner,
-            context.config.lease_ttl,
-        )
-        .await?
-        else {
-            outcome.bins_skipped += 1;
-            continue;
-        };
-
-        // One fence covers reconciliation -> compaction -> expiry -> live-set
-        // rebuild -> GC for this physical table. Keep the release outside the
-        // stage future so an external failure cannot strand the lease row.
-        let table_result: Result<bool, ForgeError> = async {
-            outcome.reconciled +=
-                run_compaction_reconciliation_for_table(context, &mut lease, &key, &binding)
-                    .await?;
-            if *stopped.borrow() {
-                return Ok(true);
-            }
-
-            let compaction =
-                run_compaction_bins_for_table(context, &mut lease, &key, &binding).await?;
-            outcome.groups_seen += compaction.groups_seen;
-            outcome.bins_committed += compaction.bins_committed;
-            outcome.bins_skipped += compaction.bins_skipped;
-            outcome.reconciled += compaction.reconciled;
-            if *stopped.borrow() {
-                return Ok(true);
-            }
-
-            outcome.reconciled +=
-                run_snapshot_expiry_for_table(context, &mut lease, &key, &binding).await?;
-            if *stopped.borrow() {
-                return Ok(true);
-            }
-
-            let table = super::compact::load_table(context, &binding.table_ident()).await?;
-            let _live_set = build_live_set(context, &key, &binding, &table).await?;
-            if *stopped.borrow() {
-                return Ok(true);
-            }
-            outcome.reconciled +=
-                run_orphan_gc_for_table(context, &mut lease, &key, &binding).await?;
-            Ok(false)
-        }
-        .await;
-        let release_result = release_lease(context, &lease).await;
-        match (table_result, release_result) {
-            (Ok(stop_after), Ok(())) => {
-                if stop_after {
+        match process_table(context, &key, owner, stopped, &mut outcome).await {
+            TableRunStatus::Succeeded => outcome.tables_succeeded += 1,
+            TableRunStatus::Skipped => {
+                outcome.tables_skipped += 1;
+                if stopped.is_cancelled() {
                     break;
                 }
             }
-            (Err(error), Ok(())) => return Err(error),
-            (Ok(_), Err(release_error)) => return Err(release_error),
-            (Err(error), Err(release_error)) => {
-                tracing::warn!(
-                    error = %release_error,
-                    lease_key = %lease.lease_key,
-                    "Forge stage failed and lease release also failed"
-                );
-                return Err(error);
-            }
+            TableRunStatus::Failed => outcome.tables_failed += 1,
         }
     }
     Ok(outcome)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableRunStatus {
+    Succeeded,
+    Skipped,
+    Failed,
+}
+
+/// Resolve, lease, execute, and release one physical table.
+///
+/// This is the table-level fault-isolation boundary. Every path after lease
+/// acquisition attempts a fenced release, including cancellation and stage
+/// failure; callers receive a small status instead of a partially updated
+/// outcome so the tick can continue with the next ordered table.
+async fn process_table(
+    context: &ForgeContext,
+    key: &ForgeTableKey,
+    owner: Uuid,
+    stopped: &CancellationToken,
+    outcome: &mut ForgeTickOutcome,
+) -> TableRunStatus {
+    let binding = match TenantTableBinding::resolve((key.tenant, key.table_ref.clone())) {
+        Ok(binding) => binding,
+        Err(error) => {
+            tracing::error!(
+                tenant = %key.tenant,
+                table = %key.table_ref.fqn(),
+                error = %error,
+                "Forge table binding failed"
+            );
+            return TableRunStatus::Failed;
+        }
+    };
+    let lease_key = forge_lease_key(key.tenant, &binding.logical_namespace, &binding.table_name);
+    let mut lease = match ForgeLease::acquire(
+        &context.operator_pool,
+        lease_key,
+        owner,
+        context.config.lease_ttl,
+    )
+    .await
+    {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return TableRunStatus::Skipped,
+        Err(error) => {
+            tracing::error!(
+                tenant = %key.tenant,
+                table = %key.table_ref.fqn(),
+                error = %error,
+                "Forge table lease acquisition failed"
+            );
+            return TableRunStatus::Failed;
+        }
+    };
+
+    // Keep release outside the stage future so every post-acquisition path
+    // converges through the same cleanup decision.
+    let table_result = run_table_stages(context, &mut lease, key, &binding, stopped, outcome).await;
+    let release_result = release_lease(context, &lease).await;
+    match (table_result, release_result) {
+        (Ok(stop_after), Ok(())) => {
+            if stop_after {
+                TableRunStatus::Skipped
+            } else {
+                TableRunStatus::Succeeded
+            }
+        }
+        (Err(error), Ok(())) => {
+            tracing::error!(
+                tenant = %key.tenant,
+                table = %key.table_ref.fqn(),
+                error = %error,
+                "Forge table maintenance failed; continuing"
+            );
+            TableRunStatus::Failed
+        }
+        (Ok(_), Err(release_error)) => {
+            tracing::error!(
+                tenant = %key.tenant,
+                table = %key.table_ref.fqn(),
+                error = %release_error,
+                "Forge table lease release failed; continuing"
+            );
+            TableRunStatus::Failed
+        }
+        (Err(error), Err(release_error)) => {
+            tracing::warn!(
+                error = %release_error,
+                lease_key = %lease.lease_key,
+                "Forge stage failed and lease release also failed"
+            );
+            tracing::error!(error = %error, "Forge table maintenance failed");
+            TableRunStatus::Failed
+        }
+    }
+}
+
+/// Execute the ordered maintenance stages for one leased physical table.
+///
+/// The sequence is reconciliation, compaction, snapshot expiry, one complete
+/// retained live-set build, and orphan GC. Cancellation is checked between
+/// stages so no new stage begins after shutdown is requested. The live set is
+/// passed into GC rather than rebuilt there, while GC still performs its final
+/// per-object reference recheck before deletion.
+///
+/// This function deliberately does not release `lease`: the caller owns the
+/// release boundary so success, cancellation, stage failure, and release
+/// failure all converge through the same conditional cleanup path.
+async fn run_table_stages(
+    context: &ForgeContext,
+    lease: &mut ForgeLease,
+    key: &super::compact::ForgeTableKey,
+    binding: &TenantTableBinding,
+    stopped: &CancellationToken,
+    outcome: &mut ForgeTickOutcome,
+) -> Result<bool, ForgeError> {
+    // One fence covers reconciliation -> compaction -> expiry -> live-set
+    // rebuild -> GC for this physical table.
+    outcome.reconciled +=
+        run_compaction_reconciliation_for_table(context, lease, key, binding).await?;
+    if stopped.is_cancelled() {
+        return Ok(true);
+    }
+
+    let compaction = run_compaction_bins_for_table(context, lease, key, binding).await?;
+    outcome.groups_seen += compaction.groups_seen;
+    outcome.bins_committed += compaction.bins_committed;
+    outcome.bins_skipped += compaction.bins_skipped;
+    outcome.reconciled += compaction.reconciled;
+    if stopped.is_cancelled() {
+        return Ok(true);
+    }
+
+    outcome.reconciled += run_snapshot_expiry_for_table(context, lease, key, binding).await?;
+    if stopped.is_cancelled() {
+        return Ok(true);
+    }
+
+    let table = super::compact::load_table(context, &binding.table_ident()).await?;
+    let live_set = build_live_set(context, key, binding, &table).await?;
+    if stopped.is_cancelled() {
+        return Ok(true);
+    }
+    outcome.reconciled += run_orphan_gc_for_table(context, lease, key, binding, &live_set).await?;
+    Ok(false)
 }
 
 async fn release_lease(context: &ForgeContext, lease: &ForgeLease) -> Result<(), ForgeError> {

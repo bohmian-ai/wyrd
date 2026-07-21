@@ -2,8 +2,9 @@
 title: Cards overview
 description: The card envelope, how registration works, and a catalog of every card kind with its status.
 pillar: wyrd
-group: Reference
-order: 10
+section: Products and components
+group: Cards
+order: 1
 ---
 
 # Cards overview
@@ -11,6 +12,10 @@ order: 10
 A **card** is the typed, versioned envelope Wyrd uses for every component it
 governs. Every kind shares the same outer shape; the `spec` carries the fields
 specific to that kind.
+
+This page is the Cards component hub. Use [Card](/concepts/card/) to learn the
+mental model, [Declare](/how-to/declare/) to author a card, and the generated
+pages under [Reference](/reference/) when you need the exact field contract.
 
 <Aside title="The envelope" data-variant="wyrd">
 

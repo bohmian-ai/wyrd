@@ -780,6 +780,15 @@
 .mk .side .grp .b.rune {
   background: var(--rune-strong);
 }
+.mk .side .subhead {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+  padding: 8px 8px 3px;
+}
 .mk .side a {
   display: flex;
   align-items: center;

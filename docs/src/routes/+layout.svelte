@@ -102,11 +102,13 @@
   </header>
 
   <nav id="nav-drawer" class={`drawer ${drawer ? 'open' : ''}`} aria-label="Sections">
-    <a href={`${base}/overview/`}>Overview</a>
+    <a href={`${base}/overview/`}>Start here</a>
+    <a href={`${base}/tutorials/`}>Learn Wyrd</a>
     <a href={`${base}/get-started/`}>Get started</a>
-    <a href={`${base}/concepts/`}>Concepts</a>
-    <a href={`${base}/how-to/`}>How-to</a>
+    <a href={`${base}/how-to/`}>Build with Wyrd</a>
+    <a href={`${base}/products/`}>Products and components</a>
     <a href={`${base}/reference/`}>Reference</a>
+    <a href={`${base}/self-hosting/`}>Operate Wyrd</a>
     <a href={`${base}/for-agents/`}>For agents</a>
     <a href={`${base}/fathom/`}>Fathom · coming soon</a>
   </nav>
@@ -141,6 +143,7 @@
           <span class="ch">WYRD</span>
           <a href={`${base}/get-started/`}>Get started</a>
           <a href={`${base}/concepts/`}>Concepts</a>
+          <a href={`${base}/products/`}>Products</a>
           <a href={`${base}/reference/`}>Reference</a>
           <a href={`${base}/for-agents/`}>For agents</a>
         </div>

@@ -4440,7 +4440,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust?rev=b4c73df#b4c73df7e96b00f1956fb0e482d6401430a5aaec"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#48030828091230cbe2a60ebe2fbc9ac09a7f9056"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4496,7 +4496,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust?rev=b4c73df#b4c73df7e96b00f1956fb0e482d6401430a5aaec"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#48030828091230cbe2a60ebe2fbc9ac09a7f9056"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4507,7 +4507,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust?rev=b4c73df#b4c73df7e96b00f1956fb0e482d6401430a5aaec"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#48030828091230cbe2a60ebe2fbc9ac09a7f9056"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4523,7 +4523,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "git+https://github.com/apache/iceberg-rust?rev=b4c73df#b4c73df7e96b00f1956fb0e482d6401430a5aaec"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#48030828091230cbe2a60ebe2fbc9ac09a7f9056"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -9822,20 +9822,25 @@ dependencies = [
  "crc32c",
  "datafusion",
  "iceberg",
+ "iceberg-catalog-sql",
+ "iceberg-storage-opendal",
  "opendal",
  "parquet",
  "rand 0.8.7",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx 0.8.1",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "ulid",
  "uuid",
  "vala-sql",
+ "wyrd-bench",
  "wyrd-dev-fixtures",
  "wyrd-runtime",
  "wyrd-spec",
@@ -10900,6 +10905,7 @@ dependencies = [
  "url",
  "uuid",
  "vala-bifrost",
+ "vala-bifrost-redux",
  "vala-eval",
  "vala-ingest",
  "vala-sql",
@@ -11065,6 +11071,8 @@ dependencies = [
 name = "wyrd-testing"
 version = "0.0.1"
 dependencies = [
+ "arrow",
+ "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
  "chrono",
@@ -11072,7 +11080,9 @@ dependencies = [
  "futures-util",
  "hdrhistogram",
  "http 1.4.2",
+ "iceberg",
  "opendal",
+ "parquet",
  "pyo3",
  "rand 0.9.5",
  "reqwest 0.12.28",
@@ -11097,6 +11107,7 @@ dependencies = [
  "wyrd-auth-issue",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",
+ "wyrd-bench",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
  "wyrd-runtime",

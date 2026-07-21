@@ -11,3 +11,15 @@ max = 500_000
 metric = "speedup_vs_single_node"
 min = 2.0
 pod_count = 3
+
+[bench.bifrost.forge_compaction_throughput]
+metric = "mib_per_sec"
+min = 100.0
+
+[bench.bifrost.forge_maintenance]
+metric = "mib_per_sec"
+min = 1.0
+
+[bench.bifrost.forge_production]
+metric = "ticks_per_sec"
+min = 0.1

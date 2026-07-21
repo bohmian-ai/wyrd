@@ -59,6 +59,7 @@ wyrd-auth-verify = { path = "crates/shared/wyrd-auth-verify", version = "0.0.1" 
 wyrd-auth-check = { path = "crates/shared/wyrd-auth-check", version = "0.0.1" }
 wyrd-auth = { path = "crates/wyrd/wyrd-auth", version = "0.0.1" }
 wyrd-dev-fixtures = { path = "crates/shared/wyrd-dev-fixtures", version = "0.0.1" }
+wyrd-bench = { path = "crates/shared/wyrd-bench", version = "0.0.1" }
 wyrd-sql = { path = "crates/wyrd/wyrd-sql", version = "0.0.1" }
 wyrd-storage = { path = "crates/wyrd/wyrd-storage", version = "0.0.1" }
 wyrd-server = { path = "crates/wyrd/wyrd-server", version = "0.0.1" }
@@ -182,11 +183,11 @@ opendal = { version = "0.57", default-features = false, features = [
 # =53.1.0 matches the iceberg-rust arrow-58 line; git-pinned until iceberg 0.10 publishes.
 datafusion = "=53.1.0"
 parquet = "58"
-iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
+iceberg = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
 # sqlx 0.8.1 is a hard dep in this crate — there is no sqlx feature flag to add.
-iceberg-catalog-sql = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
-iceberg-datafusion = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df" }
-iceberg-storage-opendal = { git = "https://github.com/apache/iceberg-rust", rev = "b4c73df", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
+iceberg-catalog-sql = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
+iceberg-datafusion = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action" }
+iceberg-storage-opendal = { git = "https://github.com/mitari-ai/iceberg-rust", branch = "wyrd/rewrite-files-action", features = ["opendal-s3", "opendal-gcs", "opendal-azdls", "opendal-fs", "opendal-memory"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

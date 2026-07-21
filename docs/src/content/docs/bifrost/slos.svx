@@ -1,6 +1,6 @@
 ---
 title: SLOs
-description: Bifrost performance targets and methodology. All figures are TBD pending the bench:bifrost suite.
+description: Bifrost performance targets and methodology, including Forge maintenance benchmarks.
 pillar: wyrd
 group: Bifrost
 order: 7
@@ -21,7 +21,7 @@ These are the shapes of the numbers to expect, not committed SLOs. Use them to s
 | Write ack (Gate → Scribe → WAL fsync → ack) | Single-digit milliseconds | fsync latency of the Scribe local disk |
 | Seal to Parquet (memtable → object store → `vala.file_list` INSERT) | ~1-5s typical | Time-based seal trigger (1s) + object store PUT + Postgres commit |
 | Query freshness (write ack → visible to Oracle) | Within seal latency | Same as seal to Parquet, until live-tail RPC lands |
-| Forge compaction lag | TBD | Forge not yet implemented; tick cadence undefined |
+| Forge compaction lag | TBD | Tick cadence, lease contention, and object-store/catalog time |
 
 **Backpressure boundary:** When seal is stalled (object store slow, Postgres slow), new appends return `429_INGEST_BUSY` rather than growing WAL unboundedly. Watch this counter in production. Sustained rejections mean seal cannot keep up with ingest.
 

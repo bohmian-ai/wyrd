@@ -10,6 +10,15 @@ order: 1
 
 Bifrost is the Wyrd OLAP warehouse. It persists every Vala observation through a four-component architecture (Gate, Scribe, Oracle, Forge) and exposes them through a typed `ValaQueryService` read surface.
 
+## Choose a path
+
+- **Use Bifrost:** start with the [quickstart](./quickstart), then read [writing
+  data](./writing-data) or [reading data](./reading-data).
+- **Understand Bifrost:** read the [architecture](./architecture) and the
+  [Forge system overview](./forge).
+- **Maintain Bifrost:** use [data-plane internals](./data-plane-internals),
+  [schema](./schema), and [SLOs](./slos) as the operational reference.
+
 ## What it is
 
 Bifrost stores and queries all observability data for Wyrd:

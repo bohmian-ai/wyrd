@@ -16,6 +16,10 @@ One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to sca
 
 <WyrdBifrostSystem />
 
+The [Forge system overview](/bifrost/forge) follows the maintenance path in
+detail: how staged files move through compaction, how snapshot expiry and
+orphan GC protect live data, and how leases fence concurrent workers.
+
 ## Component responsibilities
 
 | Component | Role | Statefulness | Scaling |
@@ -55,7 +59,7 @@ One binary runs Gate, Scribe, Oracle, and Forge on the same pod. Add pods to sca
    - PUT to object store: `s3://{ns}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`.
    - Atomic Postgres transaction: INSERT `vala.file_list` row + append audit rows.
    - On commit, truncate WAL and retire manifest.
-7. **(Async) Forge** leases partition via `vala.maintenance_leases`, bin-packs small Parquet files into large ones, commits Iceberg snapshot via Mitari REPLACE, updates `vala.file_list` SET `compacted = true`.
+7. **(Async) Forge** leases a tenant/table via `vala.maintenance_leases`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
 
 **Critical:** Scribe never writes Iceberg snapshots on the ingest hot path. Forge is the only Iceberg snapshot writer.
 

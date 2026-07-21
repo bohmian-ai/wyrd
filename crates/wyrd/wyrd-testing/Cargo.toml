@@ -12,14 +12,18 @@ default = []
 python = ["dep:pyo3", "dep:wyrd-utils"]
 
 [dependencies]
+async-trait = { workspace = true }
 axum = { workspace = true }
+arrow = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
+iceberg = { workspace = true }
 http = { workspace = true }
 opendal = { workspace = true }
+parquet = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
@@ -45,6 +49,7 @@ wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
+wyrd-bench = { workspace = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
@@ -54,3 +59,7 @@ wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
+
+[[bench]]
+name = "bench_forge_production"
+harness = false

@@ -1,0 +1,55 @@
+---
+title: Products and components
+description: Choose the Wyrd product or subsystem you are learning, building with, or maintaining.
+pillar: wyrd
+section: Products and components
+group: Overview
+order: 1
+---
+
+# Products and components
+
+Wyrd documentation has two ways in: the job you are trying to do and the
+component you are working with. This page is the component map.
+
+## Wyrd core
+
+Wyrd owns the Card contract, registry, lineage, policy, identity, install, and
+audit surfaces.
+
+- [Overview](/overview/) — what Wyrd is and what runs today.
+- [Concepts](/concepts/) — the Card, Spec, Run, and Observation model.
+- [Architecture](/concepts/architecture/) — how the Wyrd products fit together.
+
+## Cards
+
+Cards are the shared declaration format for Wyrd components.
+
+- [Cards overview](/cards/) — envelope, registration boundary, and kind status.
+- [Card concept](/concepts/card/) — identity, lifecycle, and references.
+- [Declare a card](/how-to/declare/) — author Data, Model, and Prompt cards.
+- [Card schemas](/api/schemas/) — generated JSON Schema inventory.
+
+## Skald
+
+Skald owns provider clients, prompt execution, tools, agents, and workflows.
+
+- [Skald overview](/skald/) — its runtime boundary and relationship to Cards.
+- [Agent and workflow architecture](/concepts/architecture/) —
+  where Skald sits in the Wyrd system.
+- [Build an agent](/how-to/build-an-agent/) — create a bounded agent loop.
+- [Build a workflow](/how-to/build-a-workflow/) — compose agent invocations.
+
+## Bifrost
+
+Bifrost is Wyrd's analytical warehouse and observability data plane.
+
+- [Bifrost overview](/bifrost/) — how Gate, Scribe, Oracle, and Forge fit together.
+- [Quickstart](/bifrost/quickstart/) — emit and query an observation.
+- [Architecture](/bifrost/architecture/) — storage, concurrency, and data flow.
+
+## Fathom
+
+[Fathom](/fathom/) is the planned intelligence layer that reads Wyrd's typed
+model and turns runtime behavior into evidence. It is not released yet, so its
+page explains the relationship without documenting an unavailable workflow.

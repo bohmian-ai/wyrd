@@ -45,6 +45,36 @@ describe('nav ordering', () => {
   it('exposes a non-empty spine of pages', () => {
     expect(flat.length).toBeGreaterThan(0);
   });
+
+  it('organizes the sidebar by reader intent', () => {
+    expect(nav.map((group) => group.label)).toEqual([
+      'Start here',
+      'Learn Wyrd',
+      'Build with Wyrd',
+      'Products and components',
+      'Reference',
+      'Operate Wyrd',
+      'For agents'
+    ]);
+  });
+
+  it('keeps product topics nested inside the products section', () => {
+    const products = nav.find((group) => group.label === 'Products and components');
+    expect(products?.sections.map((section) => section.label)).toEqual([
+      'Overview',
+      'Cards',
+      'Bifrost',
+      'Skald',
+      'Fathom'
+    ]);
+    expect(products?.items.some((item) => item.path === '/bifrost/')).toBe(true);
+    expect(products?.items.some((item) => item.path === '/cards/')).toBe(true);
+  });
+
+  it('marks Fathom as coming soon without hiding it from navigation', () => {
+    const fathom = flat.find((item) => item.path === '/fathom/');
+    expect(fathom?.soon).toBe(true);
+  });
 });
 
 describe('siblings', () => {

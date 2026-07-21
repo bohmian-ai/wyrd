@@ -11,6 +11,7 @@ use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -163,6 +164,16 @@ pub enum ServerBootError {
          but none is configured"
     )]
     RecoveryPoolRequired,
+    /// The supervised Forge worker could not be assembled from the shared
+    /// production catalog, storage operator, and operator pool.
+    #[error("Forge scheduler context is unavailable: {detail}")]
+    ForgeSchedulerRequired {
+        /// Missing or invalid Forge dependency detail.
+        detail: String,
+    },
+    /// Forge configuration validation failed during boot.
+    #[error(transparent)]
+    Forge(#[from] vala_bifrost_redux::forge::ForgeError),
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -213,7 +224,21 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     // and append-only — a no-op after first boot; fails closed on schema drift.
     vala_bifrost::tables::register_all(&bifrost).await?;
 
-    Ok(AppState::new(postgres, storage, bifrost))
+    let operator_pool =
+        postgres
+            .operator_pool()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "platform-admin operator pool is unavailable".to_owned(),
+            })?;
+    let forge_context = ForgeContext::new(
+        postgres.vala().clone(),
+        operator_pool,
+        bifrost.iceberg_catalog(),
+        Arc::new(storage.operator().clone()),
+        ForgeConfig::default(),
+    )?;
+
+    Ok(AppState::new(postgres, storage, bifrost).with_forge_context(forge_context))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -849,40 +874,33 @@ pub async fn spawn_audit_reconciler(
     Ok(Some(handle))
 }
 
-/// Spawn the maintenance scheduler (slice 01).
+/// Build the single supervised Redux Forge maintenance scheduler future.
 ///
-/// On each 60-second tick it collects the maintenance health report and runs
-/// the commit-recovery sweep when a recovery pool is available. The sweep is
-/// idempotent and fencing-token guarded, so two pods running it concurrently
-/// cannot double-finalize a precommit. Other maintenance concerns (snapshot
-/// expiry, compaction, orphan GC, index build, projection health) report
-/// `pending` until their owning slices wire them into `scheduler::tick`.
+/// The returned future is the actual scheduler loop. The server inserts it
+/// directly into its supervised `JoinSet`, so an unexpected completion or
+/// panic cannot be hidden behind a detached shutdown waiter.
 ///
-/// Always spawns: `scheduler::tick` no-ops the recovery sweep when the recovery
-/// pool is absent (dev/test), so the health tick still runs. Production requires
-/// the recovery pool via [`check_recovery_pool`], enforced separately at boot.
-#[must_use]
+/// # Errors
+/// Returns [`ServerBootError::ForgeSchedulerRequired`] when the real server
+/// state was not assembled with a Forge context.
 pub fn spawn_maintenance_scheduler(
     state: &AppState,
     shutdown: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    let vala = state.postgres.vala().clone();
-    let catalog = Arc::clone(&state.bifrost);
-    let tick_interval =
-        Duration::from_secs(vala_bifrost::serving::repair::scheduler::TICK_INTERVAL_SECS);
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(tick_interval) => {}
-            }
-            if shutdown.is_cancelled() {
-                break;
-            }
-            vala_bifrost::serving::repair::scheduler::tick(&vala, &catalog).await;
+) -> Result<
+    impl std::future::Future<Output = Result<(), vala_bifrost_redux::forge::ForgeError>>
+    + Send
+    + 'static,
+    ServerBootError,
+> {
+    let context = state.forge_context.as_ref().cloned().ok_or_else(|| {
+        ServerBootError::ForgeSchedulerRequired {
+            detail: "AppState has no shared ForgeContext".to_owned(),
         }
-    })
+    })?;
+
+    let scheduler =
+        vala_bifrost_redux::forge::ForgeScheduler::new((*context).clone(), state.forge_interval)?;
+    Ok(scheduler.run(shutdown))
 }
 
 /// Spawn the audit-seal worker (slice 12).

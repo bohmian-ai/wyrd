@@ -71,6 +71,16 @@ pub struct CreateTableRequest<'a> {
 }
 
 impl WyrdCatalog {
+    /// Borrow the Iceberg catalog used by all Bifrost writers and readers.
+    ///
+    /// The returned trait object is the same catalog instance assembled during
+    /// server boot. Callers that need a data-plane worker must reuse it rather
+    /// than constructing a second SQL catalog over the same warehouse.
+    #[must_use]
+    pub fn iceberg_catalog(&self) -> Arc<dyn iceberg::Catalog> {
+        self.catalog.clone()
+    }
+
     /// Construct the catalog and run a best-effort startup recovery pass.
     ///
     /// `recovery_pool` must be authenticated as `vala_recovery` (the role granted

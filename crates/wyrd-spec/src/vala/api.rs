@@ -16,8 +16,8 @@ use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
-    AuditDetail, AuditDetailValueError, BatchId, ScopeHash, StoragePath,
-    audit_detail_canonical_json,
+    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ForgeOrphanGcPhase,
+    ForgeSnapshotExpirePhase, ScopeHash, StoragePath, audit_detail_canonical_json,
 };
 
 /// Bifrost table-identifier newtype.

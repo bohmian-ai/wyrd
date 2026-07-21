@@ -120,6 +120,27 @@ impl TenantTableBinding {
         &self.iceberg_namespace
     }
 
+    /// Validate and return a staging object path under this table's prefix.
+    ///
+    /// Input paths are relative object-store keys. URI forms, absolute paths,
+    /// traversal segments, and sibling prefixes are rejected before any object
+    /// store operation is attempted.
+    pub(crate) fn validate_object_path(&self, path: &str) -> Option<String> {
+        let prefix = self.object_prefix.trim_end_matches('/');
+        if prefix.is_empty()
+            || path.is_empty()
+            || path.starts_with('/')
+            || path.contains("://")
+            || path.contains('\\')
+            || path
+                .split('/')
+                .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        {
+            return None;
+        }
+        (path == prefix || path.starts_with(&format!("{prefix}/"))).then(|| path.to_owned())
+    }
+
     /// Return the single partition transform used by every physical table.
     #[must_use]
     pub const fn partition_transform(&self) -> PartitionTransform {
@@ -173,6 +194,30 @@ mod tests {
         assert_eq!(binding.table_ref, table);
         assert_eq!(binding.table_name, "spans");
         assert!(!binding.table_name.contains(&tenant.to_string()));
+    }
+
+    #[test]
+    fn staging_object_paths_are_segment_bounded() {
+        let tenant = DataTenantId::new_v7();
+        let binding = TenantTableBinding::resolve((tenant, table())).expect("binding");
+        let valid = format!("{}/part-000.parquet", binding.object_prefix);
+
+        assert_eq!(binding.validate_object_path(&valid), Some(valid.clone()));
+        assert!(
+            binding
+                .validate_object_path(&format!("{}-sibling/part.parquet", binding.object_prefix))
+                .is_none()
+        );
+        assert!(
+            binding
+                .validate_object_path(&format!("s3://bucket/{valid}"))
+                .is_none()
+        );
+        assert!(
+            binding
+                .validate_object_path(&format!("{}/../other/part.parquet", binding.object_prefix))
+                .is_none()
+        );
     }
 
     #[test]

@@ -121,6 +121,42 @@ pub async fn record_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     append_audit(conn, event).await
 }
 
+/// Read a bounded page of audit rows for one tenant-bound resource.
+///
+/// The caller supplies the last observed sequence number. RLS remains the
+/// tenant boundary; the explicit current-tenant predicate keeps the query
+/// aligned with the covering `(data_tenant_id, resource, seq)` index.
+///
+/// # Errors
+/// Returns [`SqlError`] when the page query fails.
+pub async fn list_audit_events_for_resource(
+    conn: &mut TenantConn<'_>,
+    resource: &str,
+    after_seq: i64,
+    limit: i64,
+) -> Result<Vec<AuditOutboxRow>, SqlError> {
+    sqlx::query_as::<_, AuditOutboxRow>(
+        r#"
+        SELECT data_tenant_id, seq, entry_hash, prev_hash, request_id, trace_id,
+               operation, resource, card_ref, principal_id, principal_kind,
+               auth_method, permission, decision, result, payload_summary, detail,
+               created_at, ship_batch_id
+          FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND resource = $1
+           AND seq > $2
+         ORDER BY seq
+         LIMIT $3
+        "#,
+    )
+    .bind(resource)
+    .bind(after_seq)
+    .bind(limit)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)
+}
+
 /// Mark a contiguous `seq` range shipped for the current tenant.
 ///
 /// Stamps `ship_batch_id` / `shipped_at` on every still-unshipped row in

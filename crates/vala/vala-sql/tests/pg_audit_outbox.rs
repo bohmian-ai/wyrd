@@ -252,5 +252,46 @@ mod pg_tests {
             conn.commit().await.unwrap();
             assert!(remaining.is_empty(), "all rows shipped");
         }
+
+        #[tokio::test]
+        async fn resource_reader_is_tenant_scoped_and_paginates() {
+            let (fixture, _superuser, tenant_a) = setup().await;
+            let tenant_b = DataTenantId::new_v7();
+            fixture
+                .seed_additional_tenant_with_uuid(
+                    tenant_b,
+                    &format!("test-{}", tenant_b.as_uuid().simple()),
+                )
+                .await
+                .unwrap();
+
+            append(fixture.app_pool(), tenant_a, "a.1").await;
+            append(fixture.app_pool(), tenant_a, "a.2").await;
+            append(fixture.app_pool(), tenant_b, "b.1").await;
+
+            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
+                .await
+                .unwrap();
+            let first = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn, "ns.tbl", 0, 1,
+            )
+            .await
+            .unwrap();
+            assert_eq!(first.len(), 1);
+            assert_eq!(first[0].seq, 1);
+
+            let second = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn,
+                "ns.tbl",
+                first[0].seq,
+                10,
+            )
+            .await
+            .unwrap();
+            conn.commit().await.unwrap();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].seq, 2);
+            assert_eq!(second[0].resource, "ns.tbl");
+        }
     }
 }

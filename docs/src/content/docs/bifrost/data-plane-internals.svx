@@ -1,14 +1,14 @@
 ---
 title: Data plane internals
-description: Scribe WAL format, seal state machine, vala.file_list schema, Forge compaction, and audit chain sealing.
+description: Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit chain sealing.
 pillar: wyrd
 group: Bifrost
-order: 8
+order: 9
 ---
 
 # Data plane internals
 
-This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, the Forge tick, and the audit sealing pipeline.
+This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, Forge's storage surfaces, and the audit sealing pipeline.
 
 The write surface is in [Writing data](/bifrost/writing-data); the overall system model is in [Architecture](/bifrost/architecture). This is the operator's view.
 
@@ -72,41 +72,16 @@ Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls 
 
 Oracle scans `WHERE NOT compacted` for staging data and lets Iceberg handle the rest. Forge scans the same predicate to pick compaction candidates.
 
-## Forge tick (planned)
+## Forge maintenance
 
-Forge is not yet implemented; this section describes the target behavior. Until Forge ships, sealed Parquet accumulates in `vala.file_list` and Oracle serves it directly.
+Forge is the maintenance plane for staged Parquet and Iceberg metadata. It
+leases one tenant/table at a time, compacts bounded groups of staged files,
+expires snapshots that are outside the retained ancestry, and garbage-collects
+old objects absent from both Iceberg and `vala.file_list`.
 
-<WyrdSequenceDiagram dense
-  title="One Forge tick"
-  participants={['Forge', 'Postgres', 'Object store']}
-  messages={[
-    { from: 'Forge', to: 'Postgres', label: 'acquire lease (namespace, table)' },
-    { from: 'Postgres', to: 'Forge', label: 'lease granted', dashed: true },
-    { from: 'Forge', to: 'Postgres', label: 'SELECT file_list WHERE NOT compacted' },
-    { from: 'Postgres', to: 'Forge', label: 'candidate small files', dashed: true },
-    { from: 'Forge', to: 'Object store', label: 'GET small Parquet' },
-    { from: 'Object store', to: 'Forge', label: 'Arrow batches', dashed: true },
-    { from: 'Forge', to: 'Forge', label: 'bin-pack · sort by (tenant, event_time)' },
-    { from: 'Forge', to: 'Object store', label: 'PUT compacted Parquet' },
-    { from: 'Forge', to: 'Object store', label: 'Iceberg REPLACE (Mitari)' },
-    { from: 'Forge', to: 'Postgres', label: 'UPDATE file_list SET compacted = true' },
-    { from: 'Forge', to: 'Postgres', label: 'release lease' }
-  ]}
-/>
-
-Each Forge pod runs a tick loop against Postgres-leased `(namespace, table)` pairs:
-
-1. Acquire lease on `(namespace, table)` via `vala.maintenance_leases`. Skip if held.
-2. `SELECT * FROM vala.file_list WHERE NOT compacted AND partition_day = <target>`.
-3. Read the small Parquet files from object store; bin-pack into large Parquet files (sorted by `data_tenant_id, wyrd_event_time`).
-4. PUT the compacted files.
-5. Iceberg REPLACE via Mitari: fold new files in, mark old files for deletion.
-6. `UPDATE vala.file_list SET compacted = true, committed_snapshot_id = <id> WHERE id IN (...)`.
-7. Release lease.
-
-A crashed Forge tick loses its lease on expiry. The next holder re-derives state from `vala.file_list` and Iceberg metadata and re-runs; the operation is idempotent because every step is derivable from durable state.
-
-Orphan Parquet files (PUT succeeded, Postgres commit did not) are reaped by a separate Forge GC pass that compares object store listings against `vala.file_list` and Iceberg manifests.
+The complete stage order, fencing rules, recovery behavior, and component
+boundaries are documented in [Forge system overview](/bifrost/forge). This page keeps the
+storage and audit context; the Forge page is the operational reference.
 
 ## Audit sealing
 

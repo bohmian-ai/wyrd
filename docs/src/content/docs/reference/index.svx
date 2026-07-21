@@ -12,5 +12,6 @@ The literal contract. Everything here is generated from source or documents a
 shipped surface — no narrative, no recommendations.
 
 - [CLI](/reference/cli/) — the `wyrd` binary: `auth`, `eval`, `principal`.
-- [Cards](/cards/) — field-level schema docs for each card kind.
+- [Card schemas](/api/schemas/) — generated field-level schemas for each card kind.
+- [Cards overview](/cards/) — the component hub and kind status, not the field reference.
 - [API](/api/) — error catalog, OpenAPI summary, and JSON Schema inventory.

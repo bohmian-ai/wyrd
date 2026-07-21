@@ -1,15 +1,23 @@
 use std::sync::Arc;
 
 use wyrd_client::WyrdClient;
+use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
-use wyrd_client::testing::test_auth_middleware;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
+use wyrd_client::transport::credential::ResolvedCredential;
 
 use super::{UploadHooks, UploadOutcome, validate_plan};
 use crate::WyrdStorageClient;
 use crate::error::StorageClientError;
 use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
+
+fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, wyrd_client::error::WyrdClientError> {
+    AuthMiddleware::new(
+        &ClientConfig::default(),
+        ResolvedCredential::BearerToken("test-bearer".to_owned().into()),
+    )
+}
 
 fn client() -> WyrdClient {
     let config = ClientConfig::default();

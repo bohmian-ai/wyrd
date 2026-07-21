@@ -5,10 +5,11 @@ use tempfile::NamedTempFile;
 use wiremock::matchers::{body_bytes, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::WyrdClient;
+use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
-use wyrd_client::testing::test_auth_middleware;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
+use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::storage::{HeaderPair, UploadPlan};
 use wyrd_storage_client::{
     ArtifactSource, PartUrlMinter, UploadHooks, UploadOutcome, WyrdStorageClient,
@@ -20,6 +21,13 @@ fn hooks<'a>(key: &'a str) -> UploadHooks<'a> {
         progress: None,
         part_url_minter: None,
     }
+}
+
+fn test_auth_middleware() -> Result<Arc<AuthMiddleware>, wyrd_client::error::WyrdClientError> {
+    AuthMiddleware::new(
+        &ClientConfig::default(),
+        ResolvedCredential::BearerToken("test-bearer".to_owned().into()),
+    )
 }
 
 fn wyrd(base_url: String) -> WyrdClient {

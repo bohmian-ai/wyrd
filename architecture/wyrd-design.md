@@ -155,14 +155,20 @@ Downstream artifacts are brought up to this version in a sync pass.
     JWT — no enforcement-point JWT, no SPIFFE/mTLS callee derivation.
 19. **Reference slots use exactly `Ref` or `InlineableRef<T>`.** `Ref` carries
     durable identity or an authored `Path`; `InlineableRef<T>` additionally
-    permits an inline child body. `Path` is loader-only: the loader resolves a
-    path relative to the authored file, registers the referenced full Card
-    envelope, and rewrites the slot to a durable `Ref` before the wire
-    request. There is no selector form and no third reference enum. The
-    server, registry, and evaluator reject unresolved paths.
+    permits an inline child body. `Path` is loader-only. During composite
+    registration, the loader may rewrite an authored path to the
+    registration-only `Sibling { sibling: CardRef }` form so the server can
+    distinguish a target submitted in the same request from an external Card
+    referenced with `Ref(CardRef)`. The server validates both forms and
+    rewrites them to UID-bearing `Ref(CardRef)` before hashing, relationship
+    derivation, blob persistence, or any read response. `Sibling` is not a
+    durable reference form, and there is no separate selector reference enum.
+    The server, registry, and evaluator reject unresolved paths at their
+    boundaries.
 
-    `select` and `path` resolve to `ref` before send; only `ref` and `inline`
-    cross the wire. Heavy cards (Model, Data, Experiment, Artifact) accept
+    `select` and `path` resolve to a typed registration reference before send;
+    only `ref`, registration-only `sibling`, and `inline` cross a composite
+    registration wire. Heavy cards (Model, Data, Experiment, Artifact) accept
     `ref` or `select` only — `inline` is rejected because identity anchors
     lineage. Environment/stage is target-card metadata (`labels` /
     `annotations`), never `space`; `space` is team/workspace scope only, and
@@ -1538,9 +1544,14 @@ relationship tests all project from it:
 
 `path:` is **client-side authoring sugar**, not a wire variant. It targets a
 full card envelope on disk; the loader registers that envelope as an
-independent card and rewrites the referring slot to `ref: CardRef`. The
-payload that leaves the client contains only `ref` or `inline`. The server,
-registry, and `vala` never see a `path:` value.
+independent card and rewrites the referring slot to an explicit
+registration reference. When the target is part of the same composite
+submission, the registration reference is `Sibling { sibling: CardRef }`;
+an authored external `ref: CardRef` remains `Ref(CardRef)`. This preserves
+binding intent instead of inferring it from identity. The server validates
+both forms and rewrites them to UID-bearing `Ref(CardRef)` before hashing,
+relationship derivation, or durable persistence. The server, registry, and
+`vala` never see a `path:` value or a durable `Sibling` value.
 
 - Resolved **relative to the file containing the `path:` reference** — not
   CWD, not apply-root.
@@ -1561,11 +1572,13 @@ registry, and `vala` never see a `path:` value.
 - `ref`, `select`, `path`, and `inline` are mutually exclusive on any single
   slot. Any combination is a validation error.
 
-This keeps the wire contract tight (two-variant `LightRef` post-loader:
-`ref | inline`), keeps `select`/`path` resolution client-side, prevents
-filesystem-on-server, and gives authors both the file-splitting ergonomic they
-expect from JSON-Schema `$ref` / OpenAPI external-file imports (`path`) and
-metadata-driven binding (`select`).
+This keeps the wire contract typed (`ref | inline`, with an explicit
+registration-only sibling projection where a composite write needs it), keeps
+`select`/`path` resolution client-side, prevents filesystem-on-server, and
+gives authors both the file-splitting ergonomic they expect from JSON-Schema
+`$ref` / OpenAPI external-file imports (`path`) and metadata-driven binding
+(`select`). Durable and read contracts remain the simpler direct `ref` /
+`inline` forms.
 
 ---
 

@@ -11,8 +11,6 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod global_config;
-#[cfg(feature = "test-util")]
-pub mod testing;
 pub mod transport;
 
 pub use client::WyrdClient;

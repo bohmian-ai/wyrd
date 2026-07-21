@@ -51,7 +51,7 @@ pub fn resolve_repo_config() -> Result<Option<WyrdConfig>, WyrdConfigError> {
 }
 
 /// Clear the repository config cache for tests that change the working tree.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub fn reset_repo_config_cache_for_tests() {
     let mut cache = REPO_CONFIG
         .write()

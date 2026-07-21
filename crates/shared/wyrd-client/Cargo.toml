@@ -12,9 +12,6 @@ description = "External Wyrd client transport runtime."
 [lib]
 path = "src/lib.rs"
 
-[features]
-test-util = []
-
 [dependencies]
 chrono = { workspace = true }
 reqwest = { workspace = true }

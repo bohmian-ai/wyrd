@@ -34,13 +34,15 @@ jq -n \
   --arg git_sha "$git_sha" \
   --argjson dirty_worktree "$dirty_worktree" \
   --arg pods "${WYRD_BIFROST_PODS:-3}" \
-  --arg duration_seconds "${WYRD_BIFROST_DURATION_SECONDS:-900}" \
+  --arg tenants "${WYRD_BIFROST_TENANTS:-10}" \
+  --arg run_deadline_seconds "${WYRD_BIFROST_RUN_DEADLINE_SECONDS:-540}" \
   --slurpfile scribe "$target/reports/scribe.json" \
   --slurpfile forge "$target/reports/forge.json" \
   --slurpfile oracle "$target/reports/oracle.json" \
   --slurpfile capacity "$target/reports/capacity.json" \
   '{stage: $stage, git_sha: $git_sha, dirty_worktree: $dirty_worktree,
-    configuration: {pods: $pods, duration_seconds: $duration_seconds,
+    configuration: {pods: $pods, tenants: $tenants,
+      run_deadline_seconds: $run_deadline_seconds,
       runner: "bench_real_bifrost_workload"},
     reports: [$scribe[0], $forge[0], $oracle[0], $capacity[0]]}' \
   > "$target/stage.json"

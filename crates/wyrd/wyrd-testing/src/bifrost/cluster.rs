@@ -172,6 +172,31 @@ impl WyrdTestCluster {
         self.fixture.data_tenant_id()
     }
 
+    /// Seed an additional tenant with the roles needed by a real Bifrost run.
+    ///
+    /// The tenant row and role seed are created through the same fixture-owned
+    /// Postgres path as the initial tenant; benchmarks must not construct a
+    /// second pool or schema to represent tenancy.
+    pub async fn add_tenant(&self, slug: &str) -> Result<DataTenantId, ClusterError> {
+        let tenant = self
+            .fixture
+            .seed_additional_tenant(slug)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        let mut conn = self
+            .fixture
+            .tenant_conn_for(tenant)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        conn.commit()
+            .await
+            .map_err(|error| ClusterError::Resource(error.to_string()))?;
+        Ok(tenant)
+    }
+
     /// Return the shared Postgres fixture used by every pod.
     #[must_use]
     pub fn pg_fixture(&self) -> &PgFixture {

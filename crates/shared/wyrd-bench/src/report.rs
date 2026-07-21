@@ -115,6 +115,93 @@ pub struct QueryMeasurements {
     pub audit_visibility_lag_us: u64,
 }
 
+/// Measurements for one real Bifrost pipeline stage.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StageMeasurements {
+    /// Stable stage name used in reports and comparisons.
+    pub stage: String,
+    /// Stage duration percentiles.
+    pub latency: LatencyPercentiles,
+    /// Number of stage invocations.
+    pub count: u64,
+    /// Rows processed by the stage.
+    pub rows: u64,
+    /// Bytes processed or written by the stage.
+    pub bytes: u64,
+    /// Number of failed stage invocations.
+    pub errors: u64,
+}
+
+/// One phase of a bounded workload run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseMeasurement {
+    /// Stable phase name.
+    pub phase: String,
+    /// Target rate for the phase.
+    pub target_rows_per_second: u64,
+    /// Phase duration in milliseconds.
+    pub duration_ms: u64,
+    /// Rows submitted during the phase.
+    pub submitted_rows: u64,
+    /// Rows accepted by Scribe during the phase.
+    pub accepted_rows: u64,
+    /// Append failures during the phase.
+    pub errors: u64,
+}
+
+/// A point-in-time backlog sample from Scribe and Forge.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BacklogSample {
+    /// Milliseconds since the run started.
+    pub elapsed_ms: u64,
+    /// WAL bytes retained on local pod disks.
+    pub wal_bytes: u64,
+    /// Writable memtable rows.
+    pub active_rows: u64,
+    /// Rows retained in immutable generations.
+    pub immutable_rows: u64,
+    /// Immutable generations awaiting post-commit completion.
+    pub pending_generations: u64,
+    /// Eligible Forge file-list candidates.
+    pub forge_candidates: u64,
+}
+
+/// Durable output verification result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationMeasurements {
+    /// Rows accepted by producers.
+    pub expected_rows: u64,
+    /// Rows represented by file-list entries.
+    pub file_list_rows: u64,
+    /// File-list entries whose objects were found.
+    pub parquet_files: u64,
+    /// File-list entries whose objects were missing.
+    pub missing_objects: u64,
+    /// Eligible Forge candidates remaining at verification time.
+    pub forge_candidates: u64,
+    /// Whether all required checks passed.
+    pub passed: bool,
+}
+
+/// Forge compaction counters collected across maintenance ticks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForgeMeasurements {
+    /// Maintenance ticks that returned successfully.
+    pub ticks: u64,
+    /// Candidate groups discovered by Forge.
+    pub groups_seen: u64,
+    /// Rewrite bins committed by Forge.
+    pub bins_committed: u64,
+    /// Rewrite bins skipped by a budget or lease boundary.
+    pub bins_skipped: u64,
+    /// Tables whose maintenance stages failed.
+    pub tables_failed: u64,
+    /// Lease-contention events observed by Forge.
+    pub lease_contention: u64,
+    /// Maximum eligible candidate count observed during the run.
+    pub peak_candidates: u64,
+}
+
 /// One complete machine-readable Bifrost benchmark report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkReport {
@@ -138,11 +225,23 @@ pub struct BenchmarkReport {
     pub storage: StorageMeasurements,
     /// Query and audit measurements.
     pub query: QueryMeasurements,
+    /// Forge compaction counters and backlog peak.
+    pub forge: ForgeMeasurements,
+    /// Per-stage measurements from the real data path.
+    pub stages: Vec<StageMeasurements>,
+    /// Phase-level workload measurements.
+    pub phases: Vec<PhaseMeasurement>,
+    /// Backlog samples collected during the run.
+    pub backlog: Vec<BacklogSample>,
+    /// Durable output verification.
+    pub verification: VerificationMeasurements,
+    /// False when a timeout or verification failure ended the run.
+    pub complete: bool,
 }
 
 impl BenchmarkReport {
     /// Current structured report version.
-    pub const VERSION: &'static str = "wyrd.bifrost.report/v1";
+    pub const VERSION: &'static str = "wyrd.bifrost.report/v2";
 
     /// Serialize a report as stable, pretty JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
@@ -206,6 +305,12 @@ mod tests {
             query_latency: LatencyPercentiles::default(),
             storage: StorageMeasurements::default(),
             query: QueryMeasurements::default(),
+            forge: ForgeMeasurements::default(),
+            stages: Vec::new(),
+            phases: Vec::new(),
+            backlog: Vec::new(),
+            verification: VerificationMeasurements::default(),
+            complete: true,
         };
         let json = report.to_json().expect("report serializes");
         let decoded: BenchmarkReport = serde_json::from_str(&json).expect("report parses");

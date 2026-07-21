@@ -104,6 +104,22 @@ pub fn compare_stages(
             after_report.query_latency.p99_us,
             tolerance,
         );
+        for before_stage in &before_report.stages {
+            if let Some(after_stage) = after_report
+                .stages
+                .iter()
+                .find(|stage| stage.stage == before_stage.stage)
+            {
+                compare_metric(
+                    &mut regressions,
+                    &before_report.workload.id,
+                    &format!("stage_{}_p99_us", before_stage.stage),
+                    before_stage.latency.p99_us,
+                    after_stage.latency.p99_us,
+                    tolerance,
+                );
+            }
+        }
     }
     for after_report in &after.reports {
         if !before
@@ -181,6 +197,12 @@ mod tests {
             query_latency: LatencyPercentiles::default(),
             storage: StorageMeasurements::default(),
             query: QueryMeasurements::default(),
+            forge: Default::default(),
+            stages: Vec::new(),
+            phases: Vec::new(),
+            backlog: Vec::new(),
+            verification: Default::default(),
+            complete: true,
         }
     }
 

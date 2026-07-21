@@ -12,6 +12,7 @@ pub mod seal;
 pub mod seal_key;
 pub mod stream_identity;
 pub mod tail_rpc;
+pub mod telemetry;
 pub mod wal;
 
 use arrow::array::Array;
@@ -29,6 +30,7 @@ use crate::contracts::{Scribe, ScribeAppend, ScribeError};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
+use crate::scribe::telemetry::ScribeTelemetry;
 
 /// Memtable key for per-bucket row-count inspection.
 ///
@@ -54,6 +56,8 @@ pub struct ScribeImpl {
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
     writer_epoch: i64,
+    /// Optional stage recorder used by benchmark and journey harnesses.
+    telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
 impl ScribeImpl {
@@ -70,6 +74,7 @@ impl ScribeImpl {
             wal,
             node_id,
             writer_epoch,
+            telemetry: None,
         }
     }
 
@@ -111,7 +116,21 @@ impl ScribeImpl {
             wal,
             node_id: "00000000-0000-0000-0000-000000000000".to_string(),
             writer_epoch: 1,
+            telemetry: None,
         }
+    }
+
+    /// Attach an opt-in stage recorder to this Scribe instance.
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Arc<ScribeTelemetry>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Return a snapshot of the attached stage samples.
+    #[must_use]
+    pub fn telemetry(&self) -> Option<Vec<telemetry::ScribeStageSample>> {
+        self.telemetry.as_ref().map(|recorder| recorder.snapshot())
     }
 
     /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
@@ -142,7 +161,7 @@ impl ScribeImpl {
                 detail: error.to_string(),
             })?;
 
-        let driver = SealDriver::new(self.operator.clone());
+        let driver = SealDriver::new_with_telemetry(self.operator.clone(), self.telemetry.clone());
         driver
             .pre_commit(
                 &self.memtable,
@@ -225,6 +244,7 @@ impl Default for ScribeImpl {
 #[async_trait]
 impl Scribe for ScribeImpl {
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        let append_started = std::time::Instant::now();
         // batch_id comes from the request (client-supplied v7 UUID); 2PC
         // recovery in catalog::recovery keys off this exact value.
         let batch_id = *req.batch_id.as_bytes();
@@ -253,6 +273,7 @@ impl Scribe for ScribeImpl {
                 detail: None,
             };
 
+            let preprocess_started = std::time::Instant::now();
             let audit_payload =
                 serde_json::to_vec(&audit_event).map_err(|e| ScribeError::Internal {
                     detail: format!("failed to serialize AuditEvent: {e}"),
@@ -273,10 +294,29 @@ impl Scribe for ScribeImpl {
                     detail: format!("Arrow IPC finish: {e}"),
                 })?;
             }
+            let day_rows = day_batch.num_rows();
+            let wal_payload_bytes = audit_payload.len().saturating_add(data_payload.len());
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record(
+                    "preprocess",
+                    preprocess_started.elapsed(),
+                    day_rows,
+                    wal_payload_bytes,
+                );
+            }
 
+            let wal_started = std::time::Instant::now();
             let wal_lsn = self
                 .wal
                 .append_and_fsync(batch_id, audit_payload, data_payload)?;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record(
+                    "wal_append_fsync",
+                    wal_started.elapsed(),
+                    day_rows,
+                    wal_payload_bytes,
+                );
+            }
 
             let meta = ScribeAppendMeta {
                 batch_id,
@@ -286,14 +326,21 @@ impl Scribe for ScribeImpl {
                 seal_key: seal_key.as_path_components(),
             };
 
+            let memtable_started = std::time::Instant::now();
             self.memtable
                 .insert(&seal_key, audit_event, meta, day_batch)?;
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record("memtable_insert", memtable_started.elapsed(), day_rows, 0);
+            }
 
             if self.memtable.should_seal(&seal_key)? {
                 tracing::info!(seal_key = %seal_key, "seal predicate triggered");
             }
         }
 
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record("append", append_started.elapsed(), req.rows.num_rows(), 0);
+        }
         Ok(())
     }
 }
@@ -302,7 +349,18 @@ impl ScribeImpl {
     /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
     #[must_use]
     pub fn wal_pending_bytes(&self) -> u64 {
-        0 // TODO : Real WAL pending bytes
+        self.wal.bytes_on_disk()
+    }
+
+    /// Return the number of bytes currently retained by this pod's WAL.
+    #[must_use]
+    pub fn wal_bytes_on_disk(&self) -> u64 {
+        self.wal.bytes_on_disk()
+    }
+
+    /// Return aggregate writable and immutable memtable state.
+    pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
+        self.memtable.stats()
     }
 
     /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.

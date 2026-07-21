@@ -21,12 +21,19 @@ if [[ ! -f "$runner" ]]; then
   exit 1
 fi
 
-for symbol in WyrdTestCluster WalWriter run_maintenance_tick reqwest BenchmarkReport; do
+for symbol in WyrdTestCluster BifrostHarness run_maintenance_tick reqwest BenchmarkReport; do
   if ! rg -n -w "$symbol" "$runner" >/dev/null; then
     echo "real Bifrost benchmark runner is missing required path: $symbol" >&2
     exit 1
   fi
 done
+
+if ! rg -n -w "ScribeTelemetry" \
+  crates/wyrd/wyrd-testing/src/bifrost/harness.rs \
+  crates/vala/vala-bifrost-redux/src/scribe/telemetry.rs >/dev/null; then
+  echo "real Bifrost benchmark harness is missing ScribeTelemetry" >&2
+  exit 1
+fi
 
 if rg -n 'Memory::default|chunks\(256\)|sort_unstable' "$runner" >/dev/null; then
   echo "registered Bifrost runner contains a synthetic or in-memory substitute" >&2

@@ -593,6 +593,24 @@ impl WalWriter {
         Ok(lsn)
     }
 
+    /// Return the current on-disk byte footprint of this WAL directory.
+    ///
+    /// Current Scribe does not truncate committed WAL segments yet, so this
+    /// diagnostic reports retained bytes rather than pretending they are an
+    /// active queue depth.
+    #[must_use]
+    pub fn bytes_on_disk(&self) -> u64 {
+        std::fs::read_dir(&self.base_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.metadata().ok())
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .sum()
+    }
+
     /// Roll to a new segment.
     ///
     fn roll_segment(&self) -> Result<(), ScribeError> {

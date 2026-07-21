@@ -16,6 +16,7 @@ use crate::scribe::filename::seal_filename;
 use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::wal::WalLsn;
 
 /// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
@@ -62,13 +63,29 @@ pub struct SealCommit {
 #[derive(Debug)]
 pub struct SealDriver {
     operator: Arc<Operator>,
+    telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
 impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self { operator }
+        Self {
+            operator,
+            telemetry: None,
+        }
+    }
+
+    /// Construct a seal driver with an optional benchmark recorder.
+    #[must_use]
+    pub fn new_with_telemetry(
+        operator: Arc<Operator>,
+        telemetry: Option<Arc<ScribeTelemetry>>,
+    ) -> Self {
+        Self {
+            operator,
+            telemetry,
+        }
     }
 
     /// Execute seal stages 1-4 (Freeze → Parquet → PUT → PG tx) and return a
@@ -103,10 +120,18 @@ impl SealDriver {
 
         // 1. Freeze
         info!("seal stage: Freeze");
+        let freeze_started = std::time::Instant::now();
         let frozen = memtable.freeze(seal_key)?;
+        self.record(
+            "freeze",
+            freeze_started.elapsed(),
+            frozen.batch.num_rows(),
+            frozen.batch.get_array_memory_size(),
+        );
 
         // 2. WriteParquet (spawn_blocking to avoid blocking reactor)
         info!("seal stage: WriteParquet");
+        let parquet_started = std::time::Instant::now();
         let frozen_clone = frozen.clone();
         let binding_clone = binding.clone();
         let seal_tenant = seal_key.tenant;
@@ -117,13 +142,27 @@ impl SealDriver {
         .map_err(|e| ScribeError::Internal {
             detail: format!("Parquet encode task panic: {e}"),
         })??;
+        self.record(
+            "parquet_encode",
+            parquet_started.elapsed(),
+            frozen.batch.num_rows(),
+            encoded.bytes.len(),
+        );
 
         // 3. PutObject
         info!("seal stage: PutObject");
+        let put_started = std::time::Instant::now();
         let parquet_path = self.put_object(binding, &encoded, node_id).await?;
+        self.record(
+            "object_store_put",
+            put_started.elapsed(),
+            frozen.batch.num_rows(),
+            encoded.bytes.len(),
+        );
 
         // 4. AtomicPgTx
         info!("seal stage: AtomicPgTx");
+        let pg_started = std::time::Instant::now();
         let row = file_list_writer::build_insert(
             &frozen,
             &encoded,
@@ -135,6 +174,12 @@ impl SealDriver {
         let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
             .await
             .map_err(ScribeError::from)?;
+        self.record(
+            "file_list_transaction",
+            pg_started.elapsed(),
+            frozen.batch.num_rows(),
+            encoded.bytes.len(),
+        );
 
         let wal_lsn_min = encoded
             .append_metas
@@ -163,6 +208,12 @@ impl SealDriver {
         })
     }
 
+    fn record(&self, stage: &str, elapsed: std::time::Duration, rows: usize, bytes: usize) {
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record(stage, elapsed, rows, bytes);
+        }
+    }
+
     /// PUT the Parquet object to storage with retry on transient failures.
     ///
     /// # Errors
@@ -173,8 +224,13 @@ impl SealDriver {
         encoded: &ParquetEncoded,
         node_id: &str,
     ) -> Result<String, ScribeError> {
-        let pod_id = PodId::new(node_id).map_err(|e| ScribeError::Internal {
-            detail: format!("node_id is not a valid PodId: {e}"),
+        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        let pod_id = PodId::new(format!("pod-{}", node_uuid.simple())).map_err(|error| {
+            ScribeError::Internal {
+                detail: format!("derived node PodId is invalid: {error}"),
+            }
         })?;
         let filename = seal_filename(&pod_id);
         let path = format!("{}/{}", binding.object_prefix, filename);

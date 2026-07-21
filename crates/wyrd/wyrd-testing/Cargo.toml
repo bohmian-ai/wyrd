@@ -61,9 +61,5 @@ wyrd-storage = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 
 [[bench]]
-name = "bench_forge_production"
-harness = false
-
-[[bench]]
 name = "bench_real_bifrost_workload"
 harness = false

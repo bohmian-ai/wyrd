@@ -38,6 +38,23 @@ pub struct Memtable {
     retention_grace: Duration,
 }
 
+/// Aggregate memory and generation state for a Scribe pod.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemtableStats {
+    /// Rows in writable buckets.
+    pub writable_rows: usize,
+    /// Estimated bytes in writable buckets.
+    pub writable_bytes: usize,
+    /// Rows retained in immutable generations.
+    pub immutable_rows: usize,
+    /// Estimated bytes retained in immutable generations.
+    pub immutable_bytes: usize,
+    /// Total immutable generations.
+    pub immutable_generations: usize,
+    /// Immutable generations still awaiting post-commit completion.
+    pub pending_generations: usize,
+}
+
 impl Memtable {
     /// Construct a new empty memtable.
     #[must_use]
@@ -419,6 +436,48 @@ impl Memtable {
             .flatten()
             .filter(|entry| entry.is_pending())
             .count())
+    }
+
+    /// Return aggregate writable and immutable state without exposing buckets.
+    pub fn stats(&self) -> Result<MemtableStats, ScribeError> {
+        let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable writable lock poisoned: {e}"),
+        })?;
+        let writable_rows = writable.values().map(|bucket| bucket.row_count).sum();
+        let writable_bytes = writable
+            .values()
+            .map(|bucket| bucket.bytes_accumulated)
+            .sum();
+        drop(writable);
+
+        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable immutable lock poisoned: {e}"),
+        })?;
+        let immutable_rows = immutable
+            .values()
+            .flatten()
+            .map(|entry| entry.frozen.batch.num_rows())
+            .sum();
+        let immutable_bytes = immutable
+            .values()
+            .flatten()
+            .map(|entry| entry.frozen.batch.get_array_memory_size())
+            .sum();
+        let immutable_generations = immutable.values().map(Vec::len).sum();
+        let pending_generations = immutable
+            .values()
+            .flatten()
+            .filter(|entry| entry.is_pending())
+            .count();
+
+        Ok(MemtableStats {
+            writable_rows,
+            writable_bytes,
+            immutable_rows,
+            immutable_bytes,
+            immutable_generations,
+            pending_generations,
+        })
     }
 }
 

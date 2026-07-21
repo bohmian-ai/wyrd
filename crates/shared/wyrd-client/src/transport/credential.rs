@@ -6,6 +6,7 @@
 //! resolved before each outbound request.
 
 use secrecy::SecretString;
+use wyrd_utils::config_dir::wyrd_config_dir;
 
 use crate::error::WyrdClientError;
 
@@ -114,10 +115,16 @@ impl CredentialChain {
     /// A missing or unreadable `credentials.toml` is silently ignored.
     #[must_use]
     pub fn from_env() -> Self {
+        Self::from_env_with_tenant(None)
+    }
+
+    /// Build a credential chain using an optional file-configured tenant.
+    #[must_use]
+    pub fn from_env_with_tenant(tenant_override: Option<&str>) -> Self {
         let mut chain = Self::default();
         for source in [
             explicit_token_from_env(),
-            workload_token_from_env(),
+            workload_token_from_env(tenant_override),
             api_key_from_env(),
             api_key_from_credentials_file(),
         ]
@@ -185,13 +192,18 @@ fn explicit_token_from_env() -> Option<CredentialSource> {
 /// Environment-based credential sources for the ADC chain.
 /// WYRD_WORKLOAD_TOKEN + WYRD_TENANT is a workload identity token, which is the second-highest-priority source.
 /// Often used in cloud-native environments where the workload identity provider issues a JWT that can be exchanged for a Wyrd access token.
-fn workload_token_from_env() -> Option<CredentialSource> {
+fn workload_token_from_env(tenant_override: Option<&str>) -> Option<CredentialSource> {
     let jwt = std::env::var("WYRD_WORKLOAD_TOKEN")
         .ok()
         .filter(|v| !v.is_empty())?;
     let tenant = std::env::var("WYRD_TENANT")
         .ok()
-        .filter(|v| !v.is_empty())?;
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            tenant_override
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })?;
     Some(CredentialSource::WorkloadToken {
         jwt: SecretString::from(jwt),
         tenant,
@@ -222,12 +234,12 @@ fn api_key_from_credentials_file() -> Option<CredentialSource> {
     })
 }
 
-/// Parse `~/.config/wyrd/credentials.toml` and return `[default].api_key`.
+/// Parse the resolved Wyrd `credentials.toml` and return `[default].api_key`.
 ///
 /// Returns `None` when the file is absent, unreadable, or has no key.
 fn read_credentials_toml_api_key() -> Option<String> {
-    let expanded = shellexpand::tilde("~/.config/wyrd/credentials.toml");
-    let content = std::fs::read_to_string(expanded.as_ref()).ok()?;
+    let path = wyrd_config_dir()?.join("credentials.toml");
+    let content = std::fs::read_to_string(path).ok()?;
 
     #[derive(serde::Deserialize)]
     struct CredentialsFile {
@@ -428,6 +440,49 @@ mod tests {
                 assert_eq!(k.expose_secret(), "file_floor_key");
             }
             _ => panic!("expected ApiKey from credentials.toml floor"),
+        }
+    }
+
+    #[test]
+    fn xdg_config_home_resolves_credentials_file() {
+        use std::fs;
+
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = std::env::temp_dir().join(format!(
+            "wyrd_xdg_cred_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir_all(tmp.join("wyrd")).unwrap();
+        fs::write(
+            tmp.join("wyrd/credentials.toml"),
+            "[default]\napi_key = \"xdg_key\"\n",
+        )
+        .unwrap();
+
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::remove_var("WYRD_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &tmp);
+            std::env::remove_var("HOME");
+            std::env::remove_var("WYRD_ACCESS_TOKEN");
+            std::env::remove_var("WYRD_WORKLOAD_TOKEN");
+            std::env::remove_var("WYRD_TENANT");
+            std::env::remove_var("WYRD_API_KEY");
+        }
+
+        let chain = CredentialChain::from_env();
+        let credential = chain.resolve().expect("XDG credentials file resolves");
+
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+        fs::remove_dir_all(&tmp).ok();
+
+        match credential {
+            ResolvedCredential::ApiKey(key) => assert_eq!(key.expose_secret(), "xdg_key"),
+            other => panic!("expected ApiKey from XDG credentials.toml, got {other:?}"),
         }
     }
 }

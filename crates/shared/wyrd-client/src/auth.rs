@@ -119,7 +119,7 @@ impl AuthMiddleware {
         credential: ResolvedCredential,
     ) -> Result<Arc<Self>, WyrdClientError> {
         let cache_path = if config.token_cache == TokenCacheMode::Disk {
-            token_cache_path()
+            config.token_cache_path.clone().or_else(token_cache_path)
         } else {
             None
         };
@@ -392,10 +392,9 @@ fn transport_down(err: reqwest::Error) -> AuthError {
     })
 }
 
-/// Path of the on-disk token cache: `~/.config/wyrd/token_cache.json`.
+/// Resolve the default on-disk token-cache path from the shared config helper.
 fn token_cache_path() -> Option<PathBuf> {
-    let expanded = shellexpand::tilde("~/.config/wyrd/token_cache.json");
-    Some(PathBuf::from(expanded.as_ref()))
+    wyrd_utils::config_dir::wyrd_config_dir().map(|path| path.join("tokens"))
 }
 
 /// Load a non-stale token record from the given path, if present. Best-effort.

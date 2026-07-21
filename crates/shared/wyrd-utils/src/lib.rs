@@ -5,6 +5,7 @@
 #![deny(missing_docs)]
 
 pub mod codec;
+pub mod config_dir;
 pub mod fs;
 pub mod json;
 #[cfg(feature = "python")]

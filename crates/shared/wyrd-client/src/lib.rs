@@ -10,11 +10,13 @@ pub mod auth;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod global_config;
 #[cfg(feature = "test-util")]
 pub mod testing;
 pub mod transport;
 
 pub use client::WyrdClient;
+pub use global_config::GlobalConfig;
 
 /// Serializes tests that read or mutate process-global `WYRD_*`/`HOME`
 /// environment variables. `ClientConfig::from_env` and

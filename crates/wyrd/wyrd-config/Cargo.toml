@@ -6,6 +6,7 @@ rust-version = { workspace = true }
 
 [features]
 default = []
+testing = []
 python = ["dep:pyo3", "dep:wyrd-utils", "dep:wyrd-interfaces"]
 
 [dependencies]

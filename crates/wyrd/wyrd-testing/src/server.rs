@@ -68,10 +68,10 @@ pub struct WyrdTestServer {
 }
 
 struct WyrdTestServerInner {
-    fixture: PgFixture,
+    fixture: Arc<PgFixture>,
     // Lifetime guard: only set for local-backend servers; cloud backends need no tempdir.
     #[allow(dead_code)]
-    storage_root: Option<tempfile::TempDir>,
+    storage_root: Option<Arc<tempfile::TempDir>>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -865,6 +865,59 @@ impl WyrdTestServer {
     pub fn pg_fixture(&self) -> &PgFixture {
         &self.inner.fixture
     }
+
+    /// Bind an already-constructed server to OS-assigned HTTP and gRPC ports.
+    pub(crate) async fn bind(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
+        // Inject a known shutdown token so the harness can stop the real server;
+        // `BoundServer::run` observes `state.shutdown_token`.
+        let shutdown_token = CancellationToken::new();
+        let state = self
+            .inner
+            .state
+            .clone()
+            .with_shutdown_token(shutdown_token.clone());
+
+        // Ephemeral ports, metrics off (the recorder is a process-global
+        // singleton that must not be installed per-test), reflection off.
+        let loopback = "127.0.0.1:0"
+            .parse()
+            .expect("static loopback socket addr is valid");
+        let mut config = WyrdServerConfig::default();
+        config.http.bind = loopback;
+        config.grpc.bind = loopback;
+        config.metrics.enabled = false;
+        config.serve.mode = ServeMode::Both;
+
+        let bound = WyrdServer::new(config, state)
+            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
+            .bind(ServeMode::Both)
+            .await
+            .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
+
+        let addr = bound
+            .http_addr()
+            .ok_or_else(|| WyrdTestServerError::Bind("no HTTP address bound".to_owned()))?;
+        let grpc_addr = bound
+            .grpc_addr()
+            .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
+        let base_url = format!("http://{addr}");
+
+        let serve_handle = wyrd_runtime::runtime().spawn(async move {
+            let _ = bound.run().await;
+        });
+
+        self.shutdown_token = Some(shutdown_token);
+        self.serve_handle = Some(serve_handle);
+        self.mode = Mode::Bound {
+            addr,
+            base_url: base_url.clone(),
+            grpc_addr,
+        };
+
+        wait_for_ready(&base_url).await?;
+
+        Ok(self)
+    }
 }
 
 impl Drop for WyrdTestServer {
@@ -999,10 +1052,12 @@ impl WyrdTestServerBuilder {
     ///
     /// # Errors
     /// Returns an error when database, storage, auth, or router state cannot be created.
-    pub async fn start_in_process(self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        let fixture = PgFixture::start()
-            .await
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+    pub async fn start_in_process(mut self) -> Result<WyrdTestServer, WyrdTestServerError> {
+        let fixture = Arc::new(
+            PgFixture::start()
+                .await
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let tenant_id = fixture.data_tenant_id();
         let mut conn = fixture.tenant_conn().await.map_err(sql)?;
         seed_builtin_roles_for_tenant(&mut conn, tenant_id)
@@ -1010,9 +1065,9 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         conn.commit().await.map_err(sql)?;
 
-        let (storage_root, storage) = if let Some(handle) = self.storage_handle {
+        let (storage_root, storage) = if let Some(handle) = self.storage_handle.take() {
             (None, handle)
-        } else if let Some(settings) = self.storage_settings {
+        } else if let Some(settings) = self.storage_settings.take() {
             let handle = wyrd_storage::StorageHandle::from_settings(settings)
                 .await
                 .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
@@ -1032,9 +1087,27 @@ impl WyrdTestServerBuilder {
             })
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-            (Some(root), handle)
+            (Some(Arc::new(root)), handle)
         };
         let bifrost = test_catalog(&fixture, &storage).await?;
+
+        self.start_with_resources(fixture, storage, bifrost, storage_root)
+            .await
+    }
+
+    /// Start a server over shared cluster resources.
+    ///
+    /// The caller owns the shared fixture, storage root, and catalog for the
+    /// lifetime of every server created from them. Each server still binds
+    /// its own HTTP and gRPC sockets and creates its own application state.
+    pub(crate) async fn start_with_resources(
+        self,
+        fixture: Arc<PgFixture>,
+        storage: Arc<wyrd_storage::StorageHandle>,
+        bifrost: Arc<WyrdCatalog>,
+        storage_root: Option<Arc<tempfile::TempDir>>,
+    ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        let tenant_id = fixture.data_tenant_id();
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1182,57 +1255,8 @@ impl WyrdTestServerBuilder {
     /// # Errors
     /// Returns an error when startup or socket binding fails.
     pub async fn start_bound(self) -> Result<WyrdTestServer, WyrdTestServerError> {
-        let mut srv = self.start_in_process().await?;
-
-        // Inject a known shutdown token so the harness can stop the real server;
-        // `BoundServer::run` observes `state.shutdown_token`.
-        let shutdown_token = CancellationToken::new();
-        let state = srv
-            .inner
-            .state
-            .clone()
-            .with_shutdown_token(shutdown_token.clone());
-
-        // Ephemeral ports, metrics off (the recorder is a process-global
-        // singleton that must not be installed per-test), reflection off.
-        let loopback = "127.0.0.1:0"
-            .parse()
-            .expect("static loopback socket addr is valid");
-        let mut config = WyrdServerConfig::default();
-        config.http.bind = loopback;
-        config.grpc.bind = loopback;
-        config.metrics.enabled = false;
-        config.serve.mode = ServeMode::Both;
-
-        let bound = WyrdServer::new(config, state)
-            .map_err(|e| WyrdTestServerError::Start(e.to_string()))?
-            .bind(ServeMode::Both)
-            .await
-            .map_err(|e| WyrdTestServerError::Bind(format!("{e:?}")))?;
-
-        let addr = bound
-            .http_addr()
-            .ok_or_else(|| WyrdTestServerError::Bind("no HTTP address bound".to_owned()))?;
-        let grpc_addr = bound
-            .grpc_addr()
-            .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
-        let base_url = format!("http://{addr}");
-
-        let serve_handle = wyrd_runtime::runtime().spawn(async move {
-            let _ = bound.run().await;
-        });
-
-        srv.shutdown_token = Some(shutdown_token);
-        srv.serve_handle = Some(serve_handle);
-        srv.mode = Mode::Bound {
-            addr,
-            base_url: base_url.clone(),
-            grpc_addr,
-        };
-
-        wait_for_ready(&base_url).await?;
-
-        Ok(srv)
+        let srv = self.start_in_process().await?;
+        srv.bind().await
     }
 }
 
@@ -1494,7 +1518,7 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
     WyrdTestServerError::Sql(error.to_string())
 }
 
-async fn test_catalog(
+pub(crate) async fn test_catalog(
     fixture: &PgFixture,
     storage: &Arc<wyrd_storage::StorageHandle>,
 ) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {

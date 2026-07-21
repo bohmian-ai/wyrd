@@ -23,3 +23,19 @@ min = 1.0
 [bench.bifrost.forge_production]
 metric = "ticks_per_sec"
 min = 0.1
+
+[bench.bifrost.scribe_slo]
+metric = "p99_us"
+max = 100_000
+
+[bench.bifrost.forge_slo]
+metric = "p99_us"
+max = 10_000_000
+
+[bench.bifrost.oracle_slo]
+metric = "first_byte_us"
+max = 10_000_000
+
+[bench.bifrost.capacity]
+metric = "p99_us"
+max = 10_000_000

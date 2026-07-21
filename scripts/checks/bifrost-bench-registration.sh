@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+for lane in \
+  "bench:bifrost:scribe:slo" \
+  "bench:bifrost:forge:slo" \
+  "bench:bifrost:oracle:slo" \
+  "bench:bifrost:capacity"; do
+  if ! rg -n -F "[tasks.\"$lane\"]" mise.toml >/dev/null; then
+    echo "missing required Bifrost benchmark lane: $lane" >&2
+    exit 1
+  fi
+done
+
+runner="crates/wyrd/wyrd-testing/benches/bench_real_bifrost_workload.rs"
+if [[ ! -f "$runner" ]]; then
+  echo "registered Bifrost lanes must use $runner" >&2
+  exit 1
+fi
+
+for symbol in WyrdTestCluster WalWriter run_maintenance_tick reqwest BenchmarkReport; do
+  if ! rg -n -w "$symbol" "$runner" >/dev/null; then
+    echo "real Bifrost benchmark runner is missing required path: $symbol" >&2
+    exit 1
+  fi
+done
+
+if rg -n 'Memory::default|chunks\(256\)|sort_unstable' "$runner" >/dev/null; then
+  echo "registered Bifrost runner contains a synthetic or in-memory substitute" >&2
+  exit 1
+fi
+
+echo "Bifrost benchmark registration passed"

@@ -173,6 +173,30 @@ depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo bench --locked -p vala-bifrost-redux --bench bench_wal_tail_p99 && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_compaction_throughput && cargo bench --locked -p vala-bifrost-redux --bench bench_forge_maintenance && cargo bench --locked -p wyrd-testing --bench bench_forge_production"
 
+[tasks."bench:bifrost:scribe:slo"]
+description = "Run the real multi-pod Scribe WAL/fsync workload and emit structured JSON"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=scribe --pods=3"
+
+[tasks."bench:bifrost:forge:slo"]
+description = "Run the real Forge object-store rewrite and Postgres commit workload"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=forge --pods=3"
+
+[tasks."bench:bifrost:oracle:slo"]
+description = "Run the real authenticated Oracle query path against independently bound pods"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=oracle --pods=3"
+
+[tasks."bench:bifrost:capacity"]
+description = "Run the complete real Scribe, Forge, and Oracle capacity workload"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=capacity --pods=3"
+
 [tasks."test:unit"]
 description = """Aggregate Rust test gate: family lanes (wyrd, skald, vala, shared) + storage emulator matrix + sql + server e2e.
 Bifrost (DataFusion-heavy) runs as a separate CI job via test:bifrost to avoid artifact-lock
@@ -971,6 +995,11 @@ run = "bash scripts/checks/no-tonic-outside-wyrd-tonic.sh"
 hide = true
 description = "Reject normal production dependencies on test-tier wyrd-testing or wyrd-bench crates"
 run = "bash scripts/checks/no-testing-in-prod-deps.sh"
+
+[tasks."check:bifrost-bench-registration"]
+hide = true
+description = "Ensure named Bifrost benchmark lanes execute the real server/storage workload runner"
+run = "bash scripts/checks/bifrost-bench-registration.sh"
 
 [tasks."check:proto-drift"]
 hide = true

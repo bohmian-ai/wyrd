@@ -2,8 +2,8 @@
 title: Audit Relay
 description: How Vala's background relay pumps audit events from the transactional outbox into the queryable Iceberg warehouse, with crash-safe idempotency and tenant isolation.
 pillar: wyrd
-group: Concepts
-order: 11
+group: Bifrost
+order: 10
 ---
 
 # Audit Relay

@@ -2,8 +2,8 @@
 title: Architecture
 description: The three products Wyrd ships from one source tree — control plane, runtime, and data plane — over one shared spec crate.
 pillar: wyrd
-group: Concepts
-order: 5
+group: Architecture
+order: 1
 ---
 
 # Architecture

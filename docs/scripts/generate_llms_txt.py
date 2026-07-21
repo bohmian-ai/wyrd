@@ -37,52 +37,60 @@ HOME = (
     "The typed control layer for AI systems: cards, a registry, and the Skald runtime.",
 )
 
-# Section directories in the order they appear in the site nav. Ordered to
-# match the locked 7-section Diátaxis IA (Decision 8 from commit 09):
-# Overview / Setup / Tutorials / How-to / Concepts / Reference / For Agents.
+# URL sections in the order agents should encounter them. The human sidebar
+# groups these routes by reader intent and product topic; llms.txt keeps the
+# actual URL prefixes because agents use them as stable traversal points.
 # Any content directory not listed here is appended afterwards in alphabetical
 # order so a new section never silently drops out of llms.txt.
 SECTION_ORDER = [
     "overview",
-    "setup",
+    "get-started",
     "tutorials",
-    "how-to",
     "concepts",
+    "how-to",
+    "products",
+    "skald",
+    "bifrost",
     "cards",
     "api",
+    "reference",
+    "self-hosting",
     "for-agents",
-    # Legacy sections that predate the Diátaxis IA; kept in SECTION_ORDER so
-    # they appear in a stable position rather than being sorted alphabetically.
+    "fathom",
+    # Legacy sections that predate the current IA stay below the active routes
+    # so they remain discoverable without affecting the main traversal order.
     "start-here",
-    "skald",
     "guides",
     "agents",
     "evaluation",
     "server",
     "python",
     "roadmap",
-    "fathom",
 ]
 
 SECTION_TITLES = {
     "": "Home",
     "overview": "Overview",
-    "setup": "Setup",
+    "get-started": "Get started",
     "tutorials": "Tutorials",
     "how-to": "How-to guides",
     "concepts": "Concepts",
+    "products": "Products and components",
+    "skald": "Skald runtime",
+    "bifrost": "Bifrost",
     "cards": "Cards",
     "api": "API reference",
+    "reference": "Reference",
+    "self-hosting": "Self-hosting",
     "for-agents": "For Agents",
     "start-here": "Start here",
-    "skald": "Skald runtime",
     "guides": "Guides",
     "agents": "Agents",
     "evaluation": "Evaluation",
     "server": "Server",
     "python": "Python",
-    "roadmap": "Roadmap",
     "fathom": "Fathom",
+    "roadmap": "Roadmap",
 }
 
 # Card kinds that ship a dedicated reference page under /cards/. Every other
@@ -142,8 +150,8 @@ def read_frontmatter(path: Path) -> tuple[str, str, str, bool]:
     """Return (title, description, pillar, draft) from a leading `---` block.
 
     A minimal line parser keeps the generator free of a YAML dependency in the
-    docs build environment. `pillar`/`draft` drive the same visibility filter the
-    human sidebar applies (derived-nav.ts), so both surfaces list the same pages.
+    docs build environment. `draft` controls publication; all pillars are
+    included because the docs site documents Wyrd, Fathom, and shared surfaces.
     """
     text = path.read_text(encoding="utf-8")
     title = ""
@@ -178,17 +186,16 @@ def collect_pages() -> list[tuple[str, str, str, str]]:
     """Scan the content tree and return (section, slug, title, description).
 
     The home route is injected first; every other entry is a real file on
-    disk that the build prerenders AND the human sidebar shows. The sidebar
-    (derived-nav.ts) filters `pillar === 'wyrd' && !draft`, so this generator
-    applies the same filter — both surfaces list the same pages and the agent
-    index never advertises a page the human sidebar hides.
+    disk that the build prerenders. Draft pages are omitted; product pillars are
+    all included so agents can discover the same published product surfaces as
+    human readers.
     """
     pages: list[tuple[str, str, str, str]] = [("", HOME[0], HOME[1], HOME[2])]
     for path in sorted(CONTENT_DIR.rglob("*")):
         if path.suffix not in {".svx", ".md"}:
             continue
         title, description, pillar, draft = read_frontmatter(path)
-        if pillar != "wyrd" or draft:
+        if draft:
             continue
         slug = slug_for(path)
         section = slug.split("/", 1)[0] if slug else ""

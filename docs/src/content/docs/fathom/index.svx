@@ -2,6 +2,9 @@
 title: Fathom
 description: The enterprise intelligence layer that reads Wyrd's typed model and turns behavior into evidence. Coming soon.
 pillar: fathom
+section: Products and components
+group: Fathom
+order: 1
 ---
 
 # Fathom

@@ -727,6 +727,14 @@ run = [
   "WYRD_SERVER_PORT=${WYRD_SERVER_PORT:-8080} ./target/debug/wyrd-server",
 ]
 
+[tasks."cli:dev-bootstrap"]
+description = "Seed the local Wyrd tenant and service credentials"
+run = "cargo run --locked -p wyrd-cli -- dev bootstrap"
+
+[tasks."cli:bootstrap-key"]
+description = "Mint the first admin API key for a tenant"
+run = "cargo run --locked -p wyrd-server -- bootstrap-key --tenant ${WYRD_BOOTSTRAP_TENANT:-acme}"
+
 [tasks."dev:frontend"]
 description = "SvelteKit dev server on :3000"
 dir = "crates/wyrd/wyrd-server/wyrd-ui"

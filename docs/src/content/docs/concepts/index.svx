@@ -23,6 +23,9 @@ A `Card` carries a `Spec`. A `Spec` can hold `CardRef`s to other cards — the
 server derives the lineage graph from them. A `Run` records what executed and
 which cards drove it. `Observations` annotate cards and runs with evidence.
 
+This is the mental model section. For a component workflow, use the [Cards
+hub](/cards/), [Bifrost](/bifrost/), or [How-to guides](/how-to/) instead.
+
 ## Pages
 
 - [Card](/concepts/card/) — the envelope, the spec, and the lifecycle.

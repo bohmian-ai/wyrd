@@ -26,7 +26,7 @@
       </p>
       <div class="hero-cta">
         <a class="btn btn-lime" href={`${base}/get-started/`}>▶ Get started</a>
-        <a class="btn btn-ghost" href={`${base}/concepts/`}>Explore concepts</a>
+        <a class="btn btn-ghost" href={`${base}/tutorials/`}>Learn Wyrd</a>
       </div>
     </div>
 
@@ -64,28 +64,38 @@
 <section class="sec center">
   <div class="wrap">
     <div class="sec-head">
-      <div class="sec-eye">CHOOSE YOUR OWN ADVENTURE!!!</div>
-      <h2 class="title">Four paths await <em>you</em>.</h2>
+      <div class="sec-eye">FIND THE RIGHT PATH</div>
+      <h2 class="title">Start with the question <em>you have</em>.</h2>
     </div>
     <div class="grid3" style="text-align:left;margin-top:8px">
       <a class="card" href={`${base}/get-started/`}>
-        <div class="ct"><span class="d client"></span>Agentic Development</div>
-        <p>Install Wyrd, use your harness of choice to create and optimize a model iteratively. Declare a service and deploy</p>
+        <div class="ct"><span class="d client"></span>Start here</div>
+        <p>Install Wyrd and run the first local DataCard workflow.</p>
         <div class="meta">Start here →</div>
       </a>
-      <a class="card" href={`${base}/concepts/`}>
-        <div class="ct"><span class="d rune"></span>Concepts</div>
-        <p>Cards, the shared envelope, Specs, Runs, Observations, and the registry graph.</p>
+      <a class="card" href={`${base}/tutorials/`}>
+        <div class="ct"><span class="d rune"></span>Learn Wyrd</div>
+        <p>Follow tutorials, then learn the Card, Spec, Run, and Observation model.</p>
         <div class="meta">Learn the model →</div>
+      </a>
+      <a class="card" href={`${base}/how-to/`}>
+        <div class="ct"><span class="d control"></span>Build with Wyrd</div>
+        <p>Declare Cards, build agents and workflows, and work through capability recipes.</p>
+        <div class="meta">Build something →</div>
+      </a>
+      <a class="card" href={`${base}/products/`}>
+        <div class="ct"><span class="d server"></span>Products and components</div>
+        <p>Find the right component: Wyrd core, Cards, Bifrost, Skald, or Fathom.</p>
+        <div class="meta">Choose a component →</div>
       </a>
       <a class="card" href={`${base}/reference/`}>
         <div class="ct"><span class="d control"></span>Reference</div>
-        <p>Schemas, stable error codes, CLI verbs, and MCP tools — the literal contract.</p>
+        <p>Look up schemas, stable error codes, CLI verbs, and API contracts.</p>
         <div class="meta">Look it up →</div>
       </a>
       <a class="card" href={`${base}/for-agents/`}>
         <div class="ct"><span class="d server"></span>For agents</div>
-        <p>Machine-navigable surfaces, llms.txt, and error-remediation recipes.</p>
+        <p>Use stable paths, machine-readable indexes, and error-remediation recipes.</p>
         <div class="meta">Wire an agent →</div>
       </a>
     </div>

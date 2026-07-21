@@ -30,6 +30,7 @@ describe('validateFrontmatter', () => {
       title: '  Hello World  ',
       description: 'A test page',
       pillar: 'wyrd',
+      section: 'Learn Wyrd',
       group: 'Concepts',
       order: 1,
       draft: false
@@ -38,6 +39,7 @@ describe('validateFrontmatter', () => {
       title: 'Hello World',
       description: 'A test page',
       pillar: 'wyrd',
+      section: 'Learn Wyrd',
       group: 'Concepts',
       order: 1,
       draft: false
@@ -60,8 +62,8 @@ describe('validateFrontmatter', () => {
     expect(() => validateFrontmatter('/src/content/docs/null-fm.md', null)).toThrow(/null-fm\.md/);
   });
 
-  // pillar is fail-closed: it gates sidebar inclusion and the llms.txt agent
-  // index, so a missing/invalid pillar is a hard build error, not a silent omit.
+  // pillar is fail-closed: it identifies the owning product surface used by
+  // navigation and machine-readable indexes.
   it('throws naming the path when pillar is missing', () => {
     expect(() => validateFrontmatter('/src/content/docs/no-pillar.md', { title: 'X' })).toThrow(
       /no-pillar\.md/

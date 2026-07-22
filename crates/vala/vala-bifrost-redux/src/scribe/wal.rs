@@ -23,9 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use wyrd_spec::ids::DataTenantId;
 
 use crate::contracts::ScribeError;
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
@@ -86,6 +88,7 @@ pub struct SegmentHeader {
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 const WAL_VERSION: u16 = 2;
 const SEGMENT_HEADER_SIZE: usize = 64;
+const APPEND_FRAME_MAGIC: [u8; 4] = *b"SWF1";
 
 impl SegmentHeader {
     /// Construct a new segment header.
@@ -368,6 +371,66 @@ impl WalRecord {
     }
 }
 
+/// Encode one complete paired audit/data append for the blocking WAL worker.
+pub(crate) fn encode_append_frame(
+    batch_id: [u8; 16],
+    audit: &[u8],
+    data: &[u8],
+) -> Result<Bytes, ScribeError> {
+    let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
+        detail: "audit envelope exceeds WAL frame length".to_string(),
+    })?;
+    let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
+        detail: "Arrow payload exceeds WAL frame length".to_string(),
+    })?;
+    let mut frame = Vec::with_capacity(28 + audit.len() + data.len());
+    frame.extend_from_slice(&APPEND_FRAME_MAGIC);
+    frame.extend_from_slice(&batch_id);
+    frame.extend_from_slice(&audit_len.to_le_bytes());
+    frame.extend_from_slice(&data_len.to_le_bytes());
+    frame.extend_from_slice(audit);
+    frame.extend_from_slice(data);
+    Ok(Bytes::from(frame))
+}
+
+struct DecodedAppendFrame<'a> {
+    batch_id: [u8; 16],
+    audit: &'a [u8],
+    data: &'a [u8],
+}
+
+fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
+    if frame.len() < 28 || frame[0..4] != APPEND_FRAME_MAGIC {
+        return Err(ScribeError::Internal {
+            detail: "invalid Scribe WAL append frame".to_string(),
+        });
+    }
+    let mut batch_id = [0_u8; 16];
+    batch_id.copy_from_slice(&frame[4..20]);
+    let audit_len = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]) as usize;
+    let data_len = u32::from_le_bytes([frame[24], frame[25], frame[26], frame[27]]) as usize;
+    let payload_len = audit_len
+        .checked_add(data_len)
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "Scribe WAL append frame length overflow".to_string(),
+        })?;
+    let end = 28usize
+        .checked_add(payload_len)
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "Scribe WAL append frame offset overflow".to_string(),
+        })?;
+    if end != frame.len() {
+        return Err(ScribeError::Internal {
+            detail: "Scribe WAL append frame length mismatch".to_string(),
+        });
+    }
+    Ok(DecodedAppendFrame {
+        batch_id,
+        audit: &frame[28..28 + audit_len],
+        data: &frame[28 + audit_len..end],
+    })
+}
+
 /// WAL segment — one file in the per-seal-key WAL stream.
 #[derive(Debug)]
 pub struct WalSegment {
@@ -453,13 +516,11 @@ impl WalSegment {
         })
     }
 
-    /// Append a record to the segment and fsync.
-    ///
-    /// # Panics
-    pub fn append_and_fsync(&self, record: &WalRecord) -> Result<(), ScribeError> {
+    /// Append a record to the segment without forcing it to stable storage.
+    pub fn append(&self, record: &WalRecord) -> Result<(), ScribeError> {
         let encoded = record.encode();
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
-            detail: "WAL segment file lock poisoned (append_and_fsync)".to_string(),
+            detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
 
         file.write_all(&encoded).map_err(|e| {
@@ -471,11 +532,23 @@ impl WalSegment {
                 }
             }
         })?;
+        Ok(())
+    }
 
-        file.sync_all().map_err(|e| ScribeError::Internal {
-            detail: format!("WAL fsync failed: {e}"),
+    /// Force all appended data for this segment to stable storage.
+    pub fn sync_data(&self) -> Result<(), ScribeError> {
+        let file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (sync_data)".to_string(),
         })?;
+        file.sync_data().map_err(|e| ScribeError::Internal {
+            detail: format!("WAL data sync failed: {e}"),
+        })
+    }
 
+    /// Append a record and force it to stable storage.
+    pub fn append_and_fsync(&self, record: &WalRecord) -> Result<(), ScribeError> {
+        self.append(record)?;
+        self.sync_data()?;
         Ok(())
     }
 
@@ -490,8 +563,26 @@ impl WalSegment {
             })?;
 
         let mut records = Vec::new();
-        while let Some(record) = WalRecord::decode_from(&mut *file)? {
-            records.push(record);
+        loop {
+            let record_offset = file
+                .stream_position()
+                .map_err(|error| ScribeError::Internal {
+                    detail: format!("WAL record position failed: {error}"),
+                })?;
+            match WalRecord::decode_from(&mut *file) {
+                Ok(Some(record)) => records.push(record),
+                Ok(None) => break,
+                Err(_) => {
+                    file.set_len(record_offset)
+                        .map_err(|error| ScribeError::Internal {
+                            detail: format!("WAL torn-tail truncation failed: {error}"),
+                        })?;
+                    file.sync_data().map_err(|error| ScribeError::Internal {
+                        detail: format!("WAL torn-tail sync failed: {error}"),
+                    })?;
+                    break;
+                }
+            }
         }
 
         Ok(records)
@@ -524,6 +615,38 @@ pub struct WalWriter {
     current_segment_size: Arc<AtomicU64>,
 }
 
+/// A WAL handle bound to one seal-key.
+#[derive(Debug, Clone)]
+pub struct WalHandle {
+    writer: Arc<WalWriter>,
+    seal_key: SealKey,
+}
+
+impl WalHandle {
+    pub(crate) fn new(writer: Arc<WalWriter>, seal_key: SealKey) -> Self {
+        Self { writer, seal_key }
+    }
+
+    /// The seal-key routed by this handle.
+    #[must_use]
+    pub fn seal_key(&self) -> &SealKey {
+        &self.seal_key
+    }
+
+    pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<WalLsn, ScribeError> {
+        self.writer.append_frame(frame)
+    }
+
+    pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
+        self.writer.sync_data()
+    }
+
+    pub(crate) fn create_or_roll_segment(&self) -> Result<(), ScribeError> {
+        let _ = self.writer.ensure_segment()?;
+        Ok(())
+    }
+}
+
 impl WalWriter {
     /// Create a new WAL writer for the given seal-key.
     ///
@@ -536,10 +659,6 @@ impl WalWriter {
         max_segment_size: Option<u64>,
     ) -> Result<Self, ScribeError> {
         let base_dir = base_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&base_dir).map_err(|e| ScribeError::Internal {
-            detail: format!("failed to create WAL directory: {e}"),
-        })?;
-
         Ok(Self {
             base_dir,
             node_id,
@@ -553,20 +672,54 @@ impl WalWriter {
         })
     }
 
+    pub(crate) fn handle_for_seal_key(&self, key: SealKey) -> Result<WalHandle, ScribeError> {
+        let base_dir = self.base_dir.join(key.as_path_components());
+        let mut writer = Self::new(
+            base_dir,
+            self.node_id,
+            self.writer_epoch,
+            key.tenant,
+            Some(self.max_segment_size),
+        )?;
+        // LSNs identify the pod's WAL stream, not an individual tenant/table/day
+        // directory. Keep allocation global across all lazy seal-key handles so
+        // file-list replay keys cannot collide between independent writers.
+        writer.next_lsn = Arc::clone(&self.next_lsn);
+        Ok(WalHandle::new(Arc::new(writer), key))
+    }
+
     /// Append paired (audit, data) records and fsync.
     ///
     /// Returns the assigned LSN (same for both records).
     pub fn append_and_fsync(
         &self,
         batch_id: [u8; 16],
-        audit_payload: Vec<u8>,
-        data_payload: Vec<u8>,
+        audit_payload: &[u8],
+        data_payload: &[u8],
+    ) -> Result<WalLsn, ScribeError> {
+        let frame = encode_append_frame(batch_id, audit_payload, data_payload)?;
+        let lsn = self.append_frame(&frame)?;
+        self.sync_data()?;
+        Ok(lsn)
+    }
+
+    /// Append a prepared paired frame without syncing it.
+    pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<WalLsn, ScribeError> {
+        let decoded = decode_append_frame(frame)?;
+        self.append_pair(decoded.batch_id, decoded.audit, decoded.data)
+    }
+
+    fn append_pair(
+        &self,
+        batch_id: [u8; 16],
+        audit_payload: &[u8],
+        data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
 
         // Build records to calculate their sizes
-        let audit_record = WalRecord::new(lsn, 1, batch_id, audit_payload);
-        let data_record = WalRecord::new(lsn, 0, batch_id, data_payload);
+        let audit_record = WalRecord::new(lsn, 1, batch_id, audit_payload.to_vec());
+        let data_record = WalRecord::new(lsn, 0, batch_id, data_payload.to_vec());
 
         let audit_size = audit_record.encode().len() as u64;
         let data_size = data_record.encode().len() as u64;
@@ -580,17 +733,28 @@ impl WalWriter {
 
         let segment = self.ensure_segment()?;
 
-        // Write audit record (kind=1)
-        segment.append_and_fsync(&audit_record)?;
-
-        // Write data record (kind=0)
-        segment.append_and_fsync(&data_record)?;
+        segment.append(&audit_record)?;
+        segment.append(&data_record)?;
 
         // Update segment size counter
         self.current_segment_size
             .fetch_add(total_size, Ordering::SeqCst);
 
         Ok(lsn)
+    }
+
+    fn sync_data(&self) -> Result<(), ScribeError> {
+        let segment = self
+            .current_segment
+            .lock()
+            .map_err(|_| ScribeError::Internal {
+                detail: "segment lock poisoned (sync_data)".to_string(),
+            })?
+            .clone();
+        if let Some(segment) = segment {
+            segment.sync_data()?;
+        }
+        Ok(())
     }
 
     /// Return the current on-disk byte footprint of this WAL directory.
@@ -600,15 +764,28 @@ impl WalWriter {
     /// active queue depth.
     #[must_use]
     pub fn bytes_on_disk(&self) -> u64 {
-        std::fs::read_dir(&self.base_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter_map(|entry| entry.metadata().ok())
-            .filter(std::fs::Metadata::is_file)
-            .map(|metadata| metadata.len())
-            .sum()
+        fn directory_bytes(path: &Path) -> u64 {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return 0;
+            };
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| {
+                    let Ok(metadata) = entry.metadata() else {
+                        return 0;
+                    };
+                    if metadata.is_dir() {
+                        directory_bytes(&entry.path())
+                    } else if metadata.is_file() {
+                        metadata.len()
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+
+        directory_bytes(&self.base_dir)
     }
 
     /// Roll to a new segment.
@@ -638,6 +815,9 @@ impl WalWriter {
         }
 
         let seq = self.seg_seq.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir_all(&self.base_dir).map_err(|error| ScribeError::Internal {
+            detail: format!("failed to create WAL directory: {error}"),
+        })?;
         let path = self.base_dir.join(format!("seg-{seq}.arrow"));
         #[expect(
             clippy::cast_possible_truncation,
@@ -705,14 +885,10 @@ impl WalReader {
             });
         }
 
+        let mut paths = Vec::new();
+        collect_segment_paths(dir, &mut paths)?;
         let mut segments = Vec::new();
-        for entry in std::fs::read_dir(dir).map_err(|e| ScribeError::Internal {
-            detail: format!("failed to read WAL directory: {e}"),
-        })? {
-            let entry = entry.map_err(|e| ScribeError::Internal {
-                detail: format!("failed to read WAL directory entry: {e}"),
-            })?;
-            let path = entry.path();
+        for path in paths {
             if path.extension().and_then(|s| s.to_str()) == Some("arrow") {
                 let segment = WalSegment::open(&path)?;
                 if let Some(stream) = stream
@@ -725,7 +901,11 @@ impl WalReader {
             }
         }
 
-        segments.sort_by_key(|s| s.header().seg_seq);
+        segments.sort_by(|left, right| {
+            left.path()
+                .cmp(right.path())
+                .then_with(|| left.header().seg_seq.cmp(&right.header().seg_seq))
+        });
 
         Ok(Self { segments })
     }
@@ -739,6 +919,37 @@ impl WalReader {
         }
         Ok(all_records)
     }
+
+    /// Read records while retaining the segment path used to reconstruct its seal-key.
+    pub(crate) fn read_all_records_with_paths(
+        &self,
+    ) -> Result<Vec<(PathBuf, WalRecord)>, ScribeError> {
+        let mut records = Vec::new();
+        for segment in &self.segments {
+            let path = segment.path().to_path_buf();
+            for record in segment.read_records()? {
+                records.push((path.clone(), record));
+            }
+        }
+        Ok(records)
+    }
+}
+
+fn collect_segment_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), ScribeError> {
+    for entry in std::fs::read_dir(dir).map_err(|error| ScribeError::Internal {
+        detail: format!("failed to read WAL directory: {error}"),
+    })? {
+        let entry = entry.map_err(|error| ScribeError::Internal {
+            detail: format!("failed to read WAL directory entry: {error}"),
+        })?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_segment_paths(&path, paths)?;
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("arrow") {
+            paths.push(path);
+        }
+    }
+    Ok(())
 }
 
 /// Scribe-local metadata derived from WAL records and paired data.
@@ -767,6 +978,7 @@ fn crc32c_hash(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scribe::seal_key::EventDay;
     use tempfile::TempDir;
 
     #[test]
@@ -818,7 +1030,7 @@ mod tests {
 
         let batch_id = [1u8; 16];
         let lsn = writer
-            .append_and_fsync(batch_id, b"audit".to_vec(), b"data".to_vec())
+            .append_and_fsync(batch_id, b"audit", b"data")
             .expect("append");
 
         assert_eq!(lsn, WalLsn::new(0));
@@ -831,6 +1043,40 @@ mod tests {
         assert_eq!(records[0].payload, b"audit");
         assert_eq!(records[1].envelope_kind, 0); // data
         assert_eq!(records[1].payload, b"data");
+    }
+
+    #[test]
+    fn wal_handles_share_stream_lsn_allocation() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            [8u8; 16],
+            1,
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .expect("writer");
+        let table =
+            crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
+        let first = SealKey::new(
+            DataTenantId::SYSTEM_OWNER,
+            table.clone(),
+            EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("date")),
+        );
+        let second = SealKey::new(
+            DataTenantId::SYSTEM_OWNER,
+            table,
+            EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date")),
+        );
+        let first_handle = writer.handle_for_seal_key(first).expect("first handle");
+        let second_handle = writer.handle_for_seal_key(second).expect("second handle");
+        let frame = encode_append_frame([1u8; 16], b"audit", b"data").expect("frame");
+
+        let first_lsn = first_handle.append_frame(&frame).expect("first append");
+        let second_lsn = second_handle.append_frame(&frame).expect("second append");
+
+        assert_eq!(first_lsn, WalLsn::new(0));
+        assert_eq!(second_lsn, WalLsn::new(1));
     }
 
     #[test]
@@ -848,11 +1094,7 @@ mod tests {
             let payload = format!("data-{i:03}").repeat(20); // ~100 bytes per payload
             let batch_id = [i; 16];
             writer
-                .append_and_fsync(
-                    batch_id,
-                    payload.as_bytes().to_vec(),
-                    payload.as_bytes().to_vec(),
-                )
+                .append_and_fsync(batch_id, payload.as_bytes(), payload.as_bytes())
                 .expect("append");
         }
 
@@ -886,10 +1128,10 @@ mod tests {
         let batch_id1 = [1u8; 16];
         let batch_id2 = [2u8; 16];
         writer
-            .append_and_fsync(batch_id1, b"audit1".to_vec(), b"data1".to_vec())
+            .append_and_fsync(batch_id1, b"audit1", b"data1")
             .expect("append 1");
         writer
-            .append_and_fsync(batch_id2, b"audit2".to_vec(), b"data2".to_vec())
+            .append_and_fsync(batch_id2, b"audit2", b"data2")
             .expect("append 2");
 
         // Manually create a .tmp file to simulate crash during segment creation
@@ -932,7 +1174,7 @@ mod tests {
         )
         .expect("expected writer");
         expected_writer
-            .append_and_fsync([1u8; 16], b"audit".to_vec(), b"data".to_vec())
+            .append_and_fsync([1u8; 16], b"audit", b"data")
             .expect("expected append");
 
         let foreign_segment_path = temp_dir.path().join("foreign.arrow");

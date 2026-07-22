@@ -6,7 +6,7 @@
 //! `AuditEvent` list per key.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use wyrd_spec::ids::DataTenantId;
@@ -16,6 +16,7 @@ use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
+use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::wal::{WalLsn, WalReader, WalRecord};
 
@@ -41,6 +42,8 @@ pub struct ReplayedAppendMeta {
     pub wal_lsn: WalLsn,
     /// Number of rows in this append (placeholder — real count from Arrow batch).
     pub rows_accepted: usize,
+    /// Composite idempotency identity for this batch routed to this seal-key.
+    pub append_slice_id: AppendSliceId,
 }
 
 /// Replay the WAL directory and reconstruct per-seal-key state.
@@ -75,35 +78,39 @@ pub fn replay_wal_directory(
         .unwrap_or_default();
 
     let reader = WalReader::open_directory_unfiltered(wal_dir)?;
-    let records = reader.read_all_records()?;
+    let records = reader.read_all_records_with_paths()?;
 
     // Truncate torn tails — already handled by WalRecord::decode_from returning Err on CRC mismatch
 
-    // Deduplicate by batch_id (extracted from kind=1 audit records)
-    let mut seen_batch_ids = HashSet::new();
+    // Deduplicate by (batch_id, seal_key), not by batch_id alone. A client
+    // retry may legitimately route the same batch id to a different day/key.
+    let mut seen_slices = HashSet::<AppendSliceId>::new();
     let mut deduplicated = Vec::new();
-    let mut pending_audit: Option<(WalRecord, [u8; 16])> = None;
+    let mut pending_audit: Option<(PathBuf, WalRecord, [u8; 16])> = None;
 
-    for record in records {
+    for (segment_path, record) in records {
         if record.envelope_kind == 1 {
             // Audit record — extract batch_id from WAL record header
             let _audit_event = decode_audit_event(&record.payload)?;
             let batch_id = record.batch_id;
 
-            if seen_batch_ids.contains(&batch_id) {
-                // Skip this duplicate
-                pending_audit = None;
-                continue;
-            }
-
-            seen_batch_ids.insert(batch_id);
-            pending_audit = Some((record, batch_id));
+            pending_audit = Some((segment_path, record, batch_id));
         } else if record.envelope_kind == 0 {
             // Data record — pair with pending audit
-            if let Some((audit_record, batch_id)) = pending_audit.take() {
+            if let Some((audit_path, audit_record, batch_id)) = pending_audit.take() {
+                if audit_path != segment_path {
+                    continue;
+                }
                 // Extract seal-key from WAL directory path
-                let seal_key = extract_seal_key_from_path(wal_dir)?;
+                let seal_key = extract_seal_key_from_path(&audit_path)?;
                 let seal_key_str = seal_key.as_path_components();
+                let append_slice_id = AppendSliceId {
+                    batch_id: uuid::Uuid::from_bytes(batch_id),
+                    seal_key: seal_key.clone(),
+                };
+                if !seen_slices.insert(append_slice_id) {
+                    continue;
+                }
 
                 // Skip if this LSN is sealed
                 if let Some(&sealed_lsn) = sealed_lsn_map.get(&seal_key_str)
@@ -139,6 +146,10 @@ pub fn replay_wal_directory(
             batch_id,
             wal_lsn: data_record.lsn,
             rows_accepted: 0, // Placeholder — real count from Arrow batch
+            append_slice_id: AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes(batch_id),
+                seal_key: seal_key.clone(),
+            },
         });
     }
 
@@ -166,12 +177,59 @@ pub fn replay_wal_directory(
 /// requires the directory routing.
 // justification: stub implementation for path-parsing; the real implementation returns fallible Result<SealKey, ScribeError>
 #[allow(clippy::unnecessary_wraps)]
-fn extract_seal_key_from_path(_wal_dir: &Path) -> Result<SealKey, ScribeError> {
-    // Placeholder — real path parsing pending
+fn extract_seal_key_from_path(path: &Path) -> Result<SealKey, ScribeError> {
+    let components = path
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    let Some(tenant_index) = components
+        .iter()
+        .rposition(|component| component.starts_with("tenant="))
+    else {
+        return placeholder_seal_key();
+    };
+    if tenant_index < 2 || tenant_index + 1 >= components.len() {
+        return placeholder_seal_key();
+    }
+    let namespace = crate::namespaces::BifrostNamespace::from_wire(components[tenant_index - 2])
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("invalid WAL namespace in path: {}", path.display()),
+        })?;
+    let tenant_uuid = components[tenant_index]
+        .strip_prefix("tenant=")
+        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("invalid WAL tenant in path: {}", path.display()),
+        })?;
+    let tenant = if tenant_uuid.is_nil() {
+        DataTenantId::SYSTEM_OWNER
+    } else {
+        DataTenantId::new(tenant_uuid).map_err(|error| ScribeError::Internal {
+            detail: format!("invalid WAL tenant id in path: {error}"),
+        })?
+    };
+    let day = components[tenant_index + 1]
+        .strip_prefix("day=")
+        .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
+        .ok_or_else(|| ScribeError::Internal {
+            detail: format!("invalid WAL event day in path: {}", path.display()),
+        })?;
+    Ok(SealKey::new(
+        tenant,
+        TableRef::new(namespace, components[tenant_index - 1]),
+        EventDay::new(day),
+    ))
+}
+
+fn placeholder_seal_key() -> Result<SealKey, ScribeError> {
     Ok(SealKey::new(
         DataTenantId::SYSTEM_OWNER,
         TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).ok_or_else(|| {
+            ScribeError::Internal {
+                detail: "placeholder replay date is invalid".to_string(),
+            }
+        })?),
     ))
 }
 
@@ -219,7 +277,7 @@ mod tests {
             let batch_id = [i; 16];
 
             writer
-                .append_and_fsync(batch_id, audit_bytes, data_bytes)
+                .append_and_fsync(batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -278,7 +336,7 @@ mod tests {
             let batch_id = [i; 16];
 
             writer
-                .append_and_fsync(batch_id, audit_bytes, data_bytes)
+                .append_and_fsync(batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -325,7 +383,7 @@ mod tests {
         let audit_bytes1 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event1).expect("encode");
         writer
-            .append_and_fsync(shared_batch_id, audit_bytes1, b"data-1".to_vec())
+            .append_and_fsync(shared_batch_id, &audit_bytes1, b"data-1")
             .expect("append 1");
 
         // Write second append with same batch_id=42 (duplicate)
@@ -348,7 +406,7 @@ mod tests {
         let audit_bytes2 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event2).expect("encode");
         writer
-            .append_and_fsync(shared_batch_id, audit_bytes2, b"data-2".to_vec())
+            .append_and_fsync(shared_batch_id, &audit_bytes2, b"data-2")
             .expect("append 2");
 
         // Replay should deduplicate by batch_id
@@ -401,7 +459,7 @@ mod tests {
             crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
         let batch_id = [1u8; 16];
         writer
-            .append_and_fsync(batch_id, audit_bytes, b"data".to_vec())
+            .append_and_fsync(batch_id, &audit_bytes, b"data")
             .expect("append");
 
         // Replay doesn't directly expose writer_epoch in ReplayedAppendMeta yet,
@@ -417,5 +475,42 @@ mod tests {
         // In , ReplayedAppendMeta will carry writer_epoch from segment header.
         // For , the test structure is correct even though epoch isn't yet
         // explicitly in the metadata struct.
+    }
+
+    #[test]
+    fn nested_wal_replay_reconstructs_seal_key_from_path() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let tenant = DataTenantId::new_v7();
+        let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
+        let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"));
+        let seal_key = SealKey::new(tenant, table, day);
+        let writer =
+            WalWriter::new(temp_dir.path(), [9_u8; 16], 1, tenant, None).expect("wal writer");
+        let handle = writer
+            .handle_for_seal_key(seal_key.clone())
+            .expect("wal handle");
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "bifrost.append".to_string(),
+            resource: seal_key.table.fqn(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:append".to_string(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_string(),
+            detail: None,
+        };
+        let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
+        let frame =
+            crate::scribe::wal::encode_append_frame([4_u8; 16], &audit, b"data").expect("frame");
+        handle.append_frame(&frame).expect("append");
+        handle.sync_data().expect("sync");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        assert!(replayed.contains_key(&seal_key.as_path_components()));
     }
 }

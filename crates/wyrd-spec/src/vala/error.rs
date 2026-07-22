@@ -235,6 +235,19 @@ pub enum BifrostError {
     )]
     QueryResultTooLarge,
 
+    /// The decompressed canonical ingest payload exceeded the Scribe limit.
+    #[error("ingest payload too large: {bytes} bytes")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Ingest payload too large",
+        remediation = "Reduce the request to at most 32 MiB of canonical transport bytes and retry."
+    )]
+    PayloadTooLarge {
+        /// Server-measured canonical transport bytes.
+        bytes: usize,
+    },
+
     /// An unexpected internal Bifrost failure occurred.
     #[error("internal bifrost failure: {detail}")]
     #[wyrd_error(

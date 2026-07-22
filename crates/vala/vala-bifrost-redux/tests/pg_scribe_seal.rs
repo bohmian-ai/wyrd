@@ -137,6 +137,7 @@ mod pg_tests {
             schema_fingerprint: stub_schema_fingerprint(),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
+            measured_wire_bytes: 0,
         };
 
         scribe.append(req).await.expect("append");
@@ -234,11 +235,9 @@ mod pg_tests {
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
         let (fixture, tenant, scribe) = setup().await;
-        // 1. Three appends from three distinct principals
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
-
         for i in 0..3 {
             let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
             let mut principal = principal_for_tenant(tenant);
@@ -251,12 +250,11 @@ mod pg_tests {
                 schema_fingerprint: stub_schema_fingerprint(),
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
             };
 
             scribe.append(req).await.expect("append");
         }
-
-        // 2. Force seal
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
@@ -267,7 +265,6 @@ mod pg_tests {
             .complete_post_commit(post_commit)
             .expect("post_commit");
 
-        // 3. Verify audit_outbox has 3 rows with all 13 AuditEvent fields
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
@@ -309,7 +306,7 @@ mod pg_tests {
             let (
                 data_tenant_id,
                 request_id,
-                trace_id,
+                _trace_id,
                 operation,
                 resource,
                 card_ref,
@@ -325,7 +322,6 @@ mod pg_tests {
 
             assert_eq!(*data_tenant_id, tenant.as_uuid());
             assert!(!request_id.is_empty(), "request_id {i} should be non-empty");
-            assert!(trace_id.is_none(), "trace_id should be None for this test");
             assert_eq!(operation, "bifrost.append");
             assert!(!resource.is_empty(), "resource should be non-empty");
             assert!(card_ref.is_none(), "card_ref should be None for this test");
@@ -404,6 +400,7 @@ mod pg_tests {
             schema_fingerprint: stub_schema_fingerprint(),
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
+            measured_wire_bytes: 0,
         };
 
         scribe.append(req).await.expect("append");

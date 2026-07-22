@@ -1,11 +1,14 @@
 //! Scribe implementation — WAL append, fsync, replay, and memtable (/).
 
+pub mod admission;
 pub mod audit_envelope;
+pub mod blocking_executor;
 pub mod file_list_writer;
 pub mod filename;
 pub mod manifest;
 pub mod memtable;
 pub mod parquet_writer;
+pub mod preprocess;
 pub mod registry;
 pub mod replay;
 pub mod seal;
@@ -14,35 +17,37 @@ pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
 pub mod wal;
+pub mod writer;
 
-use arrow::array::Array;
-use arrow::compute::take;
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use vala_sql::TenantConn;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+use crate::scribe::admission::{
+    AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
+};
+use crate::scribe::blocking_executor::ScribeBlockingExecutor;
 use crate::scribe::memtable::Memtable;
-use crate::scribe::seal_key::{EventDay, SealKey};
+use crate::scribe::preprocess::AdmittedAppend;
+use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::ScribeTelemetry;
+use crate::scribe::writer::TenantTableWriterRegistry;
 
 /// Memtable key for per-bucket row-count inspection.
 ///
 /// Type alias for [`SealKey`] — memtable buckets are keyed by
 /// (`tenant`, `table`, `event_day`).
 pub type MemtableKey = SealKey;
-use crate::scribe::wal::ScribeAppendMeta;
 
-/// Scribe implementation with WAL append, fsync, replay, memtable, and seal ().
+/// Scribe implementation with bounded admission, FIFO writers, WAL, memtable, and seal.
 ///
-/// `append` splits the batch by event day, writes paired (audit, data) WAL records,
-/// fsyncs, and forwards to the memtable. Seal predicate triggers freeze at first-of:
+/// `append` admits a complete request to a bounded writer queue. The writer
+/// consumer performs event-day splitting, serialization, WAL writes, memtable
+/// insertion, and `sync_data` in order. Seal predicate triggers freeze at first-of:
 /// 50k rows | 1s | 128 MiB | 5s inactivity. Seal state machine executes:
 /// Freeze → Parquet → PUT → PG tx (`file_list` + audit) → manifest → retire WAL.
 #[derive(Debug)]
@@ -56,6 +61,12 @@ pub struct ScribeImpl {
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
     writer_epoch: i64,
+    /// Pod-global request and writer admission counters.
+    admission: AdmissionController,
+    /// Fixed-width executor for preprocessing and blocking WAL operations.
+    executor: ScribeBlockingExecutor,
+    /// Atomic get-or-create registry for tenant/table FIFO writers.
+    registry: Arc<TenantTableWriterRegistry>,
     /// Optional stage recorder used by benchmark and journey harnesses.
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
@@ -68,13 +79,44 @@ impl ScribeImpl {
         node_id: String,
         writer_epoch: i64,
     ) -> Self {
-        Self {
-            memtable: Arc::new(Memtable::new()),
+        Self::new_with_config(
             operator,
             wal,
             node_id,
             writer_epoch,
-            telemetry: None,
+            AdmissionConfig::default(),
+            None,
+        )
+    }
+
+    fn new_with_config(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        admission_config: AdmissionConfig,
+        telemetry: Option<Arc<ScribeTelemetry>>,
+    ) -> Self {
+        let memtable = Arc::new(Memtable::new());
+        let admission = AdmissionController::with_config(admission_config);
+        let executor = ScribeBlockingExecutor::new();
+        let registry = TenantTableWriterRegistry::new(
+            admission.clone(),
+            Arc::clone(&memtable),
+            Arc::clone(&wal),
+            executor.clone(),
+            telemetry.clone(),
+        );
+        Self {
+            memtable,
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            admission,
+            executor,
+            registry,
+            telemetry,
         }
     }
 
@@ -110,21 +152,31 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        Self {
-            memtable: Arc::new(Memtable::new()),
+        Self::new_with_deps(
             operator,
             wal,
-            node_id: "00000000-0000-0000-0000-000000000000".to_string(),
-            writer_epoch: 1,
-            telemetry: None,
-        }
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            1,
+        )
     }
 
     /// Attach an opt-in stage recorder to this Scribe instance.
     #[must_use]
     pub fn with_telemetry(mut self, telemetry: Arc<ScribeTelemetry>) -> Self {
+        self.registry.set_telemetry(Arc::clone(&telemetry));
         self.telemetry = Some(telemetry);
         self
+    }
+
+    /// Stop accepting new writer work and shut down the bounded executor.
+    pub async fn shutdown(&self) {
+        self.registry.shutdown().await;
+        self.executor.shutdown();
+    }
+
+    /// Retire idle writers after the pod lifecycle scanner's tick.
+    pub async fn retire_idle(&self, now: std::time::Instant) {
+        self.registry.retire_idle(now).await;
     }
 
     /// Return a snapshot of the attached stage samples.
@@ -175,65 +227,6 @@ impl ScribeImpl {
     }
 }
 
-/// Split a `RecordBatch` by `wyrd_event_time` day, returning (`EventDay`, `RecordBatch`) pairs.
-fn split_batch_by_event_day(
-    batch: &RecordBatch,
-) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
-    let ts_col = batch
-        .column_by_name("wyrd_event_time")
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "missing wyrd_event_time column".into(),
-        })?;
-
-    let ts_array = ts_col
-        .as_any()
-        .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "wyrd_event_time must be TimestampMicrosecond".into(),
-        })?;
-
-    // Group row indices by UTC day
-    let mut day_indices: HashMap<chrono::NaiveDate, Vec<u32>> = HashMap::new();
-    for i in 0..ts_array.len() {
-        if ts_array.is_null(i) {
-            continue;
-        }
-        let micros = ts_array.value(i);
-        let dt = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
-            ScribeError::Internal {
-                detail: format!("invalid timestamp micros: {micros}"),
-            }
-        })?;
-        let day = dt.date_naive();
-        day_indices
-            .entry(day)
-            .or_default()
-            .push(u32::try_from(i).expect("row index within u32 range"));
-    }
-
-    // Build one RecordBatch per day using arrow::compute::take
-    let mut result = Vec::with_capacity(day_indices.len());
-    for (day, indices) in day_indices {
-        let indices_array = arrow::array::UInt32Array::from(indices);
-        let columns: Result<Vec<_>, _> = batch
-            .columns()
-            .iter()
-            .map(|col| {
-                take(col.as_ref(), &indices_array, None).map_err(|e| ScribeError::Internal {
-                    detail: format!("arrow take failed: {e}"),
-                })
-            })
-            .collect();
-        let day_batch =
-            RecordBatch::try_new(batch.schema(), columns?).map_err(|e| ScribeError::Internal {
-                detail: format!("RecordBatch::try_new failed: {e}"),
-            })?;
-        result.push((EventDay::new(day), day_batch));
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 impl Default for ScribeImpl {
     fn default() -> Self {
@@ -244,109 +237,64 @@ impl Default for ScribeImpl {
 #[async_trait]
 impl Scribe for ScribeImpl {
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
-        let append_started = std::time::Instant::now();
-        // batch_id comes from the request (client-supplied v7 UUID); 2PC
-        // recovery in catalog::recovery keys off this exact value.
-        let batch_id = *req.batch_id.as_bytes();
-        let table_fqn = req.table.fqn();
-
-        // Split cross-day input into per-day slices; a cross-day batch
-        // produces two seals into two file_list rows (see seal_key module).
-        let event_days = split_batch_by_event_day(&req.rows)?;
-        let mut append_payload_bytes = 0_usize;
-
-        for (event_day, day_batch) in event_days {
-            let seal_key = SealKey::new(req.principal.tenant_id, req.table.clone(), event_day);
-
-            let audit_event = AuditEvent {
-                request_id: req.request_id.clone(),
-                trace_id: None,
-                operation: "bifrost.append".to_string(),
-                resource: table_fqn.clone(),
-                card_ref: req.principal.card_ref().cloned(),
-                principal_id: req.principal.id,
-                principal_kind: req.principal.kind.tag(),
-                auth_method: AuthMethod::Jwt,
-                permission: "bifrost:append".to_string(),
-                decision: AuditDecision::Allow,
-                result: AuditResult::Success,
-                payload_summary: format!("{} rows", day_batch.num_rows()),
-                detail: None,
-            };
-
-            let preprocess_started = std::time::Instant::now();
-            let audit_payload =
-                serde_json::to_vec(&audit_event).map_err(|e| ScribeError::Internal {
-                    detail: format!("failed to serialize AuditEvent: {e}"),
-                })?;
-
-            let mut data_payload = Vec::new();
-            {
-                let mut writer = StreamWriter::try_new(&mut data_payload, &day_batch.schema())
-                    .map_err(|e| ScribeError::Internal {
-                        detail: format!("Arrow IPC writer init: {e}"),
-                    })?;
-                writer
-                    .write(&day_batch)
-                    .map_err(|e| ScribeError::Internal {
-                        detail: format!("Arrow IPC write: {e}"),
-                    })?;
-                writer.finish().map_err(|e| ScribeError::Internal {
-                    detail: format!("Arrow IPC finish: {e}"),
-                })?;
-            }
-            let day_rows = day_batch.num_rows();
-            let wal_payload_bytes = audit_payload.len().saturating_add(data_payload.len());
-            append_payload_bytes = append_payload_bytes.saturating_add(wal_payload_bytes);
-            if let Some(telemetry) = &self.telemetry {
-                telemetry.record(
-                    "preprocess",
-                    preprocess_started.elapsed(),
-                    day_rows,
-                    wal_payload_bytes,
-                );
-            }
-
-            let wal_started = std::time::Instant::now();
-            let wal_lsn = self
-                .wal
-                .append_and_fsync(batch_id, audit_payload, data_payload)?;
-            if let Some(telemetry) = &self.telemetry {
-                telemetry.record(
-                    "wal_append_fsync",
-                    wal_started.elapsed(),
-                    day_rows,
-                    wal_payload_bytes,
-                );
-            }
-
-            let meta = ScribeAppendMeta {
-                batch_id,
-                rows_accepted: day_batch.num_rows(),
-                wal_lsn_min: wal_lsn,
-                wal_lsn_max: wal_lsn,
-                seal_key: seal_key.as_path_components(),
-            };
-
-            let memtable_started = std::time::Instant::now();
-            self.memtable
-                .insert(&seal_key, audit_event, meta, day_batch)?;
-            if let Some(telemetry) = &self.telemetry {
-                telemetry.record("memtable_insert", memtable_started.elapsed(), day_rows, 0);
-            }
-
-            if self.memtable.should_seal(&seal_key)? {
-                tracing::info!(seal_key = %seal_key, "seal predicate triggered");
-            }
+        if req.measured_wire_bytes > MAX_REQUEST_BYTES {
+            return Err(ScribeError::PayloadTooLarge {
+                bytes: req.measured_wire_bytes,
+            });
         }
 
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.record(
-                "append",
-                append_started.elapsed(),
-                req.rows.num_rows(),
-                append_payload_bytes,
-            );
+        let binding = TenantTableBinding::resolve((req.principal.tenant_id, req.table.clone()))
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        binding
+            .validate_authenticated_tenant(req.principal.tenant_id)
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+
+        let estimated_bytes = req
+            .rows
+            .get_array_memory_size()
+            .saturating_add(req.measured_wire_bytes)
+            .saturating_add(REQUEST_OVERHEAD_BYTES);
+        let reservation = self
+            .admission
+            .try_reserve(req.table.fqn(), estimated_bytes)?;
+        let table_fqn = req.table.fqn();
+        let audit_event = AuditEvent {
+            request_id: req.request_id.clone(),
+            trace_id: None,
+            operation: "bifrost.append".to_string(),
+            resource: table_fqn,
+            card_ref: req.principal.card_ref().cloned(),
+            principal_id: req.principal.id,
+            principal_kind: req.principal.kind.tag(),
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:append".to_string(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: format!("{} rows", req.rows.num_rows()),
+            detail: None,
+        };
+        let admitted = AdmittedAppend {
+            request_id: req.request_id,
+            batch_id: req.batch_id,
+            audit_event,
+            rows: req.rows,
+            measured_wire_bytes: req.measured_wire_bytes,
+            admitted_bytes: reservation.bytes(),
+            reservation,
+            tenant: req.principal.tenant_id,
+            table: req.table,
+        };
+
+        let (writer, created) = self.registry.get_or_create(binding)?;
+        if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
+            if created {
+                self.registry.remove_if(&writer.key, writer.instance_id);
+            }
+            return Err(error);
         }
         Ok(())
     }
@@ -368,6 +316,18 @@ impl ScribeImpl {
     /// Return aggregate writable and immutable memtable state.
     pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
         self.memtable.stats()
+    }
+
+    /// Return the current pod-global admission counters.
+    #[must_use]
+    pub fn admission_snapshot(&self) -> admission::AdmissionSnapshot {
+        self.admission.snapshot()
+    }
+
+    /// Return the number of active tenant/table writer actors.
+    #[must_use]
+    pub fn writer_count(&self) -> usize {
+        self.registry.writer_count()
     }
 
     /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.
@@ -395,6 +355,7 @@ impl ScribeImpl {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<seal::PostCommitBatch, ScribeError> {
+        self.registry.drain().await;
         // A `TenantConn` is bound to exactly one tenant. Seal only the
         // memtable buckets whose seal-key belongs to that tenant; the harness
         // iterates tenants and opens a fresh `TenantConn` per tenant.

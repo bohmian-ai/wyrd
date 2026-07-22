@@ -4,10 +4,11 @@
 //! Scribe (WAL + memtable + seal). Every method is async; every error is
 //! `ScribeError`.
 //!
-//! `Scribe::append` returns `Result<(), ScribeError>` — a durable ack is
-//! signaled by `Ok(())`. Idempotency lives on the request via `batch_id`
-//! (client-supplied v7 UUID); the 2PC recovery path in `catalog::recovery`
-//! keys off it, so there is no `AppendAck` payload to plumb through Gate.
+//! `Scribe::append` returns `Result<(), ScribeError>` — `Ok(())` means the
+//! complete request owns a bounded queue admission, not that WAL or memtable
+//! work has completed. Idempotency lives on the request via `batch_id`
+//! (client-supplied v7 UUID); the recovery path keys off the batch and seal
+//! key, so there is no `AppendAck` payload to plumb through Gate.
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -39,6 +40,9 @@ pub struct ScribeAppend {
     pub request_id: RequestId,
     /// Client-supplied v7 UUID for idempotency. 2PC recovery keys off this.
     pub batch_id: uuid::Uuid,
+    /// Server-measured canonical transport bytes used for admission. This is
+    /// never copied from a client field and is validated again by Scribe.
+    pub measured_wire_bytes: usize,
 }
 
 /// Scribe-layer errors per CONTRACTS §10.
@@ -49,6 +53,9 @@ pub enum ScribeError {
 
     #[error("WAL disk full")]
     WalDiskFull,
+
+    #[error("ingest payload too large: {bytes} bytes")]
+    PayloadTooLarge { bytes: usize },
 
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
@@ -75,6 +82,7 @@ impl ScribeError {
                 table: table.clone(),
             },
             Self::WalDiskFull => BifrostError::WalDiskFull,
+            Self::PayloadTooLarge { bytes } => BifrostError::PayloadTooLarge { bytes: *bytes },
             Self::FingerprintMismatch { table } => BifrostError::FingerprintMismatch {
                 table: table.clone(),
             },
@@ -102,8 +110,8 @@ impl From<vala_sql::SqlError> for ScribeError {
 
 /// Scribe trait — the durable write boundary.
 ///
-/// `Ok(())` signals durable-ack (WAL fsynced). Idempotency lives on
-/// `req.batch_id`; the 2PC recovery path uses it to dedupe replays.
+/// `Ok(())` signals bounded queue admission. WAL write, memtable insertion,
+/// and `sync_data` happen after the acknowledgment on a writer consumer.
 #[async_trait]
 pub trait Scribe: Send + Sync {
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError>;

@@ -271,6 +271,25 @@ impl Memtable {
         Ok(buckets.get(seal_key).map_or(0, |b| b.row_count))
     }
 
+    /// Return whether this table has any active writable or immutable state.
+    pub(crate) fn has_state_for_table(&self, key: &crate::catalog::TenantTableKey) -> bool {
+        let writable_has_state = match self.writable.lock() {
+            Ok(buckets) => buckets
+                .keys()
+                .any(|seal_key| seal_key.tenant == key.0 && seal_key.table == key.1),
+            Err(_) => true,
+        };
+        if writable_has_state {
+            return true;
+        }
+        match self.immutable.lock() {
+            Ok(generations) => generations
+                .keys()
+                .any(|seal_key| seal_key.tenant == key.0 && seal_key.table == key.1),
+            Err(_) => true,
+        }
+    }
+
     /// Snapshot every active seal-key currently held by the memtable whose
     /// tenant equals `tenant`. Used by `ScribeImpl::force_seal` to drive a
     /// per-tenant seal loop without exposing the private `MemtableBucket` type.

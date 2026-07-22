@@ -7,10 +7,14 @@
 //! `TableRef` lives in `crate::catalog::table_ref` and is re-exported through
 //! `crate::catalog` — this module only owns the seal-key composition.
 
+use arrow::array::{Array, TimestampMicrosecondArray, UInt32Array};
+use arrow::compute::take;
+use arrow::record_batch::RecordBatch;
 use chrono::{DateTime, NaiveDate, Utc};
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
+use crate::contracts::ScribeError;
 
 /// Event day — the partition day extracted from `wyrd_event_time`.
 ///
@@ -92,6 +96,66 @@ impl std::fmt::Display for SealKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_path_components())
     }
+}
+
+/// Split a batch into deterministic UTC event-day slices.
+pub(crate) fn split_batch_by_event_day(
+    batch: &RecordBatch,
+) -> Result<Vec<(EventDay, RecordBatch)>, ScribeError> {
+    let ts_col = batch
+        .column_by_name("wyrd_event_time")
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "missing wyrd_event_time column".to_string(),
+        })?;
+    let ts_array = ts_col
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .ok_or_else(|| ScribeError::Internal {
+            detail: "wyrd_event_time must be TimestampMicrosecond".to_string(),
+        })?;
+
+    let mut day_indices = std::collections::BTreeMap::<NaiveDate, Vec<u32>>::new();
+    for index in 0..ts_array.len() {
+        if ts_array.is_null(index) {
+            return Err(ScribeError::Internal {
+                detail: "wyrd_event_time cannot be null".to_string(),
+            });
+        }
+        let micros = ts_array.value(index);
+        let timestamp = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| {
+            ScribeError::Internal {
+                detail: format!("invalid timestamp micros: {micros}"),
+            }
+        })?;
+        day_indices
+            .entry(timestamp.date_naive())
+            .or_default()
+            .push(u32::try_from(index).map_err(|_| ScribeError::Internal {
+                detail: "record batch row index exceeds u32::MAX".to_string(),
+            })?);
+    }
+
+    day_indices
+        .into_iter()
+        .map(|(day, indices)| {
+            let indices = UInt32Array::from(indices);
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| {
+                    take(column.as_ref(), &indices, None).map_err(|error| ScribeError::Internal {
+                        detail: format!("Arrow day split failed: {error}"),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let sliced = RecordBatch::try_new(batch.schema(), columns).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!("Arrow day slice construction failed: {error}"),
+                }
+            })?;
+            Ok((EventDay::new(day), sliced))
+        })
+        .collect()
 }
 
 #[cfg(test)]

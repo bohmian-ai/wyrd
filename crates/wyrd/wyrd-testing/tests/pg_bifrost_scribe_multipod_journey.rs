@@ -51,6 +51,7 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
                         schema_fingerprint: SchemaFingerprint([0_u8; 32]),
                         request_id: RequestId::now_v7(),
                         batch_id: Uuid::now_v7(),
+                        measured_wire_bytes: 0,
                     })
                     .await
             }));

@@ -77,11 +77,14 @@ pub(crate) async fn register_card_http(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Complete a pending Card after the internal artifact transfer finishes.
+/// Complete a pending Card after the client-side storage transfer finishes.
 #[utoipa::path(
     post,
     path = "/v1/cards/{card_uid}/complete",
-    params(("card_uid" = String, Path, description = "Server-minted Card UID")),
+    params(
+        ("card_uid" = String, Path, description = "Server-minted Card UID"),
+        ("Idempotency-Key" = String, Header, description = "Registration key reused for retries", example = "card-register-001")
+    ),
     responses(
         (status = 200, description = "Card completed", body = CreateCardResponse),
         (status = 404, description = "Card not found"),
@@ -92,23 +95,28 @@ pub(crate) async fn register_card_http(
 async fn complete_card_http(
     State(state): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path(card_uid): Path<String>,
 ) -> Result<Json<CreateCardResponse>, WyrdErrorResponse> {
     authorize_card_write(&state, &caller)?;
+    let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
-    let outcome = service::complete_card(&state, &caller, &card_uid)
+    let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(Json(single_card_response(outcome)))
 }
 
-/// Privately compensate a pending Card registration by Card UID.
+/// Clean up an incomplete Card registration by Card UID.
 #[utoipa::path(
     post,
     path = "/v1/cards/{card_uid}/abort",
-    params(("card_uid" = String, Path, description = "Server-minted Card UID")),
+    params(
+        ("card_uid" = String, Path, description = "Server-minted Card UID"),
+        ("Idempotency-Key" = String, Header, description = "Registration key reused for retries", example = "card-register-001")
+    ),
     responses(
-        (status = 200, description = "Card compensation completed", body = CreateCardResponse),
+        (status = 200, description = "Card cleanup completed", body = CreateCardResponse),
         (status = 404, description = "Card not found"),
         (status = 409, description = "Card is already active")
     )
@@ -117,11 +125,13 @@ async fn complete_card_http(
 async fn abort_card_http(
     State(state): State<AppState>,
     caller: Caller,
+    headers: HeaderMap,
     Path(card_uid): Path<String>,
 ) -> Result<Json<CreateCardResponse>, WyrdErrorResponse> {
     authorize_card_write(&state, &caller)?;
+    let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
-    let outcome = service::abort_card(&state, &caller, &card_uid)
+    let outcome = service::abort_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(Json(single_card_response(outcome)))
@@ -164,7 +174,7 @@ fn extract_required_idempotency_key(
     let value = headers
         .get(header::HeaderName::from_static(IDEMPOTENCY_KEY_HEADER))
         .ok_or_else(|| WyrdError::RegistryIdempotencyKeyRequired {
-            message: "Idempotency-Key header is required for card registration".to_owned(),
+            message: "Idempotency-Key header is required for card lifecycle requests".to_owned(),
             details: serde_json::json!({ "header": IDEMPOTENCY_KEY_HEADER }),
         })?;
     let value = value

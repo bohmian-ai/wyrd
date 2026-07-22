@@ -1,53 +1,45 @@
-//! Bounded artifact transfer through the shared storage dispatcher.
+//! Bounded artifact upload orchestration.
+//!
+//! The registry owns only the relationship between local authored sources and
+//! the server's upload entries. [`WyrdStorageClient`] owns all transfer
+//! protocol details, including provider dispatch, part URL minting, backend
+//! completion, and upload outcome handling.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use futures_util::stream::{self, StreamExt};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::registry::{
-    CardUploadEntry, CardUploadPlan, CreateCardResponse, RelativeArtifactPath,
-};
-use wyrd_spec::storage::UploadPlan;
-use wyrd_storage_client::{
-    FileSource, PartUrlMinter, UploadHooks, UploadOutcome, WyrdStorageClient,
-};
+use wyrd_spec::registry::{CardUploadEntry, CreateCardResponse, RelativeArtifactPath};
+use wyrd_storage_client::{FileSource, WyrdStorageClient};
 
 use crate::error::RegistryEngineError;
 
-/// Transfer every server-minted artifact plan with bounded concurrency.
-pub(crate) async fn artifacts(
+/// Transfer every server-minted artifact entry with bounded concurrency.
+pub(crate) async fn upload_artifacts(
     storage: &WyrdStorageClient,
     response: &CreateCardResponse,
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,
     idempotency_key: &str,
 ) -> Result<(), RegistryEngineError> {
-    let plans = response
-        .upload_plans
-        .iter()
-        .map(|plan| (plan, plan_paths(plan)))
-        .collect::<Vec<_>>();
-    let planned = plans
-        .iter()
-        .flat_map(|(_, paths)| paths.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    validate_path_sets(&planned, sources)?;
+    let entries = collect_upload_entries(response)?;
+    validate_artifact_sources(&entries, sources)?;
 
-    let uploads = plans
+    let uploads = entries
         .into_iter()
-        .flat_map(|(plan, _)| plan.entries.iter().cloned())
-        .filter_map(|entry| {
+        .map(|entry| {
             sources
                 .get(&entry.relative_path)
                 .cloned()
                 .map(|source| (entry, source))
         })
-        .collect::<Vec<_>>();
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| WyrdError::internal("validated artifact source disappeared"))?;
     let results = stream::iter(uploads)
         .map(|(entry, source)| {
             let storage = storage.clone();
             let idempotency_key = idempotency_key.to_owned();
-            async move { upload_one(&storage, &entry, source, &idempotency_key).await }
+            async move { upload_artifact_entry(&storage, &entry, source, &idempotency_key).await }
         })
         .buffer_unordered(4)
         .collect::<Vec<_>>()
@@ -58,10 +50,26 @@ pub(crate) async fn artifacts(
     Ok(())
 }
 
-fn validate_path_sets(
-    planned: &BTreeSet<RelativeArtifactPath>,
+/// Flatten server upload plans into their typed upload entries.
+fn collect_upload_entries(
+    response: &CreateCardResponse,
+) -> Result<Vec<CardUploadEntry>, RegistryEngineError> {
+    Ok(response
+        .upload_plans
+        .iter()
+        .flat_map(|plan| plan.entries.iter().cloned())
+        .collect())
+}
+
+/// Require exact equality between planned relative paths and local sources.
+fn validate_artifact_sources(
+    entries: &[CardUploadEntry],
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,
 ) -> Result<(), RegistryEngineError> {
+    let planned = entries
+        .iter()
+        .map(|entry| entry.relative_path.clone())
+        .collect::<BTreeSet<_>>();
     if let Some(missing) = sources.keys().find(|path| !planned.contains(path)) {
         return Err(WyrdError::RegistryUploadInterrupted {
             message: "the server did not return an upload plan for a declared artifact".to_owned(),
@@ -79,53 +87,18 @@ fn validate_path_sets(
     Ok(())
 }
 
-fn plan_paths(plan: &CardUploadPlan) -> BTreeSet<RelativeArtifactPath> {
-    plan.entries
-        .iter()
-        .map(|entry| entry.relative_path.clone())
-        .collect()
-}
-
-async fn upload_one(
+/// Open one local source and hand it to the storage-client façade.
+async fn upload_artifact_entry(
     storage: &WyrdStorageClient,
     entry: &CardUploadEntry,
     source: PathBuf,
     idempotency_key: &str,
 ) -> Result<(), RegistryEngineError> {
     let source = FileSource::open(source).await?;
-    let part_url_minter = s3_part_url_minter(storage, entry);
-    let outcome = storage
-        .upload(
-            &entry.plan,
-            source,
-            UploadHooks {
-                idempotency_key,
-                progress: None,
-                part_url_minter,
-            },
-        )
-        .await?;
-    if let UploadOutcome::NeedsServerComplete(request) = outcome {
-        storage.complete(&entry.upload_id, &request).await?;
-    }
-    Ok(())
-}
-
-/// Build the authenticated S3 part-URL callback for one server-owned upload.
-fn s3_part_url_minter<'a>(
-    storage: &WyrdStorageClient,
-    entry: &CardUploadEntry,
-) -> Option<PartUrlMinter<'a>> {
-    if !matches!(&entry.plan, UploadPlan::S3Multipart { .. }) {
-        return None;
-    }
-    let storage = storage.clone();
-    let upload_id = entry.upload_id.clone();
-    Some(Box::new(move |part_number| {
-        let storage = storage.clone();
-        let upload_id = upload_id.clone();
-        Box::pin(async move { storage.part_url(&upload_id, part_number).await })
-    }))
+    storage
+        .upload_artifact(&entry.upload_id, &entry.plan, source, idempotency_key)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -136,7 +109,7 @@ mod tests {
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::registry::RelativeArtifactPath;
 
-    use super::validate_path_sets;
+    use super::validate_artifact_sources;
 
     fn path(value: &str) -> RelativeArtifactPath {
         RelativeArtifactPath::new(value).expect("test path is valid")
@@ -144,10 +117,10 @@ mod tests {
 
     #[test]
     fn rejects_declared_source_without_server_plan() {
-        let planned = BTreeSet::new();
+        let entries = Vec::new();
         let sources = BTreeMap::from([(path("weights.bin"), PathBuf::from("weights.bin"))]);
 
-        let error: WyrdError = validate_path_sets(&planned, &sources)
+        let error: WyrdError = validate_artifact_sources(&entries, &sources)
             .expect_err("missing plan is rejected")
             .into();
 
@@ -158,9 +131,19 @@ mod tests {
     #[test]
     fn rejects_server_plan_without_local_source() {
         let planned = BTreeSet::from([path("weights.bin")]);
-        let sources = BTreeMap::new();
+        let entries = planned
+            .into_iter()
+            .map(|relative_path| wyrd_spec::registry::CardUploadEntry {
+                upload_id: wyrd_spec::storage::UploadId::new(),
+                relative_path,
+                plan: wyrd_spec::storage::UploadPlan::LocalFs {
+                    put_url: "http://localhost/upload".to_owned(),
+                    ttl_secs: 60,
+                },
+            })
+            .collect::<Vec<_>>();
 
-        let error: WyrdError = validate_path_sets(&planned, &sources)
+        let error: WyrdError = validate_artifact_sources(&entries, &BTreeMap::new())
             .expect_err("unexpected plan is rejected")
             .into();
 

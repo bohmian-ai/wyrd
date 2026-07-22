@@ -810,6 +810,7 @@ async fn heavy_registration_initializes_upload_after_commit() {
     let complete = Request::builder()
         .method(Method::POST)
         .uri(format!("/v1/cards/{card_uid}/complete"))
+        .header("Idempotency-Key", "heavy-only-001")
         .body(Body::empty())
         .expect("card completion request builds");
     let complete_response = server

@@ -345,6 +345,7 @@ pub async fn upload_complete(
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
     upload_id: UploadId,
+    _idempotency_key: Option<IdempotencyKey>,
     body: UploadCompleteRequest,
 ) -> Result<UploadCompleteResponse, WyrdError> {
     let state = StorageServiceState { storage, postgres };
@@ -398,6 +399,7 @@ pub async fn upload_abort(
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
     upload_id: UploadId,
+    _idempotency_key: Option<IdempotencyKey>,
 ) -> Result<AbortResponse, WyrdError> {
     let state = StorageServiceState { storage, postgres };
     let upload_uuid = upload_id_uuid(&upload_id)?;

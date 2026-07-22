@@ -1,0 +1,148 @@
+//! Card completion orchestration through the server lifecycle endpoint.
+//!
+//! Registry completion does not verify provider state. The storage client has
+//! already completed each planned transfer; the server then verifies and
+//! commits the durable Card transition.
+
+use std::collections::BTreeSet;
+
+use wyrd_client::WyrdClient;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::registry::CreateCardResponse;
+
+use crate::error::RegistryEngineError;
+
+/// Complete every uploaded Card and merge server-owned final state.
+pub(crate) async fn complete_uploaded_cards(
+    client: &WyrdClient,
+    response: &CreateCardResponse,
+    idempotency_key: &str,
+) -> Result<CreateCardResponse, RegistryEngineError> {
+    let card_uids = collect_uploaded_card_uids(response)?;
+    let mut completed = response.clone();
+    for uid in card_uids {
+        let outcome = complete_uploaded_card(client, &uid, idempotency_key).await?;
+        validate_completion_response(response, &uid, &outcome)?;
+        merge_completed_outcome(&mut completed, outcome)?;
+    }
+    Ok(completed)
+}
+
+/// Extract the unique Card UIDs represented by server upload plans.
+fn collect_uploaded_card_uids(
+    response: &CreateCardResponse,
+) -> Result<Vec<wyrd_spec::ids::CardUid>, RegistryEngineError> {
+    let mut seen = BTreeSet::new();
+    let mut uids = Vec::with_capacity(response.upload_plans.len());
+    for plan in &response.upload_plans {
+        let uid = plan
+            .card_ref
+            .uid
+            .clone()
+            .ok_or_else(|| WyrdError::RegistryInvalidCardSpec {
+                message: "server upload plan card reference has no Card UID".to_owned(),
+                details: serde_json::json!({}),
+            })?;
+        if seen.insert(uid.clone()) {
+            uids.push(uid);
+        }
+    }
+    Ok(uids)
+}
+
+/// Complete one Card using the registration saga's stable idempotency key.
+async fn complete_uploaded_card(
+    client: &WyrdClient,
+    uid: &wyrd_spec::ids::CardUid,
+    idempotency_key: &str,
+) -> Result<CreateCardResponse, RegistryEngineError> {
+    let path = format!("/v1/cards/{uid}/complete");
+    client
+        .submit_with_idempotency_key(reqwest::Method::POST, &path, &(), idempotency_key)
+        .await
+        .map_err(Into::into)
+}
+
+/// Reject a completion response that is missing the requested identity or
+/// contains a duplicate/unrelated outcome.
+fn validate_completion_response(
+    original: &CreateCardResponse,
+    uid: &wyrd_spec::ids::CardUid,
+    completed: &CreateCardResponse,
+) -> Result<(), RegistryEngineError> {
+    let matching = completed
+        .outcomes
+        .iter()
+        .filter(|outcome| outcome.card_ref.uid.as_ref() == Some(uid))
+        .count();
+    if matching != 1 || completed.outcomes.len() != 1 {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "card completion response identity did not match the requested Card"
+                .to_owned(),
+            details: serde_json::json!({
+                "card_uid": uid,
+                "outcome_count": completed.outcomes.len(),
+                "matching_count": matching,
+                "registered_outcomes": original.outcomes.len(),
+            }),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Replace only the matching outcome and preserve the server-derived root.
+fn merge_completed_outcome(
+    response: &mut CreateCardResponse,
+    completed: CreateCardResponse,
+) -> Result<(), RegistryEngineError> {
+    let outcome = completed.outcomes.into_iter().next().ok_or_else(|| {
+        WyrdError::RegistryArtifactVerifyFailed {
+            message: "card completion response did not contain an outcome".to_owned(),
+            details: serde_json::json!({}),
+        }
+    })?;
+    let existing = response
+        .outcomes
+        .iter_mut()
+        .find(|candidate| candidate.card_ref.same_identity(&outcome.card_ref))
+        .ok_or_else(|| WyrdError::RegistryArtifactVerifyFailed {
+            message: "card completion response returned an unrelated outcome".to_owned(),
+            details: serde_json::json!({ "card_ref": outcome.card_ref }),
+        })?;
+    *existing = outcome;
+    response.root = completed.root;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_completion_response;
+    use wyrd_spec::error::WyrdError;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, CardUid, SpaceName};
+    use wyrd_spec::reference::CardRef;
+    use wyrd_spec::registry::CreateCardResponse;
+    use wyrd_semver::VersionBlock;
+
+    #[test]
+    fn rejects_missing_completion_outcome() {
+        let uid = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
+        let card_ref = CardRef {
+            kind: CardKind::Prompt,
+            name: CardName::new("card-1").expect("test name"),
+            version: VersionBlock::parse("1.0.0").expect("test version"),
+            space: Some(SpaceName::new("default").expect("test space")),
+            uid: Some(uid.clone()),
+        };
+        let response = CreateCardResponse {
+            root: card_ref,
+            outcomes: Vec::new(),
+            upload_plans: Vec::new(),
+        };
+        let error: WyrdError = validate_completion_response(&response, &uid, &response)
+            .expect_err("missing outcome is rejected")
+            .into();
+        assert_eq!(error.code(), "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
+    }
+}

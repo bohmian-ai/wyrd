@@ -78,12 +78,12 @@ pub async fn compose_registration(
     if let Some((operation_id, seed)) =
         replay(state, caller, idempotency_key, &request_hash).await?
     {
-        return initialize_uploads(state, caller, operation_id, seed).await;
+        return initialize_uploads(state, caller, operation_id, seed, idempotency_key).await;
     }
     let external_refs = resolve_external(state, caller, &request.submissions).await?;
     let plan = plan_registration(request, request_hash, external_refs)?;
     let (operation_id, seed) = write_registration(state, caller, idempotency_key, plan).await?;
-    initialize_uploads(state, caller, operation_id, seed).await
+    initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
 }
 
 /// Return a committed response for an identical idempotency key.
@@ -168,6 +168,7 @@ async fn initialize_uploads(
     caller: &Caller,
     operation_id: RegistrationOperationId,
     seed: RegistrationReplaySeed,
+    idempotency_key: &str,
 ) -> Result<CreateCardResponse, WyrdError> {
     let mut response = CreateCardResponse {
         root: seed.root.clone(),
@@ -252,7 +253,7 @@ async fn initialize_uploads(
         let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
             continue;
         };
-        response.outcomes[index] = complete_card(state, caller, card_uid).await?;
+        response.outcomes[index] = complete_card(state, caller, card_uid, idempotency_key).await?;
     }
     Ok(response)
 }
@@ -817,49 +818,169 @@ pub async fn register_card(
     compose_registration(state, caller, idempotency_key, request).await
 }
 
+/// Card and manifest state loaded before completion or abort storage IO.
+struct CardCompletionState {
+    card: wyrd_sql::row_types::cards::ParsedCardRow,
+    manifests: Vec<wyrd_sql::queries::cards::CardManifestCompletionRow>,
+}
+
 /// Complete one pending Card after its storage uploads have been verified.
 ///
 /// Storage IO runs before the final short SQL transaction. The transition is
 /// therefore safe to retry without holding a database connection across
-/// backend calls.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete"))]
+/// backend calls. The route validates and forwards the caller's idempotency
+/// key so transport retries retain the registration saga key.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete", idempotency_key = idempotency_key))]
 pub async fn complete_card(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
+    idempotency_key: &str,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
-    let (card, manifests) = load_completion_state(state, caller, card_uid).await?;
-    if card.status == wyrd_sql::row_types::cards::CardStatus::Active {
-        return Ok(existing_row_to_response(
-            &card,
-            RegistrationOutcomeKind::IdempotentNoop,
-        ));
+    let completion_state = load_card_completion_state(state, caller, card_uid).await?;
+    validate_card_completion_status(&completion_state.card, card_uid)?;
+    if completion_state.card.status == CardStatus::Pending {
+        verify_card_manifests(state, caller, card_uid, &completion_state.manifests).await?;
     }
-    if card.status != wyrd_sql::row_types::cards::CardStatus::Pending {
+    let blob_uri = ensure_card_blob(state, caller, &completion_state.card).await?;
+    let activated = if completion_state.card.status == CardStatus::Active {
+        false
+    } else {
+        commit_card_activation(
+            state,
+            caller,
+            card_uid,
+            &completion_state.manifests,
+            &blob_uri,
+            completion_state.card.card_blob_uri.is_none(),
+        )
+        .await?
+    };
+    load_card_registration_outcome(
+        state,
+        caller,
+        card_uid,
+        if activated {
+            RegistrationOutcomeKind::Registered
+        } else {
+            RegistrationOutcomeKind::IdempotentNoop
+        },
+    )
+    .await
+}
+
+/// Abort one incomplete Card and clean its upload/object state.
+///
+/// This is an internal lifecycle cleanup seam. It is intentionally not exposed
+/// as a method on the public `Cards` handle. Cleanup is best-effort, while the
+/// Pending→Failed transition and its audit event remain transactional.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.abort", idempotency_key = idempotency_key))]
+pub async fn abort_card(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    idempotency_key: &str,
+) -> Result<CardRegistrationOutcome, WyrdError> {
+    let completion_state = load_card_completion_state(state, caller, card_uid).await?;
+    validate_card_abort_status(&completion_state.card, card_uid)?;
+    let cleanup_failures = cleanup_card_artifacts(state, caller, &completion_state.manifests).await;
+    let failed = commit_card_failure(state, caller, card_uid, cleanup_failures.is_empty()).await?;
+    if !cleanup_failures.is_empty() {
         return Err(WyrdError::RegistryArtifactVerifyFailed {
-            message: "card registration is no longer pending".to_owned(),
-            details: serde_json::json!({ "card_uid": card_uid, "status": card.status }),
+            message: "card registration cleanup was incomplete".to_owned(),
+            details: serde_json::json!({
+                "card_uid": card_uid,
+                "failure_count": cleanup_failures.len(),
+            }),
         });
     }
+    load_card_registration_outcome(
+        state,
+        caller,
+        card_uid,
+        if failed {
+            RegistrationOutcomeKind::IdempotentNoop
+        } else {
+            RegistrationOutcomeKind::IdempotentNoop
+        },
+    )
+    .await
+}
 
-    for manifest in &manifests {
-        verify_manifest_storage(state, caller, card_uid, manifest).await?;
-    }
-
-    let blob_uri = if card.card_blob_uri.is_some() {
-        card.card_blob_uri
-            .clone()
-            .ok_or_else(|| WyrdError::internal("card blob URI disappeared during completion"))?
-    } else {
-        write_card_blob(state, caller, &card).await?
-    };
-
+/// Load the parsed Card and tenant-bound manifest/upload rows.
+async fn load_card_completion_state(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<CardCompletionState, WyrdError> {
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(registry_db_error)?;
-    for manifest in &manifests {
+    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(CardCompletionState { card, manifests })
+}
+
+/// Validate the completion lifecycle state.
+fn validate_card_completion_status(
+    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+    card_uid: &CardUid,
+) -> Result<(), WyrdError> {
+    if card.status == CardStatus::Active {
+        return Ok(());
+    }
+    if card.status != CardStatus::Pending {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "card registration is no longer pending".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "status": card.status }),
+        });
+    }
+    Ok(())
+}
+
+/// Verify every manifest against the server-owned storage state.
+async fn verify_card_manifests(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+) -> Result<(), WyrdError> {
+    for manifest in manifests {
+        verify_manifest_storage(state, caller, card_uid, manifest).await?;
+    }
+    Ok(())
+}
+
+/// Ensure the immutable Card blob exists before activation.
+async fn ensure_card_blob(
+    state: &AppState,
+    caller: &Caller,
+    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+) -> Result<String, WyrdError> {
+    match &card.card_blob_uri {
+        Some(uri) => Ok(uri.clone()),
+        None => write_card_blob(state, caller, card).await,
+    }
+}
+
+/// Persist verified manifests, the blob URI, activation, and audit atomically.
+async fn commit_card_activation(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+    blob_uri: &str,
+    record_blob: bool,
+) -> Result<bool, WyrdError> {
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    for manifest in manifests {
         if let Some(upload_id) = manifest.upload_id {
             multipart_uploads::mark_completed_if_pending(&mut conn, upload_id)
                 .await
@@ -869,9 +990,8 @@ pub async fn complete_card(
                     .await?;
         }
     }
-    // Metadata-only cards still need the blob URI recorded before activation.
-    if card.card_blob_uri.is_none() {
-        record_card_blob(&mut conn, card_uid, &blob_uri).await?;
+    if record_blob {
+        record_card_blob(&mut conn, card_uid, blob_uri).await?;
     }
     let activated = activate_card(&mut conn, card_uid).await?;
     if activated {
@@ -887,7 +1007,16 @@ pub async fn complete_card(
         append_on(&mut conn, &event).await?;
     }
     conn.commit().await.map_err(registry_db_error)?;
+    Ok(activated)
+}
 
+/// Load the server-derived outcome after a lifecycle transition.
+async fn load_card_registration_outcome(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    outcome: RegistrationOutcomeKind,
+) -> Result<CardRegistrationOutcome, WyrdError> {
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
@@ -895,75 +1024,83 @@ pub async fn complete_card(
         .map_err(registry_db_error)?;
     let card = get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
-    Ok(existing_row_to_response(
-        &card,
-        if activated {
-            RegistrationOutcomeKind::Registered
-        } else {
-            RegistrationOutcomeKind::IdempotentNoop
-        },
-    ))
+    Ok(existing_row_to_response(&card, outcome))
 }
 
-/// Abort one pending Card and clean its upload/object state.
-///
-/// This is an internal compensation seam. It is intentionally not exposed as
-/// a method on the public `Cards` handle.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.abort"))]
-pub async fn abort_card(
-    state: &AppState,
-    caller: &Caller,
+/// Validate that abort is legal and allow Failed cleanup retries.
+fn validate_card_abort_status(
+    card: &wyrd_sql::row_types::cards::ParsedCardRow,
     card_uid: &CardUid,
-) -> Result<CardRegistrationOutcome, WyrdError> {
-    let (card, manifests) = load_completion_state(state, caller, card_uid).await?;
-    if card.status == wyrd_sql::row_types::cards::CardStatus::Active {
+) -> Result<(), WyrdError> {
+    if card.status == CardStatus::Active {
         return Err(WyrdError::Conflict {
             message: "active cards cannot be aborted".to_owned(),
             details: serde_json::json!({ "card_uid": card_uid }),
         });
     }
-    if card.status != wyrd_sql::row_types::cards::CardStatus::Pending {
-        return Ok(existing_row_to_response(
-            &card,
-            RegistrationOutcomeKind::IdempotentNoop,
-        ));
-    }
+    Ok(())
+}
 
-    let mut cleanup_failures = Vec::new();
+/// Attempt cleanup for every manifest and return only failure details.
+async fn cleanup_card_artifacts(
+    state: &AppState,
+    caller: &Caller,
+    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+) -> Vec<String> {
+    let mut failures = Vec::new();
     for manifest in manifests {
-        let Some(upload_id) = manifest.upload_id else {
-            continue;
-        };
-        let upload_id = UploadId::from_uuid(upload_id);
-        match manifest.storage_status.as_deref() {
-            Some("completed") => {
-                if let Some(path) = manifest.storage_path.as_deref() {
-                    match tenant_path::validate(path, caller.data_tenant_id) {
-                        Ok(validated) => {
-                            if let Err(error) = state.storage.delete_object(&validated).await {
-                                cleanup_failures.push(error.to_string());
-                            }
-                        }
-                        Err(error) => cleanup_failures.push(error.to_string()),
-                    }
-                }
-            }
-            Some("pending") | Some("initiating") => {
-                if let Err(error) = upload_abort(
-                    &state.storage,
-                    state.postgres.wyrd(),
-                    &storage_caller(caller),
-                    upload_id,
-                )
-                .await
-                {
-                    cleanup_failures.push(error.to_string());
-                }
-            }
-            _ => {}
+        if let Err(error) = cleanup_manifest_artifact(state, caller, manifest).await {
+            failures.push(error.to_string());
         }
     }
+    failures
+}
 
+/// Clean one completed object or pending backend upload.
+async fn cleanup_manifest_artifact(
+    state: &AppState,
+    caller: &Caller,
+    manifest: &wyrd_sql::queries::cards::CardManifestCompletionRow,
+) -> Result<(), String> {
+    let Some(upload_id) = manifest.upload_id else {
+        return Ok(());
+    };
+    let upload_id = UploadId::from_uuid(upload_id);
+    match manifest.storage_status.as_deref() {
+        Some("completed") => {
+            if let Some(path) = manifest.storage_path.as_deref() {
+                let validated = tenant_path::validate(path, caller.data_tenant_id)
+                    .map_err(|error| error.to_string())?;
+                state
+                    .storage
+                    .delete_object(&validated)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        Some("pending") | Some("initiating") => {
+            upload_abort(
+                &state.storage,
+                state.postgres.wyrd(),
+                &storage_caller(caller),
+                upload_id,
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Persist Pending→Failed and its audit event in one tenant transaction.
+async fn commit_card_failure(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    cleanup_succeeded: bool,
+) -> Result<bool, WyrdError> {
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
@@ -971,72 +1108,23 @@ pub async fn abort_card(
         .map_err(registry_db_error)?;
     let failed = fail_card(&mut conn, card_uid).await?;
     if failed {
-        let detail = if cleanup_failures.is_empty() {
-            "card registration compensation completed"
-        } else {
-            "card registration compensation completed with cleanup failures"
-        };
         let event = audit_event(
             caller,
             "card.registration.abort",
             &format!("card:{card_uid}"),
             "card:write",
             AuditDecision::Allow,
-            if cleanup_failures.is_empty() {
+            if cleanup_succeeded {
                 AuditResult::Success
             } else {
                 AuditResult::Failure
             },
-            detail,
+            "card registration cleanup completed",
         );
         append_on(&mut conn, &event).await?;
     }
     conn.commit().await.map_err(registry_db_error)?;
-
-    if !cleanup_failures.is_empty() {
-        return Err(WyrdError::RegistryArtifactVerifyFailed {
-            message: "card registration cleanup was incomplete".to_owned(),
-            details: serde_json::json!({
-                "card_uid": card_uid,
-                "failure_count": cleanup_failures.len(),
-            }),
-        });
-    }
-
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
-    let card = get_card_by_uid(&mut conn, card_uid).await?;
-    conn.commit().await.map_err(registry_db_error)?;
-    Ok(existing_row_to_response(
-        &card,
-        RegistrationOutcomeKind::IdempotentNoop,
-    ))
-}
-
-/// Load the parsed Card and tenant-bound manifest/upload rows for completion.
-async fn load_completion_state(
-    state: &AppState,
-    caller: &Caller,
-    card_uid: &CardUid,
-) -> Result<
-    (
-        wyrd_sql::row_types::cards::ParsedCardRow,
-        Vec<wyrd_sql::queries::cards::CardManifestCompletionRow>,
-    ),
-    WyrdError,
-> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
-    let card = get_card_by_uid(&mut conn, card_uid).await?;
-    let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
-    conn.commit().await.map_err(registry_db_error)?;
-    Ok((card, manifests))
+    Ok(failed)
 }
 
 /// Verify one manifest/upload binding against the configured storage backend.

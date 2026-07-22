@@ -102,9 +102,11 @@ async fn complete(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<UploadCompleteRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
+    let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_complete(
@@ -112,6 +114,7 @@ async fn complete(
         state.postgres.wyrd(),
         &storage_caller,
         upload_id,
+        idempotency_key,
         body,
     )
     .await
@@ -124,8 +127,10 @@ async fn abort(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
+    let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
@@ -133,6 +138,7 @@ async fn abort(
         state.postgres.wyrd(),
         &storage_caller,
         upload_id,
+        idempotency_key,
     )
     .await
     .map(Json)

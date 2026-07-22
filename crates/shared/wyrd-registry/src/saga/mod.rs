@@ -2,7 +2,7 @@
 
 mod abort;
 mod build_submission;
-mod finalize;
+mod complete;
 mod hash_artifacts;
 mod idempotency;
 mod submit;
@@ -15,8 +15,16 @@ use wyrd_spec::registry::{CardLifecycleStatus, CreateCardResponse, RegistrationR
 use crate::engine::RegistryEngine;
 use crate::error::RegistryEngineError;
 
-/// Drive one declarative registration input through server registration,
-/// transfer, completion, and private compensation.
+/// Drive one declarative registration input through its server-owned lifecycle:
+/// resolve authored input, build a typed request, register the composite,
+/// upload planned artifacts through [`WyrdStorageClient`], complete artifact
+/// Cards, verify Active outcomes, and abort pending Cards after failure.
+///
+/// The loader owns local source resolution. `WyrdClient` owns authenticated
+/// control-plane transport and registration idempotency. `WyrdStorageClient`
+/// owns every artifact transfer detail. `wyrd-server` owns durable manifest,
+/// activation, audit, and cleanup state. This module only sequences those
+/// operations and maps the final response into a receipt.
 pub(crate) async fn register(
     engine: &RegistryEngine,
     input: &RegistrationInput,
@@ -26,7 +34,7 @@ pub(crate) async fn register(
     let mut response =
         submit::registration(&engine.client, &prepared.request, &idempotency_key).await?;
 
-    if let Err(error) = upload::artifacts(
+    if let Err(error) = upload::upload_artifacts(
         &engine.storage,
         &response,
         &prepared.artifact_sources,
@@ -34,14 +42,14 @@ pub(crate) async fn register(
     )
     .await
     {
-        abort::compensate(&engine.client, &response, &idempotency_key).await;
+        abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
         return Err(error);
     }
 
-    match finalize::cards(&engine.client, &response, &idempotency_key).await {
+    match complete::complete_uploaded_cards(&engine.client, &response, &idempotency_key).await {
         Ok(finalized) => response = finalized,
         Err(error) => {
-            abort::compensate(&engine.client, &response, &idempotency_key).await;
+            abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
             return Err(error);
         }
     }

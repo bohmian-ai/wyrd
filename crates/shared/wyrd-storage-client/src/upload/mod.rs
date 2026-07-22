@@ -15,7 +15,7 @@ use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt};
 use tokio_util::io::ReaderStream;
 use wyrd_client::WyrdClient;
-use wyrd_spec::storage::UploadPlan;
+use wyrd_spec::storage::{UploadId, UploadPlan};
 
 use crate::error::StorageClientError;
 use reader::SourceReader;
@@ -97,14 +97,14 @@ impl ArtifactSource for FileSource {
 }
 
 /// Future returned by an on-demand S3 part URL minter.
-pub type PartUrlFuture<'a> =
+pub(crate) type PartUrlFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, StorageClientError>> + Send + 'a>>;
 
 /// On-demand S3 part URL callback.
-pub type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + 'a>;
+pub(crate) type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + 'a>;
 
 /// Hooks supplied by the engine around a byte transfer.
-pub struct UploadHooks<'a> {
+pub(crate) struct UploadHooks<'a> {
     /// Stable key to replay on direct backend requests.
     pub idempotency_key: &'a str,
     /// Optional `(uploaded, total)` callback.
@@ -115,7 +115,7 @@ pub struct UploadHooks<'a> {
 
 /// Result of a completed transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UploadOutcome {
+pub(crate) enum UploadOutcome {
     /// The backend has accepted the complete object.
     Uploaded,
     /// The server must commit the backend multipart state.
@@ -194,6 +194,24 @@ pub(crate) fn report(hooks: &UploadHooks<'_>, uploaded: u64, total: Option<u64>)
     if let Some(progress) = hooks.progress {
         progress(uploaded, total.unwrap_or(0));
     }
+}
+
+/// Build the authenticated S3 part-URL callback for one server-owned upload.
+pub(crate) fn s3_part_url_minter<'a>(
+    storage: &'a crate::WyrdStorageClient,
+    upload_id: &'a UploadId,
+    plan: &UploadPlan,
+) -> Option<PartUrlMinter<'a>> {
+    if !matches!(plan, UploadPlan::S3Multipart { .. }) {
+        return None;
+    }
+    let storage = storage.clone();
+    let upload_id = upload_id.clone();
+    Some(Box::new(move |part_number| {
+        let storage = storage.clone();
+        let upload_id = upload_id.clone();
+        Box::pin(async move { storage.part_url(&upload_id, part_number).await })
+    }))
 }
 
 pub(crate) fn plan_variant(plan: &UploadPlan) -> &'static str {

@@ -10961,6 +10961,7 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
+ "wyrd-storage-client",
  "wyrd-telemetry",
  "wyrd-testing",
  "wyrd-tonic",
@@ -11112,7 +11113,6 @@ name = "wyrd-testing"
 version = "0.0.1"
 dependencies = [
  "axum 0.8.9",
- "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
  "http 1.4.2",

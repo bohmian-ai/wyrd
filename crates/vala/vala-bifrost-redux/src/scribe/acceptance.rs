@@ -124,6 +124,7 @@ fn admitted_append(
     AdmittedAppend {
         request_id: RequestId::now_v7(),
         batch_id: Uuid::now_v7(),
+        frame_sequence: 0,
         audit_event: audit_event(&table),
         rows: rows(1_721_003_400_000_000, count),
         measured_wire_bytes: 1,
@@ -231,6 +232,7 @@ fn cross_day_enqueue_is_atomic() {
     let append = AdmittedAppend {
         request_id: RequestId::now_v7(),
         batch_id: Uuid::now_v7(),
+        frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -444,6 +446,7 @@ fn recordbatch_is_not_redecoded_normally() {
     let prepared = prepare_append(AdmittedAppend {
         request_id: RequestId::now_v7(),
         batch_id,
+        frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -472,6 +475,7 @@ fn recordbatch_is_not_redecoded_normally() {
         prepared.slices[0].id,
         AppendSliceId {
             batch_id,
+            frame_sequence: 0,
             seal_key: prepared.slices[0].seal_key.clone()
         }
     );

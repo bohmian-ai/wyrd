@@ -4,24 +4,26 @@ package wyrd.v1;
 // One typed service per observation type. Bifrost ingest only in Stage 3;
 // drift / agent-trace / otel / eval get their own typed services later.
 service BifrostIngestService {
-  // Client-streaming: the client streams N frames, the server commits them as
-  // ONE 2PC batch and returns the row count. The whole stream is one logical
-  // batch (one Iceberg snapshot, one durable idempotency key).
-  rpc InsertBatch(stream InsertBatchRequest) returns (InsertBatchResponse);
+  // Bidirectional streaming: each frame is independently validated, admitted,
+  // and acknowledged. ACK is bounded admission, not WAL durability.
+  rpc InsertBatch(stream InsertBatchRequest) returns (stream InsertBatchResponse);
 }
 
 message InsertBatchRequest {
-  string table         = 1;   // fqn "namespace.name"; set on the FIRST frame, must match on the rest
-  bytes  arrow_ipc     = 2;   // Arrow IPC stream frame — published self-describing spec, not a private enum
-  bytes  wyrd_batch_id = 3;   // 16 bytes (UUIDv7); idempotency key for THIS commit; set on the first frame
+  string table          = 1;   // fqn "namespace.name"; repeated on every frame
+  bytes  arrow_ipc      = 2;   // one frame's Arrow IPC payload
+  bytes  wyrd_batch_id  = 3;   // exactly 16 bytes; UUIDv7; repeated on every frame
+  uint64 frame_sequence = 4;   // starts at zero and increments by one
 }
-// NOTE: the proto deliberately carries ONLY table/arrow_ipc/wyrd_batch_id.
+// NOTE: the proto deliberately carries only frame-grain transport metadata.
 // `card_ref` and `run_id` are PER-ROW correlation COLUMNS inside `arrow_ipc`,
 // not proto fields — one stream mixes many cards/runs, so they cannot be
 // stream- or frame-grain metadata.
 
 message InsertBatchResponse {
-  uint64 rows_accepted = 1;   // total rows committed; a deduplicated replay returns the prior count
+  bytes  wyrd_batch_id  = 1;   // echoes the admitted frame identity
+  uint64 frame_sequence = 2;
+  uint64 rows_accepted   = 3;  // rows admitted for this frame
 }
 
 // Typed read surface for Vala observation tables. One unary rpc per query

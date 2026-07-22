@@ -12,6 +12,8 @@ use crate::error::IngestError;
 /// Hard aggregate bounds enforced as frames arrive, before any commit.
 #[derive(Clone, Debug)]
 pub struct IngestLimits {
+    /// Maximum size of one decompressed Arrow IPC frame.
+    pub max_frame_bytes: usize,
     /// Sum of frame bytes across the stream.
     pub max_stream_bytes: u64,
     /// Sum of decoded rows across the stream.
@@ -32,13 +34,14 @@ pub struct IngestLimits {
 impl Default for IngestLimits {
     fn default() -> Self {
         Self {
+            max_frame_bytes: 32 * 1024 * 1024,
             max_stream_bytes: 256 * 1024 * 1024,
             max_stream_rows: 50_000_000,
             max_stream_frames: 100_000,
             idle_deadline: Duration::from_secs(30),
             total_deadline: Duration::from_secs(600),
             max_concurrent_streams_per_tenant: 16,
-            max_decoding_message_size: 64 * 1024 * 1024,
+            max_decoding_message_size: 32 * 1024 * 1024 + 64 * 1024,
         }
     }
 }

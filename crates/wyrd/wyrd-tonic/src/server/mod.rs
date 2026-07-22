@@ -51,6 +51,9 @@ pub enum GrpcError {
     /// never mounted unauthenticated, so a missing verifier is a hard boot error.
     #[error("gRPC ingest requires a token verifier but none is configured")]
     MissingTokenVerifier,
+    /// Ingest was mounted without the server-owned Scribe runtime.
+    #[error("gRPC ingest requires a server-owned Scribe runtime")]
+    MissingScribe,
 }
 
 /// Inputs to [`build_grpc_router`].

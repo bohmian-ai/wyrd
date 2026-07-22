@@ -107,6 +107,7 @@ pub fn replay_wal_directory(
                 let seal_key_str = seal_key.as_path_components();
                 let append_slice_id = AppendSliceId {
                     batch_id: uuid::Uuid::from_bytes(batch_id),
+                    frame_sequence: 0,
                     seal_key: seal_key.clone(),
                 };
                 if !seen_slices.insert(append_slice_id) {
@@ -158,6 +159,7 @@ pub fn replay_wal_directory(
             rows_accepted,
             append_slice_id: AppendSliceId {
                 batch_id: uuid::Uuid::from_bytes(batch_id),
+                frame_sequence: 0,
                 seal_key: seal_key.clone(),
             },
         });

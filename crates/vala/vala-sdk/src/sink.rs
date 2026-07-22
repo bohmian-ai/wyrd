@@ -9,18 +9,18 @@ use wyrd_spec::error::WyrdError;
 
 /// The ingest RPC seam mirroring `wyrd.v1.BifrostIngestService::InsertBatch`.
 ///
-/// One call ships one sealed batch: the destination `table`, the 16-byte
-/// idempotency `batch_id` (proto `wyrd_batch_id`), and the Arrow IPC `frames`
-/// (proto `arrow_ipc`, carrying the per-row `card_ref`/`run_id` correlation
-/// columns). Returns `rows_accepted`. The concrete gRPC client-streaming
-/// transport is wired in a later transport commit; this seam keeps
+/// One call ships one sealed frame: the destination `table`, the 16-byte
+/// idempotency `batch_id` (proto `wyrd_batch_id`), frame sequence zero, and the
+/// Arrow IPC payload (proto `arrow_ipc`, carrying the per-row `card_ref`/`run_id`
+/// correlation columns). The concrete bidi transport must consume the matching
+/// per-frame ACK before returning. This seam keeps
 /// [`BifrostIngestSink`] fully unit-testable server-free.
 #[async_trait]
 pub trait IngestTransport: Send + Sync + 'static {
-    /// Ship one sealed batch to the ingest service; return `rows_accepted`.
+    /// Ship one frame to the ingest service; return its admitted row count.
     ///
-    /// Must be **idempotent on `batch_id`** — a retry re-sends the same id so
-    /// the server's `olap_commits` dedup holds.
+    /// Must be **idempotent on `(batch_id, frame_sequence)`** — a retry
+    /// re-sends the same identity so the server does not duplicate durable rows.
     ///
     /// # Errors
     /// Returns a [`WyrdError`] mapped from the transport/server failure.

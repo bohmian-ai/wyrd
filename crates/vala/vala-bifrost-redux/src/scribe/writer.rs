@@ -742,6 +742,7 @@ mod tests {
             AdmittedAppend {
                 request_id: RequestId::now_v7(),
                 batch_id: Uuid::now_v7(),
+                frame_sequence: 0,
                 audit_event: AuditEvent {
                     request_id: RequestId::now_v7(),
                     trace_id: None,

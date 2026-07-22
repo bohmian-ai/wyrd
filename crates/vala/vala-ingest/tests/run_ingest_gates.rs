@@ -68,6 +68,7 @@ mod pg_tests {
                 table: table.to_owned(),
                 arrow_ipc: minimal_ipc_batch(),
                 wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+                frame_sequence: 0,
             })]),
         }
     }

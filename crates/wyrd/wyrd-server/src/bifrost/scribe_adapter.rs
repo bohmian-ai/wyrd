@@ -160,6 +160,7 @@ mod tests {
             table: "vala.bifrost.events".to_owned(),
             wyrd_batch_id: vec![0; 16],
             arrow_ipc: vec![1; 37],
+            frame_sequence: 0,
         };
         assert_eq!(native_grpc_wire_bytes(&[frame]), 37);
         assert_eq!(native_http_wire_bytes(&[1; 41]), 41);

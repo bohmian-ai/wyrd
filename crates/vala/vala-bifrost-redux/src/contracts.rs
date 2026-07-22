@@ -4,18 +4,19 @@
 //! Scribe (WAL + memtable + seal). Every method is async; every error is
 //! `ScribeError`.
 //!
-//! `Scribe::append` returns `Result<(), ScribeError>` — `Ok(())` means the
-//! complete request owns a bounded queue admission, not that WAL or memtable
-//! work has completed. Idempotency lives on the request via `batch_id`
-//! (client-supplied v7 UUID); the recovery path keys off the batch and seal
-//! key, so there is no `AppendAck` payload to plumb through Gate.
+//! `Scribe::ingest_frame` returns a `FrameAdmission` after the frame owns a
+//! bounded writer-queue admission, not after WAL or memtable work completes.
+//! Idempotency is tracked by the frame identity `(batch_id, frame_sequence)`;
+//! the recovery path keys off the batch and seal key.
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
+use bytes::Bytes;
 use wyrd_runtime::principal::Principal;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::AuditEvent;
 
-use crate::catalog::TableRef;
+use crate::catalog::{TableRef, TenantTableBinding};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::StreamIdentity;
 
@@ -43,6 +44,45 @@ pub struct ScribeAppend {
     /// Server-measured canonical transport bytes used for admission. This is
     /// never copied from a client field and is validated again by Scribe.
     pub measured_wire_bytes: usize,
+}
+
+/// One fully resolved frame crossing the Gate-to-Scribe boundary.
+#[derive(Debug)]
+pub struct ScribeIngressFrame {
+    /// The server-verified principal that owns the write.
+    pub principal: Principal,
+    /// The server-resolved tenant/table binding.
+    pub binding: TenantTableBinding,
+    /// The catalog fingerprint expected for the source payload.
+    pub expected_schema_fingerprint: SchemaFingerprint,
+    /// The request correlation identifier.
+    pub request_id: RequestId,
+    /// The client idempotency identifier shared by all frames in a stream.
+    pub batch_id: uuid::Uuid,
+    /// The contiguous frame sequence within the batch stream.
+    pub frame_sequence: u64,
+    /// The server-created audit event for this frame.
+    pub audit_event: AuditEvent,
+    /// Server-measured bytes after transport decompression.
+    pub measured_wire_bytes: usize,
+    /// Native Arrow IPC or a protocol-specific projected Arrow payload.
+    pub payload: IngressPayload,
+}
+
+/// Payload forms accepted by the transport-neutral Scribe boundary.
+#[derive(Debug)]
+pub enum IngressPayload {
+    /// One self-contained Arrow IPC stream from the native transport.
+    ArrowIpc(Bytes),
+    /// Arrow batches projected by a protocol adapter such as OTLP.
+    ProjectedArrow(Vec<RecordBatch>),
+}
+
+/// The portion of a frame admission visible to the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameAdmission {
+    /// Number of rows accepted into the bounded writer queue.
+    pub rows_accepted: u64,
 }
 
 /// Scribe-layer errors per CONTRACTS §10.
@@ -110,11 +150,51 @@ impl From<vala_sql::SqlError> for ScribeError {
 
 /// Scribe trait — the durable write boundary.
 ///
-/// `Ok(())` signals bounded queue admission. WAL write, memtable insertion,
-/// and `sync_data` happen after the acknowledgment on a writer consumer.
+/// `FrameAdmission` signals bounded queue admission. WAL write, memtable
+/// insertion, and `sync_data` happen after the acknowledgment on a writer
+/// consumer.
 #[async_trait]
 pub trait Scribe: Send + Sync {
-    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError>;
+    /// Validate, prepare, and admit one resolved frame.
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError>;
+
+    /// Compatibility adapter for existing engine tests while callers migrate
+    /// to the resolved frame contract.
+    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        let binding = TenantTableBinding::resolve((req.principal.tenant_id, req.table.clone()))
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+        let expected_schema_fingerprint = req.schema_fingerprint;
+        let audit_event = AuditEvent {
+            request_id: req.request_id.clone(),
+            trace_id: None,
+            operation: "bifrost.append".to_owned(),
+            resource: req.table.fqn(),
+            card_ref: req.principal.card_ref().cloned(),
+            principal_id: req.principal.id,
+            principal_kind: req.principal.kind.tag(),
+            auth_method: wyrd_spec::vala::api::AuthMethod::Jwt,
+            permission: "bifrost:append".to_owned(),
+            decision: wyrd_spec::vala::api::AuditDecision::Allow,
+            result: wyrd_spec::vala::api::AuditResult::Success,
+            payload_summary: format!("{} rows", req.rows.num_rows()),
+            detail: None,
+        };
+        self.ingest_frame(ScribeIngressFrame {
+            principal: req.principal,
+            binding,
+            expected_schema_fingerprint,
+            request_id: req.request_id,
+            batch_id: req.batch_id,
+            frame_sequence: 0,
+            audit_event,
+            measured_wire_bytes: req.measured_wire_bytes,
+            payload: IngressPayload::ProjectedArrow(vec![req.rows]),
+        })
+        .await
+        .map(|_| ())
+    }
 }
 
 #[cfg(test)]

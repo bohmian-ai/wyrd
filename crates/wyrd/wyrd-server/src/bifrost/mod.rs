@@ -3,6 +3,7 @@
 //! conversion and schema fingerprinting the register path needs.
 
 pub mod convert;
+pub mod gate;
 pub mod routes;
 pub mod scribe_adapter;
 pub mod service;

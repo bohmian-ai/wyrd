@@ -9827,6 +9827,7 @@ dependencies = [
  "opendal",
  "parquet",
  "rand 0.8.7",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -9907,8 +9908,10 @@ name = "vala-ingest"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "async-stream",
  "base64 0.22.1",
  "chrono",
+ "futures-util",
  "secrecy",
  "serde",
  "serde_json",

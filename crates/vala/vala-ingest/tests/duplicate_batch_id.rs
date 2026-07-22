@@ -77,6 +77,7 @@ mod pg_tests {
                 table: "vala.bifrost.dup_test".to_owned(),
                 arrow_ipc: ingest_batch(),
                 wyrd_batch_id: batch_id.to_vec(),
+                frame_sequence: 0,
             })]),
         }
     }

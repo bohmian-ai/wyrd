@@ -16,11 +16,13 @@ use tokio::time::timeout;
 use vala_bifrost::writer::BifrostWriteContext;
 use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
 use vala_bifrost_redux::catalog::TableRef as ReduxTableRef;
-use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::catalog::TenantTableBinding;
+use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeAppend, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use wyrd_runtime::{Permission, PermissionCheck, Principal, RbacCheck};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_spec::vala::{CARD_REF, CARD_UID, PRINCIPAL_ID};
 use wyrd_tonic::tonic::Status;
 use wyrd_tonic::wyrd::v1::InsertBatchRequest;
@@ -494,7 +496,103 @@ where
     Ok(collected.rows)
 }
 
-fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+/// Process one already-framed native payload and admit it to Scribe.
+pub async fn run_ingest_frame_to_scribe<F>(
+    catalog: &WyrdCatalog,
+    scribe: &F,
+    limits: &IngestLimits,
+    auth: &AuthContext,
+    frame: InsertBatchRequest,
+) -> Result<u64, IngestError>
+where
+    F: Scribe + ?Sized,
+{
+    if frame.arrow_ipc.len() > limits.max_frame_bytes {
+        return Err(IngestError::PayloadTooLarge {
+            bytes: frame.arrow_ipc.len() as u64,
+            limit: limits.max_frame_bytes as u64,
+        });
+    }
+    let batch_id: [u8; 16] = frame.wyrd_batch_id.as_slice().try_into().map_err(|_| {
+        IngestError::StreamProtocolViolation("wyrd_batch_id must be exactly 16 bytes".to_owned())
+    })?;
+    let batch_id_uuid = uuid::Uuid::from_bytes(batch_id);
+    if batch_id_uuid.get_version() != Some(uuid::Version::SortRand) {
+        return Err(IngestError::StreamProtocolViolation(
+            "wyrd_batch_id must be UUIDv7".to_owned(),
+        ));
+    }
+    let (namespace, name) = resolve_fqn(&frame.table)?;
+    if namespace == BifrostNamespace::System {
+        return Err(IngestError::SystemTableWriteDenied { table: frame.table });
+    }
+    RbacCheck
+        .check(&auth.principal, &Permission::bifrost_record_write())
+        .into_result()
+        .map_err(IngestError::from_rbac)?;
+    let batches = decode_ipc(&frame.arrow_ipc)?;
+    let rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+    let source_fingerprint = batches
+        .first()
+        .map(|batch| source_schema_fingerprint(batch.schema().as_ref()))
+        .ok_or_else(|| IngestError::StreamProtocolViolation("frame carried no rows".to_owned()))?;
+    let registered_fingerprint = catalog
+        .table_schema_fingerprint(namespace, &name, auth.tenant)
+        .await
+        .map_err(IngestError::from_engine)?;
+    if source_fingerprint.0 != registered_fingerprint {
+        return Err(IngestError::SchemaMismatch { table: frame.table });
+    }
+    validate_card_scope(&batches, &auth.principal)?;
+    let stamped = stamp_correlation_columns(batches, &auth.principal)?;
+    let first = stamped.first().ok_or_else(|| {
+        IngestError::StreamProtocolViolation("frame carried no stamped rows".to_owned())
+    })?;
+    let rows_batch = arrow::compute::concat_batches(&first.schema(), &stamped)
+        .map_err(|error| IngestError::Internal(error.to_string()))?;
+    let table_ref = ReduxTableRef::new(
+        ReduxNamespace::from_wire(namespace.as_str()).ok_or_else(|| {
+            IngestError::Internal(format!("Redux namespace is not registered: {namespace:?}"))
+        })?,
+        name,
+    );
+    let binding = TenantTableBinding::resolve((auth.tenant, table_ref.clone()))
+        .map_err(|error| IngestError::Internal(error.to_string()))?;
+    let audit_event = AuditEvent {
+        request_id: auth.request_id.clone(),
+        trace_id: None,
+        operation: "bifrost.ingest_frame".to_owned(),
+        resource: table_ref.fqn(),
+        card_ref: auth.principal.card_ref().cloned(),
+        principal_id: auth.principal.id,
+        principal_kind: auth.principal.kind.tag(),
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:record:write".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: format!("{rows} rows"),
+        detail: None,
+    };
+    let admission = scribe
+        .ingest_frame(ScribeIngressFrame {
+            principal: auth.principal.clone(),
+            binding,
+            expected_schema_fingerprint: SchemaFingerprint::from_arrow_schema(
+                rows_batch.schema().as_ref(),
+            ),
+            request_id: auth.request_id.clone(),
+            batch_id: batch_id_uuid,
+            frame_sequence: frame.frame_sequence,
+            audit_event,
+            measured_wire_bytes: frame.arrow_ipc.len(),
+            payload: IngressPayload::ProjectedArrow(vec![rows_batch]),
+        })
+        .await
+        .map_err(IngestError::from_scribe)?;
+    Ok(admission.rows_accepted)
+}
+
+pub fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
     let fields: Vec<Field> = schema
         .fields()
         .iter()
@@ -680,6 +778,7 @@ mod oversized_stream {
             table: "vala.bifrost.events".to_owned(),
             arrow_ipc: vec![0u8; bytes],
             wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
+            frame_sequence: 0,
         }
     }
 

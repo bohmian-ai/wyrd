@@ -21,6 +21,7 @@ use wyrd_spec::ids::DataTenantId;
 pub(crate) struct AdmittedAppend {
     pub request_id: RequestId,
     pub batch_id: Uuid,
+    pub frame_sequence: u64,
     pub audit_event: AuditEvent,
     pub rows: RecordBatch,
     pub measured_wire_bytes: usize,
@@ -57,6 +58,7 @@ pub(crate) struct PreparedSlice {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AppendSliceId {
     pub batch_id: Uuid,
+    pub frame_sequence: u64,
     pub seal_key: SealKey,
 }
 
@@ -66,6 +68,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
     let AdmittedAppend {
         request_id,
         batch_id,
+        frame_sequence,
         audit_event,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
@@ -107,6 +110,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         slices.push(PreparedSlice {
             id: AppendSliceId {
                 batch_id,
+                frame_sequence,
                 seal_key: seal_key.clone(),
             },
             seal_key,

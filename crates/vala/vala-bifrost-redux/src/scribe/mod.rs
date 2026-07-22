@@ -3,6 +3,7 @@
 pub mod admission;
 pub mod audit_envelope;
 pub mod blocking_executor;
+pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
 pub mod manifest;
@@ -22,26 +23,26 @@ pub mod writer;
 #[cfg(test)]
 mod acceptance;
 
-use async_trait::async_trait;
-use std::sync::Arc;
-use std::time::Instant;
-use tokio::runtime::Handle;
-use vala_sql::TenantConn;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
-
 use crate::catalog::TenantTableBinding;
-use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+pub use crate::contracts::ScribeAppend;
+use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::{
     AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
 use crate::scribe::blocking_executor::ScribeBlockingExecutor;
+use crate::scribe::execution_lanes::ScribeIngressCpuPool;
 use crate::scribe::memtable::Memtable;
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{ScribeRuntimeSnapshot, ScribeTelemetry};
 use crate::scribe::writer::TenantTableWriterRegistry;
+use async_trait::async_trait;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::runtime::Handle;
+use vala_sql::TenantConn;
 
 /// Memtable key for per-bucket row-count inspection.
 ///
@@ -71,6 +72,8 @@ pub struct ScribeImpl {
     admission: AdmissionController,
     /// Fixed-width executor for preprocessing and blocking WAL operations.
     executor: ScribeBlockingExecutor,
+    /// Bounded Rayon lane for pre-ACK native decode and projection work.
+    ingress_cpu: ScribeIngressCpuPool,
     /// Atomic get-or-create registry for tenant/table FIFO writers.
     registry: Arc<TenantTableWriterRegistry>,
     /// Optional stage recorder used by benchmark and journey harnesses.
@@ -82,6 +85,7 @@ struct ScribeBuildConfig {
     telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
     executor: ScribeBlockingExecutor,
+    ingress_cpu: ScribeIngressCpuPool,
 }
 
 impl ScribeImpl {
@@ -137,6 +141,7 @@ impl ScribeImpl {
                 telemetry,
                 coordination_runtime,
                 executor: ScribeBlockingExecutor::new(),
+                ingress_cpu: ScribeIngressCpuPool::new(1),
             },
         )
     }
@@ -154,6 +159,7 @@ impl ScribeImpl {
             telemetry,
             coordination_runtime,
             executor,
+            ingress_cpu,
             ..
         } = config;
         let registry = TenantTableWriterRegistry::new_with_runtime(
@@ -172,6 +178,7 @@ impl ScribeImpl {
             writer_epoch,
             admission,
             executor,
+            ingress_cpu,
             registry,
             telemetry,
         }
@@ -232,6 +239,7 @@ impl ScribeImpl {
                 telemetry: None,
                 coordination_runtime: Handle::current(),
                 executor,
+                ingress_cpu: ScribeIngressCpuPool::new(1),
             },
         )
     }
@@ -325,70 +333,61 @@ impl Scribe for ScribeImpl {
     // Keep this method as the Gate→Scribe composition seam. It validates and
     // reserves synchronously, then transfers the canonical RecordBatch to the
     // writer queue; preprocessing and all blocking WAL work happen afterward.
-    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+    async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
-        let append_rows = req.rows.num_rows();
-        let append_wire_bytes = req.measured_wire_bytes;
-        if req.measured_wire_bytes > MAX_REQUEST_BYTES {
+        let batches = self.ingress_cpu.decode(frame.payload).await?;
+        let first = batches.first().ok_or_else(|| ScribeError::Internal {
+            detail: "ingress frame contained no record batches".to_owned(),
+        })?;
+        let rows = arrow::compute::concat_batches(&first.schema(), &batches).map_err(|error| {
+            ScribeError::Internal {
+                detail: format!("ingress frame concatenation failed: {error}"),
+            }
+        })?;
+        let append_rows = rows.num_rows();
+        let append_wire_bytes = frame.measured_wire_bytes;
+        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
             return Err(ScribeError::PayloadTooLarge {
-                bytes: req.measured_wire_bytes,
+                bytes: frame.measured_wire_bytes,
             });
         }
-        let actual_fingerprint = SchemaFingerprint::from_arrow_schema(req.rows.schema().as_ref());
-        if req.schema_fingerprint != actual_fingerprint {
+        let actual_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
+        if frame.expected_schema_fingerprint != actual_fingerprint {
             return Err(ScribeError::FingerprintMismatch {
-                table: req.table.fqn(),
+                table: frame.binding.table_ref.fqn(),
             });
         }
 
-        let binding = TenantTableBinding::resolve((req.principal.tenant_id, req.table.clone()))
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-        binding
-            .validate_authenticated_tenant(req.principal.tenant_id)
+        frame
+            .binding
+            .validate_authenticated_tenant(frame.principal.tenant_id)
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
             })?;
 
-        let estimated_bytes = req
-            .rows
+        let estimated_bytes = rows
             .get_array_memory_size()
-            .saturating_add(req.measured_wire_bytes)
+            .saturating_add(frame.measured_wire_bytes)
             .saturating_add(REQUEST_OVERHEAD_BYTES);
         let reservation = self
             .admission
-            .try_reserve(req.table.fqn(), estimated_bytes)?;
-        let table_fqn = req.table.fqn();
-        let audit_event = AuditEvent {
-            request_id: req.request_id.clone(),
-            trace_id: None,
-            operation: "bifrost.append".to_string(),
-            resource: table_fqn,
-            card_ref: req.principal.card_ref().cloned(),
-            principal_id: req.principal.id,
-            principal_kind: req.principal.kind.tag(),
-            auth_method: AuthMethod::Jwt,
-            permission: "bifrost:append".to_string(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: format!("{} rows", req.rows.num_rows()),
-            detail: None,
-        };
+            .try_reserve(frame.binding.table_ref.fqn(), estimated_bytes)?;
         let admitted = AdmittedAppend {
-            request_id: req.request_id,
-            batch_id: req.batch_id,
-            audit_event,
-            rows: req.rows,
-            measured_wire_bytes: req.measured_wire_bytes,
+            request_id: frame.request_id,
+            batch_id: frame.batch_id,
+            frame_sequence: frame.frame_sequence,
+            audit_event: frame.audit_event,
+            rows,
+            measured_wire_bytes: frame.measured_wire_bytes,
             admitted_bytes: reservation.bytes(),
             reservation,
-            tenant: req.principal.tenant_id,
-            table: req.table,
+            tenant: frame.principal.tenant_id,
+            table: frame.binding.table_ref.clone(),
             queued_at: Instant::now(),
         };
 
-        let (writer, created) = self.registry.get_or_create(binding)?;
+        let rows_accepted = admitted.rows.num_rows() as u64;
+        let (writer, created) = self.registry.get_or_create(frame.binding)?;
         if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
             if created {
                 self.registry.remove_if(&writer.key, writer.instance_id);
@@ -406,7 +405,7 @@ impl Scribe for ScribeImpl {
                 append_wire_bytes,
             );
         }
-        Ok(())
+        Ok(FrameAdmission { rows_accepted })
     }
 }
 

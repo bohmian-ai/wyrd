@@ -23,7 +23,7 @@ trap 'rm -f "$emitted" "$mapped" "$sql_emitted" "$sql_tested"' EXIT
 } | sort -u > "$emitted"
 
 rg --no-filename -oN 'SKALD_(AGENT|SESSION|WORKFLOW)_[0-9]{3}_[A-Z_]+' \
-  crates/shared/wyrd-observe/src/error_map.rs \
+  crates/skald/skald-observer/src/error_map.rs \
   | sort -u > "$mapped"
 
 if comm -23 "$emitted" "$mapped" | rg .; then

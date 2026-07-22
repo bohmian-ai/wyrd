@@ -12,9 +12,11 @@ FAMILY_WYRD=(
   wyrd-config
   wyrd-interfaces
   wyrd-mcp
+  wyrd-registry
   wyrd-server
   wyrd-sql
   wyrd-storage
+  wyrd-storage-client
   wyrd-testing
   wyrd-tonic
   wyrd-spec
@@ -25,6 +27,7 @@ FAMILY_SKALD=(
   skald-cache
   skald-prompt
   skald-providers
+  skald-observer
   skald-runtime
   skald-spec
   skald-tool
@@ -33,6 +36,7 @@ FAMILY_SKALD=(
 
 FAMILY_VALA=(
   vala-bifrost
+  vala-bifrost-redux
   vala-core
   vala-drift
   vala-eval

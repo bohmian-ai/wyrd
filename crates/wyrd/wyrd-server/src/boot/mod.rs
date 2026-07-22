@@ -12,7 +12,7 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
-use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::{ScribeImpl, ScribeLaneConfig};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_auth_oidc::WorkloadBinding;
@@ -261,26 +261,31 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     let coordination_runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
-            .thread_name("wyrd-scribe-coordination")
+            .thread_name_fn(|| {
+                static THREAD_INDEX: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                format!(
+                    "wyrd-scribe-coordination-{}",
+                    THREAD_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            })
             .enable_all()
             .build()
             .map_err(|error| {
                 ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
             })?,
     );
-    let scribe = Arc::new(ScribeImpl::new_with_runtime(
+    let scribe = Arc::new(ScribeImpl::new_with_runtime_config(
         Arc::new(storage.operator().clone()),
         wal,
         stream.node_id.to_string(),
         stream.writer_epoch.as_i64(),
+        ScribeLaneConfig::default(),
         coordination_runtime.handle().clone(),
     ));
-    let replayed_generations = tokio::task::spawn_blocking({
-        let scribe = Arc::clone(&scribe);
-        move || scribe.replay_wal()
-    })
-    .await
-    .map_err(|error| ServerBootError::Scribe(format!("WAL replay task failed: {error}")))?
+    let replayed_generations = scribe
+        .replay_wal_async()
+        .await
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     tracing::info!(replayed_generations, "Scribe WAL recovery complete");
 

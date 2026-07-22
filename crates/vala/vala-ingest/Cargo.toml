@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+bytes = { workspace = true }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
 async-stream = { workspace = true }

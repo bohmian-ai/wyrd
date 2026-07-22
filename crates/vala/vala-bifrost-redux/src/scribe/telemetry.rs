@@ -4,8 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::scribe::admission::AdmissionSnapshot;
-use crate::scribe::blocking_executor::ExecutorSnapshot;
 use crate::scribe::writer::WriterHealthSnapshot;
+
+/// Compatibility-shaped aggregate queue metrics for runtime dashboards.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutorSnapshot {
+    /// Operations currently queued or executing across post-ACK and WAL lanes.
+    pub depth: usize,
+    /// Aggregate application queue capacity.
+    pub capacity: usize,
+    /// Number of submissions that encountered lane saturation.
+    pub saturation_events: u64,
+}
 
 /// One completed Scribe stage sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,12 +30,12 @@ pub struct ScribeStageSample {
     pub bytes: u64,
 }
 
-/// Point-in-time queue, admission, executor, and writer health telemetry.
+/// Point-in-time queue, admission, execution-lane, and writer health telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScribeRuntimeSnapshot {
     /// Pod-global admission counters and limits.
     pub admission: AdmissionSnapshot,
-    /// Fixed blocking-executor queue metrics.
+    /// Aggregate execution-lane queue metrics.
     pub executor: ExecutorSnapshot,
     /// Active writer queue and health metrics.
     pub writers: WriterHealthSnapshot,

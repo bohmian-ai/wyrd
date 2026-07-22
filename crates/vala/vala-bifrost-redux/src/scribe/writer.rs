@@ -12,8 +12,9 @@ use uuid::Uuid;
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
 use crate::scribe::admission::{AdmissionController, WriterLease};
-use crate::scribe::blocking_executor::{
-    ScribeBlockingExecutor, ScribeBlockingOp, ScribeBlockingResult,
+use crate::scribe::execution_lanes::{
+    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult, ScribeWalIoOp,
+    ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memtable::Memtable;
 use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend};
@@ -47,7 +48,8 @@ struct WriterRuntime {
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
-    executor: ScribeBlockingExecutor,
+    post_ack_cpu: ScribePostAckCpuPool,
+    wal_io: ScribeWalIoPool,
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
@@ -56,7 +58,8 @@ struct WriterDependencies {
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
-    executor: ScribeBlockingExecutor,
+    post_ack_cpu: ScribePostAckCpuPool,
+    wal_io: ScribeWalIoPool,
     telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
 }
@@ -86,7 +89,8 @@ impl TenantTableWriter {
             admission,
             memtable,
             wal,
-            executor,
+            post_ack_cpu,
+            wal_io,
             telemetry,
             coordination_runtime,
         } = dependencies;
@@ -107,7 +111,8 @@ impl TenantTableWriter {
             admission,
             memtable,
             wal,
-            executor,
+            post_ack_cpu,
+            wal_io,
             telemetry,
         };
         let task = coordination_runtime.spawn(run_writer(runtime, data_rx, control_rx, age_rx));
@@ -215,7 +220,8 @@ pub(crate) struct TenantTableWriterRegistry {
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
-    executor: ScribeBlockingExecutor,
+    post_ack_cpu: ScribePostAckCpuPool,
+    wal_io: ScribeWalIoPool,
     telemetry: Mutex<Option<Arc<ScribeTelemetry>>>,
     coordination_runtime: Handle,
     drained: Notify,
@@ -227,14 +233,16 @@ impl TenantTableWriterRegistry {
         admission: AdmissionController,
         memtable: Arc<Memtable>,
         wal: Arc<WalWriter>,
-        executor: ScribeBlockingExecutor,
+        post_ack_cpu: ScribePostAckCpuPool,
+        wal_io: ScribeWalIoPool,
         telemetry: Option<Arc<ScribeTelemetry>>,
     ) -> Arc<Self> {
         Self::new_with_runtime(
             admission,
             memtable,
             wal,
-            executor,
+            post_ack_cpu,
+            wal_io,
             telemetry,
             Handle::current(),
         )
@@ -244,7 +252,8 @@ impl TenantTableWriterRegistry {
         admission: AdmissionController,
         memtable: Arc<Memtable>,
         wal: Arc<WalWriter>,
-        executor: ScribeBlockingExecutor,
+        post_ack_cpu: ScribePostAckCpuPool,
+        wal_io: ScribeWalIoPool,
         telemetry: Option<Arc<ScribeTelemetry>>,
         coordination_runtime: Handle,
     ) -> Arc<Self> {
@@ -253,7 +262,8 @@ impl TenantTableWriterRegistry {
             admission,
             memtable,
             wal,
-            executor,
+            post_ack_cpu,
+            wal_io,
             telemetry: Mutex::new(telemetry),
             coordination_runtime,
             drained: Notify::new(),
@@ -292,7 +302,8 @@ impl TenantTableWriterRegistry {
                 admission: self.admission.clone(),
                 memtable: Arc::clone(&self.memtable),
                 wal: Arc::clone(&self.wal),
-                executor: self.executor.clone(),
+                post_ack_cpu: self.post_ack_cpu.clone(),
+                wal_io: self.wal_io.clone(),
                 telemetry,
                 coordination_runtime: self.coordination_runtime.clone(),
             },
@@ -523,8 +534,8 @@ async fn run_writer(
     }
     for (_, wal) in wal_handles {
         let _ = runtime
-            .executor
-            .submit(ScribeBlockingOp::RetireWal { wal })
+            .wal_io
+            .submit(ScribeWalIoOp::RetireWal { wal })
             .await;
     }
     runtime.state.stopped.notify_waiters();
@@ -538,14 +549,12 @@ async fn process_append(
     wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
 ) -> Result<(), ScribeError> {
     let preprocess_started = Instant::now();
-    let ScribeBlockingResult::Prepared(prepared) = runtime
-        .executor
-        .submit(ScribeBlockingOp::Preprocess(Box::new(append)))
+    let prepared = match runtime
+        .post_ack_cpu
+        .submit(ScribePostAckCpuOp::Preprocess(Box::new(append)))
         .await?
-    else {
-        return Err(ScribeError::Internal {
-            detail: "blocking executor returned the wrong preprocessing result".to_string(),
-        });
+    {
+        ScribePostAckCpuResult::Prepared(prepared) => prepared,
     };
     if let Some(telemetry) = &runtime.telemetry {
         telemetry.record(
@@ -592,27 +601,27 @@ async fn process_prepared(
             let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
             wal_handles.insert(seal_key.clone(), handle.clone());
             let _ = runtime
-                .executor
-                .submit(ScribeBlockingOp::CreateOrRollSegment {
+                .wal_io
+                .submit(ScribeWalIoOp::CreateOrRollSegment {
                     wal: handle.clone(),
                 })
                 .await?;
             handle
         };
         let wal_started = Instant::now();
-        let ScribeBlockingResult::WalWritten {
+        let ScribeWalIoResult::WalWritten {
             wal: written_wal,
             lsn,
         } = runtime
-            .executor
-            .submit(ScribeBlockingOp::WriteFrame {
+            .wal_io
+            .submit(ScribeWalIoOp::WriteFrame {
                 wal: wal_handle.clone(),
                 frame: slice.wal_frame,
             })
             .await?
         else {
             return Err(ScribeError::Internal {
-                detail: "blocking executor returned the wrong WAL result".to_string(),
+                detail: "WAL IO lane returned the wrong write result".to_string(),
             });
         };
         drop(written_wal);
@@ -657,14 +666,14 @@ async fn process_prepared(
 
         let sync_started = Instant::now();
         match runtime
-            .executor
-            .submit(ScribeBlockingOp::SyncWal { wal: wal_handle })
+            .wal_io
+            .submit(ScribeWalIoOp::SyncWal { wal: wal_handle })
             .await?
         {
-            ScribeBlockingResult::WalSynced { wal: synced_wal } => drop(synced_wal),
+            ScribeWalIoResult::WalSynced { wal: synced_wal } => drop(synced_wal),
             _ => {
                 return Err(ScribeError::Internal {
-                    detail: "blocking executor returned the wrong sync result".to_string(),
+                    detail: "WAL IO lane returned the wrong sync result".to_string(),
                 });
             }
         }
@@ -692,7 +701,7 @@ mod tests {
     use crate::catalog::{TableRef, TenantTableBinding};
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::admission::AdmissionConfig;
-    use crate::scribe::blocking_executor::ScribeBlockingExecutor;
+    use crate::scribe::execution_lanes::{ScribePostAckCpuPool, ScribeWalIoPool};
 
     fn wal_root(temp_dir: &TempDir) -> Arc<WalWriter> {
         Arc::new(
@@ -712,12 +721,14 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let memtable = Arc::new(Memtable::new());
         let admission = AdmissionController::with_config(AdmissionConfig::default());
-        let executor = ScribeBlockingExecutor::with_workers(1);
+        let post_ack_cpu = ScribePostAckCpuPool::new(1);
+        let wal_io = ScribeWalIoPool::new(1);
         let registry = TenantTableWriterRegistry::new(
             admission.clone(),
             Arc::clone(&memtable),
             wal_root(&temp_dir),
-            executor,
+            post_ack_cpu,
+            wal_io,
             None,
         );
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");

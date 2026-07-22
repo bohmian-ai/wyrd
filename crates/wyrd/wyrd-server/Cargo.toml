@@ -16,6 +16,8 @@ name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+async-stream = { workspace = true }
+futures-util = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }

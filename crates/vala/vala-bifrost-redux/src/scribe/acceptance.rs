@@ -14,7 +14,9 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 
 use super::admission::{AdmissionConfig, AdmissionController};
-use super::blocking_executor::{ScribeBlockingExecutor, ScribeBlockingOp, ScribeBlockingResult};
+use super::execution_lanes::{
+    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult, ScribeWalIoPool,
+};
 use super::preprocess::{AdmittedAppend, AppendSliceId, prepare_append};
 use super::seal_key::{EventDay, SealKey};
 use super::wal::{WalWriter, encode_append_frame};
@@ -24,6 +26,16 @@ use crate::catalog::{TableRef, TenantTableBinding};
 use crate::contracts::Scribe;
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
+
+fn test_lanes(
+    preprocess_delay: Duration,
+    sync_delay: Duration,
+) -> (ScribePostAckCpuPool, ScribeWalIoPool) {
+    (
+        ScribePostAckCpuPool::with_delay(1, preprocess_delay),
+        ScribeWalIoPool::with_delay(1, sync_delay),
+    )
+}
 
 fn rows(day: i64, count: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(
@@ -140,13 +152,9 @@ fn admitted_append(
 
 #[tokio::test]
 async fn ack_returns_after_queue_admission() {
-    let executor = ScribeBlockingExecutor::with_workers_and_delays(
-        1,
-        Duration::ZERO,
-        Duration::from_millis(60),
-    );
+    let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe = ScribeImpl::new_with_test_executor(executor).with_telemetry(telemetry);
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(telemetry);
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
@@ -158,14 +166,10 @@ async fn ack_returns_after_queue_admission() {
 
 #[tokio::test]
 async fn ack_does_not_split_or_encode() {
-    let executor = ScribeBlockingExecutor::with_workers_and_delays(
-        1,
-        Duration::from_millis(60),
-        Duration::ZERO,
-    );
+    let (post_ack_cpu, wal_io) = test_lanes(Duration::from_millis(60), Duration::ZERO);
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
     let scribe =
-        ScribeImpl::new_with_test_executor(executor).with_telemetry(Arc::clone(&telemetry));
+        ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(Arc::clone(&telemetry));
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 2))
@@ -264,14 +268,10 @@ fn cross_day_enqueue_is_atomic() {
 
 #[tokio::test]
 async fn fsync_runs_after_ack() {
-    let executor = ScribeBlockingExecutor::with_workers_and_delays(
-        1,
-        Duration::ZERO,
-        Duration::from_millis(60),
-    );
+    let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
     let scribe =
-        ScribeImpl::new_with_test_executor(executor).with_telemetry(Arc::clone(&telemetry));
+        ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(Arc::clone(&telemetry));
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
@@ -484,12 +484,8 @@ fn recordbatch_is_not_redecoded_normally() {
 
 #[tokio::test]
 async fn server_runtime_remains_responsive() {
-    let executor = ScribeBlockingExecutor::with_workers_and_delays(
-        1,
-        Duration::ZERO,
-        Duration::from_millis(60),
-    );
-    let scribe = ScribeImpl::new_with_test_executor(executor);
+    let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     let (append_result, ()) = tokio::join!(
         scribe.append(append(DataTenantId::SYSTEM_OWNER, 1)),
@@ -503,11 +499,7 @@ async fn server_runtime_remains_responsive() {
 #[tokio::test]
 async fn blocking_executor_saturation_preserves_cross_writer_progress() {
     let admission = AdmissionController::new();
-    let executor = ScribeBlockingExecutor::with_workers_and_delays(
-        1,
-        Duration::from_millis(2),
-        Duration::ZERO,
-    );
+    let executor = ScribePostAckCpuPool::with_delay(1, Duration::from_millis(2));
     let timer = tokio::time::timeout(
         Duration::from_millis(50),
         tokio::time::sleep(Duration::from_millis(1)),
@@ -519,11 +511,10 @@ async fn blocking_executor_saturation_preserves_cross_writer_progress() {
         let append = admitted_append(&admission, table, 1);
         tasks.push(tokio::spawn(async move {
             match executor
-                .submit(ScribeBlockingOp::Preprocess(Box::new(append)))
+                .submit(ScribePostAckCpuOp::Preprocess(Box::new(append)))
                 .await
             {
-                Ok(ScribeBlockingResult::Prepared(_)) => Ok(()),
-                Ok(_) => Err("unexpected blocking operation result".to_owned()),
+                Ok(ScribePostAckCpuResult::Prepared(_)) => Ok(()),
                 Err(error) => Err(error.to_string()),
             }
         }));
@@ -545,7 +536,8 @@ async fn concurrent_first_write_creates_one_writer() {
         admission,
         Arc::new(super::memtable::Memtable::new()),
         test_wal(&temp),
-        super::blocking_executor::ScribeBlockingExecutor::with_workers(1),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
         None,
     );
     let binding = TenantTableBinding::resolve((
@@ -590,7 +582,8 @@ async fn known_and_dynamic_tables_share_writer_lifecycle() {
         admission,
         Arc::new(super::memtable::Memtable::new()),
         test_wal(&temp),
-        ScribeBlockingExecutor::with_workers(1),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
         None,
     );
     let known = TenantTableBinding::resolve((
@@ -623,7 +616,8 @@ async fn writer_retirement_drains_reserved_send() {
         admission.clone(),
         Arc::clone(&memtable),
         test_wal(&temp),
-        ScribeBlockingExecutor::with_workers(1),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
         None,
     );
     let binding =
@@ -648,7 +642,8 @@ async fn writer_recreates_after_idle_retirement() {
         AdmissionController::new(),
         Arc::new(super::memtable::Memtable::new()),
         test_wal(&temp),
-        ScribeBlockingExecutor::with_workers(1),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
         None,
     );
     let binding = TenantTableBinding::resolve((
@@ -673,7 +668,8 @@ async fn retiring_writer_never_overlaps_replacement() {
         AdmissionController::new(),
         Arc::new(super::memtable::Memtable::new()),
         test_wal(&temp),
-        ScribeBlockingExecutor::with_workers(1),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
         None,
     );
     let binding = TenantTableBinding::resolve((
@@ -699,11 +695,8 @@ async fn retiring_writer_never_overlaps_replacement() {
 #[tokio::test]
 async fn pod_global_item_limit_rejects_tiny_batches() {
     let scribe = ScribeImpl::new_with_test_config(
-        ScribeBlockingExecutor::with_workers_and_delays(
-            1,
-            Duration::from_millis(60),
-            Duration::ZERO,
-        ),
+        ScribePostAckCpuPool::with_delay(1, Duration::from_millis(60)),
+        ScribeWalIoPool::new(1),
         AdmissionConfig {
             max_items: 2,
             max_bytes: 1024 * 1024,

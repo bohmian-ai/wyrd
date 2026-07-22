@@ -13,7 +13,7 @@ use crate::contracts::ScribeError;
 use crate::scribe::admission::AdmissionReservation;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
-use crate::scribe::wal::encode_append_frame;
+use crate::scribe::wal::encode_append_frame_with_sequence;
 use wyrd_spec::ids::DataTenantId;
 
 /// A complete request accepted by pod-global admission.
@@ -63,7 +63,7 @@ pub struct AppendSliceId {
 }
 
 /// Split and serialize an admitted append. This function is run only by the
-/// bounded blocking executor, never on the ACK path.
+/// bounded post-ACK CPU lane, never on the ACK path.
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         request_id,
@@ -104,7 +104,12 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             })?;
         }
 
-        let wal_frame = encode_append_frame(*batch_id.as_bytes(), &audit_payload, &data_payload)?;
+        let wal_frame = encode_append_frame_with_sequence(
+            *batch_id.as_bytes(),
+            frame_sequence,
+            &audit_payload,
+            &data_payload,
+        )?;
         let wal_bytes = wal_frame.len();
         let memtable_bytes = day_rows.get_array_memory_size();
         slices.push(PreparedSlice {

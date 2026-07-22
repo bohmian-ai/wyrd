@@ -2,7 +2,6 @@
 
 pub mod admission;
 pub mod audit_envelope;
-pub mod blocking_executor;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
@@ -26,12 +25,12 @@ mod acceptance;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
-use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::{
     AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
-use crate::scribe::blocking_executor::ScribeBlockingExecutor;
-use crate::scribe::execution_lanes::ScribeIngressCpuPool;
+use crate::scribe::execution_lanes::{
+    ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool,
+};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::seal_key::SealKey;
@@ -49,6 +48,27 @@ use vala_sql::TenantConn;
 /// Type alias for [`SealKey`] — memtable buckets are keyed by
 /// (`tenant`, `table`, `event_day`).
 pub type MemtableKey = SealKey;
+
+/// Explicit boot-time execution-lane provisioning for Scribe.
+#[derive(Debug, Clone, Copy)]
+pub struct ScribeLaneConfig {
+    /// Rayon workers reserved for pre-ACK decode, validation, and projection.
+    pub ingress_cpu_threads: usize,
+    /// Rayon workers reserved for post-ACK splitting and serialization.
+    pub post_ack_cpu_threads: usize,
+    /// Rayon workers reserved for WAL filesystem operations.
+    pub wal_io_threads: usize,
+}
+
+impl Default for ScribeLaneConfig {
+    fn default() -> Self {
+        Self {
+            ingress_cpu_threads: 1,
+            post_ack_cpu_threads: 1,
+            wal_io_threads: 4,
+        }
+    }
+}
 
 /// Scribe implementation with bounded admission, FIFO writers, WAL, memtable, and seal.
 ///
@@ -70,8 +90,8 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and writer admission counters.
     admission: AdmissionController,
-    /// Fixed-width executor for preprocessing and blocking WAL operations.
-    executor: ScribeBlockingExecutor,
+    /// Bounded WAL IO lane retained for recovery and writer execution.
+    wal_io: ScribeWalIoPool,
     /// Bounded Rayon lane for pre-ACK native decode and projection work.
     ingress_cpu: ScribeIngressCpuPool,
     /// Atomic get-or-create registry for tenant/table FIFO writers.
@@ -84,7 +104,8 @@ struct ScribeBuildConfig {
     admission: AdmissionConfig,
     telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
-    executor: ScribeBlockingExecutor,
+    post_ack_cpu: ScribePostAckCpuPool,
+    wal_io: ScribeWalIoPool,
     ingress_cpu: ScribeIngressCpuPool,
 }
 
@@ -111,6 +132,25 @@ impl ScribeImpl {
         writer_epoch: i64,
         coordination_runtime: Handle,
     ) -> Self {
+        Self::new_with_runtime_config(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            ScribeLaneConfig::default(),
+            coordination_runtime,
+        )
+    }
+
+    /// Construct Scribe with explicitly provisioned execution lanes.
+    pub fn new_with_runtime_config(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        lane_config: ScribeLaneConfig,
+        coordination_runtime: Handle,
+    ) -> Self {
         Self::new_with_config(
             operator,
             wal,
@@ -118,6 +158,7 @@ impl ScribeImpl {
             writer_epoch,
             AdmissionConfig::default(),
             None,
+            lane_config,
             coordination_runtime,
         )
     }
@@ -129,6 +170,7 @@ impl ScribeImpl {
         writer_epoch: i64,
         admission_config: AdmissionConfig,
         telemetry: Option<Arc<ScribeTelemetry>>,
+        lane_config: ScribeLaneConfig,
         coordination_runtime: Handle,
     ) -> Self {
         Self::new_with_components(
@@ -140,8 +182,9 @@ impl ScribeImpl {
                 admission: admission_config,
                 telemetry,
                 coordination_runtime,
-                executor: ScribeBlockingExecutor::new(),
-                ingress_cpu: ScribeIngressCpuPool::new(1),
+                post_ack_cpu: ScribePostAckCpuPool::new(lane_config.post_ack_cpu_threads),
+                wal_io: ScribeWalIoPool::new(lane_config.wal_io_threads),
+                ingress_cpu: ScribeIngressCpuPool::new(lane_config.ingress_cpu_threads),
             },
         )
     }
@@ -158,7 +201,8 @@ impl ScribeImpl {
         let ScribeBuildConfig {
             telemetry,
             coordination_runtime,
-            executor,
+            post_ack_cpu,
+            wal_io,
             ingress_cpu,
             ..
         } = config;
@@ -166,7 +210,8 @@ impl ScribeImpl {
             admission.clone(),
             Arc::clone(&memtable),
             Arc::clone(&wal),
-            executor.clone(),
+            post_ack_cpu.clone(),
+            wal_io.clone(),
             telemetry.clone(),
             coordination_runtime,
         );
@@ -177,7 +222,7 @@ impl ScribeImpl {
             node_id,
             writer_epoch,
             admission,
-            executor,
+            wal_io,
             ingress_cpu,
             registry,
             telemetry,
@@ -191,17 +236,21 @@ impl ScribeImpl {
     #[must_use]
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_with_test_executor(ScribeBlockingExecutor::new())
+        Self::new_with_test_lanes(ScribePostAckCpuPool::new(1), ScribeWalIoPool::new(1))
     }
 
     #[cfg(test)]
-    pub(crate) fn new_with_test_executor(executor: ScribeBlockingExecutor) -> Self {
-        Self::new_with_test_config(executor, AdmissionConfig::default())
+    pub(crate) fn new_with_test_lanes(
+        post_ack_cpu: ScribePostAckCpuPool,
+        wal_io: ScribeWalIoPool,
+    ) -> Self {
+        Self::new_with_test_config(post_ack_cpu, wal_io, AdmissionConfig::default())
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_test_config(
-        executor: ScribeBlockingExecutor,
+        post_ack_cpu: ScribePostAckCpuPool,
+        wal_io: ScribeWalIoPool,
         admission_config: AdmissionConfig,
     ) -> Self {
         let operator = Arc::new(
@@ -238,7 +287,8 @@ impl ScribeImpl {
                 admission: admission_config,
                 telemetry: None,
                 coordination_runtime: Handle::current(),
-                executor,
+                post_ack_cpu,
+                wal_io,
                 ingress_cpu: ScribeIngressCpuPool::new(1),
             },
         )
@@ -252,10 +302,9 @@ impl ScribeImpl {
         self
     }
 
-    /// Stop accepting new writer work and shut down the bounded executor.
+    /// Stop accepting new writer work and drain the bounded execution lanes.
     pub async fn shutdown(&self) {
         self.registry.shutdown().await;
-        self.executor.shutdown();
     }
 
     /// Retire idle writers after the pod lifecycle scanner's tick.
@@ -269,12 +318,12 @@ impl ScribeImpl {
         self.telemetry.as_ref().map(|recorder| recorder.snapshot())
     }
 
-    /// Return the current admission, executor, and writer health metrics.
+    /// Return the current admission, lane, and writer health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
         ScribeRuntimeSnapshot {
             admission: self.admission.snapshot(),
-            executor: self.executor.snapshot(),
+            executor: Default::default(),
             writers: self.registry.health_snapshot(),
         }
     }
@@ -335,15 +384,14 @@ impl Scribe for ScribeImpl {
     // writer queue; preprocessing and all blocking WAL work happen afterward.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
         let append_started = Instant::now();
-        let batches = self.ingress_cpu.decode(frame.payload).await?;
-        let first = batches.first().ok_or_else(|| ScribeError::Internal {
-            detail: "ingress frame contained no record batches".to_owned(),
-        })?;
-        let rows = arrow::compute::concat_batches(&first.schema(), &batches).map_err(|error| {
-            ScribeError::Internal {
-                detail: format!("ingress frame concatenation failed: {error}"),
-            }
-        })?;
+        let rows = self
+            .ingress_cpu
+            .decode(
+                frame.payload,
+                frame.principal.clone(),
+                frame.expected_schema_fingerprint,
+            )
+            .await?;
         let append_rows = rows.num_rows();
         let append_wire_bytes = frame.measured_wire_bytes;
         if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
@@ -351,13 +399,6 @@ impl Scribe for ScribeImpl {
                 bytes: frame.measured_wire_bytes,
             });
         }
-        let actual_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
-        if frame.expected_schema_fingerprint != actual_fingerprint {
-            return Err(ScribeError::FingerprintMismatch {
-                table: frame.binding.table_ref.fqn(),
-            });
-        }
-
         frame
             .binding
             .validate_authenticated_tenant(frame.principal.tenant_id)
@@ -593,6 +634,31 @@ impl ScribeImpl {
     /// reconstructed as Arrow state.
     pub fn replay_wal(&self) -> Result<usize, ScribeError> {
         let replayed = replay::replay_wal_directory(self.wal.base_dir())?;
+        let restored = replayed
+            .values()
+            .map(|state| self.restore_replayed(state).map(|_| ()))
+            .collect::<Result<Vec<_>, _>>()?
+            .len();
+        self.memtable_stats()?;
+        Ok(restored)
+    }
+
+    /// Replay WAL through the bounded filesystem lane before readiness.
+    pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
+        let replayed = match self
+            .wal_io
+            .submit(crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectory {
+                path: self.wal.base_dir().to_path_buf(),
+            })
+            .await?
+        {
+            crate::scribe::execution_lanes::ScribeWalIoResult::Replayed(replayed) => replayed,
+            _ => {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong replay result".to_owned(),
+                });
+            }
+        };
         let restored = replayed
             .values()
             .map(|state| self.restore_replayed(state).map(|_| ()))

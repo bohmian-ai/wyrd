@@ -107,7 +107,7 @@ pub fn replay_wal_directory(
                 let seal_key_str = seal_key.as_path_components();
                 let append_slice_id = AppendSliceId {
                     batch_id: uuid::Uuid::from_bytes(batch_id),
-                    frame_sequence: 0,
+                    frame_sequence: record.frame_sequence,
                     seal_key: seal_key.clone(),
                 };
                 if !seen_slices.insert(append_slice_id) {
@@ -154,14 +154,14 @@ pub fn replay_wal_directory(
                 });
         state.data_records.push(data_record.payload);
         state.append_metas.push(ReplayedAppendMeta {
-            batch_id,
-            wal_lsn: data_record.lsn,
-            rows_accepted,
-            append_slice_id: AppendSliceId {
-                batch_id: uuid::Uuid::from_bytes(batch_id),
-                frame_sequence: 0,
-                seal_key: seal_key.clone(),
-            },
+                batch_id,
+                wal_lsn: data_record.lsn,
+                rows_accepted,
+                append_slice_id: AppendSliceId {
+                    batch_id: uuid::Uuid::from_bytes(batch_id),
+                    frame_sequence: data_record.frame_sequence,
+                    seal_key: seal_key.clone(),
+                },
         });
     }
 
@@ -483,6 +483,60 @@ mod tests {
         );
         assert_eq!(state.audit_events[0].operation, "append-1");
         assert_eq!(state.data_records.len(), 1);
+    }
+
+    #[test]
+    fn wal_replay_preserves_distinct_frame_sequences_for_one_batch() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
+            .expect("writer");
+        let seal_key = replay_key(tenant_id);
+        let writer = wal
+            .handle_for_seal_key(seal_key.clone())
+            .expect("seal-key handle");
+        let batch_id = [42u8; 16];
+
+        for sequence in 0..2 {
+            let event = AuditEvent {
+                request_id: RequestId::now_v7(),
+                trace_id: None,
+                operation: format!("frame-{sequence}"),
+                resource: "test".to_string(),
+                card_ref: None,
+                principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+                principal_kind: PrincipalKindTag::User,
+                auth_method: AuthMethod::Jwt,
+                permission: "test".to_string(),
+                decision: AuditDecision::Allow,
+                result: AuditResult::Success,
+                payload_summary: "1 rows".to_string(),
+                detail: None,
+            };
+            let audit = crate::scribe::audit_envelope::encode_audit_event(&event)
+                .expect("audit");
+            let frame = crate::scribe::wal::encode_append_frame_with_sequence(
+                batch_id,
+                sequence,
+                &audit,
+                format!("data-{sequence}").as_bytes(),
+            )
+            .expect("frame");
+            writer.append_frame(&frame).expect("append");
+        }
+        writer.sync_data().expect("sync");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = replayed
+            .get(&seal_key.as_path_components())
+            .expect("replayed state");
+        let sequences = state
+            .append_metas
+            .iter()
+            .map(|meta| meta.append_slice_id.frame_sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![0, 1]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::time::Instant;
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use tokio::time::timeout;
 use vala_bifrost::writer::BifrostWriteContext;
 use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
@@ -530,26 +531,10 @@ where
         .check(&auth.principal, &Permission::bifrost_record_write())
         .into_result()
         .map_err(IngestError::from_rbac)?;
-    let batches = decode_ipc(&frame.arrow_ipc)?;
-    let rows: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
-    let source_fingerprint = batches
-        .first()
-        .map(|batch| source_schema_fingerprint(batch.schema().as_ref()))
-        .ok_or_else(|| IngestError::StreamProtocolViolation("frame carried no rows".to_owned()))?;
     let registered_fingerprint = catalog
         .table_schema_fingerprint(namespace, &name, auth.tenant)
         .await
         .map_err(IngestError::from_engine)?;
-    if source_fingerprint.0 != registered_fingerprint {
-        return Err(IngestError::SchemaMismatch { table: frame.table });
-    }
-    validate_card_scope(&batches, &auth.principal)?;
-    let stamped = stamp_correlation_columns(batches, &auth.principal)?;
-    let first = stamped.first().ok_or_else(|| {
-        IngestError::StreamProtocolViolation("frame carried no stamped rows".to_owned())
-    })?;
-    let rows_batch = arrow::compute::concat_batches(&first.schema(), &stamped)
-        .map_err(|error| IngestError::Internal(error.to_string()))?;
     let table_ref = ReduxTableRef::new(
         ReduxNamespace::from_wire(namespace.as_str()).ok_or_else(|| {
             IngestError::Internal(format!("Redux namespace is not registered: {namespace:?}"))
@@ -570,22 +555,20 @@ where
         permission: "bifrost:record:write".to_owned(),
         decision: AuditDecision::Allow,
         result: AuditResult::Success,
-        payload_summary: format!("{rows} rows"),
+        payload_summary: "one bounded native frame".to_owned(),
         detail: None,
     };
     let admission = scribe
         .ingest_frame(ScribeIngressFrame {
             principal: auth.principal.clone(),
             binding,
-            expected_schema_fingerprint: SchemaFingerprint::from_arrow_schema(
-                rows_batch.schema().as_ref(),
-            ),
+            expected_schema_fingerprint: SchemaFingerprint(registered_fingerprint),
             request_id: auth.request_id.clone(),
             batch_id: batch_id_uuid,
             frame_sequence: frame.frame_sequence,
             audit_event,
             measured_wire_bytes: frame.arrow_ipc.len(),
-            payload: IngressPayload::ProjectedArrow(vec![rows_batch]),
+            payload: IngressPayload::ArrowIpc(Bytes::from(frame.arrow_ipc)),
         })
         .await
         .map_err(IngestError::from_scribe)?;

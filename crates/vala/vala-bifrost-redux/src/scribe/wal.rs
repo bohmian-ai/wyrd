@@ -89,6 +89,8 @@ const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 const WAL_VERSION: u16 = 2;
 const SEGMENT_HEADER_SIZE: usize = 64;
 const APPEND_FRAME_MAGIC: [u8; 4] = *b"SWF1";
+const APPEND_FRAME_MAGIC_V2: [u8; 4] = *b"SWF2";
+const FRAME_SEQUENCE_RESERVED: [u8; 3] = *b"WYD";
 
 impl SegmentHeader {
     /// Construct a new segment header.
@@ -214,7 +216,10 @@ impl SegmentHeader {
 
 /// WAL record — variable length framed entry.
 ///
-/// Layout: `[len:u32][lsn:u64][kind:u8][reserved:u8×3][batch_id:u8×16][payload][crc32c:u32]`
+/// Layout: `[len:u32][lsn:u64][kind:u8][reserved:u8×3][batch_id:u8×16][frame_sequence:u64][payload][crc32c:u32]`.
+///
+/// Records written before frame sequencing used zero reserved bytes and omitted
+/// `frame_sequence`; those records remain readable and decode as sequence zero.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
@@ -223,6 +228,8 @@ pub struct WalRecord {
     pub envelope_kind: u8,
     /// Batch ID for deduplication (shared across paired audit+data records).
     pub batch_id: [u8; 16],
+    /// Per-batch frame sequence used for bounded-stream idempotency.
+    pub frame_sequence: u64,
     /// Payload bytes (Arrow IPC for kind=0, JSON `AuditEvent` for kind=1).
     pub payload: Vec<u8>,
 }
@@ -235,6 +242,25 @@ impl WalRecord {
             lsn,
             envelope_kind,
             batch_id,
+            frame_sequence: 0,
+            payload,
+        }
+    }
+
+    /// Construct a record carrying an explicit bounded-stream frame sequence.
+    #[must_use]
+    pub fn new_with_frame_sequence(
+        lsn: WalLsn,
+        envelope_kind: u8,
+        batch_id: [u8; 16],
+        frame_sequence: u64,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self {
+            lsn,
+            envelope_kind,
+            batch_id,
+            frame_sequence,
             payload,
         }
     }
@@ -247,13 +273,14 @@ impl WalRecord {
     )]
     pub fn encode(&self) -> Vec<u8> {
         let len = self.payload.len() as u32;
-        let mut buf = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + self.payload.len() + 4);
+        let mut buf = Vec::with_capacity(4 + 8 + 1 + 3 + 16 + 8 + self.payload.len() + 4);
 
         buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(&self.lsn.as_u64().to_le_bytes());
         buf.push(self.envelope_kind);
-        buf.extend_from_slice(&[0u8; 3]); // reserved
+        buf.extend_from_slice(&FRAME_SEQUENCE_RESERVED);
         buf.extend_from_slice(&self.batch_id);
+        buf.extend_from_slice(&self.frame_sequence.to_le_bytes());
         buf.extend_from_slice(&self.payload);
 
         // Compute CRC over len + lsn + kind + reserved + batch_id + payload
@@ -313,7 +340,7 @@ impl WalRecord {
             .map_err(|e| ScribeError::Internal {
                 detail: format!("WAL record reserved read error: {e}"),
             })?;
-        if reserved_buf != [0u8; 3] {
+        if reserved_buf != [0u8; 3] && reserved_buf != FRAME_SEQUENCE_RESERVED {
             return Err(ScribeError::Internal {
                 detail: "WAL record reserved bits non-zero".to_string(),
             });
@@ -326,6 +353,18 @@ impl WalRecord {
             .map_err(|e| ScribeError::Internal {
                 detail: format!("WAL record batch_id read error: {e}"),
             })?;
+
+        let frame_sequence = if reserved_buf == FRAME_SEQUENCE_RESERVED {
+            let mut sequence_bytes = [0u8; 8];
+            reader
+                .read_exact(&mut sequence_bytes)
+                .map_err(|e| ScribeError::Internal {
+                    detail: format!("WAL record frame sequence read error: {e}"),
+                })?;
+            u64::from_le_bytes(sequence_bytes)
+        } else {
+            0
+        };
 
         // Read payload
         let mut payload = vec![0u8; len as usize];
@@ -351,6 +390,9 @@ impl WalRecord {
         crc_input.extend_from_slice(&kind_buf);
         crc_input.extend_from_slice(&reserved_buf);
         crc_input.extend_from_slice(&batch_id);
+        if reserved_buf == FRAME_SEQUENCE_RESERVED {
+            crc_input.extend_from_slice(&frame_sequence.to_le_bytes());
+        }
         crc_input.extend_from_slice(&payload);
 
         let computed_crc = crc32c_hash(&crc_input);
@@ -366,6 +408,7 @@ impl WalRecord {
             lsn,
             envelope_kind,
             batch_id,
+            frame_sequence,
             payload,
         }))
     }
@@ -377,15 +420,26 @@ pub(crate) fn encode_append_frame(
     audit: &[u8],
     data: &[u8],
 ) -> Result<Bytes, ScribeError> {
+    encode_append_frame_with_sequence(batch_id, 0, audit, data)
+}
+
+/// Encode one complete paired append with its bounded-stream frame sequence.
+pub(crate) fn encode_append_frame_with_sequence(
+    batch_id: [u8; 16],
+    frame_sequence: u64,
+    audit: &[u8],
+    data: &[u8],
+) -> Result<Bytes, ScribeError> {
     let audit_len = u32::try_from(audit.len()).map_err(|_| ScribeError::Internal {
         detail: "audit envelope exceeds WAL frame length".to_string(),
     })?;
     let data_len = u32::try_from(data.len()).map_err(|_| ScribeError::Internal {
         detail: "Arrow payload exceeds WAL frame length".to_string(),
     })?;
-    let mut frame = Vec::with_capacity(28 + audit.len() + data.len());
-    frame.extend_from_slice(&APPEND_FRAME_MAGIC);
+    let mut frame = Vec::with_capacity(36 + audit.len() + data.len());
+    frame.extend_from_slice(&APPEND_FRAME_MAGIC_V2);
     frame.extend_from_slice(&batch_id);
+    frame.extend_from_slice(&frame_sequence.to_le_bytes());
     frame.extend_from_slice(&audit_len.to_le_bytes());
     frame.extend_from_slice(&data_len.to_le_bytes());
     frame.extend_from_slice(audit);
@@ -395,26 +449,50 @@ pub(crate) fn encode_append_frame(
 
 struct DecodedAppendFrame<'a> {
     batch_id: [u8; 16],
+    frame_sequence: u64,
     audit: &'a [u8],
     data: &'a [u8],
 }
 
 fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
-    if frame.len() < 28 || frame[0..4] != APPEND_FRAME_MAGIC {
+    if frame.len() < 28 || (frame[0..4] != APPEND_FRAME_MAGIC && frame[0..4] != APPEND_FRAME_MAGIC_V2) {
         return Err(ScribeError::Internal {
             detail: "invalid Scribe WAL append frame".to_string(),
         });
     }
     let mut batch_id = [0_u8; 16];
     batch_id.copy_from_slice(&frame[4..20]);
-    let audit_len = u32::from_le_bytes([frame[20], frame[21], frame[22], frame[23]]) as usize;
-    let data_len = u32::from_le_bytes([frame[24], frame[25], frame[26], frame[27]]) as usize;
+    let (frame_sequence, lengths_start) = if frame[0..4] == APPEND_FRAME_MAGIC_V2 {
+        if frame.len() < 36 {
+            return Err(ScribeError::Internal {
+                detail: "invalid Scribe WAL append frame".to_string(),
+            });
+        }
+        let mut sequence_bytes = [0_u8; 8];
+        sequence_bytes.copy_from_slice(&frame[20..28]);
+        (u64::from_le_bytes(sequence_bytes), 28)
+    } else {
+        (0, 20)
+    };
+    let audit_len = u32::from_le_bytes([
+        frame[lengths_start],
+        frame[lengths_start + 1],
+        frame[lengths_start + 2],
+        frame[lengths_start + 3],
+    ]) as usize;
+    let data_len = u32::from_le_bytes([
+        frame[lengths_start + 4],
+        frame[lengths_start + 5],
+        frame[lengths_start + 6],
+        frame[lengths_start + 7],
+    ]) as usize;
     let payload_len = audit_len
         .checked_add(data_len)
         .ok_or_else(|| ScribeError::Internal {
             detail: "Scribe WAL append frame length overflow".to_string(),
         })?;
-    let end = 28usize
+    let payload_start = lengths_start + 8;
+    let end = payload_start
         .checked_add(payload_len)
         .ok_or_else(|| ScribeError::Internal {
             detail: "Scribe WAL append frame offset overflow".to_string(),
@@ -426,8 +504,9 @@ fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeErr
     }
     Ok(DecodedAppendFrame {
         batch_id,
-        audit: &frame[28..28 + audit_len],
-        data: &frame[28 + audit_len..end],
+        frame_sequence,
+        audit: &frame[payload_start..payload_start + audit_len],
+        data: &frame[payload_start + audit_len..end],
     })
 }
 
@@ -723,20 +802,38 @@ impl WalWriter {
     /// Append a prepared paired frame without syncing it.
     pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<WalLsn, ScribeError> {
         let decoded = decode_append_frame(frame)?;
-        self.append_pair(decoded.batch_id, decoded.audit, decoded.data)
+        self.append_pair(
+            decoded.batch_id,
+            decoded.frame_sequence,
+            decoded.audit,
+            decoded.data,
+        )
     }
 
     fn append_pair(
         &self,
         batch_id: [u8; 16],
+        frame_sequence: u64,
         audit_payload: &[u8],
         data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
 
         // Build records to calculate their sizes
-        let audit_record = WalRecord::new(lsn, 1, batch_id, audit_payload.to_vec());
-        let data_record = WalRecord::new(lsn, 0, batch_id, data_payload.to_vec());
+        let audit_record = WalRecord::new_with_frame_sequence(
+            lsn,
+            1,
+            batch_id,
+            frame_sequence,
+            audit_payload.to_vec(),
+        );
+        let data_record = WalRecord::new_with_frame_sequence(
+            lsn,
+            0,
+            batch_id,
+            frame_sequence,
+            data_payload.to_vec(),
+        );
 
         let audit_size = audit_record.encode().len() as u64;
         let data_size = data_record.encode().len() as u64;
@@ -1023,7 +1120,13 @@ mod tests {
     #[test]
     fn wal_record_roundtrip() {
         let batch_id = [42u8; 16];
-        let record = WalRecord::new(WalLsn::new(5), 0, batch_id, b"test data".to_vec());
+        let record = WalRecord::new_with_frame_sequence(
+            WalLsn::new(5),
+            0,
+            batch_id,
+            7,
+            b"test data".to_vec(),
+        );
         let encoded = record.encode();
 
         let mut cursor = std::io::Cursor::new(encoded);
@@ -1034,7 +1137,29 @@ mod tests {
         assert_eq!(decoded.lsn, WalLsn::new(5));
         assert_eq!(decoded.envelope_kind, 0);
         assert_eq!(decoded.batch_id, batch_id);
+        assert_eq!(decoded.frame_sequence, 7);
         assert_eq!(decoded.payload, b"test data");
+    }
+
+    #[test]
+    fn legacy_wal_record_decodes_with_zero_frame_sequence() {
+        let batch_id = [9u8; 16];
+        let mut encoded = Vec::new();
+        let payload = b"legacy";
+        encoded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(&3_u64.to_le_bytes());
+        encoded.push(0);
+        encoded.extend_from_slice(&[0; 3]);
+        encoded.extend_from_slice(&batch_id);
+        encoded.extend_from_slice(payload);
+        let crc = crc32c_hash(&encoded);
+        encoded.extend_from_slice(&crc.to_le_bytes());
+
+        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
+            .expect("decode legacy record")
+            .expect("non-empty");
+        assert_eq!(decoded.frame_sequence, 0);
+        assert_eq!(decoded.payload, payload);
     }
 
     #[test]

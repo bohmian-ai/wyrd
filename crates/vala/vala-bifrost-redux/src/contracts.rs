@@ -9,6 +9,7 @@
 //! Idempotency is tracked by the frame identity `(batch_id, frame_sequence)`;
 //! the recovery path keys off the batch and seal key.
 
+use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -19,6 +20,25 @@ use wyrd_spec::vala::api::AuditEvent;
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::StreamIdentity;
+
+fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+    let fields = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.name().as_str(),
+                wyrd_spec::vala::CARD_REF
+                    | wyrd_spec::vala::CARD_UID
+                    | wyrd_spec::vala::PRINCIPAL_ID
+                    | "run_id"
+                    | "data_tenant_id"
+            ) && !field.name().starts_with("wyrd_")
+        })
+        .map(|field| field.as_ref().clone())
+        .collect::<Vec<_>>();
+    SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
+}
 
 /// Append request carrying batch data, schema fingerprint, and Principal.
 ///
@@ -165,7 +185,12 @@ pub trait Scribe: Send + Sync {
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
             })?;
-        let expected_schema_fingerprint = req.schema_fingerprint;
+        if req.schema_fingerprint != SchemaFingerprint::from_arrow_schema(req.rows.schema().as_ref()) {
+            return Err(ScribeError::FingerprintMismatch {
+                table: req.table.fqn(),
+            });
+        }
+        let expected_schema_fingerprint = source_schema_fingerprint(req.rows.schema().as_ref());
         let audit_event = AuditEvent {
             request_id: req.request_id.clone(),
             trace_id: None,

@@ -10817,6 +10817,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "wyrd-registry"
+version = "0.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "secrecy",
+ "serde_json",
+ "serde_urlencoded",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "urlencoding",
+ "wiremock",
+ "wyrd-client",
+ "wyrd-semver",
+ "wyrd-spec",
+ "wyrd-storage-client",
+]
+
+[[package]]
 name = "wyrd-runtime"
 version = "0.0.1"
 dependencies = [
@@ -11043,6 +11062,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

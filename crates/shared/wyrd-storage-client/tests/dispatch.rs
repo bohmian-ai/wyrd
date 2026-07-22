@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use base64::Engine;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use wiremock::matchers::{body_bytes, header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -213,6 +215,35 @@ async fn download_streams_to_destination_without_exposing_signed_url() {
             .unwrap(),
         b"downloaded"
     );
+}
+
+#[tokio::test]
+async fn verified_download_rejects_digest_or_size_mismatch() {
+    let server = MockServer::start().await;
+    let wyrd = wyrd(server.uri());
+    let storage = WyrdStorageClient::new(&wyrd);
+    Mock::given(method("GET"))
+        .and(path("/verified"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"actual"))
+        .mount(&server)
+        .await;
+
+    let destination = NamedTempFile::new().expect("temporary destination");
+    let plan = wyrd_spec::storage::DownloadPlan {
+        get_url: format!("{}/verified", server.uri()),
+        ttl_secs: 60,
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"expected");
+    let expected_sha256 = base64::engine::general_purpose::STANDARD.encode(digest.finalize());
+    let error = storage
+        .download_verified(&plan, destination.path(), &expected_sha256, 8)
+        .await
+        .expect_err("mismatched bytes must fail verification");
+    let error: wyrd_spec::error::WyrdError = error.into();
+    assert_eq!(error.code(), "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
+    assert_eq!(error.status(), 507);
+    assert!(!error.to_string().contains("sig="));
 }
 
 #[tokio::test]

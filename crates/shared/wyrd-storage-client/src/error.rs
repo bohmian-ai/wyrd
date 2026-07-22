@@ -58,6 +58,20 @@ pub enum StorageClientError {
         /// Actual size or count.
         actual: u64,
     },
+    /// The downloaded bytes did not match the server-declared digest or size.
+    #[error(
+        "artifact verification failed: expected {expected_sha256} / {expected_size} bytes, got {actual_sha256} / {actual_size} bytes"
+    )]
+    VerifyFailed {
+        /// Expected base64-encoded SHA-256 digest.
+        expected_sha256: String,
+        /// Computed base64-encoded SHA-256 digest.
+        actual_sha256: String,
+        /// Expected byte length.
+        expected_size: u64,
+        /// Downloaded byte length.
+        actual_size: u64,
+    },
     /// A structured Wyrd error crossed the boundary; surfaced verbatim so
     /// stable `code`, `status`, `remediation`, and `details` are preserved.
     #[error("{0}")]
@@ -105,6 +119,20 @@ impl From<StorageClientError> for WyrdError {
             StorageClientError::SizeMismatch { expected, actual } => {
                 WyrdStorageError::SizeMismatch { expected, actual }.into()
             }
+            StorageClientError::VerifyFailed {
+                expected_sha256,
+                actual_sha256,
+                expected_size,
+                actual_size,
+            } => WyrdError::RegistryArtifactVerifyFailed {
+                message: "downloaded artifact did not match the server declaration".to_owned(),
+                details: serde_json::json!({
+                    "expected_sha256": expected_sha256,
+                    "actual_sha256": actual_sha256,
+                    "expected_size": expected_size,
+                    "actual_size": actual_size,
+                }),
+            },
             StorageClientError::PlanMismatch { expected, actual } => WyrdStorageError::Backend {
                 detail: format!("invalid upload plan: expected {expected}, got {actual}"),
             }

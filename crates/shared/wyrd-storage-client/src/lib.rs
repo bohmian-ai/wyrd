@@ -98,4 +98,31 @@ impl WyrdStorageClient {
     ) -> Result<DownloadOutcome, StorageClientError> {
         download::dispatch(&self.client, plan, dest).await
     }
+
+    /// Download an artifact and verify it against the server-declared digest
+    /// and byte length.
+    ///
+    /// This is an internal-capability seam for registry loading. The public
+    /// registry handle owns artifact selection; this client owns transfer and
+    /// byte verification.
+    ///
+    /// # Errors
+    /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes
+    /// do not match either declared value.
+    pub async fn download_verified(
+        &self,
+        plan: &DownloadPlan,
+        dest: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+    ) -> Result<DownloadOutcome, StorageClientError> {
+        download::dispatch_verified(
+            &self.client,
+            plan,
+            dest,
+            expected_sha256,
+            expected_size_bytes,
+        )
+        .await
+    }
 }

@@ -77,7 +77,12 @@ pub(crate) async fn register_card_http(
         .map_err(WyrdErrorResponse::from)
 }
 
-/// Complete a pending Card after the client-side storage transfer finishes.
+/// Complete a Pending Card after the client-side storage transfer finishes.
+///
+/// The server rechecks every manifest and stores the immutable Card blob before
+/// activating the Card. Repeating the request with the registration key is an
+/// idempotent Active no-op; provider URLs and transfer details never cross
+/// this lifecycle boundary.
 #[utoipa::path(
     post,
     path = "/v1/cards/{card_uid}/complete",
@@ -108,6 +113,11 @@ async fn complete_card_http(
 }
 
 /// Clean up an incomplete Card registration by Card UID.
+///
+/// Pending and Failed Cards may be retried through this endpoint. The server
+/// attempts every manifest cleanup, records the Failed transition and audit
+/// event transactionally, and returns a stable failure count without exposing
+/// provider credentials or URLs.
 #[utoipa::path(
     post,
     path = "/v1/cards/{card_uid}/abort",

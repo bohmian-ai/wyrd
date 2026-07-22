@@ -118,12 +118,15 @@ fn merge_completed_outcome(
 #[cfg(test)]
 mod tests {
     use super::validate_completion_response;
-    use wyrd_spec::error::WyrdError;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::error::WyrdError;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::CreateCardResponse;
-    use wyrd_semver::VersionBlock;
+    use wyrd_spec::registry::{
+        CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind,
+    };
 
     #[test]
     fn rejects_missing_completion_outcome() {
@@ -144,5 +147,41 @@ mod tests {
             .expect_err("missing outcome is rejected")
             .into();
         assert_eq!(error.code(), "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
+    }
+
+    #[test]
+    fn rejects_duplicate_or_unrelated_completion_outcomes() {
+        let requested = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
+        let unrelated = CardUid::new("018f0000-0000-7000-8000-000000000002").expect("test UID");
+        let response = |uid: CardUid, name: &str| CardRegistrationOutcome {
+            card_ref: CardRef {
+                kind: CardKind::Prompt,
+                name: CardName::new(name).expect("test name"),
+                version: VersionBlock::parse("1.0.0").expect("test version"),
+                space: Some(SpaceName::new("default").expect("test space")),
+                uid: Some(uid),
+            },
+            spec_hash: "sha256:spec".to_owned(),
+            artifact_hash: None,
+            status: CardLifecycleStatus::Active,
+            outcome: RegistrationOutcomeKind::Registered,
+            card_blob_uri: Some("wyrd://blob".parse().expect("test blob URI")),
+        };
+        let duplicate = CreateCardResponse {
+            root: response(requested.clone(), "requested").card_ref,
+            outcomes: vec![
+                response(requested.clone(), "requested"),
+                response(requested.clone(), "requested"),
+            ],
+            upload_plans: Vec::new(),
+        };
+        assert!(validate_completion_response(&duplicate, &requested, &duplicate).is_err());
+
+        let unrelated_response = CreateCardResponse {
+            root: response(unrelated.clone(), "unrelated").card_ref,
+            outcomes: vec![response(unrelated, "unrelated")],
+            upload_plans: Vec::new(),
+        };
+        assert!(validate_completion_response(&duplicate, &requested, &unrelated_response).is_err());
     }
 }

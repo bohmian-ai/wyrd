@@ -21,7 +21,12 @@ fn pending_card_uids(response: &CreateCardResponse) -> Vec<wyrd_spec::ids::CardU
     response
         .outcomes
         .iter()
-        .filter(|outcome| outcome.status != CardLifecycleStatus::Active)
+        .filter(|outcome| {
+            matches!(
+                outcome.status,
+                CardLifecycleStatus::Pending | CardLifecycleStatus::Failed
+            )
+        })
         .filter_map(|outcome| outcome.card_ref.uid.clone())
         .collect()
 }
@@ -41,11 +46,11 @@ async fn abort_card_registration(
 #[cfg(test)]
 mod tests {
     use super::pending_card_uids;
+    use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, CreateCardResponse};
-    use wyrd_semver::VersionBlock;
 
     fn card_ref(name: &str) -> CardRef {
         let uid = match name {
@@ -80,16 +85,28 @@ mod tests {
             outcome: wyrd_spec::registry::RegistrationOutcomeKind::Registered,
             card_blob_uri: None,
         };
+        let failed = CardRegistrationOutcome {
+            card_ref: card_ref("failed"),
+            spec_hash: String::new(),
+            artifact_hash: None,
+            status: CardLifecycleStatus::Failed,
+            outcome: wyrd_spec::registry::RegistrationOutcomeKind::Registered,
+            card_blob_uri: None,
+        };
         let response = CreateCardResponse {
             root: pending.card_ref.clone(),
-            outcomes: vec![active, pending],
+            outcomes: vec![active, pending, failed],
             upload_plans: Vec::new(),
         };
         let uids = pending_card_uids(&response);
-        assert_eq!(uids.len(), 1);
+        assert_eq!(uids.len(), 2);
         assert_eq!(
             uids[0],
             response.outcomes[1].card_ref.uid.clone().expect("test UID")
+        );
+        assert_eq!(
+            uids[1],
+            response.outcomes[2].card_ref.uid.clone().expect("test UID")
         );
     }
 }

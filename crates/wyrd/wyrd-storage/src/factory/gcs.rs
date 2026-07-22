@@ -85,7 +85,11 @@ pub fn build_emulator_signer(bucket: &str, emulator_host: &str) -> Result<GcsSig
         ..ClientConfig::default().anonymous()
     };
     let client = Client::new(config);
-    Ok(GcsSigner::new(client, bucket.to_owned()))
+    Ok(GcsSigner::new_emulator(
+        client,
+        bucket.to_owned(),
+        emulator_host,
+    ))
 }
 
 async fn build_client_config() -> Result<ClientConfig, gcloud_auth::error::Error> {

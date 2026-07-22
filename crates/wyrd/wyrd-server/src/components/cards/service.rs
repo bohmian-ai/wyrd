@@ -830,7 +830,13 @@ struct CardCompletionState {
 /// therefore safe to retry without holding a database connection across
 /// backend calls. The route validates and forwards the caller's idempotency
 /// key so transport retries retain the registration saga key.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete", idempotency_key = idempotency_key))]
+#[tracing::instrument(
+    skip(state, caller, idempotency_key),
+    fields(
+        operation = "card.registration.complete",
+        idempotency_key_present = !idempotency_key.is_empty()
+    )
+)]
 pub async fn complete_card(
     state: &AppState,
     caller: &Caller,
@@ -874,7 +880,13 @@ pub async fn complete_card(
 /// This is an internal lifecycle cleanup seam. It is intentionally not exposed
 /// as a method on the public `Cards` handle. Cleanup is best-effort, while the
 /// Pending→Failed transition and its audit event remain transactional.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.abort", idempotency_key = idempotency_key))]
+#[tracing::instrument(
+    skip(state, caller, idempotency_key),
+    fields(
+        operation = "card.registration.abort",
+        idempotency_key_present = !idempotency_key.is_empty()
+    )
+)]
 pub async fn abort_card(
     state: &AppState,
     caller: &Caller,
@@ -884,7 +896,7 @@ pub async fn abort_card(
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_abort_status(&completion_state.card, card_uid)?;
     let cleanup_failures = cleanup_card_artifacts(state, caller, &completion_state.manifests).await;
-    let failed = commit_card_failure(state, caller, card_uid, cleanup_failures.is_empty()).await?;
+    commit_card_failure(state, caller, card_uid, cleanup_failures.is_empty()).await?;
     if !cleanup_failures.is_empty() {
         return Err(WyrdError::RegistryArtifactVerifyFailed {
             message: "card registration cleanup was incomplete".to_owned(),
@@ -898,11 +910,7 @@ pub async fn abort_card(
         state,
         caller,
         card_uid,
-        if failed {
-            RegistrationOutcomeKind::IdempotentNoop
-        } else {
-            RegistrationOutcomeKind::IdempotentNoop
-        },
+        RegistrationOutcomeKind::IdempotentNoop,
     )
     .await
 }
@@ -1032,13 +1040,17 @@ fn validate_card_abort_status(
     card: &wyrd_sql::row_types::cards::ParsedCardRow,
     card_uid: &CardUid,
 ) -> Result<(), WyrdError> {
-    if card.status == CardStatus::Active {
-        return Err(WyrdError::Conflict {
+    match card.status {
+        CardStatus::Pending | CardStatus::Failed => Ok(()),
+        CardStatus::Active => Err(WyrdError::Conflict {
             message: "active cards cannot be aborted".to_owned(),
             details: serde_json::json!({ "card_uid": card_uid }),
-        });
+        }),
+        status => Err(WyrdError::Conflict {
+            message: "card registration is not abortable in its current state".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "status": status }),
+        }),
     }
-    Ok(())
 }
 
 /// Attempt cleanup for every manifest and return only failure details.

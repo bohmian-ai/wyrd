@@ -339,13 +339,20 @@ pub async fn upload_part_url(
 }
 
 /// Complete an upload and return the verified stored object descriptor.
-#[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+#[instrument(
+    skip(storage, postgres, caller, body, idempotency_key),
+    fields(
+        tenant = %caller.data_tenant_id,
+        upload_id = %upload_id,
+        idempotency_key_present = idempotency_key.is_some()
+    )
+)]
 pub async fn upload_complete(
     storage: &StorageHandle,
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
     upload_id: UploadId,
-    _idempotency_key: Option<IdempotencyKey>,
+    idempotency_key: Option<IdempotencyKey>,
     body: UploadCompleteRequest,
 ) -> Result<UploadCompleteResponse, WyrdError> {
     let state = StorageServiceState { storage, postgres };
@@ -393,13 +400,20 @@ pub async fn upload_complete(
 }
 
 /// Abort an in-flight upload.
-#[instrument(skip(storage, postgres, caller), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
+#[instrument(
+    skip(storage, postgres, caller, idempotency_key),
+    fields(
+        tenant = %caller.data_tenant_id,
+        upload_id = %upload_id,
+        idempotency_key_present = idempotency_key.is_some()
+    )
+)]
 pub async fn upload_abort(
     storage: &StorageHandle,
     postgres: &WyrdPostgres,
     caller: &StorageCaller,
     upload_id: UploadId,
-    _idempotency_key: Option<IdempotencyKey>,
+    idempotency_key: Option<IdempotencyKey>,
 ) -> Result<AbortResponse, WyrdError> {
     let state = StorageServiceState { storage, postgres };
     let upload_uuid = upload_id_uuid(&upload_id)?;

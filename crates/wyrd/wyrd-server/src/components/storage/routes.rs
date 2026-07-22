@@ -97,7 +97,11 @@ async fn part_url(
     .map_err(WyrdErrorResponse::from)
 }
 
-/// Complete an initialized multipart or single-part upload.
+/// Complete an initialized upload after the client has transferred its bytes.
+///
+/// The optional `Idempotency-Key` is forwarded to the storage service so a
+/// retried client completion keeps the same request context. The service
+/// verifies the backend object before persisting its artifact metadata.
 async fn complete(
     State(state): State<AppState>,
     caller: Caller,
@@ -123,6 +127,10 @@ async fn complete(
 }
 
 /// Abort an upload and release its pending storage state.
+///
+/// Aborts are safe to retry: the server treats an already completed or
+/// already aborted upload as a no-op, while the idempotency key remains
+/// available to the service for request correlation.
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,

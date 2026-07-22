@@ -10836,7 +10836,6 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
- "wiremock",
  "wyrd-client",
  "wyrd-loader",
  "wyrd-semver",
@@ -11078,7 +11077,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
- "wiremock",
  "wyrd-client",
  "wyrd-spec",
 ]

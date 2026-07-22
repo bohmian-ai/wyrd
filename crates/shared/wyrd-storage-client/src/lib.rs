@@ -13,8 +13,8 @@ use std::path::Path;
 
 use wyrd_client::WyrdClient;
 use wyrd_spec::storage::{
-    DownloadPlan, PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse, UploadId,
-    UploadPlan,
+    DownloadPlan, GcsResumableComplete, PartUrlResponse, SinglePutComplete, UploadCompleteRequest,
+    UploadCompleteResponse, UploadId, UploadPlan,
 };
 
 use crate::upload::{UploadHooks, UploadOutcome};
@@ -77,9 +77,22 @@ impl WyrdStorageClient {
                 },
             )
             .await?;
-        if let Some(request) = outcome.into_server_complete() {
-            self.complete(upload_id, &request, idempotency_key).await?;
-        }
+        let request = outcome
+            .into_server_complete()
+            .or(match plan {
+                UploadPlan::LocalFs { .. } | UploadPlan::SinglePut { .. } => {
+                    Some(UploadCompleteRequest::SinglePut(SinglePutComplete {}))
+                }
+                UploadPlan::GcsResumable { .. } => {
+                    Some(UploadCompleteRequest::GcsResumable(GcsResumableComplete {}))
+                }
+                UploadPlan::S3Multipart { .. } | UploadPlan::AzureBlockBlob { .. } => None,
+            })
+            .ok_or(StorageClientError::PlanMismatch {
+                expected: "server-completable upload outcome",
+                actual: "provider upload reported complete without completion details",
+            })?;
+        self.complete(upload_id, &request, idempotency_key).await?;
         Ok(())
     }
 

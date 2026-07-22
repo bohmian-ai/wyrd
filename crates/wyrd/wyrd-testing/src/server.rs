@@ -94,6 +94,7 @@ pub struct WyrdTestServerBuilder {
     allow_preview_auth: bool,
     storage_settings: Option<StorageSettings>,
     storage_handle: Option<Arc<wyrd_storage::StorageHandle>>,
+    catalog_backend: Option<BackendConfig>,
     access_ttl: Option<ChronoDuration>,
     auth_verify_settings: Option<WyrdAuthVerifySettings>,
     trusted_issuer_configs: Vec<IssuerEntry>,
@@ -108,6 +109,7 @@ impl Default for WyrdTestServerBuilder {
             allow_preview_auth: true,
             storage_settings: None,
             storage_handle: None,
+            catalog_backend: None,
             access_ttl: None,
             auth_verify_settings: None,
             trusted_issuer_configs: Vec::new(),
@@ -937,6 +939,16 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Use a separate backend for the test catalog warehouse.
+    ///
+    /// Emulator journeys can keep artifact transfer on the backend under
+    /// test while storing the harness catalog in a stable local emulator.
+    #[must_use]
+    pub fn with_catalog_backend(mut self, backend: BackendConfig) -> Self {
+        self.catalog_backend = Some(backend);
+        self
+    }
+
     /// Override the access token TTL for all exchange paths.
     ///
     /// Use this in TTL-expiry journey tests to mint short-lived tokens without
@@ -1024,7 +1036,10 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
             (Some(root), handle)
         };
-        let bifrost = test_catalog(&fixture, &storage).await?;
+        let catalog_backend = self
+            .catalog_backend
+            .unwrap_or_else(|| storage.backend_config().clone());
+        let bifrost = test_catalog(&fixture, &catalog_backend).await?;
 
         let issuing_key = Arc::new(
             IssuingKey::from_ed_pem(
@@ -1478,11 +1493,11 @@ fn sql(error: impl std::fmt::Display) -> WyrdTestServerError {
 
 async fn test_catalog(
     fixture: &PgFixture,
-    storage: &Arc<wyrd_storage::StorageHandle>,
+    backend: &BackendConfig,
 ) -> Result<Arc<WyrdCatalog>, WyrdTestServerError> {
     let catalog = WyrdCatalog::new(
         fixture.catalog_dsn().expose_secret(),
-        storage.backend_config(),
+        backend,
         Arc::new(fixture.app_pool().clone()),
         None,
     )

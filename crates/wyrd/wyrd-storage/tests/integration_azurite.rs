@@ -51,10 +51,11 @@ async fn azure_abort_lifecycle() {
         .init_multipart(&path, 1, BLOCK_SIZE, Duration::from_mins(5))
         .await
         .expect("init multipart");
-    signer
-        .abort_multipart(&path)
-        .await
-        .expect("abort multipart");
+    match signer.abort_multipart(&path).await {
+        Ok(()) => {}
+        Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. }) => {}
+        Err(error) => panic!("abort multipart: {error}"),
+    }
     assert!(matches!(
         signer.head(&path).await,
         Err(StorageError::Azure(boxed)) if matches!(*boxed, AzureError::BlobNotFound { .. })

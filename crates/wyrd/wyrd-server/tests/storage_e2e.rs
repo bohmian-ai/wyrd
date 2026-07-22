@@ -20,6 +20,7 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::storage::{
     DownloadInitRequest, DownloadInitResponse, DownloadPlan, UploadInitRequest, UploadInitResponse,
+    UploadPlan,
 };
 use wyrd_storage::cloud::CloudSigner;
 use wyrd_storage::settings::{AzureConfig, GcsConfig, S3Config};
@@ -122,16 +123,31 @@ fn s3_cloud_settings() -> StorageSettings {
     }))
 }
 
+fn emulator_catalog_backend() -> BackendConfig {
+    BackendConfig::S3(S3Config {
+        bucket: env_or("WYRD_STORAGE_S3_BUCKET", "wyrd-storage-test"),
+        region: Some(env_or("WYRD_STORAGE_S3_REGION", "us-east-1")),
+        endpoint_url: Some(env_or("WYRD_S3_EMULATOR_ENDPOINT", "http://localhost:9000")),
+        force_path_style: true,
+    })
+}
+
 fn gcs_emu_handle() -> Arc<StorageHandle> {
-    let signer = wyrd_storage::factory::gcs::build_emulator_signer(
-        &env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test"),
-        &env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443"),
+    let bucket = env_or("WYRD_STORAGE_GCS_BUCKET", "wyrd-storage-test");
+    let endpoint = env_or("WYRD_GCS_EMULATOR_HOST", "http://localhost:4443");
+    let signer = wyrd_storage::factory::gcs::build_emulator_signer(&bucket, &endpoint)
+        .expect("GCS emulator signer");
+    Arc::new(
+        StorageHandle::for_testing_with_multipart_threshold(
+            BackendSigner::Cloud(Box::new(CloudSigner::Gcs(signer))),
+            BackendConfig::Gcs(GcsConfig {
+                bucket,
+                endpoint_url: Some(endpoint),
+            }),
+            LOW_THRESHOLD_BYTES,
+        )
+        .expect("GCS emulator storage handle"),
     )
-    .expect("GCS emulator signer");
-    Arc::new(StorageHandle::from_signer(
-        BackendSigner::Cloud(Box::new(CloudSigner::Gcs(signer))),
-        LOW_THRESHOLD_BYTES,
-    ))
 }
 
 fn gcs_cloud_settings() -> StorageSettings {
@@ -142,15 +158,22 @@ fn gcs_cloud_settings() -> StorageSettings {
 }
 
 fn azure_emu_handle() -> Arc<StorageHandle> {
-    let signer = wyrd_storage::factory::azure::build_emulator_signer(
-        &env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test"),
-        &env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000"),
+    let container = env_or("WYRD_STORAGE_AZURE_CONTAINER", "wyrd-storage-test");
+    let endpoint = env_or("WYRD_AZURE_EMULATOR_ENDPOINT", "http://127.0.0.1:10000");
+    let signer = wyrd_storage::factory::azure::build_emulator_signer(&container, &endpoint)
+        .expect("Azure emulator signer");
+    Arc::new(
+        StorageHandle::for_testing_with_multipart_threshold(
+            BackendSigner::Cloud(Box::new(CloudSigner::Azure(signer))),
+            BackendConfig::Azure(AzureConfig {
+                account: "devstoreaccount1".to_owned(),
+                container,
+                endpoint_url: Some(endpoint),
+            }),
+            LOW_THRESHOLD_BYTES,
+        )
+        .expect("Azure emulator storage handle"),
     )
-    .expect("Azure emulator signer");
-    Arc::new(StorageHandle::from_signer(
-        BackendSigner::Cloud(Box::new(CloudSigner::Azure(signer))),
-        LOW_THRESHOLD_BYTES,
-    ))
 }
 
 fn azure_cloud_settings() -> StorageSettings {
@@ -161,9 +184,16 @@ fn azure_cloud_settings() -> StorageSettings {
     }))
 }
 
-async fn server_from_handle(handle: Arc<StorageHandle>) -> WyrdTestServer {
-    WyrdTestServer::builder()
-        .with_storage_handle(handle)
+async fn server_from_handle(
+    handle: Arc<StorageHandle>,
+    catalog_backend: Option<BackendConfig>,
+) -> WyrdTestServer {
+    let builder = WyrdTestServer::builder().with_storage_handle(handle);
+    let builder = match catalog_backend {
+        Some(backend) => builder.with_catalog_backend(backend),
+        None => builder,
+    };
+    builder
         .start_bound()
         .await
         .expect("start bound storage server")
@@ -189,7 +219,12 @@ async fn run_client_server_journey(
     let token = bootstrap_service_jwt(&srv, "storage-client-journey").await;
     let client = client_for(&srv, &token);
     let storage = WyrdStorageClient::new(&client);
-    let content = patterned_payload(MULTIPART_PAYLOAD_BYTES);
+    let content_size = if relative_path.starts_with("local/") {
+        512 * 1024
+    } else {
+        MULTIPART_PAYLOAD_BYTES
+    };
+    let content = patterned_payload(content_size);
     let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
     let idempotency_key = "storage-client-journey-001";
     let init: UploadInitResponse = client
@@ -207,10 +242,20 @@ async fn run_client_server_journey(
         )
         .await
         .expect("upload init succeeds");
+    let upload_plan = match &init.plan {
+        UploadPlan::LocalFs { ttl_secs, .. } => {
+            let base_url = srv.base_url().expect("bound server exposes base URL");
+            UploadPlan::LocalFs {
+                put_url: format!("{base_url}/v1/cards/upload/local/{}", init.storage_path),
+                ttl_secs: *ttl_secs,
+            }
+        }
+        _ => init.plan.clone(),
+    };
     storage
         .upload_artifact(
             &init.upload_id,
-            &init.plan,
+            &upload_plan,
             content.clone(),
             idempotency_key,
         )
@@ -231,6 +276,12 @@ async fn run_client_server_journey(
         .expect("download init succeeds");
     let plan = if gcs_emulator_media {
         gcs_emulator_download_plan(&init.storage_path)
+    } else if relative_path.starts_with("local/") {
+        let base_url = srv.base_url().expect("bound server exposes base URL");
+        DownloadPlan {
+            get_url: format!("{base_url}/v1/cards/download/local/{}", init.storage_path),
+            ttl_secs: 0,
+        }
     } else {
         download.plan
     };
@@ -295,7 +346,7 @@ async fn gcs_multipart_e2e_emu() {
         return;
     }
     run_client_server_journey(
-        server_from_handle(gcs_emu_handle()).await,
+        server_from_handle(gcs_emu_handle(), Some(emulator_catalog_backend())).await,
         "gcs-multipart/weights.bin",
         true,
     )
@@ -321,7 +372,7 @@ async fn azure_multipart_e2e_emu() {
         return;
     }
     run_client_server_journey(
-        server_from_handle(azure_emu_handle()).await,
+        server_from_handle(azure_emu_handle(), Some(emulator_catalog_backend())).await,
         "azure-multipart/weights.bin",
         false,
     )

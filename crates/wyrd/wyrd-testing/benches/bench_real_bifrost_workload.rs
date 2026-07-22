@@ -67,6 +67,7 @@ async fn main() -> Result<(), BenchError> {
     workload.validate()?;
 
     match lane.as_str() {
+        "preflight" => run_preflight().await?,
         "scribe" | "scribe-forge" | "capacity" => {
             let integrated = lane != "scribe";
             let (report, harness) = run_ingest(&lane, pods, tenants, workload, integrated).await?;
@@ -86,6 +87,49 @@ async fn main() -> Result<(), BenchError> {
         other => return Err(format!("unknown Bifrost lane: {other}").into()),
     }
     Ok(())
+}
+
+async fn run_preflight() -> Result<(), BenchError> {
+    let harness = BifrostHarness::start(1, 1).await?;
+    let result = async {
+        let tenant = *harness
+            .tenants()
+            .first()
+            .ok_or("preflight harness has no tenant")?;
+        let scribe = harness
+            .scribes()
+            .first()
+            .ok_or("preflight harness has no Scribe")?;
+        let principal = Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind: PrincipalKind::User,
+            tenant_id: tenant,
+            roles: Vec::new(),
+            effective_permissions: PermissionSet::new(),
+        };
+        scribe
+            .append(ScribeAppend {
+                principal,
+                table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+                rows: make_batch(1_000, tenant, 0)?,
+                schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+            })
+            .await?;
+        harness.force_seal_all().await?;
+        if !wait_for_scribe_drain(&harness, SCRIBE_DRAIN_TIMEOUT).await? {
+            return Err("preflight Scribe drain timed out".into());
+        }
+        let verification = verify_outputs(&harness, 1_000, false, 0, None).await?;
+        if !verification.passed {
+            return Err("preflight durable verification failed".into());
+        }
+        Ok::<(), BenchError>(())
+    }
+    .await;
+    harness.shutdown().await?;
+    result
 }
 
 async fn run_ingest(
@@ -488,12 +532,13 @@ async fn drain_forge(
     loop {
         let started = Instant::now();
         let outcome = run_maintenance_tick(&fixture.context).await?;
-        let mut state = state.lock().map_err(|_| "benchmark state lock poisoned")?;
-        state
-            .forge_samples
-            .push(u64::try_from(started.elapsed().as_micros())?.max(1));
-        accumulate_forge_outcome(&mut state.forge_outcome, outcome);
-        drop(state);
+        {
+            let mut state = state.lock().map_err(|_| "benchmark state lock poisoned")?;
+            state
+                .forge_samples
+                .push(u64::try_from(started.elapsed().as_micros())?.max(1));
+            accumulate_forge_outcome(&mut state.forge_outcome, outcome);
+        }
         let candidates = candidate_count(harness, table_name).await?;
         if candidates == 0 || Instant::now() >= deadline {
             return Ok(candidates);
@@ -575,7 +620,7 @@ async fn build_report(
     forge_table: Option<&str>,
     complete: bool,
 ) -> Result<BenchmarkReport, BenchError> {
-    let (accepted_rows, started, forge_samples, forge_outcome, phases, backlog) = {
+    let (accepted_rows, started, forge_samples, forge_outcome, phases, backlog, errors) = {
         let state = state.lock().map_err(|_| "benchmark state lock poisoned")?;
         (
             state.accepted_rows,
@@ -584,6 +629,7 @@ async fn build_report(
             state.forge_outcome,
             state.phases.clone(),
             state.backlog.clone(),
+            state.errors,
         )
     };
     let write_latency = LatencyPercentiles::from_samples(&state_samples(harness, "append"));
@@ -608,6 +654,9 @@ async fn build_report(
     {
         storage.fsync_us = wal.latency.p99_us;
     }
+    if let Some(append) = stage_data.iter().find(|stage| stage.stage == "append") {
+        storage.mib_per_second = append.bytes as f64 / 1_048_576.0 / elapsed;
+    }
     storage.compaction_amplification = compaction_amplification;
     let forge = ForgeMeasurements {
         ticks: u64::try_from(forge_samples.len())?,
@@ -622,6 +671,7 @@ async fn build_report(
             .max()
             .unwrap_or(0),
     };
+    let verification_passed = verification.passed;
     Ok(BenchmarkReport {
         report_version: BenchmarkReport::VERSION.to_owned(),
         lane: format!("bench:bifrost:{lane}:baseline"),
@@ -643,7 +693,8 @@ async fn build_report(
         phases,
         backlog,
         verification,
-        complete,
+        errors,
+        complete: complete && errors == 0 && verification_passed,
     })
 }
 
@@ -955,7 +1006,11 @@ async fn run_oracle(
             stages: Vec::new(),
             phases: Vec::new(),
             backlog: Vec::new(),
-            verification: VerificationMeasurements::default(),
+            verification: VerificationMeasurements {
+                passed: complete,
+                ..VerificationMeasurements::default()
+            },
+            errors: 0,
             complete,
         },
         cluster,
@@ -969,6 +1024,7 @@ fn workload_for_lane(lane: &str) -> Result<WorkloadSpec, BenchError> {
         "forge" => (TrafficShape::Bursty, SchemaWidth::Wide),
         "oracle" => (TrafficShape::LatencySensitive, SchemaWidth::Narrow),
         "capacity" => (TrafficShape::Bursty, SchemaWidth::Wide),
+        "preflight" => (TrafficShape::Steady, SchemaWidth::Narrow),
         other => return Err(format!("unknown Bifrost lane: {other}").into()),
     };
     Ok(WorkloadSpec::required(

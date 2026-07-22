@@ -88,8 +88,8 @@ impl BifrostHarness {
         }
 
         let operator = Arc::new(cluster.storage_operator());
-        let mut scribes = Vec::with_capacity(pods_for(&cluster));
-        let mut telemetry = Vec::with_capacity(pods_for(&cluster));
+        let mut scribes = Vec::with_capacity(pods_for(cluster));
+        let mut telemetry = Vec::with_capacity(pods_for(cluster));
         for (index, wal_dir) in cluster.wal_dirs().enumerate() {
             let node_id = uuid::Uuid::now_v7();
             let recorder = Arc::new(ScribeTelemetry::default());

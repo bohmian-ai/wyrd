@@ -13,6 +13,8 @@ if [[ -e "$target" ]]; then
 fi
 mkdir -p "$target/reports"
 
+mise run bench:bifrost:preflight
+
 for lane in scribe forge oracle capacity; do
   output="$target/reports/$lane.json"
   task="bench:bifrost:${lane}:slo"
@@ -21,6 +23,10 @@ for lane in scribe forge oracle capacity; do
   fi
   WYRD_BIFROST_OUTPUT="$output" mise run "$task" \
     || { echo "Bifrost lane failed: $lane" >&2; exit 1; }
+  if ! jq -e '.complete == true and .errors == 0 and .verification.passed == true' "$output" >/dev/null; then
+    echo "Bifrost lane produced an incomplete or failed report: $lane" >&2
+    exit 1
+  fi
 done
 
 git_sha="$(git rev-parse HEAD)"

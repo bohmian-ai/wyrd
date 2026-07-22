@@ -253,6 +253,7 @@ impl Scribe for ScribeImpl {
         // Split cross-day input into per-day slices; a cross-day batch
         // produces two seals into two file_list rows (see seal_key module).
         let event_days = split_batch_by_event_day(&req.rows)?;
+        let mut append_payload_bytes = 0_usize;
 
         for (event_day, day_batch) in event_days {
             let seal_key = SealKey::new(req.principal.tenant_id, req.table.clone(), event_day);
@@ -296,6 +297,7 @@ impl Scribe for ScribeImpl {
             }
             let day_rows = day_batch.num_rows();
             let wal_payload_bytes = audit_payload.len().saturating_add(data_payload.len());
+            append_payload_bytes = append_payload_bytes.saturating_add(wal_payload_bytes);
             if let Some(telemetry) = &self.telemetry {
                 telemetry.record(
                     "preprocess",
@@ -339,7 +341,12 @@ impl Scribe for ScribeImpl {
         }
 
         if let Some(telemetry) = &self.telemetry {
-            telemetry.record("append", append_started.elapsed(), req.rows.num_rows(), 0);
+            telemetry.record(
+                "append",
+                append_started.elapsed(),
+                req.rows.num_rows(),
+                append_payload_bytes,
+            );
         }
         Ok(())
     }

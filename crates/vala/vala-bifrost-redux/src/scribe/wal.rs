@@ -606,7 +606,7 @@ impl WalWriter {
             .flatten()
             .filter_map(Result::ok)
             .filter_map(|entry| entry.metadata().ok())
-            .filter(|metadata| metadata.is_file())
+            .filter(std::fs::Metadata::is_file)
             .map(|metadata| metadata.len())
             .sum()
     }

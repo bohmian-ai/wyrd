@@ -197,11 +197,12 @@ mod tests {
             query_latency: LatencyPercentiles::default(),
             storage: StorageMeasurements::default(),
             query: QueryMeasurements::default(),
-            forge: Default::default(),
+            forge: crate::report::ForgeMeasurements::default(),
             stages: Vec::new(),
             phases: Vec::new(),
             backlog: Vec::new(),
-            verification: Default::default(),
+            verification: crate::report::VerificationMeasurements::default(),
+            errors: 0,
             complete: true,
         }
     }

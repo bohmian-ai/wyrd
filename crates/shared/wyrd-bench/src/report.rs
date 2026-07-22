@@ -235,6 +235,8 @@ pub struct BenchmarkReport {
     pub backlog: Vec<BacklogSample>,
     /// Durable output verification.
     pub verification: VerificationMeasurements,
+    /// Total producer, sealing, or Forge errors observed during the run.
+    pub errors: u64,
     /// False when a timeout or verification failure ended the run.
     pub complete: bool,
 }
@@ -310,6 +312,7 @@ mod tests {
             phases: Vec::new(),
             backlog: Vec::new(),
             verification: VerificationMeasurements::default(),
+            errors: 0,
             complete: true,
         };
         let json = report.to_json().expect("report serializes");

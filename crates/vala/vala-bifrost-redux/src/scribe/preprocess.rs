@@ -3,6 +3,7 @@
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use std::time::Instant;
 use uuid::Uuid;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditEvent;
@@ -27,6 +28,7 @@ pub(crate) struct AdmittedAppend {
     pub reservation: AdmissionReservation,
     pub tenant: DataTenantId,
     pub table: TableRef,
+    pub queued_at: Instant,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -36,6 +38,7 @@ pub(crate) struct PreparedAppend {
     pub batch_id: Uuid,
     pub slices: Vec<PreparedSlice>,
     pub reservation: AdmissionReservation,
+    pub queue_wait_us: u64,
 }
 
 /// One event-day slice ready for ordered WAL and memtable processing.
@@ -70,6 +73,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         reservation,
         tenant,
         table,
+        queued_at,
     } = admitted;
 
     let mut slices = Vec::new();
@@ -119,5 +123,6 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         batch_id,
         slices,
         reservation,
+        queue_wait_us: u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
     })
 }

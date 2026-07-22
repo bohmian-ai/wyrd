@@ -8,8 +8,8 @@ pub mod workload;
 pub use compare::{BenchmarkStage, ComparisonError, ComparisonReport, Regression, compare_stages};
 pub use report::{
     BacklogSample, BenchmarkReport, ForgeMeasurements, LatencyPercentiles, MachineMetadata,
-    PhaseMeasurement, PodMetadata, QueryMeasurements, ReportError, StageMeasurements,
-    StorageMeasurements, VerificationMeasurements,
+    PhaseMeasurement, PodMetadata, QueryMeasurements, ReportError, ScribeMatrixCase,
+    StageMeasurements, StorageMeasurements, VerificationMeasurements, required_scribe_matrix,
 };
 pub use slo::{SloError, SloGate, SloMeasurement, SloResult, SloThreshold};
 pub use workload::{

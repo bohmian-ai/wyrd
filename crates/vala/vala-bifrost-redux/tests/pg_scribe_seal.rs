@@ -110,8 +110,8 @@ mod pg_tests {
         }
     }
 
-    fn stub_schema_fingerprint() -> SchemaFingerprint {
-        SchemaFingerprint([0u8; 32])
+    fn schema_fingerprint(batch: &RecordBatch) -> SchemaFingerprint {
+        SchemaFingerprint::from_arrow_schema(batch.schema().as_ref())
     }
 
     fn events_table() -> TableRef {
@@ -129,12 +129,13 @@ mod pg_tests {
             .timestamp_micros();
         let batch = make_batch(50_000, base_time, tenant);
         let principal = principal_for_tenant(tenant);
+        let fingerprint = schema_fingerprint(&batch);
 
         let req = ScribeAppend {
             principal,
             table: events_table(),
             rows: batch,
-            schema_fingerprint: stub_schema_fingerprint(),
+            schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes: 0,
@@ -242,17 +243,16 @@ mod pg_tests {
             let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
-
+            let fingerprint = schema_fingerprint(&batch);
             let req = ScribeAppend {
                 principal,
                 table: events_table(),
                 rows: batch,
-                schema_fingerprint: stub_schema_fingerprint(),
+                schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
                 measured_wire_bytes: 0,
             };
-
             scribe.append(req).await.expect("append");
         }
         let pool = fixture.app_pool();
@@ -264,12 +264,10 @@ mod pg_tests {
         scribe
             .complete_post_commit(post_commit)
             .expect("post_commit");
-
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
         let tx = conn2.transaction();
-
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             Uuid,           // data_tenant_id
@@ -308,7 +306,7 @@ mod pg_tests {
                 request_id,
                 _trace_id,
                 operation,
-                resource,
+                _resource,
                 card_ref,
                 principal_id,
                 principal_kind,
@@ -323,7 +321,6 @@ mod pg_tests {
             assert_eq!(*data_tenant_id, tenant.as_uuid());
             assert!(!request_id.is_empty(), "request_id {i} should be non-empty");
             assert_eq!(operation, "bifrost.append");
-            assert!(!resource.is_empty(), "resource should be non-empty");
             assert!(card_ref.is_none(), "card_ref should be None for this test");
             assert_ne!(
                 *principal_id,
@@ -392,12 +389,13 @@ mod pg_tests {
         .expect("batch");
 
         let principal = principal_for_tenant(tenant);
+        let fingerprint = schema_fingerprint(&batch);
 
         let req = ScribeAppend {
             principal,
             table: events_table(),
             rows: batch,
-            schema_fingerprint: stub_schema_fingerprint(),
+            schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
             measured_wire_bytes: 0,

@@ -198,6 +198,7 @@ mod tests {
             storage: StorageMeasurements::default(),
             query: QueryMeasurements::default(),
             forge: crate::report::ForgeMeasurements::default(),
+            scribe_matrix: Vec::new(),
             stages: Vec::new(),
             phases: Vec::new(),
             backlog: Vec::new(),

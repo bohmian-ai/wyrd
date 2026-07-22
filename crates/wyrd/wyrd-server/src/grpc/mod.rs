@@ -42,19 +42,48 @@ where
         .token_verifier
         .clone()
         .ok_or(GrpcError::MissingTokenVerifier)?;
-    let ingest = BifrostIngestGrpc::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
-    );
-    let traces = OtlpTraceService::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
-    );
-    let metrics = OtlpMetricsService::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
-    );
-    let logs = OtlpLogsService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier));
+    let ingest = match &state.scribe {
+        Some(scribe) => BifrostIngestGrpc::with_scribe(
+            state.bifrost.clone(),
+            scribe.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+            vala_ingest::IngestLimits::default(),
+        ),
+        None => BifrostIngestGrpc::new(
+            state.bifrost.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+        ),
+    };
+    let traces = match &state.scribe {
+        Some(scribe) => OtlpTraceService::with_scribe(
+            state.bifrost.clone(),
+            scribe.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+        ),
+        None => OtlpTraceService::new(
+            state.bifrost.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+        ),
+    };
+    let metrics = match &state.scribe {
+        Some(scribe) => OtlpMetricsService::with_scribe(
+            state.bifrost.clone(),
+            scribe.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+        ),
+        None => OtlpMetricsService::new(
+            state.bifrost.clone(),
+            ingest_auth_interceptor(verifier.clone()),
+        ),
+    };
+    let logs = match &state.scribe {
+        Some(scribe) => OtlpLogsService::with_scribe(
+            state.bifrost.clone(),
+            scribe.clone(),
+            ingest_auth_interceptor(verifier),
+        ),
+        None => OtlpLogsService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier)),
+    };
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router

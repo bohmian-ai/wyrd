@@ -15,6 +15,10 @@ use arrow::record_batch::RecordBatch;
 use tokio::time::timeout;
 use vala_bifrost::writer::BifrostWriteContext;
 use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
+use vala_bifrost_redux::catalog::TableRef as ReduxTableRef;
+use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
+use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use wyrd_runtime::{Permission, PermissionCheck, Principal, RbacCheck};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::{CARD_REF, CARD_UID, PRINCIPAL_ID};
@@ -54,6 +58,8 @@ pub struct CollectedStream {
     pub batches: Vec<RecordBatch>,
     /// Total decoded row count.
     pub rows: u64,
+    /// Server-measured Arrow IPC bytes received after transport decompression.
+    pub wire_bytes: usize,
 }
 
 /// Read the whole stream, enforcing every aggregate bound as frames arrive.
@@ -138,6 +144,9 @@ pub async fn collect_frames<S: FrameSource>(
         batch_id,
         batches,
         rows: total_rows,
+        wire_bytes: usize::try_from(total_bytes).map_err(|_| {
+            IngestError::Internal("decoded wire byte count exceeds usize".to_owned())
+        })?,
     })
 }
 
@@ -415,6 +424,89 @@ pub async fn run_ingest<S: FrameSource>(
         .map_err(IngestError::from_engine)?;
 
     Ok(collected.rows)
+}
+
+/// Drive one native stream into the queued Redux Scribe seam.
+///
+/// The complete stamped request becomes one canonical `RecordBatch` and one
+/// `ScribeAppend`. The measured bytes come from server-owned frame bodies; no
+/// client-provided size field participates in admission.
+pub async fn run_ingest_to_scribe<S, F>(
+    catalog: &WyrdCatalog,
+    scribe: &F,
+    limits: &IngestLimits,
+    auth: &AuthContext,
+    source: S,
+) -> Result<u64, IngestError>
+where
+    S: FrameSource,
+    F: Scribe + ?Sized,
+{
+    RbacCheck
+        .check(&auth.principal, &Permission::bifrost_record_write())
+        .into_result()
+        .map_err(IngestError::from_rbac)?;
+
+    let collected = collect_frames(source, limits).await?;
+    let (namespace, name) = resolve_fqn(&collected.table)?;
+    if namespace == BifrostNamespace::System {
+        return Err(IngestError::SystemTableWriteDenied {
+            table: collected.table,
+        });
+    }
+    let registered_fingerprint = catalog
+        .table_schema_fingerprint(namespace, &name, auth.tenant)
+        .await
+        .map_err(IngestError::from_engine)?;
+    let source_fingerprint = collected
+        .batches
+        .first()
+        .map(|batch| source_schema_fingerprint(batch.schema().as_ref()))
+        .ok_or_else(|| IngestError::StreamProtocolViolation("stream carried no rows".to_owned()))?;
+    if source_fingerprint.0 != registered_fingerprint {
+        return Err(IngestError::SchemaMismatch {
+            table: collected.table,
+        });
+    }
+    validate_card_scope(&collected.batches, &auth.principal)?;
+    let stamped = stamp_correlation_columns(collected.batches, &auth.principal)?;
+    let Some(first) = stamped.first() else {
+        return Ok(0);
+    };
+    let rows = arrow::compute::concat_batches(&first.schema(), &stamped)
+        .map_err(|error| IngestError::Internal(error.to_string()))?;
+    let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
+    let redux_namespace = ReduxNamespace::from_wire(namespace.as_str()).ok_or_else(|| {
+        IngestError::Internal(format!("Redux namespace is not registered: {namespace:?}"))
+    })?;
+    scribe
+        .append(ScribeAppend {
+            principal: auth.principal.clone(),
+            table: ReduxTableRef::new(redux_namespace, name),
+            rows,
+            schema_fingerprint,
+            request_id: auth.request_id.clone(),
+            batch_id: uuid::Uuid::from_bytes(collected.batch_id),
+            measured_wire_bytes: collected.wire_bytes,
+        })
+        .await
+        .map_err(IngestError::from_scribe)?;
+    Ok(collected.rows)
+}
+
+fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .filter(|field| {
+            !matches!(
+                field.name().as_str(),
+                CARD_REF | CARD_UID | PRINCIPAL_ID | "run_id" | "data_tenant_id"
+            ) && !field.name().starts_with("wyrd_")
+        })
+        .map(|field| field.as_ref().clone())
+        .collect();
+    SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
 }
 
 /// The card-scope anti-forgery gate (no DB required): `validate_card_scope`

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use vala_bifrost::WyrdCatalog;
+use vala_bifrost_redux::scribe::ScribeImpl;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_tonic::tonic::{Request, Response, Status, Streaming};
@@ -19,7 +20,7 @@ use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
 use crate::auth::{IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 use crate::limits::{IngestLimits, StreamSemaphores};
-use crate::orchestrator::run_ingest;
+use crate::orchestrator::{run_ingest, run_ingest_to_scribe};
 
 /// gRPC ingest service over `vala-bifrost`'s writer.
 ///
@@ -31,6 +32,7 @@ pub struct BifrostIngestGrpc<R: PermissionResolver + 'static, I: IssuerConfigRes
     limits: IngestLimits,
     semaphores: Arc<StreamSemaphores>,
     auth: IngestAuthInterceptor<R, I>,
+    scribe: Option<Arc<ScribeImpl>>,
 }
 
 impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> BifrostIngestGrpc<R, I> {
@@ -55,7 +57,21 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Bifrost
             limits,
             semaphores,
             auth,
+            scribe: None,
         }
+    }
+
+    /// Construct the ingest service with the server-owned queued Scribe seam.
+    #[must_use]
+    pub fn with_scribe(
+        catalog: Arc<WyrdCatalog>,
+        scribe: Arc<ScribeImpl>,
+        auth: IngestAuthInterceptor<R, I>,
+        limits: IngestLimits,
+    ) -> Self {
+        let mut service = Self::with_limits(catalog, auth, limits);
+        service.scribe = Some(scribe);
+        service
     }
 
     /// Wrap into the generated server type, raising `max_decoding_message_size`
@@ -86,7 +102,13 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Bifrost
         let request_id = auth.request_id.clone();
 
         let stream = request.into_inner();
-        let rows = run_ingest(&self.catalog, &self.limits, &auth, stream).await?;
+        let rows = match &self.scribe {
+            Some(scribe) => {
+                run_ingest_to_scribe(&self.catalog, scribe.as_ref(), &self.limits, &auth, stream)
+                    .await?
+            }
+            None => run_ingest(&self.catalog, &self.limits, &auth, stream).await?,
+        };
 
         let mut response = Response::new(InsertBatchResponse {
             rows_accepted: rows,

@@ -4,4 +4,5 @@
 
 pub mod convert;
 pub mod routes;
+pub mod scribe_adapter;
 pub mod service;

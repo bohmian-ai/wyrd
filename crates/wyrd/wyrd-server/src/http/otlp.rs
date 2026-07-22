@@ -208,9 +208,14 @@ async fn export_traces(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request)
-        .await
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+    let outcome = match &state.scribe {
+        Some(scribe) => {
+            vala_ingest::ingest_resource_spans_to_scribe(&state.bifrost, scribe, &auth, request)
+                .await
+        }
+        None => vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request).await,
+    }
+    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
     tracing::Span::current().record("accepted_spans", outcome.accepted_spans);
     tracing::Span::current().record("rejected_spans", outcome.rejected_spans);
@@ -244,9 +249,14 @@ async fn export_metrics(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = vala_ingest::ingest_resource_metrics(&state.bifrost, &auth, request)
-        .await
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+    let outcome = match &state.scribe {
+        Some(scribe) => {
+            vala_ingest::ingest_resource_metrics_to_scribe(&state.bifrost, scribe, &auth, request)
+                .await
+        }
+        None => vala_ingest::ingest_resource_metrics(&state.bifrost, &auth, request).await,
+    }
+    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
     tracing::Span::current().record("accepted_points", outcome.accepted_points);
     tracing::Span::current().record("rejected_points", outcome.rejected_points);
@@ -280,9 +290,14 @@ async fn export_logs(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = vala_ingest::ingest_resource_logs(&state.bifrost, &auth, request)
-        .await
-        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+    let outcome = match &state.scribe {
+        Some(scribe) => {
+            vala_ingest::ingest_resource_logs_to_scribe(&state.bifrost, scribe, &auth, request)
+                .await
+        }
+        None => vala_ingest::ingest_resource_logs(&state.bifrost, &auth, request).await,
+    }
+    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 
     tracing::Span::current().record("accepted_records", outcome.accepted_records);
     tracing::Span::current().record("rejected_records", outcome.rejected_records);
@@ -354,6 +369,11 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
         }
         IngestError::SchemaMismatch { table } => {
             WyrdError::from(BifrostError::FingerprintMismatch { table })
+        }
+        IngestError::PayloadTooLarge { bytes, .. } => {
+            WyrdError::from(BifrostError::PayloadTooLarge {
+                bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+            })
         }
         IngestError::WriterClosed => WyrdError::from(BifrostError::WriterUnavailable {
             table: signal.table().to_owned(),

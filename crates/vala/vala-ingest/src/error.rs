@@ -72,6 +72,14 @@ pub enum IngestError {
         /// The configured byte limit.
         limit: u64,
     },
+    /// The server-measured canonical payload exceeded Scribe's 32 MiB limit.
+    #[error("ingest payload too large ({bytes} > {limit} bytes)")]
+    PayloadTooLarge {
+        /// Measured canonical transport bytes.
+        bytes: u64,
+        /// Scribe's fixed limit.
+        limit: u64,
+    },
     /// The stream exceeded the aggregate row bound.
     #[error("ingest stream too many rows ({rows} > {limit})")]
     TooManyRows {
@@ -104,6 +112,25 @@ pub enum IngestError {
 }
 
 impl IngestError {
+    /// Map a queued Redux Scribe result onto the transport-neutral ingest
+    /// taxonomy used by HTTP and gRPC adapters.
+    pub fn from_scribe(error: vala_bifrost_redux::contracts::ScribeError) -> Self {
+        match error {
+            vala_bifrost_redux::contracts::ScribeError::IngestBusy { .. } => Self::WriterBusy,
+            vala_bifrost_redux::contracts::ScribeError::PayloadTooLarge { bytes } => {
+                Self::PayloadTooLarge {
+                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                    limit: u64::try_from(vala_bifrost_redux::scribe::admission::MAX_REQUEST_BYTES)
+                        .unwrap_or(u64::MAX),
+                }
+            }
+            vala_bifrost_redux::contracts::ScribeError::WalDiskFull => {
+                Self::Internal("Scribe WAL disk breaker is open".to_owned())
+            }
+            other => Self::Internal(other.to_string()),
+        }
+    }
+
     /// The stable `WYRD_VALA_*` (or reused `WYRD_PERMISSION_*`) code.
     #[must_use]
     pub fn wyrd_code(&self) -> &'static str {
@@ -120,6 +147,7 @@ impl IngestError {
             Self::BatchTooLarge { .. } | Self::TooManyRows { .. } => {
                 "WYRD_VALA_413_INGEST_OVERSIZED"
             }
+            Self::PayloadTooLarge { .. } => "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
             Self::StreamIdle => "WYRD_VALA_408_INGEST_IDLE_TIMEOUT",
             Self::TooManyStreams => "WYRD_VALA_429_INGEST_TOO_MANY_STREAMS",
             Self::WriterClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
@@ -143,6 +171,7 @@ impl IngestError {
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
             Self::BatchTooLarge { .. }
             | Self::TooManyRows { .. }
+            | Self::PayloadTooLarge { .. }
             | Self::TooManyStreams
             | Self::WriterBusy => Code::ResourceExhausted,
             Self::StreamIdle => Code::DeadlineExceeded,

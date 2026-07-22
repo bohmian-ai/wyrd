@@ -162,6 +162,18 @@ pub struct BacklogSample {
     pub immutable_rows: u64,
     /// Immutable generations awaiting post-commit completion.
     pub pending_generations: u64,
+    /// Accepted request items still charged to pod admission.
+    pub admitted_items: u64,
+    /// Admission bytes charged to accepted requests.
+    pub admitted_bytes: u64,
+    /// Active logical tenant/table writers.
+    pub active_writers: u64,
+    /// Operations retained by the fixed blocking executor.
+    pub executor_depth: u64,
+    /// Executor submissions that waited for capacity.
+    pub executor_saturation_events: u64,
+    /// Writers that have entered terminal unhealthy state.
+    pub unhealthy_writers: u64,
     /// Eligible Forge file-list candidates.
     pub forge_candidates: u64,
 }
@@ -202,6 +214,63 @@ pub struct ForgeMeasurements {
     pub peak_candidates: u64,
 }
 
+/// One required Scribe workload configuration from the Task 13 matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeMatrixCase {
+    /// Approximate canonical batch size. `1` represents the one-row case.
+    pub batch_size_bytes: u64,
+    /// Number of data tenants in the run.
+    pub tenant_count: u32,
+    /// Whether all appends share one seal-key or are dispersed.
+    pub seal_key_pattern: String,
+    /// Whether the batch spans more than one UTC event day.
+    pub cross_day: bool,
+    /// WAL sync condition.
+    pub fsync_mode: String,
+    /// Whether one tenant is intentionally noisy.
+    pub noisy_tenant: bool,
+}
+
+/// Return the complete required Task 13 matrix (240 configurations).
+#[must_use]
+pub fn required_scribe_matrix() -> Vec<ScribeMatrixCase> {
+    [
+        1_u64,
+        64 * 1024,
+        1024 * 1024,
+        8 * 1024 * 1024,
+        32 * 1024 * 1024,
+    ]
+    .into_iter()
+    .flat_map(|batch_size_bytes| {
+        [1_u32, 100, 1_000]
+            .into_iter()
+            .flat_map(move |tenant_count| {
+                ["same", "dispersed"]
+                    .into_iter()
+                    .flat_map(move |seal_key_pattern| {
+                        [false, true].into_iter().flat_map(move |cross_day| {
+                            ["normal", "delayed"]
+                                .into_iter()
+                                .flat_map(move |fsync_mode| {
+                                    [false, true].into_iter().map(move |noisy_tenant| {
+                                        ScribeMatrixCase {
+                                            batch_size_bytes,
+                                            tenant_count,
+                                            seal_key_pattern: seal_key_pattern.to_owned(),
+                                            cross_day,
+                                            fsync_mode: fsync_mode.to_owned(),
+                                            noisy_tenant,
+                                        }
+                                    })
+                                })
+                        })
+                    })
+            })
+    })
+    .collect()
+}
+
 /// One complete machine-readable Bifrost benchmark report.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchmarkReport {
@@ -227,6 +296,8 @@ pub struct BenchmarkReport {
     pub query: QueryMeasurements,
     /// Forge compaction counters and backlog peak.
     pub forge: ForgeMeasurements,
+    /// Required Scribe matrix configurations for this benchmark family.
+    pub scribe_matrix: Vec<ScribeMatrixCase>,
     /// Per-stage measurements from the real data path.
     pub stages: Vec<StageMeasurements>,
     /// Phase-level workload measurements.
@@ -308,6 +379,7 @@ mod tests {
             storage: StorageMeasurements::default(),
             query: QueryMeasurements::default(),
             forge: ForgeMeasurements::default(),
+            scribe_matrix: Vec::new(),
             stages: Vec::new(),
             phases: Vec::new(),
             backlog: Vec::new(),
@@ -318,5 +390,19 @@ mod tests {
         let json = report.to_json().expect("report serializes");
         let decoded: BenchmarkReport = serde_json::from_str(&json).expect("report parses");
         assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn scribe_matrix_covers_every_required_dimension() {
+        let matrix = required_scribe_matrix();
+        assert_eq!(matrix.len(), 240);
+        assert!(matrix.iter().any(|case| {
+            case.batch_size_bytes == 32 * 1024 * 1024
+                && case.tenant_count == 1_000
+                && case.seal_key_pattern == "dispersed"
+                && case.cross_day
+                && case.fsync_mode == "delayed"
+                && case.noisy_tenant
+        }));
     }
 }

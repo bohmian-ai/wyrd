@@ -25,6 +25,8 @@ pub struct AdmissionConfig {
     pub max_bytes: usize,
     /// Maximum lazily-created logical writers.
     pub max_writers: usize,
+    /// Pod memory budget used by the 90% active/immutable breaker.
+    pub memory_limit_bytes: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -33,6 +35,7 @@ impl Default for AdmissionConfig {
             max_items: 10_000,
             max_bytes: 512 * 1024 * 1024,
             max_writers: 4_096,
+            memory_limit_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -42,6 +45,8 @@ struct AdmissionState {
     items: usize,
     bytes: usize,
     writers: usize,
+    active_bytes: usize,
+    immutable_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -138,6 +143,76 @@ impl AdmissionController {
         })
     }
 
+    /// Reserve retained Arrow bytes for an active memtable generation.
+    ///
+    /// The breaker is pod-global and trips at 90% of the configured memory
+    /// budget. The caller must release the reservation if the memtable insert
+    /// fails.
+    pub fn try_reserve_active(
+        &self,
+        table: impl Into<String>,
+        bytes: usize,
+    ) -> Result<(), ScribeError> {
+        let table = table.into();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("admission state lock poisoned: {error}"),
+            })?;
+        let retained = state
+            .active_bytes
+            .saturating_add(state.immutable_bytes)
+            .saturating_add(bytes);
+        if retained > self.memory_breaker_bytes() {
+            return Err(ScribeError::IngestBusy { table });
+        }
+        state.active_bytes = state.active_bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Release active Arrow bytes after a failed memtable insertion.
+    pub fn release_active(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.active_bytes = state.active_bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Transfer retained bytes from the active to immutable generation tier.
+    pub fn transfer_active_to_immutable(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            let moved = bytes.min(state.active_bytes);
+            state.active_bytes -= moved;
+            state.immutable_bytes = state.immutable_bytes.saturating_add(moved);
+        }
+    }
+
+    /// Release immutable bytes after a generation is retired.
+    pub fn release_immutable(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.immutable_bytes = state.immutable_bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Transfer retained bytes back to the active generation after a seal
+    /// transaction rolls back.
+    pub fn transfer_immutable_to_active(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            let moved = bytes.min(state.immutable_bytes);
+            state.immutable_bytes -= moved;
+            state.active_bytes = state.active_bytes.saturating_add(moved);
+        }
+    }
+
+    /// Reconcile the counters with the authoritative memtable statistics.
+    pub fn sync_memtable_bytes(&self, active_bytes: usize, immutable_bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.active_bytes = active_bytes;
+            state.immutable_bytes = immutable_bytes;
+        }
+    }
+
     /// Return a point-in-time view of the pod admission counters.
     #[must_use]
     pub fn snapshot(&self) -> AdmissionSnapshot {
@@ -152,10 +227,18 @@ impl AdmissionController {
             items: state.items,
             bytes: state.bytes,
             writers: state.writers,
+            active_bytes: state.active_bytes,
+            immutable_bytes: state.immutable_bytes,
             max_items: self.inner.config.max_items,
             max_bytes: self.inner.config.max_bytes,
             max_writers: self.inner.config.max_writers,
+            memory_limit_bytes: self.inner.config.memory_limit_bytes,
+            memory_breaker_bytes: self.memory_breaker_bytes(),
         }
+    }
+
+    fn memory_breaker_bytes(&self) -> usize {
+        self.inner.config.memory_limit_bytes.saturating_mul(90) / 100
     }
 
     /// Trip the pod-wide WAL breaker after a terminal ENOSPC result.
@@ -238,12 +321,20 @@ pub struct AdmissionSnapshot {
     pub bytes: usize,
     /// Active logical writers.
     pub writers: usize,
+    /// Arrow bytes retained by writable memtables.
+    pub active_bytes: usize,
+    /// Arrow bytes retained by immutable generations.
+    pub immutable_bytes: usize,
     /// Configured item limit.
     pub max_items: usize,
     /// Configured byte limit.
     pub max_bytes: usize,
     /// Configured writer limit.
     pub max_writers: usize,
+    /// Configured pod memory budget.
+    pub memory_limit_bytes: usize,
+    /// 90% breaker threshold derived from the memory budget.
+    pub memory_breaker_bytes: usize,
 }
 
 #[cfg(test)]
@@ -256,6 +347,7 @@ mod tests {
             max_items: 1,
             max_bytes: 10,
             max_writers: 1,
+            memory_limit_bytes: 100,
         });
         let reservation = admission
             .try_reserve("vala.bifrost.events", 10)
@@ -279,11 +371,31 @@ mod tests {
             max_items: 1,
             max_bytes: 10,
             max_writers: 1,
+            memory_limit_bytes: 100,
         });
         let _reservation = admission.try_reserve("events", 10).expect("reserve");
         let error = admission.try_reserve("events", 1).expect_err("busy");
         assert!(matches!(error, ScribeError::IngestBusy { .. }));
         assert_eq!(admission.snapshot().items, 1);
         assert_eq!(admission.snapshot().bytes, 10);
+    }
+
+    #[test]
+    fn active_and_immutable_bytes_use_the_ninety_percent_breaker() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 10,
+            max_bytes: 100,
+            max_writers: 10,
+            memory_limit_bytes: 100,
+        });
+        admission
+            .try_reserve_active("events", 90)
+            .expect("breaker allows exactly 90 percent");
+        assert!(admission.try_reserve_active("events", 1).is_err());
+        admission.transfer_active_to_immutable(90);
+        assert_eq!(admission.snapshot().active_bytes, 0);
+        assert_eq!(admission.snapshot().immutable_bytes, 90);
+        admission.release_immutable(90);
+        assert_eq!(admission.snapshot().immutable_bytes, 0);
     }
 }

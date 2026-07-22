@@ -43,12 +43,15 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
                     roles: Vec::new(),
                     effective_permissions: PermissionSet::new(),
                 };
+                let rows = make_batch(tenant, pod_index, tenant_index);
+                let schema_fingerprint =
+                    SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
                 scribe
                     .append(ScribeAppend {
                         principal,
                         table,
-                        rows: make_batch(tenant, pod_index, tenant_index),
-                        schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+                        rows,
+                        schema_fingerprint,
                         request_id: RequestId::now_v7(),
                         batch_id: Uuid::now_v7(),
                         measured_wire_bytes: 0,

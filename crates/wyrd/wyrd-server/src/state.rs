@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::ForgeContext;
+use vala_bifrost_redux::scribe::ScribeImpl;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -60,6 +61,11 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
+    /// Optional queued Redux Scribe ingest runtime. Test states may retain the
+    /// legacy catalog-only path when no local WAL is configured.
+    pub scribe: Option<Arc<ScribeImpl>>,
+    /// Dedicated Tokio runtime that owns Scribe coordination consumers.
+    pub scribe_coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Shared Redux Forge context built from the process-wide catalog and storage.
     pub forge_context: Option<Arc<ForgeContext>>,
     /// Interval used by the supervised Forge worker.
@@ -99,6 +105,8 @@ impl AppState {
             postgres,
             storage,
             bifrost,
+            scribe: None,
+            scribe_coordination_runtime: None,
             forge_context: None,
             forge_interval: Duration::from_secs(60),
             auth: ServerAuth::default(),
@@ -183,6 +191,24 @@ impl AppState {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Attach the server-owned queued Scribe runtime.
+    #[must_use]
+    pub fn with_scribe(mut self, scribe: Arc<ScribeImpl>) -> Self {
+        self.scribe = Some(scribe);
+        self
+    }
+
+    /// Keep the dedicated Scribe coordination runtime alive with application
+    /// state until the server performs its shutdown drain.
+    #[must_use]
+    pub fn with_scribe_coordination_runtime(
+        mut self,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Self {
+        self.scribe_coordination_runtime = Some(runtime);
         self
     }
 

@@ -372,6 +372,22 @@ impl WyrdCatalog {
         Ok(wyrd_spec::vala::api::BifrostTableDescription { entry, fields })
     }
 
+    /// Return the registered user-schema fingerprint for a table visible to
+    /// `tenant`, using the same tenant/system lookup as [`Self::describe_table`].
+    pub async fn table_schema_fingerprint(
+        &self,
+        ns: BifrostNamespace,
+        name: &str,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<[u8; 32], BifrostError> {
+        let meta = self.get(ns, name, tenant).await?;
+        meta.row
+            .fingerprint
+            .as_slice()
+            .try_into()
+            .map_err(|_| BifrostError::Internal("schema fingerprint length mismatch".to_owned()))
+    }
+
     /// Open a writer for `tenant` (the authenticated **data tenant**, for both
     /// scopes). The control-plane RLS bind for the registration lookup — and for
     /// the commit coordinator's `vala.olap_commits` precommit/finalize rows — is

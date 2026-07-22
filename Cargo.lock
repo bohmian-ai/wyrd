@@ -9919,6 +9919,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vala-bifrost",
+ "vala-bifrost-redux",
  "vala-sql",
  "wyrd-auth-oidc",
  "wyrd-auth-verify",

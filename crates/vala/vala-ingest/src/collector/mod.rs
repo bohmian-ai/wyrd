@@ -20,11 +20,16 @@ pub mod map;
 
 use std::sync::Arc;
 
+use uuid::Uuid;
 use vala_bifrost::tables::logs::RecordsTable;
 use vala_bifrost::tables::metrics::PointsTable;
 use vala_bifrost::tables::traces::SpansTable;
 use vala_bifrost::writer::BifrostWriteContext;
-use vala_bifrost::{TableScope, WyrdCatalog};
+use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
+use vala_bifrost_redux::catalog::TableRef as ReduxTableRef;
+use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
+use vala_bifrost_redux::scribe::ScribeImpl;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::{Permission, PermissionCheck, RbacCheck};
@@ -42,6 +47,7 @@ use wyrd_tonic::otlp::trace_service::trace_service_server::{TraceService, TraceS
 use wyrd_tonic::otlp::trace_service::{
     ExportTracePartialSuccess, ExportTraceServiceRequest, ExportTraceServiceResponse,
 };
+use wyrd_tonic::prost::Message;
 use wyrd_tonic::tonic::{Request, Response, Status};
 
 use crate::auth::{AuthContext, IngestAuthInterceptor};
@@ -61,13 +67,32 @@ const OTLP_ORIGIN: &str = "otlp";
 pub struct OtlpTraceService<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     auth: IngestAuthInterceptor<R, I>,
+    scribe: Option<Arc<ScribeImpl>>,
 }
 
 impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpTraceService<R, I> {
     /// Construct from the engine catalog and the shared ingest auth interceptor.
     #[must_use]
     pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R, I>) -> Self {
-        Self { catalog, auth }
+        Self {
+            catalog,
+            auth,
+            scribe: None,
+        }
+    }
+
+    /// Construct the OTLP service with the server-owned queued Scribe seam.
+    #[must_use]
+    pub fn with_scribe(
+        catalog: Arc<WyrdCatalog>,
+        scribe: Arc<ScribeImpl>,
+        auth: IngestAuthInterceptor<R, I>,
+    ) -> Self {
+        Self {
+            catalog,
+            auth,
+            scribe: Some(scribe),
+        }
     }
 
     /// Wrap into the generated OTLP server type for mounting on the shared
@@ -92,7 +117,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpTra
         auth: &AuthContext,
         request: ExportTraceServiceRequest,
     ) -> Result<IngestOutcome, IngestError> {
-        ingest_resource_spans(&self.catalog, auth, request).await
+        match &self.scribe {
+            Some(scribe) => {
+                ingest_resource_spans_to_scribe(&self.catalog, scribe, auth, request).await
+            }
+            None => ingest_resource_spans(&self.catalog, auth, request).await,
+        }
     }
 }
 
@@ -161,6 +191,44 @@ pub async fn ingest_resource_spans(
         .await
         .map_err(IngestError::from_engine)?;
 
+    Ok(IngestOutcome {
+        accepted_spans,
+        rejected_spans,
+        rejection_message,
+    })
+}
+
+/// OTLP trace projection into queued Scribe. `encoded_len` is captured before
+/// mapping and is carried unchanged as the source charge.
+pub async fn ingest_resource_spans_to_scribe(
+    catalog: &WyrdCatalog,
+    scribe: &ScribeImpl,
+    auth: &AuthContext,
+    request: ExportTraceServiceRequest,
+) -> Result<IngestOutcome, IngestError> {
+    authorize_otlp(auth)?;
+    let source_bytes = request.encoded_len();
+    let MappedSpans { records, rejected } = map_resource_spans(&request.resource_spans);
+    let rejected_spans = rejected.len() as i64;
+    let rejection_message = rejected.first().map(|first| first.reason.clone());
+    if records.is_empty() {
+        return Ok(IngestOutcome {
+            accepted_spans: 0,
+            rejected_spans,
+            rejection_message,
+        });
+    }
+    let accepted_spans = records.len() as i64;
+    let batch = spans_to_record_batch(&records).map_err(IngestError::Decode)?;
+    enqueue_scribe(
+        catalog,
+        scribe,
+        auth,
+        "vala.traces.spans",
+        batch,
+        source_bytes,
+    )
+    .await?;
     Ok(IngestOutcome {
         accepted_spans,
         rejected_spans,
@@ -257,13 +325,32 @@ fn map_export_error(error: IngestError) -> Status {
 pub struct OtlpMetricsService<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     auth: IngestAuthInterceptor<R, I>,
+    scribe: Option<Arc<ScribeImpl>>,
 }
 
 impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpMetricsService<R, I> {
     /// Construct from the engine catalog and the shared ingest auth interceptor.
     #[must_use]
     pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R, I>) -> Self {
-        Self { catalog, auth }
+        Self {
+            catalog,
+            auth,
+            scribe: None,
+        }
+    }
+
+    /// Construct the OTLP metrics service with the queued Scribe seam.
+    #[must_use]
+    pub fn with_scribe(
+        catalog: Arc<WyrdCatalog>,
+        scribe: Arc<ScribeImpl>,
+        auth: IngestAuthInterceptor<R, I>,
+    ) -> Self {
+        Self {
+            catalog,
+            auth,
+            scribe: Some(scribe),
+        }
     }
 
     /// Wrap into the generated OTLP server type for mounting on the shared tonic
@@ -284,7 +371,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpMet
         auth: &AuthContext,
         request: ExportMetricsServiceRequest,
     ) -> Result<MetricsOutcome, IngestError> {
-        ingest_resource_metrics(&self.catalog, auth, request).await
+        match &self.scribe {
+            Some(scribe) => {
+                ingest_resource_metrics_to_scribe(&self.catalog, scribe, auth, request).await
+            }
+            None => ingest_resource_metrics(&self.catalog, auth, request).await,
+        }
     }
 }
 
@@ -342,6 +434,44 @@ pub async fn ingest_resource_metrics(
         .await
         .map_err(IngestError::from_engine)?;
 
+    Ok(MetricsOutcome {
+        accepted_points,
+        rejected_points,
+        rejection_message,
+    })
+}
+
+/// OTLP metrics projection into queued Scribe using the full source request
+/// size for the admission charge.
+pub async fn ingest_resource_metrics_to_scribe(
+    catalog: &WyrdCatalog,
+    scribe: &ScribeImpl,
+    auth: &AuthContext,
+    request: ExportMetricsServiceRequest,
+) -> Result<MetricsOutcome, IngestError> {
+    authorize_otlp(auth)?;
+    let source_bytes = request.encoded_len();
+    let MappedMetrics { records, rejected } = map_resource_metrics(&request.resource_metrics);
+    let rejected_points = rejected.len() as i64;
+    let rejection_message = rejected.first().map(|first| first.reason.clone());
+    if records.is_empty() {
+        return Ok(MetricsOutcome {
+            accepted_points: 0,
+            rejected_points,
+            rejection_message,
+        });
+    }
+    let accepted_points = records.len() as i64;
+    let batch = metrics_to_record_batch(&records).map_err(IngestError::Decode)?;
+    enqueue_scribe(
+        catalog,
+        scribe,
+        auth,
+        "vala.metrics.points",
+        batch,
+        source_bytes,
+    )
+    .await?;
     Ok(MetricsOutcome {
         accepted_points,
         rejected_points,
@@ -425,13 +555,32 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Metrics
 pub struct OtlpLogsService<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     auth: IngestAuthInterceptor<R, I>,
+    scribe: Option<Arc<ScribeImpl>>,
 }
 
 impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpLogsService<R, I> {
     /// Construct from the engine catalog and the shared ingest auth interceptor.
     #[must_use]
     pub fn new(catalog: Arc<WyrdCatalog>, auth: IngestAuthInterceptor<R, I>) -> Self {
-        Self { catalog, auth }
+        Self {
+            catalog,
+            auth,
+            scribe: None,
+        }
+    }
+
+    /// Construct the OTLP logs service with the queued Scribe seam.
+    #[must_use]
+    pub fn with_scribe(
+        catalog: Arc<WyrdCatalog>,
+        scribe: Arc<ScribeImpl>,
+        auth: IngestAuthInterceptor<R, I>,
+    ) -> Self {
+        Self {
+            catalog,
+            auth,
+            scribe: Some(scribe),
+        }
     }
 
     /// Wrap into the generated OTLP server type for mounting on the shared tonic
@@ -452,7 +601,12 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> OtlpLog
         auth: &AuthContext,
         request: ExportLogsServiceRequest,
     ) -> Result<LogsOutcome, IngestError> {
-        ingest_resource_logs(&self.catalog, auth, request).await
+        match &self.scribe {
+            Some(scribe) => {
+                ingest_resource_logs_to_scribe(&self.catalog, scribe, auth, request).await
+            }
+            None => ingest_resource_logs(&self.catalog, auth, request).await,
+        }
     }
 }
 
@@ -515,6 +669,86 @@ pub async fn ingest_resource_logs(
         rejected_records,
         rejection_message,
     })
+}
+
+/// OTLP logs projection into queued Scribe using the full source request size
+/// for the admission charge.
+pub async fn ingest_resource_logs_to_scribe(
+    catalog: &WyrdCatalog,
+    scribe: &ScribeImpl,
+    auth: &AuthContext,
+    request: ExportLogsServiceRequest,
+) -> Result<LogsOutcome, IngestError> {
+    authorize_otlp(auth)?;
+    let source_bytes = request.encoded_len();
+    let MappedLogs { records, rejected } = map_resource_logs(&request.resource_logs);
+    let rejected_records = rejected.len() as i64;
+    let rejection_message = rejected.first().map(|first| first.reason.clone());
+    if records.is_empty() {
+        return Ok(LogsOutcome {
+            accepted_records: 0,
+            rejected_records,
+            rejection_message,
+        });
+    }
+    let accepted_records = records.len() as i64;
+    let batch = logs_to_record_batch(&records).map_err(IngestError::Decode)?;
+    enqueue_scribe(
+        catalog,
+        scribe,
+        auth,
+        "vala.logs.records",
+        batch,
+        source_bytes,
+    )
+    .await?;
+    Ok(LogsOutcome {
+        accepted_records,
+        rejected_records,
+        rejection_message,
+    })
+}
+
+fn authorize_otlp(auth: &AuthContext) -> Result<(), IngestError> {
+    RbacCheck
+        .check(&auth.principal, &Permission::bifrost_record_write())
+        .into_result()
+        .map_err(IngestError::from_rbac)
+}
+
+async fn enqueue_scribe(
+    catalog: &WyrdCatalog,
+    scribe: &ScribeImpl,
+    auth: &AuthContext,
+    table: &str,
+    rows: arrow::record_batch::RecordBatch,
+    measured_wire_bytes: usize,
+) -> Result<(), IngestError> {
+    let table = ReduxTableRef::parse_fqn(table)
+        .ok_or_else(|| IngestError::Internal(format!("invalid OTLP Scribe table: {table}")))?;
+    catalog
+        .table_schema_fingerprint(
+            BifrostNamespace::from_wire(table.namespace.as_str())
+                .ok_or_else(|| IngestError::Internal("invalid OTLP namespace".to_owned()))?,
+            &table.name,
+            auth.tenant,
+        )
+        .await
+        .map_err(IngestError::from_engine)?;
+    let batch_id = Uuid::now_v7();
+    let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
+    scribe
+        .append(ScribeAppend {
+            principal: auth.principal.clone(),
+            table,
+            rows,
+            schema_fingerprint,
+            request_id: auth.request_id.clone(),
+            batch_id,
+            measured_wire_bytes,
+        })
+        .await
+        .map_err(IngestError::from_scribe)
 }
 
 /// Result of one accepted OTLP logs export: committed vs. dropped records.

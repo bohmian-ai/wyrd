@@ -34,6 +34,8 @@ pub struct PostCommitToken {
     pub wal_lsn_min: WalLsn,
     /// Inclusive maximum WAL LSN in the generation.
     pub wal_lsn_max: WalLsn,
+    /// Arrow bytes transferred from the writable to immutable tier.
+    pub memtable_bytes: usize,
 }
 
 /// A set of post-commit capabilities produced by one force-seal call.
@@ -202,6 +204,7 @@ impl SealDriver {
                 file_list_row_id: insert_outcome.id,
                 wal_lsn_min,
                 wal_lsn_max,
+                memtable_bytes: frozen.batch.get_array_memory_size(),
             },
             binding: binding.clone(),
             parquet_path,

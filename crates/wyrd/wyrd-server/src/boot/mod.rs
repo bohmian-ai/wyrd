@@ -12,6 +12,9 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
+use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
+use vala_bifrost_redux::scribe::wal::WalWriter;
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -174,6 +177,9 @@ pub enum ServerBootError {
     /// Forge configuration validation failed during boot.
     #[error(transparent)]
     Forge(#[from] vala_bifrost_redux::forge::ForgeError),
+    /// Scribe WAL/runtime construction failed during boot.
+    #[error("Scribe runtime construction failed: {0}")]
+    Scribe(String),
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -230,6 +236,54 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
             .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
                 detail: "platform-admin operator pool is unavailable".to_owned(),
             })?;
+    let node_id = NodeId::generate();
+    let advertise_addr =
+        std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+    let stream = acquire_on_boot(&operator_pool, node_id, "scribe", &advertise_addr)
+        .await
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
+    std::fs::create_dir_all(&wal_dir).map_err(|error| {
+        ServerBootError::Scribe(format!("WAL directory creation failed: {error}"))
+    })?;
+    let wal = Arc::new(
+        WalWriter::new(
+            &wal_dir,
+            *stream.node_id.as_bytes(),
+            stream.writer_epoch.as_i64(),
+            DataTenantId::SYSTEM_OWNER,
+            None,
+        )
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+    );
+    let coordination_runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("wyrd-scribe-coordination")
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
+            })?,
+    );
+    let scribe = Arc::new(ScribeImpl::new_with_runtime(
+        Arc::new(storage.operator().clone()),
+        wal,
+        stream.node_id.to_string(),
+        stream.writer_epoch.as_i64(),
+        coordination_runtime.handle().clone(),
+    ));
+    let replayed_generations = tokio::task::spawn_blocking({
+        let scribe = Arc::clone(&scribe);
+        move || scribe.replay_wal()
+    })
+    .await
+    .map_err(|error| ServerBootError::Scribe(format!("WAL replay task failed: {error}")))?
+    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    tracing::info!(replayed_generations, "Scribe WAL recovery complete");
+
     let forge_context = ForgeContext::new(
         postgres.vala().clone(),
         operator_pool,
@@ -238,7 +292,10 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
         ForgeConfig::default(),
     )?;
 
-    Ok(AppState::new(postgres, storage, bifrost).with_forge_context(forge_context))
+    Ok(AppState::new(postgres, storage, bifrost)
+        .with_forge_context(forge_context)
+        .with_scribe(scribe)
+        .with_scribe_coordination_runtime(coordination_runtime))
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.

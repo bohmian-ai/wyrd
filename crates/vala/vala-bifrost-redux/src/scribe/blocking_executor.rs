@@ -1,8 +1,10 @@
 //! Fixed-width blocking executor for Scribe preprocessing and WAL work.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -13,6 +15,12 @@ use crate::scribe::wal::{WalHandle, WalLsn};
 
 const DEFAULT_QUEUE_CAPACITY: usize = 256;
 const DEFAULT_WORKERS: usize = 8;
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockingDelays {
+    preprocess: Duration,
+    sync: Duration,
+}
 
 /// Operations allowed to run on the bounded blocking executor.
 #[derive(Debug)]
@@ -61,6 +69,19 @@ struct ExecutorInner {
     sender: Mutex<Option<mpsc::SyncSender<BlockingRequest>>>,
     receiver: Arc<Mutex<mpsc::Receiver<BlockingRequest>>>,
     permits: Arc<Semaphore>,
+    depth: AtomicUsize,
+    saturation_events: AtomicU64,
+}
+
+/// Point-in-time metrics for the bounded blocking executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorSnapshot {
+    /// Operations admitted and not yet completed.
+    pub depth: usize,
+    /// Maximum number of admitted operations.
+    pub capacity: usize,
+    /// Number of submissions that waited for a permit.
+    pub saturation_events: u64,
 }
 
 /// Cloneable handle to the fixed blocking worker pool.
@@ -79,16 +100,40 @@ impl ScribeBlockingExecutor {
     /// Start a worker pool with an explicit worker count for focused tests.
     #[must_use]
     pub(crate) fn with_workers(worker_count: usize) -> Self {
+        Self::with_workers_internal(worker_count, Duration::ZERO, Duration::ZERO)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_workers_and_delays(
+        worker_count: usize,
+        preprocess_delay: Duration,
+        sync_delay: Duration,
+    ) -> Self {
+        Self::with_workers_internal(worker_count, preprocess_delay, sync_delay)
+    }
+
+    fn with_workers_internal(
+        worker_count: usize,
+        preprocess_delay: Duration,
+        sync_delay: Duration,
+    ) -> Self {
         let worker_count = worker_count.max(1);
         let (sender, receiver) = mpsc::sync_channel(DEFAULT_QUEUE_CAPACITY);
         let inner = Arc::new(ExecutorInner {
             sender: Mutex::new(Some(sender)),
             receiver: Arc::new(Mutex::new(receiver)),
             permits: Arc::new(Semaphore::new(DEFAULT_QUEUE_CAPACITY)),
+            depth: AtomicUsize::new(0),
+            saturation_events: AtomicU64::new(0),
         });
 
         for worker_index in 0..worker_count {
             let receiver = Arc::clone(&inner.receiver);
+            let executor_inner = Arc::clone(&inner);
+            let delays = BlockingDelays {
+                preprocess: preprocess_delay,
+                sync: sync_delay,
+            };
             let worker_name = format!("wyrd-scribe-blocking-{worker_index}");
             let _ = thread::Builder::new().name(worker_name).spawn(move || {
                 loop {
@@ -102,7 +147,8 @@ impl ScribeBlockingExecutor {
                     let Ok(request) = request else {
                         break;
                     };
-                    let result = execute(request.operation);
+                    executor_inner.depth.fetch_sub(1, Ordering::AcqRel);
+                    let result = execute(request.operation, delays);
                     let _ = request.response.send(result);
                     drop(request.permit);
                 }
@@ -113,19 +159,34 @@ impl ScribeBlockingExecutor {
     }
 
     /// Submit one operation without spawning an unbounded blocking task.
+    ///
+    /// A semaphore permit accounts for every operation before it enters the
+    /// synchronous channel. The caller waits asynchronously for capacity and
+    /// for the worker's oneshot result, so neither queue admission nor a worker
+    /// operation blocks a Tokio core thread.
     pub(crate) async fn submit(
         &self,
         operation: ScribeBlockingOp,
     ) -> Result<ScribeBlockingResult, ScribeError> {
-        let permit = self
-            .inner
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("blocking executor semaphore closed: {error}"),
-            })?;
+        let permit = match self.inner.permits.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                self.inner.saturation_events.fetch_add(1, Ordering::Relaxed);
+                self.inner
+                    .permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("blocking executor semaphore closed: {error}"),
+                    })?
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                return Err(ScribeError::Internal {
+                    detail: "blocking executor semaphore closed".to_string(),
+                });
+            }
+        };
         let (response, result) = oneshot::channel();
         let request = BlockingRequest {
             operation,
@@ -145,11 +206,13 @@ impl ScribeBlockingExecutor {
             .ok_or_else(|| ScribeError::Internal {
                 detail: "blocking executor is shut down".to_string(),
             })?;
-        sender
-            .try_send(request)
-            .map_err(|error| ScribeError::Internal {
+        self.inner.depth.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = sender.try_send(request) {
+            self.inner.depth.fetch_sub(1, Ordering::AcqRel);
+            return Err(ScribeError::Internal {
                 detail: format!("blocking executor queue rejected operation: {error}"),
-            })?;
+            });
+        }
 
         result.await.map_err(|error| ScribeError::Internal {
             detail: format!("blocking executor worker dropped result: {error}"),
@@ -162,11 +225,28 @@ impl ScribeBlockingExecutor {
             sender.take();
         }
     }
+
+    /// Return queue depth and saturation counters for inspection/telemetry.
+    #[must_use]
+    pub(crate) fn snapshot(&self) -> ExecutorSnapshot {
+        ExecutorSnapshot {
+            depth: self.inner.depth.load(Ordering::Acquire),
+            capacity: DEFAULT_QUEUE_CAPACITY,
+            saturation_events: self.inner.saturation_events.load(Ordering::Relaxed),
+        }
+    }
 }
 
-fn execute(operation: ScribeBlockingOp) -> Result<ScribeBlockingResult, ScribeError> {
+/// Execute one blocking operation on a fixed executor worker.
+fn execute(
+    operation: ScribeBlockingOp,
+    delays: BlockingDelays,
+) -> Result<ScribeBlockingResult, ScribeError> {
     match operation {
         ScribeBlockingOp::Preprocess(append) => {
+            if !delays.preprocess.is_zero() {
+                thread::sleep(delays.preprocess);
+            }
             prepare_append(*append).map(ScribeBlockingResult::Prepared)
         }
         ScribeBlockingOp::WriteFrame { wal, frame } => {
@@ -174,6 +254,9 @@ fn execute(operation: ScribeBlockingOp) -> Result<ScribeBlockingResult, ScribeEr
             Ok(ScribeBlockingResult::WalWritten { wal, lsn })
         }
         ScribeBlockingOp::SyncWal { wal } => {
+            if !delays.sync.is_zero() {
+                thread::sleep(delays.sync);
+            }
             wal.sync_data()?;
             Ok(ScribeBlockingResult::WalSynced { wal })
         }
@@ -192,6 +275,8 @@ fn execute(operation: ScribeBlockingOp) -> Result<ScribeBlockingResult, ScribeEr
     }
 }
 
+/// Atomically replace a manifest after syncing both the temporary file and its
+/// parent directory.
 fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> {
     let temporary = path.with_extension("tmp");
     std::fs::write(&temporary, contents).map_err(|error| ScribeError::Internal {

@@ -3,6 +3,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::scribe::admission::AdmissionSnapshot;
+use crate::scribe::blocking_executor::ExecutorSnapshot;
+use crate::scribe::writer::WriterHealthSnapshot;
+
 /// One completed Scribe stage sample.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScribeStageSample {
@@ -14,6 +18,17 @@ pub struct ScribeStageSample {
     pub rows: u64,
     /// Bytes handled by the stage when known.
     pub bytes: u64,
+}
+
+/// Point-in-time queue, admission, executor, and writer health telemetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScribeRuntimeSnapshot {
+    /// Pod-global admission counters and limits.
+    pub admission: AdmissionSnapshot,
+    /// Fixed blocking-executor queue metrics.
+    pub executor: ExecutorSnapshot,
+    /// Active writer queue and health metrics.
+    pub writers: WriterHealthSnapshot,
 }
 
 /// Opt-in, bounded-run recorder used by benchmark and journey harnesses.

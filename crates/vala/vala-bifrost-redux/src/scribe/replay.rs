@@ -6,6 +6,7 @@
 //! `AuditEvent` list per key.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -40,7 +41,7 @@ pub struct ReplayedAppendMeta {
     pub batch_id: [u8; 16],
     /// LSN for this append.
     pub wal_lsn: WalLsn,
-    /// Number of rows in this append (placeholder — real count from Arrow batch).
+    /// Number of rows in this append, when the Arrow IPC payload decoded.
     pub rows_accepted: usize,
     /// Composite idempotency identity for this batch routed to this seal-key.
     pub append_slice_id: AppendSliceId,
@@ -141,11 +142,20 @@ pub fn replay_wal_directory(
             });
 
         state.audit_events.push(audit_event);
+        let rows_accepted =
+            arrow::ipc::reader::StreamReader::try_new(Cursor::new(&data_record.payload), None)
+                .ok()
+                .map_or(0, |reader| {
+                    reader
+                        .filter_map(Result::ok)
+                        .map(|batch| batch.num_rows())
+                        .sum()
+                });
         state.data_records.push(data_record.payload);
         state.append_metas.push(ReplayedAppendMeta {
             batch_id,
             wal_lsn: data_record.lsn,
-            rows_accepted: 0, // Placeholder — real count from Arrow batch
+            rows_accepted,
             append_slice_id: AppendSliceId {
                 batch_id: uuid::Uuid::from_bytes(batch_id),
                 seal_key: seal_key.clone(),
@@ -163,20 +173,6 @@ pub fn replay_wal_directory(
 /// # Errors
 /// Returns [`ScribeError::Internal`] if the path format is invalid.
 ///
-/// # Implementation Note ()
-///
-/// This function currently returns a placeholder seal-key because full path parsing
-/// requires WAL directory routing from . The real implementation will:
-///
-/// 1. Parse path structure: `${SCRIBE_WAL_DIR}/{namespace}/{table}/tenant={uuid}/day={YYYY-MM-DD}`
-/// 2. Extract `tenant=` component and parse UUID
-/// 3. Extract `day=` component and parse date
-/// 4. Build `TableRef` from namespace + table components
-///
-/// For , tests use a flat temp directory structure. Real multi-key replay testing
-/// requires the directory routing.
-// justification: stub implementation for path-parsing; the real implementation returns fallible Result<SealKey, ScribeError>
-#[allow(clippy::unnecessary_wraps)]
 fn extract_seal_key_from_path(path: &Path) -> Result<SealKey, ScribeError> {
     let components = path
         .components()
@@ -186,10 +182,17 @@ fn extract_seal_key_from_path(path: &Path) -> Result<SealKey, ScribeError> {
         .iter()
         .rposition(|component| component.starts_with("tenant="))
     else {
-        return placeholder_seal_key();
+        return Err(ScribeError::Internal {
+            detail: format!(
+                "WAL segment path is missing tenant routing: {}",
+                path.display()
+            ),
+        });
     };
     if tenant_index < 2 || tenant_index + 1 >= components.len() {
-        return placeholder_seal_key();
+        return Err(ScribeError::Internal {
+            detail: format!("invalid WAL seal-key path: {}", path.display()),
+        });
     }
     let namespace = crate::namespaces::BifrostNamespace::from_wire(components[tenant_index - 2])
         .ok_or_else(|| ScribeError::Internal {
@@ -221,18 +224,6 @@ fn extract_seal_key_from_path(path: &Path) -> Result<SealKey, ScribeError> {
     ))
 }
 
-fn placeholder_seal_key() -> Result<SealKey, ScribeError> {
-    Ok(SealKey::new(
-        DataTenantId::SYSTEM_OWNER,
-        TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
-        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).ok_or_else(|| {
-            ScribeError::Internal {
-                detail: "placeholder replay date is invalid".to_string(),
-            }
-        })?),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,14 +235,25 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
+    fn replay_key(tenant: DataTenantId) -> SealKey {
+        SealKey::new(
+            tenant,
+            TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        )
+    }
+
     #[test]
     fn wal_replay_rebuilds_memtable_and_audit_events() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let writer = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
             .expect("writer");
+        let writer = wal
+            .handle_for_seal_key(replay_key(tenant_id))
+            .expect("seal-key handle");
 
         // Write 2 appends
         for i in 0u8..2 {
@@ -283,24 +285,76 @@ mod tests {
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
 
-        // Placeholder test — real implementation would verify actual seal-key grouping
-        assert!(!replayed.is_empty());
+        let state = replayed.values().next().expect("replayed state");
+        assert_eq!(state.seal_key, replay_key(tenant_id));
+        assert_eq!(state.audit_events.len(), 2);
     }
 
     #[test]
     fn wal_replay_skips_sealed_lsn_per_seal_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
+            .expect("writer");
+        let first_key = replay_key(tenant_id);
+        let second_key = SealKey::new(
+            tenant_id,
+            TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("date")),
+        );
+        let first = wal
+            .handle_for_seal_key(first_key.clone())
+            .expect("first handle");
+        let second = wal
+            .handle_for_seal_key(second_key.clone())
+            .expect("second handle");
+        let event = |resource: &str| AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: resource.to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_owned(),
+            detail: None,
+        };
+        let first_audit = crate::scribe::audit_envelope::encode_audit_event(&event("first"))
+            .expect("first audit");
+        let second_audit = crate::scribe::audit_envelope::encode_audit_event(&event("second"))
+            .expect("second audit");
+        first
+            .append_and_fsync([1; 16], &first_audit, b"first")
+            .expect("first append");
+        second
+            .append_and_fsync([2; 16], &second_audit, b"second")
+            .expect("second append");
+        let mut manifest = crate::scribe::manifest::Manifest::new(
+            crate::scribe::stream_identity::StreamIdentity::new(
+                node_id,
+                crate::scribe::stream_identity::WriterEpoch::new(1),
+            ),
+        );
+        manifest.update_sealed_lsn(&first_key, crate::scribe::wal::WalLsn::new(0));
+        crate::scribe::manifest::write_atomic(temp_dir.path().join("manifest"), &manifest)
+            .expect("manifest");
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        assert!(!replayed.contains_key(&first_key.as_path_components()));
+        assert_eq!(
+            replayed[&second_key.as_path_components()]
+                .audit_events
+                .len(),
+            1
+        );
+
         // Regression test for C1: per-seal-key sealed_lsn watermark
         //
-        // For : This test uses the simplified seal-key extraction that returns
-        // a single placeholder seal-key for all records. The test structure is correct,
-        // but real multi-key verification requires 's full WAL directory routing.
-        //
-        // Test contract: sealed_lsn[K1] = N skips only K1's records where LSN <= N,
-        // not K2's records. Once real seal-key extraction lands in , this test
-        // will verify true multi-key isolation.
-
-        // For now, placeholder: real implementation requires multi-key WAL routing
-        // which is part of 's integration.
     }
 
     #[test]
@@ -309,8 +363,11 @@ mod tests {
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let writer = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
             .expect("writer");
+        let writer = wal
+            .handle_for_seal_key(replay_key(tenant_id))
+            .expect("seal-key handle");
 
         // Write 5 records
         for i in 0u8..5 {
@@ -358,8 +415,11 @@ mod tests {
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let writer = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
             .expect("writer");
+        let writer = wal
+            .handle_for_seal_key(replay_key(tenant_id))
+            .expect("seal-key handle");
 
         let shared_batch_id = [42u8; 16];
 
@@ -436,8 +496,11 @@ mod tests {
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
         // Write segments with writer_epoch=3
-        let writer = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 3, tenant_id, None)
+        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 3, tenant_id, None)
             .expect("writer");
+        let writer = wal
+            .handle_for_seal_key(replay_key(tenant_id))
+            .expect("seal-key handle");
 
         let audit_event = AuditEvent {
             request_id: RequestId::now_v7(),

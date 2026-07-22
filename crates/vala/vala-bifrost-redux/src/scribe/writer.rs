@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
 
@@ -28,6 +29,7 @@ struct WriterState {
     healthy: AtomicBool,
     pending: AtomicUsize,
     reserved_sends: AtomicUsize,
+    terminal_errors: AtomicUsize,
     last_activity: Mutex<Instant>,
     stopped: Notify,
 }
@@ -49,6 +51,16 @@ struct WriterRuntime {
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
+#[derive(Debug)]
+struct WriterDependencies {
+    admission: AdmissionController,
+    memtable: Arc<Memtable>,
+    wal: Arc<WalWriter>,
+    executor: ScribeBlockingExecutor,
+    telemetry: Option<Arc<ScribeTelemetry>>,
+    coordination_runtime: Handle,
+}
+
 /// One FIFO writer for a tenant/table binding.
 #[derive(Debug)]
 pub(crate) struct TenantTableWriter {
@@ -64,15 +76,20 @@ pub(crate) struct TenantTableWriter {
 }
 
 impl TenantTableWriter {
+    /// Create one FIFO writer actor for a resolved tenant/table binding.
     fn new(
         binding: TenantTableBinding,
         lease: WriterLease,
-        memtable: Arc<Memtable>,
-        wal: Arc<WalWriter>,
-        executor: ScribeBlockingExecutor,
-        admission: AdmissionController,
-        telemetry: Option<Arc<ScribeTelemetry>>,
+        dependencies: WriterDependencies,
     ) -> Arc<Self> {
+        let WriterDependencies {
+            admission,
+            memtable,
+            wal,
+            executor,
+            telemetry,
+            coordination_runtime,
+        } = dependencies;
         let (data_tx, data_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let (age_tx, age_rx) = watch::channel(Instant::now());
@@ -81,6 +98,7 @@ impl TenantTableWriter {
             healthy: AtomicBool::new(true),
             pending: AtomicUsize::new(0),
             reserved_sends: AtomicUsize::new(0),
+            terminal_errors: AtomicUsize::new(0),
             last_activity: Mutex::new(Instant::now()),
             stopped: Notify::new(),
         });
@@ -92,7 +110,7 @@ impl TenantTableWriter {
             executor,
             telemetry,
         };
-        let task = tokio::spawn(run_writer(runtime, data_rx, control_rx, age_rx));
+        let task = coordination_runtime.spawn(run_writer(runtime, data_rx, control_rx, age_rx));
         let key = (binding.tenant, binding.table_ref.clone());
         Arc::new(Self {
             key,
@@ -113,6 +131,14 @@ impl TenantTableWriter {
 
     pub(crate) fn pending(&self) -> usize {
         self.state.pending.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.state.healthy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn terminal_errors(&self) -> usize {
+        self.state.terminal_errors.load(Ordering::Acquire)
     }
 
     fn is_idle(&self, now: Instant) -> bool {
@@ -139,6 +165,47 @@ impl TenantTableWriter {
                 detail: format!("writer control queue closed: {error}"),
             })
     }
+
+    #[cfg(test)]
+    pub(crate) fn make_idle_for_test(&self) {
+        if let Ok(mut last_activity) = self.state.last_activity.lock() {
+            *last_activity = Instant::now()
+                .checked_sub(std::time::Duration::from_mins(11))
+                .expect("test clock supports idle writer offset");
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_accepting_for_test(&self) {
+        self.state.accepting.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn close_with_reserved_send_for_test(
+        &self,
+        append: AdmittedAppend,
+    ) -> Result<(), ScribeError> {
+        let stopped = self.state.stopped.notified();
+        let permit = self
+            .data_tx
+            .try_reserve()
+            .map_err(|_| ScribeError::IngestBusy {
+                table: self.binding.table_ref.fqn(),
+            })?;
+        self.state.reserved_sends.fetch_add(1, Ordering::AcqRel);
+        self.state.pending.fetch_add(1, Ordering::AcqRel);
+        self.state.accepting.store(false, Ordering::Release);
+        self.control_tx
+            .send(WriterControl::Shutdown)
+            .await
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("writer shutdown test control failed: {error}"),
+            })?;
+        permit.send(append);
+        self.state.reserved_sends.fetch_sub(1, Ordering::AcqRel);
+        stopped.await;
+        Ok(())
+    }
 }
 
 /// Pod-global registry of active tenant/table writers.
@@ -150,16 +217,36 @@ pub(crate) struct TenantTableWriterRegistry {
     wal: Arc<WalWriter>,
     executor: ScribeBlockingExecutor,
     telemetry: Mutex<Option<Arc<ScribeTelemetry>>>,
+    coordination_runtime: Handle,
     drained: Notify,
 }
 
 impl TenantTableWriterRegistry {
+    #[cfg(test)]
     pub(crate) fn new(
         admission: AdmissionController,
         memtable: Arc<Memtable>,
         wal: Arc<WalWriter>,
         executor: ScribeBlockingExecutor,
         telemetry: Option<Arc<ScribeTelemetry>>,
+    ) -> Arc<Self> {
+        Self::new_with_runtime(
+            admission,
+            memtable,
+            wal,
+            executor,
+            telemetry,
+            Handle::current(),
+        )
+    }
+
+    pub(crate) fn new_with_runtime(
+        admission: AdmissionController,
+        memtable: Arc<Memtable>,
+        wal: Arc<WalWriter>,
+        executor: ScribeBlockingExecutor,
+        telemetry: Option<Arc<ScribeTelemetry>>,
+        coordination_runtime: Handle,
     ) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
@@ -168,6 +255,7 @@ impl TenantTableWriterRegistry {
             wal,
             executor,
             telemetry: Mutex::new(telemetry),
+            coordination_runtime,
             drained: Notify::new(),
         })
     }
@@ -200,16 +288,24 @@ impl TenantTableWriterRegistry {
         let writer = TenantTableWriter::new(
             binding,
             lease,
-            Arc::clone(&self.memtable),
-            Arc::clone(&self.wal),
-            self.executor.clone(),
-            self.admission.clone(),
-            telemetry,
+            WriterDependencies {
+                admission: self.admission.clone(),
+                memtable: Arc::clone(&self.memtable),
+                wal: Arc::clone(&self.wal),
+                executor: self.executor.clone(),
+                telemetry,
+                coordination_runtime: self.coordination_runtime.clone(),
+            },
         );
         entries.insert(key, Arc::clone(&writer));
         Ok((writer, true))
     }
 
+    /// Try to admit one complete request into the writer's bounded FIFO queue.
+    ///
+    /// The sender permit and pending counter are reserved before the accepting
+    /// flag is checked, which lets retirement distinguish an accepted race from
+    /// a request that must be rejected.
     pub(crate) fn enqueue(
         writer: &Arc<TenantTableWriter>,
         append: AdmittedAppend,
@@ -226,6 +322,7 @@ impl TenantTableWriterRegistry {
             .map_err(|_| ScribeError::IngestBusy {
                 table: writer.binding.table_ref.fqn(),
             })?;
+
         writer.state.reserved_sends.fetch_add(1, Ordering::AcqRel);
         if !writer.state.accepting.load(Ordering::Acquire) {
             writer.state.reserved_sends.fetch_sub(1, Ordering::AcqRel);
@@ -234,6 +331,7 @@ impl TenantTableWriterRegistry {
             });
         }
         writer.state.pending.fetch_add(1, Ordering::AcqRel);
+
         permit.send(append);
         writer.state.reserved_sends.fetch_sub(1, Ordering::AcqRel);
         if let Ok(mut last_activity) = writer.state.last_activity.lock() {
@@ -271,6 +369,25 @@ impl TenantTableWriterRegistry {
 
     pub(crate) fn writer_count(&self) -> usize {
         self.entries.lock().map_or(0, |entries| entries.len())
+    }
+
+    pub(crate) fn health_snapshot(&self) -> WriterHealthSnapshot {
+        let entries = match self.entries.lock() {
+            Ok(entries) => entries,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        WriterHealthSnapshot {
+            writers: entries.len(),
+            unhealthy_writers: entries
+                .values()
+                .filter(|writer| !writer.is_healthy())
+                .count(),
+            pending_items: entries.values().map(|writer| writer.pending()).sum(),
+            terminal_errors: entries
+                .values()
+                .map(|writer| writer.terminal_errors())
+                .sum(),
+        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -326,6 +443,20 @@ impl TenantTableWriterRegistry {
     }
 }
 
+/// Point-in-time health and queue metrics for active logical writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterHealthSnapshot {
+    /// Active tenant/table consumers.
+    pub writers: usize,
+    /// Consumers that have failed after admission.
+    pub unhealthy_writers: usize,
+    /// Items retained in writer data queues or being processed.
+    pub pending_items: usize,
+    /// Terminal post-ACK consumer errors.
+    pub terminal_errors: usize,
+}
+
+/// Run one writer's control and data queues on the dedicated coordination runtime.
 async fn run_writer(
     runtime: WriterRuntime,
     mut data_rx: mpsc::Receiver<AdmittedAppend>,
@@ -335,12 +466,22 @@ async fn run_writer(
     let mut seen_slices = HashSet::<AppendSliceId>::new();
     let mut wal_handles = HashMap::<crate::scribe::seal_key::SealKey, WalHandle>::new();
     let mut controls_closed = false;
+    let mut shutdown_requested = false;
     loop {
+        if shutdown_requested
+            && runtime.state.pending.load(Ordering::Acquire) == 0
+            && runtime.state.reserved_sends.load(Ordering::Acquire) == 0
+        {
+            break;
+        }
         tokio::select! {
             biased;
-            control = control_rx.recv(), if !controls_closed => {
+            control = control_rx.recv(), if !controls_closed && !shutdown_requested => {
                 match control {
-                    Some(WriterControl::Shutdown) => break,
+                    Some(WriterControl::Shutdown) => {
+                        runtime.state.accepting.store(false, Ordering::Release);
+                        shutdown_requested = true;
+                    }
                     Some(WriterControl::PersistenceCompleted | WriterControl::GraceExpired) => {},
                     None => controls_closed = true,
                 }
@@ -348,6 +489,10 @@ async fn run_writer(
             _ = age_rx.changed() => {}
             append = data_rx.recv() => {
                 let Some(append) = append else { break; };
+                let request_id = append.request_id.clone();
+                let batch_id = append.batch_id;
+                let tenant = append.tenant;
+                let table = append.table.clone();
                 let result = process_append(
                     &runtime,
                     append,
@@ -356,10 +501,20 @@ async fn run_writer(
                 ).await;
                 if let Err(error) = result {
                     runtime.state.healthy.store(false, Ordering::Release);
+                    runtime.state.terminal_errors.fetch_add(1, Ordering::AcqRel);
                     if matches!(&error, ScribeError::WalDiskFull) {
                         runtime.admission.trip_wal_disk_full();
                     }
-                    tracing::error!(error = %error, "Scribe writer became unhealthy");
+                    tracing::error!(
+                        error = %error,
+                        tenant = %tenant,
+                        table = %table,
+                        request_id = %request_id,
+                        batch_id = %batch_id,
+                        seal_key = "unknown",
+                        stage = "consumer",
+                        "Scribe writer became unhealthy"
+                    );
                 }
                 runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
             }
@@ -375,6 +530,7 @@ async fn run_writer(
     runtime.state.stopped.notify_waiters();
 }
 
+/// Preprocess one admitted request and apply each prepared day slice in FIFO order.
 async fn process_append(
     runtime: &WriterRuntime,
     append: AdmittedAppend,
@@ -392,6 +548,20 @@ async fn process_append(
         });
     };
     if let Some(telemetry) = &runtime.telemetry {
+        telemetry.record(
+            "queue_wait",
+            std::time::Duration::from_micros(prepared.queue_wait_us),
+            prepared
+                .slices
+                .iter()
+                .map(|slice| slice.rows.num_rows())
+                .sum(),
+            prepared
+                .slices
+                .iter()
+                .map(|slice| slice.memtable_bytes)
+                .sum(),
+        );
         let rows = prepared
             .slices
             .iter()
@@ -448,7 +618,7 @@ async fn process_prepared(
         drop(written_wal);
         if let Some(telemetry) = &runtime.telemetry {
             telemetry.record(
-                "wal_write",
+                "write_all",
                 wal_started.elapsed(),
                 slice.rows.num_rows(),
                 slice.wal_bytes,
@@ -457,8 +627,11 @@ async fn process_prepared(
 
         let row_count = slice.rows.num_rows();
         let memtable_bytes = slice.memtable_bytes;
+        runtime
+            .admission
+            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
         let memtable_started = Instant::now();
-        runtime.memtable.insert(
+        if let Err(error) = runtime.memtable.insert(
             &seal_key,
             slice.audit_event,
             ScribeAppendMeta {
@@ -469,7 +642,10 @@ async fn process_prepared(
                 seal_key: seal_key.as_path_components(),
             },
             slice.rows,
-        )?;
+        ) {
+            runtime.admission.release_active(memtable_bytes);
+            return Err(error);
+        }
         if let Some(telemetry) = &runtime.telemetry {
             telemetry.record(
                 "memtable_insert",
@@ -587,6 +763,7 @@ mod tests {
                 reservation,
                 tenant: DataTenantId::SYSTEM_OWNER,
                 table: table.clone(),
+                queued_at: Instant::now(),
             },
         )
         .expect("enqueue");

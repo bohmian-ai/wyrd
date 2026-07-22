@@ -17,6 +17,7 @@ use wyrd_bench::{
     BacklogSample, BenchmarkReport, ForgeMeasurements, LatencyPercentiles, MachineMetadata,
     PhaseMeasurement, PodMetadata, QueryMeasurements, SchemaWidth, StageMeasurements,
     StorageMeasurements, TrafficShape, VerificationMeasurements, WorkloadSpec,
+    required_scribe_matrix,
 };
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::auth::PrincipalId;
@@ -107,12 +108,14 @@ async fn run_preflight() -> Result<(), BenchError> {
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
         };
+        let rows = make_batch(1_000, tenant, 0)?;
+        let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
         scribe
             .append(ScribeAppend {
                 principal,
                 table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
-                rows: make_batch(1_000, tenant, 0)?,
-                schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+                rows,
+                schema_fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
                 measured_wire_bytes: 0,
@@ -352,6 +355,8 @@ async fn run_phase(
                     _ = phase_stop.cancelled() => break,
                     _ = ticker.tick() => {
                         let batch = make_batch(batch_rows, tenant, sequence)?;
+                        let schema_fingerprint =
+                            SchemaFingerprint::from_arrow_schema(batch.schema().as_ref());
                         sequence = sequence.saturating_add(1);
                         {
                             let mut phase = phase_state
@@ -365,7 +370,7 @@ async fn run_phase(
                             principal: principal.clone(),
                             table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
                             rows: batch,
-                            schema_fingerprint: SchemaFingerprint([0_u8; 32]),
+                            schema_fingerprint,
                             request_id: RequestId::now_v7(),
                             batch_id: uuid::Uuid::now_v7(),
                             measured_wire_bytes: 0,
@@ -495,6 +500,55 @@ fn spawn_sampler(
                             active_rows: u64::try_from(stats.writable_rows)?,
                             immutable_rows: u64::try_from(stats.immutable_rows)?,
                             pending_generations: u64::try_from(stats.pending_generations)?,
+                            admitted_items: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    u64::try_from(scribe.runtime_snapshot().admission.items)
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .sum(),
+                            admitted_bytes: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    u64::try_from(scribe.runtime_snapshot().admission.bytes)
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .sum(),
+                            active_writers: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    u64::try_from(scribe.runtime_snapshot().writers.writers)
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .sum(),
+                            executor_depth: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    u64::try_from(scribe.runtime_snapshot().executor.depth)
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .sum(),
+                            executor_saturation_events: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    scribe.runtime_snapshot().executor.saturation_events
+                                })
+                                .sum(),
+                            unhealthy_writers: harness
+                                .scribes()
+                                .iter()
+                                .map(|scribe| {
+                                    u64::try_from(
+                                        scribe.runtime_snapshot().writers.unhealthy_writers,
+                                    )
+                                    .unwrap_or(u64::MAX)
+                                })
+                                .sum(),
                             forge_candidates: candidates,
                         });
                 }
@@ -645,14 +699,18 @@ async fn build_report(
         wal_growth_bytes: harness.wal_bytes(),
         active_memory_bytes: u64::try_from(stats.writable_bytes)?,
         immutable_memory_bytes: u64::try_from(stats.immutable_bytes)?,
-        queued_memory_bytes: u64::try_from(stats.pending_generations)?,
+        queued_memory_bytes: backlog
+            .iter()
+            .map(|sample| sample.admitted_bytes)
+            .max()
+            .unwrap_or(0),
         file_count,
         average_file_size_bytes,
         ..StorageMeasurements::default()
     };
     if let Some(wal) = stage_data
         .iter()
-        .find(|stage| stage.stage == "wal_append_fsync")
+        .find(|stage| stage.stage == "wal_sync_data")
     {
         storage.fsync_us = wal.latency.p99_us;
     }
@@ -691,6 +749,11 @@ async fn build_report(
         storage,
         query: QueryMeasurements::default(),
         forge,
+        scribe_matrix: if lane == "scribe" {
+            required_scribe_matrix()
+        } else {
+            Vec::new()
+        },
         stages: stage_data,
         phases,
         backlog,
@@ -1005,6 +1068,7 @@ async fn run_oracle(
                 audit_visibility_lag_us: 0,
             },
             forge: ForgeMeasurements::default(),
+            scribe_matrix: Vec::new(),
             stages: Vec::new(),
             phases: Vec::new(),
             backlog: Vec::new(),

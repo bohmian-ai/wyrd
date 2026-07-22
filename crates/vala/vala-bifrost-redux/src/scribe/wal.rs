@@ -637,6 +637,17 @@ impl WalHandle {
         self.writer.append_frame(frame)
     }
 
+    #[cfg(test)]
+    pub(crate) fn append_and_fsync(
+        &self,
+        batch_id: [u8; 16],
+        audit_payload: &[u8],
+        data_payload: &[u8],
+    ) -> Result<WalLsn, ScribeError> {
+        self.writer
+            .append_and_fsync(batch_id, audit_payload, data_payload)
+    }
+
     pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
         self.writer.sync_data()
     }
@@ -670,6 +681,12 @@ impl WalWriter {
             max_segment_size: max_segment_size.unwrap_or(4096),
             current_segment_size: Arc::new(AtomicU64::new(0)),
         })
+    }
+
+    /// Return the pod-local WAL root used for replay and diagnostics.
+    #[must_use]
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
     }
 
     pub(crate) fn handle_for_seal_key(&self, key: SealKey) -> Result<WalHandle, ScribeError> {

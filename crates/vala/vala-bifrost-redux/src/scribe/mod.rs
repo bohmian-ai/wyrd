@@ -19,13 +19,19 @@ pub mod telemetry;
 pub mod wal;
 pub mod writer;
 
+#[cfg(test)]
+mod acceptance;
+
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Instant;
+use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{Scribe, ScribeAppend, ScribeError};
+use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::admission::{
     AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
@@ -34,7 +40,7 @@ use crate::scribe::memtable::Memtable;
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
-use crate::scribe::telemetry::ScribeTelemetry;
+use crate::scribe::telemetry::{ScribeRuntimeSnapshot, ScribeTelemetry};
 use crate::scribe::writer::TenantTableWriterRegistry;
 
 /// Memtable key for per-bucket row-count inspection.
@@ -71,6 +77,13 @@ pub struct ScribeImpl {
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
+struct ScribeBuildConfig {
+    admission: AdmissionConfig,
+    telemetry: Option<Arc<ScribeTelemetry>>,
+    coordination_runtime: Handle,
+    executor: ScribeBlockingExecutor,
+}
+
 impl ScribeImpl {
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
     pub fn new_with_deps(
@@ -79,6 +92,21 @@ impl ScribeImpl {
         node_id: String,
         writer_epoch: i64,
     ) -> Self {
+        Self::new_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
+    }
+
+    /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
+    ///
+    /// Server deployments pass the handle for their dedicated WAL coordination
+    /// runtime here. Tests and embedded callers can use [`Self::new_with_deps`]
+    /// to schedule consumers on the current runtime.
+    pub fn new_with_runtime(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        coordination_runtime: Handle,
+    ) -> Self {
         Self::new_with_config(
             operator,
             wal,
@@ -86,6 +114,7 @@ impl ScribeImpl {
             writer_epoch,
             AdmissionConfig::default(),
             None,
+            coordination_runtime,
         )
     }
 
@@ -96,16 +125,44 @@ impl ScribeImpl {
         writer_epoch: i64,
         admission_config: AdmissionConfig,
         telemetry: Option<Arc<ScribeTelemetry>>,
+        coordination_runtime: Handle,
+    ) -> Self {
+        Self::new_with_components(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            ScribeBuildConfig {
+                admission: admission_config,
+                telemetry,
+                coordination_runtime,
+                executor: ScribeBlockingExecutor::new(),
+            },
+        )
+    }
+
+    fn new_with_components(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        config: ScribeBuildConfig,
     ) -> Self {
         let memtable = Arc::new(Memtable::new());
-        let admission = AdmissionController::with_config(admission_config);
-        let executor = ScribeBlockingExecutor::new();
-        let registry = TenantTableWriterRegistry::new(
+        let admission = AdmissionController::with_config(config.admission);
+        let ScribeBuildConfig {
+            telemetry,
+            coordination_runtime,
+            executor,
+            ..
+        } = config;
+        let registry = TenantTableWriterRegistry::new_with_runtime(
             admission.clone(),
             Arc::clone(&memtable),
             Arc::clone(&wal),
             executor.clone(),
             telemetry.clone(),
+            coordination_runtime,
         );
         Self {
             memtable,
@@ -127,6 +184,19 @@ impl ScribeImpl {
     #[must_use]
     #[cfg(test)]
     pub fn new() -> Self {
+        Self::new_with_test_executor(ScribeBlockingExecutor::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_executor(executor: ScribeBlockingExecutor) -> Self {
+        Self::new_with_test_config(executor, AdmissionConfig::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_test_config(
+        executor: ScribeBlockingExecutor,
+        admission_config: AdmissionConfig,
+    ) -> Self {
         let operator = Arc::new(
             opendal::Operator::new(opendal::services::Memory::default())
                 .expect("memory backend init")
@@ -152,11 +222,17 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        Self::new_with_deps(
+        Self::new_with_components(
             operator,
             wal,
             "00000000-0000-0000-0000-000000000000".to_string(),
             1,
+            ScribeBuildConfig {
+                admission: admission_config,
+                telemetry: None,
+                coordination_runtime: Handle::current(),
+                executor,
+            },
         )
     }
 
@@ -183,6 +259,16 @@ impl ScribeImpl {
     #[must_use]
     pub fn telemetry(&self) -> Option<Vec<telemetry::ScribeStageSample>> {
         self.telemetry.as_ref().map(|recorder| recorder.snapshot())
+    }
+
+    /// Return the current admission, executor, and writer health metrics.
+    #[must_use]
+    pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
+        ScribeRuntimeSnapshot {
+            admission: self.admission.snapshot(),
+            executor: self.executor.snapshot(),
+            writers: self.registry.health_snapshot(),
+        }
     }
 
     /// Execute seal pre-commit stages (Freeze → Parquet → PUT → PG tx) for a
@@ -236,10 +322,22 @@ impl Default for ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
+    // Keep this method as the Gate→Scribe composition seam. It validates and
+    // reserves synchronously, then transfers the canonical RecordBatch to the
+    // writer queue; preprocessing and all blocking WAL work happen afterward.
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        let append_started = Instant::now();
+        let append_rows = req.rows.num_rows();
+        let append_wire_bytes = req.measured_wire_bytes;
         if req.measured_wire_bytes > MAX_REQUEST_BYTES {
             return Err(ScribeError::PayloadTooLarge {
                 bytes: req.measured_wire_bytes,
+            });
+        }
+        let actual_fingerprint = SchemaFingerprint::from_arrow_schema(req.rows.schema().as_ref());
+        if req.schema_fingerprint != actual_fingerprint {
+            return Err(ScribeError::FingerprintMismatch {
+                table: req.table.fqn(),
             });
         }
 
@@ -287,6 +385,7 @@ impl Scribe for ScribeImpl {
             reservation,
             tenant: req.principal.tenant_id,
             table: req.table,
+            queued_at: Instant::now(),
         };
 
         let (writer, created) = self.registry.get_or_create(binding)?;
@@ -295,6 +394,17 @@ impl Scribe for ScribeImpl {
                 self.registry.remove_if(&writer.key, writer.instance_id);
             }
             return Err(error);
+        }
+
+        if let Some(telemetry) = &self.telemetry {
+            // Measure only the synchronous validation, reservation, and enqueue
+            // portion of the request so ACK latency is not confused with WAL IO.
+            telemetry.record(
+                "append",
+                append_started.elapsed(),
+                append_rows,
+                append_wire_bytes,
+            );
         }
         Ok(())
     }
@@ -315,7 +425,10 @@ impl ScribeImpl {
 
     /// Return aggregate writable and immutable memtable state.
     pub fn memtable_stats(&self) -> Result<memtable::MemtableStats, ScribeError> {
-        self.memtable.stats()
+        let stats = self.memtable.stats()?;
+        self.admission
+            .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+        Ok(stats)
     }
 
     /// Return the current pod-global admission counters.
@@ -366,7 +479,11 @@ impl ScribeImpl {
         let mut tokens = Vec::with_capacity(keys.len());
         for key in keys {
             match self.seal_one(&key, conn).await {
-                Ok(handle) => tokens.push(handle.token),
+                Ok(handle) => {
+                    self.admission
+                        .transfer_active_to_immutable(handle.token.memtable_bytes);
+                    tokens.push(handle.token);
+                }
                 Err(error) => {
                     for token in tokens {
                         let _ = self.abort_post_commit(token);
@@ -397,6 +514,8 @@ impl ScribeImpl {
         T: Into<seal::PostCommitBatch>,
     {
         for token in post_commit.into().0 {
+            self.admission
+                .transfer_immutable_to_active(token.memtable_bytes);
             self.memtable.abort_post_commit(token.seal_id)?;
         }
         Ok(())
@@ -462,6 +581,26 @@ impl ScribeImpl {
         replayed: &replay::ReplayedSealKey,
     ) -> Result<memtable::FrozenMemtable, ScribeError> {
         self.memtable.restore_replayed(replayed)
+    }
+
+    /// Replay every complete, unretired WAL frame into pending immutable state.
+    ///
+    /// This is the boot recovery boundary: replay performs paired audit/data
+    /// validation and `(batch_id, seal_key)` deduplication before the restored
+    /// Arrow batches become visible to the normal seal/reconciliation path.
+    ///
+    /// # Errors
+    /// Returns [`ScribeError`] when the WAL cannot be read or a frame cannot be
+    /// reconstructed as Arrow state.
+    pub fn replay_wal(&self) -> Result<usize, ScribeError> {
+        let replayed = replay::replay_wal_directory(self.wal.base_dir())?;
+        let restored = replayed
+            .values()
+            .map(|state| self.restore_replayed(state).map(|_| ()))
+            .collect::<Result<Vec<_>, _>>()?
+            .len();
+        self.memtable_stats()?;
+        Ok(restored)
     }
 
     /// Sweep committed immutable generations whose grace period elapsed.

@@ -453,6 +453,10 @@ impl BoundServer {
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
         let terminal = supervise(set, shutdown, drain).await;
 
+        if let Some(scribe) = &self.state.scribe {
+            scribe.shutdown().await;
+        }
+
         tracing::info!("wyrd-server shutdown complete");
         match terminal {
             Some(msg) => Err(BootExit::Other(

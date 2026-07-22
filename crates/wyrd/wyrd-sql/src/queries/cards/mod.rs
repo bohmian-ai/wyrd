@@ -6,6 +6,7 @@ mod auth_projection;
 mod delete;
 mod field_resolver;
 mod get;
+mod lifecycle;
 mod list;
 mod register;
 mod version_query;
@@ -15,6 +16,10 @@ mod version_sql;
 pub use auth_projection::upsert_service_account_from_card;
 pub use delete::soft_delete_card;
 pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid};
+pub use lifecycle::{
+    CardManifestCompletionRow, activate_card, fail_card, manifest_completion_rows,
+    mark_manifest_verified, record_blob_failure, record_card_blob,
+};
 pub use list::{
     CardQuery, ListCursor, ListPage, MAX_LIST_LIMIT, check_uid_exists, find_card_by_spec_hash,
     get_unique_spaces, query_cards,

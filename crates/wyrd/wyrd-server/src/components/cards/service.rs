@@ -4,11 +4,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
-use chrono::{Duration, Utc};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use wyrd_semver::VersionSpec;
-use wyrd_spec::envelope::{Card, Spec};
+use wyrd_spec::api_version::ApiVersion;
+use wyrd_spec::envelope::{Card, Metadata, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
@@ -18,22 +18,26 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::reference::{CardRef, CardRefIdentity};
 use wyrd_spec::registry::{
-    CardSubmission, CardUploadPlan, CreateCardRequest, CreateCardResponse, HttpMethod,
-    PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed,
-    RelativeArtifactPath,
+    CardLifecycleStatus, CardRegistrationOutcome, CardSubmission, CardUploadEntry, CardUploadPlan,
+    CreateCardRequest, CreateCardResponse, RegistrationOperationId, RegistrationOutcomeKind,
+    RegistrationReplaySeed, RelativeArtifactPath,
 };
-use wyrd_spec::storage::{UploadInitRequest, UploadPlan};
+use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 use wyrd_sql::CardStatus;
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, Resolution, SubmittedCardIdentity,
-    artifact_manifest_hash, commit_registration_operation, find_card_by_ref,
-    insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    lock_version_line, lookup_existing_operation, lookup_expired_operation, manifest_rows_for_init,
-    mark_manifest_upload_initialized, registration_request_hash, resolve_version,
+    NewCardRow, NewRegistrationOperation, Resolution, SubmittedCardIdentity, activate_card,
+    artifact_manifest_hash, commit_registration_operation, fail_card, find_card_by_ref,
+    get_card_by_uid, insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
+    lock_version_line, lookup_existing_operation, lookup_expired_operation,
+    manifest_completion_rows, manifest_rows_for_init, mark_manifest_upload_initialized,
+    record_blob_failure, record_card_blob, registration_request_hash, resolve_version,
     upsert_service_account_from_card,
 };
-use wyrd_storage::service::upload_init;
+use wyrd_sql::queries::storage::multipart_uploads;
+use wyrd_storage::StorageError;
+use wyrd_storage::service::{upload_abort, upload_init};
+use wyrd_storage::tenant_path;
 
 use crate::audit::{append_on, audit_event, record_audit};
 use crate::components::auth::Caller;
@@ -230,6 +234,26 @@ async fn initialize_uploads(
             .then_with(|| left.card_ref.name.cmp(&right.card_ref.name))
     });
     response.upload_plans = plans;
+
+    // Metadata-only cards, and replayed artifact cards whose manifests are
+    // already verified, complete in the same server-owned lifecycle seam. A
+    // card with a still-pending upload plan remains Pending for the client
+    // upload phase.
+    for index in 0..response.outcomes.len() {
+        let outcome = response.outcomes[index].clone();
+        if outcome.status != CardLifecycleStatus::Pending
+            || response
+                .upload_plans
+                .iter()
+                .any(|plan| plan.card_ref.same_identity(&outcome.card_ref))
+        {
+            continue;
+        }
+        let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
+            continue;
+        };
+        response.outcomes[index] = complete_card(state, caller, card_uid).await?;
+    }
     Ok(response)
 }
 
@@ -240,7 +264,7 @@ async fn initialize_card_uploads(
     operation_id: RegistrationOperationId,
     card_uid: &CardUid,
     allowed_paths: &[String],
-) -> Vec<PresignedUpload> {
+) -> Vec<CardUploadEntry> {
     let rows = match load_manifest_rows(state, caller, card_uid).await {
         Ok(rows) => rows,
         Err(error) => {
@@ -288,7 +312,7 @@ async fn initialize_manifest_row(
     operation_id: RegistrationOperationId,
     card_uid: &CardUid,
     row: &wyrd_sql::queries::cards::CardArtifactManifestRow,
-) -> Result<PresignedUpload, WyrdError> {
+) -> Result<CardUploadEntry, WyrdError> {
     let key = IdempotencyKey::new(format!(
         "registration-{}-{}",
         operation_id.as_uuid(),
@@ -321,7 +345,7 @@ async fn initialize_manifest_row(
         .upload_id
         .as_uuid()
         .map_err(|error| WyrdError::internal(format!("upload id invalid: {error}")))?;
-    let entry = presigned_upload(&row.relative_path, initialized.plan)?;
+    let entry = card_upload_entry(&row.relative_path, initialized.upload_id, initialized.plan)?;
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
@@ -342,38 +366,16 @@ async fn initialize_manifest_row(
     Ok(entry)
 }
 
-/// Project a storage single-PUT plan into the registry upload contract.
-fn presigned_upload(relative_path: &str, plan: UploadPlan) -> Result<PresignedUpload, WyrdError> {
-    let (url, ttl_secs, required_headers) = match plan {
-        UploadPlan::SinglePut {
-            put_url,
-            ttl_secs,
-            required_headers,
-        } => (
-            put_url,
-            ttl_secs,
-            required_headers
-                .into_iter()
-                .map(|header| (header.name, header.value))
-                .collect(),
-        ),
-        UploadPlan::LocalFs { put_url, ttl_secs } => (put_url, ttl_secs, Vec::new()),
-        UploadPlan::S3Multipart { .. }
-        | UploadPlan::GcsResumable { .. }
-        | UploadPlan::AzureBlockBlob { .. } => {
-            return Err(WyrdError::registry_unavailable(
-                "card artifact registration requires a single PUT upload plan",
-            ));
-        }
-    };
-    Ok(PresignedUpload {
+/// Project the complete storage upload contract into the registry response.
+fn card_upload_entry(
+    relative_path: &str,
+    upload_id: UploadId,
+    plan: UploadPlan,
+) -> Result<CardUploadEntry, WyrdError> {
+    Ok(CardUploadEntry {
         relative_path: RelativeArtifactPath::new(relative_path).map_err(WyrdError::from)?,
-        url: url::Url::parse(&url).map_err(|error| {
-            WyrdError::internal(format!("storage returned invalid URL: {error}"))
-        })?,
-        method: HttpMethod::Put,
-        expires_at: Utc::now() + Duration::seconds(i64::from(ttl_secs)),
-        required_headers,
+        upload_id,
+        plan,
     })
 }
 
@@ -815,10 +817,367 @@ pub async fn register_card(
     compose_registration(state, caller, idempotency_key, request).await
 }
 
+/// Complete one pending Card after its storage uploads have been verified.
+///
+/// Storage IO runs before the final short SQL transaction. The transition is
+/// therefore safe to retry without holding a database connection across
+/// backend calls.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete"))]
+pub async fn complete_card(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<CardRegistrationOutcome, WyrdError> {
+    let (card, manifests) = load_completion_state(state, caller, card_uid).await?;
+    if card.status == wyrd_sql::row_types::cards::CardStatus::Active {
+        return Ok(existing_row_to_response(
+            &card,
+            RegistrationOutcomeKind::IdempotentNoop,
+        ));
+    }
+    if card.status != wyrd_sql::row_types::cards::CardStatus::Pending {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "card registration is no longer pending".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "status": card.status }),
+        });
+    }
+
+    for manifest in &manifests {
+        verify_manifest_storage(state, caller, card_uid, manifest).await?;
+    }
+
+    let blob_uri = if card.card_blob_uri.is_some() {
+        card.card_blob_uri
+            .clone()
+            .ok_or_else(|| WyrdError::internal("card blob URI disappeared during completion"))?
+    } else {
+        write_card_blob(state, caller, &card).await?
+    };
+
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    for manifest in &manifests {
+        if let Some(upload_id) = manifest.upload_id {
+            multipart_uploads::mark_completed_if_pending(&mut conn, upload_id)
+                .await
+                .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+            let _ =
+                wyrd_sql::queries::cards::mark_manifest_verified(&mut conn, card_uid, upload_id)
+                    .await?;
+        }
+    }
+    // Metadata-only cards still need the blob URI recorded before activation.
+    if card.card_blob_uri.is_none() {
+        record_card_blob(&mut conn, card_uid, &blob_uri).await?;
+    }
+    let activated = activate_card(&mut conn, card_uid).await?;
+    if activated {
+        let event = audit_event(
+            caller,
+            "card.registration.complete",
+            &format!("card:{card_uid}"),
+            "card:write",
+            AuditDecision::Allow,
+            AuditResult::Success,
+            "card registration completed and activated",
+        );
+        append_on(&mut conn, &event).await?;
+    }
+    conn.commit().await.map_err(registry_db_error)?;
+
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(existing_row_to_response(
+        &card,
+        if activated {
+            RegistrationOutcomeKind::Registered
+        } else {
+            RegistrationOutcomeKind::IdempotentNoop
+        },
+    ))
+}
+
+/// Abort one pending Card and clean its upload/object state.
+///
+/// This is an internal compensation seam. It is intentionally not exposed as
+/// a method on the public `Cards` handle.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.abort"))]
+pub async fn abort_card(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<CardRegistrationOutcome, WyrdError> {
+    let (card, manifests) = load_completion_state(state, caller, card_uid).await?;
+    if card.status == wyrd_sql::row_types::cards::CardStatus::Active {
+        return Err(WyrdError::Conflict {
+            message: "active cards cannot be aborted".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid }),
+        });
+    }
+    if card.status != wyrd_sql::row_types::cards::CardStatus::Pending {
+        return Ok(existing_row_to_response(
+            &card,
+            RegistrationOutcomeKind::IdempotentNoop,
+        ));
+    }
+
+    let mut cleanup_failures = Vec::new();
+    for manifest in manifests {
+        let Some(upload_id) = manifest.upload_id else {
+            continue;
+        };
+        let upload_id = UploadId::from_uuid(upload_id);
+        match manifest.storage_status.as_deref() {
+            Some("completed") => {
+                if let Some(path) = manifest.storage_path.as_deref() {
+                    match tenant_path::validate(path, caller.data_tenant_id) {
+                        Ok(validated) => {
+                            if let Err(error) = state.storage.delete_object(&validated).await {
+                                cleanup_failures.push(error.to_string());
+                            }
+                        }
+                        Err(error) => cleanup_failures.push(error.to_string()),
+                    }
+                }
+            }
+            Some("pending") | Some("initiating") => {
+                if let Err(error) = upload_abort(
+                    &state.storage,
+                    state.postgres.wyrd(),
+                    &storage_caller(caller),
+                    upload_id,
+                )
+                .await
+                {
+                    cleanup_failures.push(error.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    let failed = fail_card(&mut conn, card_uid).await?;
+    if failed {
+        let detail = if cleanup_failures.is_empty() {
+            "card registration compensation completed"
+        } else {
+            "card registration compensation completed with cleanup failures"
+        };
+        let event = audit_event(
+            caller,
+            "card.registration.abort",
+            &format!("card:{card_uid}"),
+            "card:write",
+            AuditDecision::Allow,
+            if cleanup_failures.is_empty() {
+                AuditResult::Success
+            } else {
+                AuditResult::Failure
+            },
+            detail,
+        );
+        append_on(&mut conn, &event).await?;
+    }
+    conn.commit().await.map_err(registry_db_error)?;
+
+    if !cleanup_failures.is_empty() {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "card registration cleanup was incomplete".to_owned(),
+            details: serde_json::json!({
+                "card_uid": card_uid,
+                "failure_count": cleanup_failures.len(),
+            }),
+        });
+    }
+
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(existing_row_to_response(
+        &card,
+        RegistrationOutcomeKind::IdempotentNoop,
+    ))
+}
+
+/// Load the parsed Card and tenant-bound manifest/upload rows for completion.
+async fn load_completion_state(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<
+    (
+        wyrd_sql::row_types::cards::ParsedCardRow,
+        Vec<wyrd_sql::queries::cards::CardManifestCompletionRow>,
+    ),
+    WyrdError,
+> {
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok((card, manifests))
+}
+
+/// Verify one manifest/upload binding against the configured storage backend.
+async fn verify_manifest_storage(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    manifest: &wyrd_sql::queries::cards::CardManifestCompletionRow,
+) -> Result<(), WyrdError> {
+    let valid = matches!(
+        manifest.manifest_status.as_str(),
+        "pending" | "uploaded" | "verified"
+    ) && matches!(
+        manifest.storage_status.as_deref(),
+        Some("pending" | "completed")
+    ) && manifest
+        .storage_card_uid
+        .as_deref()
+        .is_some_and(|value| value == card_uid.to_string())
+        && manifest.storage_relative_path.as_deref() == Some(manifest.relative_path.as_str())
+        && manifest.storage_expected_sha256.as_deref() == Some(manifest.expected_sha256.as_str())
+        && manifest.storage_expected_size_bytes == Some(manifest.expected_size_bytes)
+        && manifest.storage_backend.as_deref()
+            == Some(state.storage.backend().to_string().as_str());
+    if !valid {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "artifact upload does not match its registration manifest".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "relative_path": manifest.relative_path }),
+        });
+    }
+    let path = manifest.storage_path.as_deref().ok_or_else(|| {
+        WyrdError::RegistryArtifactVerifyFailed {
+            message: "completed artifact upload has no storage path".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "relative_path": manifest.relative_path }),
+        }
+    })?;
+    let validated = tenant_path::validate(path, caller.data_tenant_id).map_err(|error| {
+        WyrdError::RegistryArtifactVerifyFailed {
+            message: "artifact storage path failed tenant validation".to_owned(),
+            details: serde_json::json!({ "reason": error.to_string() }),
+        }
+    })?;
+    if validated.card_uid != card_uid.to_string()
+        || validated.relative_path != manifest.relative_path
+    {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "artifact storage path is not bound to the Card manifest".to_owned(),
+            details: serde_json::json!({ "card_uid": card_uid, "relative_path": manifest.relative_path }),
+        });
+    }
+    let head = state
+        .storage
+        .signer()
+        .head_for_verification(&validated)
+        .await
+        .map_err(map_storage_error)?;
+    let expected_size = u64::try_from(manifest.expected_size_bytes).map_err(|_| {
+        WyrdError::RegistryArtifactVerifyFailed {
+            message: "artifact manifest size is invalid".to_owned(),
+            details: serde_json::json!({ "relative_path": manifest.relative_path }),
+        }
+    })?;
+    if head.size_bytes != expected_size {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "stored artifact size does not match its manifest".to_owned(),
+            details: serde_json::json!({
+                "relative_path": manifest.relative_path,
+                "expected_size_bytes": expected_size,
+                "actual_size_bytes": head.size_bytes,
+            }),
+        });
+    }
+    if state.storage.require_encryption() && head.sse_marker.is_none() {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "stored artifact is missing required encryption metadata".to_owned(),
+            details: serde_json::json!({ "relative_path": manifest.relative_path }),
+        });
+    }
+    Ok(())
+}
+
+/// Persist the immutable resolved Card envelope and return its stable URI.
+async fn write_card_blob(
+    state: &AppState,
+    caller: &Caller,
+    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+) -> Result<String, WyrdError> {
+    let blob_path = tenant_path::build(
+        caller.data_tenant_id,
+        &card.card_uid.to_string(),
+        &format!("blob/{}.json", card.spec_hash),
+    );
+    let validated = tenant_path::validate(&blob_path, caller.data_tenant_id).map_err(|error| {
+        WyrdError::internal(format!("card blob path failed validation: {error}"))
+    })?;
+    let envelope = Card {
+        api_version: ApiVersion::v1(),
+        kind: card.kind.clone(),
+        metadata: Metadata {
+            name: card.name.clone(),
+            version: Some(VersionSpec::Pin(card.version.clone())),
+            bump: None,
+            space: Some(card.space.clone()),
+            uid: Some(card.card_uid.clone()),
+            labels: card.labels.clone(),
+            annotations: card.annotations.clone(),
+            spec_hash: Some(card.spec_hash.parse().map_err(|error| {
+                WyrdError::internal(format!("stored spec hash invalid: {error}"))
+            })?),
+            artifact_hash: card.artifact_hash.clone(),
+            origin: None,
+        },
+        spec: card.spec.clone(),
+        relationships: relationships_from_spec(&card.spec),
+        status: None,
+    };
+    let bytes = serde_jcs::to_vec(&envelope).map_err(WyrdError::from_spec_serialization)?;
+    if let Err(error) = state.storage.put_object(&validated, bytes).await {
+        let mut conn = state
+            .postgres
+            .tenant_conn(caller.data_tenant_id)
+            .await
+            .map_err(registry_db_error)?;
+        record_blob_failure(&mut conn, &card.card_uid).await?;
+        conn.commit().await.map_err(registry_db_error)?;
+        return Err(map_storage_error(error));
+    }
+    Ok(format!("wyrd://{blob_path}"))
+}
+
+/// Convert a server-tier storage error to the shared Wyrd error catalog.
+fn map_storage_error(error: StorageError) -> WyrdError {
+    wyrd_spec::error::storage::WyrdStorageError::from(error).into()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{hash_request, validate_request};
+    use super::{card_upload_entry, hash_request, validate_request};
+    use uuid::Uuid;
     use wyrd_spec::registry::CreateCardRequest;
+    use wyrd_spec::storage::{UploadId, UploadPlan};
 
     /// Decode a compact registration request used by pure composition tests.
     fn request(value: serde_json::Value) -> CreateCardRequest {
@@ -890,5 +1249,36 @@ mod tests {
             "WYRD_REGISTRY_400_HEAVY_ARTIFACT_NOT_SOLE_SUBMISSION"
         );
         assert_eq!(error.status(), 400);
+    }
+
+    /// Keep every storage protocol and its durable upload ID in the card wire
+    /// response; cloud plans must not be collapsed into a single PUT shape.
+    #[test]
+    fn card_upload_entry_preserves_cloud_storage_plans() {
+        let upload_id = UploadId::from_uuid(Uuid::now_v7());
+        let plans = [
+            UploadPlan::S3Multipart {
+                part_count: 2,
+                part_size_bytes: 8,
+                part_url_ttl_secs: 60,
+                required_headers: Vec::new(),
+            },
+            UploadPlan::GcsResumable {
+                session_uri: "https://storage.googleapis.com/session".to_owned(),
+                chunk_size_bytes: 8,
+            },
+            UploadPlan::AzureBlockBlob {
+                sas_url: "https://blob.core.windows.net/object?sas".to_owned(),
+                block_size_bytes: 8,
+                block_count_planned: 2,
+            },
+        ];
+
+        for plan in plans {
+            let entry = card_upload_entry("weights.bin", upload_id.clone(), plan.clone())
+                .expect("test_setup: valid card upload entry");
+            assert_eq!(entry.upload_id, upload_id);
+            assert_eq!(entry.plan, plan);
+        }
     }
 }

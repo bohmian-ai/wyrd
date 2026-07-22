@@ -9,6 +9,9 @@ mod engine;
 mod error;
 mod handle;
 mod reads;
+mod saga;
 
 pub use handle::{CardSelector, Cards, LoadedCard};
-pub use wyrd_spec::registry::{CardSummary, ListCardsRequest, ListCardsResponse};
+pub use wyrd_spec::registry::{
+    CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,
+};

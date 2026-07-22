@@ -12,7 +12,10 @@
 use std::path::Path;
 
 use wyrd_client::WyrdClient;
-use wyrd_spec::storage::{DownloadPlan, UploadPlan};
+use wyrd_spec::storage::{
+    DownloadPlan, PartUrlResponse, UploadCompleteRequest, UploadCompleteResponse, UploadId,
+    UploadPlan,
+};
 
 pub mod download;
 pub mod error;
@@ -72,6 +75,50 @@ impl WyrdStorageClient {
         hooks: UploadHooks<'_>,
     ) -> Result<UploadOutcome, StorageClientError> {
         upload::dispatch(&self.client, plan, source, hooks).await
+    }
+
+    /// Mint one S3 multipart part URL through the authenticated Wyrd server.
+    ///
+    /// The returned URL is provider-presigned and must be used without Wyrd
+    /// credentials. The storage service remains responsible for tenant checks
+    /// and validating the part against the durable upload row.
+    ///
+    /// # Errors
+    /// Returns a structured server error when the upload is missing, expired,
+    /// or is not an S3 multipart upload.
+    pub async fn part_url(
+        &self,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<String, StorageClientError> {
+        let path = format!("/v1/cards/upload/{upload_id}/part-url?part_number={part_number}");
+        let response: PartUrlResponse = self
+            .client
+            .request_json(reqwest::Method::POST, &path, None::<&()>)
+            .await
+            .map_err(crate::error::from_authenticated)?;
+        Ok(response.url)
+    }
+
+    /// Complete a server-owned upload after the backend accepted its bytes.
+    ///
+    /// S3 multipart and Azure block uploads require this call to commit their
+    /// backend state. The server then verifies the stored object and advances
+    /// the durable upload row.
+    ///
+    /// # Errors
+    /// Returns a structured server error when completion fails validation,
+    /// backend commit, object verification, or tenant authorization.
+    pub async fn complete(
+        &self,
+        upload_id: &UploadId,
+        request: &UploadCompleteRequest,
+    ) -> Result<UploadCompleteResponse, StorageClientError> {
+        let path = format!("/v1/cards/upload/{upload_id}/complete");
+        self.client
+            .request_json(reqwest::Method::POST, &path, Some(request))
+            .await
+            .map_err(crate::error::from_authenticated)
     }
 
     /// Download an artifact according to a server-minted plan.

@@ -10,6 +10,7 @@ use tracing::instrument;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::error::storage::WyrdStorageError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{
@@ -1207,6 +1208,12 @@ async fn persist_completed_upload(
     multipart_uploads::mark_completed(conn, upload_uuid)
         .await
         .map_err(|error| map_sql_error(&error))?;
+    if let Ok(card_uid) = CardUid::new(&row.card_uid) {
+        // Registration manifests are an optional owner of a storage upload.
+        // Generic storage callers still succeed when no manifest row exists;
+        // registered Card completion gets the durable verification marker.
+        wyrd_sql::queries::cards::mark_manifest_verified(conn, &card_uid, upload_uuid).await?;
+    }
     audit::write(
         conn,
         caller,

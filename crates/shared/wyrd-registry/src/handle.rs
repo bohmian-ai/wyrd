@@ -6,6 +6,7 @@ use std::sync::Arc;
 use secrecy::SecretString;
 use tempfile::TempDir;
 use wyrd_client::WyrdClient;
+use wyrd_loader::RegistrationInput;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -157,6 +158,21 @@ impl Cards {
         Self {
             engine: RegistryEngine::new(client),
         }
+    }
+
+    /// Register a loader-produced composite input and drive its private
+    /// artifact transfer and server-owned completion lifecycle.
+    ///
+    /// Native language card holders lower into this input at their language
+    /// adapter boundary. Local source paths are consumed only by the private
+    /// saga and never enter the request body.
+    pub async fn register(
+        &self,
+        input: &RegistrationInput,
+    ) -> Result<crate::RegistrationReceipt, WyrdError> {
+        crate::saga::register(&self.engine, input)
+            .await
+            .map_err(Into::into)
     }
 
     /// Fetch one Card envelope using exact or latest selector semantics.

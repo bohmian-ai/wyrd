@@ -4,7 +4,7 @@ use std::sync::Arc;
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
-use wiremock::matchers::{body_bytes, header, header_exists, method, path};
+use wiremock::matchers::{body_bytes, header, header_exists, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -12,7 +12,9 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
-use wyrd_spec::storage::{HeaderPair, UploadPlan};
+use wyrd_spec::storage::{
+    AzureBlockBlobComplete, HeaderPair, UploadCompleteRequest, UploadId, UploadPlan,
+};
 use wyrd_storage_client::{
     ArtifactSource, PartUrlMinter, UploadHooks, UploadOutcome, WyrdStorageClient,
 };
@@ -45,6 +47,54 @@ fn wyrd(base_url: String) -> WyrdClient {
     )
     .expect("transport builds");
     WyrdClient::from_parts(auth, transport, config.grpc)
+}
+
+#[tokio::test]
+async fn server_owned_part_urls_and_completion_use_upload_id_routes() {
+    let server = MockServer::start().await;
+    let wyrd = wyrd(server.uri());
+    let storage = WyrdStorageClient::new(&wyrd);
+    let upload_id = UploadId::new();
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/cards/upload/{upload_id}/part-url")))
+        .and(query_param("part_number", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "url": "https://s3.example/part-2",
+            "ttl_secs": 60
+        })))
+        .mount(&server)
+        .await;
+    assert_eq!(
+        storage
+            .part_url(&upload_id, 2)
+            .await
+            .expect("part URL request succeeds"),
+        "https://s3.example/part-2"
+    );
+
+    Mock::given(method("POST"))
+        .and(path(format!("/v1/cards/upload/{upload_id}/complete")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "stored": {
+                "storage_path": "tenant/card/object",
+                "size_bytes": 8,
+                "sha256": "digest",
+                "content_type": null,
+                "sse_marker": null,
+                "created_at": "2026-01-01T00:00:00Z"
+            }
+        })))
+        .mount(&server)
+        .await;
+    let completed = storage
+        .complete(
+            &upload_id,
+            &UploadCompleteRequest::AzureBlockBlob(AzureBlockBlobComplete { block_count: 1 }),
+        )
+        .await
+        .expect("server completion request succeeds");
+    assert_eq!(completed.stored.size_bytes, 8);
 }
 
 #[tokio::test]

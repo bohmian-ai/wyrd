@@ -42,9 +42,9 @@ use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
-    CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadPlan, CreateCardRequest,
-    CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
-    ListVersionsResponse, PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind,
+    CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan,
+    CreateCardRequest, CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest,
+    ListCardsResponse, ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind,
     RegistrationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
@@ -160,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<ArtifactManifestEntry>(out, golden, "artifact_manifest_entry")?;
     write::<CardRegistrationOutcome>(out, golden, "card_registration_outcome")?;
     write::<CardUploadPlan>(out, golden, "card_upload_plan")?;
-    write::<PresignedUpload>(out, golden, "presigned_upload")?;
+    write::<CardUploadEntry>(out, golden, "card_upload_entry")?;
     write::<CreateCardRequest>(out, golden, "create_card_request")?;
     write::<CreateCardResponse>(out, golden, "create_card_response")?;
     write::<RegistrationReplaySeed>(out, golden, "registration_replay_seed")?;

@@ -413,6 +413,32 @@ pub async fn mark_completed(conn: &mut TenantConn<'_>, id: Uuid) -> Result<(), S
     ensure_one_row(result.rows_affected(), "mark upload completed")
 }
 
+/// Mark a pending upload completed when the owning workflow verified the object.
+///
+/// This is intentionally idempotent so a Card completion retry can race with
+/// the standalone storage completion route without turning a successful upload
+/// into a lifecycle error.
+pub async fn mark_completed_if_pending(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<(), SqlError> {
+    sqlx::query(
+        r#"
+        UPDATE wyrd.storage_multipart_uploads
+        SET status = 'completed',
+            completed_at = now()
+        WHERE id = $1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(())
+}
+
 /// Mark an upload as aborted.
 ///
 /// # Errors

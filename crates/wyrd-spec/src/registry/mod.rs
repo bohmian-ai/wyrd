@@ -15,6 +15,6 @@ pub use reads::{
 };
 pub use submission::{
     ArtifactManifestEntry, CardRegistrationOutcome, CardSubmission, CardUploadPlan,
-    CreateCardRequest, CreateCardResponse, RegistrationReplaySeed,
+    CreateCardRequest, CreateCardResponse, RegistrationReceipt, RegistrationReplaySeed,
 };
-pub use upload::{HttpMethod, PresignedUpload};
+pub use upload::CardUploadEntry;

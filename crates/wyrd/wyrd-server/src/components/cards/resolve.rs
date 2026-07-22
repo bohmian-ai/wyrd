@@ -93,9 +93,7 @@ fn validate_and_collect_refs(
                 }
             },
             SlotValue::InlineablePrompt(reference) => match reference {
-                wyrd_spec::reference::InlineableRef::Ref(card_ref) => {
-                    output.push(card_ref.clone());
-                }
+                wyrd_spec::reference::InlineableRef::Ref(card_ref) => output.push(card_ref.clone()),
                 wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
                     result = validate_sibling(sibling, siblings);
                 }
@@ -281,7 +279,7 @@ fn display_ref(card_ref: &CardRef) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use uuid::Uuid;
     use wyrd_semver::{VersionBlock, VersionSpec};
@@ -291,7 +289,9 @@ mod tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::CardSubmission;
 
-    use super::{bind_card_references, collect_card_refs, sibling_identities};
+    use super::{
+        bind_card_references, collect_card_refs, sibling_identities, validate_and_collect_refs,
+    };
 
     fn prompt_ref(name: &str) -> CardRef {
         CardRef {
@@ -359,6 +359,23 @@ mod tests {
             }),
         )
         .expect("test_setup: sibling service spec is valid")
+    }
+
+    #[test]
+    fn sibling_prompt_reference_is_not_external() {
+        let prompt = prompt_ref("child");
+        let spec = Spec::from_kind_and_value(
+            &CardKind::Agent,
+            serde_json::json!({"prompt": {"sibling": prompt.clone()}}),
+        )
+        .expect("test_setup: sibling agent spec is valid");
+        let siblings = BTreeSet::from([prompt.identity_key()]);
+        let mut refs = Vec::new();
+
+        validate_and_collect_refs(&spec, &siblings, &mut refs)
+            .expect("test_setup: sibling prompt is accepted");
+
+        assert!(refs.is_empty());
     }
 
     #[test]

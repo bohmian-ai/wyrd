@@ -7,7 +7,7 @@ use crate::api_version::ApiVersion;
 use crate::envelope::{CardKind, Metadata};
 use crate::reference::CardRef;
 use crate::registry::{
-    CardLifecycleStatus, PresignedUpload, RegistrationOutcomeKind, RelativeArtifactPath,
+    CardLifecycleStatus, CardUploadEntry, RegistrationOutcomeKind, RelativeArtifactPath,
 };
 
 /// One card submitted for registration.
@@ -87,8 +87,8 @@ pub struct CardRegistrationOutcome {
 pub struct CardUploadPlan {
     /// Card whose submission declared the artifact manifest.
     pub card_ref: CardRef,
-    /// One presigned upload per manifest entry.
-    pub entries: Vec<PresignedUpload>,
+    /// One server-minted upload per manifest entry.
+    pub entries: Vec<CardUploadEntry>,
 }
 
 /// Composite registration response.
@@ -102,6 +102,29 @@ pub struct CreateCardResponse {
     pub outcomes: Vec<CardRegistrationOutcome>,
     /// Upload plans for artifact-bearing submissions.
     pub upload_plans: Vec<CardUploadPlan>,
+}
+
+/// Public SDK receipt after the engine completes all required side effects.
+///
+/// Upload plans and operation identifiers remain internal to the registration
+/// engine and are intentionally absent from this projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct RegistrationReceipt {
+    /// Server-derived graph root.
+    pub root: CardRef,
+    /// Dependency-first server outcomes with final lifecycle state.
+    pub outcomes: Vec<CardRegistrationOutcome>,
+}
+
+impl From<CreateCardResponse> for RegistrationReceipt {
+    fn from(response: CreateCardResponse) -> Self {
+        Self {
+            root: response.root,
+            outcomes: response.outcomes,
+        }
+    }
 }
 
 /// Durable registration replay data used to mint upload URLs on demand.
@@ -119,7 +142,7 @@ pub struct RegistrationReplaySeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardSubmission, CreateCardRequest, CreateCardResponse};
+    use super::{CardSubmission, CreateCardRequest, CreateCardResponse, RegistrationReceipt};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
@@ -197,5 +220,21 @@ mod tests {
             CardLifecycleStatus::Pending,
             RegistrationOutcomeKind::Registered,
         );
+    }
+
+    #[test]
+    fn registration_receipt_excludes_internal_upload_plans() {
+        let response = CreateCardResponse {
+            root: serde_json::from_value(json!({
+                "kind": "Audit", "name": "audit-a", "space": "default", "version": "1.0.0"
+            }))
+            .expect("card ref deserializes"),
+            outcomes: Vec::new(),
+            upload_plans: Vec::new(),
+        };
+        let receipt = RegistrationReceipt::from(response);
+        let value = serde_json::to_value(receipt).expect("receipt serializes");
+        assert!(value.get("upload_plans").is_none());
+        assert!(value.get("operation_id").is_none());
     }
 }

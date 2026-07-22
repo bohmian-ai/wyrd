@@ -208,14 +208,16 @@ async fn export_traces(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = match &state.scribe {
-        Some(scribe) => {
-            vala_ingest::ingest_resource_spans_to_scribe(&state.bifrost, scribe, &auth, request)
-                .await
-        }
-        None => vala_ingest::ingest_resource_spans(&state.bifrost, &auth, request).await,
-    }
-    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
+    let gate = state.gate.as_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "Bifrost Gate is not available".to_owned(),
+            details: serde_json::Value::Null,
+        })
+    })?;
+    let outcome = gate
+        .ingest_resource_spans(&auth, request)
+        .await
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Traces))?;
 
     tracing::Span::current().record("accepted_spans", outcome.accepted_spans);
     tracing::Span::current().record("rejected_spans", outcome.rejected_spans);
@@ -249,14 +251,16 @@ async fn export_metrics(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = match &state.scribe {
-        Some(scribe) => {
-            vala_ingest::ingest_resource_metrics_to_scribe(&state.bifrost, scribe, &auth, request)
-                .await
-        }
-        None => vala_ingest::ingest_resource_metrics(&state.bifrost, &auth, request).await,
-    }
-    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
+    let gate = state.gate.as_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "Bifrost Gate is not available".to_owned(),
+            details: serde_json::Value::Null,
+        })
+    })?;
+    let outcome = gate
+        .ingest_resource_metrics(&auth, request)
+        .await
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Metrics))?;
 
     tracing::Span::current().record("accepted_points", outcome.accepted_points);
     tracing::Span::current().record("rejected_points", outcome.rejected_points);
@@ -290,14 +294,16 @@ async fn export_logs(
         .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
     let auth = caller_auth_context(&caller);
 
-    let outcome = match &state.scribe {
-        Some(scribe) => {
-            vala_ingest::ingest_resource_logs_to_scribe(&state.bifrost, scribe, &auth, request)
-                .await
-        }
-        None => vala_ingest::ingest_resource_logs(&state.bifrost, &auth, request).await,
-    }
-    .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
+    let gate = state.gate.as_ref().ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::ServiceUnavailable {
+            message: "Bifrost Gate is not available".to_owned(),
+            details: serde_json::Value::Null,
+        })
+    })?;
+    let outcome = gate
+        .ingest_resource_logs(&auth, request)
+        .await
+        .map_err(|e| ingest_error_to_response(e, OtlpSignal::Logs))?;
 
     tracing::Span::current().record("accepted_records", outcome.accepted_records);
     tracing::Span::current().record("rejected_records", outcome.rejected_records);

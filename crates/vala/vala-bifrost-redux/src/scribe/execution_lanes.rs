@@ -29,7 +29,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::system_columns::{
     CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 #[cfg(test)]
@@ -47,6 +47,7 @@ pub(crate) struct ScribeIngressCpuPool {
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
+    saturation_events: Arc<AtomicU64>,
     capacity: usize,
 }
 
@@ -70,6 +71,7 @@ impl ScribeIngressCpuPool {
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
+            saturation_events: Arc::new(AtomicU64::new(0)),
             capacity,
         }
     }
@@ -83,13 +85,12 @@ impl ScribeIngressCpuPool {
         request_id: RequestId,
         batch_id: uuid::Uuid,
     ) -> Result<RecordBatch, ScribeError> {
-        let permit =
-            self.permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| ScribeError::IngestBusy {
-                    table: "ingress".to_owned(),
-                })?;
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            self.saturation_events.fetch_add(1, Ordering::Relaxed);
+            return Err(ScribeError::IngestBusy {
+                table: "ingress".to_owned(),
+            });
+        };
         self.depth.fetch_add(1, Ordering::AcqRel);
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
@@ -125,8 +126,18 @@ impl ScribeIngressCpuPool {
         crate::scribe::telemetry::ExecutorSnapshot {
             depth: self.depth.load(Ordering::Acquire),
             capacity: self.capacity,
-            saturation_events: 0,
+            saturation_events: self.saturation_events.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(test)]
+    fn worker_name(&self) -> String {
+        self.pool.install(|| {
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned()
+        })
     }
 }
 
@@ -166,11 +177,13 @@ fn decode(
     for field in rows.schema().fields() {
         let reserved = match field.name().as_str() {
             CARD_UID | PRINCIPAL_ID | "run_id" | DATA_TENANT_ID | WYRD_BATCH_ID
-            | WYRD_INGESTED_AT => true,
+            | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
             WYRD_EVENT_TIME => native_payload,
             _ => false,
         };
-        if reserved {
+        let projected_correlation =
+            !native_payload && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
+        if reserved && !projected_correlation {
             return Err(ScribeError::Internal {
                 detail: format!(
                     "reserved system column supplied by client: {}",
@@ -186,7 +199,7 @@ fn decode(
         });
     }
     validate_card_scope(&rows, principal)?;
-    stamp_correlation_columns(&rows, principal, request_id, batch_id)
+    stamp_correlation_columns(&rows, principal, request_id, batch_id, native_payload)
 }
 
 fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
@@ -241,11 +254,13 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     principal: &Principal,
-    _request_id: &RequestId,
+    request_id: &RequestId,
     batch_id: uuid::Uuid,
+    native_payload: bool,
 ) -> Result<RecordBatch, ScribeError> {
     let row_count = rows.num_rows();
-    let server_owned = server_owned_columns();
+    let stamp_event_time = native_payload || rows.schema().index_of(WYRD_EVENT_TIME).is_err();
+    let server_owned = server_owned_columns(stamp_event_time);
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
@@ -254,7 +269,18 @@ fn stamp_correlation_columns(
         principal.id.to_string();
         row_count
     ])));
-    append_system_columns(&mut fields, &mut columns, principal, batch_id, row_count)?;
+    columns.push(Arc::new(StringArray::from(vec![
+        request_id.as_str();
+        row_count
+    ])));
+    append_system_columns(
+        &mut fields,
+        &mut columns,
+        principal,
+        batch_id,
+        row_count,
+        stamp_event_time,
+    )?;
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
         ScribeError::Internal {
             detail: format!("correlation stamping failed: {error}"),
@@ -262,16 +288,20 @@ fn stamp_correlation_columns(
     })
 }
 
-fn server_owned_columns() -> [&'static str; 7] {
-    [
+fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
+    let mut columns = vec![
         CARD_REF,
         CARD_UID,
         PRINCIPAL_ID,
-        WYRD_EVENT_TIME,
+        WYRD_REQUEST_ID,
         WYRD_INGESTED_AT,
         WYRD_BATCH_ID,
         DATA_TENANT_ID,
-    ]
+    ];
+    if native_payload {
+        columns.push(WYRD_EVENT_TIME);
+    }
+    columns
 }
 
 fn user_fields(rows: &RecordBatch, server_owned: &[&str]) -> Vec<Field> {
@@ -342,15 +372,21 @@ fn append_system_columns(
     principal: &Principal,
     batch_id: uuid::Uuid,
     row_count: usize,
+    native_payload: bool,
 ) -> Result<(), ScribeError> {
     fields.extend([
         Field::new(CARD_UID, DataType::Utf8, true),
         Field::new(PRINCIPAL_ID, DataType::Utf8, false),
-        Field::new(
+        Field::new(WYRD_REQUEST_ID, DataType::Utf8, false),
+    ]);
+    if native_payload {
+        fields.push(Field::new(
             WYRD_EVENT_TIME,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
-        ),
+        ));
+    }
+    fields.extend([
         Field::new(
             WYRD_INGESTED_AT,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -372,7 +408,9 @@ fn append_system_columns(
     let timestamp_array =
         Arc::new(TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"))
             as ArrayRef;
-    columns.push(Arc::clone(&timestamp_array));
+    if native_payload {
+        columns.push(Arc::clone(&timestamp_array));
+    }
     columns.push(timestamp_array);
     let mut batch_id_builder = FixedSizeBinaryBuilder::with_capacity(row_count, 16);
     for _ in 0..row_count {
@@ -523,6 +561,16 @@ impl ScribePostAckCpuPool {
             capacity: self.capacity,
             saturation_events: self.saturation_events.load(Ordering::Relaxed),
         }
+    }
+
+    #[cfg(test)]
+    fn worker_name(&self) -> String {
+        self.pool.install(|| {
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned()
+        })
     }
 }
 
@@ -694,6 +742,16 @@ impl ScribeWalIoPool {
             saturation_events: self.saturation_events.load(Ordering::Relaxed),
         }
     }
+
+    #[cfg(test)]
+    fn worker_name(&self) -> String {
+        self.pool.install(|| {
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned()
+        })
+    }
 }
 
 fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> {
@@ -721,4 +779,197 @@ fn replace_manifest(path: &PathBuf, contents: &[u8]) -> Result<(), ScribeError> 
             })?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
+    use uuid::Uuid;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::DataTenantId;
+    use wyrd_spec::reference::{CardRef, CardRefScope};
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::system_columns::{
+        CARD_REF, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
+        WYRD_REQUEST_ID,
+    };
+
+    use super::{
+        ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool, decode,
+        source_schema_fingerprint,
+    };
+    use crate::contracts::IngressPayload;
+
+    fn principal() -> Principal {
+        Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::User,
+            DataTenantId::SYSTEM_OWNER,
+            Vec::new(),
+            PermissionSet::new(),
+        )
+    }
+
+    fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("test batch")
+    }
+
+    #[test]
+    fn ingress_cpu_runs_on_named_rayon_thread() {
+        assert!(
+            ScribeIngressCpuPool::new(1)
+                .worker_name()
+                .starts_with("wyrd-scribe-ingress-cpu-")
+        );
+    }
+
+    #[test]
+    fn post_ack_cpu_runs_on_separate_named_rayon_thread() {
+        assert!(
+            ScribePostAckCpuPool::new(1)
+                .worker_name()
+                .starts_with("wyrd-scribe-post-ack-cpu-")
+        );
+    }
+
+    #[test]
+    fn wal_io_runs_on_separate_named_rayon_thread() {
+        assert!(
+            ScribeWalIoPool::new(1)
+                .worker_name()
+                .starts_with("wyrd-scribe-wal-io-")
+        );
+    }
+
+    #[test]
+    fn reserved_columns_reject_before_writer_admission() {
+        let rows = batch(
+            vec![Field::new("run_id", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec!["client-run"]))],
+        );
+        let mut payload = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut payload, &rows.schema())
+                .expect("IPC writer initializes");
+            writer.write(&rows).expect("IPC batch writes");
+            writer.finish().expect("IPC writer finishes");
+        }
+        let error = decode(
+            IngressPayload::ArrowIpc(payload.into()),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("run_id is server-owned");
+        assert!(matches!(
+            error,
+            crate::contracts::ScribeError::Internal { .. }
+        ));
+    }
+
+    #[test]
+    fn card_scope_rejects_before_writer_admission() {
+        let card = CardRef::from_str("prod/Service/billing@1.0.0").expect("card");
+        let principal = Principal::new(
+            PrincipalId::new(Uuid::now_v7()),
+            PrincipalKind::Service {
+                card_ref: card.clone(),
+                card_ref_scope: CardRefScope::own(&card),
+            },
+            DataTenantId::SYSTEM_OWNER,
+            Vec::new(),
+            PermissionSet::new(),
+        );
+        let rows = batch(
+            vec![Field::new(CARD_REF, DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![
+                "prod/Service/other@1.0.0",
+            ]))],
+        );
+        let error = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal,
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("card outside scope");
+        assert!(matches!(
+            error,
+            crate::contracts::ScribeError::Internal { .. }
+        ));
+    }
+
+    #[test]
+    fn schema_fields_map_by_name_not_position() {
+        let rows = batch(
+            vec![
+                Field::new("second", DataType::Int64, false),
+                Field::new("first", DataType::Int64, false),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![2_i64])),
+                Arc::new(Int64Array::from(vec![1_i64])),
+            ],
+        );
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("schema is valid");
+        assert_eq!(decoded.schema().field(0).name(), "second");
+        assert_eq!(decoded.schema().field(1).name(), "first");
+        assert_eq!(
+            decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2
+        );
+        assert_eq!(
+            decoded
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+    }
+
+    #[test]
+    fn data_tenant_and_request_columns_are_server_stamped() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        );
+        let batch_id = Uuid::now_v7();
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            batch_id,
+        )
+        .expect("schema is valid");
+        assert!(decoded.schema().index_of(DATA_TENANT_ID).is_ok());
+        assert!(decoded.schema().index_of(PRINCIPAL_ID).is_ok());
+        assert!(decoded.schema().index_of(WYRD_BATCH_ID).is_ok());
+        assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
+        assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
+        assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
+    }
 }

@@ -19,6 +19,8 @@ mod pg_tests {
     use chrono::Duration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tower::ServiceExt;
+    use vala_bifrost_redux::scribe::{ScribeImpl, wal::WalWriter};
+    use vala_ingest::{IngestLimits, ingest_auth_interceptor};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -64,16 +66,39 @@ mod pg_tests {
             ),
             WyrdAuthVerifySettings::default(),
         ));
-        AppState::new(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            support::test_catalog().await,
-        )
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let catalog = support::test_catalog().await;
+        let wal_root = tempfile::tempdir().expect("wal temp dir");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                DataTenantId::SYSTEM_OWNER,
+                None,
+            )
+            .expect("wal initializes"),
+        );
+        let scribe = Arc::new(ScribeImpl::new_with_deps(
+            Arc::new(storage.operator().clone()),
+            wal,
+            uuid::Uuid::now_v7().to_string(),
+            1,
+        ));
+        let gate = Arc::new(wyrd_server::bifrost::gate::Gate::with_scribe(
+            Arc::clone(&catalog),
+            Arc::clone(&scribe),
+            ingest_auth_interceptor(Arc::clone(&verifier)),
+            IngestLimits::default(),
+        ));
+        AppState::new(postgres, storage, catalog)
+            .with_scribe(scribe)
+            .with_gate(gate)
+            .with_auth(ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..ServerAuth::default()
+            })
     }
 
     fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {

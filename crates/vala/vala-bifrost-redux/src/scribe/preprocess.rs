@@ -10,7 +10,7 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
-use crate::scribe::admission::AdmissionReservation;
+use crate::scribe::admission::RetainedFrameReservation;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
 use crate::scribe::wal::encode_append_frame_with_sequence;
@@ -26,7 +26,7 @@ pub(crate) struct AdmittedAppend {
     pub rows: RecordBatch,
     pub measured_wire_bytes: usize,
     pub admitted_bytes: usize,
-    pub reservation: AdmissionReservation,
+    pub reservation: RetainedFrameReservation,
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub queued_at: Instant,
@@ -38,7 +38,7 @@ pub(crate) struct PreparedAppend {
     pub request_id: RequestId,
     pub batch_id: Uuid,
     pub slices: Vec<PreparedSlice>,
-    pub reservation: AdmissionReservation,
+    pub reservation: RetainedFrameReservation,
     pub queue_wait_us: u64,
 }
 

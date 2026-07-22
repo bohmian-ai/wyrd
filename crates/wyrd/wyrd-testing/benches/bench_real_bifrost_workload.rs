@@ -5,7 +5,7 @@ use std::error::Error;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::TableRef;
@@ -108,7 +108,7 @@ async fn run_preflight() -> Result<(), BenchError> {
             roles: Vec::new(),
             effective_permissions: PermissionSet::new(),
         };
-        let rows = make_batch(1_000, tenant, 0)?;
+        let rows = make_batch(1_000, 0)?;
         let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
         scribe
             .append(ScribeAppend {
@@ -354,7 +354,7 @@ async fn run_phase(
                 tokio::select! {
                     _ = phase_stop.cancelled() => break,
                     _ = ticker.tick() => {
-                        let batch = make_batch(batch_rows, tenant, sequence)?;
+                        let batch = make_batch(batch_rows, sequence)?;
                         let schema_fingerprint =
                             SchemaFingerprint::from_arrow_schema(batch.schema().as_ref());
                         sequence = sequence.saturating_add(1);
@@ -973,11 +973,7 @@ fn phases(integrated: bool) -> Vec<PhaseSpec> {
     ]
 }
 
-fn make_batch(
-    rows: usize,
-    tenant: wyrd_spec::DataTenantId,
-    sequence: u64,
-) -> Result<RecordBatch, arrow::error::ArrowError> {
+fn make_batch(rows: usize, sequence: u64) -> Result<RecordBatch, arrow::error::ArrowError> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
@@ -985,7 +981,6 @@ fn make_batch(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".to_owned().into())),
             false,
         ),
-        Field::new("data_tenant_id", DataType::Utf8, false),
     ]));
     let now = chrono::Utc::now().timestamp_micros();
     RecordBatch::try_new(
@@ -1009,7 +1004,6 @@ fn make_batch(
                 )
                 .with_timezone("UTC"),
             ),
-            Arc::new(StringArray::from(vec![tenant.to_string(); rows])),
         ],
     )
 }

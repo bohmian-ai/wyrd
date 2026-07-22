@@ -64,14 +64,14 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
-    /// Optional queued Redux Scribe ingest runtime. Test states may retain the
-    /// legacy catalog-only path when no local WAL is configured.
-    pub scribe: Option<Arc<ScribeImpl>>,
+    /// Private lifecycle handle for the booted Scribe runtime. Request handlers
+    /// use `gate`; this field exists only for startup recovery and shutdown.
+    pub(crate) scribe: Option<Arc<ScribeImpl>>,
     /// Fully constructed native Bifrost Gate. Production boot installs this
     /// before any listener can bind; test-only states may leave it absent.
     pub gate: Option<Arc<ServerGate>>,
     /// Dedicated Tokio runtime that owns Scribe coordination consumers.
-    pub scribe_coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    pub(crate) scribe_coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Shared Redux Forge context built from the process-wide catalog and storage.
     pub forge_context: Option<Arc<ForgeContext>>,
     /// Interval used by the supervised Forge worker.
@@ -238,6 +238,26 @@ impl AppState {
     pub fn with_forge_interval(mut self, interval: Duration) -> Self {
         self.forge_interval = interval;
         self
+    }
+
+    /// Flush the private Scribe runtime for the test harness only.
+    #[cfg(feature = "test-support")]
+    pub async fn flush_scribe_for_test(
+        &self,
+        mut conn: vala_sql::TenantConn<'_>,
+    ) -> Result<(), vala_bifrost_redux::contracts::ScribeError> {
+        let Some(scribe) = &self.scribe else {
+            return Err(vala_bifrost_redux::contracts::ScribeError::Internal {
+                detail: "Scribe is not configured".to_owned(),
+            });
+        };
+        let post_commit = scribe.force_seal(&mut conn).await?;
+        conn.commit().await.map_err(|error| {
+            vala_bifrost_redux::contracts::ScribeError::Internal {
+                detail: error.to_string(),
+            }
+        })?;
+        scribe.complete_post_commit(post_commit)
     }
 }
 

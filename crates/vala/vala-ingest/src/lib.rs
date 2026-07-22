@@ -17,12 +17,9 @@ pub mod orchestrator;
 
 pub use auth::{AuthContext, IngestAuthInterceptor, ingest_auth_interceptor};
 pub use collector::{
-    IngestOutcome, LogsOutcome, MetricsOutcome, OtlpLogsService, OtlpMetricsService,
-    OtlpTraceService, ingest_resource_logs, ingest_resource_logs_to_scribe,
-    ingest_resource_metrics, ingest_resource_metrics_to_scribe, ingest_resource_spans,
-    ingest_resource_spans_to_scribe,
+    IngestOutcome, LogsOutcome, MetricsOutcome, ingest_resource_logs_to_scribe,
+    ingest_resource_metrics_to_scribe, ingest_resource_spans_to_scribe,
 };
 pub use error::IngestError;
 pub use limits::{IngestLimits, StreamSemaphores};
-pub use orchestrator::run_ingest_to_scribe;
 pub use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};

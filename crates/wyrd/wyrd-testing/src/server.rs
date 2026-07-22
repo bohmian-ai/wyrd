@@ -17,6 +17,9 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
+use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::wal::WalWriter;
+use vala_ingest::{IngestLimits, ingest_auth_interceptor};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -72,6 +75,7 @@ struct WyrdTestServerInner {
     // Lifetime guard: only set for local-backend servers; cloud backends need no tempdir.
     #[allow(dead_code)]
     storage_root: Option<Arc<tempfile::TempDir>>,
+    _scribe_wal_root: Arc<tempfile::TempDir>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -227,6 +231,23 @@ impl WyrdTestServer {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
         Ok(())
+    }
+
+    /// Flush the server-owned Scribe through its normal post-commit seal path.
+    ///
+    /// This is intentionally test-tier only: production callers use the
+    /// generation and shutdown coordinators rather than reaching into Scribe.
+    ///
+    /// # Errors
+    /// Returns an error when the server has no Scribe or the seal transaction
+    /// cannot be committed.
+    pub async fn flush_bifrost(&self) -> Result<(), WyrdTestServerError> {
+        let conn = self.tenant_conn().await?;
+        self.inner
+            .state
+            .flush_scribe_for_test(conn)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Return the base URL when bound to a real socket.
@@ -1201,9 +1222,37 @@ impl WyrdTestServerBuilder {
             ForgeConfig::default(),
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let scribe_wal_root = Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
+        let node_id = Uuid::now_v7();
+        let wal = Arc::new(
+            WalWriter::new(
+                scribe_wal_root.path(),
+                *node_id.as_bytes(),
+                1,
+                tenant_id,
+                None,
+            )
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
+        let scribe = Arc::new(ScribeImpl::new_with_deps(
+            Arc::new(storage.operator().clone()),
+            wal,
+            node_id.to_string(),
+            1,
+        ));
+        let gate = Arc::new(wyrd_server::bifrost::gate::Gate::with_scribe(
+            Arc::clone(&bifrost),
+            Arc::clone(&scribe),
+            ingest_auth_interceptor(Arc::clone(&verifier)),
+            IngestLimits::default(),
+        ));
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_forge_context(forge_context)
             .with_forge_interval(self.forge_interval)
+            .with_scribe(scribe)
+            .with_gate(gate)
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
@@ -1227,6 +1276,7 @@ impl WyrdTestServerBuilder {
             inner: WyrdTestServerInner {
                 fixture,
                 storage_root,
+                _scribe_wal_root: scribe_wal_root,
                 state,
                 router,
                 verifier,

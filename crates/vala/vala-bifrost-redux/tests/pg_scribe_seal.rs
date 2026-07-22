@@ -9,7 +9,7 @@ mod pg_tests {
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
-    use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+    use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::DateTime;
     use opendal::services::Memory;
@@ -70,9 +70,8 @@ mod pg_tests {
         (fixture, tenant, scribe)
     }
 
-    fn make_batch(row_count: usize, base_time_micros: i64, tenant: DataTenantId) -> RecordBatch {
+    fn make_batch(row_count: usize, base_time_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -87,12 +86,9 @@ mod pg_tests {
         let values: Vec<u64> = (0..row_count)
             .map(|i| u64::try_from(i).expect("bounded row index"))
             .collect();
-        let tenant_ids = vec![tenant.to_string(); row_count];
-
         RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],
@@ -127,7 +123,7 @@ mod pg_tests {
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
-        let batch = make_batch(50_000, base_time, tenant);
+        let batch = make_batch(50_000, base_time);
         let principal = principal_for_tenant(tenant);
         let fingerprint = schema_fingerprint(&batch);
 
@@ -240,7 +236,7 @@ mod pg_tests {
             .unwrap()
             .timestamp_micros();
         for i in 0..3 {
-            let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
+            let batch = make_batch(1000, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
             let fingerprint = schema_fingerprint(&batch);
@@ -353,7 +349,6 @@ mod pg_tests {
             .timestamp_micros();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -376,12 +371,9 @@ mod pg_tests {
             timestamps.push(day2_time + ((i - 60) * 100_000));
             values.push(u64::try_from(i).expect("bounded row index"));
         }
-        let tenant_ids = vec![tenant.to_string(); timestamps.len()];
-
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],

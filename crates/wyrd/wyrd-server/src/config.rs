@@ -153,6 +153,161 @@ pub struct ServeConfig {
     pub mode: ServeMode,
 }
 
+/// Boot-time bounds and execution-lane sizing for Scribe.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScribeRuntimeConfig {
+    /// Tokio coordination worker count.
+    #[serde(default = "default_scribe_coordination_threads")]
+    pub coordination_threads: usize,
+    /// Ingress CPU worker count.
+    #[serde(default = "default_scribe_ingress_cpu_threads")]
+    pub ingress_cpu_threads: usize,
+    /// Post-ACK CPU worker count.
+    #[serde(default = "default_scribe_post_ack_cpu_threads")]
+    pub post_ack_cpu_threads: usize,
+    /// WAL IO worker count.
+    #[serde(default = "default_scribe_wal_io_threads")]
+    pub wal_io_threads: usize,
+    /// Global ingress item capacity.
+    #[serde(default = "default_scribe_ingress_queue_items")]
+    pub ingress_queue_items: usize,
+    /// Global ingress byte capacity.
+    #[serde(default = "default_scribe_ingress_queue_bytes")]
+    pub ingress_queue_bytes: usize,
+    /// Pod-global retained frame item capacity.
+    #[serde(default = "default_scribe_retained_frame_items")]
+    pub retained_frame_items: usize,
+    /// Pod-global retained frame byte capacity.
+    #[serde(default = "default_scribe_retained_frame_bytes")]
+    pub retained_frame_bytes: usize,
+    /// Post-ACK CPU submission capacity.
+    #[serde(default = "default_scribe_post_ack_queue_items")]
+    pub post_ack_queue_items: usize,
+    /// WAL IO submission capacity.
+    #[serde(default = "default_scribe_wal_io_queue_items")]
+    pub wal_io_queue_items: usize,
+    /// Per-writer data queue capacity.
+    #[serde(default = "default_scribe_writer_queue_items")]
+    pub writer_queue_items: usize,
+    /// Pod-global active writer limit.
+    #[serde(default = "default_scribe_active_writer_limit")]
+    pub active_writer_limit: usize,
+    /// Idle writer eviction TTL in seconds.
+    #[serde(default = "default_scribe_writer_idle_ttl_secs")]
+    pub writer_idle_ttl_secs: u64,
+}
+
+fn default_scribe_coordination_threads() -> usize {
+    2
+}
+
+fn default_scribe_ingress_cpu_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (available.saturating_sub(2).max(2) / 3).max(1)
+}
+
+fn default_scribe_post_ack_cpu_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let budget = available.saturating_sub(2).max(2);
+    budget
+        .saturating_sub(default_scribe_ingress_cpu_threads())
+        .max(1)
+}
+
+fn default_scribe_wal_io_threads() -> usize {
+    4
+}
+
+fn default_scribe_ingress_queue_items() -> usize {
+    256
+}
+
+fn default_scribe_ingress_queue_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+fn default_scribe_retained_frame_items() -> usize {
+    256
+}
+
+fn default_scribe_retained_frame_bytes() -> usize {
+    512 * 1024 * 1024
+}
+
+fn default_scribe_post_ack_queue_items() -> usize {
+    64
+}
+
+fn default_scribe_wal_io_queue_items() -> usize {
+    256
+}
+
+fn default_scribe_writer_queue_items() -> usize {
+    64
+}
+
+fn default_scribe_active_writer_limit() -> usize {
+    1024
+}
+
+fn default_scribe_writer_idle_ttl_secs() -> u64 {
+    600
+}
+
+impl Default for ScribeRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            coordination_threads: default_scribe_coordination_threads(),
+            ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
+            post_ack_cpu_threads: default_scribe_post_ack_cpu_threads(),
+            wal_io_threads: default_scribe_wal_io_threads(),
+            ingress_queue_items: default_scribe_ingress_queue_items(),
+            ingress_queue_bytes: default_scribe_ingress_queue_bytes(),
+            retained_frame_items: default_scribe_retained_frame_items(),
+            retained_frame_bytes: default_scribe_retained_frame_bytes(),
+            post_ack_queue_items: default_scribe_post_ack_queue_items(),
+            wal_io_queue_items: default_scribe_wal_io_queue_items(),
+            writer_queue_items: default_scribe_writer_queue_items(),
+            active_writer_limit: default_scribe_active_writer_limit(),
+            writer_idle_ttl_secs: default_scribe_writer_idle_ttl_secs(),
+        }
+    }
+}
+
+impl ScribeRuntimeConfig {
+    /// Validate that every configured bound can provide bounded operation.
+    pub fn validate(&self) -> Result<(), String> {
+        let thread_values = [
+            ("coordination_threads", self.coordination_threads),
+            ("ingress_cpu_threads", self.ingress_cpu_threads),
+            ("post_ack_cpu_threads", self.post_ack_cpu_threads),
+            ("wal_io_threads", self.wal_io_threads),
+            ("ingress_queue_items", self.ingress_queue_items),
+            ("post_ack_queue_items", self.post_ack_queue_items),
+            ("wal_io_queue_items", self.wal_io_queue_items),
+            ("writer_queue_items", self.writer_queue_items),
+            ("active_writer_limit", self.active_writer_limit),
+        ];
+        if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
+            return Err(format!("scribe.{name} must be at least 1"));
+        }
+        let min_bytes = 32 * 1024 * 1024;
+        for (name, value) in [
+            ("ingress_queue_bytes", self.ingress_queue_bytes),
+            ("retained_frame_bytes", self.retained_frame_bytes),
+        ] {
+            if value < min_bytes {
+                return Err(format!("scribe.{name} must be at least 33554432 bytes"));
+            }
+        }
+        if self.writer_idle_ttl_secs == 0 {
+            return Err("scribe.writer_idle_ttl_secs must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Prometheus metrics server configuration.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,6 +396,9 @@ pub struct WyrdServerConfig {
     /// Transport-selection configuration.
     #[serde(default)]
     pub serve: ServeConfig,
+    /// Bounded Scribe runtime and queue configuration.
+    #[serde(default)]
+    pub scribe: ScribeRuntimeConfig,
     /// Prometheus metrics server configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -893,6 +1051,10 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.scribe
+            .validate()
+            .map_err(|message| ConfigError::Invalid { message })?;
+
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
             return Err(ConfigError::BindCollision {
@@ -1288,6 +1450,36 @@ mod tests {
     fn default_config_validates() {
         let cfg = WyrdServerConfig::default();
         cfg.validate().expect("default config must be valid");
+    }
+
+    #[test]
+    fn scribe_runtime_defaults_match_bounded_contract() {
+        let cfg = ScribeRuntimeConfig::default();
+        assert_eq!(cfg.coordination_threads, 2);
+        assert_eq!(cfg.ingress_queue_items, 256);
+        assert_eq!(cfg.retained_frame_items, 256);
+        assert_eq!(cfg.post_ack_queue_items, 64);
+        assert_eq!(cfg.wal_io_queue_items, 256);
+        assert_eq!(cfg.writer_queue_items, 64);
+        assert_eq!(cfg.active_writer_limit, 1024);
+        assert_eq!(cfg.writer_idle_ttl_secs, 600);
+        cfg.validate().expect("resolved defaults must validate");
+    }
+
+    #[test]
+    fn scribe_runtime_rejects_zero_and_small_byte_bounds() {
+        let cfg = ScribeRuntimeConfig {
+            post_ack_queue_items: 0,
+            ..ScribeRuntimeConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ScribeRuntimeConfig {
+            post_ack_queue_items: 1,
+            ..ScribeRuntimeConfig::default()
+        };
+        cfg.retained_frame_bytes = 1024;
+        assert!(cfg.validate().is_err());
     }
 
     // ── 2. TOML with unknown legacy field fails with ParseToml ────────────────

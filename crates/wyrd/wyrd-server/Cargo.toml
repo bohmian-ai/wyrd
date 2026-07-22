@@ -10,6 +10,7 @@ authors = { workspace = true }
 [features]
 cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
+test-support = []
 
 [[bin]]
 name = "wyrd-server"

@@ -26,7 +26,8 @@ use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::scribe::admission::{
-    AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
+    AdmissionConfig, AdmissionController, IngressQueueBudget, IngressQueueConfig,
+    IngressQueueReservation, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
 use crate::scribe::execution_lanes::{ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool};
 use crate::scribe::memtable::Memtable;
@@ -36,9 +37,10 @@ use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFr
 use crate::scribe::telemetry::{ScribeRuntimeSnapshot, ScribeTelemetry};
 use crate::scribe::writer::TenantTableWriterRegistry;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot};
 use vala_sql::TenantConn;
 
 /// Memtable key for per-bucket row-count inspection.
@@ -58,6 +60,8 @@ pub struct ScribeLaneConfig {
     pub wal_io_threads: usize,
     /// Bounded ingress CPU submissions.
     pub ingress_queue_items: usize,
+    /// Bounded raw ingress bytes.
+    pub ingress_queue_bytes: usize,
     /// Bounded post-ACK CPU submissions.
     pub post_ack_queue_items: usize,
     /// Bounded WAL IO submissions.
@@ -82,6 +86,7 @@ impl ScribeLaneConfig {
             post_ack_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
             wal_io_threads: 4,
             ingress_queue_items: 256,
+            ingress_queue_bytes: 512 * 1024 * 1024,
             post_ack_queue_items: 64,
             wal_io_queue_items: 256,
         }
@@ -114,6 +119,8 @@ pub struct ScribeImpl {
     ingress_cpu: ScribeIngressCpuPool,
     /// Atomic get-or-create registry for tenant/table FIFO writers.
     registry: Arc<TenantTableWriterRegistry>,
+    /// Bounded global raw-ingress dispatcher.
+    ingress_queue: ScribeIngressQueue,
     /// Optional stage recorder used by benchmark and journey harnesses.
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
@@ -125,6 +132,110 @@ struct ScribeBuildConfig {
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
     ingress_cpu: ScribeIngressCpuPool,
+    ingress_queue_items: usize,
+    ingress_queue_bytes: usize,
+}
+
+struct IngressJob {
+    frame: ScribeIngressFrame,
+    reservation: IngressQueueReservation,
+    response: oneshot::Sender<Result<FrameAdmission, ScribeError>>,
+}
+
+#[derive(Debug)]
+struct ScribeIngressQueue {
+    sender: mpsc::Sender<IngressJob>,
+    budget: IngressQueueBudget,
+    telemetry: Arc<Mutex<Option<Arc<ScribeTelemetry>>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl ScribeIngressQueue {
+    fn new(
+        items: usize,
+        bytes: usize,
+        admission: AdmissionController,
+        ingress_cpu: ScribeIngressCpuPool,
+        registry: Arc<TenantTableWriterRegistry>,
+        telemetry: Option<Arc<ScribeTelemetry>>,
+        coordination_runtime: Handle,
+    ) -> Self {
+        let capacity = items.max(1);
+        let budget = IngressQueueBudget::with_config(IngressQueueConfig {
+            max_items: capacity,
+            max_bytes: bytes,
+        });
+        let telemetry_slot = Arc::new(Mutex::new(telemetry));
+        let task_telemetry = Arc::clone(&telemetry_slot);
+        let (sender, mut receiver) = mpsc::channel(capacity);
+        let task = coordination_runtime.spawn(async move {
+            while let Some(job) = receiver.recv().await {
+                let IngressJob {
+                    frame,
+                    mut reservation,
+                    response,
+                } = job;
+                let telemetry = task_telemetry
+                    .lock()
+                    .ok()
+                    .and_then(|telemetry| telemetry.clone());
+                let result = process_ingress_frame(
+                    frame,
+                    &mut reservation,
+                    &admission,
+                    &ingress_cpu,
+                    &registry,
+                    telemetry.as_ref(),
+                )
+                .await;
+                let _ = response.send(result);
+            }
+        });
+        Self {
+            sender,
+            budget,
+            telemetry: telemetry_slot,
+            _task: task,
+        }
+    }
+
+    fn set_telemetry(&self, telemetry: Arc<ScribeTelemetry>) {
+        if let Ok(mut slot) = self.telemetry.lock() {
+            *slot = Some(telemetry);
+        }
+    }
+
+    async fn submit(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
+        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
+            return Err(ScribeError::PayloadTooLarge {
+                bytes: frame.measured_wire_bytes,
+            });
+        }
+        let table = frame.binding.table_ref.fqn();
+        let bytes = frame
+            .measured_wire_bytes
+            .saturating_add(REQUEST_OVERHEAD_BYTES);
+        let reservation = self.budget.try_reserve(table.clone(), bytes)?;
+        let (response, result) = oneshot::channel();
+        match self.sender.try_send(IngressJob {
+            frame,
+            reservation,
+            response,
+        }) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return Err(ScribeError::IngestBusy { table });
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return Err(ScribeError::Internal {
+                    detail: "ingress dispatcher is closed".to_owned(),
+                });
+            }
+        }
+        result.await.map_err(|_| ScribeError::Internal {
+            detail: "ingress dispatcher dropped its frame result".to_owned(),
+        })?
+    }
 }
 
 impl ScribeImpl {
@@ -169,13 +280,34 @@ impl ScribeImpl {
         lane_config: ScribeLaneConfig,
         coordination_runtime: Handle,
     ) -> Self {
+        Self::new_with_runtime_config_and_admission(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            lane_config,
+            AdmissionConfig::default(),
+            coordination_runtime,
+        )
+    }
+
+    /// Construct Scribe with explicit execution lanes and admission bounds.
+    pub fn new_with_runtime_config_and_admission(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        lane_config: ScribeLaneConfig,
+        admission: AdmissionConfig,
+        coordination_runtime: Handle,
+    ) -> Self {
         Self::new_with_components(
             operator,
             wal,
             node_id,
             writer_epoch,
             ScribeBuildConfig {
-                admission: AdmissionConfig::default(),
+                admission,
                 telemetry: None,
                 coordination_runtime,
                 post_ack_cpu: ScribePostAckCpuPool::new_with_capacity(
@@ -190,6 +322,8 @@ impl ScribeImpl {
                     lane_config.ingress_cpu_threads,
                     lane_config.ingress_queue_items,
                 ),
+                ingress_queue_items: lane_config.ingress_queue_items,
+                ingress_queue_bytes: lane_config.ingress_queue_bytes,
             },
         )
     }
@@ -209,6 +343,8 @@ impl ScribeImpl {
             post_ack_cpu,
             wal_io,
             ingress_cpu,
+            ingress_queue_items,
+            ingress_queue_bytes,
             ..
         } = config;
         let registry = TenantTableWriterRegistry::new_with_runtime(
@@ -217,6 +353,15 @@ impl ScribeImpl {
             Arc::clone(&wal),
             post_ack_cpu.clone(),
             wal_io.clone(),
+            telemetry.clone(),
+            coordination_runtime.clone(),
+        );
+        let ingress_queue = ScribeIngressQueue::new(
+            ingress_queue_items,
+            ingress_queue_bytes,
+            admission.clone(),
+            ingress_cpu.clone(),
+            Arc::clone(&registry),
             telemetry.clone(),
             coordination_runtime,
         );
@@ -230,6 +375,7 @@ impl ScribeImpl {
             wal_io,
             ingress_cpu,
             registry,
+            ingress_queue,
             telemetry,
         }
     }
@@ -295,6 +441,8 @@ impl ScribeImpl {
                 post_ack_cpu,
                 wal_io,
                 ingress_cpu: ScribeIngressCpuPool::new(1),
+                ingress_queue_items: 256,
+                ingress_queue_bytes: 512 * 1024 * 1024,
             },
         )
     }
@@ -303,6 +451,7 @@ impl ScribeImpl {
     #[must_use]
     pub fn with_telemetry(mut self, telemetry: Arc<ScribeTelemetry>) -> Self {
         self.registry.set_telemetry(Arc::clone(&telemetry));
+        self.ingress_queue.set_telemetry(Arc::clone(&telemetry));
         self.telemetry = Some(telemetry);
         self
     }
@@ -338,6 +487,12 @@ impl ScribeImpl {
                     .saturating_add(ingress.saturation_events),
             },
             writers: self.registry.health_snapshot(),
+            durability: self
+                .telemetry
+                .as_ref()
+                .map_or_else(Default::default, |telemetry| {
+                    telemetry.durability_snapshot()
+                }),
         }
     }
 
@@ -400,73 +555,85 @@ impl Scribe for ScribeImpl {
     // reserves synchronously, then transfers the canonical RecordBatch to the
     // writer queue; preprocessing and all blocking WAL work happen afterward.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        let append_started = Instant::now();
-        let rows = self
-            .ingress_cpu
-            .decode(
-                frame.payload,
-                frame.principal.clone(),
-                frame.expected_schema_fingerprint,
-                frame.request_id.clone(),
-                frame.batch_id,
-            )
-            .await?;
-        let append_rows = rows.num_rows();
-        let append_wire_bytes = frame.measured_wire_bytes;
-        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
-            return Err(ScribeError::PayloadTooLarge {
-                bytes: frame.measured_wire_bytes,
-            });
-        }
-        frame
-            .binding
-            .validate_authenticated_tenant(frame.principal.tenant_id)
-            .map_err(|error| ScribeError::Internal {
-                detail: error.to_string(),
-            })?;
-
-        let estimated_bytes = rows
-            .get_array_memory_size()
-            .saturating_add(frame.measured_wire_bytes)
-            .saturating_add(REQUEST_OVERHEAD_BYTES);
-        let reservation = self
-            .admission
-            .try_reserve(frame.binding.table_ref.fqn(), estimated_bytes)?;
-        let admitted = AdmittedAppend {
-            request_id: frame.request_id,
-            batch_id: frame.batch_id,
-            frame_sequence: frame.frame_sequence,
-            audit_event: frame.audit_event,
-            rows,
-            measured_wire_bytes: frame.measured_wire_bytes,
-            admitted_bytes: reservation.bytes(),
-            reservation,
-            tenant: frame.principal.tenant_id,
-            table: frame.binding.table_ref.clone(),
-            queued_at: Instant::now(),
-        };
-
-        let rows_accepted = admitted.rows.num_rows() as u64;
-        let (writer, created) = self.registry.get_or_create(frame.binding)?;
-        if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
-            if created {
-                self.registry.remove_if(&writer.key, writer.instance_id);
-            }
-            return Err(error);
-        }
-
-        if let Some(telemetry) = &self.telemetry {
-            // Measure only the synchronous validation, reservation, and enqueue
-            // portion of the request so ACK latency is not confused with WAL IO.
-            telemetry.record(
-                "append",
-                append_started.elapsed(),
-                append_rows,
-                append_wire_bytes,
-            );
-        }
-        Ok(FrameAdmission { rows_accepted })
+        self.ingress_queue.submit(frame).await
     }
+}
+
+async fn process_ingress_frame(
+    frame: ScribeIngressFrame,
+    raw_reservation: &mut IngressQueueReservation,
+    admission: &AdmissionController,
+    ingress_cpu: &ScribeIngressCpuPool,
+    registry: &TenantTableWriterRegistry,
+    telemetry: Option<&Arc<ScribeTelemetry>>,
+) -> Result<FrameAdmission, ScribeError> {
+    let append_started = Instant::now();
+    frame
+        .binding
+        .validate_authenticated_tenant(frame.principal.tenant_id)
+        .map_err(|error| ScribeError::Internal {
+            detail: error.to_string(),
+        })?;
+    let rows = ingress_cpu
+        .decode(
+            frame.payload,
+            frame.principal.clone(),
+            frame.expected_schema_fingerprint,
+            frame.request_id.clone(),
+            frame.batch_id,
+        )
+        .await?;
+    let append_rows = rows.num_rows();
+    let total_rows = frame
+        .stream_rows_before
+        .saturating_add(u64::try_from(append_rows).unwrap_or(u64::MAX));
+    if total_rows > frame.stream_rows_limit {
+        return Err(ScribeError::TooManyRows {
+            rows: total_rows,
+            limit: frame.stream_rows_limit,
+        });
+    }
+    let append_wire_bytes = frame.measured_wire_bytes;
+    let estimated_bytes = rows
+        .get_array_memory_size()
+        .saturating_add(frame.measured_wire_bytes)
+        .saturating_add(REQUEST_OVERHEAD_BYTES);
+    let reservation = raw_reservation.transfer_to_retained(
+        admission,
+        frame.binding.table_ref.fqn(),
+        estimated_bytes,
+    )?;
+    let admitted = AdmittedAppend {
+        request_id: frame.request_id,
+        batch_id: frame.batch_id,
+        frame_sequence: frame.frame_sequence,
+        audit_event: frame.audit_event,
+        rows,
+        measured_wire_bytes: frame.measured_wire_bytes,
+        admitted_bytes: reservation.bytes(),
+        reservation,
+        tenant: frame.principal.tenant_id,
+        table: frame.binding.table_ref.clone(),
+        queued_at: Instant::now(),
+    };
+    let rows_accepted = admitted.rows.num_rows() as u64;
+    let (writer, created) = registry.get_or_create(frame.binding)?;
+    if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
+        if created {
+            registry.remove_if(&writer.key, writer.instance_id);
+        }
+        return Err(error);
+    }
+    if let Some(telemetry) = telemetry {
+        telemetry.record_accepted(append_rows);
+        telemetry.record(
+            "append",
+            append_started.elapsed(),
+            append_rows,
+            append_wire_bytes,
+        );
+    }
+    Ok(FrameAdmission { rows_accepted })
 }
 
 impl ScribeImpl {

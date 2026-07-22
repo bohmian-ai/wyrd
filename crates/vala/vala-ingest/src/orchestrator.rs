@@ -1,202 +1,27 @@
-//! Stream collection, the three pre-flush authorization gates, and the 2PC
-//! commit that drives `vala-bifrost`'s writer.
-//!
-//! The heavy lifting is split so the bounds/decode and the card-scope gate are
-//! testable without a database: [`collect_frames`] and [`validate_card_scope`]
-//! take in-memory inputs and never touch the catalog.
+//! Transport-neutral frame validation and projection helpers.
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use tokio::time::timeout;
-use vala_bifrost::writer::BifrostWriteContext;
-use vala_bifrost::{BifrostNamespace, TableScope, WyrdCatalog};
+use vala_bifrost::{BifrostNamespace, WyrdCatalog};
 use vala_bifrost_redux::catalog::TableRef as ReduxTableRef;
 use vala_bifrost_redux::catalog::TenantTableBinding;
-use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeAppend, ScribeIngressFrame};
+use vala_bifrost_redux::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use wyrd_runtime::{Permission, PermissionCheck, Principal, RbacCheck};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_spec::vala::{CARD_REF, CARD_UID, PRINCIPAL_ID};
-use wyrd_tonic::tonic::Status;
 use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 
 use crate::auth::AuthContext;
-use crate::decode::decode_ipc;
 use crate::error::IngestError;
 use crate::limits::IngestLimits;
-
-/// Source of inbound `InsertBatch` frames. Implemented for `tonic::Streaming`
-/// on the server path and by an in-memory source in tests — so the streaming
-/// bounds logic is exercised without a live transport.
-pub trait FrameSource {
-    /// Yield the next frame, `Ok(None)` on half-close, or a transport error.
-    fn next_frame(
-        &mut self,
-    ) -> impl std::future::Future<Output = Result<Option<InsertBatchRequest>, Status>> + Send;
-}
-
-impl FrameSource for wyrd_tonic::tonic::Streaming<InsertBatchRequest> {
-    async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
-        self.message().await
-    }
-}
-
-/// The fully-read, decoded stream: the target table, the durable idempotency
-/// key, and every decoded batch (`[user + run_id + card_ref]`, client-supplied).
-#[derive(Debug)]
-pub struct CollectedStream {
-    /// Fully-qualified table name (`namespace.name`), from the first frame.
-    pub table: String,
-    /// The stream's `wyrd_batch_id` (16-byte UUIDv7), from the first frame.
-    pub batch_id: [u8; 16],
-    /// Decoded record batches, in stream order.
-    pub batches: Vec<RecordBatch>,
-    /// Total decoded row count.
-    pub rows: u64,
-    /// Server-measured Arrow IPC bytes received after transport decompression.
-    pub wire_bytes: usize,
-}
-
-/// Read the whole stream, enforcing every aggregate bound as frames arrive.
-///
-/// Any breach, disconnect, or deadline aborts here — before any gate or commit —
-/// so no precommit row and no Parquet is ever written for a rejected stream.
-///
-/// # Errors
-/// Returns the mapped [`IngestError`] for a bound breach, an idle/total
-/// deadline, a protocol violation (mismatched table/batch id, bad batch id
-/// length, too many frames), or an Arrow decode failure.
-pub async fn collect_frames<S: FrameSource>(
-    mut source: S,
-    limits: &IngestLimits,
-) -> Result<CollectedStream, IngestError> {
-    let started = Instant::now();
-    let mut table: Option<String> = None;
-    let mut batch_id: Option<[u8; 16]> = None;
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    let mut total_bytes: u64 = 0;
-    let mut total_rows: u64 = 0;
-    let mut frame_count: u64 = 0;
-
-    loop {
-        let next = timeout(limits.idle_deadline, source.next_frame())
-            .await
-            .map_err(|_| IngestError::StreamIdle)?;
-        let frame = match next {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(status) => {
-                return Err(IngestError::StreamProtocolViolation(format!(
-                    "stream aborted by client: {}",
-                    status.message()
-                )));
-            }
-        };
-
-        if started.elapsed() > limits.total_deadline {
-            return Err(IngestError::StreamIdle);
-        }
-
-        frame_count += 1;
-        if frame_count > limits.max_stream_frames {
-            return Err(IngestError::StreamProtocolViolation(format!(
-                "stream exceeded {} frames",
-                limits.max_stream_frames
-            )));
-        }
-
-        total_bytes += frame.arrow_ipc.len() as u64;
-        if total_bytes > limits.max_stream_bytes {
-            return Err(IngestError::BatchTooLarge {
-                bytes: total_bytes,
-                limit: limits.max_stream_bytes,
-            });
-        }
-
-        reconcile_header(&frame, &mut table, &mut batch_id)?;
-
-        for decoded in decode_ipc(&frame.arrow_ipc)? {
-            total_rows += decoded.num_rows() as u64;
-            if total_rows > limits.max_stream_rows {
-                return Err(IngestError::TooManyRows {
-                    rows: total_rows,
-                    limit: limits.max_stream_rows,
-                });
-            }
-            batches.push(decoded);
-        }
-    }
-
-    let table = table.ok_or_else(|| {
-        IngestError::StreamProtocolViolation("stream carried no table".to_owned())
-    })?;
-    let batch_id = batch_id.ok_or_else(|| {
-        IngestError::StreamProtocolViolation("stream carried no wyrd_batch_id".to_owned())
-    })?;
-
-    Ok(CollectedStream {
-        table,
-        batch_id,
-        batches,
-        rows: total_rows,
-        wire_bytes: usize::try_from(total_bytes).map_err(|_| {
-            IngestError::Internal("decoded wire byte count exceeds usize".to_owned())
-        })?,
-    })
-}
-
-/// Establish `table`/`batch_id` from the first frame and require every later
-/// frame to repeat them identically (an empty field on a later frame is treated
-/// as "unchanged").
-fn reconcile_header(
-    frame: &InsertBatchRequest,
-    table: &mut Option<String>,
-    batch_id: &mut Option<[u8; 16]>,
-) -> Result<(), IngestError> {
-    match table {
-        None => {
-            if frame.table.is_empty() {
-                return Err(IngestError::StreamProtocolViolation(
-                    "first frame is missing table".to_owned(),
-                ));
-            }
-            *table = Some(frame.table.clone());
-        }
-        Some(established) if !frame.table.is_empty() && &frame.table != established => {
-            return Err(IngestError::StreamProtocolViolation(format!(
-                "table changed mid-stream: {} != {established}",
-                frame.table
-            )));
-        }
-        Some(_) => {}
-    }
-
-    if !frame.wyrd_batch_id.is_empty() {
-        let id: [u8; 16] = frame.wyrd_batch_id.as_slice().try_into().map_err(|_| {
-            IngestError::StreamProtocolViolation(
-                "wyrd_batch_id must be 16 bytes (UUIDv7)".to_owned(),
-            )
-        })?;
-        match batch_id {
-            None => *batch_id = Some(id),
-            Some(established) if &id != established => {
-                return Err(IngestError::StreamProtocolViolation(
-                    "wyrd_batch_id changed mid-stream".to_owned(),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(())
-}
 
 /// The anti-forgery gate: every per-row `card_ref` in the decoded batches must
 /// be a member of the principal's card-ref scope (exact `CardRef` equality). A
@@ -370,133 +195,6 @@ pub fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError>
     })
 }
 
-/// Drive one ingest stream end-to-end: RBAC gate → collect → system-table gate
-/// → card-scope gate → buffered write → one 2PC `flush(ctx)`.
-///
-/// # Errors
-/// Returns the first gate/limit/engine failure as an [`IngestError`]; a rejected
-/// stream writes no precommit row and no Parquet.
-pub async fn run_ingest<S: FrameSource>(
-    catalog: &WyrdCatalog,
-    limits: &IngestLimits,
-    auth: &AuthContext,
-    source: S,
-) -> Result<u64, IngestError> {
-    // Gate (a): record-write capability. Coarse/operation-scoped; tenant
-    // isolation is the data-partition boundary, enforced separately.
-    RbacCheck
-        .check(&auth.principal, &Permission::bifrost_record_write())
-        .into_result()
-        .map_err(IngestError::from_rbac)?;
-
-    let collected = collect_frames(source, limits).await?;
-
-    // Gate (b): destination-table boundary — no external write to reserved
-    // system tables (`vala.system.*`).
-    let (namespace, name) = resolve_fqn(&collected.table)?;
-    if namespace == BifrostNamespace::System {
-        return Err(IngestError::SystemTableWriteDenied {
-            table: collected.table.clone(),
-        });
-    }
-
-    // Gate (c): attribution boundary — every per-row card must be in scope.
-    validate_card_scope(&collected.batches, &auth.principal)?;
-
-    // Resolve card_ref → card_uid and stamp principal_id server-side (M-11).
-    let stamped = stamp_correlation_columns(collected.batches, &auth.principal)?;
-
-    let writer = catalog
-        .writer(namespace, &name, TableScope::TenantOwned, auth.tenant)
-        .await
-        .map_err(IngestError::from_engine)?;
-
-    let ctx = BifrostWriteContext {
-        batch_id: collected.batch_id,
-        origin: "ingest".to_owned(),
-        actor: auth.principal.id.to_string(),
-        request_id: auth.request_id.clone(),
-        // Writer-identity card for C5 audit attribution (constant per commit).
-        card_ref: auth.principal.card_ref().cloned(),
-    };
-    // All stamped batches are one commit unit under `collected.batch_id`;
-    // `commit_one` closes the writer so the coordinator drains and commits.
-    let _snapshot = writer
-        .commit_one(auth.tenant, stamped, ctx)
-        .await
-        .map_err(IngestError::from_engine)?;
-
-    Ok(collected.rows)
-}
-
-/// Drive one native stream into the queued Redux Scribe seam.
-///
-/// The complete stamped request becomes one canonical `RecordBatch` and one
-/// `ScribeAppend`. The measured bytes come from server-owned frame bodies; no
-/// client-provided size field participates in admission.
-pub async fn run_ingest_to_scribe<S, F>(
-    catalog: &WyrdCatalog,
-    scribe: &F,
-    limits: &IngestLimits,
-    auth: &AuthContext,
-    source: S,
-) -> Result<u64, IngestError>
-where
-    S: FrameSource,
-    F: Scribe + ?Sized,
-{
-    RbacCheck
-        .check(&auth.principal, &Permission::bifrost_record_write())
-        .into_result()
-        .map_err(IngestError::from_rbac)?;
-
-    let collected = collect_frames(source, limits).await?;
-    let (namespace, name) = resolve_fqn(&collected.table)?;
-    if namespace == BifrostNamespace::System {
-        return Err(IngestError::SystemTableWriteDenied {
-            table: collected.table,
-        });
-    }
-    let registered_fingerprint = catalog
-        .table_schema_fingerprint(namespace, &name, auth.tenant)
-        .await
-        .map_err(IngestError::from_engine)?;
-    let source_fingerprint = collected
-        .batches
-        .first()
-        .map(|batch| source_schema_fingerprint(batch.schema().as_ref()))
-        .ok_or_else(|| IngestError::StreamProtocolViolation("stream carried no rows".to_owned()))?;
-    if source_fingerprint.0 != registered_fingerprint {
-        return Err(IngestError::SchemaMismatch {
-            table: collected.table,
-        });
-    }
-    validate_card_scope(&collected.batches, &auth.principal)?;
-    let stamped = stamp_correlation_columns(collected.batches, &auth.principal)?;
-    let Some(first) = stamped.first() else {
-        return Ok(0);
-    };
-    let rows = arrow::compute::concat_batches(&first.schema(), &stamped)
-        .map_err(|error| IngestError::Internal(error.to_string()))?;
-    let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
-    let redux_namespace = ReduxNamespace::from_wire(namespace.as_str()).ok_or_else(|| {
-        IngestError::Internal(format!("Redux namespace is not registered: {namespace:?}"))
-    })?;
-    scribe
-        .append(ScribeAppend {
-            principal: auth.principal.clone(),
-            table: ReduxTableRef::new(redux_namespace, name),
-            rows,
-            schema_fingerprint,
-            request_id: auth.request_id.clone(),
-            batch_id: uuid::Uuid::from_bytes(collected.batch_id),
-            measured_wire_bytes: collected.wire_bytes,
-        })
-        .await
-        .map_err(IngestError::from_scribe)?;
-    Ok(collected.rows)
-}
-
 /// Process one already-framed native payload and admit it to Scribe.
 pub async fn run_ingest_frame_to_scribe<F>(
     catalog: &WyrdCatalog,
@@ -504,6 +202,7 @@ pub async fn run_ingest_frame_to_scribe<F>(
     limits: &IngestLimits,
     auth: &AuthContext,
     frame: InsertBatchRequest,
+    stream_rows_before: u64,
 ) -> Result<u64, IngestError>
 where
     F: Scribe + ?Sized,
@@ -523,14 +222,14 @@ where
             "wyrd_batch_id must be UUIDv7".to_owned(),
         ));
     }
-    let (namespace, name) = resolve_fqn(&frame.table)?;
-    if namespace == BifrostNamespace::System {
-        return Err(IngestError::SystemTableWriteDenied { table: frame.table });
-    }
     RbacCheck
         .check(&auth.principal, &Permission::bifrost_record_write())
         .into_result()
         .map_err(IngestError::from_rbac)?;
+    let (namespace, name) = resolve_fqn(&frame.table)?;
+    if namespace == BifrostNamespace::System {
+        return Err(IngestError::SystemTableWriteDenied { table: frame.table });
+    }
     let registered_fingerprint = catalog
         .table_schema_fingerprint(namespace, &name, auth.tenant)
         .await
@@ -568,6 +267,8 @@ where
             frame_sequence: frame.frame_sequence,
             audit_event,
             measured_wire_bytes: frame.arrow_ipc.len(),
+            stream_rows_before,
+            stream_rows_limit: limits.max_stream_rows,
             payload: IngressPayload::ArrowIpc(Bytes::from(frame.arrow_ipc)),
         })
         .await
@@ -705,131 +406,6 @@ mod card_scope {
 
         let err = validate_card_scope(&[batch], &user).expect_err("empty scope rejects all");
         assert!(matches!(err, IngestError::CardScopeDenied { .. }));
-    }
-}
-
-/// Aggregate stream bounds reject before any commit (no DB required): the
-/// bounds are enforced entirely inside `collect_frames`, so an oversized/idle
-/// stream aborts before the writer is ever opened.
-#[cfg(test)]
-mod oversized_stream {
-    use std::collections::VecDeque;
-    use std::time::Duration;
-
-    use wyrd_tonic::tonic::Status;
-
-    use crate::InsertBatchRequest;
-    use crate::error::IngestError;
-    use crate::limits::IngestLimits;
-    use crate::orchestrator::{FrameSource, collect_frames};
-
-    /// In-memory frame source for driving `collect_frames` without a transport.
-    struct VecSource {
-        frames: VecDeque<Result<InsertBatchRequest, Status>>,
-    }
-
-    impl VecSource {
-        fn new(frames: Vec<Result<InsertBatchRequest, Status>>) -> Self {
-            Self {
-                frames: frames.into(),
-            }
-        }
-    }
-
-    impl FrameSource for VecSource {
-        async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
-            match self.frames.pop_front() {
-                Some(Ok(frame)) => Ok(Some(frame)),
-                Some(Err(status)) => Err(status),
-                None => Ok(None),
-            }
-        }
-    }
-
-    /// A frame source whose first read never completes, to trip the idle deadline.
-    struct SlowSource;
-
-    impl FrameSource for SlowSource {
-        async fn next_frame(&mut self) -> Result<Option<InsertBatchRequest>, Status> {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok(None)
-        }
-    }
-
-    fn frame(bytes: usize) -> InsertBatchRequest {
-        InsertBatchRequest {
-            table: "vala.bifrost.events".to_owned(),
-            arrow_ipc: vec![0u8; bytes],
-            wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec(),
-            frame_sequence: 0,
-        }
-    }
-
-    #[tokio::test]
-    async fn oversized_stream_byte_cap_rejects_before_decode() {
-        let limits = IngestLimits {
-            max_stream_bytes: 16,
-            ..IngestLimits::default()
-        };
-        // 100 bytes of non-Arrow payload: the byte cap trips before the decoder runs.
-        let source = VecSource::new(vec![Ok(frame(100))]);
-
-        let err = collect_frames(source, &limits)
-            .await
-            .expect_err("byte cap trips");
-        assert!(
-            matches!(err, IngestError::BatchTooLarge { .. }),
-            "expected BatchTooLarge, got {err:?}"
-        );
-        assert_eq!(err.wyrd_code(), "WYRD_VALA_413_INGEST_OVERSIZED");
-    }
-
-    #[tokio::test]
-    async fn oversized_stream_frame_cap_rejects() {
-        let limits = IngestLimits {
-            max_stream_frames: 0,
-            ..IngestLimits::default()
-        };
-        let source = VecSource::new(vec![Ok(frame(4))]);
-
-        let err = collect_frames(source, &limits)
-            .await
-            .expect_err("frame cap trips");
-        assert!(
-            matches!(err, IngestError::StreamProtocolViolation(_)),
-            "expected StreamProtocolViolation, got {err:?}"
-        );
-        assert_eq!(err.wyrd_code(), "WYRD_VALA_400_INGEST_PROTO");
-    }
-
-    #[tokio::test]
-    async fn oversized_stream_idle_deadline_rejects() {
-        let limits = IngestLimits {
-            idle_deadline: Duration::from_millis(20),
-            ..IngestLimits::default()
-        };
-
-        let err = collect_frames(SlowSource, &limits)
-            .await
-            .expect_err("idle deadline trips");
-        assert!(
-            matches!(err, IngestError::StreamIdle),
-            "expected StreamIdle, got {err:?}"
-        );
-        assert_eq!(err.wyrd_code(), "WYRD_VALA_408_INGEST_IDLE_TIMEOUT");
-    }
-
-    #[tokio::test]
-    async fn oversized_stream_client_abort_rejects() {
-        let source = VecSource::new(vec![Err(Status::cancelled("client went away"))]);
-
-        let err = collect_frames(source, &IngestLimits::default())
-            .await
-            .expect_err("client abort surfaces");
-        assert!(
-            matches!(err, IngestError::StreamProtocolViolation(_)),
-            "expected StreamProtocolViolation, got {err:?}"
-        );
     }
 }
 

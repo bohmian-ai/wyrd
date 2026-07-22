@@ -46,5 +46,5 @@ pub use error::BifrostError;
 pub use system_columns::{
     CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RESERVED_CORRELATION_COLUMNS,
     RESERVED_SYSTEM_COLUMNS, RUN_ID, SystemColumnSet, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, is_reserved_correlation_column, is_reserved_system_column,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, is_reserved_correlation_column, is_reserved_system_column,
 };

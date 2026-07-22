@@ -9,7 +9,6 @@
 //! Idempotency is tracked by the frame identity `(batch_id, frame_sequence)`;
 //! the recovery path keys off the batch and seal key.
 
-use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,7 +20,7 @@ use crate::catalog::{TableRef, TenantTableBinding};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::StreamIdentity;
 
-fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
+fn projected_source_schema_fingerprint(schema: &arrow::datatypes::Schema) -> SchemaFingerprint {
     let fields = schema
         .fields()
         .iter()
@@ -37,33 +36,7 @@ fn source_schema_fingerprint(schema: &Schema) -> SchemaFingerprint {
         })
         .map(|field| field.as_ref().clone())
         .collect::<Vec<_>>();
-    SchemaFingerprint::from_arrow_schema(&Schema::new(fields))
-}
-
-/// Append request carrying batch data, schema fingerprint, and Principal.
-///
-/// Tenant is not a top-level field — it lives on `principal.tenant_id` and
-/// Scribe reads it there. Duplicating it on the wire risks a mismatch
-/// between the two.
-#[derive(Debug, Clone)]
-pub struct ScribeAppend {
-    /// Full runtime principal — carries subject, tenant, scopes without
-    /// re-derivation. Server-verified upstream by Gate.
-    pub principal: Principal,
-    /// Target Bifrost table: `(BifrostNamespace, name)` per CONTRACTS §13.
-    pub table: TableRef,
-    /// Arrow rows; column layout matches the table's registered schema.
-    pub rows: RecordBatch,
-    /// Client-computed fingerprint of the source Arrow schema; Scribe
-    /// rejects with `FingerprintMismatch` when the catalog value differs.
-    pub schema_fingerprint: SchemaFingerprint,
-    /// Server-assigned per-request id (Gate mints it on the way in).
-    pub request_id: RequestId,
-    /// Client-supplied v7 UUID for idempotency. 2PC recovery keys off this.
-    pub batch_id: uuid::Uuid,
-    /// Server-measured canonical transport bytes used for admission. This is
-    /// never copied from a client field and is validated again by Scribe.
-    pub measured_wire_bytes: usize,
+    SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(fields))
 }
 
 /// One fully resolved frame crossing the Gate-to-Scribe boundary.
@@ -85,8 +58,32 @@ pub struct ScribeIngressFrame {
     pub audit_event: AuditEvent,
     /// Server-measured bytes after transport decompression.
     pub measured_wire_bytes: usize,
+    /// Decoded rows admitted earlier in the same transport stream.
+    pub stream_rows_before: u64,
+    /// Aggregate decoded-row ceiling for the transport stream.
+    pub stream_rows_limit: u64,
     /// Native Arrow IPC or a protocol-specific projected Arrow payload.
     pub payload: IngressPayload,
+}
+
+/// In-process projected-frame adapter retained for engine-only tests and
+/// benchmark fixtures. Public transports use [`ScribeIngressFrame`] directly.
+#[derive(Debug, Clone)]
+pub struct ScribeAppend {
+    /// Server-verified principal.
+    pub principal: Principal,
+    /// Server-resolved logical table.
+    pub table: TableRef,
+    /// Already projected Arrow rows.
+    pub rows: RecordBatch,
+    /// Source schema fingerprint.
+    pub schema_fingerprint: SchemaFingerprint,
+    /// Correlation identifier.
+    pub request_id: RequestId,
+    /// Frame identity batch identifier.
+    pub batch_id: uuid::Uuid,
+    /// Server-measured source bytes.
+    pub measured_wire_bytes: usize,
 }
 
 /// Payload forms accepted by the transport-neutral Scribe boundary.
@@ -120,6 +117,9 @@ pub enum ScribeError {
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
 
+    #[error("ingest stream too many rows: {rows} > {limit}")]
+    TooManyRows { rows: u64, limit: u64 },
+
     #[error("object store PUT failed")]
     ObjectStorePutFailed(#[source] opendal::Error),
 
@@ -145,6 +145,9 @@ impl ScribeError {
             Self::PayloadTooLarge { bytes } => BifrostError::PayloadTooLarge { bytes: *bytes },
             Self::FingerprintMismatch { table } => BifrostError::FingerprintMismatch {
                 table: table.clone(),
+            },
+            Self::TooManyRows { rows, limit } => BifrostError::Internal {
+                detail: format!("ingest stream too many rows: {rows} > {limit}"),
             },
             Self::ObjectStorePutFailed(e) => BifrostError::Internal {
                 detail: format!("object store PUT failed: {e}"),
@@ -178,9 +181,19 @@ pub trait Scribe: Send + Sync {
     /// Validate, prepare, and admit one resolved frame.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError>;
 
-    /// Compatibility adapter for existing engine tests while callers migrate
-    /// to the resolved frame contract.
+    /// Adapt an already-projected in-process frame to the resolved seam.
+    /// Network transports never call this method.
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        if req
+            .rows
+            .schema()
+            .index_of(wyrd_spec::vala::WYRD_EVENT_TIME)
+            .is_err()
+        {
+            return Err(ScribeError::Internal {
+                detail: "projected append is missing wyrd_event_time".to_owned(),
+            });
+        }
         let binding = TenantTableBinding::resolve((req.principal.tenant_id, req.table.clone()))
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
@@ -192,12 +205,6 @@ pub trait Scribe: Send + Sync {
                 table: req.table.fqn(),
             });
         }
-        if req.rows.schema().index_of("wyrd_event_time").is_err() {
-            return Err(ScribeError::Internal {
-                detail: "legacy append requires wyrd_event_time".to_owned(),
-            });
-        }
-        let expected_schema_fingerprint = source_schema_fingerprint(req.rows.schema().as_ref());
         let audit_event = AuditEvent {
             request_id: req.request_id.clone(),
             trace_id: None,
@@ -216,12 +223,16 @@ pub trait Scribe: Send + Sync {
         self.ingest_frame(ScribeIngressFrame {
             principal: req.principal,
             binding,
-            expected_schema_fingerprint,
+            expected_schema_fingerprint: projected_source_schema_fingerprint(
+                req.rows.schema().as_ref(),
+            ),
             request_id: req.request_id,
             batch_id: req.batch_id,
             frame_sequence: 0,
             audit_event,
             measured_wire_bytes: req.measured_wire_bytes,
+            stream_rows_before: 0,
+            stream_rows_limit: u64::MAX,
             payload: IngressPayload::ProjectedArrow(vec![req.rows]),
         })
         .await

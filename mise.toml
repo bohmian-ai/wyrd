@@ -149,7 +149,7 @@ so they stay out of the fast lane) against live Postgres."""
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = """
-cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --ignored --test-threads=1
+cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_scribe_multipod_journey -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_forge_multipod_journey -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_forge_scheduler_closeout_journey -- --ignored --test-threads=1

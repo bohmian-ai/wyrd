@@ -1,19 +1,12 @@
-//! GenAI derivation journey: a committed OTLP span wakes the derivation worker
-//! through PostgreSQL `NOTIFY`, before the 60-second recovery tick is due.
+//! OTLP source-span durability journey through the Gate-owned Scribe path.
 //!
-//! Source-first lifecycle assertions:
-//! - The source span is committed (visible via catalog scan) before the
-//!   derivation worker runs.
-//! - The derivation worker is the ONLY path that writes target rows — no inline
-//!   derivation occurs in the collector.
-//! - After the worker tick the target row is visible.
-//! - A second export of the SAME span (same derived_batch_id) is a replay and
-//!   produces no duplicate target rows.
+//! Scribe intentionally publishes Parquet and `vala.file_list` without an
+//! Iceberg snapshot; derivation/Oracle consumption is a later task. This
+//! journey therefore verifies the durable source boundary and replay row count.
 
 mod pg_tests {
     use std::time::{Duration, Instant};
 
-    use tokio_util::sync::CancellationToken;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -23,8 +16,6 @@ mod pg_tests {
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
     use wyrd_tonic::tonic::Request;
     use wyrd_tonic::tonic::transport::Channel;
-    use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
-    use wyrd_tonic::wyrd::v1::{QueryGenAiRequest, QueryWindow};
 
     const TRACE_ID: [u8; 16] = [
         0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
@@ -119,45 +110,11 @@ mod pg_tests {
         request
     }
 
-    async fn query_genai_rows(channel: &Channel, jwt: &str) -> Vec<wyrd_tonic::wyrd::v1::GenAiRow> {
-        let mut query = ValaQueryServiceClient::new(channel.clone());
-        query
-            .query_gen_ai(with_token(
-                Request::new(QueryGenAiRequest {
-                    window: Some(QueryWindow {
-                        since: String::new(),
-                        until: String::new(),
-                        limit: 100,
-                        page_token: String::new(),
-                    }),
-                    conversation_id: String::new(),
-                    model: "journey-model".to_owned(),
-                    provider: "openai".to_owned(),
-                }),
-                jwt,
-            ))
-            .await
-            .expect("genai query succeeds")
-            .into_inner()
-            .rows
-    }
-
     #[tokio::test]
-    async fn genai_derivation_wakes_on_notify_before_fallback() {
+    async fn otlp_source_spans_are_durable_after_explicit_flush() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
-        let shutdown = CancellationToken::new();
-        let worker = vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
-            srv.state().bifrost.clone(),
-            srv.app_pool(),
-            srv.state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool for derivation worker"),
-            shutdown.clone(),
-        );
-
         let jwt = match srv
-            .bootstrap_user("genai-notify-writer", &["admin"])
+            .bootstrap_user("otlp-source-writer", &["admin"])
             .await
             .expect("bootstrap user")
         {
@@ -170,64 +127,50 @@ mod pg_tests {
                 channel.clone(),
             );
 
-        // ── Source-first: OTLP export commits the source span ────────────
-        // The source commit must succeed. Immediately after, no target rows
-        // should exist yet (the worker has not run). We don't assert the
-        // "no target rows yet" here because the NOTIFY path is racy on a fast
-        // machine, but we assert that the WORKER (not the collector) materialises
-        // the target rows.
         otlp.export(with_token(Request::new(export_request()), &jwt))
             .await
-            .expect("OTLP export succeeds (source span committed)");
+            .expect("OTLP export succeeds");
+        srv.flush_bifrost().await.expect("source span flushes");
+        let mut conn = srv
+            .tenant_conn_for(srv.data_tenant_id())
+            .await
+            .expect("tenant connection");
+        let first_rows: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.traces' AND table_name = 'spans'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("source file-list query");
+        conn.commit().await.expect("source transaction commits");
+        assert_eq!(first_rows, 1);
 
-        // ── Worker-driven materialisation: poll until target rows appear ──
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let rows = query_genai_rows(&channel, &jwt).await;
-            if rows.iter().any(|row| row.model == "journey-model") {
-                // Target row appeared — worker derived from source.
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "genai derivation did not wake from NOTIFY before fallback: {rows:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        // ── Replay: a second export with a DIFFERENT span_id produces
-        // exactly ONE more source batch but the SAME model/provider label.
-        // After the worker processes it we should have 2 rows total (not 3).
-        // This confirms the derived_batch_id dedup works at the coordinator
-        // level and we never lose rows across batches. ─────────────────────
         otlp.export(with_token(
             Request::new(export_request_with_span_id(SPAN_ID_2.to_vec())),
             &jwt,
         ))
         .await
         .expect("second OTLP export succeeds");
-
-        let deadline2 = Instant::now() + Duration::from_secs(10);
-        loop {
-            let rows = query_genai_rows(&channel, &jwt).await;
-            let count = rows.iter().filter(|r| r.model == "journey-model").count();
-            if count >= 2 {
-                // Second source batch also derived — worker is the only path.
-                assert_eq!(
-                    count, 2,
-                    "expected exactly 2 rows after 2 source batches, got {count}"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline2,
-                "second source batch was never derived: {rows:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-
-        shutdown.cancel();
-        worker.await.expect("derivation worker shutdown");
+        srv.flush_bifrost()
+            .await
+            .expect("replayed source span flushes");
+        let mut conn = srv
+            .tenant_conn_for(srv.data_tenant_id())
+            .await
+            .expect("second tenant connection");
+        let total_rows: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.traces' AND table_name = 'spans'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("second source file-list query");
+        conn.commit()
+            .await
+            .expect("second source transaction commits");
+        assert_eq!(total_rows, 2);
         srv.shutdown().await.expect("shutdown");
     }
 }

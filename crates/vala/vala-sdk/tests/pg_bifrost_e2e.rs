@@ -14,12 +14,21 @@ mod pg_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::ipc::writer::StreamWriter;
+    use arrow::record_batch::RecordBatch;
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
-    use vala_sdk::{Bifrost, ClientScope, SinkKind, observe};
+    use vala_bifrost::catalog::CreateTableRequest;
+    use vala_bifrost::catalog::namespaces::BifrostNamespace;
+    use vala_bifrost::types::TableScope;
+    use vala_sdk::{
+        Bifrost, BifrostGrpcTransport, ClientScope, IngestTransport, SinkKind, observe,
+    };
+    use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
-    use wyrd_client::transport::HttpConfig;
+    use wyrd_client::transport::{GrpcConfig, HttpConfig};
     use wyrd_queue::{BatchSink, MockSink, QueueConfig, SealedBatch, WyrdQueueError};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::reference::CardRef;
@@ -86,6 +95,122 @@ mod pg_tests {
             flush_timeout_ms: 60_000,
             max_message_bytes: 4 * 1024 * 1024,
         }
+    }
+
+    fn native_ipc() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![7, 8])),
+                Arc::new(StringArray::from(vec!["first", "second"])),
+            ],
+        )
+        .expect("valid native SDK batch");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, schema.as_ref()).expect("IPC writer");
+        writer.write(&batch).expect("write IPC batch");
+        writer.finish().expect("finish IPC stream");
+        bytes
+    }
+
+    #[tokio::test]
+    async fn public_sdk_bidi_write_ack_and_durable_readback() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let table_name = format!("sdk_roundtrip_{}", uuid::Uuid::now_v7().simple());
+        srv.state()
+            .bifrost
+            .create_table(CreateTableRequest {
+                ns: BifrostNamespace::Bifrost,
+                name: &table_name,
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                scope: TableScope::TenantOwned,
+                tenant: srv.data_tenant_id(),
+                partition_columns: &[],
+                audit: None,
+            })
+            .await
+            .expect("register SDK journey table");
+
+        let bootstrap = srv
+            .bootstrap_service("sdk-bifrost-writer", &["admin"])
+            .await
+            .expect("bootstrap SDK writer");
+        let api_key = bootstrap.api_key().expect("machine API key").clone();
+        let mut config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
+        };
+        config.grpc.connect_retries = 0;
+        let client = WyrdClient::with_config(config).expect("SDK client");
+        let transport = BifrostGrpcTransport::connect(&client)
+            .await
+            .expect("connect public SDK transport");
+        let batch_id = uuid::Uuid::now_v7().into_bytes();
+        let rows = transport
+            .insert_batch(
+                &format!("vala.bifrost.{table_name}"),
+                batch_id,
+                0,
+                native_ipc(),
+            )
+            .await
+            .expect("per-frame ACK");
+        assert_eq!(rows, 2, "ACK reports exactly the admitted frame rows");
+
+        srv.flush_bifrost()
+            .await
+            .expect("flush server-owned Scribe");
+        let tenant = srv.data_tenant_id();
+        let mut conn = srv
+            .tenant_conn_for(tenant)
+            .await
+            .expect("tenant-scoped read connection");
+        let row_count: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.bifrost' AND table_name = $1",
+        )
+        .bind(&table_name)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("read Scribe file-list rows");
+        assert_eq!(row_count, 2, "durable read boundary contains exact rows");
+        let file_path: String = sqlx::query_scalar(
+            "SELECT file_path
+               FROM vala.file_list
+              WHERE namespace = 'vala.bifrost' AND table_name = $1
+              ORDER BY file_path
+              LIMIT 1",
+        )
+        .bind(&table_name)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("read sealed file path");
+        conn.commit().await.expect("commit tenant-scoped read");
+        srv.state()
+            .storage
+            .operator()
+            .stat(&file_path)
+            .await
+            .expect("sealed Parquet object exists");
+        srv.shutdown().await.expect("server shutdown");
     }
 
     /// Happy-path: insert via Bifrost handle + observe path, no drops, real server

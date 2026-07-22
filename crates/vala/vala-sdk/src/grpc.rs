@@ -111,10 +111,7 @@ impl BifrostGrpcTransport {
     /// Build a transport over an already connected, authenticated channel.
     #[must_use]
     pub fn new(connection: GrpcConnection, config: BifrostTransportConfig) -> Self {
-        Self {
-            connection,
-            config,
-        }
+        Self { connection, config }
     }
 
     /// Return the transport retry configuration.
@@ -134,19 +131,18 @@ impl BifrostGrpcTransport {
         let mut client = BifrostIngestServiceClient::new(self.connection.channel())
             .max_decoding_message_size(max_message_bytes)
             .max_encoding_message_size(max_message_bytes);
-        let response = client
-            .insert_batch(request)
-            .await
-            .map_err(AttemptError::from_status)?;
+        let response_fut = client.insert_batch(request);
+        tokio::pin!(response_fut);
 
-        sender
-            .send(frame.clone())
-            .await
-            .map_err(|_| AttemptError::retryable(transport_unavailable(
+        sender.send(frame.clone()).await.map_err(|_| {
+            AttemptError::retryable(transport_unavailable(
                 "request stream closed before frame send",
                 frame.frame_sequence,
-            )))?;
+            ))
+        })?;
         drop(sender);
+
+        let response = response_fut.await.map_err(AttemptError::from_status)?;
 
         let mut responses = response.into_inner();
         let Some(ack) = responses
@@ -171,26 +167,22 @@ impl BifrostGrpcTransport {
             .await
             .map_err(auth_error_to_wyrd)?;
         let access_token = format!("Bearer {}", bearer.expose());
-        let access_token = MetadataValue::try_from(access_token.as_str()).map_err(|_| {
-            WyrdError::Internal {
+        let access_token =
+            MetadataValue::try_from(access_token.as_str()).map_err(|_| WyrdError::Internal {
                 message: "bifrost access token cannot be represented as gRPC metadata".to_owned(),
                 details: serde_json::json!({}),
-            }
-        })?;
+            })?;
         request
             .metadata_mut()
             .insert("x-wyrd-access-token", access_token);
 
         let request_id = self.connection.auth().request_id(None);
-        let request_id = MetadataValue::try_from(request_id.as_str()).map_err(|_| {
-            WyrdError::Internal {
+        let request_id =
+            MetadataValue::try_from(request_id.as_str()).map_err(|_| WyrdError::Internal {
                 message: "bifrost request ID cannot be represented as gRPC metadata".to_owned(),
                 details: serde_json::json!({}),
-            }
-        })?;
-        request
-            .metadata_mut()
-            .insert("wyrd-request-id", request_id);
+            })?;
+        request.metadata_mut().insert("wyrd-request-id", request_id);
         Ok(())
     }
 }
@@ -364,9 +356,18 @@ mod tests {
     #[test]
     fn only_transport_loss_statuses_are_retryable() {
         assert!(retryable_status(&Status::new(Code::Unavailable, "down")));
-        assert!(retryable_status(&Status::new(Code::DeadlineExceeded, "late")));
-        assert!(!retryable_status(&Status::new(Code::InvalidArgument, "bad frame")));
-        assert!(!retryable_status(&Status::new(Code::ResourceExhausted, "full")));
+        assert!(retryable_status(&Status::new(
+            Code::DeadlineExceeded,
+            "late"
+        )));
+        assert!(!retryable_status(&Status::new(
+            Code::InvalidArgument,
+            "bad frame"
+        )));
+        assert!(!retryable_status(&Status::new(
+            Code::ResourceExhausted,
+            "full"
+        )));
     }
 
     #[test]
@@ -384,6 +385,6 @@ mod tests {
         };
         let error = accepted_rows(&frame, ack).expect_err("wrong sequence must fail");
         assert_eq!(error.code(), "WYRD_SPEC_500_INTERNAL");
-        assert_eq!(error.details()["expected_frame_sequence"], 4);
+        assert!(error.to_string().contains("ACK does not match"));
     }
 }

@@ -36,6 +36,10 @@ uuid = { workspace = true, features = ["v7"] }
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+vala-bifrost = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-testing = { workspace = true }

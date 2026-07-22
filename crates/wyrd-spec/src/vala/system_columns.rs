@@ -4,6 +4,8 @@ pub const WYRD_EVENT_TIME: &str = "wyrd_event_time";
 pub const WYRD_INGESTED_AT: &str = "wyrd_ingested_at";
 /// Arrow column name for the 16-byte batch idempotency key.
 pub const WYRD_BATCH_ID: &str = "wyrd_batch_id";
+/// Arrow column name for the server-minted request correlation id.
+pub const WYRD_REQUEST_ID: &str = "wyrd_request_id";
 /// Arrow column name for the tenant isolation key on `SystemShared` tables.
 pub const DATA_TENANT_ID: &str = "data_tenant_id";
 
@@ -13,6 +15,7 @@ pub const RESERVED_SYSTEM_COLUMNS: &[&str] = &[
     WYRD_EVENT_TIME,
     WYRD_INGESTED_AT,
     WYRD_BATCH_ID,
+    WYRD_REQUEST_ID,
     DATA_TENANT_ID,
 ];
 

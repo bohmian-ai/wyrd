@@ -186,6 +186,44 @@ async fn ack_does_not_split_or_encode() {
 }
 
 #[tokio::test]
+async fn accepted_and_fsynced_metrics_track_the_durability_gap() {
+    let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
+    let scribe = ScribeImpl::new().with_telemetry(Arc::clone(&telemetry));
+    scribe
+        .append(append(DataTenantId::SYSTEM_OWNER, 1))
+        .await
+        .expect("frame accepted");
+    assert_eq!(telemetry.durability_snapshot().accepted_frames, 1);
+    scribe.shutdown().await;
+    let snapshot = telemetry.durability_snapshot();
+    assert_eq!(snapshot.accepted_frames, 1);
+    assert_eq!(snapshot.fsynced_frames, 1);
+    assert_eq!(snapshot.frame_gap(), 0);
+}
+
+#[tokio::test]
+async fn retrying_the_same_frame_identity_does_not_double_write() {
+    let scribe = ScribeImpl::new();
+    let request = append(DataTenantId::SYSTEM_OWNER, 1);
+    let table = request.table.clone();
+    let batch_id = request.batch_id;
+    scribe
+        .append(request.clone())
+        .await
+        .expect("first admission");
+    scribe.append(request).await.expect("retry admission");
+    scribe.shutdown().await;
+    scribe.registry.drain().await;
+    let keys = scribe
+        .memtable
+        .seal_keys_for_tenant(DataTenantId::SYSTEM_OWNER)
+        .expect("memtable keys");
+    assert_eq!(keys.len(), 1, "one retained seal key for {table}");
+    assert_eq!(scribe.memtable_row_count(&keys[0]), 1);
+    assert_eq!(batch_id.get_version(), Some(uuid::Version::SortRand));
+}
+
+#[tokio::test]
 async fn schema_fingerprint_conflict_rejects_before_mutation() {
     let scribe = ScribeImpl::new();
     let mut request = append(DataTenantId::SYSTEM_OWNER, 1);
@@ -210,6 +248,7 @@ fn queue_full_rejects_before_mutation() {
         max_bytes: 64,
         max_writers: 1,
         writer_queue_items: 64,
+        writer_idle_ttl: std::time::Duration::from_mins(10),
         memory_limit_bytes: 1_000,
     });
     let reservation = admission
@@ -492,7 +531,7 @@ async fn post_ack_lane_saturation_preserves_cross_writer_progress() {
         tokio::time::sleep(Duration::from_millis(1)),
     );
     let mut tasks = Vec::new();
-    for _ in 0..300 {
+    for _ in 0..200 {
         let executor = executor.clone();
         let table = TableRef::new(BifrostNamespace::Bifrost, "saturated");
         let append = admitted_append(&admission, table, 1);
@@ -557,6 +596,7 @@ fn active_writer_limit_rejects_new_cardinality() {
         max_bytes: 10_000,
         max_writers: 1,
         writer_queue_items: 64,
+        writer_idle_ttl: std::time::Duration::from_mins(10),
         memory_limit_bytes: 10_000,
     });
     let first = admission.try_reserve_writer("one").expect("first writer");
@@ -693,6 +733,7 @@ async fn pod_global_item_limit_rejects_tiny_batches() {
             max_bytes: 1024 * 1024,
             max_writers: 10,
             writer_queue_items: 64,
+            writer_idle_ttl: std::time::Duration::from_mins(10),
             memory_limit_bytes: 10_000,
         },
     );

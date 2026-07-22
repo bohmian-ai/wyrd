@@ -22,19 +22,19 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
-pub mod handle;
 pub mod grpc;
+pub mod handle;
 pub mod observe;
 #[cfg(feature = "python")]
 pub mod python;
 pub mod scope;
 pub mod sink;
 
-pub use handle::{Bifrost, schema_from_json_schema};
 pub use grpc::{
     BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
     PROTO_FRAME_OVERHEAD_BYTES,
 };
+pub use handle::{Bifrost, schema_from_json_schema};
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
 

@@ -17,7 +17,7 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memtable::Memtable;
-use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend};
+use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend, PreparedSlice};
 use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::wal::{ScribeAppendMeta, WalHandle, WalWriter};
 
@@ -62,6 +62,7 @@ struct WriterDependencies {
     telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
     writer_queue_items: usize,
+    writer_idle_ttl: std::time::Duration,
 }
 
 /// One FIFO writer for a tenant/table binding.
@@ -74,6 +75,7 @@ pub(crate) struct TenantTableWriter {
     data_tx: mpsc::Sender<AdmittedAppend>,
     control_tx: mpsc::Sender<WriterControl>,
     age_tx: watch::Sender<Instant>,
+    idle_ttl: std::time::Duration,
     _lease: WriterLease,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -94,6 +96,7 @@ impl TenantTableWriter {
             telemetry,
             coordination_runtime,
             writer_queue_items,
+            writer_idle_ttl,
         } = dependencies;
         let (data_tx, data_rx) = mpsc::channel(writer_queue_items.max(1));
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
@@ -126,6 +129,7 @@ impl TenantTableWriter {
             data_tx,
             control_tx,
             age_tx,
+            idle_ttl: writer_idle_ttl,
             _lease: lease,
             _task: task,
         })
@@ -149,7 +153,7 @@ impl TenantTableWriter {
 
     fn is_idle(&self, now: Instant) -> bool {
         let inactive = match self.state.last_activity.lock() {
-            Ok(last) => now.saturating_duration_since(*last) >= std::time::Duration::from_mins(10),
+            Ok(last) => now.saturating_duration_since(*last) >= self.idle_ttl,
             Err(_) => false,
         };
         self.state.accepting.load(Ordering::Acquire)
@@ -308,6 +312,7 @@ impl TenantTableWriterRegistry {
                 telemetry,
                 coordination_runtime: self.coordination_runtime.clone(),
                 writer_queue_items: self.admission.config().writer_queue_items,
+                writer_idle_ttl: self.admission.config().writer_idle_ttl,
             },
         );
         entries.insert(key, Arc::clone(&writer));
@@ -613,98 +618,116 @@ async fn process_prepared(
 ) -> Result<(), ScribeError> {
     let _request_id = prepared.request_id;
     let batch_id = *prepared.batch_id.as_bytes();
+    let frame_rows = prepared
+        .slices
+        .iter()
+        .map(|slice| slice.rows.num_rows())
+        .sum::<usize>();
     for slice in prepared.slices {
         if !seen_slices.insert(slice.id.clone()) {
             continue;
         }
-        let seal_key = slice.seal_key.clone();
-        let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
-            handle.clone()
-        } else {
-            let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
-            wal_handles.insert(seal_key.clone(), handle.clone());
-            let _ = runtime
-                .wal_io
-                .submit(ScribeWalIoOp::CreateOrRollSegment {
-                    wal: handle.clone(),
-                })
-                .await?;
-            handle
-        };
-        let wal_started = Instant::now();
-        let ScribeWalIoResult::WalWritten {
-            wal: written_wal,
-            lsn,
-        } = runtime
-            .wal_io
-            .submit(ScribeWalIoOp::WriteFrame {
-                wal: wal_handle.clone(),
-                frame: slice.wal_frame,
-            })
-            .await?
-        else {
-            return Err(ScribeError::Internal {
-                detail: "WAL IO lane returned the wrong write result".to_string(),
-            });
-        };
-        drop(written_wal);
-        if let Some(telemetry) = &runtime.telemetry {
-            telemetry.record(
-                "write_all",
-                wal_started.elapsed(),
-                slice.rows.num_rows(),
-                slice.wal_bytes,
-            );
-        }
-
-        let row_count = slice.rows.num_rows();
-        let memtable_bytes = slice.memtable_bytes;
-        runtime
-            .admission
-            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
-        let memtable_started = Instant::now();
-        if let Err(error) = runtime.memtable.insert(
-            &seal_key,
-            slice.audit_event,
-            ScribeAppendMeta {
-                batch_id,
-                rows_accepted: slice.rows.num_rows(),
-                wal_lsn_min: lsn,
-                wal_lsn_max: lsn,
-                seal_key: seal_key.as_path_components(),
-            },
-            slice.rows,
-        ) {
-            runtime.admission.release_active(memtable_bytes);
-            return Err(error);
-        }
-        if let Some(telemetry) = &runtime.telemetry {
-            telemetry.record(
-                "memtable_insert",
-                memtable_started.elapsed(),
-                row_count,
-                memtable_bytes,
-            );
-        }
-
-        let sync_started = Instant::now();
-        match runtime
-            .wal_io
-            .submit(ScribeWalIoOp::SyncWal { wal: wal_handle })
-            .await?
-        {
-            ScribeWalIoResult::WalSynced { wal: synced_wal } => drop(synced_wal),
-            _ => {
-                return Err(ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong sync result".to_string(),
-                });
-            }
-        }
-        if let Some(telemetry) = &runtime.telemetry {
-            telemetry.record("wal_sync_data", sync_started.elapsed(), 0, 0);
-        }
+        process_prepared_slice(runtime, slice, batch_id, wal_handles).await?;
+    }
+    if let Some(telemetry) = &runtime.telemetry {
+        telemetry.record_fsynced(frame_rows);
     }
     drop(prepared.reservation);
+    Ok(())
+}
+
+async fn process_prepared_slice(
+    runtime: &WriterRuntime,
+    slice: PreparedSlice,
+    batch_id: [u8; 16],
+    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+) -> Result<(), ScribeError> {
+    let seal_key = slice.seal_key.clone();
+    let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
+        handle.clone()
+    } else {
+        let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
+        wal_handles.insert(seal_key.clone(), handle.clone());
+        let _ = runtime
+            .wal_io
+            .submit(ScribeWalIoOp::CreateOrRollSegment {
+                wal: handle.clone(),
+            })
+            .await?;
+        handle
+    };
+    let wal_started = Instant::now();
+    let ScribeWalIoResult::WalWritten {
+        wal: written_wal,
+        lsn,
+    } = runtime
+        .wal_io
+        .submit(ScribeWalIoOp::WriteFrame {
+            wal: wal_handle.clone(),
+            frame: slice.wal_frame,
+        })
+        .await?
+    else {
+        return Err(ScribeError::Internal {
+            detail: "WAL IO lane returned the wrong write result".to_string(),
+        });
+    };
+    drop(written_wal);
+    if let Some(telemetry) = &runtime.telemetry {
+        telemetry.record(
+            "write_all",
+            wal_started.elapsed(),
+            slice.rows.num_rows(),
+            slice.wal_bytes,
+        );
+    }
+
+    let row_count = slice.rows.num_rows();
+    let memtable_bytes = slice.memtable_bytes;
+    runtime
+        .admission
+        .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+    let memtable_started = Instant::now();
+    if let Err(error) = runtime.memtable.insert(
+        &seal_key,
+        slice.audit_event,
+        ScribeAppendMeta {
+            batch_id,
+            rows_accepted: row_count,
+            wal_lsn_min: lsn,
+            wal_lsn_max: lsn,
+            seal_key: seal_key.as_path_components(),
+        },
+        slice.rows,
+    ) {
+        runtime.admission.release_active(memtable_bytes);
+        return Err(error);
+    }
+    if let Some(telemetry) = &runtime.telemetry {
+        telemetry.record(
+            "memtable_insert",
+            memtable_started.elapsed(),
+            row_count,
+            memtable_bytes,
+        );
+    }
+
+    let sync_started = Instant::now();
+    match runtime
+        .wal_io
+        .submit(ScribeWalIoOp::SyncWal { wal: wal_handle })
+        .await?
+    {
+        ScribeWalIoResult::WalSynced { wal: synced_wal } => drop(synced_wal),
+        _ => {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong sync result".to_string(),
+            });
+        }
+    }
+    if let Some(telemetry) = &runtime.telemetry {
+        telemetry.record("wal_sync_data", sync_started.elapsed(), 0, 0);
+    }
     Ok(())
 }
 

@@ -103,6 +103,9 @@ pub enum IngestError {
     /// Callers must back off and retry the full request.
     #[error("ingest writer busy — local buffer full")]
     WriterBusy,
+    /// The pod-wide WAL disk breaker is open.
+    #[error("ingest WAL storage is unavailable")]
+    WalDiskFull,
     /// Arrow IPC decode failed.
     #[error("ingest arrow decode failed: {0}")]
     Decode(String),
@@ -124,10 +127,17 @@ impl IngestError {
                         .unwrap_or(u64::MAX),
                 }
             }
-            vala_bifrost_redux::contracts::ScribeError::WalDiskFull => {
-                Self::Internal("Scribe WAL disk breaker is open".to_owned())
+            vala_bifrost_redux::contracts::ScribeError::FingerprintMismatch { table } => {
+                Self::SchemaMismatch { table }
             }
-            other => Self::Internal(other.to_string()),
+            vala_bifrost_redux::contracts::ScribeError::TooManyRows { rows, limit } => {
+                Self::TooManyRows { rows, limit }
+            }
+            vala_bifrost_redux::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
+            other => {
+                tracing::error!(error = %other, "Scribe ingest failed after transport validation");
+                Self::Internal("Scribe ingest failed".to_owned())
+            }
         }
     }
 
@@ -152,6 +162,7 @@ impl IngestError {
             Self::TooManyStreams => "WYRD_VALA_429_INGEST_TOO_MANY_STREAMS",
             Self::WriterClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
             Self::WriterBusy => "WYRD_VALA_429_INGEST_BUSY",
+            Self::WalDiskFull => "WYRD_VALA_507_INGEST_WAL_UNAVAILABLE",
             Self::Internal(_) => "WYRD_VALA_500_INGEST_INTERNAL",
         }
     }
@@ -176,6 +187,7 @@ impl IngestError {
             | Self::WriterBusy => Code::ResourceExhausted,
             Self::StreamIdle => Code::DeadlineExceeded,
             Self::WriterClosed => Code::Aborted,
+            Self::WalDiskFull => Code::ResourceExhausted,
             Self::Internal(_) => Code::Internal,
         }
     }

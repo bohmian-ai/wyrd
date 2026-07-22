@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::TableRef;
@@ -43,7 +43,7 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
                     roles: Vec::new(),
                     effective_permissions: PermissionSet::new(),
                 };
-                let rows = make_batch(tenant, pod_index, tenant_index);
+                let rows = make_batch(pod_index, tenant_index);
                 let schema_fingerprint =
                     SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
                 scribe
@@ -105,11 +105,7 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
     Ok(())
 }
 
-fn make_batch(
-    tenant: wyrd_spec::DataTenantId,
-    pod_index: usize,
-    tenant_index: usize,
-) -> RecordBatch {
+fn make_batch(pod_index: usize, tenant_index: usize) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("value", DataType::Int64, false),
         Field::new(
@@ -117,7 +113,6 @@ fn make_batch(
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             false,
         ),
-        Field::new("data_tenant_id", DataType::Utf8, false),
     ]));
     let timestamp = chrono::Utc::now().timestamp_micros();
     RecordBatch::try_new(
@@ -134,7 +129,6 @@ fn make_batch(
                 TimestampMicrosecondArray::from(vec![timestamp; ROWS_PER_APPEND])
                     .with_timezone("UTC"),
             ),
-            Arc::new(StringArray::from(vec![tenant.to_string(); ROWS_PER_APPEND])),
         ],
     )
     .expect("valid journey batch")

@@ -43,6 +43,7 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
+vala-ingest = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
@@ -54,7 +55,7 @@ wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-server = { workspace = true }
+wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }

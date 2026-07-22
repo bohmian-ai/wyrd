@@ -30,6 +30,7 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 vala-bifrost = { workspace = true }
 vala-sql = { workspace = true }

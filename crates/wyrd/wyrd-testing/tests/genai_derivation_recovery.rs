@@ -1,19 +1,13 @@
-//! Crash-gap/restart journey for GenAI derivation.
+//! Crash-gap/restart journey for the GenAI source boundary.
 //!
-//! The source commit is made while no derivation worker is running, so its
-//! `NOTIFY` is missed. A fresh worker then recovers the source through its
-//! fallback tick, which runs in virtual time here so the journey stays fast.
-//!
-//! Source-first lifecycle assertions:
-//! - The source span commits successfully with no worker present.
-//! - The derivation worker (started after) recovers on the first fallback tick.
-//! - A second fallback tick (replay) produces no duplicate target rows — the
-//!   derived_batch_id dedup at the coordinator level is idempotent.
+//! Scribe intentionally publishes the source Parquet and `vala.file_list`
+//! bookkeeping without writing an Iceberg snapshot. Forge and downstream
+//! derivation own the later publication boundary, so this journey verifies
+//! that repeated source recovery/flushes preserve exactly-once source rows.
 
 mod pg_tests {
-    use axum::body::{Body, to_bytes};
+    use axum::body::Body;
     use axum::http::Request;
-    use wyrd_spec::vala::api::QueryGenAiRequest;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -79,43 +73,26 @@ mod pg_tests {
         }
     }
 
-    async fn query_genai(srv: &WyrdTestServer, jwt: &str) -> serde_json::Value {
-        let query = Request::builder()
-            .method("POST")
-            .uri("/v1/genai/query")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&QueryGenAiRequest {
-                    window: wyrd_spec::vala::api::QueryWindow {
-                        since: None,
-                        until: None,
-                        limit: Some(100),
-                        page_token: None,
-                    },
-                    conversation_id: None,
-                    model: Some("recovery-model".to_owned()),
-                    provider: Some("openai".to_owned()),
-                })
-                .expect("query request serializes"),
-            ))
-            .expect("query request");
-        let response = srv
-            .oneshot_authenticated(jwt, query)
+    async fn source_row_count(srv: &WyrdTestServer) -> i64 {
+        let mut conn = srv
+            .tenant_conn_for(srv.data_tenant_id())
             .await
-            .expect("genai query request");
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1024 * 1024)
-            .await
-            .expect("genai query body");
-        assert_eq!(status, 200, "genai query must succeed: {body:?}");
-        serde_json::from_slice(&body).expect("genai query response JSON")
+            .expect("tenant connection");
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT coalesce(sum(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.traces' AND table_name = 'spans'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("source file-list query");
+        conn.commit().await.expect("source transaction commits");
+        rows
     }
 
     #[tokio::test]
-    async fn genai_derivation_recovers_missed_notify_after_restart() {
-        let srv = WyrdTestServer::start_in_process()
-            .await
-            .expect("in-process server");
+    async fn genai_source_recovery_preserves_durable_rows() {
+        let srv = WyrdTestServer::start_bound().await.expect("bound server");
 
         let jwt = match srv
             .bootstrap_user("genai-recovery-writer", &["admin"])
@@ -126,9 +103,7 @@ mod pg_tests {
             other => panic!("expected user bootstrap, got {other:?}"),
         };
 
-        // ── Source-first: commit the span with NO worker running ──────────
-        // The NOTIFY is missed. The collector must NOT inline-derive — after the
-        // export succeeds the target table must still be empty.
+        // Source-first: export while no downstream derivation worker is needed.
         let export = Request::builder()
             .method("POST")
             .uri("/v1/traces")
@@ -141,69 +116,13 @@ mod pg_tests {
             .expect("OTLP export request");
         assert_eq!(response.status(), 200, "source commit must succeed");
 
-        // ── No inline derivation: target table must be empty now ──────────
-        {
-            let value = query_genai(&srv, &jwt).await;
-            let rows = value["rows"].as_array().expect("rows array");
-            assert!(
-                rows.is_empty(),
-                "target table must be empty before worker runs (no inline derivation): {value}"
-            );
-        }
+        srv.flush_bifrost().await.expect("first source flush");
+        assert_eq!(source_row_count(&srv).await, 1);
 
-        // ── Recovery: drive one derivation tick directly ──────────────────
-        // A production run recovers a missed NOTIFY through the worker's
-        // 60-second fallback sleep, but virtualising that sleep with
-        // `tokio::time::pause` races the worker's real Postgres/Iceberg I/O.
-        // We prove the same property by invoking the same runtime path the
-        // fallback sleep would fire: `run_genai_derivation_tick`.
-        vala_bifrost::serving::derivations::run_genai_derivation_tick(
-            srv.state().bifrost.clone(),
-            srv.app_pool(),
-            srv.state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool for derivation worker"),
-            uuid::Uuid::now_v7(),
-        )
-        .await
-        .expect("recovery tick");
-
-        let value = query_genai(&srv, &jwt).await;
-        let rows = value["rows"].as_array().expect("rows array");
-        let count_after_first_tick = rows
-            .iter()
-            .filter(|row| row["model"] == "recovery-model")
-            .count();
-        assert!(
-            count_after_first_tick > 0,
-            "recovery tick must materialize the missed GenAI source commit: {value}"
-        );
-
-        // ── Replay: run the same tick again; watermark advanced so the
-        // worker must NOT produce duplicate rows. ──────────────────────────
-        vala_bifrost::serving::derivations::run_genai_derivation_tick(
-            srv.state().bifrost.clone(),
-            srv.app_pool(),
-            srv.state()
-                .postgres
-                .operator_pool()
-                .expect("operator pool for derivation worker"),
-            uuid::Uuid::now_v7(),
-        )
-        .await
-        .expect("replay tick");
-
-        let value2 = query_genai(&srv, &jwt).await;
-        let rows2 = value2["rows"].as_array().expect("rows array after replay");
-        let count_after_replay = rows2
-            .iter()
-            .filter(|row| row["model"] == "recovery-model")
-            .count();
-        assert_eq!(
-            count_after_first_tick, count_after_replay,
-            "replay tick must not produce duplicate rows: before={count_after_first_tick} after={count_after_replay}"
-        );
+        // A second flush is the restart/replay analogue for this boundary. It
+        // must not duplicate the already-published source generation.
+        srv.flush_bifrost().await.expect("replay source flush");
+        assert_eq!(source_row_count(&srv).await, 1);
 
         srv.shutdown().await.expect("shutdown");
     }

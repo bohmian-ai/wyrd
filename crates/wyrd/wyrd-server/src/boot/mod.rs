@@ -12,6 +12,7 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::WalWriter;
 use vala_bifrost_redux::scribe::{ScribeImpl, ScribeLaneConfig};
@@ -192,7 +193,8 @@ pub enum ServerBootError {
 /// construction fails.
 pub async fn build_app_state() -> Result<AppState, ServerBootError> {
     let boot = PostgresBoot::from_env().await?;
-    build_app_state_from_boot(&boot).await
+    build_app_state_from_boot_with_config(&boot, crate::config::ScribeRuntimeConfig::default())
+        .await
 }
 
 /// Assemble runtime state from a resolved Postgres boot mode.
@@ -201,6 +203,15 @@ pub async fn build_app_state() -> Result<AppState, ServerBootError> {
 /// Returns [`ServerBootError`] when DSN resolution, migrations, or runtime
 /// pool construction fails.
 pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, ServerBootError> {
+    build_app_state_from_boot_with_config(boot, crate::config::ScribeRuntimeConfig::default()).await
+}
+
+/// Assemble runtime state from a resolved Postgres boot mode and Scribe config.
+pub async fn build_app_state_from_boot_with_config(
+    boot: &PostgresBoot,
+    scribe_config: crate::config::ScribeRuntimeConfig,
+) -> Result<AppState, ServerBootError> {
+    scribe_config.validate().map_err(ServerBootError::Scribe)?;
     let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
     let storage_settings = load_storage_settings()?;
@@ -258,9 +269,25 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
+    tracing::info!(
+        coordination_threads = scribe_config.coordination_threads,
+        ingress_cpu_threads = scribe_config.ingress_cpu_threads,
+        post_ack_cpu_threads = scribe_config.post_ack_cpu_threads,
+        wal_io_threads = scribe_config.wal_io_threads,
+        ingress_queue_items = scribe_config.ingress_queue_items,
+        ingress_queue_bytes = scribe_config.ingress_queue_bytes,
+        retained_frame_items = scribe_config.retained_frame_items,
+        retained_frame_bytes = scribe_config.retained_frame_bytes,
+        post_ack_queue_items = scribe_config.post_ack_queue_items,
+        wal_io_queue_items = scribe_config.wal_io_queue_items,
+        writer_queue_items = scribe_config.writer_queue_items,
+        active_writer_limit = scribe_config.active_writer_limit,
+        writer_idle_ttl_secs = scribe_config.writer_idle_ttl_secs,
+        "resolved Scribe runtime configuration"
+    );
     let coordination_runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(scribe_config.coordination_threads)
             .thread_name_fn(|| {
                 static THREAD_INDEX: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
@@ -275,12 +302,30 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
                 ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
             })?,
     );
-    let scribe = Arc::new(ScribeImpl::new_with_runtime_config(
+    let lane_config = ScribeLaneConfig {
+        ingress_cpu_threads: scribe_config.ingress_cpu_threads,
+        post_ack_cpu_threads: scribe_config.post_ack_cpu_threads,
+        wal_io_threads: scribe_config.wal_io_threads,
+        ingress_queue_items: scribe_config.ingress_queue_items,
+        ingress_queue_bytes: scribe_config.ingress_queue_bytes,
+        post_ack_queue_items: scribe_config.post_ack_queue_items,
+        wal_io_queue_items: scribe_config.wal_io_queue_items,
+    };
+    let admission = AdmissionConfig {
+        max_items: scribe_config.retained_frame_items,
+        max_bytes: scribe_config.retained_frame_bytes,
+        max_writers: scribe_config.active_writer_limit,
+        writer_queue_items: scribe_config.writer_queue_items,
+        writer_idle_ttl: std::time::Duration::from_secs(scribe_config.writer_idle_ttl_secs),
+        memory_limit_bytes: scribe_config.retained_frame_bytes,
+    };
+    let scribe = Arc::new(ScribeImpl::new_with_runtime_config_and_admission(
         Arc::new(storage.operator().clone()),
         wal,
         stream.node_id.to_string(),
         stream.writer_epoch.as_i64(),
-        ScribeLaneConfig::default(),
+        lane_config,
+        admission,
         coordination_runtime.handle().clone(),
     ));
     let replayed_generations = scribe
@@ -341,7 +386,7 @@ pub async fn build_state(
     let shutdown = CancellationToken::new();
 
     let boot = PostgresBoot::from_env().await?;
-    let state = build_app_state_from_boot(&boot).await?;
+    let state = build_app_state_from_boot_with_config(&boot, config.scribe).await?;
     let sealing_key = build_sealing_key(config)?;
 
     let state = attach_config_fields(state, config, shutdown, telemetry)?;

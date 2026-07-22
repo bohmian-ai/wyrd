@@ -27,8 +27,115 @@ pub struct AdmissionConfig {
     pub max_writers: usize,
     /// Maximum admitted frames waiting in one tenant/table writer queue.
     pub writer_queue_items: usize,
+    /// Duration after which an empty writer may be retired.
+    pub writer_idle_ttl: std::time::Duration,
     /// Pod memory budget used by the 90% active/immutable breaker.
     pub memory_limit_bytes: usize,
+}
+
+/// Independent raw-ingress queue bounds. These bounds limit transport payloads
+/// waiting for or running through pre-ACK CPU work; retained canonical frames
+/// use [`AdmissionConfig`] instead.
+#[derive(Debug, Clone, Copy)]
+pub struct IngressQueueConfig {
+    /// Maximum raw frames in the ingress dispatcher.
+    pub max_items: usize,
+    /// Maximum raw bytes in the ingress dispatcher.
+    pub max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct IngressQueueState {
+    items: usize,
+    bytes: usize,
+}
+
+#[derive(Debug)]
+struct IngressQueueInner {
+    config: IngressQueueConfig,
+    state: Mutex<IngressQueueState>,
+}
+
+/// Pod-global raw-ingress queue accounting.
+#[derive(Debug, Clone)]
+pub struct IngressQueueBudget {
+    inner: Arc<IngressQueueInner>,
+}
+
+impl IngressQueueBudget {
+    /// Construct a raw-ingress budget with explicit bounds.
+    #[must_use]
+    pub fn with_config(config: IngressQueueConfig) -> Self {
+        Self {
+            inner: Arc::new(IngressQueueInner {
+                config,
+                state: Mutex::new(IngressQueueState::default()),
+            }),
+        }
+    }
+
+    /// Reserve one raw frame without waiting.
+    pub fn try_reserve(
+        &self,
+        table: impl Into<String>,
+        bytes: usize,
+    ) -> Result<IngressQueueReservation, ScribeError> {
+        let table = table.into();
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("ingress queue state lock poisoned: {error}"),
+            })?;
+        if state.items >= self.inner.config.max_items
+            || bytes > self.inner.config.max_bytes.saturating_sub(state.bytes)
+        {
+            return Err(ScribeError::IngestBusy { table });
+        }
+        state.items += 1;
+        state.bytes += bytes;
+        drop(state);
+        Ok(IngressQueueReservation {
+            inner: Some(Arc::clone(&self.inner)),
+            bytes,
+        })
+    }
+
+    /// Return the raw queue counters and configured bounds.
+    #[must_use]
+    pub fn snapshot(&self) -> IngressQueueSnapshot {
+        let state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        IngressQueueSnapshot {
+            items: state.items,
+            bytes: state.bytes,
+            max_items: self.inner.config.max_items,
+            max_bytes: self.inner.config.max_bytes,
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if let Ok(mut state) = self.inner.state.lock() {
+            state.items = state.items.saturating_sub(1);
+            state.bytes = state.bytes.saturating_sub(bytes);
+        }
+    }
+}
+
+/// Raw-ingress queue counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressQueueSnapshot {
+    /// Raw frames currently reserved.
+    pub items: usize,
+    /// Raw bytes currently reserved.
+    pub bytes: usize,
+    /// Configured raw frame ceiling.
+    pub max_items: usize,
+    /// Configured raw byte ceiling.
+    pub max_bytes: usize,
 }
 
 impl Default for AdmissionConfig {
@@ -38,6 +145,7 @@ impl Default for AdmissionConfig {
             max_bytes: 512 * 1024 * 1024,
             max_writers: 1_024,
             writer_queue_items: 64,
+            writer_idle_ttl: std::time::Duration::from_mins(10),
             memory_limit_bytes: 512 * 1024 * 1024,
         }
     }
@@ -93,7 +201,34 @@ impl AdmissionController {
         &self,
         table: impl Into<String>,
         bytes: usize,
-    ) -> Result<AdmissionReservation, ScribeError> {
+    ) -> Result<RetainedFrameReservation, ScribeError> {
+        self.try_reserve_kind(table, bytes)
+    }
+
+    /// Reserve raw transport bytes before ingress decoding.
+    pub fn try_reserve_raw(
+        &self,
+        table: impl Into<String>,
+        bytes: usize,
+    ) -> Result<RawIngressReservation, ScribeError> {
+        let mut reservation = self.try_reserve_kind(table, bytes)?;
+        let inner = reservation
+            .inner
+            .take()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "new admission reservation did not contain state".to_owned(),
+            })?;
+        Ok(RawIngressReservation {
+            inner: Some(inner),
+            bytes: reservation.bytes,
+        })
+    }
+
+    fn try_reserve_kind(
+        &self,
+        table: impl Into<String>,
+        bytes: usize,
+    ) -> Result<RetainedFrameReservation, ScribeError> {
         let table = table.into();
         if !self.inner.wal_available.load(Ordering::Acquire) {
             return Err(ScribeError::WalDiskFull);
@@ -116,7 +251,7 @@ impl AdmissionController {
         state.bytes += bytes;
         drop(state);
 
-        Ok(AdmissionReservation {
+        Ok(RetainedFrameReservation {
             inner: Some(Arc::clone(&self.inner)),
             bytes,
         })
@@ -275,14 +410,50 @@ impl Default for AdmissionController {
     }
 }
 
-/// A request's item and byte reservation.
+/// RAII reservation for one raw ingress payload.
 #[derive(Debug)]
-pub struct AdmissionReservation {
+pub struct IngressQueueReservation {
+    inner: Option<Arc<IngressQueueInner>>,
+    bytes: usize,
+}
+
+impl IngressQueueReservation {
+    /// Transfer the raw queue reservation into the retained-frame budget.
+    ///
+    /// The raw reservation remains held when retained admission fails, so the
+    /// caller can retry or let normal RAII release the original accounting.
+    pub fn transfer_to_retained(
+        &mut self,
+        admission: &AdmissionController,
+        table: impl Into<String>,
+        retained_bytes: usize,
+    ) -> Result<RetainedFrameReservation, ScribeError> {
+        let retained = admission.try_reserve(table, retained_bytes)?;
+        self.release_inner();
+        Ok(retained)
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            IngressQueueBudget { inner }.release(self.bytes);
+        }
+    }
+}
+
+impl Drop for IngressQueueReservation {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+/// Raw transport item and byte reservation held during ingress decoding.
+#[derive(Debug)]
+pub struct RawIngressReservation {
     inner: Option<Arc<AdmissionInner>>,
     bytes: usize,
 }
 
-impl AdmissionReservation {
+impl RawIngressReservation {
     /// Return the request's charged byte count.
     #[must_use]
     pub const fn bytes(&self) -> usize {
@@ -294,6 +465,53 @@ impl AdmissionReservation {
         self.release_inner();
     }
 
+    /// Atomically transfer this item from raw ingress bytes to retained bytes.
+    ///
+    /// The item count remains reserved while the byte charge is replaced. If
+    /// the retained charge would exceed the pod limit, the raw reservation is
+    /// left intact so the caller can release it through normal RAII.
+    pub fn transfer_to_retained(
+        &mut self,
+        retained_bytes: usize,
+    ) -> Result<RetainedFrameReservation, ScribeError> {
+        let Some(inner) = self.inner.take() else {
+            return Err(ScribeError::Internal {
+                detail: "raw ingress reservation was already released".to_owned(),
+            });
+        };
+        let result = match inner.state.lock() {
+            Ok(mut state) => {
+                let retained_total = state
+                    .bytes
+                    .saturating_sub(self.bytes)
+                    .saturating_add(retained_bytes);
+                if retained_bytes > inner.config.max_bytes
+                    || retained_total > inner.config.max_bytes
+                {
+                    Err(ScribeError::IngestBusy {
+                        table: "ingress".to_owned(),
+                    })
+                } else {
+                    state.bytes = retained_total;
+                    Ok(())
+                }
+            }
+            Err(_) => Err(ScribeError::Internal {
+                detail: "admission state lock poisoned while transferring reservation".to_owned(),
+            }),
+        };
+        match result {
+            Ok(()) => Ok(RetainedFrameReservation {
+                inner: Some(inner),
+                bytes: retained_bytes,
+            }),
+            Err(error) => {
+                self.inner = Some(inner);
+                Err(error)
+            }
+        }
+    }
+
     fn release_inner(&mut self) {
         if let Some(inner) = self.inner.take() {
             AdmissionController { inner }.release_request(self.bytes);
@@ -301,11 +519,46 @@ impl AdmissionReservation {
     }
 }
 
-impl Drop for AdmissionReservation {
+impl Drop for RawIngressReservation {
     fn drop(&mut self) {
         self.release_inner();
     }
 }
+
+/// Canonical retained item and byte reservation carried by a writer queue.
+#[derive(Debug)]
+pub struct RetainedFrameReservation {
+    inner: Option<Arc<AdmissionInner>>,
+    bytes: usize,
+}
+
+impl RetainedFrameReservation {
+    /// Return the retained byte charge.
+    #[must_use]
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Release the retained reservation immediately.
+    pub fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            AdmissionController { inner }.release_request(self.bytes);
+        }
+    }
+}
+
+impl Drop for RetainedFrameReservation {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
+}
+
+/// Compatibility name for internal callers that have not yet been migrated.
+pub type AdmissionReservation = RetainedFrameReservation;
 
 /// A writer-count reservation held by one registry entry.
 #[derive(Debug)]
@@ -348,6 +601,8 @@ pub struct AdmissionSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[test]
@@ -357,6 +612,7 @@ mod tests {
             max_bytes: 10,
             max_writers: 1,
             writer_queue_items: 64,
+            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
         let reservation = admission
@@ -382,6 +638,7 @@ mod tests {
             max_bytes: 10,
             max_writers: 1,
             writer_queue_items: 64,
+            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
         let _reservation = admission.try_reserve("events", 10).expect("reserve");
@@ -398,6 +655,7 @@ mod tests {
             max_bytes: 100,
             max_writers: 10,
             writer_queue_items: 64,
+            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
         admission
@@ -409,5 +667,106 @@ mod tests {
         assert_eq!(admission.snapshot().immutable_bytes, 90);
         admission.release_immutable(90);
         assert_eq!(admission.snapshot().immutable_bytes, 0);
+    }
+
+    #[test]
+    fn ingress_item_and_byte_bounds_release_on_every_error() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 1,
+            max_bytes: 16,
+            max_writers: 1,
+            writer_queue_items: 1,
+            writer_idle_ttl: Duration::from_mins(10),
+            memory_limit_bytes: 100,
+        });
+        let mut raw = admission
+            .try_reserve_raw("events", 8)
+            .expect("raw reservation");
+        assert!(raw.transfer_to_retained(17).is_err());
+        drop(raw);
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+        assert!(admission.try_reserve_raw("events", 17).is_err());
+        assert_eq!(admission.snapshot().items, 0);
+    }
+
+    #[test]
+    fn retained_reservation_survives_ack_and_writer_queue_admission() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 2,
+            max_bytes: 32,
+            max_writers: 2,
+            writer_queue_items: 1,
+            writer_idle_ttl: Duration::from_mins(10),
+            memory_limit_bytes: 100,
+        });
+        let mut raw = admission
+            .try_reserve_raw("events", 8)
+            .expect("raw reservation");
+        let retained = raw.transfer_to_retained(16).expect("retained transfer");
+        assert_eq!(admission.snapshot().items, 1);
+        assert_eq!(admission.snapshot().bytes, 16);
+        drop(retained);
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    #[test]
+    fn retained_reservation_releases_on_cancel_panic_shutdown_and_replay() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 4,
+            max_bytes: 64,
+            max_writers: 4,
+            writer_queue_items: 1,
+            writer_idle_ttl: Duration::from_mins(10),
+            memory_limit_bytes: 100,
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reservation = admission.try_reserve("events", 16).expect("reservation");
+            panic!("test cancellation path");
+        }));
+        assert!(result.is_err());
+        assert_eq!(admission.snapshot().items, 0);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    #[test]
+    fn many_writer_queues_share_one_retained_byte_ceiling() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 8,
+            max_bytes: 32,
+            max_writers: 8,
+            writer_queue_items: 1,
+            writer_idle_ttl: Duration::from_mins(10),
+            memory_limit_bytes: 100,
+        });
+        let first = admission.try_reserve("tenant_a.events", 16).expect("first");
+        let second = admission
+            .try_reserve("tenant_b.events", 16)
+            .expect("second");
+        assert!(admission.try_reserve("tenant_c.events", 1).is_err());
+        drop(first);
+        drop(second);
+        assert_eq!(admission.snapshot().bytes, 0);
+    }
+
+    #[test]
+    fn active_writer_limit_rejects_and_idle_eviction_releases_lease() {
+        let admission = AdmissionController::with_config(AdmissionConfig {
+            max_items: 8,
+            max_bytes: 64,
+            max_writers: 1,
+            writer_queue_items: 1,
+            writer_idle_ttl: Duration::from_secs(1),
+            memory_limit_bytes: 100,
+        });
+        let lease = admission
+            .try_reserve_writer("events")
+            .expect("writer lease");
+        assert!(admission.try_reserve_writer("other").is_err());
+        drop(lease);
+        admission
+            .try_reserve_writer("other")
+            .expect("released writer lease");
     }
 }

@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use wyrd_spec::vala::system_columns::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 /// Extend the user fields with the physical Bifrost columns for a dynamically-created
@@ -20,6 +20,7 @@ pub fn with_system_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
     user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+    user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
     user_fields.push(Field::new(
         WYRD_EVENT_TIME,
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -57,6 +58,7 @@ mod tests {
                 RUN_ID,
                 CARD_UID,
                 PRINCIPAL_ID,
+                WYRD_REQUEST_ID,
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,

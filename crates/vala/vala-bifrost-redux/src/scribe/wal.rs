@@ -455,7 +455,9 @@ struct DecodedAppendFrame<'a> {
 }
 
 fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
-    if frame.len() < 28 || (frame[0..4] != APPEND_FRAME_MAGIC && frame[0..4] != APPEND_FRAME_MAGIC_V2) {
+    if frame.len() < 28
+        || (frame[0..4] != APPEND_FRAME_MAGIC && frame[0..4] != APPEND_FRAME_MAGIC_V2)
+    {
         return Err(ScribeError::Internal {
             detail: "invalid Scribe WAL append frame".to_string(),
         });
@@ -1146,7 +1148,11 @@ mod tests {
         let batch_id = [9u8; 16];
         let mut encoded = Vec::new();
         let payload = b"legacy";
-        encoded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        encoded.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("legacy WAL test payload fits record length")
+                .to_le_bytes(),
+        );
         encoded.extend_from_slice(&3_u64.to_le_bytes());
         encoded.push(0);
         encoded.extend_from_slice(&[0; 3]);

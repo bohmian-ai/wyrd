@@ -63,7 +63,7 @@ const OTLP_ORIGIN: &str = "otlp";
 /// OTLP/gRPC trace receiver over `vala-bifrost`'s group-commit writer.
 ///
 /// Generic over the resolver-backed verifier's `R` / `I`, static-dispatched like
-/// [`crate::service::BifrostIngestGrpc`], so it shares the one auth seam.
+/// The server-owned Gate, so it shares the one auth seam.
 pub struct OtlpTraceService<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     auth: IngestAuthInterceptor<R, I>,

@@ -168,8 +168,8 @@ async fn ack_returns_after_queue_admission() {
 async fn ack_does_not_split_or_encode() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::from_millis(60), Duration::ZERO);
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe =
-        ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(Arc::clone(&telemetry));
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io)
+        .with_telemetry(Arc::clone(&telemetry));
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 2))
@@ -209,6 +209,7 @@ fn queue_full_rejects_before_mutation() {
         max_items: 1,
         max_bytes: 64,
         max_writers: 1,
+        writer_queue_items: 64,
         memory_limit_bytes: 1_000,
     });
     let reservation = admission
@@ -270,8 +271,8 @@ fn cross_day_enqueue_is_atomic() {
 async fn fsync_runs_after_ack() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe =
-        ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(Arc::clone(&telemetry));
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io)
+        .with_telemetry(Arc::clone(&telemetry));
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
@@ -401,7 +402,7 @@ fn fsynced_frames_replay_exactly() {
 }
 
 #[tokio::test]
-async fn consumer_failure_stops_writer_admission() {
+async fn invalid_legacy_append_rejects_before_writer_admission() {
     let scribe = ScribeImpl::new();
     let mut request = append(DataTenantId::SYSTEM_OWNER, 1);
     request.rows = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
@@ -411,27 +412,13 @@ async fn consumer_failure_stops_writer_admission() {
     )])));
     request.schema_fingerprint =
         SchemaFingerprint::from_arrow_schema(request.rows.schema().as_ref());
-    scribe
+    let error = scribe
         .append(request)
         .await
-        .expect("post-ack request is admitted");
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while scribe.runtime_snapshot().writers.unhealthy_writers == 0 {
-        assert!(
-            Instant::now() < deadline,
-            "consumer failure was not observed"
-        );
-        tokio::task::yield_now().await;
-    }
-
-    let error = scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 1))
-        .await
-        .expect_err("unhealthy writer must reject later admission");
+        .expect_err("missing event time must be rejected before admission");
     assert!(matches!(
         error,
-        crate::contracts::ScribeError::IngestBusy { .. }
+        crate::contracts::ScribeError::Internal { .. }
     ));
     scribe.shutdown().await;
 }
@@ -497,7 +484,7 @@ async fn server_runtime_remains_responsive() {
 }
 
 #[tokio::test]
-async fn blocking_executor_saturation_preserves_cross_writer_progress() {
+async fn post_ack_lane_saturation_preserves_cross_writer_progress() {
     let admission = AdmissionController::new();
     let executor = ScribePostAckCpuPool::with_delay(1, Duration::from_millis(2));
     let timer = tokio::time::timeout(
@@ -515,6 +502,9 @@ async fn blocking_executor_saturation_preserves_cross_writer_progress() {
                 .await
             {
                 Ok(ScribePostAckCpuResult::Prepared(_)) => Ok(()),
+                Ok(ScribePostAckCpuResult::ParquetEncoded(_)) => {
+                    Err("post-ACK lane returned parquet result".to_owned())
+                }
                 Err(error) => Err(error.to_string()),
             }
         }));
@@ -566,6 +556,7 @@ fn active_writer_limit_rejects_new_cardinality() {
         max_items: 10,
         max_bytes: 10_000,
         max_writers: 1,
+        writer_queue_items: 64,
         memory_limit_bytes: 10_000,
     });
     let first = admission.try_reserve_writer("one").expect("first writer");
@@ -701,6 +692,7 @@ async fn pod_global_item_limit_rejects_tiny_batches() {
             max_items: 2,
             max_bytes: 1024 * 1024,
             max_writers: 10,
+            writer_queue_items: 64,
             memory_limit_bytes: 10_000,
         },
     );

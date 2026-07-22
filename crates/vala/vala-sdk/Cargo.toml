@@ -19,6 +19,7 @@ python = ["dep:pyo3"]
 [dependencies]
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 arrow-schema = { workspace = true }
@@ -28,6 +29,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = "0.1"
+uuid = { workspace = true, features = ["v7"] }
 
 pyo3 = { workspace = true, optional = true }
 

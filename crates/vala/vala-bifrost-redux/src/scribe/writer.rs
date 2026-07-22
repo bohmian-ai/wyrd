@@ -21,7 +21,6 @@ use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend};
 use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::wal::{ScribeAppendMeta, WalHandle, WalWriter};
 
-const WRITER_QUEUE_CAPACITY: usize = 1_024;
 const CONTROL_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Debug)]
@@ -62,6 +61,7 @@ struct WriterDependencies {
     wal_io: ScribeWalIoPool,
     telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
+    writer_queue_items: usize,
 }
 
 /// One FIFO writer for a tenant/table binding.
@@ -93,8 +93,9 @@ impl TenantTableWriter {
             wal_io,
             telemetry,
             coordination_runtime,
+            writer_queue_items,
         } = dependencies;
-        let (data_tx, data_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
+        let (data_tx, data_rx) = mpsc::channel(writer_queue_items.max(1));
         let (control_tx, control_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         let (age_tx, age_rx) = watch::channel(Instant::now());
         let state = Arc::new(WriterState {
@@ -306,6 +307,7 @@ impl TenantTableWriterRegistry {
                 wal_io: self.wal_io.clone(),
                 telemetry,
                 coordination_runtime: self.coordination_runtime.clone(),
+                writer_queue_items: self.admission.config().writer_queue_items,
             },
         );
         entries.insert(key, Arc::clone(&writer));
@@ -399,6 +401,22 @@ impl TenantTableWriterRegistry {
                 .map(|writer| writer.terminal_errors())
                 .sum(),
         }
+    }
+
+    pub(crate) fn lane_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
+        let post_ack = self.post_ack_cpu.snapshot();
+        let wal_io = self.wal_io.snapshot();
+        crate::scribe::telemetry::ExecutorSnapshot {
+            depth: post_ack.depth.saturating_add(wal_io.depth),
+            capacity: post_ack.capacity.saturating_add(wal_io.capacity),
+            saturation_events: post_ack
+                .saturation_events
+                .saturating_add(wal_io.saturation_events),
+        }
+    }
+
+    pub(crate) fn post_ack_cpu(&self) -> ScribePostAckCpuPool {
+        self.post_ack_cpu.clone()
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -555,6 +573,11 @@ async fn process_append(
         .await?
     {
         ScribePostAckCpuResult::Prepared(prepared) => prepared,
+        ScribePostAckCpuResult::ParquetEncoded(_) => {
+            return Err(ScribeError::Internal {
+                detail: "post-ACK lane returned the wrong writer result".to_owned(),
+            });
+        }
     };
     if let Some(telemetry) = &runtime.telemetry {
         telemetry.record(

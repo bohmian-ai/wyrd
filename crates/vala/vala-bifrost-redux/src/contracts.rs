@@ -185,9 +185,16 @@ pub trait Scribe: Send + Sync {
             .map_err(|error| ScribeError::Internal {
                 detail: error.to_string(),
             })?;
-        if req.schema_fingerprint != SchemaFingerprint::from_arrow_schema(req.rows.schema().as_ref()) {
+        if req.schema_fingerprint
+            != SchemaFingerprint::from_arrow_schema(req.rows.schema().as_ref())
+        {
             return Err(ScribeError::FingerprintMismatch {
                 table: req.table.fqn(),
+            });
+        }
+        if req.rows.schema().index_of("wyrd_event_time").is_err() {
+            return Err(ScribeError::Internal {
+                detail: "legacy append requires wyrd_event_time".to_owned(),
             });
         }
         let expected_schema_fingerprint = source_schema_fingerprint(req.rows.schema().as_ref());

@@ -39,13 +39,8 @@ where
         .token_verifier
         .clone()
         .ok_or(GrpcError::MissingTokenVerifier)?;
+    let ingest = state.gate.clone().ok_or(GrpcError::MissingScribe)?;
     let scribe = state.scribe.clone().ok_or(GrpcError::MissingScribe)?;
-    let ingest = crate::bifrost::gate::Gate::with_scribe(
-        state.bifrost.clone(),
-        scribe.clone(),
-        ingest_auth_interceptor(verifier.clone()),
-        vala_ingest::IngestLimits::default(),
-    );
     let traces = OtlpTraceService::with_scribe(
         state.bifrost.clone(),
         scribe.clone(),
@@ -64,7 +59,7 @@ where
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router
-        .add_service(ingest.into_server())
+        .add_service((*ingest).clone().into_server())
         .add_service(traces.into_server())
         .add_service(metrics.into_server())
         .add_service(logs.into_server())

@@ -10,11 +10,14 @@ use wyrd_spec::ids::PodId;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
+use crate::scribe::execution_lanes::{
+    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult,
+};
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
 use crate::scribe::filename::seal_filename;
-use crate::scribe::memtable::Memtable;
-use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
+use crate::scribe::memtable::{FrozenMemtable, Memtable};
+use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::wal::WalLsn;
@@ -66,16 +69,14 @@ pub struct SealCommit {
 pub struct SealDriver {
     operator: Arc<Operator>,
     telemetry: Option<Arc<ScribeTelemetry>>,
+    post_ack_cpu: ScribePostAckCpuPool,
 }
 
 impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self {
-            operator,
-            telemetry: None,
-        }
+        Self::new_with_telemetry_and_lane(operator, None, ScribePostAckCpuPool::new(1))
     }
 
     /// Construct a seal driver with an optional benchmark recorder.
@@ -84,9 +85,20 @@ impl SealDriver {
         operator: Arc<Operator>,
         telemetry: Option<Arc<ScribeTelemetry>>,
     ) -> Self {
+        Self::new_with_telemetry_and_lane(operator, telemetry, ScribePostAckCpuPool::new(1))
+    }
+
+    /// Construct a seal driver using the boot-owned post-ACK CPU lane.
+    #[must_use]
+    pub(crate) fn new_with_telemetry_and_lane(
+        operator: Arc<Operator>,
+        telemetry: Option<Arc<ScribeTelemetry>>,
+        post_ack_cpu: ScribePostAckCpuPool,
+    ) -> Self {
         Self {
             operator,
             telemetry,
+            post_ack_cpu,
         }
     }
 
@@ -131,19 +143,12 @@ impl SealDriver {
             frozen.batch.get_array_memory_size(),
         );
 
-        // 2. WriteParquet (spawn_blocking to avoid blocking reactor)
+        // 2. WriteParquet on the boot-owned post-ACK CPU lane.
         info!("seal stage: WriteParquet");
         let parquet_started = std::time::Instant::now();
-        let frozen_clone = frozen.clone();
-        let binding_clone = binding.clone();
-        let seal_tenant = seal_key.tenant;
-        let encoded = tokio::task::spawn_blocking(move || {
-            encode_batch(&frozen_clone, &binding_clone, seal_tenant)
-        })
-        .await
-        .map_err(|e| ScribeError::Internal {
-            detail: format!("Parquet encode task panic: {e}"),
-        })??;
+        let encoded = self
+            .encode_parquet(&frozen, binding, seal_key.tenant)
+            .await?;
         self.record(
             "parquet_encode",
             parquet_started.elapsed(),
@@ -209,6 +214,28 @@ impl SealDriver {
             binding: binding.clone(),
             parquet_path,
         })
+    }
+
+    async fn encode_parquet(
+        &self,
+        frozen: &FrozenMemtable,
+        binding: &TenantTableBinding,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<ParquetEncoded, ScribeError> {
+        match self
+            .post_ack_cpu
+            .submit(ScribePostAckCpuOp::EncodeParquet {
+                frozen: Box::new(frozen.clone()),
+                binding: binding.clone(),
+                tenant,
+            })
+            .await?
+        {
+            ScribePostAckCpuResult::ParquetEncoded(encoded) => Ok(encoded),
+            ScribePostAckCpuResult::Prepared(_) => Err(ScribeError::Internal {
+                detail: "post-ACK lane returned the wrong seal result".to_owned(),
+            }),
+        }
     }
 
     fn record(&self, stage: &str, elapsed: std::time::Duration, rows: usize, bytes: usize) {

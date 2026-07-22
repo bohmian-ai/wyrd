@@ -11,8 +11,6 @@ authors.workspace = true
 bytes = { workspace = true }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
-async-stream = { workspace = true }
-futures-util = { workspace = true }
 # tonic / prost / tonic-types are consumed ONLY through wyrd-tonic re-exports
 # (check:no-tonic-outside-wyrd-tonic forbids direct deps here).
 wyrd-tonic = { workspace = true, features = ["server"] }

@@ -15,6 +15,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
+use crate::bifrost::gate::Gate;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::components::health::ReadinessSnapshot;
@@ -26,6 +27,8 @@ use crate::postgres::ServerPostgres;
 /// (`PgIssuerResolver`). Aliased so the nested handle type stays readable across
 /// `AppState`, the boot path, and the test harness.
 pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
+/// Production Gate specialization used by AppState.
+pub type ServerGate = Gate<SqlPermissionResolver, PgIssuerResolver>;
 
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +67,9 @@ pub struct AppState {
     /// Optional queued Redux Scribe ingest runtime. Test states may retain the
     /// legacy catalog-only path when no local WAL is configured.
     pub scribe: Option<Arc<ScribeImpl>>,
+    /// Fully constructed native Bifrost Gate. Production boot installs this
+    /// before any listener can bind; test-only states may leave it absent.
+    pub gate: Option<Arc<ServerGate>>,
     /// Dedicated Tokio runtime that owns Scribe coordination consumers.
     pub scribe_coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     /// Shared Redux Forge context built from the process-wide catalog and storage.
@@ -106,6 +112,7 @@ impl AppState {
             storage,
             bifrost,
             scribe: None,
+            gate: None,
             scribe_coordination_runtime: None,
             forge_context: None,
             forge_interval: Duration::from_secs(60),
@@ -198,6 +205,13 @@ impl AppState {
     #[must_use]
     pub fn with_scribe(mut self, scribe: Arc<ScribeImpl>) -> Self {
         self.scribe = Some(scribe);
+        self
+    }
+
+    /// Attach the fully constructed server-owned Gate.
+    #[must_use]
+    pub fn with_gate(mut self, gate: Arc<ServerGate>) -> Self {
+        self.gate = Some(gate);
         self
     }
 

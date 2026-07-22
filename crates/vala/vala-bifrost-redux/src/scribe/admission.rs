@@ -25,6 +25,8 @@ pub struct AdmissionConfig {
     pub max_bytes: usize,
     /// Maximum lazily-created logical writers.
     pub max_writers: usize,
+    /// Maximum admitted frames waiting in one tenant/table writer queue.
+    pub writer_queue_items: usize,
     /// Pod memory budget used by the 90% active/immutable breaker.
     pub memory_limit_bytes: usize,
 }
@@ -32,9 +34,10 @@ pub struct AdmissionConfig {
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            max_items: 10_000,
+            max_items: 256,
             max_bytes: 512 * 1024 * 1024,
-            max_writers: 4_096,
+            max_writers: 1_024,
+            writer_queue_items: 64,
             memory_limit_bytes: 512 * 1024 * 1024,
         }
     }
@@ -237,6 +240,12 @@ impl AdmissionController {
         }
     }
 
+    /// Return the resolved admission configuration.
+    #[must_use]
+    pub fn config(&self) -> AdmissionConfig {
+        self.inner.config
+    }
+
     fn memory_breaker_bytes(&self) -> usize {
         self.inner.config.memory_limit_bytes.saturating_mul(90) / 100
     }
@@ -347,6 +356,7 @@ mod tests {
             max_items: 1,
             max_bytes: 10,
             max_writers: 1,
+            writer_queue_items: 64,
             memory_limit_bytes: 100,
         });
         let reservation = admission
@@ -371,6 +381,7 @@ mod tests {
             max_items: 1,
             max_bytes: 10,
             max_writers: 1,
+            writer_queue_items: 64,
             memory_limit_bytes: 100,
         });
         let _reservation = admission.try_reserve("events", 10).expect("reserve");
@@ -386,6 +397,7 @@ mod tests {
             max_items: 10,
             max_bytes: 100,
             max_writers: 10,
+            writer_queue_items: 64,
             memory_limit_bytes: 100,
         });
         admission

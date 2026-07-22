@@ -9,8 +9,7 @@ use vala_bifrost::WyrdCatalog;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_ingest::{
     IngestAuthInterceptor, IngestError, IngestLimits, StreamSemaphores,
-    orchestrator::run_ingest_frame_to_scribe,
-    auth::WYRD_REQUEST_ID_METADATA,
+    auth::WYRD_REQUEST_ID_METADATA, orchestrator::run_ingest_frame_to_scribe,
 };
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
@@ -24,6 +23,7 @@ use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 ///
 /// Gate owns authentication, stream bounds, tenant concurrency, and transport
 /// response ordering. The Scribe dependency is mandatory at construction.
+#[derive(Clone)]
 pub struct Gate<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> {
     catalog: Arc<WyrdCatalog>,
     scribe: Arc<ScribeImpl>,
@@ -62,10 +62,11 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Gate<R,
 }
 
 #[wyrd_tonic::tonic::async_trait]
-impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
-    BifrostIngestService for Gate<R, I>
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> BifrostIngestService
+    for Gate<R, I>
 {
-    type InsertBatchStream = Pin<Box<dyn Stream<Item = Result<InsertBatchResponse, Status>> + Send>>;
+    type InsertBatchStream =
+        Pin<Box<dyn Stream<Item = Result<InsertBatchResponse, Status>> + Send>>;
 
     async fn insert_batch(
         &self,
@@ -144,7 +145,9 @@ impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
         };
         let mut response = Response::new(Box::pin(output) as Self::InsertBatchStream);
         if let Ok(value) = auth.request_id.as_str().parse() {
-            response.metadata_mut().insert(WYRD_REQUEST_ID_METADATA, value);
+            response
+                .metadata_mut()
+                .insert(WYRD_REQUEST_ID_METADATA, value);
         }
         Ok(response)
     }

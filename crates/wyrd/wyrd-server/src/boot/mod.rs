@@ -12,9 +12,9 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
-use vala_bifrost_redux::scribe::{ScribeImpl, ScribeLaneConfig};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::WalWriter;
+use vala_bifrost_redux::scribe::{ScribeImpl, ScribeLaneConfig};
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -286,7 +286,7 @@ pub async fn build_app_state_from_boot(boot: &PostgresBoot) -> Result<AppState, 
     let replayed_generations = scribe
         .replay_wal_async()
         .await
-    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     tracing::info!(replayed_generations, "Scribe WAL recovery complete");
 
     let forge_context = ForgeContext::new(
@@ -346,6 +346,22 @@ pub async fn build_state(
 
     let state = attach_config_fields(state, config, shutdown, telemetry)?;
     let state = install_auth(state, config, sealing_key.clone()).await?;
+    let verifier = state
+        .auth
+        .token_verifier
+        .clone()
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
+    let scribe = state
+        .scribe
+        .clone()
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires Scribe".to_owned()))?;
+    let gate = Arc::new(crate::bifrost::gate::Gate::with_scribe(
+        state.bifrost.clone(),
+        scribe,
+        vala_ingest::ingest_auth_interceptor(verifier),
+        vala_ingest::IngestLimits::default(),
+    ));
+    let state = state.with_gate(gate);
     seed_federation(&state, config, sealing_key.as_deref()).await?;
 
     // Install the real authz audit writer as the OSS default. Callers can

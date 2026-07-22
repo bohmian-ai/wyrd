@@ -9908,11 +9908,9 @@ name = "vala-ingest"
 version = "0.0.1"
 dependencies = [
  "arrow",
- "async-stream",
  "base64 0.22.1",
  "bytes",
  "chrono",
- "futures-util",
  "secrecy",
  "serde",
  "serde_json",
@@ -9946,12 +9944,15 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "tokio-stream",
  "tracing",
+ "uuid",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-testing",
+ "wyrd-tonic",
 ]
 
 [[package]]

@@ -154,14 +154,14 @@ pub fn replay_wal_directory(
                 });
         state.data_records.push(data_record.payload);
         state.append_metas.push(ReplayedAppendMeta {
-                batch_id,
-                wal_lsn: data_record.lsn,
-                rows_accepted,
-                append_slice_id: AppendSliceId {
-                    batch_id: uuid::Uuid::from_bytes(batch_id),
-                    frame_sequence: data_record.frame_sequence,
-                    seal_key: seal_key.clone(),
-                },
+            batch_id,
+            wal_lsn: data_record.lsn,
+            rows_accepted,
+            append_slice_id: AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes(batch_id),
+                frame_sequence: data_record.frame_sequence,
+                seal_key: seal_key.clone(),
+            },
         });
     }
 
@@ -514,8 +514,7 @@ mod tests {
                 payload_summary: "1 rows".to_string(),
                 detail: None,
             };
-            let audit = crate::scribe::audit_envelope::encode_audit_event(&event)
-                .expect("audit");
+            let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
             let frame = crate::scribe::wal::encode_append_frame_with_sequence(
                 batch_id,
                 sequence,

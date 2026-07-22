@@ -28,9 +28,7 @@ use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::scribe::admission::{
     AdmissionConfig, AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
-use crate::scribe::execution_lanes::{
-    ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool,
-};
+use crate::scribe::execution_lanes::{ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::seal_key::SealKey;
@@ -58,14 +56,34 @@ pub struct ScribeLaneConfig {
     pub post_ack_cpu_threads: usize,
     /// Rayon workers reserved for WAL filesystem operations.
     pub wal_io_threads: usize,
+    /// Bounded ingress CPU submissions.
+    pub ingress_queue_items: usize,
+    /// Bounded post-ACK CPU submissions.
+    pub post_ack_queue_items: usize,
+    /// Bounded WAL IO submissions.
+    pub wal_io_queue_items: usize,
 }
 
 impl Default for ScribeLaneConfig {
     fn default() -> Self {
+        Self::resolved()
+    }
+}
+
+impl ScribeLaneConfig {
+    /// Resolve the boot defaults from the host's available parallelism.
+    #[must_use]
+    pub fn resolved() -> Self {
+        let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        let cpu_budget = available.saturating_sub(2).max(2);
+        let ingress_cpu_threads = (cpu_budget / 3).max(1);
         Self {
-            ingress_cpu_threads: 1,
-            post_ack_cpu_threads: 1,
+            ingress_cpu_threads,
+            post_ack_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
             wal_io_threads: 4,
+            ingress_queue_items: 256,
+            post_ack_queue_items: 64,
+            wal_io_queue_items: 256,
         }
     }
 }
@@ -151,40 +169,27 @@ impl ScribeImpl {
         lane_config: ScribeLaneConfig,
         coordination_runtime: Handle,
     ) -> Self {
-        Self::new_with_config(
-            operator,
-            wal,
-            node_id,
-            writer_epoch,
-            AdmissionConfig::default(),
-            None,
-            lane_config,
-            coordination_runtime,
-        )
-    }
-
-    fn new_with_config(
-        operator: Arc<opendal::Operator>,
-        wal: Arc<wal::WalWriter>,
-        node_id: String,
-        writer_epoch: i64,
-        admission_config: AdmissionConfig,
-        telemetry: Option<Arc<ScribeTelemetry>>,
-        lane_config: ScribeLaneConfig,
-        coordination_runtime: Handle,
-    ) -> Self {
         Self::new_with_components(
             operator,
             wal,
             node_id,
             writer_epoch,
             ScribeBuildConfig {
-                admission: admission_config,
-                telemetry,
+                admission: AdmissionConfig::default(),
+                telemetry: None,
                 coordination_runtime,
-                post_ack_cpu: ScribePostAckCpuPool::new(lane_config.post_ack_cpu_threads),
-                wal_io: ScribeWalIoPool::new(lane_config.wal_io_threads),
-                ingress_cpu: ScribeIngressCpuPool::new(lane_config.ingress_cpu_threads),
+                post_ack_cpu: ScribePostAckCpuPool::new_with_capacity(
+                    lane_config.post_ack_cpu_threads,
+                    lane_config.post_ack_queue_items,
+                ),
+                wal_io: ScribeWalIoPool::new_with_capacity(
+                    lane_config.wal_io_threads,
+                    lane_config.wal_io_queue_items,
+                ),
+                ingress_cpu: ScribeIngressCpuPool::new_with_capacity(
+                    lane_config.ingress_cpu_threads,
+                    lane_config.ingress_queue_items,
+                ),
             },
         )
     }
@@ -321,9 +326,17 @@ impl ScribeImpl {
     /// Return the current admission, lane, and writer health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
+        let lanes = self.registry.lane_snapshot();
+        let ingress = self.ingress_cpu.snapshot();
         ScribeRuntimeSnapshot {
             admission: self.admission.snapshot(),
-            executor: Default::default(),
+            executor: crate::scribe::telemetry::ExecutorSnapshot {
+                depth: lanes.depth.saturating_add(ingress.depth),
+                capacity: lanes.capacity.saturating_add(ingress.capacity),
+                saturation_events: lanes
+                    .saturation_events
+                    .saturating_add(ingress.saturation_events),
+            },
             writers: self.registry.health_snapshot(),
         }
     }
@@ -356,7 +369,11 @@ impl ScribeImpl {
                 detail: error.to_string(),
             })?;
 
-        let driver = SealDriver::new_with_telemetry(self.operator.clone(), self.telemetry.clone());
+        let driver = SealDriver::new_with_telemetry_and_lane(
+            self.operator.clone(),
+            self.telemetry.clone(),
+            self.registry.post_ack_cpu(),
+        );
         driver
             .pre_commit(
                 &self.memtable,
@@ -390,6 +407,8 @@ impl Scribe for ScribeImpl {
                 frame.payload,
                 frame.principal.clone(),
                 frame.expected_schema_fingerprint,
+                frame.request_id.clone(),
+                frame.batch_id,
             )
             .await?;
         let append_rows = rows.num_rows();
@@ -645,19 +664,18 @@ impl ScribeImpl {
 
     /// Replay WAL through the bounded filesystem lane before readiness.
     pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
-        let replayed = match self
+        let crate::scribe::execution_lanes::ScribeWalIoResult::Replayed(replayed) = self
             .wal_io
-            .submit(crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectory {
-                path: self.wal.base_dir().to_path_buf(),
-            })
+            .submit(
+                crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectory {
+                    path: self.wal.base_dir().to_path_buf(),
+                },
+            )
             .await?
-        {
-            crate::scribe::execution_lanes::ScribeWalIoResult::Replayed(replayed) => replayed,
-            _ => {
-                return Err(ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong replay result".to_owned(),
-                });
-            }
+        else {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong replay result".to_owned(),
+            });
         };
         let restored = replayed
             .values()

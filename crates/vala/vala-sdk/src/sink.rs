@@ -17,7 +17,7 @@ use wyrd_spec::error::WyrdError;
 /// [`BifrostIngestSink`] fully unit-testable server-free.
 #[async_trait]
 pub trait IngestTransport: Send + Sync + 'static {
-    /// Ship one frame to the ingest service; return its admitted row count.
+    /// Ship one sealed frame to the ingest service; return its admitted row count.
     ///
     /// Must be **idempotent on `(batch_id, frame_sequence)`** — a retry
     /// re-sends the same identity so the server does not duplicate durable rows.
@@ -28,7 +28,8 @@ pub trait IngestTransport: Send + Sync + 'static {
         &self,
         table: &str,
         batch_id: [u8; 16],
-        frames: Vec<u8>,
+        frame_sequence: u64,
+        arrow_ipc: Vec<u8>,
     ) -> Result<u64, WyrdError>;
 }
 
@@ -53,7 +54,7 @@ impl BifrostIngestSink {
 impl BatchSink for BifrostIngestSink {
     async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
         self.transport
-            .insert_batch(&batch.table, batch.batch_id, batch.frames)
+            .insert_batch(&batch.table, batch.batch_id, 0, batch.frames)
             .await
     }
 }

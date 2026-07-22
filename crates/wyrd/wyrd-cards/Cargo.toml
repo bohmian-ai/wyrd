@@ -15,6 +15,7 @@ python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/pyth
 skald-spec = { workspace = true }
 skald-prompt = { workspace = true }
 wyrd-spec = { workspace = true }
+wyrd-config = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-interfaces = { workspace = true }
 wyrd-utils = { workspace = true }

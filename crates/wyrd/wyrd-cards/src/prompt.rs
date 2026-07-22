@@ -121,13 +121,22 @@ impl PromptCard {
     /// Create a local `PromptCard` holder around a native prompt.
     #[must_use]
     pub fn from_native_prompt(prompt: skald_spec::Prompt) -> Self {
+        let mut space = None;
+        let mut labels = Labels::default();
+        let mut annotations = Annotations::default();
+        crate::identity::apply_repo_defaults(
+            &CardKind::Prompt,
+            &mut space,
+            &mut labels,
+            &mut annotations,
+        );
         Self {
-            space: "default".to_owned(),
+            space: space.unwrap_or_else(|| "default".to_owned()),
             name: "prompt".to_owned(),
             version: "0.1.0".to_owned(),
             uid: wyrd_utils::uuid7(),
-            labels: Labels::default(),
-            annotations: Annotations::default(),
+            labels,
+            annotations,
             metadata: PromptCardMetadata { prompt },
             created_at: Utc::now(),
             is_card: true,
@@ -434,13 +443,23 @@ impl PromptCard {
             Some(prompt.clone().unbind())
         };
 
+        let mut resolved_space = space.map(str::to_owned);
+        let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
+        let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
+        crate::identity::apply_repo_defaults(
+            &CardKind::Prompt,
+            &mut resolved_space,
+            &mut resolved_labels,
+            &mut resolved_annotations,
+        );
+
         Ok(Self {
-            space: space.unwrap_or("default").to_owned(),
+            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("prompt").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
-            labels: labels_from_user(labels.unwrap_or_default())?,
-            annotations: annotations_from_user(annotations.unwrap_or_default())?,
+            labels: resolved_labels,
+            annotations: resolved_annotations,
             metadata,
             created_at: Utc::now(),
             is_card: true,

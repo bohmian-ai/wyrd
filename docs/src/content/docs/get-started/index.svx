@@ -58,6 +58,8 @@ from wyrd.data import DataCard, PandasInterface
 
 ## Next
 
+- [Client configuration](/get-started/client-configuration/) — configure client
+  endpoints, credentials, and repository card defaults.
 - [Your first card](/tutorials/first-card/) — the same flow, explained line by line.
 - [Concepts](/concepts/) — what a Card is and why it has the shape it does.
 - [Declare recipes](/how-to/declare/) — author and register Prompt, Model, and Data cards.

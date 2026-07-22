@@ -10631,6 +10631,7 @@ dependencies = [
  "skald-prompt",
  "skald-spec",
  "tokio",
+ "wyrd-config",
  "wyrd-interfaces",
  "wyrd-semver",
  "wyrd-spec",

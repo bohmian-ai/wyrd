@@ -76,6 +76,7 @@
 ## Get Started
 
 - [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
+- [Client configuration](https://mitari-ai.github.io/wyrd/get-started/client-configuration/): Configure Wyrd clients, credentials, and repository defaults for local development and automation.
 
 ## Reference
 

@@ -151,7 +151,7 @@ fn admitted_append(
 }
 
 #[tokio::test]
-async fn ack_returns_after_queue_admission() {
+async fn ack_waits_for_writer_try_send_only() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(telemetry);
@@ -306,8 +306,77 @@ fn cross_day_enqueue_is_atomic() {
     drop(temp);
 }
 
+#[test]
+fn frame_identity_distinguishes_sequences_in_one_batch() {
+    let seal_key = SealKey::new(
+        DataTenantId::SYSTEM_OWNER,
+        TableRef::new(BifrostNamespace::Bifrost, "identity"),
+        EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
+    );
+    let batch_id = Uuid::now_v7();
+    let first = AppendSliceId {
+        batch_id,
+        frame_sequence: 0,
+        seal_key: seal_key.clone(),
+    };
+    let second = AppendSliceId {
+        batch_id,
+        frame_sequence: 1,
+        seal_key,
+    };
+    assert_ne!(first, second);
+}
+
+#[test]
+fn append_slice_identity_distinguishes_cross_day_slices() {
+    let table = TableRef::new(BifrostNamespace::Bifrost, "identity");
+    let batch_id = Uuid::now_v7();
+    let first = AppendSliceId {
+        batch_id,
+        frame_sequence: 0,
+        seal_key: SealKey::new(
+            DataTenantId::SYSTEM_OWNER,
+            table.clone(),
+            EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
+        ),
+    };
+    let second = AppendSliceId {
+        batch_id,
+        frame_sequence: 0,
+        seal_key: SealKey::new(
+            DataTenantId::SYSTEM_OWNER,
+            table,
+            EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 16).expect("date")),
+        ),
+    };
+    assert_ne!(first, second);
+}
+
 #[tokio::test]
-async fn fsync_runs_after_ack() {
+async fn post_ack_failure_marks_writer_unhealthy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = TenantTableWriterRegistry::new(
+        AdmissionController::new(),
+        Arc::new(super::memtable::Memtable::new()),
+        test_wal(&temp),
+        ScribePostAckCpuPool::new(1),
+        ScribeWalIoPool::new(1),
+        None,
+    );
+    let binding = TenantTableBinding::resolve((
+        DataTenantId::SYSTEM_OWNER,
+        TableRef::new(BifrostNamespace::Bifrost, "health"),
+    ))
+    .expect("binding");
+    let (writer, _) = registry.get_or_create(binding).expect("writer");
+    writer.mark_unhealthy_for_test();
+    let snapshot = registry.health_snapshot();
+    assert_eq!(snapshot.unhealthy_writers, 1);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn ack_does_not_wait_for_day_split_wal_fsync_or_parquet() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io)
@@ -509,7 +578,7 @@ fn recordbatch_is_not_redecoded_normally() {
 }
 
 #[tokio::test]
-async fn server_runtime_remains_responsive() {
+async fn wal_saturation_cannot_consume_ingress_threads() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
@@ -523,7 +592,7 @@ async fn server_runtime_remains_responsive() {
 }
 
 #[tokio::test]
-async fn post_ack_lane_saturation_preserves_cross_writer_progress() {
+async fn post_ack_saturation_cannot_consume_ingress_threads() {
     let admission = AdmissionController::new();
     let executor = ScribePostAckCpuPool::with_delay(1, Duration::from_millis(2));
     let timer = tokio::time::timeout(

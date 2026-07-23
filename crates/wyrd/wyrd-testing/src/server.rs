@@ -251,6 +251,22 @@ impl WyrdTestServer {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
+    /// Flush the server-owned Scribe through a specific tenant's seal path.
+    ///
+    /// # Errors
+    /// Returns an error when the tenant connection or seal transaction fails.
+    pub async fn flush_bifrost_for_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        let conn = self.tenant_conn_for(tenant).await?;
+        self.inner
+            .state
+            .flush_scribe_for_test(conn)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
     /// Return the base URL when bound to a real socket.
     #[must_use]
     pub fn base_url(&self) -> Option<&str> {

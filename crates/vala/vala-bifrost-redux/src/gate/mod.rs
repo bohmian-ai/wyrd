@@ -729,6 +729,7 @@ mod tests {
     use super::error::CatalogError;
     use super::limits::IngestLimits;
     use super::{AuthContext, Catalog, Gate, IngestError, oracle_unavailable, validate_frame};
+    use crate::catalog::{TableRef, TenantTableBinding, TenantTableBindingError};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::fingerprint::SchemaFingerprint;
     use arrow::array::Int64Array;
@@ -1099,7 +1100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn permission_failure_precedes_projection_and_scribe() {
+    async fn gate_enforces_bifrost_record_write() {
         let projection_calls = Arc::new(AtomicUsize::new(0));
         let scribe_calls = Arc::new(AtomicUsize::new(0));
         let gate = Gate::with_scribe_and_projection(
@@ -1124,7 +1125,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authentication_rejection_is_recorded_before_body_processing() {
+    async fn gate_authenticates_before_reading_frames() {
         let gate = Gate::with_scribe(
             Arc::new(TestCatalog),
             Arc::new(TestScribe),
@@ -1136,6 +1137,37 @@ mod tests {
         let telemetry = gate.telemetry_snapshot();
         assert_eq!(telemetry.auth_attempts, 1);
         assert_eq!(telemetry.auth_rejections, 1);
+    }
+
+    #[test]
+    fn gate_resolves_principal_tenant_table_and_binding() {
+        let tenant = DataTenantId::new_v7();
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+        let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
+        assert_eq!(binding.tenant, tenant);
+        assert_eq!(binding.table_ref, table);
+        assert_eq!(binding.table_name, "events");
+        assert!(
+            binding
+                .object_prefix
+                .starts_with(&format!("tenants/{tenant}/"))
+        );
+    }
+
+    #[test]
+    fn gate_rejects_tenant_binding_mismatch() {
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Bifrost, "events"),
+        ))
+        .expect("binding");
+        let error = binding
+            .validate_authenticated_tenant(DataTenantId::new_v7())
+            .expect_err("a binding must not cross tenant boundaries");
+        assert!(matches!(
+            error,
+            TenantTableBindingError::TenantMismatch { .. }
+        ));
     }
 
     #[tokio::test]

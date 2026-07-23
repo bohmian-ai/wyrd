@@ -191,6 +191,11 @@ impl TenantTableWriter {
     }
 
     #[cfg(test)]
+    pub(crate) fn mark_unhealthy_for_test(&self) {
+        self.state.healthy.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
     pub(crate) async fn close_with_reserved_send_for_test(
         &self,
         append: AdmittedAppend,

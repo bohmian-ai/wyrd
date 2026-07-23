@@ -43,6 +43,19 @@ pub struct BifrostTransportConfig {
     pub max_frame_retries: u32,
 }
 
+/// One immutable frame submitted by [`BifrostGrpcTransport::insert_batch_stream`].
+#[derive(Debug, Clone)]
+pub struct BifrostFrame {
+    /// Logical table FQN repeated on every frame.
+    pub table: String,
+    /// UUIDv7 batch identity retained across retries.
+    pub batch_id: [u8; 16],
+    /// Zero-based contiguous stream sequence.
+    pub frame_sequence: u64,
+    /// Arrow IPC payload for this frame.
+    pub arrow_ipc: Vec<u8>,
+}
+
 impl Default for BifrostTransportConfig {
     fn default() -> Self {
         Self {
@@ -118,6 +131,91 @@ impl BifrostGrpcTransport {
     #[must_use]
     pub fn config(&self) -> BifrostTransportConfig {
         self.config
+    }
+
+    /// Send a bounded sequence of frames and consume each ACK before sending
+    /// the next frame. The request stream remains open while ACKs arrive, so a
+    /// caller can observe per-frame admission before half-close.
+    ///
+    /// # Errors
+    /// Returns the first transport, validation, authentication, or server
+    /// error. Frames already acknowledged remain valid and may be retried by
+    /// the caller starting at the first unacknowledged sequence.
+    pub async fn insert_batch_stream(
+        &self,
+        frames: Vec<BifrostFrame>,
+    ) -> Result<Vec<u64>, WyrdError> {
+        if frames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (sender, receiver) = mpsc::channel(REQUEST_STREAM_CAPACITY);
+        let mut request = Request::new(ReceiverStream::new(receiver));
+        self.add_auth_metadata(&mut request).await?;
+        let max_message_bytes = MAX_FRAME_BYTES + PROTO_FRAME_OVERHEAD_BYTES;
+        let mut client = BifrostIngestServiceClient::new(self.connection.channel())
+            .max_decoding_message_size(max_message_bytes)
+            .max_encoding_message_size(max_message_bytes);
+        let response_fut = client.insert_batch(request);
+        tokio::pin!(response_fut);
+        let first = frames.first().expect("non-empty frame stream");
+        validate_frame(&first.table, first.batch_id, first.arrow_ipc.len())?;
+        let first_request = InsertBatchRequest {
+            table: first.table.clone(),
+            arrow_ipc: first.arrow_ipc.clone(),
+            wyrd_batch_id: first.batch_id.to_vec(),
+            frame_sequence: first.frame_sequence,
+        };
+        sender.send(first_request.clone()).await.map_err(|_| {
+            transport_unavailable(
+                "request stream closed before frame send",
+                first.frame_sequence,
+            )
+        })?;
+        let response = response_fut
+            .await
+            .map_err(|status| from_grpc_status(&status))?;
+        let mut responses = response.into_inner();
+        let mut accepted = Vec::with_capacity(frames.len());
+        let first_ack = responses
+            .message()
+            .await
+            .map_err(|status| from_grpc_status(&status))?
+            .ok_or_else(|| {
+                transport_unavailable(
+                    "ingest response stream ended before ACK",
+                    first.frame_sequence,
+                )
+            })?;
+        accepted.push(accepted_rows(&first_request, first_ack)?);
+
+        for frame in frames.into_iter().skip(1) {
+            validate_frame(&frame.table, frame.batch_id, frame.arrow_ipc.len())?;
+            let request = InsertBatchRequest {
+                table: frame.table,
+                arrow_ipc: frame.arrow_ipc,
+                wyrd_batch_id: frame.batch_id.to_vec(),
+                frame_sequence: frame.frame_sequence,
+            };
+            sender.send(request.clone()).await.map_err(|_| {
+                transport_unavailable(
+                    "request stream closed before frame send",
+                    frame.frame_sequence,
+                )
+            })?;
+            let ack = responses
+                .message()
+                .await
+                .map_err(|status| from_grpc_status(&status))?
+                .ok_or_else(|| {
+                    transport_unavailable(
+                        "ingest response stream ended before ACK",
+                        frame.frame_sequence,
+                    )
+                })?;
+            accepted.push(accepted_rows(&request, ack)?);
+        }
+        drop(sender);
+        Ok(accepted)
     }
 
     async fn send_once(&self, frame: &InsertBatchRequest) -> Result<u64, AttemptError> {

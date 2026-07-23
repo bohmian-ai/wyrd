@@ -43,6 +43,7 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
+vala-sdk = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
@@ -51,6 +52,7 @@ wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-bench = { workspace = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-client = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
@@ -62,4 +64,8 @@ wyrd-utils = { workspace = true, features = ["python"], optional = true }
 
 [[bench]]
 name = "bench_real_bifrost_workload"
+harness = false
+
+[[bench]]
+name = "bench_ingest_ack_latency"
 harness = false

@@ -953,6 +953,28 @@ mod tests {
         assert_eq!(snapshot.panicked, 0);
     }
 
+    #[tokio::test]
+    async fn rayon_lane_panic_releases_permit_and_returns_typed_error() {
+        let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
+        let error = pool
+            .run(|| -> Result<(), crate::contracts::ScribeError> {
+                panic!("intentional lane panic");
+            })
+            .await
+            .expect_err("panic must become a typed error");
+        assert!(matches!(
+            error,
+            crate::contracts::ScribeError::Internal { .. }
+        ));
+        let result = pool
+            .run(|| Ok::<_, crate::contracts::ScribeError>(()))
+            .await;
+        assert!(result.is_ok(), "panic must release the queue permit");
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.depth, 0);
+        assert_eq!(snapshot.panicked, 1);
+    }
+
     #[test]
     fn post_ack_cpu_runs_on_separate_named_rayon_thread() {
         assert!(
@@ -1071,7 +1093,7 @@ mod tests {
     }
 
     #[test]
-    fn data_tenant_and_request_columns_are_server_stamped() {
+    fn ipc_decode_schema_type_validation_and_stamping_precede_ack() {
         let rows = batch(
             vec![Field::new("value", DataType::Int64, false)],
             vec![Arc::new(Int64Array::from(vec![1_i64]))],

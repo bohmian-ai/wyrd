@@ -143,6 +143,9 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// [`WyrdError::UpstreamFailure`] with the original code preserved in
 /// `details.original_code` rather than silently dropped.
 fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -> WyrdError {
+    if let Some(bifrost) = bifrost_error_from_code(code, &message, &details) {
+        return bifrost;
+    }
     if let Some(reconstructed) = WyrdError::from_code(code, message.clone(), details.clone()) {
         return reconstructed;
     }
@@ -153,6 +156,32 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
             "original_details": details,
         }),
     }
+}
+
+fn bifrost_error_from_code(
+    code: &str,
+    message: &str,
+    details: &serde_json::Value,
+) -> Option<WyrdError> {
+    use wyrd_spec::vala::error::BifrostError;
+
+    let table_from_message = |prefix: &str| {
+        message
+            .strip_prefix(prefix)
+            .or_else(|| details.get("table").and_then(serde_json::Value::as_str))
+            .unwrap_or("<unknown>")
+            .to_owned()
+    };
+    let error = match code {
+        "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND" => BifrostError::TableNotFound {
+            table: table_from_message("bifrost table not found: "),
+        },
+        "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH" => BifrostError::FingerprintMismatch {
+            table: table_from_message("schema fingerprint mismatch: "),
+        },
+        _ => return None,
+    };
+    Some(WyrdError::Vala { error })
 }
 
 #[cfg(test)]
@@ -188,6 +217,28 @@ mod tests {
             json["details"]["original_code"].as_str(),
             Some("WYRD_CUSTOM_999_EXPERIMENTAL"),
             "original code must be preserved in catch-all variant details"
+        );
+    }
+
+    #[test]
+    fn bifrost_grpc_codes_keep_their_wire_status() {
+        let not_found = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+            "detail": "bifrost table not found: vala.bifrost.missing",
+            "details": {},
+        }));
+        assert_eq!(not_found.status(), 404);
+        assert_eq!(not_found.code(), "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND");
+
+        let conflict = from_problem_json(&serde_json::json!({
+            "code": "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+            "detail": "schema fingerprint mismatch: vala.bifrost.events",
+            "details": {},
+        }));
+        assert_eq!(conflict.status(), 409);
+        assert_eq!(
+            conflict.code(),
+            "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH"
         );
     }
 

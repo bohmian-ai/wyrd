@@ -31,7 +31,7 @@ pub mod scope;
 pub mod sink;
 
 pub use grpc::{
-    BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
+    BifrostFrame, BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
     PROTO_FRAME_OVERHEAD_BYTES,
 };
 pub use handle::{Bifrost, schema_from_json_schema};

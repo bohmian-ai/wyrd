@@ -149,9 +149,16 @@ pub async fn list_cards(
     caller: &Caller,
     request: ListCardsRequest,
 ) -> Result<ListCardsResponse, WyrdError> {
+    if request.status == Some(CardLifecycleStatus::Deleted) {
+        return Ok(ListCardsResponse {
+            items: Vec::new(),
+            next_cursor: None,
+        });
+    }
     let limit = match request.limit {
-        Some(value) => u32::try_from(value)
-            .map_err(|_| WyrdError::registry_list_limit_out_of_range(value.max(0) as u32, 200))?,
+        Some(value) => u32::try_from(value).map_err(|_| {
+            WyrdError::registry_list_limit_out_of_range(value.unsigned_abs(), 200)
+        })?,
         None => DEFAULT_LIST_LIMIT,
     };
     let cursor = decode_list_cursor(request.cursor.as_deref(), limit)?;
@@ -1321,9 +1328,9 @@ async fn complete_card_inner(
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_completion_status(&completion_state.card, card_uid)?;
     if completion_state.card.status == CardStatus::Active {
-        if schedule_failures {
+        if schedule_failures || lease_owner.is_some() {
             let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-            mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
+            mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
             conn.commit().await.map_err(registry_db_error)?;
         }
         return load_card_registration_outcome(

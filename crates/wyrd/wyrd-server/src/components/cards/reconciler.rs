@@ -20,7 +20,7 @@ const LEASE_SECONDS: i64 = 30;
 const TICK: Duration = Duration::from_secs(1);
 
 /// Spawn the bounded Card lifecycle reconciler when the audited operator pool exists.
-pub(crate) fn spawn(
+pub(crate) fn spawn_reconciler(
     state: &AppState,
     shutdown: CancellationToken,
 ) -> Option<tokio::task::JoinHandle<()>> {
@@ -82,7 +82,7 @@ async fn process_claim(state: &AppState, claim: CardReconcileClaim) {
                 .await
             {
                 Ok(true) => {
-                    counter!("wyrd_card_reconciliation_dead_letters_total", "kind" => claim.reconcile_kind)
+                    counter!("wyrd_card_reconciliation_dead_letters_total", "kind" => claim.reconcile_kind.clone())
                         .increment(1);
                     tracing::error!(
                         kind = %claim.reconcile_kind,

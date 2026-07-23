@@ -176,6 +176,17 @@ async fn local_blob(
 }
 
 /// Create a signed or local download plan for a stored artifact.
+#[utoipa::path(
+    post,
+    path = "/v1/cards/download/init",
+    request_body = DownloadInitRequest,
+    responses(
+        (status = 200, description = "Download plan", body = wyrd_spec::storage::DownloadInitResponse),
+        (status = 403, description = "Card read permission required"),
+        (status = 404, description = "Card artifact not found"),
+        (status = 503, description = "Storage unavailable")
+    )
+)]
 async fn download_init(
     State(state): State<AppState>,
     caller: Caller,

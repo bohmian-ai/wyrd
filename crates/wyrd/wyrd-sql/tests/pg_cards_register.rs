@@ -2,6 +2,7 @@
 
 use std::env;
 
+use chrono::{Duration, Utc};
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::PermissionSet;
@@ -12,10 +13,12 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation, persist_outbound_relationships, recheck_active_card_refs,
-    soft_delete_card_by_ref, soft_delete_card_with_state,
+    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION,
+    claim_card_reconciliation, insert_artifact_manifest_rows, insert_card_row,
+    insert_registration_operation, persist_outbound_relationships, record_card_reconciliation_failure,
+    recheck_active_card_refs, soft_delete_card_by_ref, soft_delete_card_with_state,
 };
+use wyrd_sql::OperatorPool;
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// Return whether live Postgres registration tests are enabled.
@@ -57,7 +60,11 @@ async fn consolidated_registration_migration_has_locked_shape() {
         "SELECT column_name FROM information_schema.columns \
          WHERE table_schema = 'wyrd' AND table_name = 'cards' \
            AND column_name IN ('registration_operation_id', 'pending_since', 'finalized_at', \
-                               'card_blob_uri', 'blob_failed_at', 'blob_status') \
+                               'card_blob_uri', 'blob_failed_at', \
+                               'reconcile_kind', 'reconcile_status', 'reconcile_attempts', \
+                               'reconcile_next_attempt_at', 'reconcile_lease_owner', \
+                               'reconcile_lease_expires_at', 'reconcile_last_error_code', \
+                               'reconcile_last_error_message', 'reconcile_dead_lettered_at') \
          ORDER BY column_name",
     )
     .fetch_all(fixture.platform_admin_pool())
@@ -71,6 +78,15 @@ async fn consolidated_registration_migration_has_locked_shape() {
             "card_blob_uri",
             "finalized_at",
             "pending_since",
+            "reconcile_attempts",
+            "reconcile_dead_lettered_at",
+            "reconcile_kind",
+            "reconcile_last_error_code",
+            "reconcile_last_error_message",
+            "reconcile_lease_expires_at",
+            "reconcile_lease_owner",
+            "reconcile_next_attempt_at",
+            "reconcile_status",
             "registration_operation_id",
         ]
     );
@@ -176,6 +192,124 @@ async fn pending_card_and_manifest_share_registration_transaction() {
     assert_eq!(manifest_state.1, None);
     assert_eq!(manifest_state.2, None);
     conn.commit().await.expect("assertion transaction commits");
+}
+
+/// Claims are serialized by `SKIP LOCKED`, recover after lease expiry, and stop
+/// after the third failed attempt without a fourth claim.
+#[tokio::test]
+async fn reconciliation_claims_are_bounded_and_lease_safe() {
+    if !enabled() {
+        return;
+    }
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let principal_id = PrincipalId::new(Uuid::now_v7());
+    let operation_id = RegistrationOperationId::new(Uuid::now_v7());
+    let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
+    let card = prompt_card("reconcile-bounded");
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+    insert_registration_operation(
+        &mut conn,
+        NewRegistrationOperation {
+            operation_id,
+            principal_id,
+            idempotency_key: "reconcile-bounded-001",
+            request_hash: "reconcile-bounded-hash",
+        },
+    )
+    .await
+    .expect("operation inserts");
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &card,
+            card_uid: card_uid.clone(),
+            principal_id,
+            operation_id,
+            status: CardStatus::Pending,
+            spec_hash: "reconcile-bounded-spec",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("card inserts");
+    conn.commit().await.expect("setup commits");
+
+    let operator = OperatorPool::from(fixture.platform_admin_pool().clone());
+    let first_now = Utc::now() + Duration::seconds(1);
+    let first = claim_card_reconciliation(
+        &operator,
+        first_now,
+        first_now + Duration::seconds(30),
+        32,
+    )
+    .await
+    .expect("first claim succeeds");
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
+    assert_eq!(first[0].reconcile_attempts, 1);
+    let owner = first[0].reconcile_lease_owner;
+
+    let immediate = claim_card_reconciliation(
+        &operator,
+        first_now,
+        first_now + Duration::seconds(30),
+        32,
+    )
+    .await
+    .expect("second claim succeeds");
+    assert!(immediate.is_empty(), "live lease must exclude the Card");
+
+    for (attempt, now) in [(1, first_now + Duration::seconds(31)), (2, first_now + Duration::seconds(36))] {
+        let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+        let dead = record_card_reconciliation_failure(
+            &mut conn,
+            &card_uid,
+            owner,
+            now + Duration::seconds(1),
+            "WYRD_STORAGE_500_BACKEND",
+            "Card blob persistence failed; retry the storage transition",
+        )
+        .await
+        .expect("failure records");
+        assert!(!dead);
+        conn.commit().await.expect("failure commits");
+
+        let claim = claim_card_reconciliation(
+            &operator,
+            now + Duration::seconds(2),
+            now + Duration::seconds(32),
+            32,
+        )
+        .await
+        .expect("retry claim succeeds");
+        assert_eq!(claim.len(), 1);
+        assert_eq!(claim[0].reconcile_attempts, attempt + 1);
+        assert_eq!(claim[0].reconcile_lease_owner, owner);
+    }
+
+    let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+    let dead = record_card_reconciliation_failure(
+        &mut conn,
+        &card_uid,
+        owner,
+        first_now + Duration::seconds(100),
+        "WYRD_STORAGE_500_BACKEND",
+        "Card blob persistence failed; retry the storage transition",
+    )
+    .await
+    .expect("third failure records");
+    assert!(dead);
+    conn.commit().await.expect("dead letter commits");
+
+    let fourth = claim_card_reconciliation(
+        &operator,
+        first_now + Duration::seconds(101),
+        first_now + Duration::seconds(131),
+        32,
+    )
+    .await
+    .expect("bounded claim succeeds");
+    assert!(fourth.is_empty(), "dead-lettered Card must not be claimed again");
 }
 
 /// Persist a UID-bearing outbound edge atomically with its source Card row.

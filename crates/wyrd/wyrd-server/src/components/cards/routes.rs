@@ -7,7 +7,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
@@ -16,7 +16,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    CardRef, CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+    CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
     GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
@@ -187,7 +187,6 @@ async fn list_versions_http(
 #[utoipa::path(
     get,
     path = "/v1/cards",
-    params(ListCardsRequest),
     responses(
         (status = 200, description = "Card summaries", body = ListCardsResponse),
         (status = 400, description = "Invalid list query"),

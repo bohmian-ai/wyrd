@@ -7,6 +7,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
+use skald_runtime::ProviderRegistry;
+use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec, CardMetadata,
@@ -21,7 +23,7 @@ use crate::callbacks::{
 };
 use crate::error::AgentResult;
 use crate::journal::{Journal, NoopJournal};
-use crate::run::RunConfig;
+use crate::run::{AgentRun, RunConfig};
 use crate::session::{NoSession, SessionId, SessionMemory};
 
 /// Wire form for a durable Agent Card.
@@ -33,11 +35,11 @@ pub trait PromptResolver: Send + Sync {
     ///
     /// # Errors
     /// Returns a Wyrd error when a referenced Prompt Card cannot be resolved.
-    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError>;
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError>;
 }
 
 impl<T: PromptResolver + ?Sized> PromptResolver for &T {
-    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         (**self).resolve(prompt_ref)
     }
 }
@@ -47,7 +49,7 @@ impl<T: PromptResolver + ?Sized> PromptResolver for &T {
 pub struct LocalPromptResolver;
 
 impl PromptResolver for LocalPromptResolver {
-    fn resolve(&self, prompt_ref: &InlineableRef<skald_spec::Prompt>) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
             InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
             InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
@@ -170,7 +172,7 @@ pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
     /// Preserved durable prompt reference.
-    pub(crate) prompt_ref: InlineableRef<skald_spec::Prompt>,
+    pub(crate) prompt_ref: InlineableRef<PromptSpec>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -242,7 +244,7 @@ impl Agent {
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_from_ref(
-        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt_ref: InlineableRef<PromptSpec>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
@@ -275,7 +277,7 @@ impl Agent {
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_with_prompt(
         mut self,
-        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt_ref: InlineableRef<PromptSpec>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
@@ -490,7 +492,7 @@ impl Agent {
 
     /// Return the preserved prompt reference.
     #[must_use]
-    pub fn prompt_ref(&self) -> &InlineableRef<skald_spec::Prompt> {
+    pub fn prompt_ref(&self) -> &InlineableRef<PromptSpec> {
         &self.prompt_ref
     }
 
@@ -660,7 +662,7 @@ impl Agent {
     ///
     /// # Errors
     /// Returns Skald agent runtime errors.
-    pub async fn run(&self, input: &str) -> AgentResult<crate::run::AgentRun> {
+    pub async fn run(&self, input: &str) -> AgentResult<AgentRun> {
         let providers = skald_runtime::default_registry();
         crate::loop_runtime::run(self, providers.as_ref(), None, input).await
     }
@@ -671,10 +673,10 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_with(
         &self,
-        providers: &skald_runtime::ProviderRegistry,
+        providers: &ProviderRegistry,
         session_id: Option<SessionId>,
         input: &str,
-    ) -> AgentResult<crate::run::AgentRun> {
+    ) -> AgentResult<AgentRun> {
         crate::loop_runtime::run(self, providers, session_id, input).await
     }
 
@@ -685,17 +687,17 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_prompt(
         &self,
-        providers: &skald_runtime::ProviderRegistry,
+        providers: &ProviderRegistry,
         prompt: &Prompt,
         vars: &[(&str, &str)],
         parent_run_id: Option<&str>,
-    ) -> AgentResult<crate::run::AgentRun> {
+    ) -> AgentResult<AgentRun> {
         crate::loop_runtime::run_prompt(self, providers, prompt, vars, parent_run_id).await
     }
 
     fn from_resolved_parts(
         id: String,
-        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt_ref: InlineableRef<PromptSpec>,
         prompt: Prompt,
     ) -> Self {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
@@ -703,7 +705,7 @@ impl Agent {
 
     fn from_resolved_arc_parts(
         id: String,
-        prompt_ref: InlineableRef<skald_spec::Prompt>,
+        prompt_ref: InlineableRef<PromptSpec>,
         prompt: Arc<Prompt>,
     ) -> Self {
         Self {
@@ -810,7 +812,7 @@ pub fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
 }
 
 fn resolve_prompt_ref(
-    prompt_ref: &InlineableRef<skald_spec::Prompt>,
+    prompt_ref: &InlineableRef<PromptSpec>,
     resolver: &dyn PromptResolver,
 ) -> Result<Prompt, WyrdError> {
     match prompt_ref {

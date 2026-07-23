@@ -6,7 +6,7 @@
 //! completion, and upload outcome handling.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use futures_util::stream::{self, StreamExt};
 use wyrd_spec::error::WyrdError;
@@ -22,24 +22,15 @@ pub(crate) async fn upload_artifacts(
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,
     idempotency_key: &str,
 ) -> Result<(), RegistryEngineError> {
-    let entries = collect_upload_entries(response)?;
+    let entries = collect_upload_entries(response);
     validate_artifact_sources(&entries, sources)?;
 
-    let uploads = entries
-        .into_iter()
-        .map(|entry| {
-            sources
+    let results = stream::iter(entries)
+        .map(|entry| async move {
+            let source = sources
                 .get(&entry.relative_path)
-                .cloned()
-                .map(|source| (entry, source))
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| WyrdError::internal("validated artifact source disappeared"))?;
-    let results = stream::iter(uploads)
-        .map(|(entry, source)| {
-            let storage = storage.clone();
-            let idempotency_key = idempotency_key.to_owned();
-            async move { upload_artifact_entry(&storage, &entry, source, &idempotency_key).await }
+                .ok_or_else(|| WyrdError::internal("validated artifact source disappeared"))?;
+            upload_artifact_entry(storage, &entry, source, idempotency_key).await
         })
         .buffer_unordered(4)
         .collect::<Vec<_>>()
@@ -51,14 +42,12 @@ pub(crate) async fn upload_artifacts(
 }
 
 /// Flatten server upload plans into their typed upload entries.
-fn collect_upload_entries(
-    response: &CreateCardResponse,
-) -> Result<Vec<CardUploadEntry>, RegistryEngineError> {
-    Ok(response
+fn collect_upload_entries(response: &CreateCardResponse) -> Vec<CardUploadEntry> {
+    response
         .upload_plans
         .iter()
         .flat_map(|plan| plan.entries.iter().cloned())
-        .collect())
+        .collect()
 }
 
 /// Require exact equality between planned relative paths and local sources.
@@ -68,7 +57,7 @@ fn validate_artifact_sources(
 ) -> Result<(), RegistryEngineError> {
     let planned = entries
         .iter()
-        .map(|entry| entry.relative_path.clone())
+        .map(|entry| &entry.relative_path)
         .collect::<BTreeSet<_>>();
     if let Some(missing) = sources.keys().find(|path| !planned.contains(path)) {
         return Err(WyrdError::RegistryUploadInterrupted {
@@ -91,7 +80,7 @@ fn validate_artifact_sources(
 async fn upload_artifact_entry(
     storage: &WyrdStorageClient,
     entry: &CardUploadEntry,
-    source: PathBuf,
+    source: &Path,
     idempotency_key: &str,
 ) -> Result<(), RegistryEngineError> {
     let source = FileSource::open(source).await?;

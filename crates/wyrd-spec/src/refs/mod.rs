@@ -4,8 +4,23 @@
 //! slots in a Card's spec. The visitor yields mutable handles to each reference position,
 //! enabling reference resolution, validation, and transformation during the loader pipeline.
 
+use crate::card::agent::AgentSpec;
+use crate::card::artifact::ArtifactSpec;
+use crate::card::audit::AuditSpec;
+use crate::card::data::{DataInterface, DataSpec, SplitStrategy};
+use crate::card::drift::{DriftSignal, DriftSpec};
+use crate::card::eval::EvalSpec;
+use crate::card::experiment::ExperimentSpec;
+use crate::card::mcp::McpSpec;
+use crate::card::model::ModelSpec;
+use crate::card::operator::{OperatorAction, OperatorSpec};
+use crate::card::service::ServiceSpec;
+use crate::card::trigger::{TriggerSource, TriggerSpec};
+use crate::card::workflow::{WorkflowAction, WorkflowSpec};
 use crate::envelope::Spec;
 use crate::reference::{InlineableRef, Ref};
+use crate::vala::eval::EvalTask;
+use skald_spec::Prompt;
 
 /// A yielded reference slot with metadata about its kind and a mutable handle.
 pub struct SlotEntry<'a> {
@@ -20,9 +35,9 @@ pub enum SlotValue<'a> {
     /// A durable-only reference slot.
     Durable(&'a mut Ref),
     /// An inlineable Skald prompt slot.
-    InlineablePrompt(&'a mut InlineableRef<skald_spec::Prompt>),
+    InlineablePrompt(&'a mut InlineableRef<Prompt>),
     /// An inlineable Agent spec slot.
-    InlineableAgent(&'a mut InlineableRef<crate::card::agent::AgentSpec>),
+    InlineableAgent(&'a mut InlineableRef<AgentSpec>),
 }
 
 /// Canonical visitor that yields every reference slot on a `Spec`.
@@ -66,7 +81,7 @@ pub trait Visit {
         F: FnMut(SlotEntry<'_>);
 }
 
-impl Visit for crate::card::data::DataSpec {
+impl Visit for DataSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -79,7 +94,7 @@ impl Visit for crate::card::data::DataSpec {
         }
         visit_publishes_to(&mut self.publishes_to, f);
         for (label, split) in &mut self.splits {
-            if let crate::card::data::SplitStrategy::Materialized(card_ref) = &mut split.strategy {
+            if let SplitStrategy::Materialized(card_ref) = &mut split.strategy {
                 f(SlotEntry {
                     path: format!("spec.splits[{}].strategy.Materialized", label),
                     value: SlotValue::Durable(card_ref),
@@ -87,7 +102,7 @@ impl Visit for crate::card::data::DataSpec {
             }
         }
         match &mut self.interface {
-            crate::card::data::DataInterface::Image(meta) => {
+            DataInterface::Image(meta) => {
                 if let Some(card_ref) = &mut meta.manifest_ref {
                     f(SlotEntry {
                         path: "spec.interface.Image.manifest_ref".to_owned(),
@@ -95,7 +110,7 @@ impl Visit for crate::card::data::DataSpec {
                     });
                 }
             }
-            crate::card::data::DataInterface::Text(meta) => {
+            DataInterface::Text(meta) => {
                 if let Some(card_ref) = &mut meta.manifest_ref {
                     f(SlotEntry {
                         path: "spec.interface.Text.manifest_ref".to_owned(),
@@ -108,7 +123,7 @@ impl Visit for crate::card::data::DataSpec {
     }
 }
 
-impl Visit for crate::card::model::ModelSpec {
+impl Visit for ModelSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -123,7 +138,7 @@ impl Visit for crate::card::model::ModelSpec {
     }
 }
 
-impl Visit for crate::card::experiment::ExperimentSpec {
+impl Visit for ExperimentSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -143,7 +158,7 @@ impl Visit for crate::card::experiment::ExperimentSpec {
     }
 }
 
-impl Visit for crate::card::agent::AgentSpec {
+impl Visit for AgentSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -152,13 +167,11 @@ impl Visit for crate::card::agent::AgentSpec {
     }
 }
 
-impl Visit for crate::card::workflow::WorkflowSpec {
+impl Visit for WorkflowSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        use crate::card::workflow::WorkflowAction;
-
         if let Some(governance) = &mut self.governance {
             for (index, policy_ref) in governance.policy_refs.iter_mut().enumerate() {
                 f(SlotEntry {
@@ -211,13 +224,11 @@ impl Visit for crate::card::workflow::WorkflowSpec {
     }
 }
 
-impl Visit for crate::card::eval::EvalSpec {
+impl Visit for EvalSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        use crate::vala::eval::EvalTask;
-
         if let Some(dataset_ref) = &mut self.dataset {
             f(SlotEntry {
                 path: "spec.dataset".to_owned(),
@@ -240,13 +251,11 @@ impl Visit for crate::card::eval::EvalSpec {
     }
 }
 
-impl Visit for crate::card::drift::DriftSpec {
+impl Visit for DriftSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        use crate::card::drift::DriftSignal;
-
         match &mut self.signal {
             DriftSignal::Distribution { baseline_ref, .. } => {
                 f(SlotEntry {
@@ -271,7 +280,7 @@ impl Visit for crate::card::drift::DriftSpec {
     }
 }
 
-impl Visit for crate::card::service::ServiceSpec {
+impl Visit for ServiceSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -286,7 +295,7 @@ impl Visit for crate::card::service::ServiceSpec {
     }
 }
 
-impl Visit for crate::card::mcp::McpSpec {
+impl Visit for McpSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -300,7 +309,7 @@ impl Visit for crate::card::mcp::McpSpec {
     }
 }
 
-impl Visit for crate::card::audit::AuditSpec {
+impl Visit for AuditSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -326,7 +335,7 @@ impl Visit for crate::card::audit::AuditSpec {
     }
 }
 
-impl Visit for crate::card::artifact::ArtifactSpec {
+impl Visit for ArtifactSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -340,13 +349,11 @@ impl Visit for crate::card::artifact::ArtifactSpec {
     }
 }
 
-impl Visit for crate::card::trigger::TriggerSpec {
+impl Visit for TriggerSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        use crate::card::trigger::TriggerSource;
-
         f(SlotEntry {
             path: "spec.operator_ref".to_owned(),
             value: SlotValue::Durable(&mut self.operator_ref),
@@ -378,12 +385,12 @@ impl Visit for crate::card::trigger::TriggerSpec {
     }
 }
 
-impl Visit for crate::card::operator::OperatorSpec {
+impl Visit for OperatorSpec {
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
     {
-        if let crate::card::operator::OperatorAction::Workflow { workflow_ref } = &mut self.action {
+        if let OperatorAction::Workflow { workflow_ref } = &mut self.action {
             f(SlotEntry {
                 path: "spec.action.workflow_ref".to_owned(),
                 value: SlotValue::Durable(workflow_ref),
@@ -404,7 +411,7 @@ where
     }
 }
 
-fn visit_agent<F>(agent: &mut crate::card::agent::AgentSpec, prefix: &str, f: &mut F)
+fn visit_agent<F>(agent: &mut AgentSpec, prefix: &str, f: &mut F)
 where
     F: FnMut(SlotEntry<'_>),
 {
@@ -437,6 +444,7 @@ mod completeness_tests {
     use std::collections::{BTreeMap, HashMap};
 
     use serde_json::json;
+    use skald_spec::Prompt;
 
     use super::{ReferenceSlotVisitor, SlotValue};
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
@@ -444,8 +452,8 @@ mod completeness_tests {
     use crate::card::audit::AuditSpec;
     use crate::card::common::{Governance, ObservationHooks};
     use crate::card::data::{
-        ColorMode, DataInterface, DataSchema, DataSpec, DataStats, ImageFormat, ImageMeta,
-        PandasMeta, ParquetCompression, SplitStrategy, TextMeta,
+        ColorMode, DataInterface, DataSchema, DataSpec, DataSplit, DataStats, ImageFormat,
+        ImageMeta, PandasMeta, ParquetCompression, SplitStrategy, TextMeta,
     };
     use crate::card::drift::{DriftCondition, DriftMethod, DriftSignal, DriftSpec};
     use crate::card::experiment::ExperimentSpec;
@@ -473,8 +481,8 @@ mod completeness_tests {
         }
     }
 
-    fn prompt() -> skald_spec::Prompt {
-        skald_spec::Prompt::new(
+    fn prompt() -> Prompt {
+        Prompt::new(
             skald_spec::ProviderRequest::OpenAiChatCompletion(skald_spec::OpenAiChatRequest {
                 model: "gpt-test".to_owned(),
                 messages: vec![skald_spec::OpenAiChatMessage {
@@ -524,7 +532,7 @@ mod completeness_tests {
             card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "data-artifact"))],
             splits: HashMap::from([(
                 crate::ids::SplitName::new("train").expect("fixture split is valid"),
-                crate::card::data::DataSplit {
+                DataSplit {
                     label: crate::ids::SplitName::new("train").expect("fixture split is valid"),
                     strategy: SplitStrategy::Materialized(Ref::Ref(card_ref(
                         CardKind::Artifact,

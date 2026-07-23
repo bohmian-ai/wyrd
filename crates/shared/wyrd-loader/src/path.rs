@@ -4,14 +4,20 @@ use std::path::{Path, PathBuf};
 
 use super::error::Diagnostic;
 
-/// Path sandbox enforcing workspace root boundaries.
+#[cfg(all(test, unix))]
+use std::os::unix::fs::symlink;
+
+/// Path resolver that provides contained resolution and portability advisories.
 pub struct PathSandbox {
-    /// The workspace root — no path may escape this.
+    /// The workspace root used by contained resolution methods.
     root: PathBuf,
 }
 
 impl PathSandbox {
     /// Create a new sandbox rooted at the given path.
+    ///
+    /// # Errors
+    /// Returns an IO diagnostic when `root` cannot be canonicalized.
     pub fn new(root: &Path) -> Result<Self, Diagnostic> {
         let canonical = root
             .canonicalize()
@@ -27,8 +33,13 @@ impl PathSandbox {
 
     /// Resolve a path reference relative to the given base file.
     ///
-    /// Returns the canonicalized path, or a diagnostic if the path escapes
-    /// the sandbox or contains invalid traversal.
+    /// Relative paths are resolved within the sandbox. Absolute paths are
+    /// accepted for portability-oriented workflows and return an advisory;
+    /// use [`Self::resolve_contained`] when containment is required.
+    ///
+    /// # Errors
+    /// Returns an IO or path diagnostic when the reference cannot be
+    /// canonicalized or a relative reference escapes the sandbox.
     pub fn resolve(
         &self,
         base_file: &Path,
@@ -50,6 +61,10 @@ impl PathSandbox {
 
     /// Resolve a relative path and require its canonical target to remain in
     /// this sandbox.
+    ///
+    /// # Errors
+    /// Returns a path diagnostic for absolute or escaping references and an
+    /// IO diagnostic when the base or target cannot be canonicalized.
     pub fn resolve_contained(
         &self,
         base_file: &Path,
@@ -76,11 +91,19 @@ impl PathSandbox {
     }
 
     /// Canonicalize an existing path and require it to remain in this sandbox.
+    ///
+    /// # Errors
+    /// Returns a path diagnostic when the canonical target is outside the
+    /// sandbox or an IO diagnostic when it cannot be canonicalized.
     pub fn ensure_contained(&self, base_file: &Path, path: &Path) -> Result<PathBuf, Diagnostic> {
         self.canonicalize_contained(base_file, path)
     }
 
     /// Resolve a contained path and verify that it is a readable regular file.
+    ///
+    /// # Errors
+    /// Returns a path or IO diagnostic when the target is outside the sandbox,
+    /// is not a regular file, or cannot be opened for reading.
     pub fn resolve_regular_file(
         &self,
         base_file: &Path,
@@ -223,8 +246,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn path_sandbox_rejects_symlink_target_outside_root() {
-        use std::os::unix::fs::symlink;
-
         let root_temp = TempDir::new().unwrap();
         let outside_temp = TempDir::new().unwrap();
         let outside = outside_temp.path().join("secret.yaml");
@@ -242,8 +263,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn path_discovery_does_not_follow_symlink_directories() {
-        use std::os::unix::fs::symlink;
-
         let temp = TempDir::new().unwrap();
         let cards = temp.path().join("cards");
         std::fs::create_dir(&cards).unwrap();
@@ -258,8 +277,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn path_discovery_reports_dangling_yaml_symlink() {
-        use std::os::unix::fs::symlink;
-
         let temp = TempDir::new().unwrap();
         symlink("missing.yaml", temp.path().join("dangling.yaml")).unwrap();
 

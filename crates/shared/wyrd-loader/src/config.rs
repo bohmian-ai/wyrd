@@ -2,9 +2,10 @@
 
 use std::path::Path;
 
+use wyrd_config::{WyrdConfig, apply_defaults as apply_config_defaults};
 use wyrd_spec::ids::SpaceName;
 
-use super::error::LoadError;
+use super::error::{Diagnostic, LoadError};
 use super::parse::AuthoredCard;
 
 /// Discover `wyrd.toml` via ancestor walk from the given path's parent directory.
@@ -19,14 +20,14 @@ use super::parse::AuthoredCard;
 /// # Errors
 ///
 /// Returns diagnostic only when a `wyrd.toml` file exists but is malformed.
-pub fn discover(entry_path: &Path) -> Result<wyrd_config::WyrdConfig, LoadError> {
+pub fn discover(entry_path: &Path) -> Result<WyrdConfig, LoadError> {
     let start_dir = if entry_path.is_dir() {
         entry_path
     } else {
         entry_path.parent().unwrap_or(entry_path)
     };
-    wyrd_config::WyrdConfig::discover_from(start_dir).map_err(|error| {
-        LoadError::single(super::error::Diagnostic::config_load_failed(
+    WyrdConfig::discover_from(start_dir).map_err(|error| {
+        LoadError::single(Diagnostic::config_load_failed(
             start_dir.to_path_buf(),
             error.to_string(),
         ))
@@ -47,9 +48,9 @@ pub fn discover(entry_path: &Path) -> Result<wyrd_config::WyrdConfig, LoadError>
 ///
 /// Panics only if the hard-coded system fallback space violates the `SpaceName`
 /// invariant.
-pub fn apply_defaults(cards: &mut [AuthoredCard], config: &wyrd_config::WyrdConfig) {
+pub fn apply_defaults(cards: &mut [AuthoredCard], config: &WyrdConfig) {
     for card in cards {
-        wyrd_config::apply_defaults(&mut card.metadata, &card.kind, config);
+        apply_config_defaults(&mut card.metadata, &card.kind, config);
         if card.metadata.space.is_none() {
             card.metadata.space = Some(
                 SpaceName::new("default")
@@ -64,6 +65,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::TempDir;
+    use wyrd_spec::envelope::CardKind;
 
     #[test]
     fn config_absent_uses_system_defaults() {
@@ -102,11 +104,7 @@ space = "ml-prod"
 
         let config = discover(&entry_file).unwrap();
         assert!(config.defaults.space.is_some());
-        assert!(
-            config
-                .kind_overrides
-                .contains_key(&wyrd_spec::envelope::CardKind::Model)
-        );
+        assert!(config.kind_overrides.contains_key(&CardKind::Model));
     }
 
     #[test]

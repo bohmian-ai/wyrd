@@ -7,6 +7,7 @@ use secrecy::SecretString;
 use tempfile::TempDir;
 use wyrd_client::WyrdClient;
 use wyrd_loader::RegistrationInput;
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -34,7 +35,7 @@ pub enum CardSelector {
         /// Card name.
         name: CardName,
         /// Exact version, or `None` for latest Active reads.
-        version: Option<wyrd_semver::VersionBlock>,
+        version: Option<VersionBlock>,
     },
     /// Select by an exact reference without changing its optional UID.
     Exact(CardRef),
@@ -49,7 +50,7 @@ pub enum CardSelector {
         /// Optional asserted name.
         name: Option<CardName>,
         /// Optional asserted exact version.
-        version: Option<wyrd_semver::VersionBlock>,
+        version: Option<VersionBlock>,
     },
 }
 
@@ -85,7 +86,7 @@ impl CardSelector {
 
     /// Add an exact version assertion to a selector.
     #[must_use]
-    pub fn with_version(mut self, version: wyrd_semver::VersionBlock) -> Self {
+    pub fn with_version(mut self, version: VersionBlock) -> Self {
         match &mut self {
             Self::Named {
                 version: selected, ..
@@ -142,6 +143,10 @@ impl Cards {
     /// optional explicit server URL and API-key overrides.
     ///
     /// No network or token exchange occurs during construction.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the local configuration or API-key override
+    /// cannot be loaded.
     pub fn new(server_url: Option<&str>, api_key: Option<SecretString>) -> Result<Self, WyrdError> {
         let client = config::load(server_url, api_key).map_err(WyrdError::from)?;
         Ok(Self {
@@ -166,6 +171,10 @@ impl Cards {
     /// Native language card holders lower into this input at their language
     /// adapter boundary. Local source paths are consumed only by the private
     /// saga and never enter the request body.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when validation, registration, artifact upload, or
+    /// server-owned completion fails.
     pub async fn register(
         &self,
         input: &RegistrationInput,
@@ -176,6 +185,10 @@ impl Cards {
     }
 
     /// Fetch one Card envelope using exact or latest selector semantics.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the selector is invalid, the Card is absent,
+    /// or the server request fails.
     pub async fn get(&self, selector: CardSelector) -> Result<Card, WyrdError> {
         reads::get(&self.engine.client, &selector)
             .await
@@ -183,6 +196,10 @@ impl Cards {
     }
 
     /// List metadata-only Card summaries through the typed server query.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the request is invalid or the server query
+    /// fails.
     pub async fn list(&self, request: ListCardsRequest) -> Result<ListCardsResponse, WyrdError> {
         reads::list(&self.engine.client, request)
             .await
@@ -190,6 +207,10 @@ impl Cards {
     }
 
     /// Soft-delete one Card. Named selectors must include an exact version.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the selector is not exact, the Card is absent,
+    /// or the server mutation fails.
     pub async fn delete(&self, selector: CardSelector) -> Result<(), WyrdError> {
         crate::reads::delete(&self.engine.client, selector)
             .await
@@ -197,6 +218,10 @@ impl Cards {
     }
 
     /// Resolve the latest Active version to an exact `CardRef`.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when no Active version matches or the server query
+    /// fails.
     pub async fn resolve_latest(
         &self,
         kind: CardKind,
@@ -213,6 +238,10 @@ impl Cards {
     /// The returned envelope remains server-derived. A later language adapter
     /// can lower it into a native holder without introducing another network
     /// or storage implementation.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the Card, artifact inventory, destination, or
+    /// artifact transfer cannot be loaded.
     pub async fn load(
         &self,
         selector: CardSelector,

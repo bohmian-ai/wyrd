@@ -1,10 +1,16 @@
 //! Structured loader errors and agent-readable diagnostics.
 
-use std::path::PathBuf;
+use std::io::Error as IoError;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
+use serde_json::Error as JsonError;
+use serde_yaml::Error as YamlError;
 use thiserror::Error;
 use wyrd_spec::error::WyrdError;
+
+#[cfg(test)]
+use schemars::schema::RootSchema;
 
 /// Loader error collecting every error-severity diagnostic.
 #[derive(Debug, Error)]
@@ -106,7 +112,7 @@ impl Diagnostic {
 
     /// Create an IO diagnostic.
     #[must_use]
-    pub fn io(path: PathBuf, source: &std::io::Error) -> Self {
+    pub fn io(path: PathBuf, source: &IoError) -> Self {
         let message = source.to_string();
         Self::from_wyrd_error(
             path,
@@ -121,7 +127,7 @@ impl Diagnostic {
 
     /// Create a YAML syntax diagnostic with parser location when available.
     #[must_use]
-    pub fn yaml_syntax(path: PathBuf, source: &serde_yaml::Error) -> Self {
+    pub fn yaml_syntax(path: PathBuf, source: &YamlError) -> Self {
         let span = source.location().map(|location| SourceSpan {
             line: location.line(),
             column: location.column(),
@@ -154,7 +160,7 @@ impl Diagnostic {
 
     /// Create a path escape diagnostic.
     #[must_use]
-    pub fn path_escape(path: PathBuf, _escaped_path: &std::path::Path) -> Self {
+    pub fn path_escape(path: PathBuf, _escaped_path: &Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Error,
@@ -168,7 +174,7 @@ impl Diagnostic {
 
     /// Create an absolute-path portability warning.
     #[must_use]
-    pub fn path_absolute_advisory(path: PathBuf, _absolute_path: &std::path::Path) -> Self {
+    pub fn path_absolute_advisory(path: PathBuf, _absolute_path: &Path) -> Self {
         Self::from_wyrd_error(
             path,
             Severity::Warning,
@@ -198,7 +204,7 @@ impl Diagnostic {
 /// Return the JSON Schema for the machine-readable diagnostic contract.
 #[must_use]
 #[cfg(test)]
-pub fn diagnostic_schema() -> schemars::schema::RootSchema {
+pub fn diagnostic_schema() -> RootSchema {
     schemars::schema_for!(Diagnostic)
 }
 
@@ -206,7 +212,7 @@ pub fn diagnostic_schema() -> schemars::schema::RootSchema {
 ///
 /// # Errors
 /// Returns a JSON serialization error if structured context is invalid.
-pub fn emit_json(diagnostics: &[Diagnostic]) -> Result<String, serde_json::Error> {
+pub fn emit_json(diagnostics: &[Diagnostic]) -> Result<String, JsonError> {
     let mut ordered = diagnostics.to_vec();
     ordered.sort_by(|left, right| {
         (

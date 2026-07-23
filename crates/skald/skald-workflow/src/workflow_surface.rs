@@ -16,8 +16,10 @@ use wyrd_spec::card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowSpec, WorkflowStep,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::SpaceName;
 use wyrd_spec::metadata::{Annotations, CardMetadata, Labels};
 use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::{AgentCard, AgentSpec};
 
 use crate::context::Context;
 use crate::def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
@@ -38,11 +40,11 @@ pub enum WorkflowInput {
 pub trait AgentResolver: Send + Sync {
     /// Resolve a referenced Agent Card without performing filesystem or
     /// network work in the workflow surface.
-    fn resolve(&self, agent_ref: &InlineableRef<wyrd_spec::AgentSpec>) -> Result<Agent, WyrdError>;
+    fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError>;
 }
 
 impl<T: AgentResolver + ?Sized> AgentResolver for &T {
-    fn resolve(&self, agent_ref: &InlineableRef<wyrd_spec::AgentSpec>) -> Result<Agent, WyrdError> {
+    fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError> {
         (**self).resolve(agent_ref)
     }
 }
@@ -355,7 +357,7 @@ impl Workflow {
         for step in &card.spec.steps {
             match &step.action {
                 WorkflowAction::Agent(InlineableRef::Inline(spec)) => {
-                    let card = wyrd_spec::AgentCard {
+                    let card = AgentCard {
                         space: card.space.clone(),
                         name: format!("{}-{}", card.name, step.id),
                         version: "0.0.0".to_owned(),
@@ -557,13 +559,13 @@ impl Workflow {
         self.cascade_children.sort_by(|a, b| {
             let a_key = (
                 a.kind.wire_name(),
-                a.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str),
+                a.space.as_ref().map(SpaceName::as_str),
                 a.name.as_str(),
                 a.version.to_string(),
             );
             let b_key = (
                 b.kind.wire_name(),
-                b.space.as_ref().map(wyrd_spec::ids::SpaceName::as_str),
+                b.space.as_ref().map(SpaceName::as_str),
                 b.name.as_str(),
                 b.version.to_string(),
             );

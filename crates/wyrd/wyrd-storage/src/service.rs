@@ -506,7 +506,12 @@ pub async fn upload_local_blob(
             serde_json::json!({ "upload_id": upload_id }),
         )
     })?;
-    let actual_size = body.len() as u64;
+    let actual_size = u64::try_from(body.len()).map_err(|_| {
+        internal_error(
+            "request body exceeds the supported size range",
+            serde_json::json!({ "size_bytes": body.len() }),
+        )
+    })?;
     if actual_size != expected_size {
         return Err(map_storage_error(StorageError::SizeMismatch {
             expected: expected_size,
@@ -1683,7 +1688,10 @@ mod tests {
         let (mut file, len) = download_local_blob(&storage, tenant, path)
             .await
             .expect("download file");
-        assert_eq!(len, b"download me".len() as u64);
+        assert_eq!(
+            len,
+            u64::try_from(b"download me".len()).expect("test bytes length fits u64")
+        );
         let mut body = String::new();
         file.read_to_string(&mut body)
             .await

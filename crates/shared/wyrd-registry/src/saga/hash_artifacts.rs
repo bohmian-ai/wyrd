@@ -1,7 +1,7 @@
 //! Client-owned artifact provenance and aggregate manifest hashing.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -54,7 +54,7 @@ pub(crate) async fn validate_and_stamp(
     Ok(())
 }
 
-async fn hash_source(source: &PathBuf) -> Result<(u64, String), RegistryEngineError> {
+async fn hash_source(source: &Path) -> Result<(u64, String), RegistryEngineError> {
     let file = tokio::fs::File::open(source).await?;
     let mut reader = BufReader::new(file);
     let mut hasher = Sha256::new();
@@ -65,7 +65,8 @@ async fn hash_source(source: &PathBuf) -> Result<(u64, String), RegistryEngineEr
         if read == 0 {
             break;
         }
-        size = size.checked_add(read as u64).ok_or_else(|| {
+        let read_u64 = u64::try_from(read).expect("invariant: read buffer length fits u64");
+        size = size.checked_add(read_u64).ok_or_else(|| {
             RegistryEngineError::Wyrd(WyrdError::RegistrySpecTooLarge {
                 message: "local artifact exceeds the supported size range".to_owned(),
                 details: serde_json::json!({ "source": source }),
@@ -126,7 +127,7 @@ mod tests {
         let entry = ArtifactManifestEntry {
             relative_path: relative_path.clone(),
             sha256: base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes)),
-            size_bytes: bytes.len() as u64,
+            size_bytes: u64::try_from(bytes.len()).expect("test bytes length fits u64"),
             content_type: None,
         };
         let mut card = submission(entry);

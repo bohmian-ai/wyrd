@@ -68,9 +68,12 @@ struct ExistingNode {
     outcome: RegistrationOutcomeKind,
 }
 
-/// Execute the resolve, graph, idempotency, write, audit, and replay pipeline.
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.compose"))]
-pub async fn compose_registration(
+/// Register a composite card request through the server-owned transaction.
+///
+/// This operation resolves references, applies idempotency replay, writes the
+/// registration transaction, and initializes any artifact uploads.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration"))]
+pub async fn register_card(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
@@ -887,16 +890,6 @@ fn idempotency_conflict(idempotency_key: &str) -> WyrdError {
 fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
     tracing::error!(%error, "card registration database operation failed");
     WyrdError::registry_unavailable("card registry unavailable")
-}
-
-/// Register a composite card request through the server-owned transaction.
-pub async fn register_card(
-    state: &AppState,
-    caller: &Caller,
-    idempotency_key: &str,
-    request: CreateCardRequest,
-) -> Result<CreateCardResponse, WyrdError> {
-    compose_registration(state, caller, idempotency_key, request).await
 }
 
 /// Card and manifest state loaded before completion or abort storage IO.

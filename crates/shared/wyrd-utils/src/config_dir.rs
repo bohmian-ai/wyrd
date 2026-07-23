@@ -48,6 +48,23 @@ mod tests {
 
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+    struct EnvironmentGuard {
+        previous: Vec<(String, Option<OsString>)>,
+    }
+
+    impl Drop for EnvironmentGuard {
+        fn drop(&mut self) {
+            unsafe {
+                for (name, value) in self.previous.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(name, value),
+                        None => std::env::remove_var(name),
+                    }
+                }
+            }
+        }
+    }
+
     /// Run a configuration-directory assertion with a controlled environment.
     fn with_env<T>(values: &[(&str, Option<&str>)], test: impl FnOnce() -> T) -> T {
         let _guard = ENV_MUTEX
@@ -57,6 +74,7 @@ mod tests {
             .iter()
             .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
             .collect::<Vec<(String, Option<OsString>)>>();
+        let _environment = EnvironmentGuard { previous };
         unsafe {
             for (name, value) in values {
                 match value {
@@ -65,16 +83,7 @@ mod tests {
                 }
             }
         }
-        let result = test();
-        unsafe {
-            for (name, value) in previous {
-                match value {
-                    Some(value) => std::env::set_var(name, value),
-                    None => std::env::remove_var(name),
-                }
-            }
-        }
-        result
+        test()
     }
 
     #[test]
@@ -149,5 +158,28 @@ mod tests {
             wyrd_config_dir_required,
         );
         assert!(matches!(result, Err(ConfigDirError::Unresolvable)));
+    }
+
+    #[test]
+    fn environment_is_restored_after_panic() {
+        let values = [
+            ("WYRD_CONFIG_HOME", Some("/tmp/panic-config")),
+            ("XDG_CONFIG_HOME", Some("/tmp/panic-xdg")),
+            ("HOME", Some("/tmp/panic-home")),
+        ];
+        let previous = values
+            .iter()
+            .map(|(name, _)| ((*name).to_owned(), std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_env(&values, || panic!("deliberate environment panic"));
+        }));
+        assert!(result.is_err());
+
+        with_env(&[], || {
+            for (name, value) in previous {
+                assert_eq!(std::env::var_os(name), value);
+            }
+        });
     }
 }

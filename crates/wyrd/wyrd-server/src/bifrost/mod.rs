@@ -2,7 +2,6 @@
 //! over the shared `AppState.bifrost` handle, plus the `DataTypeSpec ↔ arrow`
 //! conversion and schema fingerprinting the register path needs.
 
-pub mod catalog_adapter;
 pub mod convert;
 pub mod routes;
 pub mod service;

@@ -18,7 +18,7 @@
 //! - **Version 1** (): Initial implementation with paired audit/data records.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, IoSlice, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -88,7 +88,11 @@ pub struct SegmentHeader {
 const WAL_MAGIC: u32 = 0x5741_5257; // "WRAW"
 const WAL_VERSION: u16 = 2;
 const SEGMENT_HEADER_SIZE: usize = 64;
+pub(crate) const WAL_RECORD_HEADER_SIZE: usize = 40;
+const WAL_RECORD_CRC_SIZE: usize = 4;
+#[cfg(test)]
 const APPEND_FRAME_MAGIC: [u8; 4] = *b"SWF1";
+#[cfg(test)]
 const APPEND_FRAME_MAGIC_V2: [u8; 4] = *b"SWF2";
 const FRAME_SEQUENCE_RESERVED: [u8; 3] = *b"WYD";
 
@@ -232,6 +236,118 @@ pub struct WalRecord {
     pub frame_sequence: u64,
     /// Payload bytes (Arrow IPC for kind=0, JSON `AuditEvent` for kind=1).
     pub payload: Vec<u8>,
+}
+
+/// Explicit WAL sizing used by every Scribe writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalConfig {
+    /// Maximum segment bytes before a non-empty segment rolls.
+    pub segment_bytes: u64,
+}
+
+impl WalConfig {
+    /// Construct a validated WAL configuration.
+    pub fn new(segment_bytes: u64) -> Result<Self, ScribeError> {
+        if segment_bytes == 0 {
+            return Err(ScribeError::Internal {
+                detail: "WAL segment_bytes must be greater than zero".to_owned(),
+            });
+        }
+        Ok(Self { segment_bytes })
+    }
+}
+
+impl Default for WalConfig {
+    fn default() -> Self {
+        Self {
+            segment_bytes: 512 * 1024 * 1024,
+        }
+    }
+}
+
+/// A paired audit/data append prepared without allocating an encoded record.
+#[derive(Debug)]
+pub(crate) struct PreparedWalAppend {
+    pub(crate) lsn: WalLsn,
+    pub(crate) batch_id: [u8; 16],
+    pub(crate) frame_sequence: u64,
+    pub(crate) audit: Bytes,
+    pub(crate) data: Bytes,
+    pub(crate) audit_header: [u8; WAL_RECORD_HEADER_SIZE],
+    pub(crate) data_header: [u8; WAL_RECORD_HEADER_SIZE],
+    pub(crate) encoded_bytes: u64,
+}
+
+/// Result of one append, including every segment whose bytes were touched.
+#[derive(Debug)]
+pub(crate) struct WalAppendResult {
+    pub(crate) lsn: WalLsn,
+    pub(crate) touched_segments: Vec<Arc<WalSegment>>,
+    pub(crate) encoded_bytes: u64,
+}
+
+impl PreparedWalAppend {
+    pub(crate) fn new(
+        lsn: WalLsn,
+        batch_id: [u8; 16],
+        frame_sequence: u64,
+        audit: Bytes,
+        data: Bytes,
+    ) -> Result<Self, ScribeError> {
+        let audit_header = record_header(lsn, 1, batch_id, frame_sequence, audit.len())?;
+        let data_header = record_header(lsn, 0, batch_id, frame_sequence, data.len())?;
+        let audit_bytes = u64::try_from(audit.len()).map_err(|_| ScribeError::Internal {
+            detail: "audit payload length does not fit WAL accounting".to_owned(),
+        })?;
+        let data_bytes = u64::try_from(data.len()).map_err(|_| ScribeError::Internal {
+            detail: "data payload length does not fit WAL accounting".to_owned(),
+        })?;
+        let record_overhead = u64::try_from(WAL_RECORD_HEADER_SIZE + WAL_RECORD_CRC_SIZE)
+            .expect("WAL record overhead fits u64");
+        let encoded_bytes = record_overhead
+            .saturating_mul(2)
+            .saturating_add(audit_bytes)
+            .saturating_add(data_bytes);
+        Ok(Self {
+            lsn,
+            batch_id,
+            frame_sequence,
+            audit,
+            data,
+            audit_header,
+            data_header,
+            encoded_bytes,
+        })
+    }
+
+    fn assign_lsn(&mut self, lsn: WalLsn) -> Result<(), ScribeError> {
+        self.lsn = lsn;
+        self.audit_header =
+            record_header(lsn, 1, self.batch_id, self.frame_sequence, self.audit.len())?;
+        self.data_header =
+            record_header(lsn, 0, self.batch_id, self.frame_sequence, self.data.len())?;
+        Ok(())
+    }
+}
+
+fn record_header(
+    lsn: WalLsn,
+    envelope_kind: u8,
+    batch_id: [u8; 16],
+    frame_sequence: u64,
+    payload_len: usize,
+) -> Result<[u8; WAL_RECORD_HEADER_SIZE], ScribeError> {
+    let payload_len = u32::try_from(payload_len).map_err(|_| ScribeError::Internal {
+        detail: "WAL payload exceeds the v2 record length".to_owned(),
+    })?;
+    let mut header = [0_u8; WAL_RECORD_HEADER_SIZE];
+    header[0..4].copy_from_slice(&payload_len.to_le_bytes());
+    header[4..12].copy_from_slice(&lsn.as_u64().to_le_bytes());
+    header[12] = envelope_kind;
+    header[13..16].copy_from_slice(&FRAME_SEQUENCE_RESERVED);
+    header[16..32].copy_from_slice(&batch_id);
+    header[32..40].copy_from_slice(&frame_sequence.to_le_bytes());
+    Ok(header)
 }
 
 impl WalRecord {
@@ -415,6 +531,7 @@ impl WalRecord {
 }
 
 /// Encode one complete paired audit/data append for the blocking WAL worker.
+#[cfg(test)]
 pub(crate) fn encode_append_frame(
     batch_id: [u8; 16],
     audit: &[u8],
@@ -424,6 +541,7 @@ pub(crate) fn encode_append_frame(
 }
 
 /// Encode one complete paired append with its bounded-stream frame sequence.
+#[cfg(test)]
 pub(crate) fn encode_append_frame_with_sequence(
     batch_id: [u8; 16],
     frame_sequence: u64,
@@ -447,6 +565,7 @@ pub(crate) fn encode_append_frame_with_sequence(
     Ok(Bytes::from(frame))
 }
 
+#[cfg(test)]
 struct DecodedAppendFrame<'a> {
     batch_id: [u8; 16],
     frame_sequence: u64,
@@ -454,6 +573,7 @@ struct DecodedAppendFrame<'a> {
     data: &'a [u8],
 }
 
+#[cfg(test)]
 fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
     if frame.len() < 28
         || (frame[0..4] != APPEND_FRAME_MAGIC && frame[0..4] != APPEND_FRAME_MAGIC_V2)
@@ -616,6 +736,14 @@ impl WalSegment {
         Ok(())
     }
 
+    fn append_prepared(&self, prepared: &PreparedWalAppend) -> Result<(), ScribeError> {
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (append_prepared)".to_owned(),
+        })?;
+        write_record_vectored(&mut file, &prepared.audit_header, &prepared.audit)?;
+        write_record_vectored(&mut file, &prepared.data_header, &prepared.data)
+    }
+
     /// Force all appended data for this segment to stable storage.
     pub fn sync_data(&self) -> Result<(), ScribeError> {
         let file = self.file.lock().map_err(|_| ScribeError::Internal {
@@ -682,6 +810,45 @@ impl WalSegment {
     }
 }
 
+fn write_record_vectored(
+    file: &mut File,
+    header: &[u8; WAL_RECORD_HEADER_SIZE],
+    payload: &Bytes,
+) -> Result<(), ScribeError> {
+    let mut crc = crc32c::crc32c_append(0, header);
+    crc = crc32c::crc32c_append(crc, payload);
+    let crc_bytes = crc.to_le_bytes();
+    let mut remaining: Vec<&[u8]> = vec![header, payload, &crc_bytes];
+    while !remaining.is_empty() {
+        let parts: Vec<IoSlice<'_>> = remaining.iter().map(|part| IoSlice::new(part)).collect();
+        let mut written = file.write_vectored(&parts).map_err(|error| {
+            if error.kind() == io::ErrorKind::StorageFull || error.raw_os_error() == Some(28) {
+                ScribeError::WalDiskFull
+            } else {
+                ScribeError::Internal {
+                    detail: format!("WAL record vectored write failed: {error}"),
+                }
+            }
+        })?;
+        if written == 0 {
+            return Err(ScribeError::Internal {
+                detail: "WAL vectored write made no progress".to_owned(),
+            });
+        }
+        while written > 0 && !remaining.is_empty() {
+            let first_len = remaining[0].len();
+            if written >= first_len {
+                written -= first_len;
+                remaining.remove(0);
+            } else {
+                remaining[0] = &remaining[0][written..];
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// WAL writer — handles per-seal-key append with automatic segment rollover.
 #[derive(Debug)]
 pub struct WalWriter {
@@ -690,10 +857,16 @@ pub struct WalWriter {
     writer_epoch: i64,
     tenant_id: DataTenantId,
     next_lsn: Arc<AtomicU64>,
-    current_segment: Mutex<Option<Arc<WalSegment>>>,
-    seg_seq: Arc<AtomicU64>,
-    max_segment_size: u64,
-    current_segment_size: Arc<AtomicU64>,
+    segment_bytes: u64,
+    state: Mutex<WalState>,
+}
+
+#[derive(Debug, Default)]
+struct WalState {
+    current_segment: Option<Arc<WalSegment>>,
+    seg_seq: u64,
+    current_segment_size: u64,
+    current_segment_records: u64,
 }
 
 /// A WAL handle bound to one seal-key.
@@ -714,8 +887,20 @@ impl WalHandle {
         &self.seal_key
     }
 
+    #[cfg(test)]
     pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<WalLsn, ScribeError> {
         self.writer.append_frame(frame)
+    }
+
+    pub(crate) fn append_prepared(
+        &self,
+        append: PreparedWalAppend,
+    ) -> Result<WalAppendResult, ScribeError> {
+        self.writer.append_prepared(append)
+    }
+
+    pub(crate) fn sync_segments(segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        WalWriter::sync_segments(segments)
     }
 
     #[cfg(test)]
@@ -732,24 +917,20 @@ impl WalHandle {
     pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
         self.writer.sync_data()
     }
-
-    pub(crate) fn create_or_roll_segment(&self) -> Result<(), ScribeError> {
-        let _ = self.writer.ensure_segment()?;
-        Ok(())
-    }
 }
 
 impl WalWriter {
     /// Create a new WAL writer for the given seal-key.
     ///
-    /// `max_segment_size` defaults to 4 KiB if `None`.
+    /// Segment sizing is explicit and validated before the writer is returned.
     pub fn new(
         base_dir: impl AsRef<Path>,
         node_id: [u8; 16],
         writer_epoch: i64,
         tenant_id: DataTenantId,
-        max_segment_size: Option<u64>,
+        config: WalConfig,
     ) -> Result<Self, ScribeError> {
+        let config = WalConfig::new(config.segment_bytes)?;
         let base_dir = base_dir.as_ref().to_path_buf();
         Ok(Self {
             base_dir,
@@ -757,10 +938,8 @@ impl WalWriter {
             writer_epoch,
             tenant_id,
             next_lsn: Arc::new(AtomicU64::new(0)),
-            current_segment: Mutex::new(None),
-            seg_seq: Arc::new(AtomicU64::new(0)),
-            max_segment_size: max_segment_size.unwrap_or(4096),
-            current_segment_size: Arc::new(AtomicU64::new(0)),
+            segment_bytes: config.segment_bytes,
+            state: Mutex::new(WalState::default()),
         })
     }
 
@@ -777,7 +956,9 @@ impl WalWriter {
             self.node_id,
             self.writer_epoch,
             key.tenant,
-            Some(self.max_segment_size),
+            WalConfig {
+                segment_bytes: self.segment_bytes(),
+            },
         )?;
         // LSNs identify the pod's WAL stream, not an individual tenant/table/day
         // directory. Keep allocation global across all lazy seal-key handles so
@@ -795,77 +976,93 @@ impl WalWriter {
         audit_payload: &[u8],
         data_payload: &[u8],
     ) -> Result<WalLsn, ScribeError> {
-        let frame = encode_append_frame(batch_id, audit_payload, data_payload)?;
-        let lsn = self.append_frame(&frame)?;
-        self.sync_data()?;
-        Ok(lsn)
+        let prepared = PreparedWalAppend::new(
+            WalLsn::ZERO,
+            batch_id,
+            0,
+            Bytes::copy_from_slice(audit_payload),
+            Bytes::copy_from_slice(data_payload),
+        )?;
+        let result = self.append_prepared(prepared)?;
+        Self::sync_segments(&result.touched_segments)?;
+        Ok(result.lsn)
     }
 
-    /// Append a prepared paired frame without syncing it.
+    /// Append one prepared paired record without syncing it.
+    pub(crate) fn append_prepared(
+        &self,
+        mut prepared: PreparedWalAppend,
+    ) -> Result<WalAppendResult, ScribeError> {
+        let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
+        prepared.assign_lsn(lsn)?;
+        let mut state = self.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL state lock poisoned (append_prepared)".to_owned(),
+        })?;
+        if state.current_segment.is_some()
+            && state.current_segment_records > 0
+            && state
+                .current_segment_size
+                .saturating_add(prepared.encoded_bytes)
+                > self.segment_bytes()
+        {
+            state.current_segment = None;
+            state.current_segment_size = 0;
+            state.current_segment_records = 0;
+        }
+        let segment = self.ensure_segment_locked(&mut state)?;
+        segment.append_prepared(&prepared)?;
+        state.current_segment_size = state
+            .current_segment_size
+            .saturating_add(prepared.encoded_bytes);
+        state.current_segment_records = state.current_segment_records.saturating_add(2);
+        Ok(WalAppendResult {
+            lsn,
+            touched_segments: vec![segment],
+            encoded_bytes: prepared.encoded_bytes,
+        })
+    }
+
+    /// Sync every distinct segment touched by a group exactly once.
+    pub(crate) fn sync_segments(segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        let mut synced = Vec::with_capacity(segments.len());
+        for segment in segments {
+            if synced.iter().any(|path: &PathBuf| path == segment.path()) {
+                continue;
+            }
+            segment.sync_data()?;
+            synced.push(segment.path().to_path_buf());
+        }
+        Ok(())
+    }
+
+    /// Return the configured segment size.
+    #[must_use]
+    pub fn segment_bytes(&self) -> u64 {
+        self.segment_bytes
+    }
+
+    #[cfg(test)]
+    /// Append a fixture frame through the reference decoder.
     pub(crate) fn append_frame(&self, frame: &[u8]) -> Result<WalLsn, ScribeError> {
         let decoded = decode_append_frame(frame)?;
-        self.append_pair(
+        let prepared = PreparedWalAppend::new(
+            WalLsn::ZERO,
             decoded.batch_id,
             decoded.frame_sequence,
-            decoded.audit,
-            decoded.data,
-        )
-    }
-
-    fn append_pair(
-        &self,
-        batch_id: [u8; 16],
-        frame_sequence: u64,
-        audit_payload: &[u8],
-        data_payload: &[u8],
-    ) -> Result<WalLsn, ScribeError> {
-        let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
-
-        // Build records to calculate their sizes
-        let audit_record = WalRecord::new_with_frame_sequence(
-            lsn,
-            1,
-            batch_id,
-            frame_sequence,
-            audit_payload.to_vec(),
-        );
-        let data_record = WalRecord::new_with_frame_sequence(
-            lsn,
-            0,
-            batch_id,
-            frame_sequence,
-            data_payload.to_vec(),
-        );
-
-        let audit_size = audit_record.encode().len() as u64;
-        let data_size = data_record.encode().len() as u64;
-        let total_size = audit_size + data_size;
-
-        // Check if we need to roll to a new segment
-        let current_size = self.current_segment_size.load(Ordering::SeqCst);
-        if current_size + total_size > self.max_segment_size {
-            self.roll_segment()?;
-        }
-
-        let segment = self.ensure_segment()?;
-
-        segment.append(&audit_record)?;
-        segment.append(&data_record)?;
-
-        // Update segment size counter
-        self.current_segment_size
-            .fetch_add(total_size, Ordering::SeqCst);
-
-        Ok(lsn)
+            Bytes::copy_from_slice(decoded.audit),
+            Bytes::copy_from_slice(decoded.data),
+        )?;
+        Ok(self.append_prepared(prepared)?.lsn)
     }
 
     fn sync_data(&self) -> Result<(), ScribeError> {
         let segment = self
-            .current_segment
+            .state
             .lock()
             .map_err(|_| ScribeError::Internal {
                 detail: "segment lock poisoned (sync_data)".to_string(),
             })?
+            .current_segment
             .clone();
         if let Some(segment) = segment {
             segment.sync_data()?;
@@ -904,33 +1101,13 @@ impl WalWriter {
         directory_bytes(&self.base_dir)
     }
 
-    /// Roll to a new segment.
-    ///
-    fn roll_segment(&self) -> Result<(), ScribeError> {
-        let mut current = self
-            .current_segment
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "segment lock poisoned (roll_segment)".to_string(),
-            })?;
-        *current = None;
-        self.current_segment_size.store(0, Ordering::SeqCst);
-        Ok(())
-    }
-
-    fn ensure_segment(&self) -> Result<Arc<WalSegment>, ScribeError> {
-        let mut current = self
-            .current_segment
-            .lock()
-            .map_err(|_| ScribeError::Internal {
-                detail: "segment lock poisoned (ensure_segment)".to_string(),
-            })?;
-
-        if let Some(ref segment) = *current {
+    fn ensure_segment_locked(&self, state: &mut WalState) -> Result<Arc<WalSegment>, ScribeError> {
+        if let Some(ref segment) = state.current_segment {
             return Ok(Arc::clone(segment));
         }
 
-        let seq = self.seg_seq.fetch_add(1, Ordering::SeqCst);
+        let seq = state.seg_seq;
+        state.seg_seq = state.seg_seq.saturating_add(1);
         std::fs::create_dir_all(&self.base_dir).map_err(|error| ScribeError::Internal {
             detail: format!("failed to create WAL directory: {error}"),
         })?;
@@ -950,11 +1127,11 @@ impl WalWriter {
         );
 
         let segment = Arc::new(WalSegment::create(&path, header)?);
-        *current = Some(Arc::clone(&segment));
+        state.current_segment = Some(Arc::clone(&segment));
 
         // Initialize segment size to header size
-        self.current_segment_size
-            .store(SEGMENT_HEADER_SIZE as u64, Ordering::SeqCst);
+        state.current_segment_size = SEGMENT_HEADER_SIZE as u64;
+        state.current_segment_records = 0;
 
         Ok(segment)
     }
@@ -1174,7 +1351,8 @@ mod tests {
         let node_id = [3u8; 16];
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, None).expect("writer");
+        let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, WalConfig::default())
+            .expect("writer");
 
         let batch_id = [1u8; 16];
         let lsn = writer
@@ -1201,7 +1379,7 @@ mod tests {
             [8u8; 16],
             1,
             DataTenantId::SYSTEM_OWNER,
-            None,
+            WalConfig::default(),
         )
         .expect("writer");
         let table =
@@ -1234,8 +1412,14 @@ mod tests {
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
         // Create writer with 500-byte max segment size
-        let writer =
-            WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, Some(500)).expect("writer");
+        let writer = WalWriter::new(
+            temp_dir.path(),
+            node_id,
+            1,
+            tenant_id,
+            WalConfig { segment_bytes: 500 },
+        )
+        .expect("writer");
 
         // Write appends totaling >500 bytes (each record has overhead)
         for i in 0u8..10 {
@@ -1270,7 +1454,8 @@ mod tests {
         let node_id = [5u8; 16];
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, None).expect("writer");
+        let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, WalConfig::default())
+            .expect("writer");
 
         // Write 2 appends to segment 0
         let batch_id1 = [1u8; 16];
@@ -1318,7 +1503,7 @@ mod tests {
             expected_node,
             3,
             DataTenantId::SYSTEM_OWNER,
-            None,
+            WalConfig::default(),
         )
         .expect("expected writer");
         expected_writer

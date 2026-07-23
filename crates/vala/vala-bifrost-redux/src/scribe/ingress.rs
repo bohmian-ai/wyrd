@@ -7,7 +7,6 @@ use crate::scribe::admission::{
 };
 use crate::scribe::execution_lanes::ScribeIngressCpuPool;
 use crate::scribe::preprocess::AdmittedAppend;
-use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::writer::TenantTableWriterRegistry;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,7 +24,6 @@ struct IngressJob {
 pub(super) struct ScribeIngressQueue {
     sender: Mutex<Option<mpsc::Sender<IngressJob>>>,
     budget: IngressQueueBudget,
-    telemetry: Arc<Mutex<Option<Arc<ScribeTelemetry>>>>,
     closed: AtomicBool,
     active: Arc<AtomicUsize>,
     drained: Arc<Notify>,
@@ -39,7 +37,6 @@ impl ScribeIngressQueue {
         admission: AdmissionController,
         ingress_cpu: ScribeIngressCpuPool,
         registry: Arc<TenantTableWriterRegistry>,
-        telemetry: Option<Arc<ScribeTelemetry>>,
         coordination_runtime: &Handle,
     ) -> Self {
         let capacity = items.max(1);
@@ -47,8 +44,6 @@ impl ScribeIngressQueue {
             max_items: capacity,
             max_bytes: bytes,
         });
-        let telemetry_slot = Arc::new(Mutex::new(telemetry));
-        let task_telemetry = Arc::clone(&telemetry_slot);
         let (sender, mut receiver) = mpsc::channel(capacity);
         let processing = Arc::new(Semaphore::new(capacity));
         let active = Arc::new(AtomicUsize::new(0));
@@ -64,7 +59,6 @@ impl ScribeIngressQueue {
                 let admission = admission.clone();
                 let ingress_cpu = ingress_cpu.clone();
                 let registry = Arc::clone(&registry);
-                let task_telemetry = Arc::clone(&task_telemetry);
                 let active = Arc::clone(&task_active);
                 let drained = Arc::clone(&task_drained);
                 let IngressJob {
@@ -73,17 +67,12 @@ impl ScribeIngressQueue {
                     response,
                 } = job;
                 tokio::spawn(async move {
-                    let telemetry = task_telemetry
-                        .lock()
-                        .ok()
-                        .and_then(|telemetry| telemetry.clone());
                     let result = process_ingress_frame(
                         frame,
                         &mut reservation,
                         &admission,
                         &ingress_cpu,
                         &registry,
-                        telemetry.as_ref(),
                     )
                     .await;
                     let _ = response.send(result);
@@ -103,17 +92,10 @@ impl ScribeIngressQueue {
         Self {
             sender: Mutex::new(Some(sender)),
             budget,
-            telemetry: telemetry_slot,
             closed: AtomicBool::new(false),
             active,
             drained,
             task: tokio::sync::Mutex::new(Some(task)),
-        }
-    }
-
-    pub(super) fn set_telemetry(&self, telemetry: Arc<ScribeTelemetry>) {
-        if let Ok(mut slot) = self.telemetry.lock() {
-            *slot = Some(telemetry);
         }
     }
 
@@ -122,9 +104,13 @@ impl ScribeIngressQueue {
         frame: ScribeIngressFrame,
     ) -> Result<FrameAdmission, ScribeError> {
         if self.closed.load(Ordering::Acquire) {
+            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "closed")
+                .increment(1);
             return Err(ScribeError::IngressClosed);
         }
         if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
+            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "payload_too_large")
+                .increment(1);
             return Err(ScribeError::PayloadTooLarge {
                 bytes: frame.measured_wire_bytes,
             });
@@ -133,7 +119,10 @@ impl ScribeIngressQueue {
         let bytes = frame
             .measured_wire_bytes
             .saturating_add(REQUEST_OVERHEAD_BYTES);
-        let reservation = self.budget.try_reserve(table.clone(), bytes)?;
+        let reservation = self.budget.try_reserve(table.clone(), bytes).inspect_err(|_| {
+            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "raw_budget")
+                .increment(1);
+        })?;
         let (response, result) = oneshot::channel();
         let sender = self
             .sender
@@ -150,9 +139,13 @@ impl ScribeIngressQueue {
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
+                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "ingress_queue_full")
+                    .increment(1);
                 return Err(ScribeError::IngestBusy { table });
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
+                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "closed")
+                    .increment(1);
                 return Err(ScribeError::IngressClosed);
             }
         }
@@ -187,7 +180,6 @@ async fn process_ingress_frame(
     admission: &AdmissionController,
     ingress_cpu: &ScribeIngressCpuPool,
     registry: &TenantTableWriterRegistry,
-    telemetry: Option<&Arc<ScribeTelemetry>>,
 ) -> Result<FrameAdmission, ScribeError> {
     let append_started = Instant::now();
     frame
@@ -213,7 +205,6 @@ async fn process_ingress_frame(
             limit: frame.stream_rows_limit,
         });
     }
-    let append_wire_bytes = frame.measured_wire_bytes;
     let estimated_bytes = rows
         .get_array_memory_size()
         .saturating_add(frame.measured_wire_bytes)
@@ -224,7 +215,6 @@ async fn process_ingress_frame(
         estimated_bytes,
     )?;
     let admitted = AdmittedAppend {
-        request_id: frame.request_id,
         batch_id: frame.batch_id,
         frame_sequence: frame.frame_sequence,
         audit_event: frame.audit_event,
@@ -244,14 +234,9 @@ async fn process_ingress_frame(
         }
         return Err(error);
     }
-    if let Some(telemetry) = telemetry {
-        telemetry.record_accepted(append_rows);
-        telemetry.record(
-            "append",
-            append_started.elapsed(),
-            append_rows,
-            append_wire_bytes,
-        );
-    }
+    metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
+    metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted").increment(rows_accepted);
+    metrics::histogram!("bifrost_scribe_ack_seconds")
+        .record(append_started.elapsed().as_secs_f64());
     Ok(FrameAdmission { rows_accepted })
 }

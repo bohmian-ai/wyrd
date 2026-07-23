@@ -6,7 +6,7 @@ cd "$repo_root"
 
 stage="${1:?usage: capture-bifrost-stage.sh <stage> [before-stage-json]}"
 before_manifest="${2:-}"
-root=".dev/benchmarks/06-bifrost-rebuild"
+root="target/bifrost-benchmarks"
 target="$(pwd)/$root/$stage"
 if [[ -e "$target" ]]; then
   target="$target/rerun-$(date -u +%Y%m%dT%H%M%SZ)"
@@ -21,7 +21,7 @@ for lane in scribe forge oracle capacity; do
   if [[ "$lane" == "capacity" ]]; then
     task="bench:bifrost:capacity"
   fi
-  WYRD_BIFROST_OUTPUT="$output" mise run "$task" \
+  WYRD_BIFROST_OUTPUT="$output" WYRD_BIFROST_STAGE="$stage" mise run "$task" \
     || { echo "Bifrost lane failed: $lane" >&2; exit 1; }
   if ! jq -e '.complete == true and .errors == 0 and .verification.passed == true' "$output" >/dev/null; then
     echo "Bifrost lane produced an incomplete or failed report: $lane" >&2
@@ -52,6 +52,12 @@ jq -n \
       runner: "bench_real_bifrost_workload"},
     reports: [$scribe[0], $forge[0], $oracle[0], $capacity[0]]}' \
   > "$target/stage.json"
+
+jq -r --arg stage "$stage" '
+  "# Bifrost benchmark stage: \($stage)\n\n" +
+  ("| Lane | Complete | Errors |\n|---|---:|---:|\n" +
+    ([.reports[] | "| \(.lane) | \(.complete) | \(.errors) |"] | join("\n")) + "\n")
+' "$target/stage.json" > "$target/stage.md"
 
 if [[ -n "$before_manifest" ]]; then
   cargo run --locked -p wyrd-bench --bin bifrost_compare -- \

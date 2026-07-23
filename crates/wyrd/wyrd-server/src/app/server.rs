@@ -38,6 +38,7 @@ pub struct WyrdServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
 }
 
@@ -58,6 +59,15 @@ impl WyrdServer {
     /// Returns [`ServerBootError`] on gRPC router assembly (e.g. missing token
     /// verifier).
     pub fn new(config: WyrdServerConfig, state: AppState) -> Result<Self, ServerBootError> {
+        Self::new_with_metrics_handle(config, state, None)
+    }
+
+    /// Assemble a server when the process recorder was installed before boot.
+    pub fn new_with_metrics_handle(
+        config: WyrdServerConfig,
+        state: AppState,
+        metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    ) -> Result<Self, ServerBootError> {
         let (reporter, health_service) = wyrd_tonic::tonic_health::server::health_reporter();
         // Store this reporter in state so readiness drives THIS health service.
         let state = state.with_grpc_health(reporter.clone());
@@ -77,6 +87,7 @@ impl WyrdServer {
             http_router,
             grpc_router,
             reporter,
+            metrics_handle,
             extra_workers: Vec::new(),
         })
     }
@@ -239,6 +250,7 @@ impl WyrdServer {
             http_router: self.http_router,
             grpc_router: self.grpc_router,
             reporter: self.reporter,
+            metrics_handle: self.metrics_handle,
             extra_workers: self.extra_workers,
             http_listener,
             grpc_listener,
@@ -262,6 +274,7 @@ pub struct BoundServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     http_listener: Option<TcpListener>,
     grpc_listener: Option<TcpListener>,
@@ -431,12 +444,11 @@ impl BoundServer {
                 serve_grpc_with_listener(router, listener, token).await
             }));
         }
-        // The recorder is a process-global singleton installed here (once, at
-        // run, only when the metrics listener was bound) rather than in `new` or
-        // `bind` — a constructed or bound but never-run server never touches the
-        // global recorder.
         if let Some(listener) = self.metrics_listener.take() {
-            let handle = install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?;
+            let handle = match self.metrics_handle.take() {
+                Some(handle) => handle,
+                None => install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?,
+            };
             let router = metrics_router(handle);
             set.spawn(fallible_task(
                 TaskId::Metrics,
@@ -480,7 +492,10 @@ mod pg_tests {
     use uuid::Uuid;
     use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
     use vala_bifrost_redux::gate::limits::IngestLimits;
-    use vala_bifrost_redux::scribe::{ScribeImpl, wal::WalWriter};
+    use vala_bifrost_redux::scribe::{
+        ScribeImpl,
+        wal::{WalConfig, WalWriter},
+    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -521,11 +536,18 @@ mod pg_tests {
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let catalog = crate::test_support::test_catalog().await;
+        let redux_catalog = crate::test_support::test_redux_catalog().await;
         let tenant = crate::test_support::test_tenant().await;
         let wal_root = tempdir().expect("wal temp dir");
         let wal = Arc::new(
-            WalWriter::new(wal_root.path(), *Uuid::now_v7().as_bytes(), 1, tenant, None)
-                .expect("wal initializes"),
+            WalWriter::new(
+                wal_root.path(),
+                *Uuid::now_v7().as_bytes(),
+                1,
+                tenant,
+                WalConfig::default(),
+            )
+            .expect("wal initializes"),
         );
         let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
@@ -534,9 +556,7 @@ mod pg_tests {
             1,
         ));
         let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-            Arc::new(crate::bifrost::catalog_adapter::ServerCatalog::new(
-                Arc::clone(&catalog),
-            )),
+            Arc::clone(&redux_catalog),
             scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
@@ -545,6 +565,7 @@ mod pg_tests {
             )),
         ));
         AppState::new(postgres, storage, catalog)
+            .with_bifrost_redux(redux_catalog)
             .with_scribe(scribe)
             .with_gate(gate)
             .with_auth(ServerAuth {

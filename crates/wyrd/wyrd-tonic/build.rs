@@ -34,6 +34,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(build_server)
         .build_client(build_client)
+        .bytes([
+            ".wyrd.v1.InsertBatchRequest.arrow_ipc",
+            ".wyrd.v1.InsertBatchRequest.wyrd_batch_id",
+            ".wyrd.v1.InsertBatchResponse.wyrd_batch_id",
+        ])
         .file_descriptor_set_path(&descriptor)
         .compile_protos(&[proto], &[proto_dir])?;
 

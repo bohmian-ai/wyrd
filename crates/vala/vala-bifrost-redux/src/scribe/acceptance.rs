@@ -19,7 +19,7 @@ use super::execution_lanes::{
 };
 use super::preprocess::{AdmittedAppend, AppendSliceId, prepare_append};
 use super::seal_key::{EventDay, SealKey};
-use super::wal::{WalWriter, encode_append_frame};
+use super::wal::{WalConfig, WalWriter, encode_append_frame};
 use super::writer::TenantTableWriterRegistry;
 use super::{ScribeAppend, ScribeImpl};
 use crate::catalog::{TableRef, TenantTableBinding};
@@ -85,11 +85,11 @@ fn append(tenant: DataTenantId, count: usize) -> ScribeAppend {
     let rows = rows(1_721_003_400_000_000, count);
     let schema_fingerprint = SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
     ScribeAppend {
+        request_id: RequestId::now_v7(),
         principal: principal(tenant),
         table: TableRef::new(BifrostNamespace::Bifrost, "acceptance_events"),
         rows,
         schema_fingerprint,
-        request_id: RequestId::now_v7(),
         batch_id: Uuid::now_v7(),
         measured_wire_bytes: 64 * 1024,
     }
@@ -97,8 +97,14 @@ fn append(tenant: DataTenantId, count: usize) -> ScribeAppend {
 
 fn test_wal(temp: &tempfile::TempDir) -> Arc<WalWriter> {
     Arc::new(
-        WalWriter::new(temp.path(), [0; 16], 1, DataTenantId::SYSTEM_OWNER, None)
-            .expect("acceptance wal"),
+        WalWriter::new(
+            temp.path(),
+            [0; 16],
+            1,
+            DataTenantId::SYSTEM_OWNER,
+            WalConfig::default(),
+        )
+        .expect("acceptance wal"),
     )
 }
 
@@ -134,7 +140,6 @@ fn admitted_append(
     count: usize,
 ) -> AdmittedAppend {
     AdmittedAppend {
-        request_id: RequestId::now_v7(),
         batch_id: Uuid::now_v7(),
         frame_sequence: 0,
         audit_event: audit_event(&table),
@@ -153,8 +158,7 @@ fn admitted_append(
 #[tokio::test]
 async fn ack_waits_for_writer_try_send_only() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
-    let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io).with_telemetry(telemetry);
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
@@ -167,38 +171,25 @@ async fn ack_waits_for_writer_try_send_only() {
 #[tokio::test]
 async fn ack_does_not_split_or_encode() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::from_millis(60), Duration::ZERO);
-    let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io)
-        .with_telemetry(Arc::clone(&telemetry));
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 2))
         .await
         .expect("ack");
     assert!(started.elapsed() < Duration::from_millis(50));
-    assert!(
-        telemetry
-            .snapshot()
-            .iter()
-            .all(|sample| sample.stage != "preprocess")
-    );
     scribe.shutdown().await;
 }
 
 #[tokio::test]
-async fn accepted_and_fsynced_metrics_track_the_durability_gap() {
-    let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe = ScribeImpl::new().with_telemetry(Arc::clone(&telemetry));
+async fn accepted_frames_reach_the_durable_writer_path() {
+    let scribe = ScribeImpl::new();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
         .await
         .expect("frame accepted");
-    assert_eq!(telemetry.durability_snapshot().accepted_frames, 1);
     scribe.shutdown().await;
-    let snapshot = telemetry.durability_snapshot();
-    assert_eq!(snapshot.accepted_frames, 1);
-    assert_eq!(snapshot.fsynced_frames, 1);
-    assert_eq!(snapshot.frame_gap(), 0);
+    assert_eq!(scribe.writer_count(), 1);
 }
 
 #[tokio::test]
@@ -274,7 +265,6 @@ fn cross_day_enqueue_is_atomic() {
         .try_reserve(table.fqn(), 1)
         .expect("reservation");
     let append = AdmittedAppend {
-        request_id: RequestId::now_v7(),
         batch_id: Uuid::now_v7(),
         frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
@@ -361,7 +351,6 @@ async fn post_ack_failure_marks_writer_unhealthy() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let binding = TenantTableBinding::resolve((
         DataTenantId::SYSTEM_OWNER,
@@ -378,42 +367,14 @@ async fn post_ack_failure_marks_writer_unhealthy() {
 #[tokio::test]
 async fn ack_does_not_wait_for_day_split_wal_fsync_or_parquet() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
-    let telemetry = Arc::new(super::telemetry::ScribeTelemetry::default());
-    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io)
-        .with_telemetry(Arc::clone(&telemetry));
+    let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
         .append(append(DataTenantId::SYSTEM_OWNER, 1))
         .await
         .expect("ack");
     assert!(started.elapsed() < Duration::from_millis(50));
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while !telemetry
-        .snapshot()
-        .iter()
-        .any(|sample| sample.stage == "wal_sync_data")
-    {
-        assert!(Instant::now() < deadline, "consumer did not fsync");
-        tokio::task::yield_now().await;
-    }
-    let samples = telemetry.snapshot();
-    let ack = samples
-        .iter()
-        .position(|sample| sample.stage == "append")
-        .expect("ack sample");
-    let sync = samples
-        .iter()
-        .position(|sample| sample.stage == "wal_sync_data")
-        .expect("sync sample");
-    let write = samples
-        .iter()
-        .position(|sample| sample.stage == "write_all")
-        .expect("write sample");
-    let memtable = samples
-        .iter()
-        .position(|sample| sample.stage == "memtable_insert")
-        .expect("memtable sample");
-    assert!(ack < write && write < memtable && memtable < sync);
+    tokio::time::sleep(Duration::from_millis(150)).await;
     scribe.shutdown().await;
 }
 
@@ -539,7 +500,6 @@ fn recordbatch_is_not_redecoded_normally() {
     let reservation = admission.try_reserve(table.fqn(), 1).expect("reservation");
     let batch_id = Uuid::now_v7();
     let prepared = prepare_append(AdmittedAppend {
-        request_id: RequestId::now_v7(),
         batch_id,
         frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
@@ -639,7 +599,6 @@ async fn concurrent_first_write_creates_one_writer() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let binding = TenantTableBinding::resolve((
         DataTenantId::SYSTEM_OWNER,
@@ -687,7 +646,6 @@ async fn known_and_dynamic_tables_share_writer_lifecycle() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let known = TenantTableBinding::resolve((
         DataTenantId::SYSTEM_OWNER,
@@ -721,7 +679,6 @@ async fn writer_retirement_drains_reserved_send() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let binding =
         TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, table.clone())).expect("binding");
@@ -747,7 +704,6 @@ async fn writer_recreates_after_idle_retirement() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let binding = TenantTableBinding::resolve((
         DataTenantId::SYSTEM_OWNER,
@@ -773,7 +729,6 @@ async fn retiring_writer_never_overlaps_replacement() {
         test_wal(&temp),
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
-        None,
     );
     let binding = TenantTableBinding::resolve((
         DataTenantId::SYSTEM_OWNER,

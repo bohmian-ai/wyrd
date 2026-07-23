@@ -6,13 +6,13 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use vala_bifrost::catalog::CreateTableRequest;
-use vala_bifrost::catalog::namespaces::BifrostNamespace;
-use vala_bifrost::types::TableScope;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_spec::vala::api::TableScopeWire;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
 
@@ -39,23 +39,22 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
         );
     }
 
-    for (tenant_index, tenant) in tenants.iter().enumerate() {
-        let table_name = format!("{TABLE_PREFIX}_{tenant_index}");
+    for tenant in &tenants {
         cluster
             .server(0)
             .ok_or("missing catalog pod")?
             .state()
-            .bifrost
+            .bifrost_redux
+            .as_ref()
+            .ok_or("missing Redux catalog")?
             .create_table(CreateTableRequest {
-                ns: BifrostNamespace::Bifrost,
-                name: &table_name,
+                table: TableRef::new(BifrostNamespace::Bifrost, TABLE_PREFIX),
                 user_fields: vec![
                     Field::new("id", DataType::Int64, false),
                     Field::new("value", DataType::Utf8, false),
                 ],
-                scope: TableScope::TenantOwned,
+                scope: TableScopeWire::TenantOwned,
                 tenant: *tenant,
-                partition_columns: &[],
                 audit: None,
             })
             .await?;
@@ -63,7 +62,7 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
 
     let payload = ipc();
     for (tenant_index, tenant) in tenants.iter().enumerate() {
-        let table_fqn = format!("vala.bifrost.{TABLE_PREFIX}_{tenant_index}");
+        let table_fqn = format!("vala.bifrost.{TABLE_PREFIX}");
         let server = cluster
             .server(tenant_index % 3)
             .ok_or("missing sustained pod")?;
@@ -98,7 +97,7 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
                     table: table_fqn.clone(),
                     batch_id: uuid::Uuid::now_v7().into_bytes(),
                     frame_sequence: 0,
-                    arrow_ipc: payload.clone(),
+                    arrow_ipc: payload.clone().into(),
                 }])
                 .await?;
             assert_eq!(acknowledgements, vec![2]);
@@ -113,15 +112,14 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
             .await?;
     }
 
-    for (tenant_index, tenant) in tenants.into_iter().enumerate() {
-        let table_name = format!("{TABLE_PREFIX}_{tenant_index}");
+    for tenant in tenants {
         let rows: i64 = sqlx::query_scalar(
             "SELECT COALESCE(SUM(row_count), 0)::bigint
                FROM vala.file_list
               WHERE data_tenant_id = $1 AND namespace = 'vala.bifrost' AND table_name = $2",
         )
         .bind(tenant.as_uuid())
-        .bind(table_name)
+        .bind(TABLE_PREFIX)
         .fetch_one(cluster.pg_fixture().platform_admin_pool())
         .await?;
         assert_eq!(

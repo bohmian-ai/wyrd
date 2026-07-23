@@ -139,6 +139,11 @@ boundaries.
 
 ## Catalog And Storage
 
+- Keep one table model. Immutable logical definitions may be server-owned
+  built-ins or user-registered datasets; that ownership distinction never
+  selects a physical scope. Every instantiated table resolves through
+  `(DataTenantId, TableRef)` to one organization-qualified physical Iceberg
+  table and object-store prefix.
 - Keep two Postgres responsibilities distinct: the Iceberg SQL catalog
   stores Iceberg table metadata pointers; `vala.*` tables store Wyrd
   control-plane state, idempotency, commit tracking, cache epochs,

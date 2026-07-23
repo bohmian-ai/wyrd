@@ -8,9 +8,12 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+metrics.workspace = true
+num-traits = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-sql = { workspace = true }
+wyrd-storage = { workspace = true }
 vala-sql = { workspace = true }
 
 async-trait = { workspace = true }
@@ -24,6 +27,8 @@ serde_json = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 iceberg = { workspace = true }
+iceberg-catalog-sql = { workspace = true }
+iceberg-storage-opendal = { workspace = true }
 datafusion = { workspace = true }
 opendal = { workspace = true }
 crc32c = { workspace = true }
@@ -35,6 +40,7 @@ wyrd-auth-verify = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
 ulid = { workspace = true }
 bytes = "1"
 rayon = { workspace = true }
@@ -48,7 +54,6 @@ wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-bench = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
-sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }
 
 [lints]
 workspace = true

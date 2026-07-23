@@ -56,7 +56,7 @@ mod pg_tests {
                 node_id_bytes,
                 1,
                 tenant,
-                None,
+                vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),
         );

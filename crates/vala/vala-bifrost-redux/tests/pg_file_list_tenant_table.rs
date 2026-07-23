@@ -3,9 +3,11 @@ mod pg_tests {
 
     use chrono::{DateTime, NaiveDate, Utc};
     use opendal::services::Memory;
+    use secrecy::ExposeSecret;
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::tenant_table::TenantTableBindingError;
+    use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, CreateTableRequest};
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::scribe::ScribeImpl;
@@ -18,7 +20,10 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+    use wyrd_spec::vala::api::{
+        AuditDecision, AuditEvent, AuditResult, AuthMethod, TableScopeWire,
+    };
+    use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     fn logical_table() -> TableRef {
         TableRef::new(BifrostNamespace::Traces, "spans")
@@ -189,6 +194,92 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    async fn test_redux_catalog_registers_same_logical_name_per_tenant() {
+        let (fixture, tenant_a, tenant_b) = setup().await;
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: warehouse.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: std::time::Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("storage");
+        let catalog = BifrostCatalog::new(
+            fixture.catalog_dsn().expose_secret(),
+            storage.backend_config(),
+            fixture.vala_postgres().clone(),
+        )
+        .await
+        .expect("Redux catalog");
+        let table = TableRef::new(BifrostNamespace::Bifrost, "shared_logical_name");
+        let user_fields = vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )];
+
+        let uid_a = catalog
+            .create_table(CreateTableRequest {
+                table: table.clone(),
+                user_fields: user_fields.clone(),
+                scope: TableScopeWire::TenantOwned,
+                tenant: tenant_a,
+                audit: None,
+            })
+            .await
+            .expect("tenant A table");
+        let uid_b = catalog
+            .create_table(CreateTableRequest {
+                table: table.clone(),
+                user_fields,
+                scope: TableScopeWire::TenantOwned,
+                tenant: tenant_b,
+                audit: None,
+            })
+            .await
+            .expect("tenant B table");
+
+        assert_ne!(uid_a, uid_b);
+        assert_eq!(
+            catalog
+                .describe_table(&table, tenant_a)
+                .await
+                .expect("tenant A description")
+                .entry
+                .name,
+            "shared_logical_name"
+        );
+        assert_eq!(
+            catalog
+                .describe_table(&table, tenant_b)
+                .await
+                .expect("tenant B description")
+                .entry
+                .name,
+            "shared_logical_name"
+        );
+        let unregistered_tenant = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(
+                unregistered_tenant,
+                &format!("unregistered-{}", unregistered_tenant.as_uuid().simple()),
+            )
+            .await
+            .expect("unregistered tenant");
+        assert!(matches!(
+            catalog
+                .table_schema_fingerprint(&table, unregistered_tenant)
+                .await,
+            Err(BifrostCatalogError::TableNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn test_file_list_row_uses_exact_tenant_table_identity() {
         let (fixture, tenant_a, _) = setup().await;
         let binding = TenantTableBinding::resolve((tenant_a, logical_table())).expect("binding");
@@ -235,7 +326,7 @@ mod pg_tests {
                 *node_id.as_bytes(),
                 1,
                 tenant_a,
-                None,
+                vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),
         );

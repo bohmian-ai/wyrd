@@ -21,7 +21,10 @@ mod pg_tests {
     use tower::ServiceExt;
     use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
     use vala_bifrost_redux::gate::limits::IngestLimits;
-    use vala_bifrost_redux::scribe::{ScribeImpl, wal::WalWriter};
+    use vala_bifrost_redux::scribe::{
+        ScribeImpl,
+        wal::{WalConfig, WalWriter},
+    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -69,6 +72,7 @@ mod pg_tests {
         ));
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let catalog = support::test_catalog().await;
+        let redux_catalog = support::test_redux_catalog().await;
         let wal_root = tempfile::tempdir().expect("wal temp dir");
         let wal = Arc::new(
             WalWriter::new(
@@ -76,7 +80,7 @@ mod pg_tests {
                 *uuid::Uuid::now_v7().as_bytes(),
                 1,
                 DataTenantId::SYSTEM_OWNER,
-                None,
+                WalConfig::default(),
             )
             .expect("wal initializes"),
         );
@@ -87,9 +91,7 @@ mod pg_tests {
             1,
         ));
         let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-            Arc::new(wyrd_server::bifrost::catalog_adapter::ServerCatalog::new(
-                Arc::clone(&catalog),
-            )),
+            Arc::clone(&redux_catalog),
             scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
@@ -98,6 +100,7 @@ mod pg_tests {
             )),
         ));
         AppState::new(postgres, storage, catalog)
+            .with_bifrost_redux(redux_catalog)
             .with_scribe(scribe)
             .with_gate(gate)
             .with_auth(ServerAuth {

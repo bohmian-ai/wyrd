@@ -10,13 +10,13 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
-use vala_bifrost::catalog::CreateTableRequest;
-use vala_bifrost::catalog::namespaces::BifrostNamespace;
-use vala_bifrost::types::TableScope;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport, IngestTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_spec::vala::api::TableScopeWire;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
 
@@ -42,17 +42,17 @@ async fn run_closeout_journey(
     let first = cluster.server(0).ok_or("missing first Bifrost pod")?;
     first
         .state()
-        .bifrost
+        .bifrost_redux
+        .as_ref()
+        .ok_or("missing Redux catalog")?
         .create_table(CreateTableRequest {
-            ns: BifrostNamespace::Bifrost,
-            name: TABLE_NAME,
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
             user_fields: vec![
                 Field::new("id", DataType::Int64, false),
                 Field::new("value", DataType::Utf8, false),
             ],
-            scope: TableScope::TenantOwned,
+            scope: TableScopeWire::TenantOwned,
             tenant,
-            partition_columns: &[],
             audit: None,
         })
         .await?;
@@ -91,7 +91,7 @@ async fn run_closeout_journey(
             TABLE_FQN,
             retry_frame.batch_id,
             retry_frame.frame_sequence,
-            retry_frame.arrow_ipc.clone(),
+            retry_frame.arrow_ipc.to_vec(),
         )
         .await?;
     admin
@@ -99,7 +99,7 @@ async fn run_closeout_journey(
             TABLE_FQN,
             retry_frame.batch_id,
             retry_frame.frame_sequence,
-            retry_frame.arrow_ipc,
+            retry_frame.arrow_ipc.to_vec(),
         )
         .await?;
     first.flush_bifrost().await?;
@@ -199,7 +199,7 @@ fn frame(batch_id: [u8; 16], sequence: u64, ids: &[i64]) -> BifrostFrame {
         table: TABLE_FQN.to_owned(),
         batch_id,
         frame_sequence: sequence,
-        arrow_ipc: ipc(ids),
+        arrow_ipc: ipc(ids).into(),
     }
 }
 

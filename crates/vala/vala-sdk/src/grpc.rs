@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::{Uuid, Version};
@@ -53,7 +54,7 @@ pub struct BifrostFrame {
     /// Zero-based contiguous stream sequence.
     pub frame_sequence: u64,
     /// Arrow IPC payload for this frame.
-    pub arrow_ipc: Vec<u8>,
+    pub arrow_ipc: Bytes,
 }
 
 impl Default for BifrostTransportConfig {
@@ -157,19 +158,19 @@ impl BifrostGrpcTransport {
             .max_encoding_message_size(max_message_bytes);
         let response_fut = client.insert_batch(request);
         tokio::pin!(response_fut);
-        let first = frames.first().expect("non-empty frame stream");
+        let mut frames = frames.into_iter();
+        let first = frames.next().expect("non-empty frame stream");
         validate_frame(&first.table, first.batch_id, first.arrow_ipc.len())?;
         let first_request = InsertBatchRequest {
-            table: first.table.clone(),
-            arrow_ipc: first.arrow_ipc.clone(),
-            wyrd_batch_id: first.batch_id.to_vec(),
+            table: first.table,
+            arrow_ipc: first.arrow_ipc,
+            wyrd_batch_id: Bytes::copy_from_slice(&first.batch_id),
             frame_sequence: first.frame_sequence,
         };
-        sender.send(first_request.clone()).await.map_err(|_| {
-            transport_unavailable(
-                "request stream closed before frame send",
-                first.frame_sequence,
-            )
+        let first_batch_id = first_request.wyrd_batch_id.clone();
+        let first_sequence = first_request.frame_sequence;
+        sender.send(first_request).await.map_err(|_| {
+            transport_unavailable("request stream closed before frame send", first_sequence)
         })?;
         let response = response_fut
             .await
@@ -181,38 +182,31 @@ impl BifrostGrpcTransport {
             .await
             .map_err(|status| from_grpc_status(&status))?
             .ok_or_else(|| {
-                transport_unavailable(
-                    "ingest response stream ended before ACK",
-                    first.frame_sequence,
-                )
+                transport_unavailable("ingest response stream ended before ACK", first_sequence)
             })?;
-        accepted.push(accepted_rows(&first_request, first_ack)?);
+        accepted.push(accepted_rows(&first_batch_id, first_sequence, first_ack)?);
 
-        for frame in frames.into_iter().skip(1) {
+        for frame in frames {
             validate_frame(&frame.table, frame.batch_id, frame.arrow_ipc.len())?;
             let request = InsertBatchRequest {
                 table: frame.table,
                 arrow_ipc: frame.arrow_ipc,
-                wyrd_batch_id: frame.batch_id.to_vec(),
+                wyrd_batch_id: Bytes::copy_from_slice(&frame.batch_id),
                 frame_sequence: frame.frame_sequence,
             };
-            sender.send(request.clone()).await.map_err(|_| {
-                transport_unavailable(
-                    "request stream closed before frame send",
-                    frame.frame_sequence,
-                )
+            let batch_id = request.wyrd_batch_id.clone();
+            let sequence = request.frame_sequence;
+            sender.send(request).await.map_err(|_| {
+                transport_unavailable("request stream closed before frame send", sequence)
             })?;
             let ack = responses
                 .message()
                 .await
                 .map_err(|status| from_grpc_status(&status))?
                 .ok_or_else(|| {
-                    transport_unavailable(
-                        "ingest response stream ended before ACK",
-                        frame.frame_sequence,
-                    )
+                    transport_unavailable("ingest response stream ended before ACK", sequence)
                 })?;
-            accepted.push(accepted_rows(&request, ack)?);
+            accepted.push(accepted_rows(&batch_id, sequence, ack)?);
         }
         drop(sender);
         Ok(accepted)
@@ -254,7 +248,8 @@ impl BifrostGrpcTransport {
             )));
         };
 
-        accepted_rows(frame, ack).map_err(AttemptError::terminal)
+        accepted_rows(&frame.wyrd_batch_id, frame.frame_sequence, ack)
+            .map_err(AttemptError::terminal)
     }
 
     async fn add_auth_metadata<T>(&self, request: &mut Request<T>) -> Result<(), WyrdError> {
@@ -297,8 +292,8 @@ impl IngestTransport for BifrostGrpcTransport {
         validate_frame(table, batch_id, arrow_ipc.len())?;
         let frame = InsertBatchRequest {
             table: table.to_owned(),
-            arrow_ipc,
-            wyrd_batch_id: batch_id.to_vec(),
+            arrow_ipc: Bytes::from(arrow_ipc),
+            wyrd_batch_id: Bytes::copy_from_slice(&batch_id),
             frame_sequence,
         };
 
@@ -381,14 +376,18 @@ fn validate_frame(table: &str, batch_id: [u8; 16], arrow_bytes: usize) -> Result
     Ok(())
 }
 
-fn accepted_rows(frame: &InsertBatchRequest, ack: InsertBatchResponse) -> Result<u64, WyrdError> {
-    if ack.wyrd_batch_id != frame.wyrd_batch_id || ack.frame_sequence != frame.frame_sequence {
+fn accepted_rows(
+    batch_id: &[u8],
+    frame_sequence: u64,
+    ack: InsertBatchResponse,
+) -> Result<u64, WyrdError> {
+    if ack.wyrd_batch_id.as_ref() != batch_id || ack.frame_sequence != frame_sequence {
         return Err(WyrdError::Internal {
             message: "bifrost ACK does not match the submitted frame".to_owned(),
             details: serde_json::json!({
-                "expected_frame_sequence": frame.frame_sequence,
+                "expected_frame_sequence": frame_sequence,
                 "actual_frame_sequence": ack.frame_sequence,
-                "expected_batch_id": hex::encode(&frame.wyrd_batch_id),
+                "expected_batch_id": hex::encode(batch_id),
                 "actual_batch_id": hex::encode(&ack.wyrd_batch_id),
             }),
         });
@@ -472,8 +471,8 @@ mod tests {
     fn mismatched_ack_is_terminal_and_carries_identity_details() {
         let frame = InsertBatchRequest {
             table: "events".to_owned(),
-            arrow_ipc: Vec::new(),
-            wyrd_batch_id: Uuid::now_v7().as_bytes().to_vec(),
+            arrow_ipc: Bytes::new(),
+            wyrd_batch_id: Bytes::copy_from_slice(Uuid::now_v7().as_bytes()),
             frame_sequence: 4,
         };
         let ack = InsertBatchResponse {
@@ -481,7 +480,8 @@ mod tests {
             frame_sequence: 5,
             rows_accepted: 1,
         };
-        let error = accepted_rows(&frame, ack).expect_err("wrong sequence must fail");
+        let error = accepted_rows(&frame.wyrd_batch_id, frame.frame_sequence, ack)
+            .expect_err("wrong sequence must fail");
         assert_eq!(error.code(), "WYRD_SPEC_500_INTERNAL");
         assert!(error.to_string().contains("ACK does not match"));
     }

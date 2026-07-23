@@ -17,6 +17,7 @@ default = []
 python = ["dep:pyo3"]
 
 [dependencies]
+bytes = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["client"] }

@@ -1,9 +1,12 @@
 //! Structured Bifrost benchmark reports and percentile math.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::recorder::BenchmarkMetricSnapshot;
 use crate::workload::WorkloadSpec;
 
 /// Latency percentiles in microseconds.
@@ -231,6 +234,416 @@ pub struct ScribeMatrixCase {
     pub noisy_tenant: bool,
 }
 
+/// One compact Scribe SLO workload declaration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeCompactCase {
+    /// Stable case identifier.
+    pub id: String,
+    /// Target frame size used to construct the Arrow IPC payload.
+    pub frame_size_bytes: u64,
+    /// Concurrent public SDK streams used by the case.
+    pub writers: u32,
+    /// Number of tables receiving frames in the case.
+    pub tables: u32,
+    /// Table distribution: all streams share one table or are dispersed.
+    pub table_distribution: String,
+    /// Fsync mode declared by the case.
+    pub fsync_mode: String,
+    /// Injected fsync delay in milliseconds.
+    pub fsync_delay_ms: u64,
+    /// Minimum measured frames after warmup.
+    pub minimum_samples: u64,
+}
+
+/// Return the twelve-case compact Scribe matrix required by task 13d.
+#[must_use]
+pub fn compact_scribe_matrix() -> Vec<ScribeCompactCase> {
+    [
+        ("tiny-1-normal", 1, 1, 1, "same", "normal", 0, 1_000),
+        ("tiny-64-normal", 1, 64, 1, "same", "normal", 0, 1_000),
+        ("64k-1-normal", 64 * 1024, 1, 1, "same", "normal", 0, 1_000),
+        (
+            "64k-64-normal",
+            64 * 1024,
+            64,
+            1,
+            "same",
+            "normal",
+            0,
+            1_000,
+        ),
+        (
+            "64k-64-64-normal",
+            64 * 1024,
+            64,
+            64,
+            "dispersed",
+            "normal",
+            0,
+            1_000,
+        ),
+        (
+            "64k-64-delayed",
+            64 * 1024,
+            64,
+            1,
+            "same",
+            "delayed",
+            60,
+            1_000,
+        ),
+        ("1m-1-normal", 1024 * 1024, 1, 1, "same", "normal", 0, 256),
+        ("1m-32-normal", 1024 * 1024, 32, 1, "same", "normal", 0, 256),
+        (
+            "8m-1-normal",
+            8 * 1024 * 1024,
+            1,
+            1,
+            "same",
+            "normal",
+            0,
+            64,
+        ),
+        (
+            "8m-8-8-normal",
+            8 * 1024 * 1024,
+            8,
+            8,
+            "dispersed",
+            "normal",
+            0,
+            64,
+        ),
+        (
+            "32m-1-normal",
+            32 * 1024 * 1024,
+            1,
+            1,
+            "same",
+            "normal",
+            0,
+            16,
+        ),
+        (
+            "32m-4-4-delayed",
+            32 * 1024 * 1024,
+            4,
+            4,
+            "dispersed",
+            "delayed",
+            60,
+            16,
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(
+            id,
+            frame_size_bytes,
+            writers,
+            tables,
+            table_distribution,
+            fsync_mode,
+            fsync_delay_ms,
+            minimum_samples,
+        )| ScribeCompactCase {
+            id: id.to_owned(),
+            frame_size_bytes,
+            writers,
+            tables,
+            table_distribution: table_distribution.to_owned(),
+            fsync_mode: fsync_mode.to_owned(),
+            fsync_delay_ms,
+            minimum_samples,
+        },
+    )
+    .collect()
+}
+
+/// A distribution captured from a production metric series.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeDistribution {
+    /// Number of observations.
+    pub count: u64,
+    /// 50th percentile in microseconds or metric units.
+    pub p50: u64,
+    /// 95th percentile in microseconds or metric units.
+    pub p95: u64,
+    /// 99th percentile when at least 100 observations exist.
+    pub p99: Option<u64>,
+    /// Maximum observed value.
+    pub max: u64,
+}
+
+/// Per-case absolute verification facts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeCaseVerification {
+    /// Overall absolute checks that were exercised by this case.
+    pub passed: bool,
+    /// Whether all accepted frames became durable before clean shutdown.
+    pub drain_zero_gap: bool,
+    /// Whether replay identity was checked without duplicate rows/audits.
+    pub replay_exact_identity: Option<bool>,
+    /// Whether the case stayed within retained item and byte ceilings.
+    pub retained_within_ceiling: bool,
+    /// Exact 429 capacity behavior when a saturation probe ran.
+    pub exact_429: Option<bool>,
+    /// Exact 507 WAL exhaustion behavior when a disk probe ran.
+    pub exact_507: Option<bool>,
+}
+
+/// Measurements emitted for one compact Scribe case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScribeCaseReport {
+    /// Workload declaration.
+    pub case: ScribeCompactCase,
+    /// Frames sent after warmup.
+    pub measured_frames: u64,
+    /// Rows accepted by Gate/Scribe.
+    pub admitted_rows: u64,
+    /// Rows confirmed durable after drain.
+    pub durable_rows: u64,
+    /// Wall-clock duration in microseconds.
+    pub elapsed_us: u64,
+    /// Accepted frames per second.
+    pub admitted_frames_per_second: f64,
+    /// Durable frames per second.
+    pub durable_frames_per_second: f64,
+    /// Durable rows per second.
+    pub rows_per_second: f64,
+    /// Durable MiB per second.
+    pub mib_per_second: f64,
+    /// ACK latency distribution in microseconds.
+    pub ack: ScribeDistribution,
+    /// Gate resolution distribution in microseconds.
+    pub resolution: ScribeDistribution,
+    /// Ingress CPU distribution in microseconds.
+    pub ingress: ScribeDistribution,
+    /// WAL append distribution in microseconds.
+    pub append: ScribeDistribution,
+    /// WAL sync distribution in microseconds.
+    pub sync: ScribeDistribution,
+    /// Number of opportunistic groups completed.
+    pub groups: u64,
+    /// Frames per group distribution.
+    pub frames_per_group: ScribeDistribution,
+    /// Bytes per group distribution.
+    pub bytes_per_group: ScribeDistribution,
+    /// Number of fsync calls.
+    pub fsync_calls: u64,
+    /// Fsync calls divided by admitted frames.
+    pub fsync_per_frame: f64,
+    /// Accepted minus durable frame count.
+    pub accepted_durable_frame_gap: u64,
+    /// Accepted minus durable row count.
+    pub accepted_durable_row_gap: u64,
+    /// Current retained items at case end.
+    pub retained_items_current: u64,
+    /// Peak retained items.
+    pub retained_items_peak: u64,
+    /// Current retained bytes at case end.
+    pub retained_bytes_current: u64,
+    /// Peak retained bytes.
+    pub retained_bytes_peak: u64,
+    /// Peak queue depth by execution lane.
+    pub lane_queue_peaks: BTreeMap<String, u64>,
+    /// Peak active jobs by execution lane.
+    pub lane_active_peaks: BTreeMap<String, u64>,
+    /// Failed jobs by execution lane.
+    pub lane_failures: BTreeMap<String, u64>,
+    /// Panicked jobs by execution lane.
+    pub lane_panics: BTreeMap<String, u64>,
+    /// Writer unhealthy transitions observed in the interval.
+    pub writer_unhealthy_transitions: u64,
+    /// Required production metric names observed in the interval.
+    pub required_metrics_observed: Vec<String>,
+    /// Number of recorder series at case end.
+    pub metric_series: usize,
+    /// Whether the recorder cardinality cap was exceeded.
+    pub metric_series_limit_exceeded: bool,
+    /// Absolute verification facts.
+    pub verification: ScribeCaseVerification,
+}
+
+/// Component benchmark measurement from a real production seam.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScribeComponentReport {
+    /// Stable component name.
+    pub name: String,
+    /// Production path used by the measurement.
+    pub path: String,
+    /// Number of measured operations.
+    pub operations: u64,
+    /// Processed bytes.
+    pub bytes: u64,
+    /// Elapsed wall-clock microseconds.
+    pub elapsed_us: u64,
+    /// Captured distribution.
+    pub distribution: ScribeDistribution,
+}
+
+/// Configuration fingerprint for one benchmark stage.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeBenchmarkConfig {
+    /// Number of bound server pods.
+    pub pods: u32,
+    /// Number of tenants available to the run.
+    pub tenants: u32,
+    /// Queue and admission configuration as resolved by the server.
+    pub resolved: BTreeMap<String, String>,
+    /// Compact matrix identifier.
+    pub matrix: String,
+}
+
+/// Explicit comparison state for environments without a pre-repair baseline.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeComparisonStatus {
+    /// Whether a comparable Stage A report was available.
+    pub baseline_available: bool,
+    /// `unavailable`, `passed`, or `failed`.
+    pub status: String,
+    /// Human-readable reason for an unavailable comparison.
+    pub reason: String,
+}
+
+/// Complete post-repair Scribe benchmark artifact.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScribeBenchmarkReport {
+    /// Report schema version.
+    pub report_version: String,
+    /// `pre-throughput` or `post-throughput`.
+    pub stage: String,
+    /// Benchmark lane name.
+    pub lane: String,
+    /// Git and machine identity.
+    pub machine: MachineMetadata,
+    /// Human-readable environment fingerprint.
+    pub environment_fingerprint: String,
+    /// Configuration fingerprint used for future comparisons.
+    pub configuration_fingerprint: String,
+    /// Resolved benchmark configuration.
+    pub configuration: ScribeBenchmarkConfig,
+    /// Component measurements.
+    pub components: Vec<ScribeComponentReport>,
+    /// Compact matrix measurements.
+    pub cases: Vec<ScribeCaseReport>,
+    /// Full production metric snapshot.
+    pub metrics: BenchmarkMetricSnapshot,
+    /// Names required by the task contract.
+    pub required_metric_families: Vec<String>,
+    /// Absolute verification summary.
+    pub verification: ScribeCaseVerification,
+    /// Comparison status; relative throughput is never inferred.
+    pub comparison: ScribeComparisonStatus,
+    /// Report errors.
+    pub errors: u64,
+    /// Whether all required post-change measurements completed.
+    pub complete: bool,
+}
+
+impl ScribeBenchmarkReport {
+    /// Current Scribe report schema version.
+    pub const VERSION: &'static str = "wyrd.bifrost.scribe.report/v1";
+
+    /// Serialize the report as stable pretty JSON.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Write JSON and its adjacent concise Markdown summary.
+    pub fn write_artifacts(&self, json_path: impl AsRef<Path>) -> Result<(), ReportError> {
+        let json_path = json_path.as_ref();
+        std::fs::write(
+            json_path,
+            format!(
+                "{}\n",
+                self.to_json()
+                    .map_err(|error| ReportError::Serialize(error.to_string()))?
+            ),
+        )
+        .map_err(|error| ReportError::Write {
+            path: json_path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let markdown_path = json_path.with_extension("md");
+        std::fs::write(&markdown_path, self.to_markdown()).map_err(|error| ReportError::Write {
+            path: markdown_path.display().to_string(),
+            message: error.to_string(),
+        })
+    }
+
+    /// Render the human-readable summary without dropping machine fields.
+    #[must_use]
+    pub fn to_markdown(&self) -> String {
+        let mut output = format!(
+            "# Bifrost Scribe benchmark\n\n- Stage: `{}`\n- Lane: `{}`\n- Complete: `{}`\n- Comparison: `{}` ({})\n- Environment: `{}`\n- Configuration: `{}`\n\n",
+            self.stage,
+            self.lane,
+            self.complete,
+            self.comparison.status,
+            self.comparison.reason,
+            self.environment_fingerprint,
+            self.configuration_fingerprint,
+        );
+        output.push_str("| Case | Frames | Durable fps | ACK p99 (us) | Fsync/frame | Groups |\n|---|---:|---:|---:|---:|---:|\n");
+        for case in &self.cases {
+            let p99 = case
+                .ack
+                .p99
+                .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+            let _ = writeln!(
+                output,
+                "| {} | {} | {:.2} | {} | {:.4} | {} |",
+                case.case.id,
+                case.measured_frames,
+                case.durable_frames_per_second,
+                p99,
+                case.fsync_per_frame,
+                case.groups,
+            );
+        }
+        output.push_str("\n## Required metric families\n\n");
+        for metric in &self.required_metric_families {
+            let _ = writeln!(output, "- `{metric}`");
+        }
+        output
+    }
+}
+
+/// Every production metric family required by task 13d.
+#[must_use]
+pub fn required_scribe_metric_families() -> Vec<String> {
+    [
+        "bifrost_gate_frames_total",
+        "bifrost_gate_frame_bytes_total",
+        "bifrost_gate_resolution_seconds",
+        "bifrost_scribe_ack_seconds",
+        "bifrost_scribe_admission_rejections_total",
+        "bifrost_scribe_retained_items",
+        "bifrost_scribe_retained_bytes",
+        "bifrost_scribe_lane_queued",
+        "bifrost_scribe_lane_active",
+        "bifrost_scribe_lane_jobs_total",
+        "bifrost_scribe_lane_job_seconds",
+        "bifrost_scribe_writer_queue_depth",
+        "bifrost_scribe_writer_groups_total",
+        "bifrost_scribe_writer_group_frames",
+        "bifrost_scribe_writer_group_bytes",
+        "bifrost_scribe_wal_append_seconds",
+        "bifrost_scribe_wal_sync_seconds",
+        "bifrost_scribe_wal_fsync_total",
+        "bifrost_scribe_wal_bytes_total",
+        "bifrost_scribe_frames_total",
+        "bifrost_scribe_rows_total",
+        "bifrost_scribe_writer_unhealthy_total",
+        "bifrost_scribe_replay_seconds",
+        "bifrost_scribe_shutdown_seconds",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Return the complete required Task 13 matrix (240 configurations).
 #[must_use]
 pub fn required_scribe_matrix() -> Vec<ScribeMatrixCase> {
@@ -404,5 +817,34 @@ mod tests {
                 && case.fsync_mode == "delayed"
                 && case.noisy_tenant
         }));
+    }
+
+    #[test]
+    fn compact_scribe_matrix_has_the_locked_twelve_cases() {
+        let matrix = compact_scribe_matrix();
+        assert_eq!(matrix.len(), 12);
+        assert_eq!(matrix[5].fsync_delay_ms, 60);
+        assert_eq!(matrix[5].minimum_samples, 1_000);
+        assert_eq!(matrix[10].frame_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(matrix[11].writers, 4);
+        assert_eq!(matrix[11].tables, 4);
+    }
+
+    #[test]
+    fn scribe_report_renders_json_and_markdown_without_comparison() {
+        let report = ScribeBenchmarkReport {
+            report_version: ScribeBenchmarkReport::VERSION.to_owned(),
+            stage: "post-throughput".to_owned(),
+            lane: "bench:bifrost:scribe:slo".to_owned(),
+            comparison: ScribeComparisonStatus {
+                status: "unavailable".to_owned(),
+                reason: "pre-repair baseline was not captured".to_owned(),
+                ..ScribeComparisonStatus::default()
+            },
+            ..ScribeBenchmarkReport::default()
+        };
+        let json = report.to_json().expect("scribe report serializes");
+        assert!(json.contains("post-throughput"));
+        assert!(report.to_markdown().contains("unavailable"));
     }
 }

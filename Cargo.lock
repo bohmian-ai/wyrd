@@ -9827,6 +9827,8 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",
+ "metrics",
+ "num-traits",
  "opendal",
  "parquet",
  "rand 0.8.7",
@@ -9852,6 +9854,7 @@ dependencies = [
  "wyrd-runtime",
  "wyrd-spec",
  "wyrd-sql",
+ "wyrd-storage",
  "wyrd-tonic",
 ]
 
@@ -9927,6 +9930,7 @@ dependencies = [
  "arrow",
  "arrow-schema",
  "async-trait",
+ "bytes",
  "hex",
  "pyo3",
  "reqwest 0.12.28",
@@ -10628,6 +10632,9 @@ name = "wyrd-bench"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "hdrhistogram",
+ "metrics",
+ "num-traits",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -11075,6 +11082,7 @@ dependencies = [
  "async-trait",
  "axum 0.8.9",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "ed25519-dalek",
  "futures-util",

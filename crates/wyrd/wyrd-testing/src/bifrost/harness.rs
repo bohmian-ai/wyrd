@@ -6,8 +6,7 @@ use thiserror::Error;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
 use vala_bifrost_redux::scribe::seal::PostCommitBatch;
-use vala_bifrost_redux::scribe::telemetry::ScribeTelemetry;
-use vala_bifrost_redux::scribe::wal::WalWriter;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_sql::TenantConn;
 use wyrd_spec::DataTenantId;
 
@@ -34,7 +33,6 @@ pub enum HarnessError {
 pub struct BifrostHarness {
     cluster: WyrdTestCluster,
     scribes: Vec<Arc<ScribeImpl>>,
-    telemetry: Vec<Arc<ScribeTelemetry>>,
     tenants: Vec<DataTenantId>,
 }
 
@@ -57,10 +55,9 @@ impl BifrostHarness {
         };
         let cluster = WyrdTestCluster::start(pods, topology).await?;
         match Self::start_with_cluster(&cluster, tenant_count).await {
-            Ok((scribes, telemetry, tenants)) => Ok(Self {
+            Ok((scribes, tenants)) => Ok(Self {
                 cluster,
                 scribes,
-                telemetry,
                 tenants,
             }),
             Err(error) => {
@@ -73,14 +70,7 @@ impl BifrostHarness {
     async fn start_with_cluster(
         cluster: &WyrdTestCluster,
         tenant_count: usize,
-    ) -> Result<
-        (
-            Vec<Arc<ScribeImpl>>,
-            Vec<Arc<ScribeTelemetry>>,
-            Vec<DataTenantId>,
-        ),
-        HarnessError,
-    > {
+    ) -> Result<(Vec<Arc<ScribeImpl>>, Vec<DataTenantId>), HarnessError> {
         let mut tenants = Vec::with_capacity(tenant_count);
         tenants.push(cluster.data_tenant_id());
         for index in 1..tenant_count {
@@ -89,10 +79,8 @@ impl BifrostHarness {
 
         let operator = Arc::new(cluster.storage_operator());
         let mut scribes = Vec::with_capacity(pods_for(cluster));
-        let mut telemetry = Vec::with_capacity(pods_for(cluster));
         for (index, wal_dir) in cluster.wal_dirs().enumerate() {
             let node_id = uuid::Uuid::now_v7();
-            let recorder = Arc::new(ScribeTelemetry::default());
             let wal = Arc::new(
                 WalWriter::new(
                     wal_dir,
@@ -100,7 +88,7 @@ impl BifrostHarness {
                     i64::try_from(index + 1)
                         .map_err(|error| HarnessError::Configuration(error.to_string()))?,
                     tenants[0],
-                    None,
+                    WalConfig::default(),
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
             );
@@ -110,13 +98,11 @@ impl BifrostHarness {
                 node_id.to_string(),
                 i64::try_from(index + 1)
                     .map_err(|error| HarnessError::Configuration(error.to_string()))?,
-            )
-            .with_telemetry(Arc::clone(&recorder));
+            );
             scribes.push(Arc::new(scribe));
-            telemetry.push(recorder);
         }
 
-        Ok((scribes, telemetry, tenants))
+        Ok((scribes, tenants))
     }
 
     /// Return the shared real cluster and its servers.
@@ -135,12 +121,6 @@ impl BifrostHarness {
     #[must_use]
     pub fn scribes(&self) -> &[Arc<ScribeImpl>] {
         &self.scribes
-    }
-
-    /// Return the per-pod stage recorders.
-    #[must_use]
-    pub fn telemetry(&self) -> &[Arc<ScribeTelemetry>] {
-        &self.telemetry
     }
 
     /// Acquire a tenant-scoped connection from the shared fixture.

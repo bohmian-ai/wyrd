@@ -5,7 +5,6 @@ use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use std::time::Instant;
 use uuid::Uuid;
-use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TableRef;
@@ -13,13 +12,12 @@ use crate::contracts::ScribeError;
 use crate::scribe::admission::RetainedFrameReservation;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
-use crate::scribe::wal::encode_append_frame_with_sequence;
+use crate::scribe::wal::PreparedWalAppend;
 use wyrd_spec::ids::DataTenantId;
 
 /// A complete request accepted by pod-global admission.
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
-    pub request_id: RequestId,
     pub batch_id: Uuid,
     pub frame_sequence: u64,
     pub audit_event: AuditEvent,
@@ -35,11 +33,9 @@ pub(crate) struct AdmittedAppend {
 /// A request after deterministic event-day splitting and serialization.
 #[derive(Debug)]
 pub(crate) struct PreparedAppend {
-    pub request_id: RequestId,
     pub batch_id: Uuid,
     pub slices: Vec<PreparedSlice>,
     pub reservation: RetainedFrameReservation,
-    pub queue_wait_us: u64,
 }
 
 /// One event-day slice ready for ordered WAL and memtable processing.
@@ -49,8 +45,7 @@ pub(crate) struct PreparedSlice {
     pub seal_key: SealKey,
     pub audit_event: AuditEvent,
     pub rows: RecordBatch,
-    pub wal_frame: Bytes,
-    pub wal_bytes: usize,
+    pub wal_append: PreparedWalAppend,
     pub memtable_bytes: usize,
 }
 
@@ -66,7 +61,6 @@ pub struct AppendSliceId {
 /// bounded post-ACK CPU lane, never on the ACK path.
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
-        request_id,
         batch_id,
         frame_sequence,
         audit_event,
@@ -78,6 +72,9 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         table,
         queued_at,
     } = admitted;
+
+    metrics::histogram!("bifrost_scribe_queue_wait_seconds")
+        .record(queued_at.elapsed().as_secs_f64());
 
     let mut slices = Vec::new();
     for (event_day, day_rows) in split_batch_by_event_day(&rows)? {
@@ -104,13 +101,13 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             })?;
         }
 
-        let wal_frame = encode_append_frame_with_sequence(
+        let wal_append = PreparedWalAppend::new(
+            crate::scribe::wal::WalLsn::ZERO,
             *batch_id.as_bytes(),
             frame_sequence,
-            &audit_payload,
-            &data_payload,
+            Bytes::from(audit_payload),
+            Bytes::from(data_payload),
         )?;
-        let wal_bytes = wal_frame.len();
         let memtable_bytes = day_rows.get_array_memory_size();
         slices.push(PreparedSlice {
             id: AppendSliceId {
@@ -121,17 +118,14 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
             seal_key,
             audit_event: day_audit,
             rows: day_rows,
-            wal_frame,
-            wal_bytes,
+            wal_append,
             memtable_bytes,
         });
     }
 
     Ok(PreparedAppend {
-        request_id,
         batch_id,
         slices,
         reservation,
-        queue_wait_us: u64::try_from(queued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
     })
 }

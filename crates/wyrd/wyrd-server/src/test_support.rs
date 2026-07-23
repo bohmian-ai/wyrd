@@ -11,6 +11,7 @@ use std::sync::{Arc, OnceLock};
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_storage::StorageHandle;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
@@ -21,6 +22,7 @@ struct SharedCatalog {
     _fixture: PgFixture,
     _warehouse: TempDir,
     catalog: Arc<WyrdCatalog>,
+    redux_catalog: Arc<BifrostCatalog>,
 }
 
 static SHARED: OnceLock<SharedCatalog> = OnceLock::new();
@@ -52,11 +54,19 @@ async fn build_shared() -> SharedCatalog {
     )
     .await
     .expect("catalog builds against embedded postgres");
+    let redux_catalog = BifrostCatalog::new(
+        catalog_dsn.expose_secret(),
+        storage.backend_config(),
+        fixture.vala_postgres().clone(),
+    )
+    .await
+    .expect("Redux catalog builds against embedded postgres");
 
     SharedCatalog {
         _fixture: fixture,
         _warehouse: warehouse,
         catalog: Arc::new(catalog),
+        redux_catalog: Arc::new(redux_catalog),
     }
 }
 
@@ -83,6 +93,12 @@ fn shared() -> &'static SharedCatalog {
 /// Return a live catalog handle for constructing `AppState` in unit tests.
 pub async fn test_catalog() -> Arc<WyrdCatalog> {
     shared().catalog.clone()
+}
+
+/// Return the independently constructed Redux catalog for tests that exercise
+/// Gate, Forge, Oracle, or tenant-qualified registration.
+pub async fn test_redux_catalog() -> Arc<BifrostCatalog> {
+    Arc::clone(&shared().redux_catalog)
 }
 
 /// Return the fixture's `wyrd_app` pool for tests that must persist rows under

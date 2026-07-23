@@ -6,8 +6,9 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost::TableScope;
-use vala_bifrost::error::BifrostError as EngineBifrostError;
+use vala_bifrost_redux::catalog::{
+    BifrostCatalog, BifrostCatalogError, CreateTableRequest, TableRef,
+};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -23,9 +24,19 @@ use crate::bifrost::convert;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 
-/// Map an engine Bifrost error to the public `WyrdError` via the single delegate.
-fn map_engine_error(error: EngineBifrostError) -> WyrdError {
+/// Map a Redux catalog error to the public `WyrdError` via the single delegate.
+fn map_engine_error(error: BifrostCatalogError) -> WyrdError {
     error.into_public().into()
+}
+
+fn redux_catalog(state: &AppState) -> Result<&BifrostCatalog, WyrdError> {
+    state
+        .bifrost_redux
+        .as_deref()
+        .ok_or_else(|| WyrdError::Internal {
+            message: "Redux Bifrost catalog is not configured".to_owned(),
+            details: serde_json::Value::Null,
+        })
 }
 
 /// Authorize the caller against a required permission before execution.
@@ -68,14 +79,6 @@ async fn authorize_audited(
     }
 }
 
-/// Map the wire scope enum to the engine scope.
-fn engine_scope(scope: TableScopeWire) -> TableScope {
-    match scope {
-        TableScopeWire::TenantOwned => TableScope::TenantOwned,
-        TableScopeWire::SystemShared => TableScope::SystemShared,
-    }
-}
-
 /// Register (idempotently create) a Bifrost table.
 ///
 /// `SystemShared` registration requires `bifrost_table:install`; `TenantOwned`
@@ -86,14 +89,13 @@ pub async fn register_table(
     caller: Caller,
     body: RegisterTableRequest,
 ) -> Result<RegisterTableResponse, WyrdError> {
-    let scope = engine_scope(body.scope);
-    let required = match scope {
-        TableScope::SystemShared => Permission::bifrost_table_install(),
-        TableScope::TenantOwned => Permission::bifrost_table_write(),
+    let required = match body.scope {
+        TableScopeWire::SystemShared => Permission::bifrost_table_install(),
+        TableScopeWire::TenantOwned => Permission::bifrost_table_write(),
     };
-    let operation = match scope {
-        TableScope::SystemShared => "vala.bifrost.install",
-        TableScope::TenantOwned => "vala.bifrost.register",
+    let operation = match body.scope {
+        TableScopeWire::SystemShared => "vala.bifrost.install",
+        TableScopeWire::TenantOwned => "vala.bifrost.register",
     };
     let fqn_for_audit = format!("{}.{}", body.namespace, body.name);
     authorize_audited(state, &caller, &required, operation, &fqn_for_audit).await?;
@@ -106,14 +108,24 @@ pub async fn register_table(
     for spec in &body.partition_columns {
         partition_columns.push(convert::partition_column_to_engine(spec)?);
     }
+    if !partition_columns.is_empty()
+        && partition_columns
+            != [(
+                "wyrd_event_time".to_owned(),
+                vala_bifrost_redux::catalog::PartitionTransform::Day,
+            )]
+    {
+        return Err(WyrdError::Validation {
+            message: "Redux Bifrost tables use the fixed wyrd_event_time/day partition".to_owned(),
+            details: serde_json::json!({ "table": fqn_for_audit }),
+        });
+    }
 
     let fqn = format!("{}.{}", ns.as_str(), body.name);
+    let table = TableRef::new(ns, body.name.clone());
+    let catalog = redux_catalog(state)?;
 
-    match state
-        .bifrost
-        .describe_table(ns, &body.name, caller.data_tenant_id)
-        .await
-    {
+    match catalog.describe_table(&table, caller.data_tenant_id).await {
         Ok(existing) => {
             if existing.entry.fingerprint == fingerprint {
                 Ok(RegisterTableResponse {
@@ -125,7 +137,7 @@ pub async fn register_table(
                 Err(wyrd_spec::vala::BifrostError::FingerprintMismatch { table: fqn }.into())
             }
         }
-        Err(EngineBifrostError::TableNotFound(_)) => {
+        Err(BifrostCatalogError::TableNotFound(_)) => {
             // Audit the successful registration in the SAME tx as the catalog row
             // (append happens inside `create_table` before its commit).
             let event = audit::audit_event(
@@ -137,21 +149,12 @@ pub async fn register_table(
                 AuditResult::Success,
                 "bifrost table registered",
             );
-            let table_uid = state
-                .bifrost
-                .create_table(vala_bifrost::catalog::CreateTableRequest {
-                    ns,
-
-                    name: &body.name,
-
+            let table_uid = catalog
+                .create_table(CreateTableRequest {
+                    table,
                     user_fields,
-
-                    scope,
-
+                    scope: body.scope,
                     tenant: caller.data_tenant_id,
-
-                    partition_columns: &partition_columns,
-
                     audit: Some(event),
                 })
                 .await
@@ -172,8 +175,7 @@ pub async fn list_tables(
     caller: Caller,
 ) -> Result<Vec<BifrostTableEntry>, WyrdError> {
     authorize(state, &caller, &Permission::bifrost_table_read())?;
-    state
-        .bifrost
+    redux_catalog(state)?
         .list_tables(caller.data_tenant_id)
         .await
         .map_err(map_engine_error)
@@ -188,9 +190,9 @@ pub async fn describe_table(
 ) -> Result<BifrostTableDescription, WyrdError> {
     authorize(state, &caller, &Permission::bifrost_table_read())?;
     let ns = convert::namespace_from_wire(&namespace)?;
-    state
-        .bifrost
-        .describe_table(ns, &name, caller.data_tenant_id)
+    let table = TableRef::new(ns, name);
+    redux_catalog(state)?
+        .describe_table(&table, caller.data_tenant_id)
         .await
         .map_err(map_engine_error)
 }
@@ -229,6 +231,7 @@ mod pg_tests {
             Arc::clone(&storage),
             crate::test_support::test_catalog().await,
         )
+        .with_bifrost_redux(crate::test_support::test_redux_catalog().await)
     }
 
     async fn caller_with(permissions: impl IntoIterator<Item = Permission>) -> Caller {

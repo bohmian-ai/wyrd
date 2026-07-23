@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use num_traits::ToPrimitive;
+
 use crate::contracts::ScribeError;
 
 /// Maximum request size accepted by the Scribe seam.
@@ -95,6 +97,10 @@ impl IngressQueueBudget {
         }
         state.items += 1;
         state.bytes += bytes;
+        metrics::gauge!("bifrost_scribe_retained_items")
+            .set(state.items.to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_retained_bytes")
+            .set(state.bytes.to_f64().unwrap_or(f64::MAX));
         drop(state);
         Ok(IngressQueueReservation {
             inner: Some(Arc::clone(&self.inner)),
@@ -121,6 +127,10 @@ impl IngressQueueBudget {
         if let Ok(mut state) = self.inner.state.lock() {
             state.items = state.items.saturating_sub(1);
             state.bytes = state.bytes.saturating_sub(bytes);
+            metrics::gauge!("bifrost_scribe_retained_items")
+                .set(state.items.to_f64().unwrap_or(f64::MAX));
+            metrics::gauge!("bifrost_scribe_retained_bytes")
+                .set(state.bytes.to_f64().unwrap_or(f64::MAX));
         }
     }
 }
@@ -146,7 +156,7 @@ impl Default for AdmissionConfig {
             max_writers: 1_024,
             writer_queue_items: 64,
             writer_idle_ttl: std::time::Duration::from_mins(10),
-            memory_limit_bytes: 512 * 1024 * 1024,
+            memory_limit_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -664,6 +674,22 @@ mod tests {
         assert_eq!(admission.snapshot().immutable_bytes, 90);
         admission.release_immutable(90);
         assert_eq!(admission.snapshot().immutable_bytes, 0);
+    }
+
+    #[test]
+    fn default_memory_budget_covers_the_compact_large_frame_workload() {
+        let admission = AdmissionController::default();
+        let frame_bytes = 32 * 1024 * 1024;
+        for _ in 0..16 {
+            admission
+                .try_reserve_active("events", frame_bytes)
+                .expect("compact 32 MiB workload must fit the active memory budget");
+        }
+        assert_eq!(
+            admission.snapshot().active_bytes,
+            16 * frame_bytes,
+            "the compact matrix's 16-frame ceiling must remain below the breaker"
+        );
     }
 
     #[test]

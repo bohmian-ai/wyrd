@@ -5,12 +5,15 @@ use std::sync::Arc;
 use opendal::Operator;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
-use crate::server::{WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, test_catalog};
+use crate::server::{
+    WyrdTestServer, WyrdTestServerBuilder, WyrdTestServerError, test_catalog, test_redux_catalog,
+};
 
 /// Supported role topology for a Bifrost cluster journey.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,15 @@ impl WyrdTestCluster {
     /// Returns an error when Postgres, object storage, Iceberg, a WAL
     /// directory, or an independently bound server cannot be created.
     pub async fn start(pods: usize, topology: BifrostTopology) -> Result<Self, ClusterError> {
+        Self::start_with_wal_sync_delay(pods, topology, std::time::Duration::ZERO).await
+    }
+
+    /// Start a cluster with an explicit WAL fsync delay for benchmark cases.
+    pub async fn start_with_wal_sync_delay(
+        pods: usize,
+        topology: BifrostTopology,
+        wal_sync_delay: std::time::Duration,
+    ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
         if pods == 0 {
             return Err(ClusterError::Resource(
@@ -130,6 +142,7 @@ impl WyrdTestCluster {
         .await
         .map_err(|error| ClusterError::Resource(error.to_string()))?;
         let catalog: Arc<WyrdCatalog> = test_catalog(&fixture, &storage).await?;
+        let redux_catalog: Arc<BifrostCatalog> = test_redux_catalog(&fixture, &storage).await?;
 
         let mut wal_dirs = Vec::with_capacity(pods);
         let mut servers = Vec::with_capacity(pods);
@@ -137,10 +150,12 @@ impl WyrdTestCluster {
             let wal_dir =
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?;
             let server = WyrdTestServerBuilder::default()
+                .with_wal_sync_delay(wal_sync_delay)
                 .start_with_resources(
                     Arc::clone(&fixture),
                     Arc::clone(&storage),
                     Arc::clone(&catalog),
+                    Arc::clone(&redux_catalog),
                     Some(Arc::clone(&storage_root)),
                 )
                 .await?

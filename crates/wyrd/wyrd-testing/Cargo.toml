@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 arrow = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 futures-util = { workspace = true }

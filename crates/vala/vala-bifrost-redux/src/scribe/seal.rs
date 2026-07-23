@@ -19,7 +19,6 @@ use crate::scribe::filename::seal_filename;
 use crate::scribe::memtable::{FrozenMemtable, Memtable};
 use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
-use crate::scribe::telemetry::ScribeTelemetry;
 use crate::scribe::wal::WalLsn;
 
 /// Capability returned by `pre_commit` and consumed after the SQL transaction commits.
@@ -68,7 +67,6 @@ pub struct SealCommit {
 #[derive(Debug)]
 pub struct SealDriver {
     operator: Arc<Operator>,
-    telemetry: Option<Arc<ScribeTelemetry>>,
     post_ack_cpu: ScribePostAckCpuPool,
 }
 
@@ -76,28 +74,17 @@ impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self::new_with_telemetry_and_lane(operator, None, ScribePostAckCpuPool::new(1))
-    }
-
-    /// Construct a seal driver with an optional benchmark recorder.
-    #[must_use]
-    pub fn new_with_telemetry(
-        operator: Arc<Operator>,
-        telemetry: Option<Arc<ScribeTelemetry>>,
-    ) -> Self {
-        Self::new_with_telemetry_and_lane(operator, telemetry, ScribePostAckCpuPool::new(1))
+        Self::new_with_lane(operator, ScribePostAckCpuPool::new(1))
     }
 
     /// Construct a seal driver using the boot-owned post-ACK CPU lane.
     #[must_use]
-    pub(crate) fn new_with_telemetry_and_lane(
+    pub(crate) fn new_with_lane(
         operator: Arc<Operator>,
-        telemetry: Option<Arc<ScribeTelemetry>>,
         post_ack_cpu: ScribePostAckCpuPool,
     ) -> Self {
         Self {
             operator,
-            telemetry,
             post_ack_cpu,
         }
     }
@@ -136,7 +123,7 @@ impl SealDriver {
         info!("seal stage: Freeze");
         let freeze_started = std::time::Instant::now();
         let frozen = memtable.freeze(seal_key)?;
-        self.record(
+        Self::record(
             "freeze",
             freeze_started.elapsed(),
             frozen.batch.num_rows(),
@@ -149,7 +136,7 @@ impl SealDriver {
         let encoded = self
             .encode_parquet(&frozen, binding, seal_key.tenant)
             .await?;
-        self.record(
+        Self::record(
             "parquet_encode",
             parquet_started.elapsed(),
             frozen.batch.num_rows(),
@@ -160,7 +147,7 @@ impl SealDriver {
         info!("seal stage: PutObject");
         let put_started = std::time::Instant::now();
         let parquet_path = self.put_object(binding, &encoded, node_id).await?;
-        self.record(
+        Self::record(
             "object_store_put",
             put_started.elapsed(),
             frozen.batch.num_rows(),
@@ -181,7 +168,7 @@ impl SealDriver {
         let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
             .await
             .map_err(ScribeError::from)?;
-        self.record(
+        Self::record(
             "file_list_transaction",
             pg_started.elapsed(),
             frozen.batch.num_rows(),
@@ -241,10 +228,13 @@ impl SealDriver {
         }
     }
 
-    fn record(&self, stage: &str, elapsed: std::time::Duration, rows: usize, bytes: usize) {
-        if let Some(telemetry) = &self.telemetry {
-            telemetry.record(stage, elapsed, rows, bytes);
-        }
+    fn record(stage: &str, elapsed: std::time::Duration, rows: usize, bytes: usize) {
+        metrics::histogram!("bifrost_scribe_seal_stage_seconds", "stage" => stage.to_owned())
+            .record(elapsed.as_secs_f64());
+        metrics::counter!("bifrost_scribe_seal_rows_total", "stage" => stage.to_owned())
+            .increment(u64::try_from(rows).unwrap_or(u64::MAX));
+        metrics::counter!("bifrost_scribe_seal_bytes_total", "stage" => stage.to_owned())
+            .increment(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     /// PUT the Parquet object to storage with retry on transient failures.

@@ -12,6 +12,7 @@ use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_storage::StorageHandle;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
@@ -20,6 +21,7 @@ struct SharedCatalog {
     _fixture: PgFixture,
     _warehouse: TempDir,
     catalog: Arc<WyrdCatalog>,
+    redux_catalog: Arc<BifrostCatalog>,
 }
 
 static SHARED: OnceCell<SharedCatalog> = OnceCell::const_new();
@@ -51,11 +53,19 @@ async fn shared() -> &'static SharedCatalog {
             )
             .await
             .expect("catalog builds against embedded postgres");
+            let redux_catalog = BifrostCatalog::new(
+                catalog_dsn.expose_secret(),
+                storage.backend_config(),
+                fixture.vala_postgres().clone(),
+            )
+            .await
+            .expect("Redux catalog builds against embedded postgres");
 
             SharedCatalog {
                 _fixture: fixture,
                 _warehouse: warehouse,
                 catalog: Arc::new(catalog),
+                redux_catalog: Arc::new(redux_catalog),
             }
         })
         .await
@@ -64,4 +74,9 @@ async fn shared() -> &'static SharedCatalog {
 /// Return a live catalog handle for constructing `AppState` in integration tests.
 pub async fn test_catalog() -> Arc<WyrdCatalog> {
     shared().await.catalog.clone()
+}
+
+/// Return the independent Redux catalog used by Gate and Forge.
+pub async fn test_redux_catalog() -> Arc<BifrostCatalog> {
+    Arc::clone(&shared().await.redux_catalog)
 }

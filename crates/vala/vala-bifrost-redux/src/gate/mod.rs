@@ -4,7 +4,6 @@ pub mod auth;
 pub mod collector;
 pub mod error;
 pub mod limits;
-pub mod telemetry;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::record_batch::RecordBatch;
 use async_stream::try_stream;
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures_util::Stream;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
@@ -35,7 +33,7 @@ use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
 };
 use wyrd_tonic::wyrd::v1::{InsertBatchRequest, InsertBatchResponse};
 
-use crate::catalog::{TableRef, TenantTableBinding};
+use crate::catalog::{BifrostCatalog, BifrostCatalogError, TableRef, TenantTableBinding};
 use crate::contracts::{IngressPayload, Scribe, ScribeIngressFrame};
 pub use crate::gate::auth::{AuthContext, IngestAuthInterceptor, WYRD_REQUEST_ID_METADATA};
 pub use crate::gate::collector::{
@@ -45,7 +43,6 @@ pub use crate::gate::collector::{
 };
 pub use crate::gate::error::{CatalogError, IngestError};
 pub use crate::gate::limits::{IngestLimits, StreamSemaphores};
-pub use crate::gate::telemetry::{GateTelemetry, GateTelemetrySnapshot};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
 
@@ -61,6 +58,27 @@ pub trait Catalog: Send + Sync {
     ) -> Result<SchemaFingerprint, CatalogError>;
 }
 
+#[async_trait]
+impl Catalog for BifrostCatalog {
+    async fn table_schema_fingerprint(
+        &self,
+        namespace: BifrostNamespace,
+        table: &str,
+        tenant: DataTenantId,
+    ) -> Result<SchemaFingerprint, CatalogError> {
+        let table_ref = TableRef::new(namespace, table);
+        BifrostCatalog::table_schema_fingerprint(self, &table_ref, tenant)
+            .await
+            .map_err(|error| match error {
+                BifrostCatalogError::TableNotFound(table) => CatalogError::TableNotFound(table),
+                BifrostCatalogError::FingerprintMismatch(table) => {
+                    CatalogError::FingerprintMismatch(table)
+                }
+                other => CatalogError::Internal(other.to_string()),
+            })
+    }
+}
+
 /// Narrow future read capability owned by the Redux Gate.
 ///
 /// The read engine is intentionally not implemented by this task. Keeping the
@@ -73,6 +91,17 @@ fn oracle_unavailable() -> WyrdError {
         message: "Bifrost Oracle is not available".to_owned(),
         details: serde_json::Value::Null,
     }
+}
+
+fn record_gate_event(event: &'static str) {
+    metrics::counter!("bifrost_gate_events_total", "stage" => event).increment(1);
+}
+
+fn record_gate_rows(accepted: i64, rejected: i64) {
+    metrics::counter!("bifrost_gate_rows_total", "status" => "accepted")
+        .increment(u64::try_from(accepted).unwrap_or(0));
+    metrics::counter!("bifrost_gate_rows_total", "status" => "rejected")
+        .increment(u64::try_from(rejected).unwrap_or(0));
 }
 
 /// The concrete Bifrost write boundary.
@@ -92,7 +121,6 @@ pub struct Gate<
     projection: Arc<dyn ProjectionExecutor>,
     semaphores: Arc<StreamSemaphores>,
     auth: IngestAuthInterceptor<R, I>,
-    telemetry: Arc<GateTelemetry>,
     closed: Arc<AtomicBool>,
 }
 
@@ -118,7 +146,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             projection: Arc::new(InlineProjectionExecutor),
             semaphores,
             auth,
-            telemetry: Arc::new(GateTelemetry::default()),
             closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -167,15 +194,9 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     /// Stop accepting new streams and frames.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
-            self.telemetry.close_event();
+            record_gate_event("close");
             tracing::info!("bifrost gate closed");
         }
-    }
-
-    /// Return the current low-cardinality Gate counters.
-    #[must_use]
-    pub fn telemetry_snapshot(&self) -> GateTelemetrySnapshot {
-        self.telemetry.snapshot()
     }
 
     fn ensure_open(&self) -> Result<(), IngestError> {
@@ -187,11 +208,17 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
 
     async fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
         self.ensure_open()?;
-        self.telemetry.auth_attempt();
+        let started = std::time::Instant::now();
+        record_gate_event("auth_attempt");
         match self.auth.authenticate(metadata).await {
-            Ok(auth) => Ok(auth),
+            Ok(auth) => {
+                metrics::histogram!("bifrost_gate_resolution_seconds", "stage" => "auth")
+                    .record(started.elapsed().as_secs_f64());
+                Ok(auth)
+            }
             Err(error) => {
-                self.telemetry.auth_rejection();
+                record_gate_event("auth_rejection");
+                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
                 Err(error)
             }
         }
@@ -212,20 +239,20 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         request: ExportTraceServiceRequest,
     ) -> Result<IngestOutcome, IngestError> {
         self.ensure_open()?;
-        self.telemetry.otlp_export();
+        record_gate_event("otlp_export");
         if let Err(error) = authorize_record_write(auth) {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         let projected = match self.projection.project_spans(request).await {
             Ok(projected) => projected,
             Err(error) => {
-                self.telemetry.projection_failure();
-                self.telemetry.otlp_rejection();
+                record_gate_event("projection_failure");
+                record_gate_event("otlp_rejection");
                 return Err(error);
             }
         };
-        self.telemetry.record_otlp_rows(
+        record_gate_rows(
             projected.outcome.accepted_spans,
             projected.outcome.rejected_spans,
         );
@@ -234,7 +261,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 .dispatch_projected(auth, "vala.traces.spans", batch, projected.source_bytes)
                 .await
         {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         Ok(projected.outcome)
@@ -248,20 +275,20 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         request: ExportMetricsServiceRequest,
     ) -> Result<MetricsOutcome, IngestError> {
         self.ensure_open()?;
-        self.telemetry.otlp_export();
+        record_gate_event("otlp_export");
         if let Err(error) = authorize_record_write(auth) {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         let projected = match self.projection.project_metrics(request).await {
             Ok(projected) => projected,
             Err(error) => {
-                self.telemetry.projection_failure();
-                self.telemetry.otlp_rejection();
+                record_gate_event("projection_failure");
+                record_gate_event("otlp_rejection");
                 return Err(error);
             }
         };
-        self.telemetry.record_otlp_rows(
+        record_gate_rows(
             projected.outcome.accepted_points,
             projected.outcome.rejected_points,
         );
@@ -270,7 +297,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 .dispatch_projected(auth, "vala.metrics.points", batch, projected.source_bytes)
                 .await
         {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         Ok(projected.outcome)
@@ -284,20 +311,20 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         request: ExportLogsServiceRequest,
     ) -> Result<LogsOutcome, IngestError> {
         self.ensure_open()?;
-        self.telemetry.otlp_export();
+        record_gate_event("otlp_export");
         if let Err(error) = authorize_record_write(auth) {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         let projected = match self.projection.project_logs(request).await {
             Ok(projected) => projected,
             Err(error) => {
-                self.telemetry.projection_failure();
-                self.telemetry.otlp_rejection();
+                record_gate_event("projection_failure");
+                record_gate_event("otlp_rejection");
                 return Err(error);
             }
         };
-        self.telemetry.record_otlp_rows(
+        record_gate_rows(
             projected.outcome.accepted_records,
             projected.outcome.rejected_records,
         );
@@ -306,7 +333,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 .dispatch_projected(auth, "vala.logs.records", batch, projected.source_bytes)
                 .await
         {
-            self.telemetry.otlp_rejection();
+            record_gate_event("otlp_rejection");
             return Err(error);
         }
         Ok(projected.outcome)
@@ -336,7 +363,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .table_schema_fingerprint(namespace, &name, auth.tenant)
             .await
             .map_err(|error| {
-                self.telemetry.catalog_failure();
+                record_gate_event("catalog_failure");
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
@@ -373,7 +400,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             })
             .await
             .map_err(|error| {
-                self.telemetry.scribe_failure();
+                record_gate_event("scribe_failure");
                 IngestError::from_scribe(error)
             })
             .map(|_| ())
@@ -397,14 +424,18 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         stream_rows_before: u64,
     ) -> Result<u64, IngestError> {
         self.ensure_open()?;
-        self.telemetry.native_frame();
+        let resolution_started = std::time::Instant::now();
+        record_gate_event("native_frame");
+        metrics::counter!("bifrost_gate_frame_bytes_total")
+            .increment(u64::try_from(frame.arrow_ipc.len()).unwrap_or(u64::MAX));
         if frame.arrow_ipc.len() > limits.max_frame_bytes {
+            metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
             return Err(IngestError::PayloadTooLarge {
                 bytes: frame.arrow_ipc.len() as u64,
                 limit: limits.max_frame_bytes as u64,
             });
         }
-        let batch_id: [u8; 16] = frame.wyrd_batch_id.as_slice().try_into().map_err(|_| {
+        let batch_id: [u8; 16] = frame.wyrd_batch_id.as_ref().try_into().map_err(|_| {
             IngestError::StreamProtocolViolation(
                 "wyrd_batch_id must be exactly 16 bytes".to_owned(),
             )
@@ -431,7 +462,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .table_schema_fingerprint(namespace, &name, auth.tenant)
             .await
             .map_err(|error| {
-                self.telemetry.catalog_failure();
+                record_gate_event("catalog_failure");
+                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
@@ -465,13 +497,17 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 measured_wire_bytes: frame.arrow_ipc.len(),
                 stream_rows_before,
                 stream_rows_limit: limits.max_stream_rows,
-                payload: IngressPayload::ArrowIpc(Bytes::from(frame.arrow_ipc)),
+                payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
             })
             .await
             .map_err(|error| {
-                self.telemetry.scribe_failure();
+                record_gate_event("scribe_failure");
+                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
                 IngestError::from_scribe(error)
             })?;
+        metrics::counter!("bifrost_gate_frames_total", "status" => "accepted").increment(1);
+        metrics::histogram!("bifrost_gate_resolution_seconds")
+            .record(resolution_started.elapsed().as_secs_f64());
         Ok(admission.rows_accepted)
     }
 }
@@ -521,7 +557,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             projection: Arc::clone(&self.projection),
             semaphores: Arc::clone(&self.semaphores),
             auth: self.auth.clone(),
-            telemetry: Arc::clone(&self.telemetry),
             closed: Arc::clone(&self.closed),
         };
         let limits = self.limits.clone();
@@ -559,7 +594,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                     frame.clone(),
                     total_rows,
                 ).await.inspect_err(|_error| {
-                    gate.telemetry.native_rejection();
+                    record_gate_event("native_rejection");
                 })?;
                 total_rows = total_rows.saturating_add(rows);
                 yield InsertBatchResponse {
@@ -617,19 +652,19 @@ fn validate_frame(
         *stream_table = Some(frame.table.clone());
     }
     if let Some(batch_id) = stream_batch_id {
-        if batch_id != &frame.wyrd_batch_id {
+        if batch_id.as_slice() != frame.wyrd_batch_id.as_ref() {
             return Err(IngestError::StreamProtocolViolation(
                 "wyrd_batch_id changed mid-stream; every frame must repeat the established batch"
                     .to_owned(),
             ));
         }
     } else {
-        *stream_batch_id = Some(frame.wyrd_batch_id.clone());
+        *stream_batch_id = Some(frame.wyrd_batch_id.to_vec());
     }
     let batch_id = uuid::Uuid::from_bytes(
         frame
             .wyrd_batch_id
-            .as_slice()
+            .as_ref()
             .try_into()
             .map_err(|_| IngestError::StreamProtocolViolation("invalid batch id".to_owned()))?,
     );
@@ -753,11 +788,11 @@ mod tests {
         );
     }
 
-    fn frame(sequence: u64, table: &str, batch_id: Vec<u8>, bytes: usize) -> InsertBatchRequest {
+    fn frame(sequence: u64, table: &str, batch_id: &[u8], bytes: usize) -> InsertBatchRequest {
         InsertBatchRequest {
             table: table.to_owned(),
-            arrow_ipc: vec![0; bytes],
-            wyrd_batch_id: batch_id,
+            arrow_ipc: bytes::Bytes::from(vec![0; bytes]),
+            wyrd_batch_id: bytes::Bytes::copy_from_slice(batch_id),
             frame_sequence: sequence,
         }
     }
@@ -768,7 +803,7 @@ mod tests {
         let mut table = None;
         let mut identity = None;
         validate_frame(
-            &frame(0, "vala.bifrost.events", batch_id.clone(), 1),
+            &frame(0, "vala.bifrost.events", &batch_id, 1),
             &IngestLimits::default(),
             0,
             0,
@@ -778,7 +813,7 @@ mod tests {
         )
         .expect("first frame");
         let error = validate_frame(
-            &frame(1, "vala.bifrost.other", batch_id, 1),
+            &frame(1, "vala.bifrost.other", &batch_id, 1),
             &IngestLimits::default(),
             1,
             1,
@@ -792,12 +827,7 @@ mod tests {
             super::error::IngestError::StreamProtocolViolation(_)
         ));
         let error = validate_frame(
-            &frame(
-                1,
-                "vala.bifrost.events",
-                uuid::Uuid::now_v7().as_bytes().to_vec(),
-                1,
-            ),
+            &frame(1, "vala.bifrost.events", uuid::Uuid::now_v7().as_bytes(), 1),
             &IngestLimits::default(),
             1,
             1,
@@ -817,12 +847,7 @@ mod tests {
         let mut table = None;
         let mut identity = None;
         let error = validate_frame(
-            &frame(
-                2,
-                "vala.bifrost.events",
-                uuid::Uuid::now_v7().as_bytes().to_vec(),
-                1,
-            ),
+            &frame(2, "vala.bifrost.events", uuid::Uuid::now_v7().as_bytes(), 1),
             &IngestLimits::default(),
             0,
             0,
@@ -844,7 +869,7 @@ mod tests {
         let mut identity = None;
         let id = uuid::Uuid::now_v7().as_bytes().to_vec();
         validate_frame(
-            &frame(0, "vala.bifrost.events", id.clone(), limits.max_frame_bytes),
+            &frame(0, "vala.bifrost.events", &id, limits.max_frame_bytes),
             &limits,
             0,
             0,
@@ -855,7 +880,7 @@ mod tests {
         .expect("aggregate validator accepts the exact stream budget");
         assert_eq!(limits.max_frame_bytes, 32 * 1024 * 1024);
         let error = validate_frame(
-            &frame(1, "vala.bifrost.events", id, limits.max_frame_bytes + 1),
+            &frame(1, "vala.bifrost.events", &id, limits.max_frame_bytes + 1),
             &limits,
             1,
             1,
@@ -1134,9 +1159,6 @@ mod tests {
         );
         let metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
         assert!(gate.authenticate(&metadata).await.is_err());
-        let telemetry = gate.telemetry_snapshot();
-        assert_eq!(telemetry.auth_attempts, 1);
-        assert_eq!(telemetry.auth_rejections, 1);
     }
 
     #[test]
@@ -1189,7 +1211,6 @@ mod tests {
             .expect_err("catalog failure must reject the write");
         assert!(matches!(error, IngestError::TableNotFound { .. }));
         assert_eq!(scribe_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(gate.telemetry_snapshot().catalog_failures, 1);
     }
 
     #[tokio::test]
@@ -1212,6 +1233,5 @@ mod tests {
             .expect_err("closed Gate must reject new work");
         assert!(matches!(error, IngestError::WriterClosed));
         assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(gate.telemetry_snapshot().close_events, 1);
     }
 }

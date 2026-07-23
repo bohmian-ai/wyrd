@@ -16,11 +16,12 @@ use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::wal::WalWriter;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -105,6 +106,7 @@ pub struct WyrdTestServerBuilder {
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
+    wal_sync_delay: Duration,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -120,6 +122,7 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
+            wal_sync_delay: Duration::ZERO,
         }
     }
 }
@@ -1086,6 +1089,14 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Inject a deterministic WAL sync delay for benchmark and failure tests.
+    /// Production server construction never uses this test-builder option.
+    #[must_use]
+    pub fn with_wal_sync_delay(mut self, delay: Duration) -> Self {
+        self.wal_sync_delay = delay;
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1128,8 +1139,9 @@ impl WyrdTestServerBuilder {
             (Some(Arc::new(root)), handle)
         };
         let bifrost = test_catalog(&fixture, &storage).await?;
+        let bifrost_redux = test_redux_catalog(&fixture, &storage).await?;
 
-        self.start_with_resources(fixture, storage, bifrost, storage_root)
+        self.start_with_resources(fixture, storage, bifrost, bifrost_redux, storage_root)
             .await
     }
 
@@ -1143,6 +1155,7 @@ impl WyrdTestServerBuilder {
         fixture: Arc<PgFixture>,
         storage: Arc<wyrd_storage::StorageHandle>,
         bifrost: Arc<WyrdCatalog>,
+        bifrost_redux: Arc<BifrostCatalog>,
         storage_root: Option<Arc<tempfile::TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
         let tenant_id = fixture.data_tenant_id();
@@ -1234,7 +1247,7 @@ impl WyrdTestServerBuilder {
         let forge_context = ForgeContext::new(
             postgres.vala().clone(),
             operator_pool,
-            bifrost.iceberg_catalog(),
+            bifrost_redux.iceberg_catalog(),
             Arc::new(storage.operator().clone()),
             ForgeConfig::default(),
         )
@@ -1249,20 +1262,30 @@ impl WyrdTestServerBuilder {
                 *node_id.as_bytes(),
                 1,
                 tenant_id,
-                None,
+                WalConfig::default(),
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
-        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
-            Arc::new(storage.operator().clone()),
-            wal,
-            node_id.to_string(),
-            1,
-        ));
+        let scribe = if self.wal_sync_delay.is_zero() {
+            ScribeImpl::new_for_embedded_with_deps(
+                Arc::new(storage.operator().clone()),
+                wal,
+                node_id.to_string(),
+                1,
+            )
+        } else {
+            ScribeImpl::try_new_for_embedded_with_wal_sync_delay(
+                Arc::new(storage.operator().clone()),
+                wal,
+                node_id.to_string(),
+                1,
+                self.wal_sync_delay,
+            )
+            .map_err(WyrdTestServerError::Start)?
+        };
+        let scribe = Arc::new(scribe);
         let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-            Arc::new(wyrd_server::bifrost::catalog_adapter::ServerCatalog::new(
-                Arc::clone(&bifrost),
-            )),
+            Arc::clone(&bifrost_redux),
             scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
@@ -1271,6 +1294,7 @@ impl WyrdTestServerBuilder {
             )),
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
+            .with_bifrost_redux(bifrost_redux)
             .with_forge_context(forge_context)
             .with_forge_interval(self.forge_interval)
             .with_scribe(scribe)
@@ -1609,6 +1633,20 @@ pub(crate) async fn test_catalog(
         .await
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
     Ok(catalog)
+}
+
+pub(crate) async fn test_redux_catalog(
+    fixture: &PgFixture,
+    storage: &Arc<wyrd_storage::StorageHandle>,
+) -> Result<Arc<BifrostCatalog>, WyrdTestServerError> {
+    BifrostCatalog::new(
+        fixture.catalog_dsn().expose_secret(),
+        storage.backend_config(),
+        fixture.vala_postgres().clone(),
+    )
+    .await
+    .map(Arc::new)
+    .map_err(|error| WyrdTestServerError::Start(error.to_string()))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

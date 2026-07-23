@@ -6,6 +6,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::ForgeContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use wyrd_auth_verify::TokenVerifier;
@@ -15,7 +16,6 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
-use crate::bifrost::catalog_adapter::ServerCatalog;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::components::health::ReadinessSnapshot;
@@ -29,7 +29,7 @@ use crate::postgres::ServerPostgres;
 pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
 /// Production Gate specialization used by AppState.
 pub type ServerGate =
-    vala_bifrost_redux::gate::Gate<ServerCatalog, SqlPermissionResolver, PgIssuerResolver>;
+    vala_bifrost_redux::gate::Gate<BifrostCatalog, SqlPermissionResolver, PgIssuerResolver>;
 
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +65,11 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
+    /// Redux-owned tenant-qualified catalog used by Gate, Scribe, Forge, and Oracle.
+    ///
+    /// The legacy catalog remains separate while old read/maintenance paths
+    /// coexist. No Redux component receives the legacy handle.
+    pub bifrost_redux: Option<Arc<BifrostCatalog>>,
     /// Private lifecycle handle for the booted Scribe runtime. Request handlers
     /// use `gate`; this field exists only for startup recovery and shutdown.
     pub(crate) scribe: Option<Arc<ScribeImpl>>,
@@ -112,6 +117,7 @@ impl AppState {
             postgres,
             storage,
             bifrost,
+            bifrost_redux: None,
             scribe: None,
             gate: None,
             scribe_coordination_runtime: None,
@@ -199,6 +205,13 @@ impl AppState {
     #[must_use]
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
         self.storage = storage;
+        self
+    }
+
+    /// Attach the Redux-owned tenant-qualified Bifrost catalog.
+    #[must_use]
+    pub fn with_bifrost_redux(mut self, catalog: Arc<BifrostCatalog>) -> Self {
+        self.bifrost_redux = Some(catalog);
         self
     }
 

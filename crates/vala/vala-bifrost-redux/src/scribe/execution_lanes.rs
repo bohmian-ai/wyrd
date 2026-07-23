@@ -13,6 +13,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use num_traits::ToPrimitive;
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 use crate::catalog::TenantTableBinding;
@@ -23,7 +24,7 @@ use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
-use crate::scribe::wal::{WalHandle, WalLsn};
+use crate::scribe::wal::{PreparedWalAppend, WalAppendResult, WalHandle, WalSegment};
 use std::str::FromStr;
 use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
@@ -40,6 +41,21 @@ const POST_ACK_QUEUE_ITEMS: usize = 64;
 #[cfg(test)]
 const WAL_IO_QUEUE_ITEMS: usize = 256;
 
+fn record_lane_state(lane: &'static str, queued: usize, active: usize) {
+    metrics::gauge!("bifrost_scribe_lane_queued", "lane" => lane)
+        .set(queued.to_f64().unwrap_or(f64::MAX));
+    metrics::gauge!("bifrost_scribe_lane_active", "lane" => lane)
+        .set(active.to_f64().unwrap_or(f64::MAX));
+}
+
+fn record_lane_job(lane: &'static str, succeeded: bool, elapsed: std::time::Duration) {
+    let status = if succeeded { "completed" } else { "failed" };
+    metrics::counter!("bifrost_scribe_lane_jobs_total", "lane" => lane, "status" => status)
+        .increment(1);
+    metrics::histogram!("bifrost_scribe_lane_job_seconds", "lane" => lane)
+        .record(elapsed.as_secs_f64());
+}
+
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
 #[derive(Debug, Clone)]
@@ -47,6 +63,7 @@ pub struct ScribeIngressCpuPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
@@ -68,23 +85,32 @@ impl ScribeIngressCpuPool {
     ///
     /// Panics if the fixed Rayon pool cannot be constructed during boot.
     pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
+        Self::try_new_with_capacity(worker_count, capacity)
+            .expect("Scribe ingress Rayon pool must be constructible")
+    }
+
+    /// Fallible pool builder used by server boot.
+    pub fn try_new_with_capacity(
+        worker_count: usize,
+        capacity: usize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-ingress-cpu-{index}"))
-            .build()
-            .expect("Scribe ingress Rayon pool must be constructible during boot");
-        Self {
+            .build()?;
+        Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
             completed: Arc::new(AtomicU64::new(0)),
             failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
             drained: Arc::new(Notify::new()),
             capacity,
-        }
+        })
     }
 
     /// Submit one native decode without waiting for an application queue slot.
@@ -103,13 +129,26 @@ impl ScribeIngressCpuPool {
             });
         };
         self.depth.fetch_add(1, Ordering::AcqRel);
+        record_lane_state(
+            "ingress",
+            self.depth.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire),
+        );
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
+        let active = Arc::clone(&self.active);
         let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
         self.pool.spawn_fifo(move || {
+            let started = std::time::Instant::now();
+            active.fetch_add(1, Ordering::AcqRel);
+            record_lane_state(
+                "ingress",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             let result = catch_unwind(AssertUnwindSafe(|| {
                 decode(
                     payload,
@@ -120,6 +159,12 @@ impl ScribeIngressCpuPool {
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            active.fetch_sub(1, Ordering::AcqRel);
+            record_lane_state(
+                "ingress",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             drained.notify_waiters();
             drop(permit);
             let result = if let Ok(result) = result {
@@ -135,6 +180,7 @@ impl ScribeIngressCpuPool {
             } else {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
+            record_lane_job("ingress", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -154,15 +200,34 @@ impl ScribeIngressCpuPool {
             });
         };
         self.depth.fetch_add(1, Ordering::AcqRel);
+        record_lane_state(
+            "ingress",
+            self.depth.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire),
+        );
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
+        let active = Arc::clone(&self.active);
         let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
         let completed = Arc::clone(&self.completed);
         let failed = Arc::clone(&self.failed);
         self.pool.spawn_fifo(move || {
+            let started = std::time::Instant::now();
+            active.fetch_add(1, Ordering::AcqRel);
+            record_lane_state(
+                "ingress",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             let result = catch_unwind(AssertUnwindSafe(job));
             depth.fetch_sub(1, Ordering::AcqRel);
+            active.fetch_sub(1, Ordering::AcqRel);
+            record_lane_state(
+                "ingress",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             drained.notify_waiters();
             drop(permit);
             let result = if let Ok(result) = result {
@@ -178,6 +243,7 @@ impl ScribeIngressCpuPool {
             } else {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
+            record_lane_job("ingress", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -498,6 +564,7 @@ pub struct ScribePostAckCpuPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
@@ -516,10 +583,24 @@ impl ScribePostAckCpuPool {
     #[cfg(test)]
     pub(crate) fn with_delay(worker_count: usize, preprocess_delay: std::time::Duration) -> Self {
         Self::with_capacity_and_delay(worker_count, POST_ACK_QUEUE_ITEMS, preprocess_delay)
+            .expect("test post-ACK Rayon pool must be constructible")
     }
 
     /// Build the fixed post-ACK CPU lane with an explicit queue bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed Rayon pool cannot be constructed.
     pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
+        Self::try_new_with_capacity(worker_count, capacity)
+            .expect("Scribe post-ACK Rayon pool must be constructible")
+    }
+
+    /// Fallible pool builder used by server boot.
+    pub fn try_new_with_capacity(
+        worker_count: usize,
+        capacity: usize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
     }
 
@@ -527,17 +608,17 @@ impl ScribePostAckCpuPool {
         worker_count: usize,
         capacity: usize,
         preprocess_delay: std::time::Duration,
-    ) -> Self {
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-post-ack-cpu-{index}"))
-            .build()
-            .expect("Scribe post-ACK Rayon pool must be constructible during boot");
-        Self {
+            .build()?;
+        Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
             completed: Arc::new(AtomicU64::new(0)),
             failed: Arc::new(AtomicU64::new(0)),
@@ -545,7 +626,7 @@ impl ScribePostAckCpuPool {
             drained: Arc::new(Notify::new()),
             preprocess_delay,
             capacity,
-        }
+        })
     }
 
     pub(crate) async fn submit(
@@ -578,7 +659,20 @@ impl ScribePostAckCpuPool {
         let delay = self.preprocess_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
+        record_lane_state(
+            "post_ack",
+            depth.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire),
+        );
+        let active = Arc::clone(&self.active);
         self.pool.spawn_fifo(move || {
+            let started = std::time::Instant::now();
+            active.fetch_add(1, Ordering::AcqRel);
+            record_lane_state(
+                "post_ack",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             let result = catch_unwind(AssertUnwindSafe(|| match operation {
                 ScribePostAckCpuOp::Preprocess(append) => {
                     if !delay.is_zero() {
@@ -597,6 +691,12 @@ impl ScribePostAckCpuPool {
                     .map(|_| ScribePostAckCpuResult::ReplayRestored),
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            active.fetch_sub(1, Ordering::AcqRel);
+            record_lane_state(
+                "post_ack",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
@@ -610,6 +710,7 @@ impl ScribePostAckCpuPool {
             } else {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
+            record_lane_job("post_ack", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -652,15 +753,12 @@ impl ScribePostAckCpuPool {
 /// Closed set of filesystem work permitted on the WAL IO lane.
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoOp {
-    WriteFrame {
+    WritePrepared {
         wal: WalHandle,
-        frame: Bytes,
+        append: PreparedWalAppend,
     },
     SyncWal {
-        wal: WalHandle,
-    },
-    CreateOrRollSegment {
-        wal: WalHandle,
+        segments: Vec<Arc<WalSegment>>,
     },
     #[expect(
         dead_code,
@@ -681,8 +779,11 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
-    WalWritten { wal: WalHandle, lsn: WalLsn },
-    WalSynced { wal: WalHandle },
+    WalWritten {
+        wal: WalHandle,
+        result: WalAppendResult,
+    },
+    WalSynced,
     Completed,
     Replayed(HashMap<String, ReplayedSealKey>),
 }
@@ -693,6 +794,7 @@ pub struct ScribeWalIoPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
     completed: Arc<AtomicU64>,
     failed: Arc<AtomicU64>,
@@ -711,29 +813,45 @@ impl ScribeWalIoPool {
 
     #[cfg(test)]
     pub(crate) fn with_delay(worker_count: usize, sync_delay: std::time::Duration) -> Self {
-        Self::with_capacity_and_delay(worker_count, WAL_IO_QUEUE_ITEMS, sync_delay)
+        Self::try_new_with_capacity_and_delay(worker_count, WAL_IO_QUEUE_ITEMS, sync_delay)
+            .expect("test WAL IO Rayon pool must be constructible")
     }
 
     /// Build the fixed WAL IO lane with an explicit queue bound.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed Rayon pool cannot be constructed.
     pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
-        Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
+        Self::try_new_with_capacity(worker_count, capacity)
+            .expect("Scribe WAL IO Rayon pool must be constructible")
     }
 
-    fn with_capacity_and_delay(
+    /// Fallible pool builder used by server boot.
+    pub fn try_new_with_capacity(
+        worker_count: usize,
+        capacity: usize,
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
+        Self::try_new_with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
+    }
+
+    /// Build the WAL lane with a deterministic sync delay for benchmark and
+    /// failure-injection harnesses. Production boot passes zero delay.
+    pub fn try_new_with_capacity_and_delay(
         worker_count: usize,
         capacity: usize,
         sync_delay: std::time::Duration,
-    ) -> Self {
+    ) -> Result<Self, rayon::ThreadPoolBuildError> {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
             .thread_name(|index| format!("wyrd-scribe-wal-io-{index}"))
-            .build()
-            .expect("Scribe WAL IO Rayon pool must be constructible during boot");
-        Self {
+            .build()?;
+        Ok(Self {
             pool: Arc::new(pool),
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
             completed: Arc::new(AtomicU64::new(0)),
             failed: Arc::new(AtomicU64::new(0)),
@@ -741,7 +859,7 @@ impl ScribeWalIoPool {
             drained: Arc::new(Notify::new()),
             sync_delay,
             capacity,
-        }
+        })
     }
 
     pub(crate) async fn submit(
@@ -774,22 +892,31 @@ impl ScribeWalIoPool {
         let delay = self.sync_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
+        record_lane_state(
+            "wal_io",
+            depth.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire),
+        );
+        let active = Arc::clone(&self.active);
         self.pool.spawn_fifo(move || {
+            let started = std::time::Instant::now();
+            active.fetch_add(1, Ordering::AcqRel);
+            record_lane_state(
+                "wal_io",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             let result = catch_unwind(AssertUnwindSafe(|| match operation {
-                ScribeWalIoOp::WriteFrame { wal, frame } => {
-                    let lsn = wal.append_frame(&frame)?;
-                    Ok(ScribeWalIoResult::WalWritten { wal, lsn })
+                ScribeWalIoOp::WritePrepared { wal, append } => {
+                    let result = wal.append_prepared(append)?;
+                    Ok(ScribeWalIoResult::WalWritten { wal, result })
                 }
-                ScribeWalIoOp::SyncWal { wal } => {
+                ScribeWalIoOp::SyncWal { segments } => {
                     if !delay.is_zero() {
                         std::thread::sleep(delay);
                     }
-                    wal.sync_data()?;
-                    Ok(ScribeWalIoResult::WalSynced { wal })
-                }
-                ScribeWalIoOp::CreateOrRollSegment { wal } => {
-                    wal.create_or_roll_segment()?;
-                    Ok(ScribeWalIoResult::Completed)
+                    WalHandle::sync_segments(&segments)?;
+                    Ok(ScribeWalIoResult::WalSynced)
                 }
                 ScribeWalIoOp::ReplaceManifest { path, contents } => {
                     replace_manifest(&path, &contents)?;
@@ -805,6 +932,12 @@ impl ScribeWalIoPool {
                 }
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            active.fetch_sub(1, Ordering::AcqRel);
+            record_lane_state(
+                "wal_io",
+                depth.load(Ordering::Acquire),
+                active.load(Ordering::Acquire),
+            );
             drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
@@ -818,6 +951,7 @@ impl ScribeWalIoPool {
             } else {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
+            record_lane_job("wal_io", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {

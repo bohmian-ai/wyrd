@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
@@ -14,9 +14,9 @@ use vala_bifrost_redux::forge::{ForgeContext, ForgeTickOutcome, run_maintenance_
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use wyrd_bench::{
-    BacklogSample, BenchmarkReport, ForgeMeasurements, LatencyPercentiles, MachineMetadata,
-    PhaseMeasurement, PodMetadata, QueryMeasurements, SchemaWidth, StageMeasurements,
-    StorageMeasurements, TrafficShape, VerificationMeasurements, WorkloadSpec,
+    BacklogSample, BenchmarkRecorder, BenchmarkReport, ForgeMeasurements, LatencyPercentiles,
+    MachineMetadata, PhaseMeasurement, PodMetadata, QueryMeasurements, SchemaWidth,
+    StageMeasurements, StorageMeasurements, TrafficShape, VerificationMeasurements, WorkloadSpec,
     required_scribe_matrix,
 };
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
@@ -34,6 +34,8 @@ const FORGE_TABLE_NAME: &str = "bench_forge_events";
 const RUN_DEADLINE: Duration = Duration::from_secs(540);
 const SCRIBE_DRAIN_TIMEOUT: Duration = Duration::from_secs(90);
 const FORGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+static BENCHMARK_RECORDER: OnceLock<Arc<BenchmarkRecorder>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct PhaseSpec {
@@ -55,6 +57,12 @@ struct RunState {
 
 #[tokio::main]
 async fn main() -> Result<(), BenchError> {
+    let recorder = BenchmarkRecorder::new()
+        .install()
+        .map_err(|error| format!("benchmark metrics recorder install failed: {error}"))?;
+    BENCHMARK_RECORDER
+        .set(recorder)
+        .map_err(|_| "benchmark recorder was installed more than once")?;
     let lane = argument("lane").unwrap_or_else(|| "capacity".to_owned());
     let pods = argument("pods")
         .as_deref()
@@ -764,27 +772,44 @@ async fn build_report(
 }
 
 fn state_samples(harness: &BifrostHarness, stage: &str) -> Vec<u64> {
-    harness
-        .telemetry()
-        .iter()
-        .flat_map(|telemetry| telemetry.snapshot())
-        .filter(|sample| sample.stage == stage)
-        .map(|sample| sample.duration_us)
-        .collect()
+    let _ = harness;
+    let metric = match stage {
+        "append" => "bifrost_scribe_ack_seconds",
+        "wal_sync_data" => "bifrost_scribe_wal_sync_seconds",
+        "write_all" => "bifrost_scribe_wal_append_seconds",
+        _ => return Vec::new(),
+    };
+    BENCHMARK_RECORDER
+        .get()
+        .and_then(|recorder| recorder.snapshot().histograms.get(metric).cloned())
+        .map(|histogram| {
+            vec![
+                histogram.p50 / 1_000,
+                histogram.p95 / 1_000,
+                histogram.p99 / 1_000,
+            ]
+        })
+        .unwrap_or_default()
 }
 
 fn stage_measurements(harness: &BifrostHarness, forge_samples: &[u64]) -> Vec<StageMeasurements> {
+    let _ = harness;
     let mut grouped: BTreeMap<String, (Vec<u64>, u64, u64, u64)> = BTreeMap::new();
-    for sample in harness
-        .telemetry()
-        .iter()
-        .flat_map(|telemetry| telemetry.snapshot())
-    {
-        let entry = grouped.entry(sample.stage).or_default();
-        entry.0.push(sample.duration_us);
-        entry.1 = entry.1.saturating_add(1);
-        entry.2 = entry.2.saturating_add(sample.rows);
-        entry.3 = entry.3.saturating_add(sample.bytes);
+    if let Some(recorder) = BENCHMARK_RECORDER.get() {
+        for (metric, histogram) in recorder.snapshot().histograms {
+            let stage = match metric.as_str() {
+                "bifrost_scribe_ack_seconds" => "append",
+                "bifrost_scribe_wal_append_seconds" => "write_all",
+                "bifrost_scribe_wal_sync_seconds" => "wal_sync_data",
+                _ => continue,
+            };
+            let samples = vec![
+                histogram.p50 / 1_000,
+                histogram.p95 / 1_000,
+                histogram.p99 / 1_000,
+            ];
+            grouped.insert(stage.to_owned(), (samples, histogram.count, 0, 0));
+        }
     }
     if !forge_samples.is_empty() {
         grouped.insert(

@@ -1121,6 +1121,13 @@ does not match the authenticated organization; Oracle adds the plan-root
 row mismatch. There is no shared physical table layout and no deployment-
 specific storage mode.
 
+Logical definition ownership is separate from physical identity. Wyrd ships
+server-owned built-in definitions for tables such as spans, GenAI, eval, drift,
+and audit, while users register dataset definitions. “Built-in” and “system”
+describe who owns the immutable logical definition; they are not table scopes.
+Every instantiated built-in or user-defined table uses the same
+organization-qualified physical binding above.
+
 The substrate is Apache Iceberg-managed Parquet in object storage, with Postgres
 as the Iceberg catalog and control plane and DataFusion as the query engine —
 consistent with Doctrine #4 (Postgres is control-plane only; analytical data
@@ -1184,7 +1191,7 @@ The accepted domain namespaces and tables:
 | `vala.traces` | `spans`, `events`, `links` | Raw OTel spans — source of truth |
 | `vala.metrics` | `points` | OTel metric data points with exemplars |
 | `vala.logs` | `records` | OTel LogRecord signal |
-| `vala.genai` | `messages`, `embeddings`, `tool_calls` | Derived from `vala.traces` spans carrying `gen_ai.*` attributes |
+| `vala.genai` | `messages`, `embeddings`, `tool_calls`, `memory` | Derived from `vala.traces` spans carrying `gen_ai.*` attributes |
 | `vala.eval` | `runs`, `assertions` | Agent/LLM evaluation records |
 | `vala.drift` | `*` | Traditional ML drift records |
 | `vala.dev` | `agent_traces` | High-fidelity coding-harness traces; carries the code axis |

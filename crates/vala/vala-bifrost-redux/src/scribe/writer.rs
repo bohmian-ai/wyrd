@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use num_traits::ToPrimitive;
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, mpsc, watch};
 use uuid::Uuid;
@@ -17,11 +18,11 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memtable::Memtable;
-use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend, PreparedSlice};
-use crate::scribe::telemetry::ScribeTelemetry;
+use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedSlice};
 use crate::scribe::wal::{ScribeAppendMeta, WalHandle, WalWriter};
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
+const MAX_DEDUPE_SLICES: usize = 1_048_576;
 
 #[derive(Debug)]
 struct WriterState {
@@ -43,13 +44,14 @@ enum WriterControl {
 
 #[derive(Debug)]
 struct WriterRuntime {
+    writer_identity: String,
     state: Arc<WriterState>,
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
-    telemetry: Option<Arc<ScribeTelemetry>>,
+    commit_config: crate::scribe::ScribeCommitConfig,
 }
 
 #[derive(Debug)]
@@ -59,10 +61,10 @@ struct WriterDependencies {
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
-    telemetry: Option<Arc<ScribeTelemetry>>,
     coordination_runtime: Handle,
     writer_queue_items: usize,
     writer_idle_ttl: std::time::Duration,
+    commit_config: crate::scribe::ScribeCommitConfig,
 }
 
 /// One FIFO writer for a tenant/table binding.
@@ -87,13 +89,14 @@ impl TenantTableWriter {
         lease: WriterLease,
         dependencies: WriterDependencies,
     ) -> Arc<Self> {
+        let writer_identity = format!("{}:{}", binding.tenant, binding.table_ref.fqn());
         let WriterDependencies {
             admission,
             memtable,
             wal,
             post_ack_cpu,
             wal_io,
-            telemetry,
+            commit_config,
             coordination_runtime,
             writer_queue_items,
             writer_idle_ttl,
@@ -111,13 +114,14 @@ impl TenantTableWriter {
             stopped: Notify::new(),
         });
         let runtime = WriterRuntime {
+            writer_identity,
             state: Arc::clone(&state),
             admission,
             memtable,
             wal,
             post_ack_cpu,
             wal_io,
-            telemetry,
+            commit_config,
         };
         let task = coordination_runtime.spawn(run_writer(runtime, data_rx, control_rx, age_rx));
         let key = (binding.tenant, binding.table_ref.clone());
@@ -232,9 +236,9 @@ pub(crate) struct TenantTableWriterRegistry {
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
-    telemetry: Mutex<Option<Arc<ScribeTelemetry>>>,
     coordination_runtime: Handle,
     drained: Notify,
+    commit_config: crate::scribe::ScribeCommitConfig,
 }
 
 impl TenantTableWriterRegistry {
@@ -245,7 +249,6 @@ impl TenantTableWriterRegistry {
         wal: Arc<WalWriter>,
         post_ack_cpu: ScribePostAckCpuPool,
         wal_io: ScribeWalIoPool,
-        telemetry: Option<Arc<ScribeTelemetry>>,
     ) -> Arc<Self> {
         Self::new_with_runtime(
             admission,
@@ -253,8 +256,8 @@ impl TenantTableWriterRegistry {
             wal,
             post_ack_cpu,
             wal_io,
-            telemetry,
             Handle::current(),
+            crate::scribe::ScribeCommitConfig::default(),
         )
     }
 
@@ -264,8 +267,8 @@ impl TenantTableWriterRegistry {
         wal: Arc<WalWriter>,
         post_ack_cpu: ScribePostAckCpuPool,
         wal_io: ScribeWalIoPool,
-        telemetry: Option<Arc<ScribeTelemetry>>,
         coordination_runtime: Handle,
+        commit_config: crate::scribe::ScribeCommitConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
@@ -274,9 +277,9 @@ impl TenantTableWriterRegistry {
             wal,
             post_ack_cpu,
             wal_io,
-            telemetry: Mutex::new(telemetry),
             coordination_runtime,
             drained: Notify::new(),
+            commit_config,
         })
     }
 
@@ -301,10 +304,6 @@ impl TenantTableWriterRegistry {
         // makes the first-write path one atomic get-or-create operation: racing
         // callers cannot each spawn an unregistered FIFO consumer.
         let lease = self.admission.try_reserve_writer(binding.table_ref.fqn())?;
-        let telemetry = match self.telemetry.lock() {
-            Ok(telemetry) => telemetry.clone(),
-            Err(_) => None,
-        };
         let writer = TenantTableWriter::new(
             binding,
             lease,
@@ -314,7 +313,7 @@ impl TenantTableWriterRegistry {
                 wal: Arc::clone(&self.wal),
                 post_ack_cpu: self.post_ack_cpu.clone(),
                 wal_io: self.wal_io.clone(),
-                telemetry,
+                commit_config: self.commit_config,
                 coordination_runtime: self.coordination_runtime.clone(),
                 writer_queue_items: self.admission.config().writer_queue_items,
                 writer_idle_ttl: self.admission.config().writer_idle_ttl,
@@ -342,18 +341,26 @@ impl TenantTableWriterRegistry {
         let permit = writer
             .data_tx
             .try_reserve()
-            .map_err(|_| ScribeError::IngestBusy {
-                table: writer.binding.table_ref.fqn(),
+            .map_err(|_| {
+                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "writer_queue_full")
+                    .increment(1);
+                ScribeError::IngestBusy {
+                    table: writer.binding.table_ref.fqn(),
+                }
             })?;
 
         writer.state.reserved_sends.fetch_add(1, Ordering::AcqRel);
         if !writer.state.accepting.load(Ordering::Acquire) {
+            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "writer_unavailable")
+                .increment(1);
             writer.state.reserved_sends.fetch_sub(1, Ordering::AcqRel);
             return Err(ScribeError::IngestBusy {
                 table: writer.binding.table_ref.fqn(),
             });
         }
         writer.state.pending.fetch_add(1, Ordering::AcqRel);
+        metrics::gauge!("bifrost_scribe_writer_queue_depth")
+            .set(writer.pending().to_f64().unwrap_or(f64::MAX));
 
         permit.send(append);
         writer.state.reserved_sends.fetch_sub(1, Ordering::AcqRel);
@@ -485,12 +492,6 @@ impl TenantTableWriterRegistry {
             self.remove_if(&writer.key, writer.instance_id);
         }
     }
-
-    pub(crate) fn set_telemetry(&self, telemetry: Arc<ScribeTelemetry>) {
-        if let Ok(mut current) = self.telemetry.lock() {
-            *current = Some(telemetry);
-        }
-    }
 }
 
 /// Point-in-time health and queue metrics for active logical writers.
@@ -515,8 +516,13 @@ async fn run_writer(
 ) {
     let mut seen_slices = HashSet::<AppendSliceId>::new();
     let mut wal_handles = HashMap::<crate::scribe::seal_key::SealKey, WalHandle>::new();
+    let mut retained = None;
     let mut controls_closed = false;
     let mut shutdown_requested = false;
+    let max_frames = runtime.commit_config.max_group_frames;
+    let max_bytes = runtime.commit_config.max_group_bytes;
+    let mut group = Vec::with_capacity(max_frames);
+
     loop {
         if shutdown_requested
             && runtime.state.pending.load(Ordering::Acquire) == 0
@@ -524,51 +530,81 @@ async fn run_writer(
         {
             break;
         }
-        tokio::select! {
-            biased;
-            control = control_rx.recv(), if !controls_closed && !shutdown_requested => {
-                match control {
-                    Some(WriterControl::Shutdown) => {
-                        runtime.state.accepting.store(false, Ordering::Release);
-                        shutdown_requested = true;
+        let first = if retained.is_some() {
+            retained.take()
+        } else {
+            tokio::select! {
+                biased;
+                control = control_rx.recv(), if !controls_closed && !shutdown_requested => {
+                    match control {
+                        Some(WriterControl::Shutdown) => {
+                            runtime.state.accepting.store(false, Ordering::Release);
+                            shutdown_requested = true;
+                        }
+                        Some(WriterControl::PersistenceCompleted | WriterControl::GraceExpired) => {}
+                        None => controls_closed = true,
                     }
-                    Some(WriterControl::PersistenceCompleted | WriterControl::GraceExpired) => {},
-                    None => controls_closed = true,
+                    None
                 }
+                _ = age_rx.changed() => None,
+                append = data_rx.recv() => append,
             }
-            _ = age_rx.changed() => {}
-            append = data_rx.recv() => {
-                let Some(append) = append else { break; };
-                let request_id = append.request_id.clone();
-                let batch_id = append.batch_id;
-                let tenant = append.tenant;
-                let table = append.table.clone();
-                let result = process_append(
-                    &runtime,
-                    append,
-                    &mut seen_slices,
-                    &mut wal_handles,
-                ).await;
-                if let Err(error) = result {
-                    runtime.state.healthy.store(false, Ordering::Release);
-                    runtime.state.terminal_errors.fetch_add(1, Ordering::AcqRel);
-                    if matches!(&error, ScribeError::WalDiskFull) {
-                        runtime.admission.trip_wal_disk_full();
-                    }
-                    tracing::error!(
-                        error = %error,
-                        tenant = %tenant,
-                        table = %table,
-                        request_id = %request_id,
-                        batch_id = %batch_id,
-                        seal_key = "unknown",
-                        stage = "consumer",
-                        "Scribe writer became unhealthy"
-                    );
-                }
+        };
+        let Some(first) = first else {
+            if controls_closed && data_rx.is_empty() {
+                break;
+            }
+            continue;
+        };
+
+        let group_bytes = fill_group(
+            &mut data_rx,
+            first,
+            &mut retained,
+            &mut group,
+            max_frames,
+            max_bytes,
+        );
+
+        let group_len = group.len();
+        let result = process_group(
+            &runtime,
+            &mut group,
+            group_bytes,
+            &mut seen_slices,
+            &mut wal_handles,
+        )
+        .await;
+        for _ in 0..group_len {
+            runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        metrics::gauge!("bifrost_scribe_writer_queue_depth").set(
+            runtime
+                .state
+                .pending
+                .load(Ordering::Acquire)
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
+        if let Err(error) = result {
+            runtime.state.healthy.store(false, Ordering::Release);
+            runtime.state.terminal_errors.fetch_add(1, Ordering::AcqRel);
+            if matches!(&error, ScribeError::WalDiskFull) {
+                runtime.admission.trip_wal_disk_full();
+            }
+            tracing::error!(error = %error, group_frames = group_len, group_bytes, stage = "wal_group", "Scribe writer became unhealthy");
+            metrics::counter!("bifrost_scribe_writer_groups_total", "status" => "failed")
+                .increment(1);
+            metrics::counter!("bifrost_scribe_writer_unhealthy_total", "reason" => "wal_group")
+                .increment(1);
+            while let Ok(queued) = data_rx.try_recv() {
+                drop(queued);
                 runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
             }
-            else => break,
+            if retained.take().is_some() {
+                runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
+            }
+            break;
         }
     }
     for (_, wal) in wal_handles {
@@ -580,176 +616,237 @@ async fn run_writer(
     runtime.state.stopped.notify_waiters();
 }
 
-/// Preprocess one admitted request and apply each prepared day slice in FIFO order.
-async fn process_append(
+fn fill_group(
+    data_rx: &mut mpsc::Receiver<AdmittedAppend>,
+    first: AdmittedAppend,
+    retained: &mut Option<AdmittedAppend>,
+    group: &mut Vec<AdmittedAppend>,
+    max_frames: usize,
+    max_bytes: usize,
+) -> usize {
+    group.clear();
+    let mut group_bytes = first.admitted_bytes;
+    group.push(first);
+    while group.len() < max_frames {
+        match data_rx.try_recv() {
+            Ok(next) if group.len() == 1 && next.admitted_bytes > max_bytes => {
+                *retained = Some(next);
+                break;
+            }
+            Ok(next) if group_bytes.saturating_add(next.admitted_bytes) <= max_bytes => {
+                group_bytes = group_bytes.saturating_add(next.admitted_bytes);
+                group.push(next);
+            }
+            Ok(next) => {
+                *retained = Some(next);
+                break;
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+    group_bytes
+}
+
+/// Prepare, append, and sync one opportunistic FIFO group.
+async fn process_group(
     runtime: &WriterRuntime,
-    append: AdmittedAppend,
+    group: &mut Vec<AdmittedAppend>,
+    group_bytes: usize,
     seen_slices: &mut HashSet<AppendSliceId>,
     wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
 ) -> Result<(), ScribeError> {
-    let preprocess_started = Instant::now();
-    let prepared = match runtime
-        .post_ack_cpu
-        .submit(ScribePostAckCpuOp::Preprocess(Box::new(append)))
-        .await?
-    {
-        ScribePostAckCpuResult::Prepared(prepared) => prepared,
-        ScribePostAckCpuResult::ParquetEncoded(_) => {
-            return Err(ScribeError::Internal {
-                detail: "post-ACK lane returned the wrong writer result".to_owned(),
-            });
-        }
-        ScribePostAckCpuResult::ReplayRestored => {
-            return Err(ScribeError::Internal {
-                detail: "post-ACK lane returned replay output during append".to_owned(),
-            });
-        }
-    };
-    if let Some(telemetry) = &runtime.telemetry {
-        telemetry.record(
-            "queue_wait",
-            std::time::Duration::from_micros(prepared.queue_wait_us),
-            prepared
-                .slices
-                .iter()
-                .map(|slice| slice.rows.num_rows())
-                .sum(),
-            prepared
-                .slices
-                .iter()
-                .map(|slice| slice.memtable_bytes)
-                .sum(),
-        );
-        let rows = prepared
-            .slices
-            .iter()
-            .map(|slice| slice.rows.num_rows())
-            .sum();
-        telemetry.record("preprocess", preprocess_started.elapsed(), rows, 0);
-    }
+    let span = tracing::info_span!(
+        "scribe_wal_group",
+        writer_identity = %runtime.writer_identity,
+        frame_count = group.len(),
+        group_bytes,
+        append_duration_us = tracing::field::Empty,
+        sync_duration_us = tracing::field::Empty,
+        touched_segment_count = tracing::field::Empty,
+    );
+    let _entered = span.enter();
+    let mut prepared = prepare_group(runtime, group).await?;
 
-    process_prepared(runtime, prepared, seen_slices, wal_handles).await
-}
-
-async fn process_prepared(
-    runtime: &WriterRuntime,
-    prepared: PreparedAppend,
-    seen_slices: &mut HashSet<AppendSliceId>,
-    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
-) -> Result<(), ScribeError> {
-    let _request_id = prepared.request_id;
-    let batch_id = *prepared.batch_id.as_bytes();
-    let frame_rows = prepared
-        .slices
-        .iter()
-        .map(|slice| slice.rows.num_rows())
-        .sum::<usize>();
-    for slice in prepared.slices {
-        if !seen_slices.insert(slice.id.clone()) {
-            continue;
-        }
-        process_prepared_slice(runtime, slice, batch_id, wal_handles).await?;
-    }
-    if let Some(telemetry) = &runtime.telemetry {
-        telemetry.record_fsynced(frame_rows);
-    }
-    drop(prepared.reservation);
-    Ok(())
-}
-
-async fn process_prepared_slice(
-    runtime: &WriterRuntime,
-    slice: PreparedSlice,
-    batch_id: [u8; 16],
-    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
-) -> Result<(), ScribeError> {
-    let seal_key = slice.seal_key.clone();
-    let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
-        handle.clone()
-    } else {
-        let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
-        wal_handles.insert(seal_key.clone(), handle.clone());
-        let _ = runtime
-            .wal_io
-            .submit(ScribeWalIoOp::CreateOrRollSegment {
-                wal: handle.clone(),
-            })
-            .await?;
-        handle
-    };
-    let wal_started = Instant::now();
-    let ScribeWalIoResult::WalWritten {
-        wal: written_wal,
-        lsn,
-    } = runtime
-        .wal_io
-        .submit(ScribeWalIoOp::WriteFrame {
-            wal: wal_handle.clone(),
-            frame: slice.wal_frame,
-        })
-        .await?
-    else {
-        return Err(ScribeError::Internal {
-            detail: "WAL IO lane returned the wrong write result".to_string(),
-        });
-    };
-    drop(written_wal);
-    if let Some(telemetry) = &runtime.telemetry {
-        telemetry.record(
-            "write_all",
-            wal_started.elapsed(),
-            slice.rows.num_rows(),
-            slice.wal_bytes,
-        );
-    }
-
-    let row_count = slice.rows.num_rows();
-    let memtable_bytes = slice.memtable_bytes;
-    runtime
-        .admission
-        .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
-    let memtable_started = Instant::now();
-    if let Err(error) = runtime.memtable.insert(
-        &seal_key,
-        slice.audit_event,
-        ScribeAppendMeta {
-            batch_id,
-            rows_accepted: row_count,
-            wal_lsn_min: lsn,
-            wal_lsn_max: lsn,
-            seal_key: seal_key.as_path_components(),
-        },
-        slice.rows,
-    ) {
-        runtime.admission.release_active(memtable_bytes);
-        return Err(error);
-    }
-    if let Some(telemetry) = &runtime.telemetry {
-        telemetry.record(
-            "memtable_insert",
-            memtable_started.elapsed(),
-            row_count,
-            memtable_bytes,
-        );
-    }
-
+    let append_stats = append_group(runtime, &mut prepared, seen_slices, wal_handles).await?;
+    let touched = append_stats.touched;
+    let durable_frames = append_stats.durable_frames;
+    let durable_rows = append_stats.durable_rows;
+    let wal_bytes = append_stats.wal_bytes;
+    let append_duration = append_stats.elapsed;
+    span.record("append_duration_us", append_duration.as_micros());
     let sync_started = Instant::now();
-    match runtime
-        .wal_io
-        .submit(ScribeWalIoOp::SyncWal { wal: wal_handle })
-        .await?
-    {
-        ScribeWalIoResult::WalSynced { wal: synced_wal } => drop(synced_wal),
-        _ => {
-            return Err(ScribeError::Internal {
-                detail: "WAL IO lane returned the wrong sync result".to_string(),
-            });
+    for (_, segment) in touched.values() {
+        match runtime
+            .wal_io
+            .submit(ScribeWalIoOp::SyncWal {
+                segments: vec![Arc::clone(segment)],
+            })
+            .await?
+        {
+            ScribeWalIoResult::WalSynced => {}
+            _ => {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong sync result".to_owned(),
+                });
+            }
         }
     }
-    if let Some(telemetry) = &runtime.telemetry {
-        telemetry.record("wal_sync_data", sync_started.elapsed(), 0, 0);
+    let sync_duration = sync_started.elapsed();
+    span.record("sync_duration_us", sync_duration.as_micros());
+    span.record("touched_segment_count", touched.len());
+    metrics::counter!("bifrost_scribe_writer_groups_total", "status" => "completed").increment(1);
+    metrics::histogram!("bifrost_scribe_writer_group_frames")
+        .record(durable_frames.to_f64().unwrap_or(f64::MAX));
+    metrics::histogram!("bifrost_scribe_writer_group_bytes")
+        .record(group_bytes.to_f64().unwrap_or(f64::MAX));
+    metrics::histogram!("bifrost_scribe_wal_append_seconds").record(append_duration.as_secs_f64());
+    metrics::histogram!("bifrost_scribe_wal_sync_seconds").record(sync_duration.as_secs_f64());
+    metrics::counter!("bifrost_scribe_wal_fsync_total", "status" => "completed")
+        .increment(touched.len() as u64);
+    metrics::counter!("bifrost_scribe_wal_bytes_total").increment(wal_bytes);
+    metrics::counter!("bifrost_scribe_frames_total", "status" => "fsynced")
+        .increment(durable_frames);
+    metrics::counter!("bifrost_scribe_rows_total", "status" => "fsynced").increment(durable_rows);
+    for prepared_append in prepared {
+        drop(prepared_append.reservation);
     }
     Ok(())
+}
+
+async fn prepare_group(
+    runtime: &WriterRuntime,
+    group: &mut Vec<AdmittedAppend>,
+) -> Result<Vec<crate::scribe::preprocess::PreparedAppend>, ScribeError> {
+    let mut prepared = Vec::with_capacity(group.len());
+    for append in group.drain(..) {
+        let prepared_append = match runtime
+            .post_ack_cpu
+            .submit(ScribePostAckCpuOp::Preprocess(Box::new(append)))
+            .await?
+        {
+            ScribePostAckCpuResult::Prepared(prepared) => prepared,
+            ScribePostAckCpuResult::ParquetEncoded(_) | ScribePostAckCpuResult::ReplayRestored => {
+                return Err(ScribeError::Internal {
+                    detail: "post-ACK lane returned the wrong writer result".to_owned(),
+                });
+            }
+        };
+        prepared.push(prepared_append);
+    }
+    Ok(prepared)
+}
+
+struct AppendGroupStats {
+    touched: HashMap<std::path::PathBuf, (WalHandle, Arc<crate::scribe::wal::WalSegment>)>,
+    durable_frames: u64,
+    durable_rows: u64,
+    wal_bytes: u64,
+    elapsed: std::time::Duration,
+}
+
+async fn append_group(
+    runtime: &WriterRuntime,
+    prepared: &mut Vec<crate::scribe::preprocess::PreparedAppend>,
+    seen_slices: &mut HashSet<AppendSliceId>,
+    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+) -> Result<AppendGroupStats, ScribeError> {
+    let started = Instant::now();
+    let mut stats = AppendGroupStats {
+        touched: HashMap::new(),
+        durable_frames: 0,
+        durable_rows: 0,
+        wal_bytes: 0,
+        elapsed: std::time::Duration::ZERO,
+    };
+    for prepared_append in prepared {
+        let batch_id = *prepared_append.batch_id.as_bytes();
+        let slices = std::mem::take(&mut prepared_append.slices);
+        let mut frame_had_work = false;
+        for slice in slices {
+            if seen_slices.contains(&slice.id) {
+                continue;
+            }
+            if seen_slices.len() >= MAX_DEDUPE_SLICES {
+                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "dedupe_capacity")
+                    .increment(1);
+                return Err(ScribeError::IngestBusy {
+                    table: slice.seal_key.table.fqn(),
+                });
+            }
+            seen_slices.insert(slice.id.clone());
+            metrics::gauge!("bifrost_scribe_dedupe_bytes").set(
+                seen_slices
+                    .len()
+                    .saturating_mul(256)
+                    .to_f64()
+                    .unwrap_or(f64::MAX),
+            );
+            frame_had_work = true;
+            let seal_key = slice.seal_key.clone();
+            let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
+                handle.clone()
+            } else {
+                let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
+                wal_handles.insert(seal_key.clone(), handle.clone());
+                handle
+            };
+            let PreparedSlice {
+                audit_event,
+                rows,
+                wal_append,
+                memtable_bytes,
+                ..
+            } = slice;
+            let ScribeWalIoResult::WalWritten { wal, result } = runtime
+                .wal_io
+                .submit(ScribeWalIoOp::WritePrepared {
+                    wal: wal_handle,
+                    append: wal_append,
+                })
+                .await?
+            else {
+                return Err(ScribeError::Internal {
+                    detail: "WAL IO lane returned the wrong write result".to_owned(),
+                });
+            };
+            let lsn = result.lsn;
+            stats.wal_bytes = stats.wal_bytes.saturating_add(result.encoded_bytes);
+            for segment in result.touched_segments {
+                stats
+                    .touched
+                    .insert(segment.path().to_path_buf(), (wal.clone(), segment));
+            }
+            let row_count = rows.num_rows();
+            stats.durable_rows = stats
+                .durable_rows
+                .saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            runtime
+                .admission
+                .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+            if let Err(error) = runtime.memtable.insert(
+                &seal_key,
+                audit_event,
+                ScribeAppendMeta {
+                    batch_id,
+                    rows_accepted: row_count,
+                    wal_lsn_min: lsn,
+                    wal_lsn_max: lsn,
+                    seal_key: seal_key.as_path_components(),
+                },
+                rows,
+            ) {
+                runtime.admission.release_active(memtable_bytes);
+                return Err(error);
+            }
+        }
+        if frame_had_work {
+            stats.durable_frames = stats.durable_frames.saturating_add(1);
+        }
+    }
+    stats.elapsed = started.elapsed();
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -769,6 +866,7 @@ mod tests {
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::admission::AdmissionConfig;
     use crate::scribe::execution_lanes::{ScribePostAckCpuPool, ScribeWalIoPool};
+    use crate::scribe::wal::WalConfig;
 
     fn wal_root(temp_dir: &TempDir) -> Arc<WalWriter> {
         Arc::new(
@@ -777,7 +875,7 @@ mod tests {
                 [0_u8; 16],
                 1,
                 DataTenantId::SYSTEM_OWNER,
-                None,
+                WalConfig::default(),
             )
             .expect("wal"),
         )
@@ -796,7 +894,6 @@ mod tests {
             wal_root(&temp_dir),
             post_ack_cpu,
             wal_io,
-            None,
         );
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let binding = TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, table.clone()))
@@ -818,7 +915,6 @@ mod tests {
         TenantTableWriterRegistry::enqueue(
             &writer,
             AdmittedAppend {
-                request_id: RequestId::now_v7(),
                 batch_id: Uuid::now_v7(),
                 frame_sequence: 0,
                 audit_event: AuditEvent {

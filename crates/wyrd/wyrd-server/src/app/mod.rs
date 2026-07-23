@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tracing::info;
 use wyrd_telemetry::{TelemetryGuard, init as init_telemetry};
 
+use crate::app::metrics::install_recorder;
 use crate::boot::{StateOverrides, build_state, production_guards};
 use crate::config::{ServeMode, WyrdServerConfig};
 
@@ -37,6 +38,11 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
     let telemetry: Arc<TelemetryGuard> = Arc::new(
         init_telemetry(config.telemetry.clone()).map_err(|e| BootExit::Other(Box::new(e)))?,
     );
+    let metrics_handle = if config.metrics.enabled {
+        Some(install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?)
+    } else {
+        None
+    };
     info!(
         service.name = config
             .telemetry
@@ -52,7 +58,7 @@ pub async fn run(mode: Option<ServeMode>) -> Result<(), BootExit> {
         .await
         .map_err(|e| BootExit::Other(Box::new(e)))?;
 
-    let result = WyrdServer::new(config, state)
+    let result = WyrdServer::new_with_metrics_handle(config, state, metrics_handle)
         .map_err(|e| BootExit::Other(Box::new(e)))?
         .serve(mode)
         .await;

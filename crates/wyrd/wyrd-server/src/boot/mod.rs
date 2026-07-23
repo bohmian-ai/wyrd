@@ -11,12 +11,13 @@ use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
+use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
-use vala_bifrost_redux::scribe::wal::WalWriter;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
-    ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
+    ScribeBuildConfig, ScribeCommitConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
     ScribePostAckCpuPool, ScribeWalIoPool,
 };
 use wyrd_auth_oidc::WorkloadBinding;
@@ -243,6 +244,15 @@ pub async fn build_app_state_from_boot_with_config(
     // so the ingest and query paths have their physical Iceberg tables. Idempotent
     // and append-only — a no-op after first boot; fails closed on schema drift.
     vala_bifrost::tables::register_all(&bifrost).await?;
+    let bifrost_redux = Arc::new(
+        BifrostCatalog::new(
+            dsns.catalog_app.expose_secret(),
+            storage.backend_config(),
+            postgres.vala().clone(),
+        )
+        .await
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+    );
 
     let operator_pool =
         postgres
@@ -268,7 +278,9 @@ pub async fn build_app_state_from_boot_with_config(
             *stream.node_id.as_bytes(),
             stream.writer_epoch.as_i64(),
             DataTenantId::SYSTEM_OWNER,
-            None,
+            WalConfig {
+                segment_bytes: scribe_config.wal_segment_bytes,
+            },
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
@@ -281,11 +293,15 @@ pub async fn build_app_state_from_boot_with_config(
         ingress_queue_bytes = scribe_config.ingress_queue_bytes,
         retained_frame_items = scribe_config.retained_frame_items,
         retained_frame_bytes = scribe_config.retained_frame_bytes,
+        memory_limit_bytes = scribe_config.memory_limit_bytes,
         post_ack_queue_items = scribe_config.post_ack_queue_items,
         wal_io_queue_items = scribe_config.wal_io_queue_items,
         writer_queue_items = scribe_config.writer_queue_items,
         active_writer_limit = scribe_config.active_writer_limit,
         writer_idle_ttl_secs = scribe_config.writer_idle_ttl_secs,
+        commit_group_frames = scribe_config.commit_group_frames,
+        commit_group_bytes = scribe_config.commit_group_bytes,
+        wal_segment_bytes = scribe_config.wal_segment_bytes,
         "resolved Scribe runtime configuration"
     );
     let coordination_runtime = Arc::new(
@@ -311,21 +327,24 @@ pub async fn build_app_state_from_boot_with_config(
         max_writers: scribe_config.active_writer_limit,
         writer_queue_items: scribe_config.writer_queue_items,
         writer_idle_ttl: std::time::Duration::from_secs(scribe_config.writer_idle_ttl_secs),
-        memory_limit_bytes: scribe_config.retained_frame_bytes,
+        memory_limit_bytes: scribe_config.memory_limit_bytes,
     };
     let execution_pools = ScribeExecutionPools::new(
-        ScribeIngressCpuPool::new_with_capacity(
+        ScribeIngressCpuPool::try_new_with_capacity(
             scribe_config.ingress_cpu_threads,
             scribe_config.ingress_queue_items,
-        ),
-        ScribePostAckCpuPool::new_with_capacity(
+        )
+        .map_err(|error| ServerBootError::Scribe(format!("ingress CPU pool failed: {error}")))?,
+        ScribePostAckCpuPool::try_new_with_capacity(
             scribe_config.post_ack_cpu_threads,
             scribe_config.post_ack_queue_items,
-        ),
-        ScribeWalIoPool::new_with_capacity(
+        )
+        .map_err(|error| ServerBootError::Scribe(format!("post-ACK CPU pool failed: {error}")))?,
+        ScribeWalIoPool::try_new_with_capacity(
             scribe_config.wal_io_threads,
             scribe_config.wal_io_queue_items,
-        ),
+        )
+        .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
     );
     let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
         Arc::new(storage.operator().clone()),
@@ -334,11 +353,15 @@ pub async fn build_app_state_from_boot_with_config(
         stream.writer_epoch.as_i64(),
         ScribeBuildConfig {
             admission,
-            telemetry: None,
             coordination_runtime: coordination_runtime.handle().clone(),
             execution_pools,
             ingress_queue_items: scribe_config.ingress_queue_items,
             ingress_queue_bytes: scribe_config.ingress_queue_bytes,
+            commit_config: ScribeCommitConfig::new(
+                scribe_config.commit_group_frames,
+                scribe_config.commit_group_bytes,
+            )
+            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         },
     ));
     let replayed_generations = scribe
@@ -350,12 +373,13 @@ pub async fn build_app_state_from_boot_with_config(
     let forge_context = ForgeContext::new(
         postgres.vala().clone(),
         operator_pool,
-        bifrost.iceberg_catalog(),
+        bifrost_redux.iceberg_catalog(),
         Arc::new(storage.operator().clone()),
         ForgeConfig::default(),
     )?;
 
     Ok(AppState::new(postgres, storage, bifrost)
+        .with_bifrost_redux(bifrost_redux)
         .with_forge_context(forge_context)
         .with_scribe(scribe)
         .with_scribe_coordination_runtime(coordination_runtime))
@@ -413,10 +437,12 @@ pub async fn build_state(
         .scribe
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires Scribe".to_owned()))?;
+    let bifrost_redux = state
+        .bifrost_redux
+        .clone()
+        .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
     let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-        Arc::new(crate::bifrost::catalog_adapter::ServerCatalog::new(
-            state.bifrost.clone(),
-        )),
+        bifrost_redux,
         scribe.clone(),
         vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
         vala_bifrost_redux::gate::limits::IngestLimits::default(),

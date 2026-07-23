@@ -181,6 +181,9 @@ pub struct ScribeRuntimeConfig {
     /// Pod-global retained frame byte capacity.
     #[serde(default = "default_scribe_retained_frame_bytes")]
     pub retained_frame_bytes: usize,
+    /// Pod memory budget for active and immutable Arrow generations.
+    #[serde(default = "default_scribe_memory_limit_bytes")]
+    pub memory_limit_bytes: usize,
     /// Post-ACK CPU submission capacity.
     #[serde(default = "default_scribe_post_ack_queue_items")]
     pub post_ack_queue_items: usize,
@@ -196,6 +199,15 @@ pub struct ScribeRuntimeConfig {
     /// Idle writer eviction TTL in seconds.
     #[serde(default = "default_scribe_writer_idle_ttl_secs")]
     pub writer_idle_ttl_secs: u64,
+    /// Maximum frames committed by one opportunistic writer group.
+    #[serde(default = "default_scribe_commit_group_frames")]
+    pub commit_group_frames: usize,
+    /// Maximum retained bytes committed by one opportunistic writer group.
+    #[serde(default = "default_scribe_commit_group_bytes")]
+    pub commit_group_bytes: usize,
+    /// Maximum WAL segment size before rollover.
+    #[serde(default = "default_scribe_wal_segment_bytes")]
+    pub wal_segment_bytes: u64,
 }
 
 fn default_scribe_coordination_threads() -> usize {
@@ -235,6 +247,10 @@ fn default_scribe_retained_frame_bytes() -> usize {
     512 * 1024 * 1024
 }
 
+fn default_scribe_memory_limit_bytes() -> usize {
+    1024 * 1024 * 1024
+}
+
 fn default_scribe_post_ack_queue_items() -> usize {
     64
 }
@@ -255,6 +271,18 @@ fn default_scribe_writer_idle_ttl_secs() -> u64 {
     600
 }
 
+fn default_scribe_commit_group_frames() -> usize {
+    64
+}
+
+fn default_scribe_commit_group_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_scribe_wal_segment_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
 impl Default for ScribeRuntimeConfig {
     fn default() -> Self {
         Self {
@@ -266,11 +294,15 @@ impl Default for ScribeRuntimeConfig {
             ingress_queue_bytes: default_scribe_ingress_queue_bytes(),
             retained_frame_items: default_scribe_retained_frame_items(),
             retained_frame_bytes: default_scribe_retained_frame_bytes(),
+            memory_limit_bytes: default_scribe_memory_limit_bytes(),
             post_ack_queue_items: default_scribe_post_ack_queue_items(),
             wal_io_queue_items: default_scribe_wal_io_queue_items(),
             writer_queue_items: default_scribe_writer_queue_items(),
             active_writer_limit: default_scribe_active_writer_limit(),
             writer_idle_ttl_secs: default_scribe_writer_idle_ttl_secs(),
+            commit_group_frames: default_scribe_commit_group_frames(),
+            commit_group_bytes: default_scribe_commit_group_bytes(),
+            wal_segment_bytes: default_scribe_wal_segment_bytes(),
         }
     }
 }
@@ -296,6 +328,7 @@ impl ScribeRuntimeConfig {
         for (name, value) in [
             ("ingress_queue_bytes", self.ingress_queue_bytes),
             ("retained_frame_bytes", self.retained_frame_bytes),
+            ("memory_limit_bytes", self.memory_limit_bytes),
         ] {
             if value < min_bytes {
                 return Err(format!("scribe.{name} must be at least 33554432 bytes"));
@@ -303,6 +336,15 @@ impl ScribeRuntimeConfig {
         }
         if self.writer_idle_ttl_secs == 0 {
             return Err("scribe.writer_idle_ttl_secs must be at least 1".to_owned());
+        }
+        if self.commit_group_frames == 0 {
+            return Err("scribe.commit_group_frames must be at least 1".to_owned());
+        }
+        if self.commit_group_bytes == 0 {
+            return Err("scribe.commit_group_bytes must be at least 1".to_owned());
+        }
+        if self.wal_segment_bytes == 0 {
+            return Err("scribe.wal_segment_bytes must be at least 1".to_owned());
         }
         Ok(())
     }
@@ -1458,6 +1500,7 @@ mod tests {
         assert_eq!(cfg.coordination_threads, 2);
         assert_eq!(cfg.ingress_queue_items, 256);
         assert_eq!(cfg.retained_frame_items, 256);
+        assert_eq!(cfg.memory_limit_bytes, 1024 * 1024 * 1024);
         assert_eq!(cfg.post_ack_queue_items, 64);
         assert_eq!(cfg.wal_io_queue_items, 256);
         assert_eq!(cfg.writer_queue_items, 64);

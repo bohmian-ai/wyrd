@@ -19,6 +19,8 @@ use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
 use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::{EventDay, SealKey};
+#[cfg(test)]
+use crate::scribe::wal::WalConfig;
 use crate::scribe::wal::{WalLsn, WalReader, WalRecord};
 
 /// Replayed state for one seal-key.
@@ -251,8 +253,14 @@ mod tests {
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let writer = wal
             .handle_for_seal_key(replay_key(tenant_id))
             .expect("seal-key handle");
@@ -297,8 +305,14 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let first_key = replay_key(tenant_id);
         let second_key = SealKey::new(
             tenant_id,
@@ -365,8 +379,14 @@ mod tests {
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let writer = wal
             .handle_for_seal_key(replay_key(tenant_id))
             .expect("seal-key handle");
@@ -417,8 +437,14 @@ mod tests {
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let writer = wal
             .handle_for_seal_key(replay_key(tenant_id))
             .expect("seal-key handle");
@@ -490,8 +516,14 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
         let tenant_id = DataTenantId::SYSTEM_OWNER;
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 1, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let seal_key = replay_key(tenant_id);
         let writer = wal
             .handle_for_seal_key(seal_key.clone())
@@ -551,8 +583,14 @@ mod tests {
         let tenant_id = DataTenantId::SYSTEM_OWNER;
 
         // Write segments with writer_epoch=3
-        let wal = WalWriter::new(temp_dir.path(), *node_id.as_bytes(), 3, tenant_id, None)
-            .expect("writer");
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            3,
+            tenant_id,
+            WalConfig::default(),
+        )
+        .expect("writer");
         let writer = wal
             .handle_for_seal_key(replay_key(tenant_id))
             .expect("seal-key handle");
@@ -602,8 +640,8 @@ mod tests {
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"));
         let seal_key = SealKey::new(tenant, table, day);
-        let writer =
-            WalWriter::new(temp_dir.path(), [9_u8; 16], 1, tenant, None).expect("wal writer");
+        let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, tenant, WalConfig::default())
+            .expect("wal writer");
         let handle = writer
             .handle_for_seal_key(seal_key.clone())
             .expect("wal handle");

@@ -240,11 +240,16 @@ def test_artifact_card_input_rejects_non_artifact_card_ref() -> None:
     assert exc.value.details["actual_kind"] == "Data"
 
 
-def test_manifest_ref_rejects_missing_space() -> None:
-    with pytest.raises(WyrdError) as exc:
-        ImageInterface(manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"})
+def test_manifest_ref_allows_authored_ref_without_space() -> None:
+    interface = ImageInterface(
+        manifest_ref={"kind": "Artifact", "name": "manifest", "version": "1.0.0"}
+    )
 
-    assert exc.value.code
+    assert interface.to_dict()["meta"]["manifest_ref"] == {
+        "kind": "Artifact",
+        "name": "manifest",
+        "version": "1.0.0",
+    }
 
 
 def test_set_interface_replaces_spec_metadata_and_schema() -> None:

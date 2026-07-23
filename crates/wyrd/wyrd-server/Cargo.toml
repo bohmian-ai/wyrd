@@ -87,6 +87,9 @@ wyrd-cli = { path = "../wyrd-cli", version = "0.0.1" }
 wyrd-client = { path = "../../shared/wyrd-client", version = "0.0.1" }
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
+wyrd-loader = { path = "../../shared/wyrd-loader", version = "0.0.1" }
+wyrd-registry = { path = "../../shared/wyrd-registry", version = "0.0.1" }
+wyrd-storage-client = { path = "../../shared/wyrd-storage-client", version = "0.0.1" }
 
 [[test]]
 name = "pg_grpc_smoke"

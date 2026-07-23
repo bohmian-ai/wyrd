@@ -16,8 +16,10 @@ use wyrd_spec::card::workflow::{
     WorkflowAction, WorkflowCard, WorkflowCardError, WorkflowSpec, WorkflowStep,
 };
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::SpaceName;
 use wyrd_spec::metadata::{Annotations, CardMetadata, Labels};
-use wyrd_spec::reference::{AgentRef, CardRef, PromptRef};
+use wyrd_spec::reference::{CardRef, InlineableRef};
+use wyrd_spec::{AgentCard, AgentSpec};
 
 use crate::context::Context;
 use crate::def::{TaskDef, WorkflowAgent, WorkflowDef, default_max_retries};
@@ -32,6 +34,19 @@ pub enum WorkflowInput {
     Text(String),
     /// Pre-shaped variable bindings.
     Vars(Map<String, Value>),
+}
+
+/// Resolves durable Agent Card references into runtime agents.
+pub trait AgentResolver: Send + Sync {
+    /// Resolve a referenced Agent Card without performing filesystem or
+    /// network work in the workflow surface.
+    fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError>;
+}
+
+impl<T: AgentResolver + ?Sized> AgentResolver for &T {
+    fn resolve(&self, agent_ref: &InlineableRef<AgentSpec>) -> Result<Agent, WyrdError> {
+        (**self).resolve(agent_ref)
+    }
 }
 
 impl From<&str> for WorkflowInput {
@@ -308,8 +323,8 @@ impl Workflow {
 
     /// Reconstruct a workflow from a `WorkflowCard` envelope.
     ///
-    /// Inline `AgentRef::Inline` steps populate the resolved-agents map
-    /// eagerly; `AgentRef::Card` steps require runtime resolution before
+    /// Inline agent steps populate the resolved-agents map eagerly. Referenced
+    /// agent steps require [`Self::from_card_with_agent_resolver`] before
     /// `.run()` can drive them.
     ///
     /// # Errors
@@ -320,22 +335,53 @@ impl Workflow {
         tool_resolver: &dyn skald_tool::ToolResolver,
         prompt_resolver: &dyn skald_agent::PromptResolver,
     ) -> Result<Self, WyrdError> {
+        Self::from_card_with_agent_resolver(card, tool_resolver, prompt_resolver, None)
+    }
+
+    /// Reconstruct a workflow and hydrate referenced Agent Card steps through
+    /// an explicit runtime resolver.
+    ///
+    /// `Sibling` is accepted here because the loader and registration engine
+    /// have already established its exact identity. The resolver owns the
+    /// durable-card lookup; this crate performs no filesystem or network IO.
+    ///
+    /// # Errors
+    /// Returns prompt, tool, or agent resolver errors.
+    pub fn from_card_with_agent_resolver(
+        card: WorkflowCard,
+        tool_resolver: &dyn skald_tool::ToolResolver,
+        prompt_resolver: &dyn skald_agent::PromptResolver,
+        agent_resolver: Option<&dyn AgentResolver>,
+    ) -> Result<Self, WyrdError> {
         let mut resolved = HashMap::new();
         for step in &card.spec.steps {
-            if let WorkflowAction::Agent(AgentRef::Inline(spec)) = &step.action {
-                let card = wyrd_spec::AgentCard {
-                    space: card.space.clone(),
-                    name: format!("{}-{}", card.name, step.id),
-                    version: "0.0.0".to_owned(),
-                    uid: String::new(),
-                    labels: Labels::default(),
-                    annotations: Annotations::default(),
-                    spec: (**spec).clone(),
-                    cascade_children: Vec::new(),
-                    created_at: Utc::now(),
-                };
-                let agent = Agent::from_card(card, tool_resolver, prompt_resolver)?;
-                resolved.insert(step.id.clone(), Arc::new(agent));
+            match &step.action {
+                WorkflowAction::Agent(InlineableRef::Inline(spec)) => {
+                    let card = AgentCard {
+                        space: card.space.clone(),
+                        name: format!("{}-{}", card.name, step.id),
+                        version: "0.0.0".to_owned(),
+                        uid: String::new(),
+                        labels: Labels::default(),
+                        annotations: Annotations::default(),
+                        spec: (**spec).clone(),
+                        cascade_children: Vec::new(),
+                        created_at: Utc::now(),
+                    };
+                    let agent = Agent::from_card(card, tool_resolver, prompt_resolver)?;
+                    resolved.insert(step.id.clone(), Arc::new(agent));
+                }
+                WorkflowAction::Agent(
+                    agent_ref @ (InlineableRef::Ref(_) | InlineableRef::Sibling { .. }),
+                ) => {
+                    if let Some(agent_resolver) = agent_resolver {
+                        let agent = agent_resolver.resolve(agent_ref)?;
+                        resolved.insert(step.id.clone(), Arc::new(agent));
+                    }
+                }
+                WorkflowAction::Agent(InlineableRef::Path(_))
+                | WorkflowAction::Mcp(_)
+                | WorkflowAction::Prompt(_) => {}
             }
         }
         Ok(Self {
@@ -468,13 +514,13 @@ impl Workflow {
             .map_err(|error| WorkflowError::Other(error.to_string()))?
         {
             self.cascade_children.push(card_ref.clone());
-            WorkflowAction::Agent(AgentRef::Card(card_ref))
+            WorkflowAction::Agent(InlineableRef::Ref(card_ref))
         } else {
             let spec = agent.to_spec();
-            if let PromptRef::Card(prompt_ref) = &spec.prompt {
+            if let Some(prompt_ref) = spec.prompt.as_card_ref() {
                 self.cascade_children.push(prompt_ref.clone());
             }
-            WorkflowAction::Agent(AgentRef::from(spec))
+            WorkflowAction::Agent(InlineableRef::from(spec))
         };
         self.spec.steps.push(WorkflowStep {
             id: step_id.clone(),
@@ -513,13 +559,13 @@ impl Workflow {
         self.cascade_children.sort_by(|a, b| {
             let a_key = (
                 a.kind.wire_name(),
-                a.space.as_str(),
+                a.space.as_ref().map(SpaceName::as_str),
                 a.name.as_str(),
                 a.version.to_string(),
             );
             let b_key = (
                 b.kind.wire_name(),
-                b.space.as_str(),
+                b.space.as_ref().map(SpaceName::as_str),
                 b.name.as_str(),
                 b.version.to_string(),
             );

@@ -16,12 +16,14 @@ use wyrd_spec::storage::{StorageBackendKind, UploadPlan, WireProtocol};
 pub struct GcsSigner {
     client: Client,
     bucket: String,
+    emulator_endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for GcsSigner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GcsSigner")
             .field("bucket", &self.bucket)
+            .field("emulator_endpoint", &self.emulator_endpoint)
             .field("client", &"<gcloud_storage::client::Client>")
             .finish()
     }
@@ -31,7 +33,22 @@ impl GcsSigner {
     /// Build a GCS signer from an already-built SDK client.
     #[must_use]
     pub fn new(client: Client, bucket: String) -> Self {
-        Self { client, bucket }
+        Self {
+            client,
+            bucket,
+            emulator_endpoint: None,
+        }
+    }
+
+    /// Build a signer for the fake-GCS emulator's unsigned media endpoint.
+    #[cfg(any(test, feature = "emulator"))]
+    #[must_use]
+    pub fn new_emulator(client: Client, bucket: String, endpoint: &str) -> Self {
+        Self {
+            client,
+            bucket,
+            emulator_endpoint: Some(endpoint.trim_end_matches('/').to_owned()),
+        }
     }
 
     /// Borrow the bucket name.
@@ -129,6 +146,13 @@ impl GcsSigner {
         path: &ValidatedPath,
         ttl: Duration,
     ) -> Result<String, StorageError> {
+        if let Some(endpoint) = &self.emulator_endpoint {
+            return Ok(format!(
+                "{endpoint}/storage/v1/b/{}/o/{}?alt=media",
+                self.bucket,
+                path.full.replace('/', "%2F")
+            ));
+        }
         self.client
             .signed_url(
                 &self.bucket,

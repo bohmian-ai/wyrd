@@ -159,7 +159,7 @@ hide = true
 description = "Run vala-bifrost-redux Postgres+opendal integration tests (scribe seal state machine)"
 depends = ["setup:postgres"]
 env = { DATABASE_URL = "postgres://wyrd_migrator:wyrd_migrator_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo test --locked -p vala-bifrost-redux --tests --features scribe-inspect -- --test-threads=1"
+run = "cargo test --locked -p vala-bifrost-redux --tests -- --test-threads=1"
 
 [tasks."test:bifrost:journey"]
 description = """Run the Stage-5 closeout Rust user-journey tests (marked #[ignore] so they
@@ -405,7 +405,7 @@ run = "cargo test -p wyrd-storage --all-features --test integration_azurite -- -
 
 [tasks."test:storage:e2e"]
 hide = true
-description = "Run server-level storage HTTP e2e tests (local single-put + S3/GCS/Azure multipart) against the docker emulators + Postgres"
+description = "Run real WyrdStorageClient client/server upload and verified-download journeys (Local + S3/GCS/Azure emulators) against Postgres"
 depends = ["storage:up", "setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_E2E = "1", WYRD_STORAGE_INTEGRATION_S3 = "1", WYRD_STORAGE_INTEGRATION_GCS = "1", WYRD_STORAGE_INTEGRATION_AZURE = "1", WYRD_GCS_EMULATOR_HOST = "http://localhost:4443", WYRD_AZURE_EMULATOR_ENDPOINT = "http://127.0.0.1:10000", AWS_ACCESS_KEY_ID = "wyrd-test-key", AWS_SECRET_ACCESS_KEY = "wyrd-test-secret", AWS_REGION = "us-east-1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
 run = "cargo test -p wyrd-server --features storage-emulator --test storage_e2e -- --nocapture --test-threads=1"
@@ -413,7 +413,7 @@ run = "cargo test -p wyrd-server --features storage-emulator --test storage_e2e 
 
 [tasks."test:storage:s3:cloud"]
 hide = true
-description = "Run the StorageHandle CRUD + server multipart e2e against real AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
+description = "Run StorageHandle CRUD plus the real WyrdStorageClient client/server journey against AWS S3 (merge-to-main only; requires AWS creds + WYRD_STORAGE_S3_BUCKET in env)"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_S3 = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
@@ -423,7 +423,7 @@ cargo test -p wyrd-server --features storage-emulator --test storage_e2e s3_mult
 
 [tasks."test:storage:gcs:cloud"]
 hide = true
-description = "Run the StorageHandle CRUD + server multipart e2e against real GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
+description = "Run StorageHandle CRUD plus the real WyrdStorageClient client/server journey against GCS (merge-to-main only; requires GCP creds + WYRD_STORAGE_GCS_BUCKET in env)"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_GCS = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
@@ -433,7 +433,7 @@ cargo test -p wyrd-server --features storage-emulator --test storage_e2e gcs_mul
 
 [tasks."test:storage:azure:cloud"]
 hide = true
-description = "Run the StorageHandle CRUD + server multipart e2e against real Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
+description = "Run StorageHandle CRUD plus the real WyrdStorageClient client/server journey against Azure Blob Storage (merge-to-main only; requires Azure creds + WYRD_STORAGE_AZURE_{ACCOUNT,CONTAINER} in env)"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_STORAGE_CLOUD_AZURE = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw" }
 run = """
@@ -710,10 +710,17 @@ hide = true
 description = "Run the split-registry gateway workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
 
+[tasks."examples:cli:registration-progress"]
+description = "Show Card registration terminal progress rendering"
+run = "cargo run --locked -p wyrd-cli --example registration_progress"
+
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
-run = "cargo build -p skald-workflow --examples --features otel"
+run = [
+  "cargo build -p skald-workflow --examples --features otel",
+  "cargo check --locked -p wyrd-cli --example registration_progress",
+]
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"

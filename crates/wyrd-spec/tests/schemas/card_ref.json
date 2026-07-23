@@ -1,12 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "CardRef",
-  "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+  "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
   "type": "object",
   "required": [
     "kind",
     "name",
-    "space",
     "version"
   ],
   "properties": {
@@ -27,10 +26,13 @@
       ]
     },
     "space": {
-      "description": "Space pinning identity together with `name` and `version`.",
-      "allOf": [
+      "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+      "anyOf": [
         {
           "$ref": "#/definitions/SpaceName"
+        },
+        {
+          "type": "null"
         }
       ]
     },

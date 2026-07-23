@@ -49,7 +49,7 @@ pub async fn upsert_drift_alert(
     .bind(ins.drift_ref.kind.wire_name())
     .bind(ins.drift_ref.name.as_str())
     .bind(ins.drift_ref.version.to_string())
-    .bind(ins.drift_ref.space.as_str())
+    .bind(resolved_space(ins.drift_ref)?)
     .bind(ins.drift_type)
     .bind(ins.series.unwrap_or(""))
     .bind(ins.alert)
@@ -85,7 +85,7 @@ pub async fn resolve_drift_alerts(
     .bind(drift_ref.kind.wire_name())
     .bind(drift_ref.name.as_str())
     .bind(drift_ref.version.to_string())
-    .bind(drift_ref.space.as_str())
+    .bind(resolved_space(drift_ref)?)
     .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
@@ -117,11 +117,55 @@ pub async fn acknowledge_drift_alert(
     .bind(drift_ref.kind.wire_name())
     .bind(drift_ref.name.as_str())
     .bind(drift_ref.version.to_string())
-    .bind(drift_ref.space.as_str())
+    .bind(resolved_space(drift_ref)?)
     .bind(drift_type)
     .bind(series)
     .execute(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
     Ok(())
+}
+
+fn resolved_space(card_ref: &CardRef) -> Result<&str, SqlError> {
+    card_ref
+        .space
+        .as_ref()
+        .map(|space| space.as_str())
+        .ok_or_else(|| SqlError::InvariantViolation {
+            detail: format!("drift alert reference {} has no resolved space", card_ref),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolved_space;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::CardRef;
+
+    fn card_ref(space: Option<SpaceName>) -> CardRef {
+        CardRef {
+            kind: CardKind::Drift,
+            name: CardName::new("drift").expect("test card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("test version is valid"),
+            space,
+            uid: None,
+        }
+    }
+
+    #[test]
+    fn resolved_space_returns_persisted_space() {
+        let reference = card_ref(Some(SpaceName::new("default").expect("space is valid")));
+        assert_eq!(
+            resolved_space(&reference).expect("space resolves"),
+            "default"
+        );
+    }
+
+    #[test]
+    fn resolved_space_rejects_unresolved_reference() {
+        let error = resolved_space(&card_ref(None)).expect_err("space must be resolved");
+        assert!(matches!(error, crate::SqlError::InvariantViolation { .. }));
+    }
 }

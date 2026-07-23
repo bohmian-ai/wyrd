@@ -12,9 +12,6 @@ description = "External Wyrd client transport runtime."
 [lib]
 path = "src/lib.rs"
 
-[features]
-test-util = []
-
 [dependencies]
 chrono = { workspace = true }
 reqwest = { workspace = true }
@@ -22,7 +19,6 @@ schemars = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-shellexpand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 toml = { workspace = true }
@@ -30,8 +26,10 @@ tracing = { workspace = true }
 uuid = { workspace = true, features = ["v7"] }
 wyrd-spec = { workspace = true }
 wyrd-tonic = { workspace = true }
+wyrd-utils = { workspace = true }
 
 [dev-dependencies]
 secrecy = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util", "time"] }
 wyrd-testing = { workspace = true }

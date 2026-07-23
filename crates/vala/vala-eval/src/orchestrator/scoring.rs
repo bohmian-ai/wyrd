@@ -102,15 +102,15 @@ impl ScenarioScoring {
     /// Build aggregation input for a scored scenario.
     ///
     /// # Errors
-    /// Returns [`OrchestratorError`] when mechanic results require a subject_ref
-    /// but the EvalSpec does not declare one.
+    /// Returns [`OrchestratorError`] when mechanic results exist but the caller
+    /// does not supply the publisher's subject reference.
     pub fn scenario_aggregation(
         &self,
         cursor: &ScenarioCursor,
         result: &ScenarioExecutionResults,
+        subject_ref: Option<&CardRef>,
     ) -> Result<ScenarioAggregationInput, OrchestratorError> {
-        let mechanic_results =
-            mechanic_by_subject(self.spec.subject_ref.as_ref(), &result.mechanic)?;
+        let mechanic_results = mechanic_by_subject(subject_ref, &result.mechanic)?;
         let passenger_tasks = result
             .passenger
             .iter()
@@ -173,6 +173,7 @@ impl ScenarioScoring {
     pub async fn score_record_batch(
         &self,
         identity: RunIdentity,
+        subject_ref: Option<&CardRef>,
         records: &[EvalRecordObservation],
     ) -> Result<EvalResults, OrchestratorError> {
         let scenario_id =
@@ -224,10 +225,7 @@ impl ScenarioScoring {
         };
         let aggregation = ScenarioAggregationInput {
             scenario_id,
-            mechanic_results: mechanic_by_subject(
-                self.spec.subject_ref.as_ref(),
-                &scenario.mechanic,
-            )?,
+            mechanic_results: mechanic_by_subject(subject_ref, &scenario.mechanic)?,
             passenger_tasks: Vec::new(),
             conversation_history: Vec::new(),
             started_at,

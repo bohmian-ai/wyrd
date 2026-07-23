@@ -10,7 +10,7 @@ use crate::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationship
 use crate::error::WyrdError;
 use crate::ids::{CardName, CardUid, SpaceName};
 use crate::metadata::{Annotations, Labels};
-use crate::reference::{CardRef, PromptRef};
+use crate::reference::{CardRef, InlineableRef, Ref};
 use wyrd_semver::VersionBlock;
 
 /// Pure-serde mirror of the Skald agent run configuration.
@@ -34,16 +34,20 @@ pub struct AgentRunConfigSpec {
 /// Agent authoring body inside a Wyrd Agent Card envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct AgentSpec {
     /// Prompt reference preserved on disk and resolved by `skald-agent`.
     #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
-    pub prompt: PromptRef,
+    pub prompt: InlineableRef<skald_spec::Prompt>,
     /// Runtime-local tool names resolved from a local Skald tool registry.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_names: Vec<String>,
     /// Agent run configuration.
     #[serde(default, skip_serializing_if = "is_default_run_config")]
     pub run_config: AgentRunConfigSpec,
+    /// Eval and Drift cards that receive observations from this agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes_to: Vec<Ref>,
 }
 
 fn is_default_run_config(config: &AgentRunConfigSpec) -> bool {
@@ -162,7 +166,7 @@ impl AgentCard {
             kind: CardKind::Agent,
             name: card_name("metadata.name", &self.name)?,
             version: version_block("metadata.version", &self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -321,15 +325,7 @@ impl From<AgentCardError> for WyrdError {
 
 /// Return card refs declared by an agent for cascade and scope traversal.
 fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
-    match &spec.prompt {
-        PromptRef::Card(card_ref) => vec![card_ref.clone()],
-        PromptRef::Inline(_) => Vec::new(),
-    }
-}
-
-/// Return card refs declared by an agent for card-ref scope traversal.
-pub(crate) fn scope_child_card_refs(spec: &AgentSpec) -> Vec<CardRef> {
-    derive_cascade_children(spec)
+    spec.prompt.as_card_ref().cloned().into_iter().collect()
 }
 
 fn card_name(field: &str, value: &str) -> Result<CardName, WyrdError> {
@@ -365,20 +361,14 @@ fn optional_card_uid(value: &str) -> Result<Option<CardUid>, WyrdError> {
 }
 
 fn card_ref_display(card_ref: &CardRef) -> String {
-    format!(
-        "{}/{}/{}@{}",
-        card_ref.space,
-        card_ref.kind.wire_name(),
-        card_ref.name,
-        card_ref.version
-    )
+    card_ref.to_string()
 }
 
 #[cfg(test)]
 mod agent_spec_tests {
     use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::envelope::CardKind;
-    use crate::reference::{CardRef, PromptRef};
+    use crate::reference::{CardRef, InlineableRef};
 
     fn prompt() -> skald_spec::Prompt {
         skald_spec::Prompt::new(
@@ -414,7 +404,7 @@ mod agent_spec_tests {
     #[test]
     fn agent_spec_inline_prompt_roundtrips() {
         let spec = AgentSpec {
-            prompt: PromptRef::from(prompt()),
+            prompt: InlineableRef::from(prompt()),
             tool_names: vec!["search_docs".to_owned()],
             run_config: AgentRunConfigSpec {
                 max_iterations: Some(7),
@@ -422,6 +412,7 @@ mod agent_spec_tests {
                 session_recent_limit: Some(5),
                 timeout_ms: Some(1_500),
             },
+            publishes_to: Vec::new(),
         };
 
         let json = serde_json::to_string(&spec).expect("serialize");
@@ -436,15 +427,16 @@ mod agent_spec_tests {
     #[test]
     fn agent_spec_card_prompt_uses_single_version_field() {
         let spec = AgentSpec {
-            prompt: PromptRef::from(CardRef {
+            prompt: InlineableRef::from(CardRef {
                 kind: CardKind::Prompt,
                 name: "planner-prompt".parse().expect("valid card name"),
                 version: "0.3.0".parse().expect("valid version"),
-                space: "research".parse().expect("valid space"),
+                space: Some("research".parse().expect("valid space")),
                 uid: None,
             }),
             tool_names: Vec::new(),
             run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
         };
 
         let yaml = serde_yaml::to_string(&spec).expect("serialize");

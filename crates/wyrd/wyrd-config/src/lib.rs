@@ -8,6 +8,8 @@
 
 #![deny(missing_docs)]
 
+use std::sync::RwLock;
+
 mod config;
 mod discovery;
 mod error;
@@ -19,6 +21,98 @@ mod py;
 pub use config::{Defaults, KindOverride, WyrdConfig};
 pub use error::WyrdConfigError;
 pub use merge::apply_defaults;
+
+type CachedResult = Result<Option<WyrdConfig>, WyrdConfigError>;
+
+static REPO_CONFIG: RwLock<Option<CachedResult>> = RwLock::new(None);
+
+/// Resolve the repository `wyrd.toml` once per process.
+///
+/// Both successful loads and errors are cached. The returned configuration is
+/// cloned so tests can safely reset the cache without invalidating a caller's
+/// value.
+pub fn resolve_repo_config() -> Result<Option<WyrdConfig>, WyrdConfigError> {
+    let mut cache = REPO_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(result) = cache.as_ref() {
+        return result.clone();
+    }
+    let result = config::WyrdConfig::load(None).map(|config| {
+        if config.root_path.is_some() {
+            Some(config)
+        } else {
+            None
+        }
+    });
+    let returned = result.clone();
+    *cache = Some(result);
+    returned
+}
+
+/// Clear the repository config cache for tests that change the working tree.
+#[cfg(test)]
+pub fn reset_repo_config_cache_for_tests() {
+    let mut cache = REPO_CONFIG
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *cache = None;
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::{WyrdConfigError, reset_repo_config_cache_for_tests, resolve_repo_config};
+
+    /// Run a repository-cache assertion from a temporary git root.
+    fn in_temp_repo(contents: Option<&str>, test: impl FnOnce()) {
+        let original = std::env::current_dir().unwrap();
+        let directory = TempDir::new().unwrap();
+        fs::create_dir(directory.path().join(".git")).unwrap();
+        if let Some(contents) = contents {
+            fs::write(directory.path().join("wyrd.toml"), contents).unwrap();
+        }
+        std::env::set_current_dir(directory.path()).unwrap();
+        reset_repo_config_cache_for_tests();
+        test();
+        reset_repo_config_cache_for_tests();
+        std::env::set_current_dir(original).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_repo_config_is_cached_as_none() {
+        in_temp_repo(None, || {
+            assert!(matches!(resolve_repo_config(), Ok(None)));
+            assert!(matches!(resolve_repo_config(), Ok(None)));
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn valid_repo_config_is_cached() {
+        in_temp_repo(Some("[defaults]\nspace = \"journey\"\n"), || {
+            let first = resolve_repo_config().unwrap().unwrap();
+            let second = resolve_repo_config().unwrap().unwrap();
+            assert_eq!(first.defaults.space, second.defaults.space);
+            assert_eq!(first.root_path, second.root_path);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn invalid_repo_config_error_is_cached() {
+        in_temp_repo(Some("[defaults\n"), || {
+            let first = resolve_repo_config().unwrap_err();
+            let second = resolve_repo_config().unwrap_err();
+            assert!(matches!(first, WyrdConfigError::TomlParse { .. }));
+            assert!(matches!(second, WyrdConfigError::TomlParse { .. }));
+        });
+    }
+}
 
 #[cfg(feature = "python")]
 pub use py::register;

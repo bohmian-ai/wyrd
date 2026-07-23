@@ -78,7 +78,7 @@ mod observation_tests {
             kind: CardKind::Agent,
             name: CardName::new("my-agent").unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
             uid: None,
         }
     }

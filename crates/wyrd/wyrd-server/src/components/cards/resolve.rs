@@ -2,10 +2,11 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use wyrd_spec::envelope::{ReferenceSlotVisitor, Spec};
+use wyrd_spec::envelope::Spec;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefIdentity};
+use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::CardSubmission;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::select_card_uids_by_ref_batch;
@@ -24,10 +25,9 @@ pub async fn resolve_card_references(
     for submission in submissions {
         let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
             .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
-        collect_card_refs(&spec, &mut refs);
+        validate_and_collect_refs(&spec, &siblings, &mut refs)?;
     }
 
-    refs.retain(|card_ref| !siblings.contains(&sibling_key(card_ref)));
     refs.sort_by_key(display_ref);
     refs.dedup_by(|left, right| left.same_identity(right));
 
@@ -48,84 +48,219 @@ pub async fn resolve_card_references(
 }
 
 /// Collect the typed `CardRef` fields from one decoded spec.
+#[cfg(test)]
 fn collect_card_refs(spec: &Spec, output: &mut Vec<CardRef>) {
-    let mut collector = RefCollector { output };
-    spec.walk_refs(&mut collector);
+    let mut spec = spec.clone();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => {
+            if let wyrd_spec::reference::Ref::Ref(card_ref) = reference {
+                output.push(card_ref.clone());
+            }
+        }
+        SlotValue::InlineablePrompt(reference) => {
+            if let wyrd_spec::reference::InlineableRef::Ref(card_ref) = reference {
+                output.push(card_ref.clone());
+            }
+        }
+        SlotValue::InlineableAgent(reference) => {
+            if let wyrd_spec::reference::InlineableRef::Ref(card_ref) = reference {
+                output.push(card_ref.clone());
+            }
+        }
+    });
+}
+
+/// Reject loader-only paths, validate typed sibling targets, and collect external refs.
+fn validate_and_collect_refs(
+    spec: &Spec,
+    siblings: &BTreeSet<CardRefIdentity>,
+    output: &mut Vec<CardRef>,
+) -> Result<(), WyrdError> {
+    let mut spec = spec.clone();
+    let mut result = Ok(());
+    ReferenceSlotVisitor::visit(&mut spec, |slot| {
+        if result.is_err() {
+            return;
+        }
+        match slot.value {
+            SlotValue::Durable(reference) => match reference {
+                wyrd_spec::reference::Ref::Ref(card_ref) => output.push(card_ref.clone()),
+                wyrd_spec::reference::Ref::Sibling { sibling } => {
+                    result = validate_sibling(sibling, siblings);
+                }
+                wyrd_spec::reference::Ref::Path(path) => {
+                    result = Err(unresolved_path_error(path));
+                }
+            },
+            SlotValue::InlineablePrompt(reference) => match reference {
+                wyrd_spec::reference::InlineableRef::Ref(card_ref) => output.push(card_ref.clone()),
+                wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
+                    result = validate_sibling(sibling, siblings);
+                }
+                wyrd_spec::reference::InlineableRef::Path(path) => {
+                    result = Err(unresolved_path_error(path));
+                }
+                wyrd_spec::reference::InlineableRef::Inline(_) => {}
+            },
+            SlotValue::InlineableAgent(reference) => match reference {
+                wyrd_spec::reference::InlineableRef::Ref(card_ref) => {
+                    output.push(card_ref.clone());
+                }
+                wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
+                    result = validate_sibling(sibling, siblings);
+                }
+                wyrd_spec::reference::InlineableRef::Path(path) => {
+                    result = Err(unresolved_path_error(path));
+                }
+                wyrd_spec::reference::InlineableRef::Inline(_) => {}
+            },
+        }
+    });
+    result
+}
+
+fn validate_sibling(
+    sibling: &CardRef,
+    siblings: &BTreeSet<CardRefIdentity>,
+) -> Result<(), WyrdError> {
+    if siblings.contains(&sibling_key(sibling)) {
+        Ok(())
+    } else {
+        Err(WyrdError::RegistryUnresolvedDependency {
+            message: format!(
+                "sibling card dependency {} was not submitted",
+                display_ref(sibling)
+            ),
+            details: serde_json::json!({ "card_ref": display_ref(sibling) }),
+        })
+    }
+}
+
+fn unresolved_path_error(path: &std::path::Path) -> WyrdError {
+    WyrdError::RegistryUnresolvedPathRef {
+        message: format!(
+            "card reference path `{}` must be rewritten by the loader",
+            path.display()
+        ),
+        details: serde_json::json!({ "path": path.display().to_string() }),
+    }
 }
 
 /// Bind external and already-minted sibling UIDs into every embedded reference.
 pub fn bind_card_references(
     spec: &mut Spec,
     external: &ResolvedRefs,
-    siblings: &HashMap<(String, String, String), CardUid>,
+    siblings: &HashMap<CardRefIdentity, CardUid>,
 ) -> Result<(), WyrdError> {
-    let mut binder = RefBinder { external, siblings };
-    spec.walk_refs_mut(&mut binder);
-    Ok(())
+    let mut result = Ok(());
+    ReferenceSlotVisitor::visit(spec, |slot| {
+        if result.is_err() {
+            return;
+        }
+        result = match slot.value {
+            SlotValue::Durable(reference) => bind_ref(reference, external, siblings),
+            SlotValue::InlineablePrompt(reference) => {
+                bind_inline_ref(reference, external, siblings)
+            }
+            SlotValue::InlineableAgent(reference) => bind_inline_ref(reference, external, siblings),
+        };
+    });
+    result
 }
 
-/// Collects immutable typed reference slots.
-struct RefCollector<'a> {
-    output: &'a mut Vec<CardRef>,
-}
-
-impl ReferenceSlotVisitor for RefCollector<'_> {
-    fn visit_ref(&mut self, card_ref: &CardRef) {
-        self.output.push(card_ref.clone());
-    }
-
-    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
-}
-
-/// Binds a reference slot to a sibling or external UID when one is available.
-struct RefBinder<'a> {
-    external: &'a ResolvedRefs,
-    siblings: &'a HashMap<(String, String, String), CardUid>,
-}
-
-impl ReferenceSlotVisitor for RefBinder<'_> {
-    fn visit_ref(&mut self, _card_ref: &CardRef) {}
-
-    fn visit_ref_mut(&mut self, card_ref: &mut CardRef) {
-        card_ref.uid = self
-            .siblings
-            .get(&sibling_key(card_ref))
-            .or_else(|| {
-                self.external
-                    .iter()
-                    .find(|(resolved, _)| resolved.same_identity(card_ref))
-                    .map(|(_, uid)| uid)
-            })
-            .cloned();
+fn bind_ref(
+    reference: &mut wyrd_spec::reference::Ref,
+    external: &ResolvedRefs,
+    siblings: &HashMap<CardRefIdentity, CardUid>,
+) -> Result<(), WyrdError> {
+    match reference {
+        wyrd_spec::reference::Ref::Ref(card_ref) => {
+            card_ref.uid = external_uid(card_ref, external);
+            require_uid(card_ref)
+        }
+        wyrd_spec::reference::Ref::Sibling { sibling } => {
+            let uid = siblings.get(&sibling_key(sibling)).cloned();
+            let mut card_ref = sibling.clone();
+            card_ref.uid = uid;
+            require_uid(&card_ref)?;
+            *reference = wyrd_spec::reference::Ref::Ref(card_ref);
+            Ok(())
+        }
+        wyrd_spec::reference::Ref::Path(path) => Err(unresolved_path_error(path)),
     }
 }
 
-/// Collect the `(kind, space, name)` identities that appear as siblings.
+fn bind_inline_ref<T>(
+    reference: &mut wyrd_spec::reference::InlineableRef<T>,
+    external: &ResolvedRefs,
+    siblings: &HashMap<CardRefIdentity, CardUid>,
+) -> Result<(), WyrdError> {
+    match reference {
+        wyrd_spec::reference::InlineableRef::Ref(card_ref) => {
+            card_ref.uid = external_uid(card_ref, external);
+            require_uid(card_ref)
+        }
+        wyrd_spec::reference::InlineableRef::Sibling { sibling } => {
+            let uid = siblings.get(&sibling_key(sibling)).cloned();
+            let mut card_ref = sibling.clone();
+            card_ref.uid = uid;
+            require_uid(&card_ref)?;
+            *reference = wyrd_spec::reference::InlineableRef::Ref(card_ref);
+            Ok(())
+        }
+        wyrd_spec::reference::InlineableRef::Inline(_) => Ok(()),
+        wyrd_spec::reference::InlineableRef::Path(path) => Err(unresolved_path_error(path)),
+    }
+}
+
+fn external_uid(card_ref: &CardRef, external: &ResolvedRefs) -> Option<CardUid> {
+    external
+        .iter()
+        .find(|(resolved, _)| resolved.same_identity(card_ref))
+        .map(|(_, uid)| uid.clone())
+}
+
+fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
+    if card_ref.uid.is_some() {
+        Ok(())
+    } else {
+        Err(WyrdError::RegistryUnresolvedDependency {
+            message: format!("card dependency {} was not resolved", display_ref(card_ref)),
+            details: serde_json::json!({ "card_ref": display_ref(card_ref) }),
+        })
+    }
+}
+
+/// Collect the exact `(kind, space, name, version)` identities that appear as siblings.
 fn sibling_identities(
     submissions: &[CardSubmission],
-) -> Result<BTreeSet<(String, String, String)>, WyrdError> {
+) -> Result<BTreeSet<CardRefIdentity>, WyrdError> {
     submissions
         .iter()
         .map(|submission| {
             let space = submission.metadata.space.as_ref().ok_or_else(|| {
                 WyrdError::registry_invalid_card_spec("metadata.space is required")
             })?;
-            Ok((
-                submission.kind.wire_name().to_owned(),
-                space.as_str().to_owned(),
-                submission.metadata.name.as_str().to_owned(),
-            ))
+            let version = submission.metadata.resolved_pin().cloned().ok_or_else(|| {
+                WyrdError::registry_invalid_card_spec(
+                    "metadata.version must resolve to an exact pin at the registry boundary",
+                )
+            })?;
+            Ok(CardRef {
+                kind: submission.kind.clone(),
+                name: submission.metadata.name.clone(),
+                version,
+                space: Some(space.clone()),
+                uid: None,
+            }
+            .identity_key())
         })
         .collect()
 }
 
-/// Return the version-independent identity used only for sibling matching.
-fn sibling_key(card_ref: &CardRef) -> (String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref.space.as_str().to_owned(),
-        card_ref.name.as_str().to_owned(),
-    )
+/// Return the exact identity used for sibling matching and UID binding.
+fn sibling_key(card_ref: &CardRef) -> CardRefIdentity {
+    card_ref.identity_key()
 }
 
 /// Format a reference for deterministic comparison and actionable errors.
@@ -133,7 +268,10 @@ fn display_ref(card_ref: &CardRef) -> String {
     format!(
         "{}/{}/{}@{}",
         card_ref.kind.wire_name(),
-        card_ref.space,
+        card_ref
+            .space
+            .as_ref()
+            .map_or("<missing-space>", |space| space.as_str()),
         card_ref.name,
         card_ref.version
     )
@@ -141,7 +279,7 @@ fn display_ref(card_ref: &CardRef) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use uuid::Uuid;
     use wyrd_semver::{VersionBlock, VersionSpec};
@@ -151,16 +289,20 @@ mod tests {
     use wyrd_spec::reference::CardRef;
     use wyrd_spec::registry::CardSubmission;
 
-    use super::{bind_card_references, collect_card_refs, sibling_identities};
+    use super::{
+        bind_card_references, collect_card_refs, sibling_identities, validate_and_collect_refs,
+    };
 
     fn prompt_ref(name: &str) -> CardRef {
         CardRef {
             kind: CardKind::Prompt,
             name: name.parse().expect("test_setup: reference name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test_setup: reference version is valid"),
-            space: "default"
-                .parse()
-                .expect("test_setup: reference space is valid"),
+            space: Some(
+                "default"
+                    .parse()
+                    .expect("test_setup: reference space is valid"),
+            ),
             uid: None,
         }
     }
@@ -206,6 +348,36 @@ mod tests {
         .expect("test_setup: service spec is valid")
     }
 
+    fn sibling_service_spec(card_ref: CardRef) -> Spec {
+        Spec::from_kind_and_value(
+            &CardKind::Service,
+            serde_json::json!({
+                "components": [{
+                    "alias": "child",
+                    "ref": {"sibling": card_ref}
+                }]
+            }),
+        )
+        .expect("test_setup: sibling service spec is valid")
+    }
+
+    #[test]
+    fn sibling_prompt_reference_is_not_external() {
+        let prompt = prompt_ref("child");
+        let spec = Spec::from_kind_and_value(
+            &CardKind::Agent,
+            serde_json::json!({"prompt": {"sibling": prompt.clone()}}),
+        )
+        .expect("test_setup: sibling agent spec is valid");
+        let siblings = BTreeSet::from([prompt.identity_key()]);
+        let mut refs = Vec::new();
+
+        validate_and_collect_refs(&spec, &siblings, &mut refs)
+            .expect("test_setup: sibling prompt is accepted");
+
+        assert!(refs.is_empty());
+    }
+
     #[test]
     fn sibling_identity_requires_space() {
         let mut child = submission("child");
@@ -232,15 +404,8 @@ mod tests {
     fn bind_sibling_uid_without_json_shape_sniffing() {
         let expected = prompt_ref("child");
         let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
-        let mut spec = service_spec(expected.clone());
-        let siblings = HashMap::from([(
-            (
-                "Prompt".to_owned(),
-                "default".to_owned(),
-                "child".to_owned(),
-            ),
-            uid.clone(),
-        )]);
+        let mut spec = sibling_service_spec(expected.clone());
+        let siblings = HashMap::from([(expected.identity_key(), uid.clone())]);
 
         bind_card_references(&mut spec, &Vec::new(), &siblings)
             .expect("test_setup: binding succeeds");
@@ -266,5 +431,59 @@ mod tests {
         let mut refs = Vec::new();
         collect_card_refs(&spec, &mut refs);
         assert_eq!(refs[0].uid, Some(uid));
+    }
+
+    #[test]
+    fn external_and_sibling_same_identity_bind_from_separate_sources() {
+        let expected = prompt_ref("shared");
+        let external_uid = CardUid::from_uuid(Uuid::now_v7()).expect("external UUIDv7 is valid");
+        let sibling_uid = CardUid::from_uuid(Uuid::now_v7()).expect("sibling UUIDv7 is valid");
+        let mut spec = Spec::from_kind_and_value(
+            &CardKind::Service,
+            serde_json::json!({
+                "components": [
+                    {"alias": "external", "ref": expected.clone()},
+                    {"alias": "sibling", "ref": {"sibling": expected.clone()}}
+                ]
+            }),
+        )
+        .expect("test_setup: mixed service spec is valid");
+
+        bind_card_references(
+            &mut spec,
+            &vec![(expected.clone(), external_uid.clone())],
+            &HashMap::from([(expected.identity_key(), sibling_uid.clone())]),
+        )
+        .expect("test_setup: mixed binding succeeds");
+
+        let mut refs = Vec::new();
+        collect_card_refs(&spec, &mut refs);
+        assert_eq!(refs[0].uid, Some(external_uid));
+        assert_eq!(refs[1].uid, Some(sibling_uid));
+    }
+
+    #[test]
+    fn sibling_identity_includes_version() {
+        let first = submission("child");
+        let mut second = submission("child");
+        second.metadata.version = Some(VersionSpec::Pin(
+            VersionBlock::parse("2.0.0").expect("test_setup: version is valid"),
+        ));
+
+        let identities = sibling_identities(&[first, second]).expect("identities resolve");
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[test]
+    fn sibling_binding_does_not_match_a_different_version() {
+        let expected = prompt_ref("child");
+        let mut other_version = expected.clone();
+        other_version.version = VersionBlock::parse("2.0.0").expect("version is valid");
+        let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test_setup: UUIDv7 is valid");
+        let mut spec = sibling_service_spec(other_version);
+
+        let error = bind_card_references(&mut spec, &vec![(expected, uid)], &HashMap::new())
+            .expect_err("different sibling version must be rejected");
+        assert_eq!(error.code(), "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY");
     }
 }

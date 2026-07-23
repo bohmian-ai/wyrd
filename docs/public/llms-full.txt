@@ -76,6 +76,7 @@ Generated from the docs content tree and `crates/wyrd-spec/schemas/`. `architect
 ## Get Started
 
 - [Get Started](https://mitari-ai.github.io/wyrd/get-started/): Install Wyrd from the repo and run the DataCard example end to end.
+- [Client configuration](https://mitari-ai.github.io/wyrd/get-started/client-configuration/): Configure Wyrd clients, credentials, and repository defaults for local development and automation.
 
 ## Reference
 
@@ -1783,6 +1784,31 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
         "function_calling_config"
       ],
       "type": "object"
+    },
+    "InlineableRef_for_Prompt": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ],
+          "description": "An embedded child spec."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "OpenAiAllowedTools": {
       "additionalProperties": false,
@@ -3992,27 +4018,6 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "type": "object"
     },
-    "PromptRef": {
-      "anyOf": [
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/Prompt"
-            }
-          ],
-          "description": "Inline native prompt payload."
-        },
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ],
-          "description": "Reference to a registered Prompt Card."
-        }
-      ],
-      "description": "Reference to an agent prompt, either inline or by Prompt Card reference."
-    },
     "ProviderName": {
       "description": "Which provider a request targets.",
       "oneOf": [
@@ -4295,7 +4300,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
     "prompt": {
       "allOf": [
         {
-          "$ref": "#/definitions/PromptRef"
+          "$ref": "#/definitions/InlineableRef_for_Prompt"
         }
       ],
       "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
@@ -4553,6 +4558,23 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -4617,7 +4639,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
     "schema_ref": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/Ref"
         },
         {
           "type": "null"
@@ -4847,6 +4869,23 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -4875,21 +4914,21 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
     "evidence_refs": {
       "description": "Evidence artifact references.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
     "policy_refs": {
       "description": "Policy references.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
     "subject_refs": {
       "description": "Subject Card references.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     }
@@ -5614,7 +5653,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "manifest_ref": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"
@@ -5896,6 +5935,23 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "description": "DataCard SQL query key.",
       "type": "string"
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -5917,7 +5973,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
               "type": "string"
             },
             "value": {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             }
           },
           "required": [
@@ -6094,7 +6150,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
         "manifest_ref": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"
@@ -6157,7 +6213,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "default": [],
       "description": "Durable Artifact card references linked to this data card.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
@@ -6566,7 +6622,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
             "baseline_ref": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ],
               "description": "Data card carrying the baseline artifact."
@@ -6618,7 +6674,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
             "eval_ref": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ],
               "description": "Eval card whose score stream this drift consumes."
@@ -6648,7 +6704,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
             "source_ref": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ],
               "description": "Source card describing where to read the external measurement."
@@ -6890,6 +6946,23 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -6999,7 +7072,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
     "subject_ref": {
       "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/Ref"
         }
       ],
       "description": "Singular subject of the monitor: the entity drift is observed against. Allowed `subject_ref.kind`: `Model | Agent | Service | Data`."
@@ -7028,6 +7101,1035 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "definitions": {
+    "AgentRunConfigSpec": {
+      "description": "Pure-serde mirror of the Skald agent run configuration.",
+      "properties": {
+        "max_iterations": {
+          "description": "Maximum loop iterations before the agent stops.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_recent_limit": {
+          "description": "Maximum recent session turns loaded at run start.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "timeout_ms": {
+          "description": "Overall agent run timeout in milliseconds.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "tool_concurrency_cap": {
+          "description": "Maximum concurrent runtime-local tool calls per model iteration.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "AgentSpec": {
+      "description": "Agent authoring body inside a Wyrd Agent Card envelope.",
+      "properties": {
+        "prompt": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/InlineableRef_for_Prompt"
+            }
+          ],
+          "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
+        },
+        "run_config": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentRunConfigSpec"
+            }
+          ],
+          "description": "Agent run configuration."
+        },
+        "tool_names": {
+          "description": "Runtime-local tool names resolved from a local Skald tool registry.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "AnthropicCacheControl": {
+      "additionalProperties": false,
+      "properties": {
+        "ttl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "AnthropicCitationToggle": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "AnthropicCitationV1": {
+      "description": "Anthropic citation block.",
+      "oneOf": [
+        {
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_char_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_char_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "char_location"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_char_index",
+            "start_char_index",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_page_number": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_page_number": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "page_location"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_page_number",
+            "start_page_number",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "document_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "document_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "end_block_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "start_block_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": {
+              "enum": [
+                "content_block_location"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "cited_text",
+            "document_index",
+            "end_block_index",
+            "start_block_index",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "encrypted_index": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "web_search_result_location"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "cited_text",
+            "type",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cited_text": {
+              "type": "string"
+            },
+            "end_block_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "search_result_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "source": {
+              "type": "string"
+            },
+            "start_block_index": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "search_result_location"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "cited_text",
+            "end_block_index",
+            "search_result_index",
+            "source",
+            "start_block_index",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicContentBlock": {
+      "oneOf": [
+        {
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "citations": {
+              "items": {
+                "$ref": "#/definitions/AnthropicCitationV1"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/AnthropicImageSource"
+            },
+            "type": {
+              "enum": [
+                "image"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "citations": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCitationToggle"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "context": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "$ref": "#/definitions/AnthropicDocumentSource"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "document"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "signature": {
+              "type": "string"
+            },
+            "thinking": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "thinking"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "signature",
+            "thinking",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "redacted_thinking"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "input": true,
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "tool_use"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "input",
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "content": {
+              "$ref": "#/definitions/AnthropicToolResultContent"
+            },
+            "is_error": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tool_use_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "tool_result"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "tool_use_id",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicDocumentSource": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "url"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "file_id"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/definitions/AnthropicContentBlock"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "content"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicImageSource": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {
+              "type": "string"
+            },
+            "media_type": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "base64"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "data",
+            "media_type",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "url"
+              ],
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "file_id"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicMessage": {
+      "additionalProperties": false,
+      "description": "One Anthropic message.",
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/definitions/AnthropicContentBlock"
+          },
+          "type": "array"
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "role"
+      ],
+      "type": "object"
+    },
+    "AnthropicMessagesRequest": {
+      "additionalProperties": true,
+      "description": "`POST /v1/messages`.",
+      "properties": {
+        "max_tokens": {
+          "description": "Maximum output-token count. Defaults to `4096`.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/definitions/AnthropicMessage"
+          },
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_config": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicOutputConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Provider-side structured-output declaration."
+        },
+        "stop_sequences": {
+          "description": "Stop sequences.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "system": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicSystem"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "thinking": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Anthropic thinking configuration."
+        },
+        "tool_choice": true,
+        "tools": {
+          "items": {
+            "$ref": "#/definitions/AnthropicTool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "top_k": {
+          "description": "Top-k sampling limit.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "max_tokens",
+        "messages",
+        "model"
+      ],
+      "type": "object"
+    },
+    "AnthropicOutputConfig": {
+      "description": "Anthropic `output_config` block on a `/v1/messages` request.",
+      "properties": {
+        "format": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnthropicOutputFormat"
+            }
+          ],
+          "description": "Declared output format."
+        }
+      },
+      "required": [
+        "format"
+      ],
+      "type": "object"
+    },
+    "AnthropicOutputFormat": {
+      "description": "Anthropic output-format variants.",
+      "oneOf": [
+        {
+          "description": "JSON schema enforced by Anthropic at generation time.",
+          "properties": {
+            "schema": {
+              "description": "JSON Schema object describing the response shape."
+            },
+            "type": {
+              "enum": [
+                "json_schema"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicSystem": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/AnthropicSystemBlock"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "AnthropicSystemBlock": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cache_control": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/AnthropicCacheControl"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AnthropicThinkingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_tokens": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "AnthropicTool": {
+      "additionalProperties": false,
+      "properties": {
+        "cache_control": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AnthropicCacheControl"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_height_px": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "display_number": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "display_width_px": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_schema": true,
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "input_schema",
+        "name"
+      ],
+      "type": "object"
+    },
+    "AnthropicToolResultContent": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/AnthropicContentBlock"
+          },
+          "type": "array"
+        }
+      ]
+    },
     "CardKind": {
       "description": "Wyrd Card kind.",
       "enum": [
@@ -7530,10 +8632,10 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
             "judge_ref": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/InlineableRef_for_AgentSpec"
                 }
               ],
-              "description": "Reference to a `Prompt` card."
+              "description": "Reference to or inline definition of an Agent card."
             },
             "kind": {
               "enum": [
@@ -7698,6 +8800,647 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         }
       ]
     },
+    "GoogleBatchEmbedRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "requests": {
+          "items": {
+            "$ref": "#/definitions/GoogleEmbedRequest"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "requests"
+      ],
+      "type": "object"
+    },
+    "GoogleCodeExecutionResult": {
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "outcome",
+        "output"
+      ],
+      "type": "object"
+    },
+    "GoogleContent": {
+      "additionalProperties": false,
+      "description": "One Google content turn.",
+      "properties": {
+        "parts": {
+          "items": {
+            "$ref": "#/definitions/GooglePart"
+          },
+          "type": "array"
+        },
+        "role": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "parts",
+        "role"
+      ],
+      "type": "object"
+    },
+    "GoogleEmbedContent": {
+      "additionalProperties": false,
+      "properties": {
+        "parts": {
+          "items": {
+            "$ref": "#/definitions/GoogleEmbedPart"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "parts"
+      ],
+      "type": "object"
+    },
+    "GoogleEmbedPart": {
+      "additionalProperties": false,
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "GoogleEmbedRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "$ref": "#/definitions/GoogleEmbedContent"
+        },
+        "model": {
+          "type": "string"
+        },
+        "output_dimensionality": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "task_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "model"
+      ],
+      "type": "object"
+    },
+    "GoogleExecutableCode": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "language": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "language"
+      ],
+      "type": "object"
+    },
+    "GoogleFileData": {
+      "additionalProperties": false,
+      "properties": {
+        "file_uri": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "file_uri",
+        "mime_type"
+      ],
+      "type": "object"
+    },
+    "GoogleFunctionCall": {
+      "additionalProperties": false,
+      "properties": {
+        "args": true,
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "args",
+        "name"
+      ],
+      "type": "object"
+    },
+    "GoogleFunctionCallingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_function_names": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "GoogleFunctionDeclaration": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters": true
+      },
+      "required": [
+        "name",
+        "parameters"
+      ],
+      "type": "object"
+    },
+    "GoogleFunctionResponse": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "response": true
+      },
+      "required": [
+        "name",
+        "response"
+      ],
+      "type": "object"
+    },
+    "GoogleGenerateContentRequest": {
+      "additionalProperties": true,
+      "description": "`POST /v1beta/models/{model}:generateContent`.",
+      "properties": {
+        "cached_content": {
+          "description": "Cached content resource name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contents": {
+          "items": {
+            "$ref": "#/definitions/GoogleContent"
+          },
+          "type": "array"
+        },
+        "generation_config": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleGenerationConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Native Google generationConfig object."
+        },
+        "labels": {
+          "additionalProperties": true,
+          "description": "Provider labels object.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "safety_settings": {
+          "description": "Native Google safetySettings list.",
+          "items": {
+            "$ref": "#/definitions/GoogleSafetySetting"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "system_instruction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_config": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleToolConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/definitions/GoogleTool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "contents"
+      ],
+      "type": "object"
+    },
+    "GoogleGenerationConfig": {
+      "additionalProperties": true,
+      "properties": {
+        "candidate_count": {
+          "description": "Number of candidate responses.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "frequency_penalty": {
+          "description": "Frequency penalty.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "max_output_tokens": {
+          "description": "Maximum output-token count.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "presence_penalty": {
+          "description": "Presence penalty.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "response_mime_type": {
+          "description": "Response MIME type.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_modalities": {
+          "description": "Requested output modalities.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "response_schema": {
+          "description": "Response schema object."
+        },
+        "seed": {
+          "description": "Provider best-effort deterministic seed.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "speech_config": {
+          "description": "Speech configuration object."
+        },
+        "stop_sequences": {
+          "description": "Stop sequences.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "thinking_config": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoogleThinkingConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Gemini thinking configuration."
+        },
+        "top_k": {
+          "description": "Top-k sampling limit.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GoogleInlineData": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "mime_type"
+      ],
+      "type": "object"
+    },
+    "GooglePart": {
+      "anyOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "inline_data": {
+              "$ref": "#/definitions/GoogleInlineData"
+            }
+          },
+          "required": [
+            "inline_data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "file_data": {
+              "$ref": "#/definitions/GoogleFileData"
+            }
+          },
+          "required": [
+            "file_data"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "function_call": {
+              "$ref": "#/definitions/GoogleFunctionCall"
+            }
+          },
+          "required": [
+            "function_call"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "function_response": {
+              "$ref": "#/definitions/GoogleFunctionResponse"
+            }
+          },
+          "required": [
+            "function_response"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "thought": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "text",
+            "thought"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "executable_code": {
+              "$ref": "#/definitions/GoogleExecutableCode"
+            }
+          },
+          "required": [
+            "executable_code"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "code_execution_result": {
+              "$ref": "#/definitions/GoogleCodeExecutionResult"
+            }
+          },
+          "required": [
+            "code_execution_result"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GoogleSafetySetting": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "threshold": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "threshold"
+      ],
+      "type": "object"
+    },
+    "GoogleThinkingConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "include_thoughts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "thinking_budget": {
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "GoogleTool": {
+      "additionalProperties": false,
+      "properties": {
+        "code_execution": true,
+        "function_declarations": {
+          "items": {
+            "$ref": "#/definitions/GoogleFunctionDeclaration"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "google_search": true,
+        "google_search_retrieval": true,
+        "url_context": true
+      },
+      "type": "object"
+    },
+    "GoogleToolConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "function_calling_config": {
+          "$ref": "#/definitions/GoogleFunctionCallingConfig"
+        }
+      },
+      "required": [
+        "function_calling_config"
+      ],
+      "type": "object"
+    },
+    "InlineableRef_for_AgentSpec": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentSpec"
+            }
+          ],
+          "description": "An embedded child spec."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+    },
+    "InlineableRef_for_Prompt": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ],
+          "description": "An embedded child spec."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+    },
     "JsonPath": {
       "maxLength": 1024,
       "minLength": 1,
@@ -7748,6 +9491,2160 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
             "object"
           ],
           "type": "string"
+        }
+      ]
+    },
+    "OpenAiAllowedTools": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/OpenAiAllowedToolsMode"
+        },
+        "tools": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "mode",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "OpenAiAllowedToolsChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_tools": {
+          "$ref": "#/definitions/OpenAiAllowedTools"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiAllowedToolsKind"
+        }
+      },
+      "required": [
+        "allowed_tools",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiAllowedToolsKind": {
+      "enum": [
+        "allowed_tools"
+      ],
+      "type": "string"
+    },
+    "OpenAiAllowedToolsMode": {
+      "enum": [
+        "auto",
+        "required"
+      ],
+      "type": "string"
+    },
+    "OpenAiAudioFormat": {
+      "enum": [
+        "wav",
+        "aac",
+        "mp3",
+        "flac",
+        "opus",
+        "pcm16"
+      ],
+      "type": "string"
+    },
+    "OpenAiBuiltInVoice": {
+      "enum": [
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "marin",
+        "cedar"
+      ],
+      "type": "string"
+    },
+    "OpenAiChatAudio": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "$ref": "#/definitions/OpenAiAudioFormat"
+        },
+        "voice": {
+          "$ref": "#/definitions/OpenAiVoice"
+        }
+      },
+      "required": [
+        "format",
+        "voice"
+      ],
+      "type": "object"
+    },
+    "OpenAiChatMessage": {
+      "description": "One chat message on the wire.",
+      "properties": {
+        "annotations": {
+          "description": "URL citations from web search, when present.",
+          "items": {
+            "$ref": "#/definitions/OpenAiMessageAnnotation"
+          },
+          "type": "array"
+        },
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiMessageAudio"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Audio output, when present."
+        },
+        "content": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiMessageContent"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "refusal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "type": "string"
+        },
+        "tool_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_calls": {
+          "items": {
+            "$ref": "#/definitions/OpenAiToolCall"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "type": "object"
+    },
+    "OpenAiChatRequest": {
+      "additionalProperties": true,
+      "description": "`POST /v1/chat/completions`.",
+      "properties": {
+        "audio": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatAudio"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Audio output settings."
+        },
+        "frequency_penalty": {
+          "description": "Frequency penalty.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "logit_bias": {
+          "additionalProperties": true,
+          "description": "Token-bias map keyed by token id.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "logprobs": {
+          "description": "Whether to return token log probabilities.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "max_completion_tokens": {
+          "description": "Maximum completion-token count.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_tokens": {
+          "description": "Legacy maximum generated-token count.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "messages": {
+          "items": {
+            "$ref": "#/definitions/OpenAiChatMessage"
+          },
+          "type": "array"
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "modalities": {
+          "description": "Requested output modalities.",
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseModality"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "n": {
+          "description": "Number of completions to generate.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "parallel_tool_calls": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "prediction": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiPredictionContent"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Prediction content hint."
+        },
+        "presence_penalty": {
+          "description": "Presence penalty.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "prompt_cache_key": {
+          "description": "OpenAI prompt cache key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningEffort"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Requested reasoning effort."
+        },
+        "response_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponseFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "safety_identifier": {
+          "description": "Safety identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seed": {
+          "description": "Provider best-effort deterministic seed.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "service_tier": {
+          "description": "OpenAI service tier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stop": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiStop"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Stop sequence or sequences."
+        },
+        "store": {
+          "description": "Whether the provider may store the response.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream_options": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiStreamOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "tool_choice": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatToolChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/definitions/OpenAiTool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "top_logprobs": {
+          "description": "Number of top token log probabilities.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "user": {
+          "description": "Provider-visible end-user identifier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "messages",
+        "model"
+      ],
+      "type": "object"
+    },
+    "OpenAiChatToolChoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiToolChoiceMode"
+        },
+        {
+          "$ref": "#/definitions/OpenAiAllowedToolsChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiNamedFunctionToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiNamedCustomToolChoice"
+        }
+      ]
+    },
+    "OpenAiContentPart": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "image_url": {
+              "$ref": "#/definitions/OpenAiImageUrl"
+            },
+            "type": {
+              "enum": [
+                "image_url"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "input_audio": {
+              "$ref": "#/definitions/OpenAiInputAudio"
+            },
+            "type": {
+              "enum": [
+                "input_audio"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "input_audio",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "file": {
+              "$ref": "#/definitions/OpenAiFilePart"
+            },
+            "type": {
+              "enum": [
+                "file"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "file",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiCustomChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiCustomTool": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiCustomToolFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiCustomToolFormat": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "grammar": {
+              "$ref": "#/definitions/OpenAiGrammar"
+            },
+            "type": {
+              "enum": [
+                "grammar"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "grammar",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiCustomVoice": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "OpenAiEmbeddingsInput": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        {
+          "items": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        {
+          "items": {
+            "items": {
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "OpenAiEmbeddingsRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "dimensions": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "encoding_format": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "$ref": "#/definitions/OpenAiEmbeddingsInput"
+        },
+        "model": {
+          "type": "string"
+        },
+        "user": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "input",
+        "model"
+      ],
+      "type": "object"
+    },
+    "OpenAiFilePart": {
+      "additionalProperties": false,
+      "properties": {
+        "file_data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "filename": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OpenAiFunction": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "parameters": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "strict": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiFunctionChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiGrammar": {
+      "additionalProperties": false,
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "$ref": "#/definitions/OpenAiGrammarSyntax"
+        }
+      },
+      "required": [
+        "definition",
+        "syntax"
+      ],
+      "type": "object"
+    },
+    "OpenAiGrammarSyntax": {
+      "enum": [
+        "lark",
+        "regex"
+      ],
+      "type": "string"
+    },
+    "OpenAiImageUrl": {
+      "additionalProperties": false,
+      "properties": {
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
+    },
+    "OpenAiInputAudio": {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "format"
+      ],
+      "type": "object"
+    },
+    "OpenAiJsonSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "schema": {
+          "additionalProperties": true,
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "strict": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiMessageAnnotation": {
+      "description": "A URL citation annotation returned by web search.",
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "url_citation": {
+          "$ref": "#/definitions/OpenAiUrlCitation"
+        }
+      },
+      "required": [
+        "type",
+        "url_citation"
+      ],
+      "type": "object"
+    },
+    "OpenAiMessageAudio": {
+      "description": "Audio output returned by the model.",
+      "properties": {
+        "data": {
+          "type": "string"
+        },
+        "expires_at": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "transcript": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data",
+        "expires_at",
+        "id",
+        "transcript"
+      ],
+      "type": "object"
+    },
+    "OpenAiMessageContent": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/OpenAiContentPart"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "OpenAiNamedCustomToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "custom": {
+          "$ref": "#/definitions/OpenAiCustomChoice"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiNamedCustomToolChoiceKind"
+        }
+      },
+      "required": [
+        "custom",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiNamedCustomToolChoiceKind": {
+      "enum": [
+        "custom"
+      ],
+      "type": "string"
+    },
+    "OpenAiNamedFunctionToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "function": {
+          "$ref": "#/definitions/OpenAiFunctionChoice"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiNamedFunctionToolChoiceKind"
+        }
+      },
+      "required": [
+        "function",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiNamedFunctionToolChoiceKind": {
+      "enum": [
+        "function"
+      ],
+      "type": "string"
+    },
+    "OpenAiPredictionContent": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "$ref": "#/definitions/OpenAiPredictionPayload"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiPredictionKind"
+        }
+      },
+      "required": [
+        "content",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiPredictionContentPart": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiPredictionKind": {
+      "enum": [
+        "content"
+      ],
+      "type": "string"
+    },
+    "OpenAiPredictionPayload": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/OpenAiPredictionContentPart"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "OpenAiReasoning": {
+      "additionalProperties": false,
+      "properties": {
+        "effort": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningEffort2"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "generate_summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoningSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OpenAiReasoningEffort": {
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "type": "string"
+    },
+    "OpenAiReasoningEffort2": {
+      "enum": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
+      "type": "string"
+    },
+    "OpenAiReasoningSummary": {
+      "enum": [
+        "auto",
+        "concise",
+        "detailed"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponseContentPart": {
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "output_text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "image_url": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_image"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_file"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiResponseFormat": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "json_object"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "json_schema": {
+              "$ref": "#/definitions/OpenAiJsonSchema"
+            },
+            "type": {
+              "enum": [
+                "json_schema"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "json_schema",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiResponseItem": {
+      "oneOf": [
+        {
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/definitions/OpenAiResponseContentPart"
+              },
+              "type": "array"
+            },
+            "role": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "message"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "content",
+            "role",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "arguments": {
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "function_call"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "arguments",
+            "call_id",
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "call_id": {
+              "type": "string"
+            },
+            "output": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "function_call_output"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "call_id",
+            "output",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "encrypted_content": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summary": {
+              "default": null,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "reasoning"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "file_id": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_file"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "file_id",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "image_url": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "input_image"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "image_url",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiResponseModality": {
+      "enum": [
+        "text",
+        "audio"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesAllowedToolsChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsMode"
+        },
+        "tools": {
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsKind"
+        }
+      },
+      "required": [
+        "mode",
+        "tools",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesAllowedToolsKind": {
+      "enum": [
+        "allowed_tools"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesAllowedToolsMode": {
+      "enum": [
+        "auto",
+        "required"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesApplyPatchToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesApplyPatchToolKind"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesApplyPatchToolKind": {
+      "enum": [
+        "apply_patch"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesCustomToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesCustomToolKind"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesCustomToolFormat": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "grammar": {
+              "$ref": "#/definitions/OpenAiResponsesGrammar"
+            },
+            "type": {
+              "enum": [
+                "grammar"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "grammar",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiResponsesCustomToolKind": {
+      "enum": [
+        "custom"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesFunctionToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesFunctionToolKind"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesFunctionToolKind": {
+      "enum": [
+        "function"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesGrammar": {
+      "additionalProperties": false,
+      "properties": {
+        "definition": {
+          "type": "string"
+        },
+        "syntax": {
+          "$ref": "#/definitions/OpenAiResponsesGrammarSyntax"
+        }
+      },
+      "required": [
+        "definition",
+        "syntax"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesGrammarSyntax": {
+      "enum": [
+        "lark",
+        "regex"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesHostedToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesHostedToolKind"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesHostedToolKind": {
+      "enum": [
+        "file_search",
+        "web_search_preview",
+        "computer",
+        "computer_use_preview",
+        "computer_use",
+        "web_search_preview_2025_03_11",
+        "image_generation",
+        "code_interpreter"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesMcpToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "server_label": {
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesMcpToolKind"
+        }
+      },
+      "required": [
+        "server_label",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesMcpToolKind": {
+      "enum": [
+        "mcp"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesRequest": {
+      "additionalProperties": true,
+      "description": "Native OpenAI Responses generation settings flattened into the request body.",
+      "properties": {
+        "include": {
+          "description": "Additional response fields to include.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "input": {
+          "items": {
+            "$ref": "#/definitions/OpenAiResponseItem"
+          },
+          "type": "array"
+        },
+        "instructions": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_output_tokens": {
+          "description": "Maximum output-token count.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "metadata": {
+          "additionalProperties": true,
+          "description": "Provider metadata object.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "parallel_tool_calls": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "previous_response_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiReasoning"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "OpenAI Responses reasoning configuration."
+        },
+        "store": {
+          "description": "Whether the provider may store the response.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "stream": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "temperature": {
+          "description": "Sampling temperature.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "text": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesText"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tool_choice": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesToolChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/definitions/OpenAiResponsesTool"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "top_p": {
+          "description": "Nucleus sampling probability.",
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "input",
+        "model"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesShellToolChoice": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "$ref": "#/definitions/OpenAiResponsesShellToolKind"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiResponsesShellToolKind": {
+      "enum": [
+        "shell"
+      ],
+      "type": "string"
+    },
+    "OpenAiResponsesText": {
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/OpenAiTextResponseFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OpenAiResponsesTool": {
+      "oneOf": [
+        {
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "parameters": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "strict": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "function"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "web_search_preview"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "file_search"
+              ],
+              "type": "string"
+            },
+            "vector_store_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "vector_store_ids"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "code_interpreter"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "image_generation"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "allowed_tools": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "server_label": {
+              "type": "string"
+            },
+            "server_url": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "mcp"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "server_label",
+            "server_url",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "format": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/OpenAiResponsesCustomToolFormat"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiResponsesToolChoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiResponsesToolChoiceMode"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesAllowedToolsChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesHostedToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesFunctionToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesMcpToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesCustomToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesApplyPatchToolChoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiResponsesShellToolChoice"
+        }
+      ]
+    },
+    "OpenAiResponsesToolChoiceMode": {
+      "enum": [
+        "none",
+        "auto",
+        "required"
+      ],
+      "type": "string"
+    },
+    "OpenAiStop": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ]
+    },
+    "OpenAiStreamOptions": {
+      "additionalProperties": false,
+      "properties": {
+        "include_obfuscation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "include_usage": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "OpenAiTextResponseFormat": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "text"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "enum": [
+                "json_object"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "description": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "schema": {
+              "additionalProperties": true,
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "strict": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "type": {
+              "enum": [
+                "json_schema"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiTool": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "function": {
+              "$ref": "#/definitions/OpenAiFunction"
+            },
+            "type": {
+              "enum": [
+                "function"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "function",
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "custom": {
+              "$ref": "#/definitions/OpenAiCustomTool"
+            },
+            "type": {
+              "enum": [
+                "custom"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom",
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OpenAiToolCall": {
+      "additionalProperties": false,
+      "properties": {
+        "function": {
+          "$ref": "#/definitions/OpenAiToolFunctionCall"
+        },
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "function",
+        "id",
+        "type"
+      ],
+      "type": "object"
+    },
+    "OpenAiToolChoiceMode": {
+      "enum": [
+        "none",
+        "auto",
+        "required"
+      ],
+      "type": "string"
+    },
+    "OpenAiToolFunctionCall": {
+      "additionalProperties": false,
+      "properties": {
+        "arguments": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "arguments",
+        "name"
+      ],
+      "type": "object"
+    },
+    "OpenAiUrlCitation": {
+      "description": "Citation metadata for a web search result.",
+      "properties": {
+        "end_index": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "start_index": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "end_index",
+        "start_index",
+        "title",
+        "url"
+      ],
+      "type": "object"
+    },
+    "OpenAiVoice": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/OpenAiBuiltInVoice"
+        },
+        {
+          "$ref": "#/definitions/OpenAiCustomVoice"
         }
       ]
     },
@@ -8178,6 +12075,277 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       ],
       "type": "string"
     },
+    "Prompt": {
+      "description": "Authored native prompt request plus render metadata.",
+      "properties": {
+        "media_variables": {
+          "default": [],
+          "description": "Declared media placeholder names expected by `bind_media`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model": {
+          "description": "Model identifier used for indexing and selection.",
+          "type": "string"
+        },
+        "request": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ProviderRequest"
+            }
+          ],
+          "description": "Native provider-shaped request authored with `${variable}` or `{{variable}}` placeholders."
+        },
+        "response_type": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/ResponseType"
+            }
+          ],
+          "default": "text",
+          "description": "Expected response shape for runtime validation."
+        },
+        "variables": {
+          "default": [],
+          "description": "Declared text placeholder names expected by `render`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "description": "Optional author-assigned prompt version.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "model",
+        "request"
+      ],
+      "type": "object"
+    },
+    "ProviderName": {
+      "description": "Which provider a request targets.",
+      "oneOf": [
+        {
+          "description": "OpenAI provider.",
+          "enum": [
+            "open_ai"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Anthropic provider.",
+          "enum": [
+            "anthropic"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Google AI Studio provider.",
+          "enum": [
+            "google"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Google Vertex AI provider.",
+          "enum": [
+            "vertex"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Provider not modeled by skald-spec.",
+          "properties": {
+            "custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "custom"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ProviderRequest": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiChatRequest"
+            }
+          ],
+          "description": "OpenAI Chat Completions request."
+        },
+        {
+          "description": "Custom provider that accepts OpenAI Chat Completions request semantics.",
+          "properties": {
+            "provider": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderName"
+                }
+              ],
+              "description": "Provider dispatch target."
+            },
+            "request": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/OpenAiChatRequest"
+                }
+              ],
+              "description": "OpenAI Chat-shaped request body."
+            }
+          },
+          "required": [
+            "provider",
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiResponsesRequest"
+            }
+          ],
+          "description": "OpenAI Responses API request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/OpenAiEmbeddingsRequest"
+            }
+          ],
+          "description": "OpenAI Embeddings request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AnthropicMessagesRequest"
+            }
+          ],
+          "description": "Anthropic Messages request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            }
+          ],
+          "description": "Google Gemini GenerateContent request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleBatchEmbedRequest"
+            }
+          ],
+          "description": "Google Gemini BatchEmbedContents request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GoogleGenerateContentRequest"
+            }
+          ],
+          "description": "Vertex GenerateContent request."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/VertexPredictRequest"
+            }
+          ],
+          "description": "Vertex Predict request."
+        },
+        {
+          "description": "Raw provider request body that no typed variant claimed.",
+          "properties": {
+            "body": {
+              "description": "Unmodified raw provider request JSON."
+            },
+            "provider": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ProviderName"
+                }
+              ],
+              "description": "Provider dispatch target for the raw body."
+            }
+          },
+          "required": [
+            "body",
+            "provider"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "One native LLM request."
+    },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
+    "ResponseType": {
+      "description": "Expected response shape for a rendered prompt.",
+      "oneOf": [
+        {
+          "description": "Plain text response.",
+          "enum": [
+            "text"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "JSON response validated against a named schema by the runtime.",
+          "properties": {
+            "json_schema": {
+              "properties": {
+                "name": {
+                  "description": "Schema name used in diagnostics and provider-native structured output fields.",
+                  "type": "string"
+                },
+                "schema": {
+                  "description": "JSON Schema object."
+                }
+              },
+              "required": [
+                "name",
+                "schema"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "json_schema"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -8191,6 +12359,74 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "VertexEmbedInstance": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "task_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "VertexEmbedParameters": {
+      "properties": {
+        "auto_truncate": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "output_dimensionality": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "VertexPredictRequest": {
+      "additionalProperties": false,
+      "properties": {
+        "instances": {
+          "items": {
+            "$ref": "#/definitions/VertexEmbedInstance"
+          },
+          "type": "array"
+        },
+        "parameters": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/VertexEmbedParameters"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "instances"
+      ],
+      "type": "object"
     },
     "Workflow": {
       "additionalProperties": false,
@@ -8280,7 +12516,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
     "dataset": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/Ref"
         },
         {
           "type": "null"
@@ -8313,7 +12549,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
     "subject_ref": {
       "anyOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/Ref"
         },
         {
           "type": "null"
@@ -8704,6 +12940,23 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "RunKind": {
       "description": "Execution kind recorded as a Run.",
       "oneOf": [
@@ -8898,7 +13151,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
     "card_refs": {
       "description": "Artifact references.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
@@ -8947,7 +13200,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
     "target_refs": {
       "description": "Primary target Cards.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     }
@@ -9161,6 +13414,23 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -9200,7 +13470,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
     "tool_refs": {
       "description": "Tool references.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
@@ -9964,6 +14234,23 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       ],
       "type": "object"
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SampleInput": {
       "description": "Sample input description for loader-side rehydration.",
       "properties": {
@@ -10275,7 +14562,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "default": [],
       "description": "Durable Artifact card references linked to this model card.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
@@ -10605,6 +14892,23 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       ],
       "type": "object"
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -10645,14 +14949,14 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
     "post_invoke": {
       "description": "Policy Cards evaluated after invocation.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     },
     "pre_invoke": {
       "description": "Policy Cards evaluated before invocation.",
       "items": {
-        "$ref": "#/definitions/CardRef"
+        "$ref": "#/definitions/Ref"
       },
       "type": "array"
     }
@@ -15126,6 +19430,23 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "ServiceComponent": {
       "description": "Alias-bound service component.",
       "properties": {
@@ -15150,7 +19471,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
         "ref": {
           "allOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             }
           ],
           "description": "Canonical Card reference."
@@ -15591,6 +19912,23 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
         }
       ]
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -15604,7 +19942,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
             "card": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ],
               "description": "Source Drift Card reference."
@@ -15628,7 +19966,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
             "card": {
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ],
               "description": "Source Eval Card reference."
@@ -15702,7 +20040,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
     "target": {
       "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/Ref"
         }
       ],
       "description": "Target Operator Card reference."
@@ -15728,27 +20066,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "definitions": {
-    "AgentRef": {
-      "anyOf": [
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/AgentSpec"
-            }
-          ],
-          "description": "Inline agent spec body."
-        },
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ],
-          "description": "Reference to a registered Agent Card."
-        }
-      ],
-      "description": "Reference to a workflow step's agent, either inline or by Agent Card reference."
-    },
     "AgentRunConfigSpec": {
       "description": "Pure-serde mirror of the Skald agent run configuration.",
       "properties": {
@@ -15797,7 +20114,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "prompt": {
           "allOf": [
             {
-              "$ref": "#/definitions/PromptRef"
+              "$ref": "#/definitions/InlineableRef_for_Prompt"
             }
           ],
           "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
@@ -17468,7 +21785,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "audit_ref": {
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"
@@ -17486,12 +21803,62 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "policy_refs": {
           "description": "Policy Card references.",
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "$ref": "#/definitions/Ref"
           },
           "type": "array"
         }
       },
       "type": "object"
+    },
+    "InlineableRef_for_AgentSpec": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AgentSpec"
+            }
+          ],
+          "description": "An embedded child spec."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+    },
+    "InlineableRef_for_Prompt": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/Prompt"
+            }
+          ],
+          "description": "An embedded child spec."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",
@@ -17613,7 +21980,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
         "route_refs": {
           "description": "Observation route Card references.",
           "items": {
-            "$ref": "#/definitions/CardRef"
+            "$ref": "#/definitions/Ref"
           },
           "type": "array"
         }
@@ -19928,27 +24295,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       ],
       "type": "object"
     },
-    "PromptRef": {
-      "anyOf": [
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/Prompt"
-            }
-          ],
-          "description": "Inline native prompt payload."
-        },
-        {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CardRef"
-            }
-          ],
-          "description": "Reference to a registered Prompt Card."
-        }
-      ],
-      "description": "Reference to an agent prompt, either inline or by Prompt Card reference."
-    },
     "ProviderName": {
       "description": "Which provider a request targets.",
       "oneOf": [
@@ -20111,6 +24457,23 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       ],
       "description": "One native LLM request."
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+    },
     "ResponseType": {
       "description": "Expected response shape for a rendered prompt.",
       "oneOf": [
@@ -20232,7 +24595,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "Agent action \u2014 inline body or Agent Card reference.",
           "properties": {
             "target": {
-              "$ref": "#/definitions/AgentRef"
+              "$ref": "#/definitions/InlineableRef_for_AgentSpec"
             },
             "type": {
               "enum": [
@@ -20251,7 +24614,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "MCP server action.",
           "properties": {
             "target": {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             "type": {
               "enum": [
@@ -20270,7 +24633,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "Prompt action.",
           "properties": {
             "target": {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             "type": {
               "enum": [

@@ -52,10 +52,17 @@ pub async fn resolve_card_ref_scope(
             return Err(too_large("cards", MAX_SCOPE_CARDS, root));
         }
 
+        let space = card_ref
+            .space
+            .as_ref()
+            .ok_or_else(|| WyrdError::Validation {
+                message: "card scope member is missing a resolved space".to_owned(),
+                details: json!({ "card_ref": card_ref }),
+            })?;
         let row = get_card_by_ref(
             conn,
             card_ref.kind.clone(),
-            &card_ref.space,
+            space,
             &card_ref.name,
             &card_ref.version,
         )
@@ -309,7 +316,7 @@ mod pg_tests {
             kind,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: SpaceName::new(space).expect("valid space"),
+            space: Some(SpaceName::new(space).expect("valid space")),
             uid: None,
         }
     }

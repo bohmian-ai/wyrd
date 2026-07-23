@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::field::FieldSpec;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// Locked ModelCard validation rules.
 pub mod validate;
@@ -19,6 +19,7 @@ pub use validate::ModelCardError;
 /// hold model-related bytes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct ModelSpec {
     /// Framework interface tag and per-interface config metadata.
     pub interface: ModelInterface,
@@ -31,7 +32,10 @@ pub struct ModelSpec {
     pub sample_input: Option<SampleInput>,
     /// Durable Artifact card references linked to this model card.
     #[serde(default)]
-    pub card_refs: Vec<CardRef>,
+    pub card_refs: Vec<Ref>,
+    /// Eval and Drift cards that receive observations from this model card.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes_to: Vec<Ref>,
 }
 
 impl ModelSpec {
@@ -44,7 +48,7 @@ impl ModelSpec {
         task_type: TaskType,
         signature: ModelSignature,
         sample_input: Option<SampleInput>,
-        card_refs: Vec<CardRef>,
+        card_refs: Vec<Ref>,
     ) -> Result<Self, ModelCardError> {
         let spec = Self {
             interface,
@@ -52,6 +56,7 @@ impl ModelSpec {
             signature,
             sample_input,
             card_refs,
+            publishes_to: Vec::new(),
         };
         spec.validate()?;
         Ok(spec)
@@ -78,7 +83,7 @@ impl ModelSpec {
     }
 
     /// Iterate durable Artifact card references linked to this model card.
-    pub fn card_refs(&self) -> impl Iterator<Item = &CardRef> {
+    pub fn card_refs(&self) -> impl Iterator<Item = &Ref> {
         self.card_refs.iter()
     }
 }

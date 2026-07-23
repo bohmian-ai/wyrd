@@ -125,12 +125,11 @@ components:
       description: Human-visible Card name.
     CardRef:
       type: object
-      description: Reference to a registered Card by kind, name, version, space, and optional UID.
+      description: Reference to a registered Card by kind, name, version, optional space, and optional UID.
       required:
       - kind
       - name
       - version
-      - space
       properties:
         kind:
           $ref: '#/components/schemas/CardKind'
@@ -139,8 +138,14 @@ components:
           $ref: '#/components/schemas/CardName'
           description: Referenced Card name.
         space:
-          $ref: '#/components/schemas/SpaceName'
-          description: Space pinning identity together with `name` and `version`.
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SpaceName'
+            description: |-
+              Space pinning identity together with `name` and `version`.
+
+              Authors may omit it; the loader inherits the enclosing card's resolved
+              metadata space before the reference crosses a wire boundary.
         uid:
           oneOf:
           - type: 'null'
@@ -221,6 +226,24 @@ components:
     CardUid:
       type: string
       description: Resolved immutable Card UID.
+    CardUploadEntry:
+      type: object
+      description: One tenant-scoped, server-minted upload for a card artifact.
+      required:
+      - relative_path
+      - upload_id
+      - plan
+      properties:
+        plan:
+          $ref: '#/components/schemas/UploadPlan'
+          description: Backend-specific transfer protocol minted by the storage service.
+        relative_path:
+          $ref: '#/components/schemas/RelativeArtifactPath'
+          description: Manifest path this upload accepts.
+        upload_id:
+          $ref: '#/components/schemas/UploadId'
+          description: Durable storage upload identifier used for part URLs and completion.
+      additionalProperties: false
     CardUploadPlan:
       type: object
       description: Upload plan group keyed by the resolved card reference.
@@ -234,8 +257,8 @@ components:
         entries:
           type: array
           items:
-            $ref: '#/components/schemas/PresignedUpload'
-          description: One presigned upload per manifest entry.
+            $ref: '#/components/schemas/CardUploadEntry'
+          description: One server-minted upload per manifest entry.
       additionalProperties: false
     CommitSha:
       type: string
@@ -279,11 +302,20 @@ components:
             $ref: '#/components/schemas/CardUploadPlan'
           description: Upload plans for artifact-bearing submissions.
       additionalProperties: false
-    HttpMethod:
-      type: string
-      description: HTTP method permitted for a presigned upload.
-      enum:
-      - PUT
+    HeaderPair:
+      type: object
+      description: Required HTTP header for a client upload request.
+      required:
+      - name
+      - value
+      properties:
+        name:
+          type: string
+          description: Header name.
+        value:
+          type: string
+          description: Header value.
+      additionalProperties: false
     Metadata:
       type: object
       description: |-
@@ -389,38 +421,6 @@ components:
         repo:
           type: string
           description: Normalized repository identifier, e.g. `github.com/org/repo`.
-    PresignedUpload:
-      type: object
-      description: One tenant-scoped, single-artifact presigned upload.
-      required:
-      - relative_path
-      - url
-      - method
-      - expires_at
-      properties:
-        expires_at:
-          type: string
-          format: date-time
-          description: URL expiration instant.
-        method:
-          $ref: '#/components/schemas/HttpMethod'
-          description: Only `PUT` is legal for v1 artifact uploads.
-        relative_path:
-          $ref: '#/components/schemas/RelativeArtifactPath'
-          description: Manifest path this URL accepts.
-        required_headers:
-          type: array
-          items:
-            type: array
-            items: false
-            prefixItems:
-            - type: string
-            - type: string
-          description: Headers required by the storage provider.
-        url:
-          type: string
-          description: Presigned PUT URL.
-      additionalProperties: false
     RegistrationOutcomeKind:
       type: string
       description: Result of a registration write.
@@ -445,6 +445,171 @@ components:
         primitive.
 
         Wire form: 64 lowercase hex characters (BLAKE3-256 digest).
+    UploadId:
+      type: string
+      description: Typed upload identifier displayed as `wyu_{uuid_v7}`.
+    UploadPlan:
+      oneOf:
+      - type: object
+        description: Single PUT to a presigned URL.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Single PUT to a presigned URL.
+            required:
+            - put_url
+            - ttl_secs
+            properties:
+              put_url:
+                type: string
+                description: Presigned PUT URL.
+              required_headers:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HeaderPair'
+                description: Headers the client must include on the PUT.
+              ttl_secs:
+                type: integer
+                format: int32
+                description: URL time-to-live in seconds.
+                minimum: 0
+          protocol:
+            type: string
+            enum:
+            - single_put
+      - type: object
+        description: |-
+          Local filesystem auth-gated upload.
+
+          Signals that the upload URL is an auth-gated server route, not a
+          presigned PUT. SDK clients must include `Authorization: Bearer` and
+          `x-wyrd-data-tenant-id` on the PUT request.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: |-
+              Local filesystem auth-gated upload.
+
+              Signals that the upload URL is an auth-gated server route, not a
+              presigned PUT. SDK clients must include `Authorization: Bearer` and
+              `x-wyrd-data-tenant-id` on the PUT request.
+            required:
+            - put_url
+            - ttl_secs
+            properties:
+              put_url:
+                type: string
+                description: Server route PUT URL.
+              ttl_secs:
+                type: integer
+                format: int32
+                description: URL time-to-live in seconds.
+                minimum: 0
+          protocol:
+            type: string
+            enum:
+            - local_fs
+      - type: object
+        description: AWS S3 multipart upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: AWS S3 multipart upload.
+            required:
+            - part_count
+            - part_size_bytes
+            - part_url_ttl_secs
+            properties:
+              part_count:
+                type: integer
+                format: int32
+                description: Number of parts planned.
+                minimum: 0
+              part_size_bytes:
+                type: integer
+                format: int64
+                description: Size of each non-final part.
+                minimum: 0
+              part_url_ttl_secs:
+                type: integer
+                format: int32
+                description: Time-to-live for per-part URLs in seconds.
+                minimum: 0
+              required_headers:
+                type: array
+                items:
+                  $ref: '#/components/schemas/HeaderPair'
+                description: Headers the client must include on each part PUT.
+          protocol:
+            type: string
+            enum:
+            - s3_multipart
+      - type: object
+        description: Google Cloud Storage resumable upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Google Cloud Storage resumable upload.
+            required:
+            - session_uri
+            - chunk_size_bytes
+            properties:
+              chunk_size_bytes:
+                type: integer
+                format: int64
+                description: Recommended chunk size in bytes.
+                minimum: 0
+              session_uri:
+                type: string
+                description: Resumable session URI returned once to the client.
+          protocol:
+            type: string
+            enum:
+            - gcs_resumable
+      - type: object
+        description: Azure block blob upload.
+        required:
+        - data
+        - protocol
+        properties:
+          data:
+            type: object
+            description: Azure block blob upload.
+            required:
+            - sas_url
+            - block_size_bytes
+            - block_count_planned
+            properties:
+              block_count_planned:
+                type: integer
+                format: int32
+                description: Number of blocks the server expects to commit.
+                minimum: 0
+              block_size_bytes:
+                type: integer
+                format: int64
+                description: Recommended block size in bytes.
+                minimum: 0
+              sas_url:
+                type: string
+                description: SAS URL returned once to the client.
+          protocol:
+            type: string
+            enum:
+            - azure_block_blob
+      description: Tagged union describing how the client uploads bytes.
     VersionBlock:
       type: string
       description: Semver-compatible version string.

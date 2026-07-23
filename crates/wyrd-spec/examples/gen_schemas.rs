@@ -23,7 +23,9 @@ use wyrd_spec::card::model::{
     HuggingFaceTask, ModelInterface, ModelSignature, ModelSpec, SampleInput, SampleInputKind,
     TaskType, TfSaveFormat, TorchSaveFormat,
 };
-use wyrd_spec::card::operator::{OperatorBudget, OperatorInput, OperatorSpec};
+use wyrd_spec::card::operator::{
+    HttpAuth, HttpMethod, NotifyChannel, OperatorAction, OperatorBudget, OperatorSpec,
+};
 use wyrd_spec::card::policy::{InvokeContext, InvokeOutcome, PolicyDecision, PolicySpec};
 use wyrd_spec::card::prompt::{ParameterName, PromptRef, PromptSpec};
 use wyrd_spec::card::service::{LockedComponent, ServiceLock};
@@ -34,15 +36,15 @@ use wyrd_spec::card::source::{
     LogConnection, MetricsConnection, SourceAuth, SourceKind, SourceSpec, SqlConnection,
     TraceConnection,
 };
-use wyrd_spec::card::trigger::{TriggerSource, TriggerSpec};
+use wyrd_spec::card::trigger::{TriggerSchedule, TriggerSource, TriggerSpec};
 use wyrd_spec::card::workflow::WorkflowSpec;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
     ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardLocator,
-    CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadPlan, CreateCardRequest,
-    CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
-    ListVersionsResponse, PresignedUpload, RegistrationOperationId, RegistrationOutcomeKind,
+    CardRegistrationOutcome, CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan,
+    CreateCardRequest, CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest,
+    ListCardsResponse, ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind,
     RegistrationReplaySeed, RelativeArtifactPath, StoredArtifactEntry,
 };
 use wyrd_spec::run::{RunKind, RunRef};
@@ -111,9 +113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<CardEvalSpec>(out, golden, "eval_spec")?;
     write::<DriftSpec>(out, golden, "drift_spec")?;
     write::<TriggerSpec>(out, golden, "trigger_spec")?;
+    write::<TriggerSchedule>(out, golden, "trigger_schedule")?;
     write::<TriggerSource>(out, golden, "trigger_source")?;
     write::<OperatorSpec>(out, golden, "operator_spec")?;
-    write::<OperatorInput>(out, golden, "operator_input")?;
+    write::<OperatorAction>(out, golden, "operator_action")?;
+    write::<NotifyChannel>(out, golden, "notify_channel")?;
+    write::<HttpMethod>(out, golden, "http_method")?;
+    write::<HttpAuth>(out, golden, "http_auth")?;
     write::<OperatorBudget>(out, golden, "operator_budget")?;
     write::<SourceSpec>(out, golden, "source_spec")?;
     write::<SourceKind>(out, golden, "source_kind")?;
@@ -154,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<ArtifactManifestEntry>(out, golden, "artifact_manifest_entry")?;
     write::<CardRegistrationOutcome>(out, golden, "card_registration_outcome")?;
     write::<CardUploadPlan>(out, golden, "card_upload_plan")?;
-    write::<PresignedUpload>(out, golden, "presigned_upload")?;
+    write::<CardUploadEntry>(out, golden, "card_upload_entry")?;
     write::<CreateCardRequest>(out, golden, "create_card_request")?;
     write::<CreateCardResponse>(out, golden, "create_card_response")?;
     write::<RegistrationReplaySeed>(out, golden, "registration_replay_seed")?;

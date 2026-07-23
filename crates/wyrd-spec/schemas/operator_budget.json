@@ -1,18 +1,9 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "OperatorBudget",
-  "description": "Operator execution budget.",
+  "description": "Operator execution limits.",
   "type": "object",
   "properties": {
-    "max_memory_mb": {
-      "description": "Maximum memory in MiB.",
-      "type": [
-        "integer",
-        "null"
-      ],
-      "format": "uint32",
-      "minimum": 0.0
-    },
     "max_tool_calls": {
       "description": "Maximum tool calls allowed during invocation.",
       "type": [
@@ -31,5 +22,6 @@
       "format": "uint32",
       "minimum": 0.0
     }
-  }
+  },
+  "additionalProperties": false
 }

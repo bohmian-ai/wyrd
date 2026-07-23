@@ -400,13 +400,24 @@ pub async fn select_card_uids_by_ref_batch(
     if refs.is_empty() {
         return Ok(Vec::new());
     }
+    if refs.iter().any(|card_ref| card_ref.space.is_none()) {
+        return Err(WyrdError::registry_invalid_card_spec(
+            "CardRef.space is required at the registry boundary",
+        ));
+    }
     let mut query = QueryBuilder::<sqlx::Postgres>::new(
         "SELECT refs.kind, refs.space, refs.name, refs.version, cards.card_uid FROM (",
     );
     query.push_values(refs, |mut values, card_ref| {
         values
             .push_bind(card_ref.kind.wire_name())
-            .push_bind(card_ref.space.as_str())
+            .push_bind(
+                card_ref
+                    .space
+                    .as_ref()
+                    .expect("invariant: CardRef spaces were validated above")
+                    .as_str(),
+            )
             .push_bind(card_ref.name.as_str())
             .push_bind(card_ref.version.as_str());
     });
@@ -428,7 +439,10 @@ pub async fn select_card_uids_by_ref_batch(
                     .iter()
                     .find(|item| {
                         item.kind.wire_name() == kind
-                            && item.space.as_str() == space
+                            && item
+                                .space
+                                .as_ref()
+                                .is_some_and(|item_space| item_space.as_str() == space)
                             && item.name.as_str() == name
                             && item.version.as_str() == version
                     })

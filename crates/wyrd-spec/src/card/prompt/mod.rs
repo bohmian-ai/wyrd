@@ -805,7 +805,7 @@ mod prompt_promptref_tests {
             kind: CardKind::Prompt,
             name: "support_prompt".parse().expect("valid card name"),
             version: "1.0.0".parse().expect("valid version"),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
         });
 

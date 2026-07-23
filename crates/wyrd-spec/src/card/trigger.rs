@@ -1,49 +1,57 @@
-//! Status: Locked (2026-05-18)
-//! source: execution/PLAN_DELTA_LEDGER.md#plan-delta-aah-1
-//! source: reference/spec/specs.rs (TriggerSpec / TriggerSource - canonical wire shape)
-
-use std::collections::BTreeMap;
+//! Scheduled subscriptions that fire Operator cards.
 
 use serde::{Deserialize, Serialize};
 
-use crate::card::common::NonSecretValue;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
-/// Declarative trigger that invokes an Operator when its source condition fires.
+/// Declarative schedule and optional observation source for an Operator.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct TriggerSpec {
-    /// Trigger source.
-    pub source: TriggerSource,
-    /// Target Operator Card reference.
-    pub target: CardRef,
-    /// Minimum cooldown between firings, in seconds.
+    /// Optional human-readable purpose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cooldown_seconds: Option<u32>,
-    /// Non-secret trigger configuration.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub config: BTreeMap<String, NonSecretValue>,
+    pub description: Option<String>,
+    /// Required evaluation schedule.
+    pub schedule: TriggerSchedule,
+    /// Optional observation stream to evaluate on each schedule tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<TriggerSource>,
+    /// Operator fired when the source matches, or on every tick without a source.
+    pub operator_ref: Ref,
 }
 
-/// Trigger source declaration.
+/// Cron schedule for Trigger evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct TriggerSchedule {
+    /// Cron expression.
+    pub cron: String,
+    /// Optional IANA timezone; absent means UTC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz: Option<String>,
+}
+
+/// Observation source evaluated by a Trigger.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[non_exhaustive]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TriggerSource {
-    /// Drift observation emitted by a Drift Card.
+    /// Drift observations, optionally limited to one publisher.
     DriftObservation {
-        /// Source Drift Card reference.
-        card: CardRef,
+        /// Drift card to evaluate.
+        drift_ref: Ref,
+        /// Optional publisher restriction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_filter: Option<Ref>,
     },
-    /// Evaluation observation emitted by an Eval Card.
+    /// Eval observations, optionally limited to one publisher.
     EvalObservation {
-        /// Source Eval Card reference.
-        card: CardRef,
-    },
-    /// Cron schedule.
-    Schedule {
-        /// Cron expression.
-        cron: String,
+        /// Eval card to evaluate.
+        eval_ref: Ref,
+        /// Optional publisher restriction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_filter: Option<Ref>,
     },
 }

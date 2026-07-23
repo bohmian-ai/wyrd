@@ -213,7 +213,7 @@ mod tests {
             kind: CardKind::Service,
             name: CardName::new("billing").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("prod").expect("static space is valid"),
+            space: Some(SpaceName::new("prod").expect("static space is valid")),
             uid: None,
         }
     }

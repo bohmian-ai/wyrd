@@ -234,10 +234,10 @@ mod assertion_stage {
 
     fn judge_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new("test-judge").expect("static name valid"),
             version: VersionBlock::parse("1.0.0").expect("static version valid"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -245,7 +245,7 @@ mod assertion_stage {
     fn llm_judge(id: &str, expected: Value, op: ComparisonOperator, deps: &[&str]) -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid(id),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected,
             operator: op,
@@ -261,7 +261,6 @@ mod assertion_stage {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,
@@ -643,6 +642,7 @@ mod assertion_stage {
             let outcome = JudgeOutcome {
                 raw: json!({"choices": [{"parsed": self.parsed_verdict.clone()}]}),
                 parsed: self.parsed_verdict.clone(),
+                judge_ref: judge.judge_ref.as_card_ref().cloned(),
             };
             let result = AssertionResult {
                 task_id: judge.id.clone(),
@@ -684,6 +684,7 @@ mod assertion_stage {
             let outcome = JudgeOutcome {
                 raw: parsed.clone(),
                 parsed: parsed.clone(),
+                judge_ref: judge.judge_ref.as_card_ref().cloned(),
             };
             let result = AssertionResult {
                 task_id: judge.id.clone(),

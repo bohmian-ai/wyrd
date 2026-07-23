@@ -23,6 +23,10 @@ pub async fn run_local_records(args: EvalRunArgs) -> Result<ExitCode, WyrdCliErr
         .records
         .as_deref()
         .ok_or(WyrdCliError::ServerRejectsRecords)?;
+    let subject_ref = args
+        .subject
+        .as_ref()
+        .ok_or(WyrdCliError::RecordsRequireSubject)?;
     let records = load_records_jsonl(records_path)?;
     let judge = run::judge_for_spec(&spec, args.judge_mock)?;
     let scoring =
@@ -37,6 +41,7 @@ pub async fn run_local_records(args: EvalRunArgs) -> Result<ExitCode, WyrdCliErr
                 started_at: now,
                 ended_at: now,
             },
+            Some(subject_ref),
             &records,
         )
         .await

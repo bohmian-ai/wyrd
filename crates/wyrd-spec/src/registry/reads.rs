@@ -140,8 +140,13 @@ pub struct ListVersionsResponse {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum CardLocator {
-    /// Lookup by UID.
-    Uid(CardUid),
+    /// Lookup by kind-qualified UID.
+    Uid {
+        /// Card kind owning the UID.
+        kind: CardKind,
+        /// Card UID.
+        uid: CardUid,
+    },
     /// Lookup by exact reference.
     Ref(CardRef),
 }
@@ -173,6 +178,7 @@ pub struct StoredArtifactEntry {
 #[cfg(test)]
 mod tests {
     use super::{ArtifactInventoryResponse, CardLocator, ListCardsRequest, StoredArtifactEntry};
+    use crate::envelope::CardKind;
     use crate::ids::CardUid;
     use crate::query::{FieldRef, MetadataQuery, Operator, Predicate, Value};
     use crate::registry::RelativeArtifactPath;
@@ -181,11 +187,33 @@ mod tests {
     #[test]
     fn card_locator_uid_variant_uses_snake_case_tag() {
         let uid = CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").unwrap();
-        let encoded = serde_json::to_value(CardLocator::Uid(uid.clone())).unwrap();
-        assert_eq!(encoded["uid"], "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00");
+        let encoded = serde_json::to_value(CardLocator::Uid {
+            kind: CardKind::Service,
+            uid: uid.clone(),
+        })
+        .unwrap();
+        assert_eq!(encoded["uid"]["kind"], "Service");
+        assert_eq!(
+            encoded["uid"]["uid"],
+            "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00"
+        );
         let decoded: CardLocator =
             serde_json::from_value(encoded).expect("locator round-trips through JSON");
-        assert!(matches!(decoded, CardLocator::Uid(back) if back == uid));
+        assert!(matches!(
+            decoded,
+            CardLocator::Uid {
+                kind: CardKind::Service,
+                uid: back,
+            } if back == uid
+        ));
+    }
+
+    #[test]
+    fn card_locator_uid_requires_kind() {
+        let payload = serde_json::json!({
+            "uid": { "uid": "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00" }
+        });
+        assert!(serde_json::from_value::<CardLocator>(payload).is_err());
     }
 
     #[test]

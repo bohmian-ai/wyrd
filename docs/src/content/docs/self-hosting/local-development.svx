@@ -18,7 +18,7 @@ export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
 export WYRD_PUBLIC_BASE_URL=http://localhost:8080
 mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
 
-cargo run -p wyrd-server
+mise run dev:backend
 ```
 
 The server comes up on `http://localhost:8080`. Check it:
@@ -33,7 +33,7 @@ curl -s http://localhost:8080/readyz     # -> readiness snapshot
 `wyrd dev bootstrap` provisions a ready-to-use local environment in one step. It starts the embedded Postgres, runs all database migrations, creates a `dev` tenant, seeds a `local-dev` service principal with an API key, and writes everything to `~/.config/wyrd/credentials.toml` at mode `0600`:
 
 ```bash
-cargo run -p wyrd-cli -- dev bootstrap
+mise exec -- cargo run -p wyrd-cli -- dev bootstrap
 # credentials written to: /home/you/.config/wyrd/credentials.toml
 ```
 
@@ -56,7 +56,7 @@ By default the command refuses to run against a non-loopback database. If you ar
 A fresh database has no credentials. Mint the first admin API key, then use it as a bearer token:
 
 ```bash
-cargo run -p wyrd-server -- bootstrap-key --tenant acme
+mise exec -- cargo run -p wyrd-server -- bootstrap-key --tenant acme
 # wyrd_sk_acme_… (shown once)
 ```
 

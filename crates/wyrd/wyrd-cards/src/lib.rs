@@ -40,7 +40,7 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
 
     wyrd_interfaces::error::register_exceptions(&prompt)?;
     skald_prompt::register_prompt(&prompt)?;
-    prompt.add_class::<prompt::PromptRef>()?;
+    prompt.add_class::<prompt::PromptReference>()?;
     prompt.add_class::<prompt::PromptCard>()?;
     prompt.add_class::<prompt::PromptCardMetadata>()?;
 

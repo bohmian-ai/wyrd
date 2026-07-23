@@ -53,6 +53,8 @@ route.
 
 ## Pages
 
+- [Client configuration](/get-started/client-configuration/) — configure
+  endpoints, credentials, and repository defaults for an agent runtime.
 - [Agent workflow](/for-agents/workflow/) — a copyable end-to-end workflow for
   agents that need to declare and register cards.
 - [Error remediation](/for-agents/error-remediation/) — how to act on each

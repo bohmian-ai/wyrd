@@ -91,3 +91,29 @@ impl From<WyrdConfigError> for wyrd_spec::error::WyrdError {
         }
     }
 }
+
+impl Clone for WyrdConfigError {
+    /// Clone a configuration error for the process-local loader cache.
+    fn clone(&self) -> Self {
+        match self {
+            Self::CwdRead(error) => {
+                Self::CwdRead(std::io::Error::new(error.kind(), error.to_string()))
+            }
+            Self::Io { message, path } => Self::Io {
+                message: message.clone(),
+                path: path.clone(),
+            },
+            Self::TomlParse { message, path } => Self::TomlParse {
+                message: message.clone(),
+                path: path.clone(),
+            },
+            Self::Schema { message, path } => Self::Schema {
+                message: message.clone(),
+                path: path.clone(),
+            },
+            Self::NameDefaultRejected { table } => Self::NameDefaultRejected {
+                table: table.clone(),
+            },
+        }
+    }
+}

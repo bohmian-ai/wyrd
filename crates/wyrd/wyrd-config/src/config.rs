@@ -96,6 +96,21 @@ impl WyrdConfig {
 
         parse_file(&resolved_path)
     }
+
+    /// Discover `wyrd.toml` by walking ancestors from an explicit directory.
+    ///
+    /// This preserves the same `.git`/home boundary as [`WyrdConfig::load`]
+    /// without depending on the process working directory.
+    ///
+    /// # Errors
+    /// Returns an error when the start directory cannot be canonicalized or a
+    /// discovered config cannot be read or parsed.
+    pub fn discover_from(start: &Path) -> Result<Self, WyrdConfigError> {
+        match crate::discovery::find_wyrd_toml(start)? {
+            Some(path) => parse_file(&path),
+            None => Ok(Self::empty()),
+        }
+    }
 }
 
 fn parse_file(path: &Path) -> Result<WyrdConfig, WyrdConfigError> {

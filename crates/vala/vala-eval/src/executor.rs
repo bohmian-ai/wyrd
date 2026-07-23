@@ -714,7 +714,7 @@ mod end_to_end {
             kind,
             name: CardName::new(name).expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("tests").expect("static space is valid"),
+            space: Some(SpaceName::new("tests").expect("static space is valid")),
             uid: None,
         }
     }
@@ -728,7 +728,7 @@ mod end_to_end {
     }
 
     fn judge_ref() -> CardRef {
-        card_ref(CardKind::Prompt, "judge")
+        card_ref(CardKind::Agent, "judge")
     }
 
     fn trace_id() -> TraceId {
@@ -815,7 +815,7 @@ mod end_to_end {
         });
         let judge_response = EvalTask::LlmJudge(LlmJudgeTask {
             id: tid("judge_response"),
-            judge_ref: judge_ref(),
+            judge_ref: judge_ref().into(),
             context_path: None,
             operator: ComparisonOperator::Equals,
             expected: json!({"passed": true}),
@@ -868,7 +868,6 @@ mod end_to_end {
             tasks.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: Some(subject_ref()),
             dataset: None,
             tasks,
             workflow: None,

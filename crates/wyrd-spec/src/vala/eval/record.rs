@@ -54,11 +54,9 @@ pub struct EvalRecordObservation {
 
     /// Reference to the Eval card this record feeds.
     ///
-    /// `None` → the server fans the record to every Eval card whose `subject_ref`
-    /// is the run's Target (the normal online-monitoring path, plan 04). `Some` →
-    /// score against exactly this card (CLI/CI `--records` runs, targeted re-score).
-    /// Per the D8 presence rule, an online (`None`) record is only scored against
-    /// Eval cards that declared a `subject_ref`.
+    /// `None` lets the server route through the publisher's configured
+    /// `publishes_to` targets. `Some` scores against exactly this card, as used
+    /// by targeted CLI/CI replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_ref: Option<CardRef>,
 

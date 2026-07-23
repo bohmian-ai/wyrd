@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HttpMethod",
+  "description": "HTTP methods supported by an HTTP Operator action.",
+  "oneOf": [
+    {
+      "description": "GET.",
+      "type": "string",
+      "enum": [
+        "get"
+      ]
+    },
+    {
+      "description": "POST.",
+      "type": "string",
+      "enum": [
+        "post"
+      ]
+    },
+    {
+      "description": "PUT.",
+      "type": "string",
+      "enum": [
+        "put"
+      ]
+    },
+    {
+      "description": "PATCH.",
+      "type": "string",
+      "enum": [
+        "patch"
+      ]
+    },
+    {
+      "description": "DELETE.",
+      "type": "string",
+      "enum": [
+        "delete"
+      ]
+    }
+  ]
+}

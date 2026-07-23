@@ -59,7 +59,7 @@ pub async fn upsert_service_account_from_card(
         kind: card.kind.clone(),
         name: card.metadata.name.clone(),
         version: version.clone(),
-        space: space.clone(),
+        space: Some(space.clone()),
         uid: Some(card_uid.clone()),
     };
     let card_ref_json: JsonValue =

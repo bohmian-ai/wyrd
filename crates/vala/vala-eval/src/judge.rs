@@ -14,7 +14,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::Mutex;
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::card::agent::AgentSpec;
+use wyrd_spec::reference::InlineableRef;
 
 /// Failures returned by one judge invocation attempt.
 #[derive(Debug, thiserror::Error)]
@@ -41,25 +42,29 @@ impl JudgeError {
     }
 }
 
-/// Dependency-inversion boundary for prompt-backed LLM judge calls.
+/// Dependency-inversion boundary for constrained Agent-backed LLM judge calls.
 #[async_trait]
 pub trait JudgeInvoker: Send + Sync {
     /// Invoke the judge once.
     ///
-    /// `judge` is a Prompt card reference. `context` is the JSON object the
+    /// `judge` is a durable or inline Agent reference. `context` is the JSON object the
     /// engine prepared from the task's dependencies, optional context path, and
     /// per-record media bindings.
     ///
     /// # Errors
     /// Returns [`JudgeError`] when the invocation fails or returns invalid
     /// structured output.
-    async fn invoke(&self, judge: &CardRef, context: Value) -> Result<Value, JudgeError>;
+    async fn invoke(
+        &self,
+        judge: &InlineableRef<AgentSpec>,
+        context: Value,
+    ) -> Result<Value, JudgeError>;
 }
 
 /// Deterministic in-crate invoker for executor tests.
 pub struct MockJudgeInvoker {
     scripted: Mutex<VecDeque<Result<Value, JudgeError>>>,
-    seen: Mutex<Vec<(CardRef, Value)>>,
+    seen: Mutex<Vec<(InlineableRef<AgentSpec>, Value)>>,
 }
 
 impl MockJudgeInvoker {
@@ -73,14 +78,18 @@ impl MockJudgeInvoker {
     }
 
     /// Captured `(judge_ref, context)` calls in invocation order.
-    pub async fn calls(&self) -> Vec<(CardRef, Value)> {
+    pub async fn calls(&self) -> Vec<(InlineableRef<AgentSpec>, Value)> {
         self.seen.lock().await.clone()
     }
 }
 
 #[async_trait]
 impl JudgeInvoker for MockJudgeInvoker {
-    async fn invoke(&self, judge: &CardRef, context: Value) -> Result<Value, JudgeError> {
+    async fn invoke(
+        &self,
+        judge: &InlineableRef<AgentSpec>,
+        context: Value,
+    ) -> Result<Value, JudgeError> {
         self.seen
             .lock()
             .await

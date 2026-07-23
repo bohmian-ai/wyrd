@@ -36,7 +36,7 @@ export WYRD_STORAGE_LOCAL_ROOT="$PWD/.wyrd-dev/storage"
 export WYRD_PUBLIC_BASE_URL=http://localhost:8080
 mkdir -p "$WYRD_STORAGE_LOCAL_ROOT"
 
-cargo run -p wyrd-server
+mise run dev:backend
 ```
 
 That configuration is development-only. It is not safe for staging or production, and the server refuses to boot a production profile without a real signing key. See [Local development](/self-hosting/local-development/) for the walkthrough, then [Configuration](/self-hosting/configuration/) for the full env var surface a real deployment needs.

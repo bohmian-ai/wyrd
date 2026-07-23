@@ -15,7 +15,7 @@ use wyrd_spec::card::model::{
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, Ref};
 
 #[cfg(feature = "python")]
 use {
@@ -168,7 +168,7 @@ impl ModelCard {
             kind: CardKind::Model,
             name: card_name("name", &self.name)?,
             version: version_block(&self.version)?,
-            space: space_name(&self.space)?,
+            space: Some(space_name(&self.space)?),
             uid: optional_card_uid(&self.uid)?,
         })
     }
@@ -296,13 +296,23 @@ impl ModelCard {
             ModelCardInput::extract_bound(model_or_interface, false)?.into_handle(py, &metadata)?;
         metadata.interface = handle.to_spec_interface(py)?;
 
+        let mut resolved_space = space.map(str::to_owned);
+        let mut resolved_labels = labels_from_user(labels.unwrap_or_default())?;
+        let mut resolved_annotations = annotations_from_user(annotations.unwrap_or_default())?;
+        crate::identity::apply_repo_defaults(
+            &CardKind::Model,
+            &mut resolved_space,
+            &mut resolved_labels,
+            &mut resolved_annotations,
+        );
+
         let card = Self {
-            space: space.unwrap_or("default").to_owned(),
+            space: resolved_space.unwrap_or_else(|| "default".to_owned()),
             name: name.unwrap_or("model").to_owned(),
             version: version.unwrap_or("0.1.0").to_owned(),
             uid: uid.map_or_else(wyrd_utils::uuid7, str::to_owned),
-            labels: labels_from_user(labels.unwrap_or_default())?,
-            annotations: annotations_from_user(annotations.unwrap_or_default())?,
+            labels: resolved_labels,
+            annotations: resolved_annotations,
             metadata,
             created_at: utc_now(),
             is_card: true,
@@ -661,7 +671,19 @@ impl ModelCard {
                     task_type: envelope.spec.task_type,
                     signature: envelope.spec.signature,
                     sample_input: envelope.spec.sample_input,
-                    card_refs: envelope.spec.card_refs,
+                    card_refs: envelope
+                        .spec
+                        .card_refs
+                        .into_iter()
+                        .map(|reference| match reference {
+                            Ref::Ref(card_ref) => Ok(card_ref),
+                            Ref::Sibling { sibling } => Ok(sibling),
+                            Ref::Path(path) => Err(WyrdPyError::model_validation(format!(
+                                "ModelCard contains unresolved card reference path: {}",
+                                path.display()
+                            ))),
+                        })
+                        .collect::<CardPyResult<Vec<_>>>()?,
                 },
                 created_at: utc_now(),
                 is_card: true,
@@ -1007,7 +1029,8 @@ fn model_spec_from_metadata(
         task_type: metadata.task_type,
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
-        card_refs: metadata.card_refs.clone(),
+        card_refs: metadata.card_refs.iter().cloned().map(Ref::Ref).collect(),
+        publishes_to: Vec::new(),
     }
 }
 

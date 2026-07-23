@@ -878,7 +878,10 @@ mod pg_tests {
         assert_eq!(card_ref.kind.wire_name(), "Service");
         assert_eq!(card_ref.name.to_string(), "billing-service");
         assert_eq!(card_ref.version.to_string(), "1.0.0");
-        assert_eq!(card_ref.space.to_string(), "prod");
+        assert_eq!(
+            card_ref.space.as_ref().map(ToString::to_string).as_deref(),
+            Some("prod")
+        );
         assert!(card_ref.uid.is_some(), "uid must survive the round-trip");
 
         // Cleanup.
@@ -1084,7 +1087,10 @@ mod pg_tests {
             assert_eq!(card_ref.kind.wire_name(), "Service");
             assert_eq!(card_ref.name.to_string(), "svc");
             assert_eq!(card_ref.version.to_string(), "1.0.0");
-            assert_eq!(card_ref.space.to_string(), "prod");
+            assert_eq!(
+                card_ref.space.as_ref().map(ToString::to_string).as_deref(),
+                Some("prod")
+            );
         }
 
         // Seed the same issuer_url under tenant B.

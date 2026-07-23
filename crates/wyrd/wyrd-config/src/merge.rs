@@ -1,6 +1,7 @@
 //! Pure merge function. No IO, no async, no allocation surprises.
 
 use wyrd_spec::envelope::{CardKind, Metadata};
+use wyrd_spec::metadata::{Annotations, Labels};
 
 use crate::config::{KindOverride, WyrdConfig};
 
@@ -94,6 +95,48 @@ pub fn apply_defaults(meta: &mut Metadata, kind: &CardKind, cfg: &WyrdConfig) {
         &meta.spec_hash,
         &meta.artifact_hash,
     );
+}
+
+impl WyrdConfig {
+    /// Fill card-constructor fields from the most specific workspace defaults.
+    ///
+    /// Explicit card values are preserved. Map entries are merged per key,
+    /// with kind-specific values taking precedence over workspace defaults.
+    pub fn apply_defaults_fields(
+        &self,
+        kind: &CardKind,
+        space: &mut Option<String>,
+        labels: &mut Labels,
+        annotations: &mut Annotations,
+    ) {
+        let kind_override = self.kind_overrides.get(kind);
+        if space.is_none() {
+            if let Some(value) = kind_override.and_then(|override_| override_.space.as_ref()) {
+                *space = Some(value.to_string());
+            } else if let Some(value) = self.defaults.space.as_ref() {
+                *space = Some(value.to_string());
+            }
+        }
+
+        if let Some(kind_override) = kind_override {
+            for (key, value) in &kind_override.labels {
+                labels.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+            for (key, value) in &kind_override.annotations {
+                annotations
+                    .entry(key.clone())
+                    .or_insert_with(|| value.clone());
+            }
+        }
+        for (key, value) in &self.defaults.labels {
+            labels.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+        for (key, value) in &self.defaults.annotations {
+            annotations
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
 }
 
 #[cfg(test)]

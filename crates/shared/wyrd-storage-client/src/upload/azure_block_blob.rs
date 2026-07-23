@@ -80,7 +80,7 @@ pub(crate) async fn upload(
         }
         uploaded += bytes.len() as u64;
         count += 1;
-        report(hooks, uploaded, total);
+        report(hooks.progress.as_ref(), uploaded, total);
     }
     // V-004: reject an under-size source. Azure's Put Block List will happily
     // commit the shorter blob and downstream verification would fail with a

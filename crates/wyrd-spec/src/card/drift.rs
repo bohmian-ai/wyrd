@@ -13,11 +13,12 @@ use crate::card::common::NonSecretValue;
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
 use crate::ids::FeatureName;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// DriftCard spec body.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct DriftSpec {
     /// Free-text description authored on the card.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -25,10 +26,6 @@ pub struct DriftSpec {
 
     /// Drift detection method. Drives which `DriftProfile` variant is allowed.
     pub method: DriftMethod,
-
-    /// Singular subject of the monitor: the entity drift is observed against.
-    /// Allowed `subject_ref.kind`: `Model | Agent | Service | Data`.
-    pub subject_ref: CardRef,
 
     /// How the measurement enters the monitor.
     pub signal: DriftSignal,
@@ -72,7 +69,7 @@ pub enum DriftSignal {
     /// PSI or SPC over a baseline dataset.
     Distribution {
         /// Data card carrying the baseline artifact.
-        baseline_ref: CardRef,
+        baseline_ref: Ref,
         /// Columns of the baseline DataCard that participate in the monitor.
         features: Vec<FeatureName>,
     },
@@ -84,12 +81,12 @@ pub enum DriftSignal {
     /// Score stream produced by an Eval card.
     EvalScore {
         /// Eval card whose score stream this drift consumes.
-        eval_ref: CardRef,
+        eval_ref: Ref,
     },
     /// Measurement from an external system, such as Prometheus or OTel.
     External {
         /// Source card describing where to read the external measurement.
-        source_ref: CardRef,
+        source_ref: Ref,
     },
 }
 
@@ -253,12 +250,6 @@ pub struct CustomProfile {
 /// [`WyrdError`] through the [`From<DriftValidationError>`] implementation.
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum DriftValidationError {
-    /// `subject_ref.kind` was outside the allowed Drift subject set.
-    #[error("subject_ref.kind must be Model | Agent | Service | Data, got {got}")]
-    InvalidSubjectKind {
-        /// Actual Card kind.
-        got: String,
-    },
     /// `signal` was not compatible with `method`.
     #[error("signal {signal} is not compatible with method {method}")]
     SignalMethodMismatch {
@@ -383,9 +374,6 @@ impl DriftProfile {
 impl DriftValidationError {
     fn details(&self) -> serde_json::Value {
         match self {
-            Self::InvalidSubjectKind { got } => {
-                json!({ "field": "subject_ref.kind", "got": got })
-            }
             Self::SignalMethodMismatch { signal, method } => {
                 json!({ "signal": signal, "method": method })
             }
@@ -466,7 +454,6 @@ impl DriftSpec {
     /// Returns a [`DriftValidationError`] when any locked invariant fails.
     pub fn new(
         method: DriftMethod,
-        subject_ref: CardRef,
         signal: DriftSignal,
         condition: DriftCondition,
         profile: Option<DriftProfile>,
@@ -476,7 +463,6 @@ impl DriftSpec {
         let spec = Self {
             description,
             method,
-            subject_ref,
             signal,
             condition,
             profile,
@@ -491,7 +477,6 @@ impl DriftSpec {
     /// # Errors
     /// Returns the first [`DriftValidationError`] discovered.
     pub fn validate(&self) -> Result<(), DriftValidationError> {
-        validate_subject_ref(&self.subject_ref)?;
         validate_signal_method(&self.signal, self.method)?;
         validate_signal(&self.signal)?;
         validate_condition(&self.condition)?;
@@ -501,15 +486,6 @@ impl DriftSpec {
             validate_profile(profile)?;
         }
         Ok(())
-    }
-}
-
-fn validate_subject_ref(card_ref: &CardRef) -> Result<(), DriftValidationError> {
-    match card_ref.kind {
-        CardKind::Model | CardKind::Agent | CardKind::Service | CardKind::Data => Ok(()),
-        _ => Err(DriftValidationError::InvalidSubjectKind {
-            got: format!("{:?}", card_ref.kind),
-        }),
     }
 }
 
@@ -548,6 +524,9 @@ fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
             baseline_ref,
             features,
         } => {
+            let Some(baseline_ref) = baseline_ref.as_card_ref() else {
+                return Ok(());
+            };
             if baseline_ref.kind != CardKind::Data {
                 return Err(DriftValidationError::BaselineRefMustBeData {
                     got: format!("{:?}", baseline_ref.kind),
@@ -568,6 +547,9 @@ fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
         }
         DriftSignal::Metric { .. } => Ok(()),
         DriftSignal::EvalScore { eval_ref } => {
+            let Some(eval_ref) = eval_ref.as_card_ref() else {
+                return Ok(());
+            };
             if eval_ref.kind != CardKind::Eval {
                 return Err(DriftValidationError::EvalRefMustBeEval {
                     got: format!("{:?}", eval_ref.kind),
@@ -576,6 +558,9 @@ fn validate_signal(signal: &DriftSignal) -> Result<(), DriftValidationError> {
             Ok(())
         }
         DriftSignal::External { source_ref } => {
+            let Some(source_ref) = source_ref.as_card_ref() else {
+                return Ok(());
+            };
             if source_ref.kind == CardKind::Drift {
                 return Err(DriftValidationError::SourceRefInvalidKind);
             }

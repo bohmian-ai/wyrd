@@ -1,0 +1,20 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: wyrd-team
+  name: churn-classifier-drift-alert
+  version: "1.0.0"
+spec:
+  schedule:
+    cron: "*/5 * * * *"
+    tz: UTC
+  source:
+    kind: drift_observation
+    # Sibling Drift → `path:` variant.
+    drift_ref: ../model/drift.yaml
+    # Sibling Model → `path:` variant. Restricts observations to those
+    # emitted by THIS specific model.
+    subject_filter: ../model/card.yaml
+
+  # Sibling Operator → `path:` variant.
+  operator_ref: ./operator-slack.yaml

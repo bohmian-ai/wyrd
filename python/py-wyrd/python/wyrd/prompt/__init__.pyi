@@ -1353,11 +1353,11 @@ class Prompt:
         """
         ...
 
-class PromptRef:
-    """Python-facing Wyrd prompt reference.
+class PromptReference:
+    """Python-facing inlineable prompt reference.
 
-    A prompt reference points at either a registered Prompt Card or an inline
-    Prompt spec.
+    The Agent prompt slot points at either a registered Prompt Card or an
+    inline native Prompt.
     """
 
     kind: str
@@ -1365,12 +1365,12 @@ class PromptRef:
     @staticmethod
     def card(
         name: str, version: str, *, space: str | None = ..., uid: str | None = ...
-    ) -> PromptRef:
+    ) -> PromptReference:
         """Create a reference to a registered Prompt Card."""
         ...
 
     @staticmethod
-    def inline(prompt: Prompt) -> PromptRef:
+    def inline(prompt: Prompt) -> PromptReference:
         """Create an inline prompt reference from a Prompt."""
         ...
 
@@ -1383,7 +1383,7 @@ class PromptRef:
         ...
 
     @staticmethod
-    def model_validate_json(data: str) -> PromptRef:
+    def model_validate_json(data: str) -> PromptReference:
         """Build a prompt reference from serialized JSON."""
         ...
 
@@ -1605,7 +1605,7 @@ __all__ = [
     "Prompt",
     "PromptCard",
     "PromptCardMetadata",
-    "PromptRef",
+    "PromptReference",
     "ProviderRequest",
     "ProviderResponse",
     "ResponseFormat",

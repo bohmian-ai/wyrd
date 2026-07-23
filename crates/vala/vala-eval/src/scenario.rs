@@ -379,10 +379,10 @@ mod scenario_execution {
 
     fn judge_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new("scenario-judge").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -404,7 +404,7 @@ mod scenario_execution {
     fn judge_task() -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid("judge_response"),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected: json!({"passed": true}),
             operator: ComparisonOperator::Equals,
@@ -420,7 +420,6 @@ mod scenario_execution {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,

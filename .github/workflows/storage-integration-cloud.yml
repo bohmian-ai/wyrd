@@ -1,8 +1,8 @@
 name: storage-integration-cloud
 
 # Runs credentialed storage tests against real S3, GCS, and Azure Blob: the
-# StorageHandle data-plane CRUD suite (read/write/list/delete) plus the server
-# HTTP multipart e2e.
+# StorageHandle data-plane CRUD suite (read/write/list/delete) plus the real
+# WyrdStorageClient client/server upload and verified-download journey.
 # Emulators cannot verify: real IAM/role assumption, GCS workload-identity
 # signed URLs, Azure user-delegation SAS, virtual-host vs path-style addressing
 # against real endpoints, and provider-specific error shapes.

@@ -15,7 +15,7 @@ use skald_spec::{
 };
 use skald_tool::{ToolDef, ToolRegistry};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::{CardRef, PromptRef};
+use wyrd_spec::reference::{CardRef, InlineableRef};
 use wyrd_spec::{AgentCard, AgentRunConfigSpec};
 
 fn registry_lock() -> MutexGuard<'static, ()> {
@@ -93,7 +93,7 @@ fn prompt_card_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: name.parse().expect("valid prompt card name"),
         version: "0.3.0".parse().expect("valid prompt version"),
-        space: "research".parse().expect("valid space"),
+        space: Some("research".parse().expect("valid space")),
         uid: None,
     }
 }
@@ -117,11 +117,11 @@ fn agent_new_with_inline_prompt_is_infallible() {
 
 #[test]
 fn agent_try_from_ref_inline_succeeds_against_noop_resolver() {
-    let prompt_ref = PromptRef::from(prompt());
+    let prompt_ref = InlineableRef::Inline(Box::new(prompt()));
     let agent = Agent::try_from_ref(prompt_ref, default_prompt_resolver())
         .expect("inline prompts resolve without registry lookup");
 
-    assert!(matches!(agent.prompt_ref(), PromptRef::Inline(_)));
+    assert!(matches!(agent.prompt_ref(), InlineableRef::Inline(_)));
 }
 
 #[test]
@@ -131,8 +131,29 @@ fn agent_try_from_ref_card_succeeds_with_test_resolver() {
     let card_ref = prompt_card_ref("planner-prompt");
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
 
-    let agent = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
-        .expect("registered prompt resolves");
+    let agent = Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect("registered prompt resolves");
+
+    assert_eq!(agent.cascade_children(), vec![card_ref]);
+}
+
+#[test]
+fn agent_try_from_sibling_resolves_against_test_resolver() {
+    let _guard = registry_lock();
+    clear_prompt_card_registry();
+    let card_ref = prompt_card_ref("sibling-prompt");
+    register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
+
+    let agent = Agent::try_from_ref(
+        InlineableRef::Sibling {
+            sibling: card_ref.clone(),
+        },
+        default_prompt_resolver(),
+    )
+    .expect("sibling prompt resolves");
 
     assert_eq!(agent.cascade_children(), vec![card_ref]);
 }
@@ -143,7 +164,7 @@ fn agent_try_from_ref_missing_card_errors() {
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("no-such");
 
-    let err = Agent::try_from_ref(PromptRef::from(card_ref), default_prompt_resolver())
+    let err = Agent::try_from_ref(InlineableRef::Ref(card_ref), default_prompt_resolver())
         .expect_err("missing prompt card rejects");
 
     assert_eq!(err.code(), "WYRD_AGENT_404_PROMPT_CARD");
@@ -155,7 +176,7 @@ fn agent_with_chain_matches_locked_fixture() {
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("planner-prompt");
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
-    let agent = Agent::try_from_ref(PromptRef::from(card_ref), default_prompt_resolver())
+    let agent = Agent::try_from_ref(InlineableRef::Ref(card_ref), default_prompt_resolver())
         .expect("registered prompt resolves")
         .name("planner-agent")
         .version("0.3.0")
@@ -259,16 +280,22 @@ fn card_prompt_resolution_derives_cascade_and_missing_prompt_code() {
     let _guard = registry_lock();
     clear_prompt_card_registry();
     let card_ref = prompt_card_ref("planner-prompt");
-    let err = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
-        .expect_err("missing prompt card rejects");
+    let err = Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect_err("missing prompt card rejects");
     assert_eq!(err.code(), "WYRD_AGENT_404_PROMPT_CARD");
 
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("prompt registers");
-    let agent = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
-        .expect("registered prompt resolves")
-        .name("planner-agent")
-        .version("0.3.0")
-        .space("research");
+    let agent = Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect("registered prompt resolves")
+    .name("planner-agent")
+    .version("0.3.0")
+    .space("research");
     let card = agent.to_card().expect("agent projects");
 
     assert_eq!(card.cascade_children, vec![card_ref]);
@@ -284,9 +311,10 @@ fn unknown_runtime_local_tool_uses_wyrd_code() {
         labels: Default::default(),
         annotations: Default::default(),
         spec: wyrd_spec::card::agent::AgentSpec {
-            prompt: PromptRef::from(prompt()),
+            prompt: InlineableRef::Inline(Box::new(prompt())),
             tool_names: vec!["missing_tool".to_owned()],
             run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
         },
         cascade_children: Vec::new(),
         created_at: chrono::Utc::now(),
@@ -351,12 +379,15 @@ fn clear_prompt_card_registry_removes_previously_registered_entry() {
     register_prompt_card(&card_ref, Prompt::from_native(prompt())).expect("registers ok");
 
     // Confirm it resolves before the clear.
-    Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
-        .expect("registered prompt resolves");
+    Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect("registered prompt resolves");
 
     clear_prompt_card_registry();
 
-    let err = Agent::try_from_ref(PromptRef::from(card_ref), default_prompt_resolver())
+    let err = Agent::try_from_ref(InlineableRef::Ref(card_ref), default_prompt_resolver())
         .expect_err("cleared entry must not resolve");
     assert_eq!(err.code(), "WYRD_AGENT_404_PROMPT_CARD");
 }

@@ -1,22 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "OperatorSpec",
-  "description": "Server-side, policy-gated Operator declaration.",
+  "description": "A server-owned side-effect template.",
   "type": "object",
   "required": [
-    "adapter"
+    "action"
   ],
   "properties": {
-    "adapter": {
-      "description": "Framework adapter used to execute this Operator.",
+    "action": {
+      "description": "The single action performed when this operator fires.",
       "allOf": [
         {
-          "$ref": "#/definitions/FrameworkAdapterRef"
+          "$ref": "#/definitions/OperatorAction"
         }
       ]
     },
     "budget": {
-      "description": "Optional runtime budget.",
+      "description": "Optional execution limits.",
       "anyOf": [
         {
           "$ref": "#/definitions/OperatorBudget"
@@ -26,28 +26,15 @@
         }
       ]
     },
-    "inputs": {
-      "description": "Declared runtime inputs.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/OperatorInput"
-      }
-    },
-    "post_invoke": {
-      "description": "Policy Cards evaluated after invocation.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
-    },
-    "pre_invoke": {
-      "description": "Policy Cards evaluated before invocation.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/CardRef"
-      }
+    "description": {
+      "description": "Optional human-readable purpose.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "title": "CardKind",
@@ -77,12 +64,11 @@
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "type": "object",
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -103,10 +89,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -135,151 +124,322 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "FrameworkAdapterRef": {
-      "description": "Framework adapter reference for loading or invoking artifacts.",
-      "type": "object",
-      "required": [
-        "name",
-        "version"
-      ],
-      "properties": {
-        "config": {
-          "description": "Non-secret adapter configuration.",
-          "type": "object",
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          }
-        },
-        "name": {
-          "description": "Adapter name.",
-          "type": "string"
-        },
-        "version": {
-          "description": "Adapter version or version range.",
-          "type": "string"
-        }
-      }
-    },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
+    "HttpAuth": {
+      "description": "Server-side authentication sources for an HTTP action.",
       "oneOf": [
         {
-          "description": "String value.",
+          "description": "No authentication.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "scheme"
           ],
           "properties": {
-            "type": {
+            "scheme": {
               "type": "string",
               "enum": [
-                "str"
+                "none"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Bearer token loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "bearer"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "`user:password` loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "basic"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Custom header value loaded from an environment variable.",
+          "type": "object",
+          "required": [
+            "env",
+            "name",
+            "scheme"
+          ],
+          "properties": {
+            "env": {
+              "description": "Environment variable name.",
+              "type": "string"
+            },
+            "name": {
+              "description": "Header name.",
+              "type": "string"
+            },
+            "scheme": {
+              "type": "string",
+              "enum": [
+                "header"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "HttpMethod": {
+      "description": "HTTP methods supported by an HTTP Operator action.",
+      "oneOf": [
+        {
+          "description": "GET.",
+          "type": "string",
+          "enum": [
+            "get"
+          ]
+        },
+        {
+          "description": "POST.",
+          "type": "string",
+          "enum": [
+            "post"
+          ]
+        },
+        {
+          "description": "PUT.",
+          "type": "string",
+          "enum": [
+            "put"
+          ]
+        },
+        {
+          "description": "PATCH.",
+          "type": "string",
+          "enum": [
+            "patch"
+          ]
+        },
+        {
+          "description": "DELETE.",
+          "type": "string",
+          "enum": [
+            "delete"
+          ]
+        }
+      ]
+    },
+    "NotifyChannel": {
+      "description": "Typed notification destinations.",
+      "oneOf": [
+        {
+          "description": "PagerDuty event payload.",
+          "type": "object",
+          "required": [
+            "kind",
+            "severity",
+            "summary"
+          ],
+          "properties": {
+            "dedup_key": {
+              "description": "Optional de-duplication key.",
+              "type": [
+                "string",
+                "null"
               ]
             },
-            "value": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "pager_duty"
+              ]
+            },
+            "severity": {
+              "description": "PagerDuty severity.",
+              "type": "string"
+            },
+            "summary": {
+              "description": "Human-readable event summary.",
               "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
-          "description": "Numeric value.",
+          "description": "Slack message payload.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "kind",
+            "text"
           ],
           "properties": {
-            "type": {
+            "kind": {
               "type": "string",
               "enum": [
-                "number"
+                "slack"
               ]
             },
-            "value": {
-              "type": "number",
-              "format": "double"
+            "text": {
+              "description": "Message text.",
+              "type": "string"
             }
-          }
-        },
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "OperatorAction": {
+      "description": "The closed set of actions an Operator can perform.",
+      "oneOf": [
         {
-          "description": "Boolean value.",
+          "description": "Dispatch a registered Workflow.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "kind",
+            "workflow_ref"
           ],
           "properties": {
-            "type": {
+            "kind": {
               "type": "string",
               "enum": [
-                "bool"
+                "workflow"
               ]
             },
-            "value": {
-              "type": "boolean"
+            "workflow_ref": {
+              "description": "Workflow to dispatch with the trigger context.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                }
+              ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
-          "description": "List of non-secret values.",
+          "description": "Send a typed notification.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "channel",
+            "kind"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "list"
+            "channel": {
+              "description": "Notification destination and payload.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NotifyChannel"
+                }
               ]
             },
-            "value": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
+            "kind": {
+              "type": "string",
+              "enum": [
+                "notify"
+              ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
-          "description": "Object of non-secret values.",
+          "description": "Perform an HTTP request.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "kind",
+            "method",
+            "url"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "object"
+            "auth": {
+              "description": "Optional server-side authentication binding.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HttpAuth"
+                },
+                {
+                  "type": "null"
+                }
               ]
             },
-            "value": {
+            "body": {
+              "description": "Optional structured JSON body."
+            },
+            "expect_status": {
+              "description": "Optional expected response status.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint16",
+              "minimum": 0.0
+            },
+            "headers": {
+              "description": "Optional request headers.",
               "type": "object",
               "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
+                "type": "string"
               }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "http"
+              ]
+            },
+            "method": {
+              "description": "HTTP method.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpMethod"
+                }
+              ]
+            },
+            "timeout_seconds": {
+              "description": "Optional request timeout.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "url": {
+              "description": "URL template.",
+              "type": "string"
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },
     "OperatorBudget": {
-      "description": "Operator execution budget.",
+      "description": "Operator execution limits.",
       "type": "object",
       "properties": {
-        "max_memory_mb": {
-          "description": "Maximum memory in MiB.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint32",
-          "minimum": 0.0
-        },
         "max_tool_calls": {
           "description": "Maximum tool calls allowed during invocation.",
           "type": [
@@ -298,25 +458,42 @@
           "format": "uint32",
           "minimum": 0.0
         }
-      }
+      },
+      "additionalProperties": false
     },
-    "OperatorInput": {
-      "description": "Operator input declaration.",
-      "type": "object",
-      "required": [
-        "name",
-        "schema_ref"
-      ],
-      "properties": {
-        "name": {
-          "description": "Input name.",
-          "type": "string"
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
         },
-        "schema_ref": {
-          "description": "Schema reference URI or symbolic schema identifier.",
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
-      }
+      ]
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",

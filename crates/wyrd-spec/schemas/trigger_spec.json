@@ -1,46 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "TriggerSpec",
-  "description": "Declarative trigger that invokes an Operator when its source condition fires.",
+  "description": "Declarative schedule and optional observation source for an Operator.",
   "type": "object",
   "required": [
-    "source",
-    "target"
+    "operator_ref",
+    "schedule"
   ],
   "properties": {
-    "config": {
-      "description": "Non-secret trigger configuration.",
-      "type": "object",
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      }
-    },
-    "cooldown_seconds": {
-      "description": "Minimum cooldown between firings, in seconds.",
+    "description": {
+      "description": "Optional human-readable purpose.",
       "type": [
-        "integer",
+        "string",
         "null"
-      ],
-      "format": "uint32",
-      "minimum": 0.0
+      ]
     },
-    "source": {
-      "description": "Trigger source.",
+    "operator_ref": {
+      "description": "Operator fired when the source matches, or on every tick without a source.",
       "allOf": [
         {
-          "$ref": "#/definitions/TriggerSource"
+          "$ref": "#/definitions/Ref"
         }
       ]
     },
-    "target": {
-      "description": "Target Operator Card reference.",
+    "schedule": {
+      "description": "Required evaluation schedule.",
       "allOf": [
         {
-          "$ref": "#/definitions/CardRef"
+          "$ref": "#/definitions/TriggerSchedule"
+        }
+      ]
+    },
+    "source": {
+      "description": "Optional observation stream to evaluate on each schedule tick.",
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TriggerSource"
+        },
+        {
+          "type": "null"
         }
       ]
     }
   },
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "title": "CardKind",
@@ -70,12 +73,11 @@
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "type": "object",
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -96,10 +98,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -128,110 +133,37 @@
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
-      "oneOf": [
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card.",
+      "anyOf": [
         {
-          "description": "String value.",
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
           "type": "object",
           "required": [
-            "type",
-            "value"
+            "sibling"
           ],
           "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "str"
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
               ]
-            },
-            "value": {
-              "type": "string"
             }
           }
         },
         {
-          "description": "Numeric value.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "number"
-              ]
-            },
-            "value": {
-              "type": "number",
-              "format": "double"
-            }
-          }
-        },
-        {
-          "description": "Boolean value.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "bool"
-              ]
-            },
-            "value": {
-              "type": "boolean"
-            }
-          }
-        },
-        {
-          "description": "List of non-secret values.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "list"
-              ]
-            },
-            "value": {
-              "type": "array",
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
-            }
-          }
-        },
-        {
-          "description": "Object of non-secret values.",
-          "type": "object",
-          "required": [
-            "type",
-            "value"
-          ],
-          "properties": {
-            "type": {
-              "type": "string",
-              "enum": [
-                "object"
-              ]
-            },
-            "value": {
-              "type": "object",
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              }
-            }
-          }
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
         }
       ]
     },
@@ -239,22 +171,43 @@
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
+    "TriggerSchedule": {
+      "description": "Cron schedule for Trigger evaluation.",
+      "type": "object",
+      "required": [
+        "cron"
+      ],
+      "properties": {
+        "cron": {
+          "description": "Cron expression.",
+          "type": "string"
+        },
+        "tz": {
+          "description": "Optional IANA timezone; absent means UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "TriggerSource": {
-      "description": "Trigger source declaration.",
+      "description": "Observation source evaluated by a Trigger.",
       "oneOf": [
         {
-          "description": "Drift observation emitted by a Drift Card.",
+          "description": "Drift observations, optionally limited to one publisher.",
           "type": "object",
           "required": [
-            "card",
+            "drift_ref",
             "kind"
           ],
           "properties": {
-            "card": {
-              "description": "Source Drift Card reference.",
+            "drift_ref": {
+              "description": "Drift card to evaluate.",
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ]
             },
@@ -263,22 +216,34 @@
               "enum": [
                 "drift_observation"
               ]
+            },
+            "subject_filter": {
+              "description": "Optional publisher restriction.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
-          }
+          },
+          "additionalProperties": false
         },
         {
-          "description": "Evaluation observation emitted by an Eval Card.",
+          "description": "Eval observations, optionally limited to one publisher.",
           "type": "object",
           "required": [
-            "card",
+            "eval_ref",
             "kind"
           ],
           "properties": {
-            "card": {
-              "description": "Source Eval Card reference.",
+            "eval_ref": {
+              "description": "Eval card to evaluate.",
               "allOf": [
                 {
-                  "$ref": "#/definitions/CardRef"
+                  "$ref": "#/definitions/Ref"
                 }
               ]
             },
@@ -287,28 +252,20 @@
               "enum": [
                 "eval_observation"
               ]
-            }
-          }
-        },
-        {
-          "description": "Cron schedule.",
-          "type": "object",
-          "required": [
-            "cron",
-            "kind"
-          ],
-          "properties": {
-            "cron": {
-              "description": "Cron expression.",
-              "type": "string"
             },
-            "kind": {
-              "type": "string",
-              "enum": [
-                "schedule"
+            "subject_filter": {
+              "description": "Optional publisher restriction.",
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                },
+                {
+                  "type": "null"
+                }
               ]
             }
-          }
+          },
+          "additionalProperties": false
         }
       ]
     },

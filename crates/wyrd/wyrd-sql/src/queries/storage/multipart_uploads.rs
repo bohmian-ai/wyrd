@@ -340,6 +340,48 @@ pub async fn find_by_id(
     row.map(MultipartUploadRow::try_from).transpose()
 }
 
+/// Find every non-terminal upload owned by one Card.
+pub async fn find_open_for_card(
+    conn: &mut TenantConn<'_>,
+    card_uid: &str,
+) -> Result<Vec<MultipartUploadRow>, SqlError> {
+    let rows = sqlx::query_as::<_, MultipartUploadRowDb>(
+        r#"
+        SELECT
+            id,
+            data_tenant_id,
+            card_uid,
+            relative_path,
+            storage_path,
+            backend,
+            wire_protocol,
+            expected_sha256,
+            expected_size_bytes,
+            content_type,
+            part_count_planned,
+            part_size_bytes,
+            backend_upload_id,
+            block_count_planned,
+            status,
+            failure_reason,
+            created_at,
+            completed_at,
+            terminal_at,
+            expires_at
+        FROM wyrd.storage_multipart_uploads
+        WHERE card_uid = $1
+          AND status IN ('initiating', 'pending')
+        ORDER BY created_at
+        "#,
+    )
+    .bind(card_uid)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    rows.into_iter().map(MultipartUploadRow::try_from).collect()
+}
+
 /// Find a pending upload for crash-recovery dedupe.
 ///
 /// # Errors
@@ -411,6 +453,32 @@ pub async fn mark_completed(conn: &mut TenantConn<'_>, id: Uuid) -> Result<(), S
     .map_err(SqlError::from)?;
 
     ensure_one_row(result.rows_affected(), "mark upload completed")
+}
+
+/// Mark a pending upload completed when the owning workflow verified the object.
+///
+/// This is intentionally idempotent so a Card completion retry can race with
+/// the standalone storage completion route without turning a successful upload
+/// into a lifecycle error.
+pub async fn mark_completed_if_pending(
+    conn: &mut TenantConn<'_>,
+    id: Uuid,
+) -> Result<(), SqlError> {
+    sqlx::query(
+        r#"
+        UPDATE wyrd.storage_multipart_uploads
+        SET status = 'completed',
+            completed_at = now()
+        WHERE id = $1
+          AND status = 'pending'
+        "#,
+    )
+    .bind(id)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    Ok(())
 }
 
 /// Mark an upload as aborted.

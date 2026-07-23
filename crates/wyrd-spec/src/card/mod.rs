@@ -77,7 +77,7 @@ mod data_methods_tests {
     use crate::card::{FieldSpec, Inequality};
     use crate::envelope::CardKind;
     use crate::ids::{CardName, ColumnName, SpaceName, SplitName};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
     fn col(name: &str) -> ColumnName {
@@ -104,14 +104,14 @@ mod data_methods_tests {
         }
     }
 
-    fn card_ref() -> CardRef {
-        CardRef {
+    fn card_ref() -> Ref {
+        Ref::Ref(CardRef {
             kind: CardKind::Artifact,
             name: CardName::new("artifact").unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
-        }
+        })
     }
 
     fn interface() -> DataInterface {
@@ -134,6 +134,7 @@ mod data_methods_tests {
             target_columns: vec![col("target")],
             sql: None,
             stats: stats(),
+            publishes_to: Vec::new(),
         };
         spec.validate().unwrap();
 
@@ -215,7 +216,7 @@ mod data_roundtrip_tests {
     use crate::card::{FieldSpec, Inequality};
     use crate::envelope::CardKind;
     use crate::ids::{CardName, ColumnName, QueryName, SpaceName, SplitName};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
     fn col(name: &str) -> ColumnName {
@@ -230,14 +231,14 @@ mod data_roundtrip_tests {
         QueryName::new(name).unwrap()
     }
 
-    fn card_ref(name: &str) -> CardRef {
-        CardRef {
+    fn card_ref(name: &str) -> Ref {
+        Ref::Ref(CardRef {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
-        }
+        })
     }
 
     fn schema() -> DataSchema {
@@ -274,6 +275,7 @@ mod data_roundtrip_tests {
             target_columns: Vec::new(),
             sql,
             stats: stats(),
+            publishes_to: Vec::new(),
         };
         spec.validate().unwrap();
         spec
@@ -453,6 +455,7 @@ mod data_validation_tests {
             target_columns: vec![col("target")],
             sql,
             stats: valid_stats(),
+            publishes_to: Vec::new(),
         }
     }
 
@@ -528,6 +531,7 @@ mod data_validation_tests {
                 target_columns: vec![col("target")],
                 sql: None,
                 stats: valid_stats(),
+                publishes_to: Vec::new(),
             },
             DataSpec {
                 interface: DataInterface::Sql(SqlMeta {
@@ -543,6 +547,7 @@ mod data_validation_tests {
                     default_query: Some(query("main")),
                 }),
                 stats: valid_stats(),
+                publishes_to: Vec::new(),
             },
         ];
         for spec in specs {
@@ -716,6 +721,7 @@ mod data_validation_tests {
             target_columns: Vec::new(),
             sql: None,
             stats: valid_stats(),
+            publishes_to: Vec::new(),
         };
         assert_eq!(
             validate_data_spec(&spec),
@@ -763,6 +769,7 @@ mod data_validation_tests {
                 target_columns: Vec::new(),
                 sql: None,
                 stats: valid_stats(),
+                publishes_to: Vec::new(),
             };
             assert!(
                 validate_data_spec(&spec).is_ok(),
@@ -787,6 +794,7 @@ mod data_validation_tests {
                 target_columns: Vec::new(),
                 sql: None,
                 stats: valid_stats(),
+                publishes_to: Vec::new(),
             };
             assert_eq!(
                 validate_data_spec(&spec),
@@ -811,7 +819,7 @@ mod model_methods_tests {
     };
     use crate::envelope::CardKind;
     use crate::ids::{CardName, ColumnName, SpaceName};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
     fn col(name: &str) -> ColumnName {
@@ -822,14 +830,14 @@ mod model_methods_tests {
         FieldSpec::new(col(name), dtype)
     }
 
-    fn model_ref(name: &str) -> CardRef {
-        CardRef {
+    fn model_ref(name: &str) -> Ref {
+        Ref::Ref(CardRef {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
-        }
+        })
     }
 
     fn signature() -> ModelSignature {
@@ -1139,7 +1147,7 @@ mod model_roundtrip_tests {
     };
     use crate::envelope::CardKind;
     use crate::ids::{CardName, ColumnName, SpaceName};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use wyrd_semver::VersionBlock;
@@ -1152,14 +1160,14 @@ mod model_roundtrip_tests {
         FieldSpec::new(col(name), dtype)
     }
 
-    fn model_ref(name: &str) -> CardRef {
-        CardRef {
+    fn model_ref(name: &str) -> Ref {
+        Ref::Ref(CardRef {
             kind: CardKind::Artifact,
             name: CardName::new(name).unwrap(),
             version: VersionBlock::parse("1.0.0").unwrap(),
-            space: SpaceName::new("default").expect("static space is valid"),
+            space: Some(SpaceName::new("default").expect("static space is valid")),
             uid: None,
-        }
+        })
     }
 
     fn signature() -> ModelSignature {
@@ -1173,6 +1181,7 @@ mod model_roundtrip_tests {
             signature: signature(),
             sample_input: Some(SampleInput::new(SampleInputKind::Dict)),
             card_refs: vec![model_ref("model")],
+            publishes_to: Vec::new(),
         }
     }
 
@@ -1470,6 +1479,7 @@ mod model_validation_tests {
             signature: valid_signature(),
             sample_input: None,
             card_refs: Vec::new(),
+            publishes_to: Vec::new(),
         }
     }
 
@@ -1946,24 +1956,24 @@ mod drift_validation_tests {
     use crate::envelope::CardKind;
     use crate::error::WyrdError;
     use crate::ids::{CardName, FeatureName, SpaceName};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use wyrd_semver::VersionBlock;
 
-    fn card_ref(kind: CardKind, name: &str, version: &str) -> CardRef {
-        CardRef {
+    fn card_ref(kind: CardKind, name: &str, version: &str) -> Ref {
+        Ref::Ref(CardRef {
             kind,
             name: CardName::new(name).expect("valid card name"),
             version: VersionBlock::parse(version).expect("valid version"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
-        }
+        })
     }
 
-    fn data_ref(name: &str) -> CardRef {
+    fn data_ref(name: &str) -> Ref {
         card_ref(CardKind::Data, name, "1.0.0")
     }
 
-    fn model_ref(name: &str) -> CardRef {
+    fn model_ref(name: &str) -> Ref {
         card_ref(CardKind::Model, name, "1.0.0")
     }
 
@@ -2014,7 +2024,6 @@ mod drift_validation_tests {
     fn happy_path_psi_distribution_statistical() {
         let spec = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
@@ -2029,7 +2038,6 @@ mod drift_validation_tests {
     fn happy_path_external_method_with_comparator_condition() {
         let spec = DriftSpec::new(
             DriftMethod::External,
-            model_ref("subject-model"),
             external_signal(),
             DriftCondition::Above { limit: 1.0 },
             None,
@@ -2041,29 +2049,9 @@ mod drift_validation_tests {
     }
 
     #[test]
-    fn rejects_subject_ref_not_in_allowed_set() {
-        let err = DriftSpec::new(
-            DriftMethod::Psi,
-            card_ref(CardKind::Trigger, "subject-trigger", "1.0.0"),
-            distribution_signal(),
-            DriftCondition::Statistical,
-            Some(DriftProfile::Psi(psi_profile())),
-            None,
-            BTreeMap::new(),
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            err,
-            DriftValidationError::InvalidSubjectKind { .. }
-        ));
-    }
-
-    #[test]
     fn rejects_psi_with_metric_signal() {
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
@@ -2082,7 +2070,6 @@ mod drift_validation_tests {
     fn rejects_custom_with_external_signal() {
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model"),
             external_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(custom_profile())),
@@ -2106,7 +2093,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             signal,
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
@@ -2130,7 +2116,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             signal,
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
@@ -2157,7 +2142,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             signal,
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(psi_profile())),
@@ -2180,7 +2164,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject-model"),
             signal,
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(spc_profile())),
@@ -2203,7 +2186,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::External,
-            model_ref("subject-model"),
             signal,
             DriftCondition::Above { limit: 1.0 },
             None,
@@ -2219,7 +2201,6 @@ mod drift_validation_tests {
     fn rejects_profile_required_for_psi() {
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Above { limit: 1.0 },
             None,
@@ -2235,7 +2216,6 @@ mod drift_validation_tests {
     fn rejects_profile_variant_that_does_not_match_method() {
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(spc_profile())),
@@ -2254,7 +2234,6 @@ mod drift_validation_tests {
     fn rejects_profile_for_external_method() {
         let err = DriftSpec::new(
             DriftMethod::External,
-            model_ref("subject-model"),
             external_signal(),
             DriftCondition::Above { limit: 1.0 },
             Some(DriftProfile::Psi(psi_profile())),
@@ -2273,7 +2252,6 @@ mod drift_validation_tests {
     fn rejects_external_method_with_statistical_condition() {
         let err = DriftSpec::new(
             DriftMethod::External,
-            model_ref("subject-model"),
             external_signal(),
             DriftCondition::Statistical,
             None,
@@ -2292,7 +2270,6 @@ mod drift_validation_tests {
     fn rejects_above_with_non_finite_limit() {
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Above { limit: f64::NAN },
             Some(DriftProfile::Custom(custom_profile())),
@@ -2308,7 +2285,6 @@ mod drift_validation_tests {
     fn rejects_outside_with_inverted_bounds() {
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Outside {
                 lower: 10.0,
@@ -2330,7 +2306,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
@@ -2352,7 +2327,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
@@ -2371,7 +2345,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Psi,
-            model_ref("subject-model"),
             distribution_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Psi(profile)),
@@ -2390,7 +2363,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(profile)),
@@ -2409,7 +2381,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Spc,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Spc(profile)),
@@ -2428,7 +2399,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(profile)),
@@ -2447,7 +2417,6 @@ mod drift_validation_tests {
 
         let err = DriftSpec::new(
             DriftMethod::Custom,
-            model_ref("subject-model"),
             metric_signal(),
             DriftCondition::Statistical,
             Some(DriftProfile::Custom(profile)),

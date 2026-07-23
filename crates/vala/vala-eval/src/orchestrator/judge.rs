@@ -1,33 +1,40 @@
-//! Skald-backed [`crate::JudgeInvoker`] implementation.
+//! Skald-backed Agent invoker for constrained LLM judge execution.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use skald_agent::{Agent, AgentError};
+use skald_agent::{Agent, AgentError, run_config_from_agent_run_config_spec};
 use skald_prompt::Prompt;
 use skald_runtime::ProviderRegistry;
-use wyrd_spec::reference::CardRef;
+use tokio::sync::Mutex;
+use wyrd_spec::card::agent::AgentSpec;
+use wyrd_spec::reference::{CardRef, InlineableRef};
 
 use crate::{JudgeError, JudgeInvoker};
 
-/// Resolves a Prompt card reference into a runtime Skald prompt.
+/// Resolves a durable Agent card into its pure Agent spec.
 #[async_trait]
-pub trait PromptCardResolver: Send + Sync {
-    /// Resolve a prompt card reference.
-    ///
-    /// # Errors
-    /// Returns [`JudgeError`] if the prompt cannot be loaded.
-    async fn resolve(&self, judge_ref: &CardRef) -> Result<Prompt, JudgeError>;
+pub trait AgentCardResolver: Send + Sync {
+    /// Resolve an Agent card reference.
+    async fn resolve(&self, agent_ref: &CardRef) -> Result<AgentSpec, JudgeError>;
 }
 
-/// Skald-backed judge invoker.
+/// Resolves a durable Prompt card into a runtime Skald prompt.
+#[async_trait]
+pub trait PromptCardResolver: Send + Sync {
+    /// Resolve a Prompt card reference.
+    async fn resolve(&self, prompt_ref: &CardRef) -> Result<Prompt, JudgeError>;
+}
+
+/// Skald-backed invoker for one constrained Agent judge per Eval run.
 pub struct SkaldJudgeInvoker {
-    agent: Arc<Agent>,
     providers: Arc<ProviderRegistry>,
-    resolver: Arc<dyn PromptCardResolver>,
-    /// Per-attempt deadline.
+    agents: Arc<dyn AgentCardResolver>,
+    prompts: Arc<dyn PromptCardResolver>,
+    cached_agent: Mutex<Option<(InlineableRef<AgentSpec>, Arc<Agent>)>>,
+    /// Per-attempt outer deadline.
     pub call_deadline: Duration,
 }
 
@@ -35,30 +42,102 @@ impl SkaldJudgeInvoker {
     /// Construct a Skald judge invoker.
     #[must_use]
     pub fn new(
-        agent: Arc<Agent>,
         providers: Arc<ProviderRegistry>,
-        resolver: Arc<dyn PromptCardResolver>,
+        agents: Arc<dyn AgentCardResolver>,
+        prompts: Arc<dyn PromptCardResolver>,
     ) -> Self {
         Self {
-            agent,
             providers,
-            resolver,
+            agents,
+            prompts,
+            cached_agent: Mutex::new(None),
             call_deadline: Duration::from_secs(60),
         }
+    }
+
+    async fn agent_for(
+        &self,
+        judge_ref: &InlineableRef<AgentSpec>,
+    ) -> Result<Arc<Agent>, JudgeError> {
+        let mut cached = self.cached_agent.lock().await;
+        if let Some((cached_ref, agent)) = cached.as_ref() {
+            if cached_ref == judge_ref {
+                return Ok(Arc::clone(agent));
+            }
+            return Err(JudgeError::Terminal {
+                reason: "one JudgeInvoker cannot execute multiple judge Agents in one Eval run"
+                    .to_owned(),
+            });
+        }
+
+        let spec = match judge_ref {
+            InlineableRef::Ref(agent_ref) | InlineableRef::Sibling { sibling: agent_ref } => {
+                self.agents.resolve(agent_ref).await?
+            }
+            InlineableRef::Inline(spec) => (**spec).clone(),
+            InlineableRef::Path(path) => {
+                return Err(JudgeError::Terminal {
+                    reason: format!(
+                        "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: judge Agent path `{}` must be resolved by the loader",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        validate_judge_agent(&spec)?;
+
+        let prompt = match &spec.prompt {
+            InlineableRef::Inline(prompt) => Prompt::from_native((**prompt).clone()),
+            InlineableRef::Ref(prompt_ref)
+            | InlineableRef::Sibling {
+                sibling: prompt_ref,
+            } => self.prompts.resolve(prompt_ref).await?,
+            InlineableRef::Path(path) => {
+                return Err(JudgeError::Terminal {
+                    reason: format!(
+                        "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: judge Prompt path `{}` must be resolved by the loader",
+                        path.display()
+                    ),
+                });
+            }
+        };
+        if !matches!(
+            prompt.native().response_type,
+            skald_spec::ResponseType::JsonSchema { .. }
+        ) {
+            return Err(JudgeError::Terminal {
+                reason: "judge Agent prompt must require structured JSON output".to_owned(),
+            });
+        }
+
+        let id = judge_ref
+            .as_card_ref()
+            .map(|reference| reference.name.to_string())
+            .unwrap_or_else(|| "inline-judge".to_owned());
+        let agent = Agent::new(prompt)
+            .with_id(id)
+            .with_tools(std::iter::empty())
+            .with_run_config(run_config_from_agent_run_config_spec(&spec.run_config));
+        let agent = Arc::new(agent);
+        *cached = Some((judge_ref.clone(), Arc::clone(&agent)));
+        Ok(agent)
     }
 }
 
 #[async_trait]
 impl JudgeInvoker for SkaldJudgeInvoker {
-    async fn invoke(&self, judge: &CardRef, context: Value) -> Result<Value, JudgeError> {
-        let prompt = self.resolver.resolve(judge).await?;
-        let vars = flatten_object(&context);
+    async fn invoke(
+        &self,
+        judge: &InlineableRef<AgentSpec>,
+        context: Value,
+    ) -> Result<Value, JudgeError> {
+        let agent = self.agent_for(judge).await?;
+        let vars = context_variables(agent.prompt().as_ref(), &context);
         let borrowed = borrowed_pairs(&vars);
 
         let run = tokio::time::timeout(
             self.call_deadline,
-            self.agent
-                .run_prompt(self.providers.as_ref(), &prompt, &borrowed, None),
+            agent.run_prompt(self.providers.as_ref(), agent.prompt(), &borrowed, None),
         )
         .await
         .map_err(|_| JudgeError::Timeout {
@@ -69,10 +148,29 @@ impl JudgeInvoker for SkaldJudgeInvoker {
         let map = run
             .structured_output
             .ok_or_else(|| JudgeError::InvalidStructuredOutput {
-                reason: "judge prompt produced no structured output".to_owned(),
+                reason: "judge Agent produced no structured output".to_owned(),
             })?;
         Ok(Value::Object(map))
     }
+}
+
+fn validate_judge_agent(spec: &AgentSpec) -> Result<(), JudgeError> {
+    if !spec.tool_names.is_empty() {
+        return Err(JudgeError::Terminal {
+            reason: "judge Agent must not declare tools or delegation".to_owned(),
+        });
+    }
+    if spec.run_config.max_iterations != Some(1) {
+        return Err(JudgeError::Terminal {
+            reason: "judge Agent max_iterations must be explicitly set to 1".to_owned(),
+        });
+    }
+    if spec.run_config.session_recent_limit.is_some() {
+        return Err(JudgeError::Terminal {
+            reason: "judge Agent must not use session state".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn map_agent_error(error: AgentError) -> JudgeError {
@@ -102,19 +200,29 @@ fn elapsed_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn flatten_object(value: &Value) -> Vec<(String, String)> {
-    let Value::Object(map) = value else {
-        return Vec::new();
-    };
-    map.iter()
-        .map(|(key, value)| {
-            let rendered = match value {
-                Value::String(value) => value.clone(),
-                other => other.to_string(),
-            };
-            (key.clone(), rendered)
-        })
-        .collect()
+fn context_variables(prompt: &Prompt, value: &Value) -> Vec<(String, String)> {
+    let variables = &prompt.native().variables;
+    match value {
+        Value::Object(map) => variables
+            .iter()
+            .filter_map(|name| map.get(name).map(|value| (name.clone(), render(value))))
+            .collect(),
+        scalar => {
+            let name = variables
+                .iter()
+                .find(|name| name.as_str() == "context")
+                .or_else(|| (variables.len() == 1).then(|| &variables[0]));
+            name.map(|name| vec![(name.clone(), render(scalar))])
+                .unwrap_or_default()
+        }
+    }
+}
+
+fn render(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        other => other.to_string(),
+    }
 }
 
 fn borrowed_pairs(pairs: &[(String, String)]) -> Vec<(&str, &str)> {

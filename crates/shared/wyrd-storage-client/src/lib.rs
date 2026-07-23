@@ -10,9 +10,15 @@
 #![deny(missing_docs)]
 
 use std::path::Path;
+use std::sync::Arc;
 
 use wyrd_client::WyrdClient;
-use wyrd_spec::storage::{DownloadPlan, UploadPlan};
+use wyrd_spec::storage::{
+    DownloadPlan, GcsResumableComplete, PartUrlResponse, SinglePutComplete, UploadCompleteRequest,
+    UploadCompleteResponse, UploadId, UploadPlan,
+};
+
+use crate::upload::{UploadHooks, UploadOutcome};
 
 pub mod download;
 pub mod error;
@@ -20,9 +26,7 @@ pub mod upload;
 
 pub use download::DownloadOutcome;
 pub use error::StorageClientError;
-pub use upload::{
-    ArtifactSource, FileSource, PartUrlFuture, PartUrlMinter, UploadHooks, UploadOutcome,
-};
+pub use upload::{ArtifactSource, FileSource, UploadProgress, UploadProgressSink};
 
 /// Storage transfer handle that dispatches every HTTP call through a shared
 /// [`WyrdClient`].
@@ -45,7 +49,88 @@ impl WyrdStorageClient {
         }
     }
 
-    /// Upload an artifact according to a server-minted plan.
+    /// Upload one server-planned artifact and complete its server-owned upload
+    /// record when the backend protocol requires a completion request.
+    ///
+    /// This is the default no-progress artifact-upload operation exposed to
+    /// registry callers. Provider-specific dispatch, part URL minting, backend
+    /// outcomes, and the server completion request remain inside this client.
+    ///
+    /// # Errors
+    /// Returns a storage-client error when the plan is invalid, the source
+    /// cannot be read, the backend transfer fails, or server completion fails.
+    pub async fn upload_artifact<S: ArtifactSource>(
+        &self,
+        upload_id: &UploadId,
+        plan: &UploadPlan,
+        source: S,
+        idempotency_key: &str,
+    ) -> Result<(), StorageClientError> {
+        self.upload_artifact_with_progress(upload_id, plan, source, idempotency_key, None)
+            .await
+    }
+
+    /// Upload one artifact and forward provider progress to an optional
+    /// caller-owned sink.
+    ///
+    /// Progress is reported after each source chunk is accepted by the
+    /// provider request. Chunked providers report after each successful chunk;
+    /// single-request providers report as their request body consumes chunks.
+    /// An unknown source size is represented by `None` rather than a sentinel
+    /// byte count.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::upload_artifact`].
+    pub async fn upload_artifact_with_progress<S: ArtifactSource>(
+        &self,
+        upload_id: &UploadId,
+        plan: &UploadPlan,
+        source: S,
+        idempotency_key: &str,
+        progress: Option<UploadProgressSink>,
+    ) -> Result<(), StorageClientError> {
+        let part_url_minter = upload::s3_part_url_minter(self, upload_id, plan);
+        let progress_callback = progress.map(|sink| {
+            let upload_id = upload_id.clone();
+            Arc::new(move |uploaded_bytes, total_bytes| {
+                sink(UploadProgress {
+                    upload_id: upload_id.clone(),
+                    uploaded_bytes,
+                    total_bytes,
+                });
+            }) as upload::ProgressCallback
+        });
+        let outcome = self
+            .upload(
+                plan,
+                source,
+                upload::UploadHooks {
+                    idempotency_key,
+                    progress: progress_callback,
+                    part_url_minter,
+                },
+            )
+            .await?;
+        let request = outcome
+            .into_server_complete()
+            .or(match plan {
+                UploadPlan::LocalFs { .. } | UploadPlan::SinglePut { .. } => {
+                    Some(UploadCompleteRequest::SinglePut(SinglePutComplete {}))
+                }
+                UploadPlan::GcsResumable { .. } => {
+                    Some(UploadCompleteRequest::GcsResumable(GcsResumableComplete {}))
+                }
+                UploadPlan::S3Multipart { .. } | UploadPlan::AzureBlockBlob { .. } => None,
+            })
+            .ok_or(StorageClientError::PlanMismatch {
+                expected: "server-completable upload outcome",
+                actual: "provider upload reported complete without completion details",
+            })?;
+        self.complete(upload_id, &request, idempotency_key).await?;
+        Ok(())
+    }
+
+    /// Dispatch an artifact according to a server-minted plan.
     ///
     /// # Arguments
     ///
@@ -65,13 +150,58 @@ impl WyrdStorageClient {
     /// * Transport failures, 5xx responses (retried up to 3 times for multipart)
     /// * Plan/source size mismatch
     /// * Backend-specific errors (S3/GCS/Azure)
-    pub async fn upload<S: ArtifactSource>(
+    async fn upload<S: ArtifactSource>(
         &self,
         plan: &UploadPlan,
         source: S,
         hooks: UploadHooks<'_>,
     ) -> Result<UploadOutcome, StorageClientError> {
         upload::dispatch(&self.client, plan, source, hooks).await
+    }
+
+    /// Mint one S3 multipart part URL through the authenticated Wyrd server.
+    ///
+    /// The returned URL is provider-presigned and must be used without Wyrd
+    /// credentials. The storage service remains responsible for tenant checks
+    /// and validating the part against the durable upload row.
+    ///
+    /// # Errors
+    /// Returns a structured server error when the upload is missing, expired,
+    /// or is not an S3 multipart upload.
+    async fn part_url(
+        &self,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<String, StorageClientError> {
+        let path = format!("/v1/cards/upload/{upload_id}/part-url?part_number={part_number}");
+        let response: PartUrlResponse = self
+            .client
+            .request_json(reqwest::Method::POST, &path, None::<&()>)
+            .await
+            .map_err(crate::error::from_authenticated)?;
+        Ok(response.url)
+    }
+
+    /// Complete a server-owned upload after the backend accepted its bytes.
+    ///
+    /// S3 multipart and Azure block uploads require this call to commit their
+    /// backend state. The server then verifies the stored object and advances
+    /// the durable upload row.
+    ///
+    /// # Errors
+    /// Returns a structured server error when completion fails validation,
+    /// backend commit, object verification, or tenant authorization.
+    async fn complete(
+        &self,
+        upload_id: &UploadId,
+        request: &UploadCompleteRequest,
+        idempotency_key: &str,
+    ) -> Result<UploadCompleteResponse, StorageClientError> {
+        let path = format!("/v1/cards/upload/{upload_id}/complete");
+        self.client
+            .submit_with_idempotency_key(reqwest::Method::POST, &path, request, idempotency_key)
+            .await
+            .map_err(crate::error::from_authenticated)
     }
 
     /// Download an artifact according to a server-minted plan.
@@ -97,5 +227,32 @@ impl WyrdStorageClient {
         dest: &Path,
     ) -> Result<DownloadOutcome, StorageClientError> {
         download::dispatch(&self.client, plan, dest).await
+    }
+
+    /// Download an artifact and verify it against the server-declared digest
+    /// and byte length.
+    ///
+    /// This is an internal-capability seam for registry loading. The public
+    /// registry handle owns artifact selection; this client owns transfer and
+    /// byte verification.
+    ///
+    /// # Errors
+    /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes
+    /// do not match either declared value.
+    pub async fn download_verified(
+        &self,
+        plan: &DownloadPlan,
+        dest: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+    ) -> Result<DownloadOutcome, StorageClientError> {
+        download::dispatch_verified(
+            &self.client,
+            plan,
+            dest,
+            expected_sha256,
+            expected_size_bytes,
+        )
+        .await
     }
 }

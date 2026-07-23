@@ -76,7 +76,7 @@ mod pg_tests {
             kind: CardKind::Service,
             name: CardName::new(name).expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: SpaceName::new("test").expect("valid space"),
+            space: Some(SpaceName::new("test").expect("valid space")),
             uid: None,
         }
     }
@@ -140,7 +140,7 @@ mod pg_tests {
             kind: CardKind::Agent,
             name: CardName::new("agent-revoke-test").expect("valid name"),
             version: VersionBlock::parse("1.0.0").expect("valid version"),
-            space: SpaceName::new("test").expect("valid space"),
+            space: Some(SpaceName::new("test").expect("valid space")),
             uid: None,
         };
         seed_backing_card(&mut conn, &card_ref, creator).await;

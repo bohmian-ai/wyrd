@@ -74,9 +74,8 @@ pub enum UploadPlan {
     },
     /// Local filesystem auth-gated upload.
     ///
-    /// Signals that the upload URL is an auth-gated server route, not a
-    /// presigned PUT. SDK clients must include `Authorization: Bearer` and
-    /// `x-wyrd-data-tenant-id` on the PUT request.
+    /// Signals that the upload URL is an auth-gated server route for one
+    /// server-minted upload capability, not a caller-selected storage path.
     LocalFs {
         /// Server route PUT URL.
         put_url: String,

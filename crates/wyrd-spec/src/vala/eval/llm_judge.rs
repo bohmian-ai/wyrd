@@ -2,9 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::card::agent::AgentSpec;
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
-use crate::reference::CardRef;
+use crate::reference::InlineableRef;
 
 use super::condition::EvalCondition;
 use super::ids::{JsonPath, TaskId};
@@ -12,16 +13,17 @@ use super::operator::ComparisonOperator;
 
 /// LLM-as-judge task.
 ///
-/// `judge_ref` must point at a `Prompt` card. The runtime renders the prompt
-/// with workflow context, dispatches it through the approved runtime boundary,
-/// and applies `operator` and `expected` to the response.
+/// `judge_ref` must point at an `Agent` card or carry an inline Agent spec.
+/// The Agent resolves its Prompt child, runs one constrained structured-output
+/// turn with workflow context, and the Eval applies `operator` and `expected`
+/// to the response.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LlmJudgeTask {
     /// Unique identifier within the enclosing eval task map.
     pub id: TaskId,
-    /// Reference to a `Prompt` card.
-    pub judge_ref: CardRef,
+    /// Reference to or inline definition of an Agent card.
+    pub judge_ref: InlineableRef<AgentSpec>,
     /// Optional JSONPath selecting the context passed to the judge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_path: Option<JsonPath>,
@@ -45,20 +47,23 @@ fn default_max_retries() -> u32 {
 }
 
 impl LlmJudgeTask {
-    /// Constructs an LLM judge task and validates that `judge_ref` points at a
-    /// `Prompt` card.
+    /// Constructs an LLM judge task and validates that a resolved `judge_ref`
+    /// points at an Agent card.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when `judge_ref.kind` is not
-    /// [`CardKind::Prompt`].
+    /// Returns [`WyrdError::Validation`] when a resolved `judge_ref.kind` is
+    /// not [`CardKind::Agent`].
     pub fn new(
         id: TaskId,
-        judge_ref: CardRef,
+        judge_ref: impl Into<InlineableRef<AgentSpec>>,
         operator: ComparisonOperator,
         expected: serde_json::Value,
     ) -> Result<Self, WyrdError> {
-        if judge_ref.kind != CardKind::Prompt {
-            return Err(Self::kind_mismatch(&judge_ref.kind));
+        let judge_ref = judge_ref.into();
+        if let Some(card_ref) = judge_ref.as_card_ref()
+            && card_ref.kind != CardKind::Agent
+        {
+            return Err(Self::kind_mismatch(&card_ref.kind));
         }
 
         Ok(Self {
@@ -76,11 +81,13 @@ impl LlmJudgeTask {
     /// Re-validates the task after deserialization.
     ///
     /// # Errors
-    /// Returns [`WyrdError::Validation`] when `judge_ref.kind` is not
-    /// [`CardKind::Prompt`] or the optional condition is invalid.
+    /// Returns [`WyrdError::Validation`] when a resolved `judge_ref.kind` is
+    /// not [`CardKind::Agent`] or the optional condition is invalid.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        if self.judge_ref.kind != CardKind::Prompt {
-            return Err(Self::kind_mismatch(&self.judge_ref.kind));
+        if let Some(card_ref) = self.judge_ref.as_card_ref()
+            && card_ref.kind != CardKind::Agent
+        {
+            return Err(Self::kind_mismatch(&card_ref.kind));
         }
         if let Some(condition) = &self.condition {
             condition.validate()?;
@@ -90,10 +97,10 @@ impl LlmJudgeTask {
 
     fn kind_mismatch(kind: &CardKind) -> WyrdError {
         WyrdError::ValaEvalRefKindMismatch {
-            message: format!("llm_judge_task.judge_ref must reference a Prompt card; got {kind:?}"),
+            message: format!("llm_judge_task.judge_ref must reference an Agent card; got {kind:?}"),
             details: serde_json::json!({
                 "field": "llm_judge.judge_ref",
-                "expected": "Prompt",
+                "expected": "Agent",
                 "got": format!("{kind:?}"),
             }),
         }

@@ -180,7 +180,7 @@ impl CardRefPy {
             kind: parsed_kind,
             name: parsed_name,
             version: parsed_version,
-            space: parsed_space,
+            space: Some(parsed_space),
             uid: parsed_uid,
         }))
     }
@@ -206,7 +206,11 @@ impl CardRefPy {
     /// Space pinning identity together with name and version.
     #[getter]
     fn space(&self) -> String {
-        self.0.space.to_string()
+        self.0
+            .space
+            .as_ref()
+            .expect("Python CardRef construction requires a space")
+            .to_string()
     }
 
     /// Optional resolved UID.
@@ -226,7 +230,10 @@ impl CardRefPy {
             self.0.kind.wire_name(),
             self.0.name,
             self.0.version,
-            self.0.space,
+            self.0
+                .space
+                .as_ref()
+                .expect("Python CardRef construction requires a space"),
             uid,
         )
     }

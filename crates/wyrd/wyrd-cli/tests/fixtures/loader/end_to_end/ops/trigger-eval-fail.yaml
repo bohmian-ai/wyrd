@@ -1,0 +1,26 @@
+apiVersion: wyrd/v1
+kind: Trigger
+metadata:
+  space: wyrd-team
+  name: churn-triage-eval-fail
+  version: "1.0.0"
+spec:
+  # Trigger IS a subscription record. Its version reflects the (source,
+  # subject_filter, schedule, operator_ref) tuple — mutating any of them
+  # legitimately reversions THIS Trigger without touching the peer or
+  # operator cards it references.
+
+  schedule:
+    cron: "*/5 * * * *"
+    tz: UTC
+  source:
+    kind: eval_observation
+    # Sibling Eval in this composite → `path:` variant.
+    eval_ref: ../agent1/eval.yaml
+    # Sibling Agent → `path:` variant. Restricts observations to those
+    # emitted by THIS specific agent. Team B registers their own Trigger
+    # with a different subject_filter → nothing shared reversions.
+    subject_filter: ../agent1/agent.yaml
+
+  # Sibling Operator → `path:` variant.
+  operator_ref: ./operator-slack.yaml

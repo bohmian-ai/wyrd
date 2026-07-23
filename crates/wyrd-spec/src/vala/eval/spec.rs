@@ -9,7 +9,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::envelope::CardKind;
 use crate::error::WyrdError;
-use crate::reference::CardRef;
+use crate::reference::{CardRef, Ref};
 
 use super::ids::{JsonPath, TaskId};
 use super::operator::{ComparisonOperator, validate_regex_pattern};
@@ -31,8 +31,6 @@ pub const MAX_EVAL_TASKS: usize = 512;
 /// carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.
 ///
 /// Authors declare:
-/// - `subject_ref` — canonical card this rubric judges per doctrine #3 and
-///   the `ObservationCriteria.subject_refs` precedent.
 /// - `dataset` — source data, typically a `Data` card with eval scenarios.
 /// - `tasks` — the rubric DAG.
 /// - `workflow` — optional declared workflow shape.
@@ -46,22 +44,6 @@ pub const MAX_EVAL_TASKS: usize = 512;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EvalSpec {
-    /// Declarative subject — the card whose runs this rubric judges.
-    ///
-    /// When `Some`, registration can derive an `evaluates` relationship.
-    /// Runtime records may still supply the subject when this is `None`.
-    ///
-    /// **Presence rule (D8).** The struct keeps `Option<CardRef>`, but
-    /// registry validation at `wyrd apply` rejects an Eval card with
-    /// `subject_ref = None` whenever the card receives online observations
-    /// (`run.observe.eval(...)` needs the identity chain). It may be `None`
-    /// only for pure-offline rubric cards driven entirely by datasets and
-    /// scenarios. The validator itself ships with the registry surface; this
-    /// field documents the rule the validator enforces, consistent with the
-    /// kind-restriction note on `validate()` below.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_ref: Option<CardRef>,
-
     /// Source data for offline runs.
     ///
     /// Validation enforces `dataset.kind == Data`.
@@ -115,7 +97,6 @@ impl EvalSpec {
         validate_task_keys(&tasks).map_err(EvalSpecError::Wyrd)?;
         validate_dag(&tasks).map_err(EvalSpecError::Dag)?;
         Ok(Self {
-            subject_ref: None,
             dataset: None,
             tasks,
             workflow: None,
@@ -127,12 +108,6 @@ impl EvalSpec {
 
     /// Validate the task DAG, task-level validators, dataset, pass gate, and
     /// sampling policy.
-    ///
-    /// `subject_ref` kind restrictions and the presence rule are intentionally
-    /// deferred to registry validators: the allowlist is not locked here, and
-    /// the D8 presence rule (online-observation Eval cards require
-    /// `subject_ref`) is enforced at `wyrd apply` against the registered card
-    /// graph, not in pure-spec validation.
     ///
     /// # Errors
     /// Returns [`EvalSpecError`] when DAG validation fails or a nested Wyrd
@@ -244,12 +219,12 @@ fn validate_task_keys(tasks: &BTreeMap<TaskId, EvalTask>) -> Result<(), WyrdErro
 /// [`super::ids::JsonPath`].
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(transparent)]
-pub struct DatasetRef(pub CardRef);
+pub struct DatasetRef(pub Ref);
 
 impl<'de> Deserialize<'de> for DatasetRef {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let card_ref = CardRef::deserialize(deserializer)?;
-        Self::new(card_ref).map_err(serde::de::Error::custom)
+        let reference = Ref::deserialize(deserializer)?;
+        Self::new(reference).map_err(serde::de::Error::custom)
     }
 }
 
@@ -259,11 +234,13 @@ impl DatasetRef {
     /// # Errors
     /// Returns [`WyrdError::Validation`] when `card_ref.kind` is not
     /// [`CardKind::Data`].
-    pub fn new(card_ref: CardRef) -> Result<Self, WyrdError> {
-        if card_ref.kind != CardKind::Data {
+    pub fn new(reference: Ref) -> Result<Self, WyrdError> {
+        if let Some(card_ref) = reference.as_card_ref()
+            && card_ref.kind != CardKind::Data
+        {
             return Err(Self::kind_mismatch(&card_ref.kind));
         }
-        Ok(Self(card_ref))
+        Ok(Self(reference))
     }
 
     /// Re-validate after deserialization.
@@ -272,16 +249,18 @@ impl DatasetRef {
     /// Returns [`WyrdError::Validation`] when the wrapped reference is not a
     /// `Data` card reference.
     pub fn validate(&self) -> Result<(), WyrdError> {
-        if self.0.kind != CardKind::Data {
-            return Err(Self::kind_mismatch(&self.0.kind));
+        if let Some(card_ref) = self.0.as_card_ref()
+            && card_ref.kind != CardKind::Data
+        {
+            return Err(Self::kind_mismatch(&card_ref.kind));
         }
         Ok(())
     }
 
     /// Borrow the wrapped card reference.
     #[must_use]
-    pub fn as_card_ref(&self) -> &CardRef {
-        &self.0
+    pub fn as_card_ref(&self) -> Option<&CardRef> {
+        self.0.as_card_ref()
     }
 
     fn kind_mismatch(kind: &CardKind) -> WyrdError {

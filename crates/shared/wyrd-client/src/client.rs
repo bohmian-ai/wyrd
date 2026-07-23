@@ -42,6 +42,14 @@ pub struct WyrdClient {
 }
 
 impl WyrdClient {
+    /// Build a client from the global config file, environment, and defaults.
+    ///
+    /// # Errors
+    /// Returns configuration, credential, or transport errors during assembly.
+    pub fn from_global() -> Result<Self, WyrdClientError> {
+        Self::with_config(ClientConfig::from_global()?)
+    }
+
     /// Build a client from environment variables.
     ///
     /// Resolves [`ClientConfig::from_env`] for endpoints, then the effective

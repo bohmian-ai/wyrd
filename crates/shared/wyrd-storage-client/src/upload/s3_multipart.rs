@@ -66,7 +66,7 @@ pub(crate) async fn upload(
             send_part_with_retry(client, hooks, part_number, bytes.clone(), required_headers)
                 .await?;
         uploaded += bytes.len() as u64;
-        report(hooks, uploaded, total);
+        report(hooks.progress.as_ref(), uploaded, total);
         parts.push(S3CompletedPart { part_number, e_tag });
     }
     if reader.has_more().await? {

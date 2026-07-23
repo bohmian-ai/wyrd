@@ -1,0 +1,41 @@
+apiVersion: wyrd/v1
+kind: Agent
+metadata:
+  space: wyrd-team
+  name: retention-runbook
+  version: "1.0.0"
+spec:
+  # `inline:` variant — prompt body embedded in this Agent's spec. Loader
+  # resolves any nested `!file` / `path:` INSIDE the inline block before
+  # submission. This Agent's spec_hash covers the resolved bytes;
+  # mutating the inline prompt bumps THIS Agent's version. No separate
+  # PromptCard is registered.
+  #
+  # Use `inline:` when the child config is specific to THIS parent.
+  # Use `path:` (see agent1/agent.yaml) when the child should be its own
+  # reusable card. Use `ref:` when the child is already registered
+  # elsewhere.
+  prompt:
+    request:
+      contents:
+        - role: user
+          parts:
+            - text: Execute the selected retention runbook.
+      system_instruction:
+        role: system
+        parts:
+          - text: !file runbook.txt
+    model: gemini-flash-lite
+    variables: []
+    media_variables: []
+    response_type: text
+
+  tool_names: [crm_note_write, billing_apply_credit, email_send]
+  run_config:
+    max_iterations: 10
+    timeout_ms: 120000
+
+  # Same Eval as agent1 — proves shared peer reuse. Eval version does not
+  # move when the second publisher opts in.
+  publishes_to:
+    - ../agent1/eval.yaml

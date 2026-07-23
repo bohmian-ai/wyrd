@@ -5,7 +5,9 @@ use predicates::prelude::*;
 use serde_json::Value;
 use wyrd_spec::vala::eval::EvalPassGate;
 
-use eval_support::{assertion_task, judge_task, record, spec, write_eval_card, write_records};
+use eval_support::{
+    assertion_task, judge_task, record, spec, subject_ref, write_eval_card, write_records,
+};
 
 #[test]
 fn local_records_run_scores_fixture_records() {
@@ -21,6 +23,7 @@ fn local_records_run_scores_fixture_records() {
         ),
     );
     write_records(&records_path, &[record(true)]);
+    let subject = subject_ref().to_string();
 
     std::process::Command::cargo_bin("wyrd")
         .expect("wyrd binary")
@@ -31,6 +34,8 @@ fn local_records_run_scores_fixture_records() {
             eval_path.to_str().expect("utf8 path"),
             "--records",
             records_path.to_str().expect("utf8 path"),
+            "--subject",
+            &subject,
             "--judge-mock",
             "--out",
             out_dir.to_str().expect("utf8 path"),
@@ -57,6 +62,7 @@ fn local_records_run_exits_two_when_gate_fails() {
         spec(vec![assertion_task()], Some(EvalPassGate::AllPass)),
     );
     write_records(&records_path, &[record(false)]);
+    let subject = subject_ref().to_string();
 
     std::process::Command::cargo_bin("wyrd")
         .expect("wyrd binary")
@@ -67,6 +73,8 @@ fn local_records_run_exits_two_when_gate_fails() {
             eval_path.to_str().expect("utf8 path"),
             "--records",
             records_path.to_str().expect("utf8 path"),
+            "--subject",
+            &subject,
             "--judge-mock",
             "--out",
             out_dir.to_str().expect("utf8 path"),

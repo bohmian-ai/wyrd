@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::NonSecretValue;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// Audit artifact or evidence bundle metadata.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -16,13 +16,13 @@ pub struct AuditSpec {
     pub description: Option<String>,
     /// Subject Card references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub subject_refs: Vec<CardRef>,
+    pub subject_refs: Vec<Ref>,
     /// Policy references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub policy_refs: Vec<CardRef>,
+    pub policy_refs: Vec<Ref>,
     /// Evidence artifact references.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence_refs: Vec<CardRef>,
+    pub evidence_refs: Vec<Ref>,
     /// Free-form details.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub details: BTreeMap<String, NonSecretValue>,

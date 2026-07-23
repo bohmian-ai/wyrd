@@ -1,0 +1,8 @@
+[defaults]
+space = "team-default"
+
+[defaults.labels]
+environment = "test"
+
+[kind.Service.labels]
+tier = "entrypoint"

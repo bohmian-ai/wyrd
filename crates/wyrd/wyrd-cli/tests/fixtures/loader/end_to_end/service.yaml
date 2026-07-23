@@ -1,0 +1,37 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  space: wyrd-team
+  name: churn-response-service
+  version: "1.0.0"
+  labels:
+    team: churn-ml
+spec:
+  description: |
+    Score churn risk on incoming customer events, triage the high-risk cohort,
+    and execute the matched retention runbook.
+  service_type: api
+
+  # Every component uses the unified ref variant: `path` (sibling submission)
+  # or `ref` (external, identity by kind+space+name+exact version). Inline is
+  # not legal at component positions.
+  components:
+    - alias: model
+      # `ref:` — external card with an exact identity pin.
+      ref:
+        kind: Model
+        space: wyrd-team
+        name: churn-classifier
+        version: "1.4.2"
+
+    - alias: agent1
+      # `path:` — sibling submission in this composite; loader binds to its
+      # resolved identity at wire assembly.
+      ref: agent1/agent.yaml
+
+    - alias: agent2
+      ref: agent2/agent.yaml
+
+  # Optional service-level publications (deploy/scale/health events). Empty
+  # here — this service has no first-class lifecycle observations.
+  publishes_to: []

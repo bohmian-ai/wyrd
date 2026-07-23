@@ -1,0 +1,37 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  space: wyrd-team
+  name: churn-classifier
+  version: "1.4.2"
+  labels:
+    environment: production
+    stage: champion
+spec:
+  interface:
+    kind: Sklearn
+    meta:
+      framework_version: "1.4.0"
+      model_subtype: GradientBoostingClassifier
+  task_type: BinaryClassification
+  signature:
+    inputs:
+      - { name: tenure_months,   dtype: int32 }
+      - { name: monthly_charges, dtype: float64 }
+      - { name: contract_type,   dtype: string }
+    outputs:
+      - { name: churn_probability, dtype: float64 }
+
+  # Training-set Data card was registered separately by a data pipeline
+  # (Data cards typically don't live in the same tree as services).
+  # External `ref:` variant — resolved against the registry at register time.
+  card_refs:
+    - kind: Data
+      space: wyrd-team
+      name: churn-classifier-data
+      version: "1.4.2"
+
+  # Publishes to a sibling Drift card in this composite.
+  # `path:` variant — loader binds to the sibling's identity at wire assembly.
+  publishes_to:
+    - ./drift.yaml

@@ -294,6 +294,90 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Loader encountered an IO error reading a card file.
+    #[error("[WYRD_LOADER_400_IO] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_IO",
+        status = 400,
+        title = "Loader IO error",
+        remediation = "Check file permissions and that all referenced files exist."
+    )]
+    LoaderIo {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Loader encountered a YAML syntax error.
+    #[error("[WYRD_LOADER_400_YAML_SYNTAX] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_YAML_SYNTAX",
+        status = 400,
+        title = "YAML syntax error",
+        remediation = "Fix the YAML syntax error and retry."
+    )]
+    LoaderYamlSyntax {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Card envelope is missing required fields.
+    #[error("[WYRD_LOADER_400_INVALID_ENVELOPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_INVALID_ENVELOPE",
+        status = 400,
+        title = "Invalid card envelope",
+        remediation = "Ensure the card has apiVersion, kind, metadata, and spec fields."
+    )]
+    LoaderInvalidEnvelope {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Path reference escapes the workspace sandbox.
+    #[error("[WYRD_LOADER_400_PATH_ESCAPE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_PATH_ESCAPE",
+        status = 400,
+        title = "Path reference escapes workspace",
+        remediation = "Use relative paths within the workspace root."
+    )]
+    LoaderPathEscape {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Absolute path reference breaks portability (advisory warning).
+    #[error("[WYRD_LOADER_400_PATH_ABSOLUTE_ADVISORY] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_PATH_ABSOLUTE_ADVISORY",
+        status = 400,
+        title = "Absolute path reference breaks portability",
+        remediation = "Use relative paths for portability across environments."
+    )]
+    LoaderPathAbsoluteAdvisory {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// Config load failed.
+    #[error("[WYRD_LOADER_400_CONFIG_LOAD_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_LOADER_400_CONFIG_LOAD_FAILED",
+        status = 400,
+        title = "Config load failed",
+        remediation = "Check wyrd.toml syntax and structure."
+    )]
+    LoaderConfigLoadFailed {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// Requested entity was not found.
     #[error("[WYRD_SPEC_404_NOT_FOUND] {message}")]
     #[wyrd_error(
@@ -1126,7 +1210,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_DUPLICATE_SUBMISSION",
         status = 400,
         title = "Duplicate card submission",
-        remediation = "Submit each (kind, space, name) identity at most once per request."
+        remediation = "Submit each (kind, space, name, version) identity at most once per request."
     )]
     SpecDuplicateSubmission {
         /// Human-readable error message.
@@ -2518,6 +2602,12 @@ impl WyrdError {
     fn message_details(&self) -> (Cow<'_, str>, serde_json::Value) {
         match self {
             Self::Validation { message, details }
+            | Self::LoaderIo { message, details }
+            | Self::LoaderYamlSyntax { message, details }
+            | Self::LoaderInvalidEnvelope { message, details }
+            | Self::LoaderPathEscape { message, details }
+            | Self::LoaderPathAbsoluteAdvisory { message, details }
+            | Self::LoaderConfigLoadFailed { message, details }
             | Self::NotFound { message, details }
             | Self::Conflict { message, details }
             | Self::Internal { message, details }

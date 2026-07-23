@@ -37,7 +37,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: SpaceName::new("tests").expect("static space is valid"),
+        space: Some(SpaceName::new("tests").expect("static space is valid")),
         uid: None,
     }
 }
@@ -51,7 +51,7 @@ pub fn subject_ref() -> CardRef {
 }
 
 pub fn judge_ref() -> CardRef {
-    card_ref(CardKind::Prompt, "judge")
+    card_ref(CardKind::Agent, "judge")
 }
 
 pub fn scenario(
@@ -92,7 +92,7 @@ pub fn assertion_task(id: &str) -> EvalTask {
 pub fn judge_task(id: &str) -> EvalTask {
     EvalTask::LlmJudge(LlmJudgeTask {
         id: tid(id),
-        judge_ref: judge_ref(),
+        judge_ref: judge_ref().into(),
         context_path: None,
         expected: json!({"passed": true}),
         operator: ComparisonOperator::Equals,
@@ -108,7 +108,6 @@ pub fn spec(tasks: Vec<EvalTask>) -> EvalSpec {
         .map(|task| (task.id().clone(), task))
         .collect::<BTreeMap<_, _>>();
     EvalSpec {
-        subject_ref: Some(subject_ref()),
         dataset: None,
         tasks,
         workflow: None,

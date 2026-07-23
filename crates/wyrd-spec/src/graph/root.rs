@@ -2,6 +2,7 @@
 
 use super::topo::GraphError;
 use super::{RootPick, TopoOrder, identity_key};
+use crate::envelope::CardKind;
 
 /// Select the sole node with no incoming edge from another submission.
 ///
@@ -32,11 +33,42 @@ pub fn pick_root(order: &TopoOrder) -> Result<RootPick, GraphError> {
     match candidates.as_slice() {
         [root] => Ok(RootPick { root: root.clone() }),
         _ => {
+            let services = candidates
+                .iter()
+                .filter(|candidate| candidate.kind == CardKind::Service)
+                .collect::<Vec<_>>();
+            if let [service] = services.as_slice() {
+                return Ok(RootPick {
+                    root: (*service).clone(),
+                });
+            }
             let mut candidates = candidates;
             candidates.sort_by_key(identity_key);
             Err(GraphError::MultipleRoots { candidates })
         }
     }
+}
+
+/// Return a dependency-first order with the selected root in the final slot.
+///
+/// Independent peer cards may otherwise sort after a Service even though the
+/// Service is the deployment root. Moving only the selected root preserves all
+/// dependency edges while giving every caller one root-last projection.
+///
+/// # Errors
+/// Returns the same root-selection errors as [`pick_root`].
+pub fn root_last(mut order: TopoOrder) -> Result<TopoOrder, GraphError> {
+    let root = pick_root(&order)?.root;
+    let Some(position) = order
+        .nodes
+        .iter()
+        .position(|node| identity_key(&node.card_ref) == identity_key(&root))
+    else {
+        return Err(GraphError::Empty);
+    };
+    let root = order.nodes.remove(position);
+    order.nodes.push(root);
+    Ok(order)
 }
 
 #[cfg(test)]
@@ -52,7 +84,7 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: "default".parse().expect("test space is valid"),
+            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }
@@ -93,14 +125,27 @@ mod tests {
     }
 
     #[test]
-    fn pick_root_multiple_roots_returns_multiple_roots_error() {
+    fn pick_root_prefers_the_only_service_root() {
         let left = card_ref(CardKind::Agent, "left");
         let right = card_ref(CardKind::Service, "right");
+        let result = pick_root(&order(
+            vec![node(right.clone()), node(left.clone())],
+            Vec::new(),
+        ))
+        .expect("the only Service is the composite root");
+
+        assert_eq!(result, RootPick { root: right });
+    }
+
+    #[test]
+    fn pick_root_rejects_ambiguous_non_service_roots() {
+        let left = card_ref(CardKind::Agent, "left");
+        let right = card_ref(CardKind::Agent, "right");
         let error = pick_root(&order(
             vec![node(right.clone()), node(left.clone())],
             Vec::new(),
         ))
-        .expect_err("independent nodes have multiple roots");
+        .expect_err("independent agents are ambiguous");
 
         assert!(matches!(
             error,

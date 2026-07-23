@@ -1,0 +1,202 @@
+---
+title: Client configuration
+description: Configure Wyrd clients, credentials, and repository defaults for local development and automation.
+pillar: wyrd
+group: Get Started
+order: 2
+---
+
+# Client configuration
+
+Wyrd has two client-side configuration scopes:
+
+- **Global client configuration** lives in `config.toml` under your Wyrd
+  config directory. It selects the server, tenant, and token-cache behavior.
+- **Repository configuration** lives in `wyrd.toml` in a project. It supplies
+  defaults for cards authored from that repository.
+
+Keep those scopes separate. A server URL and credential belong to the client
+runtime; a card space, label, or annotation belongs to the project authoring
+the card. Server startup configuration is a different concern. See
+[Self-hosting configuration](/self-hosting/configuration/).
+
+## The short version
+
+| I need to... | Configure... | Used by |
+| --- | --- | --- |
+| Point a client at a Wyrd server | `config.toml` or `WYRD_GRPC_URL` / `WYRD_SERVER_URL` | `ClientConfig::from_global`, `WyrdClient::from_global` |
+| Give a workload a tenant and credential | Environment variables or `credentials.toml` | Client credential resolution |
+| Choose a default card space | `wyrd.toml` | Data, Model, and Prompt card constructors |
+| Add project-wide labels or annotations | `wyrd.toml` | Card constructors |
+| Override one value for a single process | An explicit `ClientConfig` field | That client only |
+
+For each non-secret client field, precedence is explicit constructor override,
+then the global profile, then the environment, then the built-in endpoint
+default. Card metadata uses its own precedence: an explicit card value, then a
+kind-specific repository default, then a workspace default, then the compiled
+card default.
+
+## Global client configuration
+
+The global file is named `config.toml`. Wyrd resolves its directory through
+`wyrd_utils::config_dir::wyrd_config_dir()` in this order:
+
+1. `$WYRD_CONFIG_HOME` used verbatim;
+2. `$XDG_CONFIG_HOME/wyrd`;
+3. `$HOME/.config/wyrd`.
+
+Empty variables are treated as unset. A missing directory or file behaves like
+an empty global profile. An existing file with invalid TOML or unknown fields
+is reported as a client configuration error.
+
+### Example
+
+```toml
+# $HOME/.config/wyrd/config.toml
+[client]
+grpc_url = "https://wyrd.example.com:50051"
+http_url = "https://wyrd.example.com:50050"
+tenant = "acme"
+
+[client.token_cache]
+kind = "disk"
+path = "/home/alice/.config/wyrd/tokens"
+```
+
+The supported fields are:
+
+| Field | Environment fallback | Built-in default |
+| --- | --- | --- |
+| `client.grpc_url` | `WYRD_GRPC_URL` | `http://localhost:50051` |
+| `client.http_url` | `WYRD_SERVER_URL` | `http://localhost:50050` |
+| `client.tenant` | `WYRD_TENANT` | unset |
+| `client.token_cache.kind` | `WYRD_TOKEN_CACHE` | `in_memory` |
+| `client.token_cache.path` | `WYRD_TOKEN_CACHE_PATH` | `<config-dir>/tokens` |
+
+Use `in_memory` or `disk` for the token-cache kind. The global profile may
+select an endpoint, tenant, or token-cache path, but it never carries an API
+key or access token.
+
+## Constructors and lazy connection
+
+Use `WyrdClient::from_global()` when you need the assembled transport client.
+It loads the global profile, applies environment fallback, resolves the
+credential chain, and builds the shared HTTP/auth state. Construction performs
+local validation only; token exchange and network connection happen on the
+first request.
+
+For programmatic overrides, build a `ClientConfig` and pass it to
+`WyrdClient::with_config`:
+
+```rust
+use secrecy::SecretString;
+use wyrd_client::{config::ClientConfig, WyrdClient};
+
+let mut config = ClientConfig::from_global()?;
+config.http.base_url = "http://localhost:50050".to_owned();
+config.api_key = Some(SecretString::from("wyrd_sk_example"));
+let client = WyrdClient::with_config(config)?;
+```
+
+`ClientConfig::from_global()` and `WyrdClient::from_global()` are the
+`ClientConfig::from_env()` and `WyrdClient::from_env()` are environment-only
+helpers. `WyrdClient` owns one HTTP/auth stack and shares it with the lazy gRPC
+connection; callers should construct one handle and reuse it rather than
+assembling transports per request.
+
+## Credentials
+
+Keep credentials out of `config.toml`. The client resolves credentials in this
+order, stopping at the first available source:
+
+1. An API key supplied explicitly on `ClientConfig::api_key`.
+2. `WYRD_ACCESS_TOKEN`.
+3. `WYRD_WORKLOAD_TOKEN` with `WYRD_TENANT`, or with `client.tenant` from the
+   global profile when `WYRD_TENANT` is unset.
+4. `WYRD_API_KEY`.
+5. `[default].api_key` in `credentials.toml` under the selected config
+   directory.
+
+For local development, the credentials file can look like this:
+
+```toml
+# $HOME/.config/wyrd/credentials.toml
+[default]
+api_key = "wyrd_sk_example"
+```
+
+Protect this file like any other local secret. Do not commit it, copy it into
+a repository, or print it in an agent trace. Rust stores secrets as
+`SecretString`; client debug output, logs, and errors redact their contents.
+An absent or unreadable credentials file is ignored until the complete chain
+produces no usable credential.
+
+## Repository card defaults
+
+Put `wyrd.toml` at the repository root or an ancestor of the working directory:
+
+```toml
+[defaults]
+space = "ml-platform"
+labels = { team = "ml", env = "dev" }
+annotations = { "org.wyrd/owner" = "ml-platform" }
+
+[kind.Model]
+space = "ml-models"
+labels = { domain = "ml" }
+```
+
+The authoring loader discovers `wyrd.toml` from the current working directory,
+bounded by the nearest `.git` boundary or `$HOME`. It does not search outside
+that boundary. Repository configuration is metadata-only: it never supplies a
+server URL, credential, or transport setting.
+
+The supported defaults are `space`, `labels`, and `annotations` in
+`[defaults]` and `[kind.<CardKind>]` tables. `name`, `version`, and `uid` are
+never synthesized from `wyrd.toml`.
+
+Labels and annotations merge per key. An explicit card key wins; otherwise a
+kind-specific key wins over the workspace default. Card constructors tolerate
+a missing, malformed, or unreadable repository file and continue with explicit
+values and compiled defaults. Calling `wyrd-config` directly remains the path
+for diagnostics about the file itself.
+
+## Agent and CI recipe
+
+Give an agent or CI job the smallest configuration surface it needs. For a job
+that already has an access token, set only the endpoint and credential in its
+environment:
+
+```bash
+export WYRD_SERVER_URL="https://wyrd.example.com:50050"
+export WYRD_ACCESS_TOKEN="${WYRD_ACCESS_TOKEN:?set a token}"
+```
+
+If the runtime uses the global-aware client, set `WYRD_CONFIG_HOME` to a
+temporary directory and write only the non-secret endpoint and tenant settings
+there. Inject the secret separately through the job's secret manager.
+
+Do not rely on an environment variable to override a field already set in
+`config.toml`; the profile intentionally wins. Use an explicit constructor
+override for the one process that needs a different endpoint or API key.
+
+## Troubleshooting
+
+| Symptom | Check |
+| --- | --- |
+| The client uses localhost | The selected global config directory, `config.toml`, and environment fallback. |
+| `WYRD_SERVER_URL` appears ignored | `config.toml` contains `client.http_url`; use an explicit constructor override for a one-process change. |
+| Card space remains `default` | The process started outside the repository boundary, or `wyrd.toml` failed validation and was soft-failed by the card constructor. |
+| The client reports no credentials | Check the credential chain and the selected config directory's `credentials.toml`. |
+| Workload identity has no tenant | Set `WYRD_TENANT` or `client.tenant` alongside `WYRD_WORKLOAD_TOKEN`. |
+| Disk caching does not persist | Use `kind = "disk"` and a writable `client.token_cache.path`. |
+
+## Related
+
+- [Get started](/get-started/) — install Wyrd and run the local card workflow.
+- [Your first card](/tutorials/first-card/) — build and save a card.
+- [Declare a Model card](/how-to/declare/model/) — author a Model card.
+- [Identity and auth](/concepts/identity-and-auth/) — understand server-side
+  identity, tenants, and authorization.
+- [Self-hosting configuration](/self-hosting/configuration/) — configure the
+  Wyrd server rather than a client.

@@ -32,7 +32,7 @@ pub fn card_ref(kind: CardKind, name: &str) -> CardRef {
         kind,
         name: CardName::new(name).expect("static card name is valid"),
         version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-        space: SpaceName::new("tests").expect("static space is valid"),
+        space: Some(SpaceName::new("tests").expect("static space is valid")),
         uid: None,
     }
 }
@@ -86,7 +86,7 @@ pub fn assertion_task() -> EvalTask {
 pub fn judge_task() -> EvalTask {
     EvalTask::LlmJudge(LlmJudgeTask {
         id: tid("judge_check"),
-        judge_ref: card_ref(CardKind::Prompt, "judge"),
+        judge_ref: card_ref(CardKind::Agent, "judge").into(),
         context_path: None,
         expected: json!({"passed": true}),
         operator: ComparisonOperator::Equals,
@@ -102,7 +102,6 @@ pub fn spec(tasks: Vec<EvalTask>, pass_gate: Option<EvalPassGate>) -> EvalSpec {
         .map(|task| (task.id().clone(), task))
         .collect::<BTreeMap<_, _>>();
     EvalSpec {
-        subject_ref: Some(subject_ref()),
         dataset: None,
         tasks,
         workflow: None,

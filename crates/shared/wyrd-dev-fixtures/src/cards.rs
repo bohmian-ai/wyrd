@@ -57,12 +57,19 @@ pub async fn seed_card_with_spec(
             $1, wyrd.current_tenant(), $2, $3, $4, $5, $6,
             $7, NULL, '{}'::jsonb, '{}'::jsonb, 'active', $8
         )
-        ON CONFLICT (data_tenant_id, kind, space, name, version) WHERE status <> 'deleted' DO NOTHING
+        ON CONFLICT (data_tenant_id, kind, space, name, version)
+            WHERE status NOT IN ('deleted', 'failed', 'expired') DO NOTHING
         "#,
     )
     .bind(Uuid::now_v7())
     .bind(card_ref.kind.wire_name())
-    .bind(card_ref.space.as_str())
+    .bind(
+        card_ref
+            .space
+            .as_ref()
+            .expect("fixture card refs must have a resolved space")
+            .as_str(),
+    )
     .bind(card_ref.name.as_str())
     .bind(card_ref.version.as_str())
     .bind(spec_json)

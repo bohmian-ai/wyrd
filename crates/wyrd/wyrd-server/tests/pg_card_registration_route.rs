@@ -1,18 +1,53 @@
 //! Public card-registration journey through the authenticated HTTP surface.
 
 use std::env;
+use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use base64::Engine;
+use secrecy::SecretString;
 use serde_json::{Value, json};
+use sha2::Digest;
+use url::Url;
+use wyrd_client::WyrdClient;
+use wyrd_client::auth::AuthMiddleware;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::HttpTransport;
+use wyrd_client::transport::config::HttpConfig;
+use wyrd_client::transport::credential::ResolvedCredential;
+use wyrd_loader::{build_registration_input, load};
+use wyrd_registry::Cards;
 use wyrd_spec::envelope::Spec;
-use wyrd_spec::reference::PromptRef;
+use wyrd_spec::ids::CardUid;
+use wyrd_spec::reference::InlineableRef;
+use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Return whether the explicitly gated Postgres route tests should run.
 fn enabled() -> bool {
     env::var("WYRD_REG_E2E").as_deref() == Ok("1")
+}
+
+/// Assemble the production HTTP client used by the native registry saga.
+fn registry_client(base_url: &str, jwt: &str) -> WyrdClient {
+    let config = ClientConfig {
+        http: HttpConfig {
+            base_url: base_url.to_owned(),
+            ..HttpConfig::default()
+        },
+        ..ClientConfig::default()
+    };
+    let auth = AuthMiddleware::new(
+        &config,
+        ResolvedCredential::BearerToken(SecretString::from(jwt.to_owned())),
+    )
+    .expect("client auth builds");
+    let transport = HttpTransport::new(&config.http, Arc::clone(&auth)).expect("transport builds");
+    WyrdClient::from_parts(auth, transport, config.grpc)
 }
 
 /// Decode an HTTP response body as JSON.
@@ -141,7 +176,7 @@ fn three_card_composite_request(idempotency_key: &str) -> Request<Body> {
                 "metadata": { "name": "composite-service", "version": "1.0.0", "space": "default" },
                 "spec": { "components": [{
                     "alias": "agent",
-                    "ref": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" }
+                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" } }
                 }] },
                 "artifacts": []
             },
@@ -149,7 +184,7 @@ fn three_card_composite_request(idempotency_key: &str) -> Request<Body> {
                 "apiVersion": "wyrd/v1", "kind": "Agent",
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
-                    "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default"
+                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
                 } },
                 "artifacts": []
             },
@@ -179,7 +214,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
                 "metadata": { "name": "composite-service", "version": "1.0.0", "space": "default" },
                 "spec": { "components": [{
                     "alias": "agent",
-                    "ref": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" }
+                    "ref": { "sibling": { "kind": "Agent", "name": "composite-agent", "version": "1.0.0", "space": "default" } }
                 }] },
                 "artifacts": []
             },
@@ -187,7 +222,7 @@ fn permuted_three_card_composite_request(idempotency_key: &str) -> Request<Body>
                 "apiVersion": "wyrd/v1", "kind": "Agent",
                 "metadata": { "name": "composite-agent", "version": "1.0.0", "space": "default" },
                 "spec": { "prompt": {
-                    "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default"
+                    "sibling": { "kind": "Prompt", "name": "composite-prompt", "version": "1.0.0", "space": "default" }
                 } },
                 "artifacts": []
             }
@@ -205,12 +240,102 @@ fn heavy_registration_request(idempotency_key: &str) -> Request<Body> {
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
             "artifacts": [{
                 "relative_path": "prompt.txt",
-                "sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                "sha256": "ypeBEsobvcr6wjGzmiPcTaeG7/gUfE5yuYB3ha/uSLs=",
                 "size_bytes": 1,
                 "content_type": "text/plain"
             }]
         }] }),
     )
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// The native registry saga returns only a final Active receipt.
+async fn client_registration_saga_returns_active_receipt() {
+    if !enabled() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("loader workspace creates");
+    let prompt_path = temp.path().join("client-prompt.yaml");
+    let artifact = b"native registry artifact";
+    std::fs::write(temp.path().join("prompt.txt"), artifact).expect("artifact writes");
+    let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(artifact));
+    std::fs::write(
+        &prompt_path,
+        format!(
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            artifact.len()
+        ),
+    )
+    .expect("prompt card writes");
+    let input = build_registration_input(load(&prompt_path).expect("loader tree builds"))
+        .expect("registration input builds");
+
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-native-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let cards = Cards::with_client(registry_client(
+        server.base_url().expect("bound server has a base URL"),
+        &jwt,
+    ));
+
+    let receipt = cards
+        .register(&input)
+        .await
+        .expect("native registration saga succeeds");
+    assert_eq!(receipt.outcomes.len(), 1);
+    assert_eq!(receipt.outcomes[0].status, CardLifecycleStatus::Active);
+    assert_eq!(
+        receipt.outcomes[0].outcome,
+        RegistrationOutcomeKind::Registered
+    );
+    assert!(receipt.outcomes[0].card_blob_uri.is_some());
+    assert_eq!(receipt.root.uid, receipt.outcomes[0].card_ref.uid);
+
+    let card_uid = receipt.outcomes[0]
+        .card_ref
+        .uid
+        .clone()
+        .expect("artifact receipt contains a Card UID");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored = get_card_by_uid(&mut conn, &card_uid)
+        .await
+        .expect("artifact card loads");
+    assert_eq!(stored.status, wyrd_sql::CardStatus::Active);
+    assert!(stored.card_blob_uri.is_some());
+    let manifest_status: String = sqlx::query_scalar(
+        "SELECT upload_status FROM wyrd.card_artifact_manifest WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("artifact manifest loads");
+    assert_eq!(manifest_status, "verified");
+    conn.commit().await.expect("assertion transaction commits");
+
+    server.shutdown().await.expect("test server shuts down");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -322,7 +447,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
     let Spec::Agent(agent) = stored.spec else {
         panic!("persisted card is not an Agent");
     };
-    let PromptRef::Card(child_ref) = agent.prompt else {
+    let InlineableRef::Ref(child_ref) = agent.prompt else {
         panic!("persisted agent prompt is not a card reference");
     };
     assert_eq!(child_ref.name.as_str(), "resolved-prompt");
@@ -332,6 +457,82 @@ async fn registration_resolves_child_card_refs_before_persisting() {
             .as_str()
             .map(ToOwned::to_owned),
     );
+    conn.commit().await.expect("assertion transaction commits");
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+#[tokio::test(flavor = "current_thread")]
+/// The offline loader hands its wire projection to the composite registration route.
+async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
+    if !enabled() {
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("loader workspace creates");
+    let prompt_path = temp.path().join("prompt.yaml");
+    let agent_path = temp.path().join("agent.yaml");
+    std::fs::write(
+        &prompt_path,
+        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: loader-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+    )
+    .expect("prompt card writes");
+    std::fs::write(
+        &agent_path,
+        "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: loader-agent\n  version: 1.0.0\n  space: default\nspec:\n  prompt: prompt.yaml\n",
+    )
+    .expect("agent card writes");
+
+    let input = build_registration_input(load(&agent_path).expect("loader tree builds"))
+        .expect("registration input builds");
+    let request = request_with_body(
+        "loader-handoff-001",
+        serde_json::to_value(input.to_create_card_request()).expect("request serializes"),
+    );
+
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("loader-registry-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let response = server
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("loader registration responds");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response_json(response).await;
+    let agent_uid: CardUid = serde_json::from_value(
+        body["outcomes"]
+            .as_array()
+            .expect("outcomes are an array")
+            .iter()
+            .find(|outcome| outcome["card_ref"]["name"] == "loader-agent")
+            .expect("agent outcome exists")["card_ref"]["uid"]
+            .clone(),
+    )
+    .expect("agent outcome contains a UID");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored = get_card_by_uid(&mut conn, &agent_uid)
+        .await
+        .expect("persisted loader agent loads");
+    let Spec::Agent(agent) = stored.spec else {
+        panic!("persisted card is not an Agent");
+    };
+    let InlineableRef::Ref(prompt_ref) = agent.prompt else {
+        panic!("the server must bind the loader sibling before persistence");
+    };
+    assert_eq!(prompt_ref.name.as_str(), "loader-prompt");
+    assert!(prompt_ref.uid.is_some());
     conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");
@@ -563,9 +764,9 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
         vec!["composite-prompt", "composite-agent", "composite-service"]
     );
     assert_eq!(body["root"]["name"], "composite-service");
-    assert_eq!(body["outcomes"][0]["status"], "pending");
-    assert_eq!(body["outcomes"][1]["status"], "pending");
-    assert_eq!(body["outcomes"][2]["status"], "pending");
+    assert_eq!(body["outcomes"][0]["status"], "active");
+    assert_eq!(body["outcomes"][1]["status"], "active");
+    assert_eq!(body["outcomes"][2]["status"], "active");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -632,6 +833,40 @@ async fn heavy_registration_initializes_upload_after_commit() {
     assert_eq!(manifest.0, "pending");
     assert!(manifest.1.is_some());
     conn.commit().await.expect("assertion transaction commits");
+
+    let upload_path = Url::parse(
+        body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
+            .as_str()
+            .expect("local upload plan contains a URL"),
+    )
+    .expect("upload URL parses")
+    .path()
+    .to_owned();
+    let upload = Request::builder()
+        .method(Method::PUT)
+        .uri(upload_path)
+        .body(Body::from("a"))
+        .expect("local upload request builds");
+    let upload_response = server
+        .oneshot_authenticated(&jwt, upload)
+        .await
+        .expect("local upload responds");
+    assert_eq!(upload_response.status(), StatusCode::OK);
+
+    let complete = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/v1/cards/{card_uid}/complete"))
+        .header("Idempotency-Key", "heavy-only-001")
+        .body(Body::empty())
+        .expect("card completion request builds");
+    let complete_response = server
+        .oneshot_authenticated(&jwt, complete)
+        .await
+        .expect("card completion responds");
+    assert_eq!(complete_response.status(), StatusCode::OK);
+    let complete_body = response_json(complete_response).await;
+    assert_eq!(complete_body["outcomes"][0]["status"], "active");
+    assert_eq!(complete_body["outcomes"][0]["outcome"], "registered");
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -743,27 +978,26 @@ async fn dependency_cycle_rejects_before_writes() {
                     {
                         "apiVersion": "wyrd/v1", "kind": "Service",
                         "metadata": { "name": "cycle-a", "version": "1.0.0", "space": "default" },
-                        "spec": { "components": [{ "alias": "b", "ref": {
+                        "spec": { "components": [{ "alias": "b", "ref": { "sibling": {
                             "kind": "Service", "name": "cycle-b", "version": "1.0.0", "space": "default"
-                        }}] }, "artifacts": []
+                        }}}] }, "artifacts": []
                     },
                     {
                         "apiVersion": "wyrd/v1", "kind": "Service",
                         "metadata": { "name": "cycle-b", "version": "1.0.0", "space": "default" },
-                        "spec": { "components": [{ "alias": "a", "ref": {
+                        "spec": { "components": [{ "alias": "a", "ref": { "sibling": {
                             "kind": "Service", "name": "cycle-a", "version": "1.0.0", "space": "default"
-                        }}] }, "artifacts": []
+                        }}}] }, "artifacts": []
                     }
                 ] }),
             ),
         )
         .await
         .expect("cyclic registration responds");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response_json(response).await["code"],
-        "WYRD_REGISTRY_400_DEPENDENCY_CYCLE"
-    );
+    let cycle_status = response.status();
+    let cycle_body = response_json(response).await;
+    assert_eq!(cycle_status, StatusCode::BAD_REQUEST, "{cycle_body}");
+    assert_eq!(cycle_body["code"], "WYRD_REGISTRY_400_DEPENDENCY_CYCLE");
 
     server.shutdown().await.expect("test server shuts down");
 }

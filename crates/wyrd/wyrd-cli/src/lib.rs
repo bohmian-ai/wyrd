@@ -9,3 +9,11 @@
 pub mod audit;
 pub mod auth;
 pub mod error;
+pub mod load;
+pub mod registration;
+
+// Re-export the public loader API
+pub use load::{
+    AuthoredCard, CardSubmission, Diagnostic, LoadError, LoadedCard, LoadedTree, RegistrationInput,
+    Severity, SourceSpan, build_registration_input, build_submissions, emit_json, load,
+};

@@ -44,6 +44,9 @@ pub struct EvalRunArgs {
     /// JSONL file of pre-collected EvalRecordObservation rows.
     #[arg(long, value_name = "PATH", conflicts_with = "server")]
     pub records: Option<PathBuf>,
+    /// Card that emitted the pre-collected records.
+    #[arg(long, value_name = "CARD_REF", requires = "records")]
+    pub subject: Option<CardRef>,
     /// Drive a remote server protocol router.
     #[arg(long, value_name = "URL", conflicts_with = "records")]
     pub server: Option<Url>,
@@ -120,6 +123,9 @@ fn validate_args(args: &EvalRunArgs) -> Result<(), WyrdCliError> {
     {
         return Err(WyrdCliError::SimulatedUserScriptRequired);
     }
+    if args.records.is_some() && args.subject.is_none() {
+        return Err(WyrdCliError::RecordsRequireSubject);
+    }
     Ok(())
 }
 
@@ -183,7 +189,7 @@ pub fn load_eval_card(input: &str) -> Result<(CardRef, EvalSpec), WyrdCliError> 
         kind: CardKind::Eval,
         name: card.metadata.name,
         version,
-        space,
+        space: Some(space),
         uid: card.metadata.uid,
     };
     Ok((eval_ref, spec))

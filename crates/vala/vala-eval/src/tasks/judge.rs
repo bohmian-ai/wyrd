@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
+use wyrd_spec::reference::InlineableRef;
 
 use wyrd_spec::vala::eval::{AssertionResult, EvalTask, LlmJudgeTask};
 
@@ -16,7 +17,7 @@ use crate::operators;
 use crate::store::JudgeOutcome;
 use crate::tasks::media::{MediaBindings, bindings_as_context};
 
-/// Executor for prompt-backed LLM judge tasks.
+/// Executor for Agent-backed LLM judge tasks.
 pub struct JudgeTaskExecutor {
     invoker: Arc<dyn JudgeInvoker>,
 }
@@ -87,6 +88,7 @@ impl TaskExecutor for JudgeTaskExecutor {
         let outcome = JudgeOutcome {
             raw: context_for_invoker,
             parsed,
+            judge_ref: judge.judge_ref.as_card_ref().cloned(),
         };
         Ok(TaskOutput::Judge { result, outcome })
     }
@@ -115,6 +117,16 @@ async fn invoke_with_retries(
     task: &LlmJudgeTask,
     context: Value,
 ) -> Result<Value, EvalExecError> {
+    if matches!(
+        &task.judge_ref,
+        InlineableRef::Path(_) | InlineableRef::Sibling { .. }
+    ) {
+        return Err(EvalExecError::JudgeRetriesExhausted {
+                task_id: task.id.clone(),
+                attempts: 0,
+                last_error: "WYRD_REGISTRY_400_UNRESOLVED_PATH_REF: judge Agent path must be rewritten by the loader before execution".to_owned(),
+            });
+    }
     let max_attempts = task.max_retries.saturating_add(1);
     let mut last_error = String::from("no attempt made");
 
@@ -186,10 +198,10 @@ mod llm_judge_executor {
 
     fn judge_card_ref() -> CardRef {
         CardRef {
-            kind: CardKind::Prompt,
+            kind: CardKind::Agent,
             name: CardName::new("eval-judge").expect("static card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("static version is valid"),
-            space: SpaceName::new("default").expect("valid space"),
+            space: Some(SpaceName::new("default").expect("valid space")),
             uid: None,
         }
     }
@@ -203,7 +215,7 @@ mod llm_judge_executor {
     ) -> EvalTask {
         EvalTask::LlmJudge(LlmJudgeTask {
             id: tid(id),
-            judge_ref: judge_card_ref(),
+            judge_ref: judge_card_ref().into(),
             context_path: None,
             expected,
             operator: op,
@@ -237,7 +249,6 @@ mod llm_judge_executor {
             map.insert(task.id().clone(), task);
         }
         EvalSpec {
-            subject_ref: None,
             dataset: None,
             tasks: map,
             workflow: None,

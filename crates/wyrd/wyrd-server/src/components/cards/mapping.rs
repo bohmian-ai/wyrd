@@ -2,6 +2,7 @@
 
 use wyrd_spec::envelope::{Relationships, Spec};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::RegisteredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
@@ -17,7 +18,7 @@ pub fn outcome_row_to_response(
             kind: row.kind.clone(),
             name: row.name.clone(),
             version: row.version.clone(),
-            space: row.space.clone(),
+            space: Some(row.space.clone()),
             uid: Some(row.card_uid.clone()),
         },
         spec_hash: row.spec_hash.clone(),
@@ -39,7 +40,7 @@ pub fn existing_row_to_response(
             kind: row.kind.clone(),
             name: row.name.clone(),
             version: row.version.clone(),
-            space: row.space.clone(),
+            space: Some(row.space.clone()),
             uid: Some(row.card_uid.clone()),
         },
         spec_hash: row.spec_hash.clone(),
@@ -53,11 +54,31 @@ pub fn existing_row_to_response(
     }
 }
 
-/// Project row-derived relationships with a concrete empty shape until the
-/// registry relationship projection is implemented.
-pub(crate) fn relationships_from_spec(_spec: &Spec) -> Relationships {
+/// Project the normalized outbound Card references from a resolved spec.
+pub(crate) fn relationships_from_spec(spec: &Spec) -> Relationships {
+    let mut spec = spec.clone();
+    let mut outbound = Vec::new();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => {
+            if let Some(card_ref) = reference.as_card_ref() {
+                outbound.push(card_ref.to_string());
+            }
+        }
+        SlotValue::InlineablePrompt(reference) => {
+            if let Some(card_ref) = reference.as_card_ref() {
+                outbound.push(card_ref.to_string());
+            }
+        }
+        SlotValue::InlineableAgent(reference) => {
+            if let Some(card_ref) = reference.as_card_ref() {
+                outbound.push(card_ref.to_string());
+            }
+        }
+    });
+    outbound.sort();
+    outbound.dedup();
     Relationships {
-        outbound: Vec::new(),
+        outbound,
         inbound: Vec::new(),
     }
 }
@@ -80,7 +101,7 @@ mod tests {
     use uuid::Uuid;
     use wyrd_runtime::principal::PrincipalId;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::registry::{
         CardLifecycleStatus, RegistrationOperationId, RegistrationOutcomeKind,
@@ -89,6 +110,33 @@ mod tests {
     use wyrd_sql::row_types::cards::CardStatus;
 
     use super::outcome_row_to_response;
+    use super::relationships_from_spec;
+
+    /// Project a resolved sibling/external reference into deterministic blob data.
+    #[test]
+    fn relationships_project_uid_bearing_refs() {
+        let spec = Spec::from_kind_and_value(
+            &CardKind::Agent,
+            serde_json::json!({
+                "prompt": {
+                    "kind": "Prompt",
+                    "name": "prompt",
+                    "version": "1.0.0",
+                    "space": "default",
+                    "uid": "018f0000-0000-7000-8000-000000000001"
+                }
+            }),
+        )
+        .expect("agent reference fixture decodes");
+
+        let relationships = relationships_from_spec(&spec);
+
+        assert_eq!(
+            relationships.outbound,
+            vec!["default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
+        );
+        assert!(relationships.inbound.is_empty());
+    }
 
     /// Build one deterministic durable row for response projection tests.
     fn row(status: CardStatus) -> RegisteredCardRow {

@@ -21,6 +21,7 @@ path = "src/main.rs"
 async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+indicatif = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -37,7 +38,11 @@ uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth-issue = { workspace = true }
+wyrd-config = { workspace = true }
 wyrd-error-derive = { workspace = true }
+
+wyrd-loader = { workspace = true }
+wyrd-registry = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-sql = { workspace = true, features = ["embedded-postgres"] }

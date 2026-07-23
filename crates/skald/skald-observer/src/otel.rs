@@ -43,7 +43,7 @@ type ContextStore = Arc<RwLock<HashMap<String, SpanContext>>>;
 ///
 /// ```rust,no_run
 /// // The OtelObserver picks up whatever provider is globally registered.
-/// use wyrd_observe::{set_global, OtelObserver};
+/// use skald_observer::{set_global, OtelObserver};
 /// use std::sync::Arc;
 /// set_global(Arc::new(OtelObserver::new()));
 /// ```

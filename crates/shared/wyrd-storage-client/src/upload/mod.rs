@@ -10,12 +10,13 @@ mod single_put;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::stream::{BoxStream, StreamExt};
 use tokio_util::io::ReaderStream;
 use wyrd_client::WyrdClient;
-use wyrd_spec::storage::UploadPlan;
+use wyrd_spec::storage::{UploadId, UploadPlan};
 
 use crate::error::StorageClientError;
 use reader::SourceReader;
@@ -30,6 +31,20 @@ pub trait ArtifactSource: Send {
     /// Consume the source as a chunk stream.
     fn into_stream(self) -> BoxStream<'static, Result<Bytes, StorageClientError>>;
 }
+
+/// Progress emitted while one artifact source is consumed by a provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadProgress {
+    /// Stable server-owned identity for the upload operation.
+    pub upload_id: UploadId,
+    /// Bytes consumed by the provider transfer so far.
+    pub uploaded_bytes: u64,
+    /// Expected source size when the source exposes one.
+    pub total_bytes: Option<u64>,
+}
+
+/// Thread-safe callback for caller-owned upload progress handling.
+pub type UploadProgressSink = Arc<dyn Fn(UploadProgress) + Send + Sync + 'static>;
 
 impl ArtifactSource for Vec<u8> {
     fn size_hint(&self) -> Option<u64> {
@@ -97,25 +112,28 @@ impl ArtifactSource for FileSource {
 }
 
 /// Future returned by an on-demand S3 part URL minter.
-pub type PartUrlFuture<'a> =
+pub(crate) type PartUrlFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, StorageClientError>> + Send + 'a>>;
 
 /// On-demand S3 part URL callback.
-pub type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + 'a>;
+pub(crate) type PartUrlMinter<'a> = Box<dyn FnMut(u32) -> PartUrlFuture<'a> + Send + 'a>;
+
+/// Owned callback used by provider streams and chunk loops.
+pub(crate) type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
 
 /// Hooks supplied by the engine around a byte transfer.
-pub struct UploadHooks<'a> {
+pub(crate) struct UploadHooks<'a> {
     /// Stable key to replay on direct backend requests.
     pub idempotency_key: &'a str,
     /// Optional `(uploaded, total)` callback.
-    pub progress: Option<&'a dyn Fn(u64, u64)>,
+    pub progress: Option<ProgressCallback>,
     /// On-demand S3 part URL minting callback.
     pub part_url_minter: Option<PartUrlMinter<'a>>,
 }
 
 /// Result of a completed transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UploadOutcome {
+pub(crate) enum UploadOutcome {
     /// The backend has accepted the complete object.
     Uploaded,
     /// The server must commit the backend multipart state.
@@ -143,8 +161,10 @@ pub(crate) async fn dispatch<S: ArtifactSource>(
     let total = source.size_hint();
     let reader = SourceReader::new(source.into_stream());
     match plan {
-        UploadPlan::LocalFs { .. } => local_fs::upload(client, plan, reader).await,
-        UploadPlan::SinglePut { .. } => single_put::upload(client, plan, reader, &hooks).await,
+        UploadPlan::LocalFs { .. } => local_fs::upload(client, plan, reader, total, &hooks).await,
+        UploadPlan::SinglePut { .. } => {
+            single_put::upload(client, plan, reader, total, &hooks).await
+        }
         UploadPlan::S3Multipart { .. } => {
             s3_multipart::upload(client, plan, reader, total, &mut hooks).await
         }
@@ -190,10 +210,28 @@ pub(crate) fn checked_size(value: u64, name: &'static str) -> Result<usize, Stor
     Ok(size)
 }
 
-pub(crate) fn report(hooks: &UploadHooks<'_>, uploaded: u64, total: Option<u64>) {
-    if let Some(progress) = hooks.progress {
-        progress(uploaded, total.unwrap_or(0));
+pub(crate) fn report(progress: Option<&ProgressCallback>, uploaded: u64, total: Option<u64>) {
+    if let Some(progress) = progress {
+        progress(uploaded, total);
     }
+}
+
+/// Build the authenticated S3 part-URL callback for one server-owned upload.
+pub(crate) fn s3_part_url_minter<'a>(
+    storage: &'a crate::WyrdStorageClient,
+    upload_id: &'a UploadId,
+    plan: &UploadPlan,
+) -> Option<PartUrlMinter<'a>> {
+    if !matches!(plan, UploadPlan::S3Multipart { .. }) {
+        return None;
+    }
+    let storage = storage.clone();
+    let upload_id = upload_id.clone();
+    Some(Box::new(move |part_number| {
+        let storage = storage.clone();
+        let upload_id = upload_id.clone();
+        Box::pin(async move { storage.part_url(&upload_id, part_number).await })
+    }))
 }
 
 pub(crate) fn plan_variant(plan: &UploadPlan) -> &'static str {

@@ -6,16 +6,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 
-use crate::envelope::{ReferenceSlotVisitor, Spec};
-use crate::reference::CardRef;
+use crate::envelope::Spec;
+use crate::reference::{CardRef, CardRefIdentity};
+use crate::refs::{ReferenceSlotVisitor, SlotValue};
 use crate::registry::CardSubmission;
+use wyrd_semver::{VersionBlock, VersionSpec};
 
 mod canonical;
 mod root;
 mod topo;
 
 pub use canonical::canonical_order;
-pub use root::pick_root;
+pub use root::{pick_root, root_last};
 pub use topo::{GraphError, topo_sort};
 
 /// One vertex in the submission DAG.
@@ -71,17 +73,53 @@ pub struct RootPick {
     pub root: CardRef,
 }
 
-/// Build the submission graph from CardRef-shaped objects in each spec.
+/// Prepare submissions for the pure graph operations.
 ///
-/// A reference becomes an edge only when its `(kind, space, name)` identity
-/// matches another submission in the same request. References to cards outside
-/// the request are deliberately ignored; external resolution belongs to the
-/// server registry boundary.
+/// Graph identity is `(kind, space, name, version)`. Auto and range version
+/// requests therefore receive a
+/// graph-only placeholder. The authored submissions are cloned and never
+/// mutated; registration keeps their original version selection.
+pub fn graph_ready_submissions(
+    submissions: &[CardSubmission],
+) -> Result<Vec<CardSubmission>, GraphError> {
+    if submissions.is_empty() {
+        return Err(GraphError::Empty);
+    }
+
+    let placeholder = VersionBlock::parse("0.0.0").map_err(|error| GraphError::InvalidSpec {
+        message: format!("invalid graph placeholder: {error}"),
+    })?;
+    submissions
+        .iter()
+        .cloned()
+        .map(|mut submission| {
+            if submission.metadata.space.is_none() {
+                return Err(GraphError::MissingSpace);
+            }
+            if !submission
+                .metadata
+                .version
+                .as_ref()
+                .is_some_and(VersionSpec::is_pin)
+            {
+                submission.metadata.version = Some(VersionSpec::Pin(placeholder.clone()));
+            }
+            Ok(submission)
+        })
+        .collect()
+}
+
+/// Build the submission graph from typed sibling references in each spec.
+///
+/// A sibling reference becomes an edge only when its `(kind, space, name, version)`
+/// identity matches another submission in the same request. External references are
+/// deliberately ignored, even when they happen to have the same identity as a
+/// submission; external resolution belongs to the server registry boundary.
 ///
 /// The register boundary supplies resolved metadata before calling this helper:
 /// each submission must have a concrete version and space. The graph itself
-/// compares nodes by `(kind, space, name)`, so version and UID do not affect
-/// sibling matching.
+/// compares nodes by `(kind, space, name, version)`, so only the server UID
+/// does not affect sibling matching.
 ///
 /// # Errors
 /// Returns [`GraphError::Empty`] when the request is empty or contains a
@@ -117,11 +155,20 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
                 message: error.to_string(),
             },
         )?;
-        let mut collector = RefCollector {
-            references: Vec::new(),
-        };
-        spec.walk_refs(&mut collector);
-        for child in collector.references {
+        let mut spec = spec;
+        let mut references = Vec::new();
+        ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+            SlotValue::Durable(reference) => {
+                references.extend(reference.as_sibling().cloned());
+            }
+            SlotValue::InlineablePrompt(reference) => {
+                references.extend(reference.as_sibling().cloned());
+            }
+            SlotValue::InlineableAgent(reference) => {
+                references.extend(reference.as_sibling().cloned());
+            }
+        });
+        for child in references {
             let Some(target) = siblings.get(&identity_key(&child)) else {
                 continue;
             };
@@ -138,12 +185,8 @@ pub fn build(submissions: &[CardSubmission]) -> Result<(Vec<Node>, Vec<Edge>), G
     Ok((nodes, edges))
 }
 
-pub(crate) fn identity_key(card_ref: &CardRef) -> (String, String, String) {
-    (
-        card_ref.kind.wire_name().to_owned(),
-        card_ref.space.as_str().to_owned(),
-        card_ref.name.as_str().to_owned(),
-    )
+pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
+    card_ref.identity_key()
 }
 
 fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
@@ -151,26 +194,14 @@ fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
         kind: submission.kind.clone(),
         name: submission.metadata.name.clone(),
         version: submission.metadata.resolved_pin()?.clone(),
-        space: submission.metadata.space.clone()?,
+        space: Some(submission.metadata.space.clone()?),
         uid: submission.metadata.uid.clone(),
     })
 }
 
-struct RefCollector {
-    references: Vec<CardRef>,
-}
-
-impl ReferenceSlotVisitor for RefCollector {
-    fn visit_ref(&mut self, card_ref: &CardRef) {
-        self.references.push(card_ref.clone());
-    }
-
-    fn visit_ref_mut(&mut self, _card_ref: &mut CardRef) {}
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Node, build, identity_key};
+    use super::{Edge, build, graph_ready_submissions, identity_key};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::reference::CardRef;
@@ -183,7 +214,7 @@ mod tests {
             kind,
             name: name.parse().expect("test card name is valid"),
             version: VersionBlock::parse("1.0.0").expect("test version is valid"),
-            space: "default".parse().expect("test space is valid"),
+            space: Some("default".parse().expect("test space is valid")),
             uid: None,
         }
     }
@@ -196,7 +227,7 @@ mod tests {
                 name: card_ref.name.clone(),
                 version: Some(VersionSpec::Pin(card_ref.version.clone())),
                 bump: None,
-                space: Some(card_ref.space.clone()),
+                space: card_ref.space.clone(),
                 uid: card_ref.uid.clone(),
                 labels: Default::default(),
                 annotations: Default::default(),
@@ -212,14 +243,20 @@ mod tests {
     #[test]
     fn build_ignores_external_refs() {
         let parent = card_ref(CardKind::Service, "service");
-        let external = card_ref(CardKind::Agent, "external");
-        let (nodes, edges) = build(&[submission(
-            &parent,
-            json!({"components": [{"alias": "external", "ref": serde_json::to_value(external).expect("ref serializes")}] }),
-        )])
+        let external = card_ref(CardKind::Prompt, "external");
+        let (nodes, edges) = build(&[
+            submission(
+                &parent,
+                json!({"components": [{"alias": "external", "ref": serde_json::to_value(external.clone()).expect("ref serializes")}] }),
+            ),
+            submission(
+                &external,
+                json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+            ),
+        ])
         .expect("resolved submission builds");
 
-        assert_eq!(nodes, vec![Node { card_ref: parent }]);
+        assert_eq!(nodes.len(), 2);
         assert!(edges.is_empty());
     }
 
@@ -227,7 +264,9 @@ mod tests {
     fn build_derives_sibling_edges_from_nested_refs() {
         let parent = card_ref(CardKind::Service, "service");
         let child = card_ref(CardKind::Prompt, "prompt");
-        let child_value = serde_json::to_value(&child).expect("ref serializes");
+        let child_value = json!({
+            "sibling": serde_json::to_value(&child).expect("ref serializes")
+        });
         let (nodes, edges) = build(&[
             submission(
                 &parent,
@@ -251,11 +290,36 @@ mod tests {
     }
 
     #[test]
-    fn identity_key_excludes_version_and_uid() {
+    fn identity_key_includes_version_but_excludes_uid() {
         let first = card_ref(CardKind::Agent, "agent");
         let mut second = first.clone();
         second.version = VersionBlock::parse("2.0.0").expect("test version is valid");
+        assert_ne!(identity_key(&first), identity_key(&second));
+
+        second.version = first.version.clone();
+        second.uid = Some(
+            crate::ids::CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b11")
+                .expect("test uid is valid"),
+        );
         assert_eq!(identity_key(&first), identity_key(&second));
+    }
+
+    #[test]
+    fn graph_ready_submissions_preserves_authored_version_selection() {
+        let card = card_ref(CardKind::Prompt, "prompt");
+        let mut authored = submission(
+            &card,
+            json!({"provider": "openai", "model": "gpt-4o", "messages": ["hello"]}),
+        );
+        authored.metadata.version = None;
+
+        let ready = graph_ready_submissions(&[authored.clone()]).expect("graph projection");
+
+        assert!(authored.metadata.version.is_none());
+        assert_eq!(
+            ready[0].metadata.resolved_pin().map(ToString::to_string),
+            Some("0.0.0".to_owned())
+        );
     }
 
     #[test]

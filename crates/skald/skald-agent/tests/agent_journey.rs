@@ -14,7 +14,7 @@ use skald_spec::wire::openai_chat::{
 use skald_spec::{ProviderName, ProviderRequest, ProviderResponse, ResponseType};
 use skald_tool::{AgentTool, ToolDef, ToolRegistry};
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::reference::{CardRef, PromptRef};
+use wyrd_spec::reference::{CardRef, InlineableRef};
 
 #[tokio::test]
 async fn journey_author_save_load_run() {
@@ -58,10 +58,13 @@ async fn journey_try_from_ref_resolves_card_prompt() {
     let card_ref = prompt_card_ref("planner-prompt");
     register_prompt_card(&card_ref, test_prompt()).expect("prompt registers");
 
-    let agent = Agent::try_from_ref(PromptRef::from(card_ref.clone()), default_prompt_resolver())
-        .expect("prompt card resolves")
-        .name("planner")
-        .version("0.3.0");
+    let agent = Agent::try_from_ref(
+        InlineableRef::Ref(card_ref.clone()),
+        default_prompt_resolver(),
+    )
+    .expect("prompt card resolves")
+    .name("planner")
+    .version("0.3.0");
 
     assert_eq!(agent.cascade_children(), vec![card_ref]);
 
@@ -162,7 +165,7 @@ fn prompt_card_ref(name: &str) -> CardRef {
         kind: CardKind::Prompt,
         name: name.parse().expect("valid prompt card name"),
         version: "1.0.0".parse().expect("valid prompt version"),
-        space: "default".parse().expect("valid space"),
+        space: Some("default".parse().expect("valid space")),
         uid: None,
     }
 }

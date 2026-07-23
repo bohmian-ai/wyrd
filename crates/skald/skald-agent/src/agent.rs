@@ -7,13 +7,15 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
 use skald_prompt::Prompt;
+use skald_runtime::ProviderRegistry;
+use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
     AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec, CardMetadata,
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
-    reference::{CardRef, PromptRef},
+    reference::{CardRef, InlineableRef},
 };
 
 use crate::callbacks::{
@@ -21,7 +23,7 @@ use crate::callbacks::{
 };
 use crate::error::AgentResult;
 use crate::journal::{Journal, NoopJournal};
-use crate::run::RunConfig;
+use crate::run::{AgentRun, RunConfig};
 use crate::session::{NoSession, SessionId, SessionMemory};
 
 /// Wire form for a durable Agent Card.
@@ -33,11 +35,11 @@ pub trait PromptResolver: Send + Sync {
     ///
     /// # Errors
     /// Returns a Wyrd error when a referenced Prompt Card cannot be resolved.
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError>;
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError>;
 }
 
 impl<T: PromptResolver + ?Sized> PromptResolver for &T {
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         (**self).resolve(prompt_ref)
     }
 }
@@ -47,24 +49,27 @@ impl<T: PromptResolver + ?Sized> PromptResolver for &T {
 pub struct LocalPromptResolver;
 
 impl PromptResolver for LocalPromptResolver {
-    fn resolve(&self, prompt_ref: &PromptRef) -> Result<Prompt, WyrdError> {
+    fn resolve(&self, prompt_ref: &InlineableRef<PromptSpec>) -> Result<Prompt, WyrdError> {
         match prompt_ref {
-            PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-            PromptRef::Card(card_ref) => prompt_registry()
-                .read()
-                .map_err(|error| {
-                    WyrdError::from(AgentCardError::validation(format!(
-                        "Agent prompt registry lock poisoned: {error}"
-                    )))
-                })?
-                .get(&prompt_key(card_ref))
-                .map(|prompt| prompt.as_ref().clone())
-                .ok_or_else(|| {
-                    AgentCardError::PromptCardNotFound {
-                        card_ref: card_ref.clone(),
-                    }
-                    .into()
-                }),
+            InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+            InlineableRef::Ref(card_ref) | InlineableRef::Sibling { sibling: card_ref } => {
+                prompt_registry()
+                    .read()
+                    .map_err(|error| {
+                        WyrdError::from(AgentCardError::validation(format!(
+                            "Agent prompt registry lock poisoned: {error}"
+                        )))
+                    })?
+                    .get(&prompt_key(card_ref))
+                    .map(|prompt| prompt.as_ref().clone())
+                    .ok_or_else(|| {
+                        AgentCardError::PromptCardNotFound {
+                            card_ref: card_ref.clone(),
+                        }
+                        .into()
+                    })
+            }
+            InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
         }
     }
 }
@@ -167,7 +172,7 @@ pub struct Agent {
     /// Local Card metadata used for envelope projection.
     pub(crate) meta: CardMetadata,
     /// Preserved durable prompt reference.
-    pub(crate) prompt_ref: PromptRef,
+    pub(crate) prompt_ref: InlineableRef<PromptSpec>,
     /// Runtime-local tool names preserved for YAML round trips.
     pub(crate) tool_names: Vec<String>,
     /// Stable id used for tracing and diagnostics.
@@ -217,7 +222,7 @@ impl Agent {
     /// run.
     #[must_use]
     pub fn new(prompt: Prompt) -> Self {
-        let prompt_ref = PromptRef::from(prompt.clone().into_native());
+        let prompt_ref = InlineableRef::from(prompt.clone().into_native());
         Self::from_resolved_parts(generate_agent_id(), prompt_ref, prompt)
     }
 
@@ -227,11 +232,11 @@ impl Agent {
     /// prompt handle.
     #[must_use]
     pub fn from_resolved(id: impl Into<String>, prompt: Arc<Prompt>) -> Self {
-        let prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
+        let prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
         Self::from_resolved_arc_parts(id.into(), prompt_ref, prompt)
     }
 
-    /// Build an Agent from a PromptRef and resolver.
+    /// Build an Agent from a prompt reference and resolver.
     ///
     /// Use this fallible constructor when the prompt may be a durable Prompt
     /// Card reference.
@@ -239,7 +244,7 @@ impl Agent {
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_from_ref(
-        prompt_ref: PromptRef,
+        prompt_ref: InlineableRef<PromptSpec>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         let prompt = resolve_prompt_ref(&prompt_ref, resolver)?;
@@ -261,18 +266,18 @@ impl Agent {
     #[must_use]
     pub fn with_prompt(mut self, prompt: impl Into<Arc<Prompt>>) -> Self {
         let prompt = prompt.into();
-        self.prompt_ref = PromptRef::from(prompt.as_ref().clone().into_native());
+        self.prompt_ref = InlineableRef::from(prompt.as_ref().clone().into_native());
         self.prompt = prompt;
         self
     }
 
-    /// Return a copy retargeted through a PromptRef and resolver.
+    /// Return a copy retargeted through a prompt reference and resolver.
     ///
     /// # Errors
     /// Returns resolver errors for card-backed prompt references.
     pub fn try_with_prompt(
         mut self,
-        prompt_ref: PromptRef,
+        prompt_ref: InlineableRef<PromptSpec>,
         resolver: &dyn PromptResolver,
     ) -> Result<Self, WyrdError> {
         self.prompt = Arc::new(resolve_prompt_ref(&prompt_ref, resolver)?);
@@ -487,7 +492,7 @@ impl Agent {
 
     /// Return the preserved prompt reference.
     #[must_use]
-    pub fn prompt_ref(&self) -> &PromptRef {
+    pub fn prompt_ref(&self) -> &InlineableRef<PromptSpec> {
         &self.prompt_ref
     }
 
@@ -657,7 +662,7 @@ impl Agent {
     ///
     /// # Errors
     /// Returns Skald agent runtime errors.
-    pub async fn run(&self, input: &str) -> AgentResult<crate::run::AgentRun> {
+    pub async fn run(&self, input: &str) -> AgentResult<AgentRun> {
         let providers = skald_runtime::default_registry();
         crate::loop_runtime::run(self, providers.as_ref(), None, input).await
     }
@@ -668,10 +673,10 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_with(
         &self,
-        providers: &skald_runtime::ProviderRegistry,
+        providers: &ProviderRegistry,
         session_id: Option<SessionId>,
         input: &str,
-    ) -> AgentResult<crate::run::AgentRun> {
+    ) -> AgentResult<AgentRun> {
         crate::loop_runtime::run(self, providers, session_id, input).await
     }
 
@@ -682,19 +687,27 @@ impl Agent {
     /// Returns Skald agent runtime errors.
     pub async fn run_prompt(
         &self,
-        providers: &skald_runtime::ProviderRegistry,
+        providers: &ProviderRegistry,
         prompt: &Prompt,
         vars: &[(&str, &str)],
         parent_run_id: Option<&str>,
-    ) -> AgentResult<crate::run::AgentRun> {
+    ) -> AgentResult<AgentRun> {
         crate::loop_runtime::run_prompt(self, providers, prompt, vars, parent_run_id).await
     }
 
-    fn from_resolved_parts(id: String, prompt_ref: PromptRef, prompt: Prompt) -> Self {
+    fn from_resolved_parts(
+        id: String,
+        prompt_ref: InlineableRef<PromptSpec>,
+        prompt: Prompt,
+    ) -> Self {
         Self::from_resolved_arc_parts(id, prompt_ref, Arc::new(prompt))
     }
 
-    fn from_resolved_arc_parts(id: String, prompt_ref: PromptRef, prompt: Arc<Prompt>) -> Self {
+    fn from_resolved_arc_parts(
+        id: String,
+        prompt_ref: InlineableRef<PromptSpec>,
+        prompt: Arc<Prompt>,
+    ) -> Self {
         Self {
             meta: CardMetadata::default(),
             prompt_ref,
@@ -719,6 +732,7 @@ impl Agent {
             prompt: self.prompt_ref.clone(),
             tool_names: self.tool_names.clone(),
             run_config: agent_run_config_spec_from_run_config(&self.run_config),
+            publishes_to: Vec::new(),
         }
     }
 
@@ -794,19 +808,25 @@ pub fn run_config_from_agent_run_config_spec(spec: &AgentRunConfigSpec) -> RunCo
 /// Derive `CardRef` cascade children from an Agent spec.
 #[must_use]
 pub fn derive_cascade_children(spec: &AgentSpec) -> Vec<CardRef> {
-    match &spec.prompt {
-        PromptRef::Card(card_ref) => vec![card_ref.clone()],
-        PromptRef::Inline(_) => Vec::new(),
-    }
+    spec.prompt.as_card_ref().cloned().into_iter().collect()
 }
 
 fn resolve_prompt_ref(
-    prompt_ref: &PromptRef,
+    prompt_ref: &InlineableRef<PromptSpec>,
     resolver: &dyn PromptResolver,
 ) -> Result<Prompt, WyrdError> {
     match prompt_ref {
-        PromptRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
-        PromptRef::Card(_) => resolver.resolve(prompt_ref),
+        InlineableRef::Inline(prompt) => Ok(Prompt::from_native((**prompt).clone())),
+        InlineableRef::Ref(_) | InlineableRef::Sibling { .. } => resolver.resolve(prompt_ref),
+        InlineableRef::Path(_) => Err(unresolved_prompt_path_error()),
+    }
+}
+
+/// Return the stable error for an unresolved loader-only prompt path.
+fn unresolved_prompt_path_error() -> WyrdError {
+    WyrdError::RegistryUnresolvedPathRef {
+        message: "prompt path must be rewritten by the loader before runtime resolution".to_owned(),
+        details: serde_json::json!({"field": "prompt"}),
     }
 }
 
@@ -816,13 +836,7 @@ fn prompt_registry() -> &'static RwLock<HashMap<String, Arc<Prompt>>> {
 }
 
 fn prompt_key(card_ref: &CardRef) -> String {
-    format!(
-        "{}/{}:{}@{}",
-        card_ref.space,
-        card_ref.kind.wire_name(),
-        card_ref.name,
-        card_ref.version,
-    )
+    card_ref.to_string()
 }
 
 fn tool_resolution_error(error: ToolError) -> AgentCardError {

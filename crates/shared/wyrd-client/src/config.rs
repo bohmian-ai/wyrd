@@ -1,14 +1,18 @@
 //! Top-level client configuration.
 //!
 //! [`ClientConfig`] is the single entry point for configuring `wyrd-client`.
-//! Build from environment variables with [`ClientConfig::from_env`], optionally
-//! set [`ClientConfig::api_key`] for an explicit key that outranks ambient env
-//! and file credentials, then call [`ClientConfig::resolve_credential`] to
-//! obtain the effective [`ResolvedCredential`].
+//! Build from the global profile with [`ClientConfig::from_global`] or from
+//! environment variables with [`ClientConfig::from_env`], optionally set
+//! [`ClientConfig::api_key`] for an explicit key that outranks ambient env and
+//! file credentials, then call [`ClientConfig::resolve_credential`] to obtain
+//! the effective [`ResolvedCredential`].
+
+use std::path::PathBuf;
 
 use secrecy::SecretString;
 
 use crate::error::WyrdClientError;
+use crate::global_config::{GlobalConfig, TokenCacheKind};
 use crate::transport::{
     config::{GRPC_DEFAULT_ENDPOINT, GrpcConfig, HTTP_DEFAULT_BASE_URL, HttpConfig},
     credential::{CredentialChain, CredentialSource, ResolvedCredential},
@@ -44,8 +48,12 @@ pub struct ClientConfig {
     /// always wins over `WYRD_API_KEY`, `WYRD_ACCESS_TOKEN`, and the
     /// `credentials.toml` floor.
     pub api_key: Option<SecretString>,
+    /// Optional tenant slug used with workload identity credentials.
+    pub tenant: Option<String>,
     /// Token cache mode.
     pub token_cache: TokenCacheMode,
+    /// Path used by the disk token cache.
+    pub token_cache_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -54,13 +62,15 @@ impl std::fmt::Debug for ClientConfig {
             .field("grpc", &self.grpc)
             .field("http", &self.http)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("tenant", &self.tenant)
             .field("token_cache", &self.token_cache)
+            .field("token_cache_path", &self.token_cache_path)
             .finish()
     }
 }
 
 impl ClientConfig {
-    /// Build from environment variables.
+    /// Build from environment variables and built-in defaults.
     ///
     /// - `WYRD_GRPC_URL` overrides the gRPC endpoint (default:
     ///   `http://localhost:50051`).
@@ -71,10 +81,58 @@ impl ClientConfig {
     /// after construction to make it the highest-priority credential source.
     #[must_use]
     pub fn from_env() -> Self {
-        let grpc_endpoint =
-            std::env::var("WYRD_GRPC_URL").unwrap_or_else(|_| GRPC_DEFAULT_ENDPOINT.to_string());
-        let http_base_url =
-            std::env::var("WYRD_SERVER_URL").unwrap_or_else(|_| HTTP_DEFAULT_BASE_URL.to_string());
+        Self::from_global_with_env(&GlobalConfig::default())
+    }
+
+    /// Build from the global config file, environment variables, and defaults.
+    ///
+    /// # Errors
+    /// Returns an error when the global config file exists but cannot be read
+    /// or parsed.
+    pub fn from_global() -> Result<Self, WyrdClientError> {
+        Ok(Self::from_global_with_env(&GlobalConfig::load()?))
+    }
+
+    /// Overlay global config values with environment values and defaults.
+    #[must_use]
+    pub fn from_global_with_env(global: &GlobalConfig) -> Self {
+        let grpc_endpoint = global
+            .client
+            .grpc_url
+            .clone()
+            .or_else(|| std::env::var("WYRD_GRPC_URL").ok())
+            .unwrap_or_else(|| GRPC_DEFAULT_ENDPOINT.to_string());
+        let http_base_url = global
+            .client
+            .http_url
+            .clone()
+            .or_else(|| std::env::var("WYRD_SERVER_URL").ok())
+            .unwrap_or_else(|| HTTP_DEFAULT_BASE_URL.to_string());
+        let tenant = global
+            .client
+            .tenant
+            .clone()
+            .or_else(|| std::env::var("WYRD_TENANT").ok());
+        let configured_cache = global.client.token_cache.as_ref();
+        let token_cache = configured_cache
+            .and_then(|cache| cache.kind)
+            .or_else(|| match std::env::var("WYRD_TOKEN_CACHE").ok().as_deref() {
+                Some("disk") => Some(TokenCacheKind::Disk),
+                Some("in_memory") => Some(TokenCacheKind::InMemory),
+                _ => None,
+            })
+            .map_or(TokenCacheMode::InMemory, |kind| match kind {
+                TokenCacheKind::InMemory => TokenCacheMode::InMemory,
+                TokenCacheKind::Disk => TokenCacheMode::Disk,
+            });
+        let token_cache_path = configured_cache
+            .and_then(|cache| cache.path.clone())
+            .or_else(|| {
+                std::env::var("WYRD_TOKEN_CACHE_PATH")
+                    .ok()
+                    .map(PathBuf::from)
+            })
+            .or_else(|| wyrd_utils::config_dir::wyrd_config_dir().map(|path| path.join("tokens")));
 
         Self {
             grpc: GrpcConfig {
@@ -86,7 +144,9 @@ impl ClientConfig {
                 ..HttpConfig::default()
             },
             api_key: None,
-            token_cache: TokenCacheMode::default(),
+            tenant,
+            token_cache,
+            token_cache_path,
         }
     }
 
@@ -107,7 +167,9 @@ impl ClientConfig {
         if let Some(key) = &self.api_key {
             chain.push(CredentialSource::ApiKey { key: key.clone() });
         }
-        chain.extend(CredentialChain::from_env());
+        chain.extend(CredentialChain::from_env_with_tenant(
+            self.tenant.as_deref(),
+        ));
         chain.resolve()
     }
 }
@@ -115,6 +177,8 @@ impl ClientConfig {
 #[cfg(test)]
 mod tests {
     use secrecy::ExposeSecret;
+
+    use crate::global_config::{ClientSection, GlobalConfig};
 
     use super::{ClientConfig, TokenCacheMode};
     use crate::transport::{
@@ -137,6 +201,61 @@ mod tests {
         assert_eq!(cfg.http.base_url, HTTP_DEFAULT_BASE_URL);
         assert_eq!(cfg.token_cache, TokenCacheMode::InMemory);
         assert!(cfg.api_key.is_none());
+    }
+
+    #[test]
+    fn file_values_beat_environment_values() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::set_var("WYRD_GRPC_URL", "environment-grpc");
+            std::env::set_var("WYRD_SERVER_URL", "environment-http");
+            std::env::set_var("WYRD_TENANT", "environment-tenant");
+        }
+
+        let config = GlobalConfig {
+            client: ClientSection {
+                grpc_url: Some("file-grpc".to_owned()),
+                http_url: Some("file-http".to_owned()),
+                tenant: Some("file-tenant".to_owned()),
+                token_cache: None,
+            },
+        };
+        let resolved = ClientConfig::from_global_with_env(&config);
+
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::remove_var("WYRD_GRPC_URL");
+            std::env::remove_var("WYRD_SERVER_URL");
+            std::env::remove_var("WYRD_TENANT");
+        }
+
+        assert_eq!(resolved.grpc.endpoint, "file-grpc");
+        assert_eq!(resolved.http.base_url, "file-http");
+        assert_eq!(resolved.tenant.as_deref(), Some("file-tenant"));
+    }
+
+    #[test]
+    fn missing_file_values_fall_back_to_environment() {
+        let _env = crate::ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::set_var("WYRD_GRPC_URL", "environment-grpc");
+            std::env::remove_var("WYRD_SERVER_URL");
+            std::env::set_var("WYRD_TENANT", "environment-tenant");
+        }
+
+        let resolved = ClientConfig::from_global_with_env(&GlobalConfig::default());
+
+        // SAFETY: ENV_MUTEX serializes environment mutation in this test binary.
+        unsafe {
+            std::env::remove_var("WYRD_GRPC_URL");
+            std::env::remove_var("WYRD_TENANT");
+        }
+
+        assert_eq!(resolved.grpc.endpoint, "environment-grpc");
+        assert_eq!(resolved.http.base_url, HTTP_DEFAULT_BASE_URL);
+        assert_eq!(resolved.tenant.as_deref(), Some("environment-tenant"));
     }
 
     #[test]

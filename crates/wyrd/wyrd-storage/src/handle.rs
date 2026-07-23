@@ -118,6 +118,21 @@ impl StorageHandle {
         Ok(Self::assemble(signer, operator, backend_config))
     }
 
+    /// Build an emulator handle with explicit backend settings and multipart
+    /// tuning. This keeps emulator endpoints available to the server's OLAP
+    /// catalog while allowing small journey fixtures to exercise multipart
+    /// transfer paths.
+    #[cfg(any(test, feature = "emulator"))]
+    pub fn for_testing_with_multipart_threshold(
+        signer: BackendSigner,
+        backend_config: BackendConfig,
+        multipart_threshold_bytes: u64,
+    ) -> Result<Self, StorageError> {
+        let mut handle = Self::for_testing(signer, backend_config)?;
+        handle.multipart_threshold_bytes = multipart_threshold_bytes;
+        Ok(handle)
+    }
+
     /// Build a storage handle from a signer with an explicit multipart
     /// threshold.
     ///

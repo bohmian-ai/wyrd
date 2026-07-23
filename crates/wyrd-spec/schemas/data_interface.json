@@ -302,12 +302,11 @@
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "type": "object",
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "properties": {
@@ -328,10 +327,13 @@
           ]
         },
         "space": {
-          "description": "Space pinning identity together with `name` and `version`.",
-          "allOf": [
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary.",
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ]
         },
@@ -506,7 +508,7 @@
           "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"
@@ -724,6 +726,40 @@
         }
       }
     },
+    "Ref": {
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card.",
+      "anyOf": [
+        {
+          "description": "A direct reference to a registered Card.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "type": "object",
+          "required": [
+            "sibling"
+          ],
+          "properties": {
+            "sibling": {
+              "description": "Exact identity of the sibling submission.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ]
+    },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
@@ -761,7 +797,7 @@
           "description": "Optional manifest Artifact card reference.",
           "anyOf": [
             {
-              "$ref": "#/definitions/CardRef"
+              "$ref": "#/definitions/Ref"
             },
             {
               "type": "null"

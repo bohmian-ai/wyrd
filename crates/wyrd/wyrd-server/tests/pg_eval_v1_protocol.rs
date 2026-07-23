@@ -215,14 +215,14 @@ mod pg_tests {
             kind,
             name: CardName::new(name).expect("card name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new(space).expect("space"),
+            space: Some(SpaceName::new(space).expect("space")),
             uid: None,
         }
     }
 
     fn eval_spec_with_dataset(data_ref: CardRef) -> Spec {
         let mut spec = EvalSpec::new(BTreeMap::new()).expect("eval spec");
-        spec.dataset = Some(DatasetRef::new(data_ref).expect("dataset ref"));
+        spec.dataset = Some(DatasetRef::new(data_ref.into()).expect("dataset ref"));
         Spec::Eval(spec)
     }
 
@@ -246,6 +246,7 @@ mod pg_tests {
                 byte_count: 1,
                 sha256: "a".repeat(64),
             },
+            publishes_to: Vec::new(),
         })
     }
 
@@ -644,7 +645,7 @@ mod pg_tests {
     }
 
     // --------------------------------------------------------------------------
-    // (e) Cross-tenant judge/prompt CardRef → denied by the tenant-bound resolver
+    // (e) Cross-tenant Agent judge CardRef → denied by the tenant-bound resolver
     // --------------------------------------------------------------------------
 
     #[tokio::test]
@@ -657,7 +658,7 @@ mod pg_tests {
 
         let tenant_b = DataTenantId::new_v7();
         seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
-        // A Prompt (judge) card exists only in tenant B.
+        // The Prompt child and Agent judge exist only in tenant B.
         let prompt_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
         let prompt_spec = Spec::from_kind_and_value(
             &CardKind::Prompt,
@@ -670,13 +671,39 @@ mod pg_tests {
             prompt_uid,
             CardKind::Prompt,
             "shared",
-            "judge",
+            "judge-prompt",
             "1.0.0",
             &prompt_spec,
         )
         .await;
 
-        let judge_ref = card_ref(CardKind::Prompt, "shared", "judge");
+        let agent_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
+        let agent_spec = Spec::from_kind_and_value(
+            &CardKind::Agent,
+            json!({
+                "prompt": {
+                    "kind": "Prompt",
+                    "name": "judge-prompt",
+                    "version": "1.0.0",
+                    "space": "shared"
+                },
+                "run_config": {"max_iterations": 1}
+            }),
+        )
+        .expect("agent spec");
+        insert_card(
+            state.postgres.app_pool(),
+            tenant_b,
+            agent_uid,
+            CardKind::Agent,
+            "shared",
+            "judge",
+            "1.0.0",
+            &agent_spec,
+        )
+        .await;
+
+        let judge_ref = card_ref(CardKind::Agent, "shared", "judge");
 
         // The judge path (whenever server-side scoring wires) resolves through the
         // same tenant-bound resolver. Under tenant A the tenant-B judge is invisible;
@@ -684,7 +711,7 @@ mod pg_tests {
         let denied = resolve_card_for_tenant(
             state.postgres.app_pool(),
             tenant_a,
-            CardKind::Prompt,
+            CardKind::Agent,
             &judge_ref,
         )
         .await;
@@ -698,7 +725,7 @@ mod pg_tests {
         let allowed = resolve_card_for_tenant(
             state.postgres.app_pool(),
             tenant_b,
-            CardKind::Prompt,
+            CardKind::Agent,
             &judge_ref,
         )
         .await;

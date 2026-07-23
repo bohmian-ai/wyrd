@@ -66,11 +66,13 @@ def test_split_materialized_accepts_artifact_card_ref() -> None:
     assert payload["value"]["kind"] == "Artifact"
 
 
-def test_split_materialized_rejects_missing_card_ref_space() -> None:
-    with pytest.raises(WyrdError) as exc:
-        Split.materialized({"kind": "Artifact", "name": "train", "version": "1.0.0"})
+def test_split_materialized_allows_authored_ref_without_space() -> None:
+    split = Split.materialized({"kind": "Artifact", "name": "train", "version": "1.0.0"})
 
-    assert exc.value.code == "WYRD_DATA_400_INVALID_SPLIT_RULE"
+    assert split.to_dict() == {
+        "kind": "Materialized",
+        "value": {"kind": "Artifact", "name": "train", "version": "1.0.0"},
+    }
 
 
 def test_mixed_materialized_ref_and_rule_based_splits_round_trip(tmp_path) -> None:

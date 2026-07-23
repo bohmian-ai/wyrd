@@ -40,7 +40,7 @@ pub fn storage_router(state: &AppState) -> Router<AppState> {
 
     if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
         router
-            .route("/cards/upload/local/{*path}", put(local_blob))
+            .route("/cards/upload/local/{*id}", put(local_blob))
             .route("/cards/download/local/{*path}", get(download_local_blob))
     } else {
         router
@@ -97,14 +97,20 @@ async fn part_url(
     .map_err(WyrdErrorResponse::from)
 }
 
-/// Complete an initialized multipart or single-part upload.
+/// Complete an initialized upload after the client has transferred its bytes.
+///
+/// The optional `Idempotency-Key` is forwarded to the storage service so a
+/// retried client completion keeps the same request context. The service
+/// verifies the backend object before persisting its artifact metadata.
 async fn complete(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<UploadCompleteRequest>,
 ) -> Result<Json<wyrd_spec::storage::UploadCompleteResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
+    let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_complete(
@@ -112,6 +118,7 @@ async fn complete(
         state.postgres.wyrd(),
         &storage_caller,
         upload_id,
+        idempotency_key,
         body,
     )
     .await
@@ -120,12 +127,18 @@ async fn complete(
 }
 
 /// Abort an upload and release its pending storage state.
+///
+/// Aborts are safe to retry: the server treats an already completed or
+/// already aborted upload as a no-op, while the idempotency key remains
+/// available to the service for request correlation.
 async fn abort(
     State(state): State<AppState>,
     caller: Caller,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<AbortResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
+    let idempotency_key = extract_idempotency_key(&headers)?;
     let upload_id = parse_upload_id(&id)?;
     let storage_caller = storage_caller(&caller);
     service::upload_abort(
@@ -133,6 +146,7 @@ async fn abort(
         state.postgres.wyrd(),
         &storage_caller,
         upload_id,
+        idempotency_key,
     )
     .await
     .map(Json)
@@ -143,13 +157,21 @@ async fn abort(
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
-    Path(path): Path<String>,
+    Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
-    service::upload_local_blob(&state.storage, caller.data_tenant_id, path, &body)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    let upload_id = parse_upload_id(&id)?;
+    let storage_caller = storage_caller(&caller);
+    service::upload_local_blob(
+        &state.storage,
+        state.postgres.wyrd(),
+        &storage_caller,
+        upload_id,
+        &body,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     Ok(Json(LocalBlobUploadResponse { uploaded: true }))
 }
 
@@ -384,7 +406,7 @@ mod tests {
             kind,
             name: CardName::new(name).expect("name"),
             version: VersionBlock::parse("1.0.0").expect("version"),
-            space: SpaceName::new("prod").expect("space"),
+            space: Some(SpaceName::new("prod").expect("space")),
             uid: None,
         }
     }

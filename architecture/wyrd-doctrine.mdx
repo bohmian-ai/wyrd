@@ -118,9 +118,10 @@ classification field.
 `tags` are not Wyrd's public metadata contract. Public Card metadata uses
 `labels` and `annotations`.
 
-Authors write `CardRef` values inside specs. The server derives relationships
-from them. Lineage reads those relationships; users do not author a parallel
-lineage graph.
+Authors write `Ref` or `InlineableRef<T>` values inside specs. A `Path` is
+loader-only and is rewritten to a durable `Ref` before the request reaches the
+server. The server derives relationships from durable refs. Lineage reads
+those relationships; users do not author a parallel lineage graph.
 
 ## Service boundaries
 
@@ -222,9 +223,9 @@ reason strong enough to survive review.
 
 | Topic | Location |
 |---|---|
-| Full doctrine (18 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
+| Full doctrine (19 numbered principles) | `architecture/wyrd-design.md §Doctrine` |
 | Per-kind spec reference | `architecture/wyrd-design.md §Per-kind specs` |
-| Spec-file authoring, `path:` / `inline:` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
+| Spec-file authoring, `path:` / `inline` / `ref:` | `architecture/wyrd-design.md §Spec-file authoring` |
 | Workspace config (`wyrd.toml`) | `architecture/wyrd-design.md §Workspace config` |
 | Reference-direction quick reference | `architecture/wyrd-design.md §Reference-direction quick reference` |
 | Auth, principal model, delegation | `architecture/wyrd-design.md §Runtime identity` |

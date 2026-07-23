@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::card::common::NonSecretValue;
-use crate::reference::CardRef;
+use crate::reference::Ref;
 
 /// Versioned artifact descriptor.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -27,7 +27,7 @@ pub struct ArtifactSpec {
     pub integrity: Option<String>,
     /// Schema Card reference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema_ref: Option<CardRef>,
+    pub schema_ref: Option<Ref>,
     /// Framework adapter metadata for runtime loaders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub framework_adapter: Option<FrameworkAdapterRef>,

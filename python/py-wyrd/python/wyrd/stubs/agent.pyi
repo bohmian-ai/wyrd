@@ -224,7 +224,7 @@ class Agent:
         """Create an Agent.
 
         Args:
-            prompt (Prompt | Mapping[str, Any]): Resolved prompt or PromptRef-like mapping.
+            prompt (Prompt | Mapping[str, Any]): Resolved prompt or inlineable prompt-reference mapping.
             name (str | None): Optional envelope name.
             version (str | None): Optional envelope version.
             space (str | None): Optional envelope space.

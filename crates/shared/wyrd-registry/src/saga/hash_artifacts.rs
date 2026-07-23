@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncReadExt, BufReader};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::{CardSubmission, RelativeArtifactPath};
 
@@ -23,8 +24,7 @@ pub(crate) async fn validate_and_stamp(
         let Some(source) = sources.get(&artifact.relative_path) else {
             continue;
         };
-        let bytes = tokio::fs::read(source).await?;
-        let actual_size = bytes.len() as u64;
+        let (actual_size, actual_sha256) = hash_source(source).await?;
         if actual_size != artifact.size_bytes {
             return Err(WyrdError::RegistryManifestHashMismatch {
                 message: "local artifact size does not match its manifest".to_owned(),
@@ -36,8 +36,6 @@ pub(crate) async fn validate_and_stamp(
             }
             .into());
         }
-        let actual_sha256 =
-            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&bytes));
         if actual_sha256 != artifact.sha256 {
             return Err(WyrdError::RegistryManifestHashMismatch {
                 message: "local artifact digest does not match its manifest".to_owned(),
@@ -54,6 +52,31 @@ pub(crate) async fn validate_and_stamp(
         serde_jcs::to_vec(&submission.artifacts).map_err(WyrdError::from_spec_serialization)?;
     submission.metadata.artifact_hash = Some(blake3::hash(&bytes).to_hex().to_string());
     Ok(())
+}
+
+async fn hash_source(source: &PathBuf) -> Result<(u64, String), RegistryEngineError> {
+    let file = tokio::fs::File::open(source).await?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        size = size.checked_add(read as u64).ok_or_else(|| {
+            RegistryEngineError::Wyrd(WyrdError::RegistrySpecTooLarge {
+                message: "local artifact exceeds the supported size range".to_owned(),
+                details: serde_json::json!({ "source": source }),
+            })
+        })?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((
+        size,
+        base64::engine::general_purpose::STANDARD.encode(hasher.finalize()),
+    ))
 }
 
 #[cfg(test)]
@@ -142,5 +165,36 @@ mod tests {
                 wyrd_spec::error::WyrdError::RegistryManifestHashMismatch { .. }
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn rejects_short_and_long_sources_before_upload() {
+        for (bytes, expected_size) in [(b"short".as_slice(), 6_u64), (b"longer".as_slice(), 5)] {
+            let directory = tempdir().expect("temporary directory creates");
+            let source = directory.path().join("weights.bin");
+            tokio::fs::write(&source, bytes)
+                .await
+                .expect("artifact writes");
+            let relative_path = RelativeArtifactPath::new("weights.bin").expect("path is valid");
+            let entry = ArtifactManifestEntry {
+                relative_path: relative_path.clone(),
+                sha256: base64::engine::general_purpose::STANDARD
+                    .encode(sha2::Sha256::digest(bytes)),
+                size_bytes: expected_size,
+                content_type: None,
+            };
+            let mut card = submission(entry);
+            let sources = BTreeMap::from([(relative_path, source)]);
+
+            let error = validate_and_stamp(&mut card, &sources)
+                .await
+                .expect_err("size mismatch must fail");
+            assert!(matches!(
+                error,
+                RegistryEngineError::Wyrd(
+                    wyrd_spec::error::WyrdError::RegistryManifestHashMismatch { .. }
+                )
+            ));
+        }
     }
 }

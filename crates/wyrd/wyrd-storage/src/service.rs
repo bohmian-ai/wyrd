@@ -173,6 +173,7 @@ pub async fn upload_init(
         caller,
         upload_uuid,
         &validated,
+        &upload_id,
         planned,
         body.expected_size_bytes,
     )
@@ -474,15 +475,51 @@ pub async fn upload_abort(
     Ok(AbortResponse { aborted })
 }
 
-/// Write a local-mode raw blob body.
-#[instrument(skip(storage, body), fields(tenant = %data_tenant_id))]
+/// Write a bounded body through an opaque, tenant-scoped local upload capability.
+#[instrument(skip(storage, postgres, caller, body), fields(tenant = %caller.data_tenant_id, upload_id = %upload_id))]
 pub async fn upload_local_blob(
     storage: &StorageHandle,
-    data_tenant_id: DataTenantId,
-    path: String,
+    postgres: &WyrdPostgres,
+    caller: &StorageCaller,
+    upload_id: UploadId,
     body: &[u8],
 ) -> Result<(), WyrdError> {
-    let validated = tenant_path::validate(&path, data_tenant_id).map_err(map_tenant_path)?;
+    let upload_uuid = upload_id_uuid(&upload_id)?;
+    let mut conn = postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    let row = load_pending_upload(&mut conn, upload_uuid).await?;
+    if row.backend != StorageBackendKind::Local || row.wire_protocol != WireProtocol::LocalFsV1 {
+        return Err(map_storage_error(StorageError::BackendCapabilityMismatch {
+            signer: row.backend,
+            op: "local_upload",
+        }));
+    }
+    let validated =
+        tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))?;
+
+    let expected_size = u64::try_from(row.expected_size_bytes).map_err(|_| {
+        internal_error(
+            "stored expected_size_bytes is negative",
+            serde_json::json!({ "upload_id": upload_id }),
+        )
+    })?;
+    let actual_size = body.len() as u64;
+    if actual_size != expected_size {
+        return Err(map_storage_error(StorageError::SizeMismatch {
+            expected: expected_size,
+            actual: actual_size,
+        }));
+    }
+    let actual_sha256 = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body));
+    if actual_sha256 != row.expected_sha256 {
+        return Err(map_storage_error(StorageError::Sha256Mismatch {
+            expected: row.expected_sha256,
+            actual: actual_sha256,
+        }));
+    }
     #[cfg_attr(not(feature = "cloud"), allow(irrefutable_let_patterns))]
     let crate::BackendSigner::Local(local) = storage.signer() else {
         return Err(internal_error(
@@ -900,13 +937,14 @@ async fn insert_initiating_upload(
 async fn drive_backend_init(
     state: &StorageServiceState<'_>,
     validated: &ValidatedPath,
+    upload_id: &UploadId,
     planned: PlannedUpload,
     expected_size_bytes: u64,
 ) -> Result<MultipartInit, WyrdError> {
     match planned {
         PlannedUpload::SinglePut => {
             let plan = if state.storage.backend() == StorageBackendKind::Local {
-                local_single_put_plan(state.storage, validated)?
+                local_single_put_plan(state.storage, upload_id)?
             } else {
                 state
                     .storage
@@ -942,10 +980,11 @@ async fn drive_backend_init_or_mark_failed(
     caller: &StorageCaller,
     upload_uuid: Uuid,
     validated: &ValidatedPath,
+    upload_id: &UploadId,
     planned: PlannedUpload,
     expected_size_bytes: u64,
 ) -> Result<MultipartInit, WyrdError> {
-    match drive_backend_init(state, validated, planned, expected_size_bytes).await {
+    match drive_backend_init(state, validated, upload_id, planned, expected_size_bytes).await {
         Ok(init) => Ok(init),
         Err(error) => {
             let error_code = error.code().to_owned();
@@ -971,7 +1010,7 @@ async fn drive_backend_init_or_mark_failed(
 
 fn local_single_put_plan(
     storage: &StorageHandle,
-    validated: &ValidatedPath,
+    upload_id: &UploadId,
 ) -> Result<UploadPlan, WyrdError> {
     let base = storage.public_base_url().ok_or_else(|| {
         internal_error(
@@ -981,7 +1020,7 @@ fn local_single_put_plan(
     })?;
     let base = normalize_base_url(base);
     Ok(UploadPlan::LocalFs {
-        put_url: format!("{base}/v1/cards/upload/local/{}", validated.full),
+        put_url: format!("{base}/v1/cards/upload/local/{upload_id}"),
         ttl_secs: storage.presign_ttl_secs(),
     })
 }
@@ -1540,22 +1579,18 @@ mod tests {
         })
         .await
         .expect("local storage handle");
-        let tenant = DataTenantId::new_v7();
-        let validated = ValidatedPath {
-            full: format!("{tenant}/cards/018f0000-0000-7000-8000-000000000000/model.bin"),
-            data_tenant_id: tenant,
-            card_uid: "018f0000-0000-7000-8000-000000000000".to_owned(),
-            relative_path: "model.bin".to_owned(),
-        };
+        let upload_id = UploadId::from_uuid(
+            Uuid::parse_str("018f0000-0000-7000-8000-000000000001").expect("upload UUID"),
+        );
 
-        let plan = local_single_put_plan(&storage, &validated).expect("local plan");
+        let plan = local_single_put_plan(&storage, &upload_id).expect("local plan");
 
         let UploadPlan::LocalFs { put_url, ttl_secs } = plan else {
             panic!("expected local_fs plan");
         };
         assert_eq!(
             put_url,
-            format!("https://wyrd.test/v1/cards/upload/local/{}", validated.full)
+            "https://wyrd.test/v1/cards/upload/local/wyu_018f0000-0000-7000-8000-000000000001"
         );
         assert_eq!(ttl_secs, 600);
     }
@@ -1654,34 +1689,6 @@ mod tests {
             .await
             .expect("read opened file");
         assert_eq!(body, "download me");
-    }
-
-    #[tokio::test]
-    async fn upload_local_blob_writes_validated_tenant_file() {
-        let root = tempfile::tempdir().expect("temp dir");
-        let storage = StorageHandle::from_settings(StorageSettings {
-            backend: BackendConfig::Local {
-                root: root.path().to_path_buf(),
-            },
-            require_encryption: false,
-            presign_ttl: Duration::from_mins(15),
-            part_size_bytes: 16 * 1024 * 1024,
-            multipart_threshold_bytes: 100 * 1024 * 1024,
-            public_base_url: Some("https://wyrd.test".to_owned()),
-        })
-        .await
-        .expect("local storage handle");
-        let tenant = DataTenantId::new_v7();
-        let path = tenant_path::build(tenant, "018f0000-0000-7000-8000-000000000000", "model.bin");
-
-        upload_local_blob(&storage, tenant, path.clone(), b"data")
-            .await
-            .expect("upload local blob");
-
-        let bytes = tokio::fs::read(root.path().join(path))
-            .await
-            .expect("read blob");
-        assert_eq!(bytes, b"data");
     }
 
     #[test]

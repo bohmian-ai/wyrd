@@ -5,14 +5,14 @@
 //! diagnostics. It performs no registry, server, SQL, storage, or network
 //! work.
 
-pub mod config;
-pub mod diagnose;
-pub mod error;
-pub mod order;
-pub mod parse;
-pub mod path;
-pub mod resolve;
-pub mod validate;
+mod config;
+mod diagnose;
+mod error;
+mod order;
+mod parse;
+mod path;
+mod resolve;
+mod validate;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ pub struct RegistrationInput {
 }
 
 impl RegistrationInput {
-    /// Project the wire-safe portion into the existing 02a registration
+    /// Project the wire-safe portion into the composite registration
     /// request. Local artifact provenance remains available to the upload
     /// phase and never enters the request body.
     #[must_use]
@@ -104,7 +104,7 @@ pub fn load(path: &Path) -> Result<LoadedTree, LoadError> {
     config::apply_defaults(&mut cards, &config);
 
     // 5. Resolve path references.
-    let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config)?;
+    let mut diagnostics = resolve::resolve_tree(&mut cards, &sandbox, &config);
 
     // 6. Validate.
     diagnostics.extend(validate::validate_tree(&cards));

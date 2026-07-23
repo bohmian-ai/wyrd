@@ -2,11 +2,14 @@
 
 use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use base64::Engine;
 use secrecy::SecretString;
 use serde_json::{Value, json};
+use sha2::Digest;
 use url::Url;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -21,6 +24,7 @@ use wyrd_spec::ids::CardUid;
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
+use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 /// Return whether the explicitly gated Postgres route tests should run.
@@ -253,15 +257,33 @@ async fn client_registration_saga_returns_active_receipt() {
 
     let temp = tempfile::tempdir().expect("loader workspace creates");
     let prompt_path = temp.path().join("client-prompt.yaml");
+    let artifact = b"native registry artifact";
+    std::fs::write(temp.path().join("prompt.txt"), artifact).expect("artifact writes");
+    let digest = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(artifact));
     std::fs::write(
         &prompt_path,
-        "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\n",
+        format!(
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: client-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: prompt.txt\n    sha256: {digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            artifact.len()
+        ),
     )
     .expect("prompt card writes");
     let input = build_registration_input(load(&prompt_path).expect("loader tree builds"))
         .expect("registration input builds");
 
-    let server = WyrdTestServer::start_bound()
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
         .await
         .expect("bound test server starts");
     let Bootstrap::User { jwt, .. } = server
@@ -288,6 +310,30 @@ async fn client_registration_saga_returns_active_receipt() {
     );
     assert!(receipt.outcomes[0].card_blob_uri.is_some());
     assert_eq!(receipt.root.uid, receipt.outcomes[0].card_ref.uid);
+
+    let card_uid = receipt.outcomes[0]
+        .card_ref
+        .uid
+        .clone()
+        .expect("artifact receipt contains a Card UID");
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let stored = get_card_by_uid(&mut conn, &card_uid)
+        .await
+        .expect("artifact card loads");
+    assert_eq!(stored.status, wyrd_sql::CardStatus::Active);
+    assert!(stored.card_blob_uri.is_some());
+    let manifest_status: String = sqlx::query_scalar(
+        "SELECT upload_status FROM wyrd.card_artifact_manifest WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("artifact manifest loads");
+    assert_eq!(manifest_status, "verified");
+    conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");
 }
@@ -417,7 +463,7 @@ async fn registration_resolves_child_card_refs_before_persisting() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-/// The offline loader hands its wire projection to the existing 02a route.
+/// The offline loader hands its wire projection to the composite registration route.
 async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
     if !enabled() {
         return;
@@ -483,7 +529,7 @@ async fn registration_accepts_loader_projection_and_persists_sibling_binding() {
         panic!("persisted card is not an Agent");
     };
     let InlineableRef::Ref(prompt_ref) = agent.prompt else {
-        panic!("02a must bind the loader sibling before persistence");
+        panic!("the server must bind the loader sibling before persistence");
     };
     assert_eq!(prompt_ref.name.as_str(), "loader-prompt");
     assert!(prompt_ref.uid.is_some());

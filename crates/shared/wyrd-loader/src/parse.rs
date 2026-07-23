@@ -50,7 +50,8 @@ struct RawCardEnvelope {
 ///
 /// Returns a vec of `AuthoredCard`s — one per `---`-separated document.
 /// Collects every envelope violation across all docs; does not short-circuit.
-pub fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
+#[cfg(test)]
+pub(crate) fn parse_file(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     let root = path.parent().unwrap_or(Path::new("."));
     let sandbox = PathSandbox::new(root).map_err(LoadError::single)?;
     parse_file_with_sandbox(path, &sandbox)
@@ -114,7 +115,8 @@ pub(crate) fn parse_file_with_sandbox(
 ///
 /// Directory entries are sorted by path before parsing so repeated loads have
 /// identical input order on every supported filesystem.
-pub fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
+#[cfg(test)]
+pub(crate) fn parse_path(path: &Path) -> Result<Vec<AuthoredCard>, LoadError> {
     let root = if path.is_dir() {
         path
     } else {

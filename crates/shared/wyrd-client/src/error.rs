@@ -3,7 +3,7 @@
 //! server-response mappers.
 
 use thiserror::Error;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdStorageError};
 
 /// Concrete client-local error.
 ///
@@ -143,6 +143,11 @@ pub fn from_grpc_status(status: &wyrd_tonic::tonic::Status) -> WyrdError {
 /// [`WyrdError::UpstreamFailure`] with the original code preserved in
 /// `details.original_code` rather than silently dropped.
 fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -> WyrdError {
+    if code.starts_with("WYRD_STORAGE_")
+        && let Ok(error) = serde_json::from_value::<WyrdStorageError>(details.clone())
+    {
+        return error.into();
+    }
     if let Some(reconstructed) = WyrdError::from_code(code, message.clone(), details.clone()) {
         return reconstructed;
     }
@@ -158,6 +163,7 @@ fn code_to_wyrd_error(code: &str, message: String, details: serde_json::Value) -
 #[cfg(test)]
 mod tests {
     use super::{WyrdClientError, from_problem_json};
+    use wyrd_spec::error::{WyrdError, WyrdStorageError};
 
     #[test]
     fn known_code_reconstructs_correct_variant() {
@@ -208,6 +214,20 @@ mod tests {
             403,
             "status must survive the round-trip, not collapse to 502"
         );
+    }
+
+    #[test]
+    fn storage_problem_json_reconstructs_delegated_error() {
+        let source: WyrdError = WyrdStorageError::InvalidUploadId {
+            reason: "upload id must start with wyu_".to_owned(),
+        }
+        .into();
+
+        let mapped = from_problem_json(&source.as_problem_json());
+
+        assert_eq!(mapped.code(), "WYRD_STORAGE_400_INVALID_UPLOAD_ID");
+        assert_eq!(mapped.status(), 400);
+        assert_eq!(mapped.as_problem_json(), source.as_problem_json());
     }
 
     #[test]

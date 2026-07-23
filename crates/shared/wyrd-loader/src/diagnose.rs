@@ -1,6 +1,9 @@
 //! Diagnostic serialization for loader consumers.
 
-pub use super::error::{Diagnostic, Severity, SourceSpan, diagnostic_schema, emit_json};
+pub use super::error::{Diagnostic, Severity, SourceSpan, emit_json};
+
+#[cfg(test)]
+use super::error::diagnostic_schema;
 
 #[cfg(test)]
 mod tests {

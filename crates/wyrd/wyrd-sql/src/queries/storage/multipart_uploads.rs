@@ -340,6 +340,48 @@ pub async fn find_by_id(
     row.map(MultipartUploadRow::try_from).transpose()
 }
 
+/// Find every non-terminal upload owned by one Card.
+pub async fn find_open_for_card(
+    conn: &mut TenantConn<'_>,
+    card_uid: &str,
+) -> Result<Vec<MultipartUploadRow>, SqlError> {
+    let rows = sqlx::query_as::<_, MultipartUploadRowDb>(
+        r#"
+        SELECT
+            id,
+            data_tenant_id,
+            card_uid,
+            relative_path,
+            storage_path,
+            backend,
+            wire_protocol,
+            expected_sha256,
+            expected_size_bytes,
+            content_type,
+            part_count_planned,
+            part_size_bytes,
+            backend_upload_id,
+            block_count_planned,
+            status,
+            failure_reason,
+            created_at,
+            completed_at,
+            terminal_at,
+            expires_at
+        FROM wyrd.storage_multipart_uploads
+        WHERE card_uid = $1
+          AND status IN ('initiating', 'pending')
+        ORDER BY created_at
+        "#,
+    )
+    .bind(card_uid)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    rows.into_iter().map(MultipartUploadRow::try_from).collect()
+}
+
 /// Find a pending upload for crash-recovery dedupe.
 ///
 /// # Errors

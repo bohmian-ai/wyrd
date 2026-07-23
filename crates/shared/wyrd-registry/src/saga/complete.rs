@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 
 use wyrd_client::WyrdClient;
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::ids::CardUid;
 use wyrd_spec::registry::CreateCardResponse;
 
 use crate::error::RegistryEngineError;
@@ -31,7 +32,7 @@ pub(crate) async fn complete_uploaded_cards(
 /// Extract the unique Card UIDs represented by server upload plans.
 fn collect_uploaded_card_uids(
     response: &CreateCardResponse,
-) -> Result<Vec<wyrd_spec::ids::CardUid>, RegistryEngineError> {
+) -> Result<Vec<CardUid>, RegistryEngineError> {
     let mut seen = BTreeSet::new();
     let mut uids = Vec::with_capacity(response.upload_plans.len());
     for plan in &response.upload_plans {
@@ -53,7 +54,7 @@ fn collect_uploaded_card_uids(
 /// Complete one Card using the registration saga's stable idempotency key.
 async fn complete_uploaded_card(
     client: &WyrdClient,
-    uid: &wyrd_spec::ids::CardUid,
+    uid: &CardUid,
     idempotency_key: &str,
 ) -> Result<CreateCardResponse, RegistryEngineError> {
     let path = format!("/v1/cards/{uid}/complete");
@@ -67,7 +68,7 @@ async fn complete_uploaded_card(
 /// contains a duplicate/unrelated outcome.
 fn validate_completion_response(
     original: &CreateCardResponse,
-    uid: &wyrd_spec::ids::CardUid,
+    uid: &CardUid,
     completed: &CreateCardResponse,
 ) -> Result<(), RegistryEngineError> {
     let matching = completed
@@ -111,13 +112,12 @@ fn merge_completed_outcome(
             details: serde_json::json!({ "card_ref": outcome.card_ref }),
         })?;
     *existing = outcome;
-    response.root = completed.root;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::validate_completion_response;
+    use super::{merge_completed_outcome, validate_completion_response};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::error::WyrdError;
@@ -127,6 +127,54 @@ mod tests {
     use wyrd_spec::registry::{
         CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind,
     };
+
+    #[test]
+    fn merge_preserves_composite_root_and_outcome_order() {
+        let first_uid = CardUid::new("018f0000-0000-7000-8000-000000000001").expect("test UID");
+        let second_uid = CardUid::new("018f0000-0000-7000-8000-000000000002").expect("test UID");
+        let card_ref = |uid: CardUid, name: &str| CardRef {
+            kind: CardKind::Prompt,
+            name: CardName::new(name).expect("test name"),
+            version: VersionBlock::parse("1.0.0").expect("test version"),
+            space: Some(SpaceName::new("default").expect("test space")),
+            uid: Some(uid),
+        };
+        let first = CardRegistrationOutcome {
+            card_ref: card_ref(first_uid, "first"),
+            spec_hash: "first".to_owned(),
+            artifact_hash: None,
+            status: CardLifecycleStatus::Pending,
+            outcome: RegistrationOutcomeKind::Registered,
+            card_blob_uri: None,
+        };
+        let second = CardRegistrationOutcome {
+            card_ref: card_ref(second_uid, "second"),
+            spec_hash: "second".to_owned(),
+            artifact_hash: None,
+            status: CardLifecycleStatus::Pending,
+            outcome: RegistrationOutcomeKind::Registered,
+            card_blob_uri: None,
+        };
+        let mut response = CreateCardResponse {
+            root: first.card_ref.clone(),
+            outcomes: vec![first, second.clone()],
+            upload_plans: Vec::new(),
+        };
+        let completed = CreateCardResponse {
+            root: second.card_ref.clone(),
+            outcomes: vec![CardRegistrationOutcome {
+                status: CardLifecycleStatus::Active,
+                ..second
+            }],
+            upload_plans: Vec::new(),
+        };
+
+        merge_completed_outcome(&mut response, completed).expect("matching outcome merges");
+
+        assert_eq!(response.root, response.outcomes[0].card_ref);
+        assert_eq!(response.outcomes[0].card_ref.name.as_str(), "first");
+        assert_eq!(response.outcomes[1].status, CardLifecycleStatus::Active);
+    }
 
     #[test]
     fn rejects_missing_completion_outcome() {

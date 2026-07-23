@@ -8,8 +8,8 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use wyrd_semver::VersionSpec;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::envelope::{Card, Metadata, Spec};
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec};
+use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
     topo_sort,
@@ -25,16 +25,19 @@ use wyrd_spec::registry::{
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 use wyrd_sql::CardStatus;
+use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, Resolution, SubmittedCardIdentity, activate_card,
+    CardArtifactManifestRow, CardManifestCompletionRow, CardRegistrationOperationRow, NewCardRow,
+    NewRegistrationOperation, Resolution, SubmittedCardIdentity, activate_card,
     artifact_manifest_hash, commit_registration_operation, fail_card, find_card_by_ref,
     get_card_by_uid, insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
     lock_version_line, lookup_existing_operation, lookup_expired_operation,
     manifest_completion_rows, manifest_rows_for_init, mark_manifest_upload_initialized,
-    record_blob_failure, record_card_blob, registration_request_hash, resolve_version,
-    upsert_service_account_from_card,
+    mark_manifest_verified, record_blob_failure, record_card_blob, registration_request_hash,
+    resolve_version, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::multipart_uploads;
+use wyrd_sql::row_types::cards::ParsedCardRow;
 use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
@@ -61,7 +64,7 @@ struct RegistrationPlan {
 
 /// Existing row plus the outcome implied by the authored version mode.
 struct ExistingNode {
-    row: wyrd_sql::row_types::cards::ParsedCardRow,
+    row: ParsedCardRow,
     outcome: RegistrationOutcomeKind,
 }
 
@@ -115,7 +118,7 @@ async fn replay(
 
 /// Validate and decode one persisted operation response.
 fn replay_operation(
-    operation: wyrd_sql::queries::cards::CardRegistrationOperationRow,
+    operation: CardRegistrationOperationRow,
     request_hash: &str,
     idempotency_key: &str,
 ) -> Result<Option<RegistrationReplaySeed>, WyrdError> {
@@ -198,33 +201,48 @@ async fn initialize_uploads(
             .unwrap_or_default();
         let semaphore = Arc::clone(&semaphore);
         tasks.spawn(async move {
-            let Ok(_permit) = semaphore.acquire_owned().await else {
-                return (card_ref, Vec::new());
-            };
-            let entries = match tokio::time::timeout(
+            let _permit = semaphore.acquire_owned().await.map_err(|_| {
+                WyrdError::internal("registration upload initialization semaphore closed")
+            })?;
+            let entries = tokio::time::timeout(
                 StdDuration::from_secs(30),
                 initialize_card_uploads(&state, &caller, operation_id, &card_uid, &allowed_paths),
             )
             .await
-            {
-                Ok(entries) => entries,
-                Err(_) => {
-                    tracing::error!(%card_uid, "card upload initialization exceeded its budget");
-                    Vec::new()
-                }
-            };
-            (card_ref, entries)
+            .map_err(|_| WyrdError::RequestTimeout {
+                message: "card upload initialization timed out".to_owned(),
+                details: serde_json::json!({ "card_uid": card_uid }),
+            })??;
+            Ok::<_, WyrdError>((card_ref, entries))
         });
     }
     let mut plans = Vec::new();
+    let mut initialization_error = None;
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((card_ref, entries)) if !entries.is_empty() => {
+            Ok(Ok((card_ref, entries))) if !entries.is_empty() => {
                 plans.push(CardUploadPlan { card_ref, entries });
             }
-            Ok(_) => {}
-            Err(error) => tracing::error!(%error, "card upload initialization task failed"),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "card upload initialization task failed");
+                if initialization_error.is_none() {
+                    initialization_error = Some(error);
+                }
+            }
+            Err(error) => {
+                let error =
+                    WyrdError::internal(format!("upload initialization task failed: {error}"));
+                tracing::error!(%error, "card upload initialization task failed");
+                if initialization_error.is_none() {
+                    initialization_error = Some(error);
+                }
+            }
         }
+    }
+    if let Some(error) = initialization_error {
+        abort_pending_registration_cards(state, caller, &response.outcomes, idempotency_key).await;
+        return Err(error);
     }
     plans.sort_by(|left, right| {
         left.card_ref
@@ -253,25 +271,38 @@ async fn initialize_uploads(
         let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
             continue;
         };
-        response.outcomes[index] = complete_card(state, caller, card_uid, idempotency_key).await?;
+        response.outcomes[index] =
+            match complete_card(state, caller, card_uid, idempotency_key).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    abort_pending_registration_cards(
+                        state,
+                        caller,
+                        &response.outcomes,
+                        idempotency_key,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
     }
     Ok(response)
 }
 
-/// Initialize every pending manifest row for one card, omitting failed entries.
+/// Initialize every pending manifest row for one card.
 async fn initialize_card_uploads(
     state: &AppState,
     caller: &Caller,
     operation_id: RegistrationOperationId,
     card_uid: &CardUid,
     allowed_paths: &[String],
-) -> Vec<CardUploadEntry> {
+) -> Result<Vec<CardUploadEntry>, WyrdError> {
     let rows = match load_manifest_rows(state, caller, card_uid).await {
         Ok(rows) => rows,
         Err(error) => {
             audit_upload_init_failure(state, caller, card_uid, "manifest lookup failed").await;
             tracing::error!(%error, %card_uid, "manifest lookup failed after registration");
-            return Vec::new();
+            return Err(error);
         }
     };
     let mut entries = Vec::with_capacity(rows.len());
@@ -279,15 +310,38 @@ async fn initialize_card_uploads(
         if !allowed_paths.iter().any(|path| path == &row.relative_path) {
             continue;
         }
-        match initialize_manifest_row(state, caller, operation_id, card_uid, &row).await {
-            Ok(entry) => entries.push(entry),
+        let entry = match initialize_manifest_row(state, caller, operation_id, card_uid, &row).await
+        {
+            Ok(entry) => entry,
             Err(error) => {
-                tracing::error!(%error, %card_uid, path = %row.relative_path, "upload init failed");
                 audit_upload_init_failure(state, caller, card_uid, &row.relative_path).await;
+                tracing::error!(%error, %card_uid, path = %row.relative_path, "upload init failed");
+                return Err(error);
             }
+        };
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+/// Abort every still-pending Card when post-commit initialization fails.
+async fn abort_pending_registration_cards(
+    state: &AppState,
+    caller: &Caller,
+    outcomes: &[CardRegistrationOutcome],
+    idempotency_key: &str,
+) {
+    for outcome in outcomes {
+        if outcome.status != CardLifecycleStatus::Pending {
+            continue;
+        }
+        let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
+            continue;
+        };
+        if let Err(error) = abort_card(state, caller, card_uid, idempotency_key).await {
+            tracing::error!(%error, %card_uid, "registration failure cleanup did not complete");
         }
     }
-    entries
 }
 
 /// Load manifest rows in a short tenant transaction.
@@ -295,7 +349,7 @@ async fn load_manifest_rows(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-) -> Result<Vec<wyrd_sql::queries::cards::CardArtifactManifestRow>, WyrdError> {
+) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
@@ -312,7 +366,7 @@ async fn initialize_manifest_row(
     caller: &Caller,
     operation_id: RegistrationOperationId,
     card_uid: &CardUid,
-    row: &wyrd_sql::queries::cards::CardArtifactManifestRow,
+    row: &CardArtifactManifestRow,
 ) -> Result<CardUploadEntry, WyrdError> {
     let key = IdempotencyKey::new(format!(
         "registration-{}-{}",
@@ -342,11 +396,18 @@ async fn initialize_manifest_row(
         message: "artifact upload initialization timed out".to_owned(),
         details: serde_json::json!({ "card_uid": card_uid, "relative_path": row.relative_path }),
     })??;
-    let upload_uuid = initialized
-        .upload_id
+    let initialized_upload_id = initialized.upload_id.clone();
+    let upload_uuid = initialized_upload_id
         .as_uuid()
         .map_err(|error| WyrdError::internal(format!("upload id invalid: {error}")))?;
-    let entry = card_upload_entry(&row.relative_path, initialized.upload_id, initialized.plan)?;
+    let entry = match card_upload_entry(&row.relative_path, initialized.upload_id, initialized.plan)
+    {
+        Ok(entry) => entry,
+        Err(error) => {
+            abort_initialized_upload(state, caller, initialized_upload_id).await;
+            return Err(error);
+        }
+    };
     let mut conn = state
         .postgres
         .tenant_conn(caller.data_tenant_id)
@@ -361,10 +422,33 @@ async fn initialize_manifest_row(
         AuditResult::Success,
         "artifact upload initialization succeeded",
     );
-    append_on(&mut conn, &event).await?;
-    mark_manifest_upload_initialized(&mut conn, card_uid, &row.relative_path, upload_uuid).await?;
-    conn.commit().await.map_err(registry_db_error)?;
+    let persisted = async {
+        append_on(&mut conn, &event).await?;
+        mark_manifest_upload_initialized(&mut conn, card_uid, &row.relative_path, upload_uuid)
+            .await?;
+        conn.commit().await.map_err(registry_db_error)
+    }
+    .await;
+    if let Err(error) = persisted {
+        abort_initialized_upload(state, caller, initialized_upload_id).await;
+        return Err(error);
+    }
     Ok(entry)
+}
+
+/// Abort a storage upload when its post-init manifest transaction fails.
+async fn abort_initialized_upload(state: &AppState, caller: &Caller, upload_id: UploadId) {
+    if let Err(error) = upload_abort(
+        &state.storage,
+        state.postgres.wyrd(),
+        &storage_caller(caller),
+        upload_id,
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, "initialized upload cleanup failed");
+    }
 }
 
 /// Project the complete storage upload contract into the registry response.
@@ -380,7 +464,7 @@ fn card_upload_entry(
     })
 }
 
-/// Record one post-commit initialization failure without changing registration success.
+/// Record one post-commit initialization failure before registration cleanup.
 async fn audit_upload_init_failure(
     state: &AppState,
     caller: &Caller,
@@ -509,11 +593,11 @@ async fn write_registration(
 
 /// Resolve one node's version, deduplicate when possible, and persist when fresh.
 async fn persist_node(
-    conn: &mut wyrd_sql::TenantConn<'_>,
+    conn: &mut TenantConn<'_>,
     caller: &Caller,
     operation_id: RegistrationOperationId,
     submission: &mut CardSubmission,
-) -> Result<wyrd_spec::registry::CardRegistrationOutcome, WyrdError> {
+) -> Result<CardRegistrationOutcome, WyrdError> {
     let mut card = submission_card(submission)?;
     let spec_hash = card
         .spec
@@ -552,10 +636,7 @@ async fn persist_node(
     )
     .await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
-    if matches!(
-        card.kind,
-        wyrd_spec::envelope::CardKind::Service | wyrd_spec::envelope::CardKind::Agent
-    ) {
+    if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         upsert_service_account_from_card(conn, &row.card_uid, &card, &caller.principal).await?;
     }
     append_registration_audit(conn, caller, &row.card_uid).await?;
@@ -567,7 +648,7 @@ async fn persist_node(
 
 /// Return an identical existing row or pin the fresh resolved version on the card.
 async fn resolve_existing(
-    conn: &mut wyrd_sql::TenantConn<'_>,
+    conn: &mut TenantConn<'_>,
     card: &mut Card,
     spec_hash: &str,
     artifact_hash: Option<&str>,
@@ -639,7 +720,7 @@ async fn resolve_existing(
 
 /// Append the required per-node audit event on the caller's transaction.
 async fn append_registration_audit(
-    conn: &mut wyrd_sql::TenantConn<'_>,
+    conn: &mut TenantConn<'_>,
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<(), WyrdError> {
@@ -820,8 +901,8 @@ pub async fn register_card(
 
 /// Card and manifest state loaded before completion or abort storage IO.
 struct CardCompletionState {
-    card: wyrd_sql::row_types::cards::ParsedCardRow,
-    manifests: Vec<wyrd_sql::queries::cards::CardManifestCompletionRow>,
+    card: ParsedCardRow,
+    manifests: Vec<CardManifestCompletionRow>,
 }
 
 /// Complete one pending Card after its storage uploads have been verified.
@@ -845,23 +926,26 @@ pub async fn complete_card(
 ) -> Result<CardRegistrationOutcome, WyrdError> {
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_completion_status(&completion_state.card, card_uid)?;
-    if completion_state.card.status == CardStatus::Pending {
-        verify_card_manifests(state, caller, card_uid, &completion_state.manifests).await?;
-    }
-    let blob_uri = ensure_card_blob(state, caller, &completion_state.card).await?;
-    let activated = if completion_state.card.status == CardStatus::Active {
-        false
-    } else {
-        commit_card_activation(
+    if completion_state.card.status == CardStatus::Active {
+        return load_card_registration_outcome(
             state,
             caller,
             card_uid,
-            &completion_state.manifests,
-            &blob_uri,
-            completion_state.card.card_blob_uri.is_none(),
+            RegistrationOutcomeKind::IdempotentNoop,
         )
-        .await?
-    };
+        .await;
+    }
+    verify_card_manifests(state, caller, card_uid, &completion_state.manifests).await?;
+    let blob_uri = ensure_card_blob(state, caller, &completion_state.card).await?;
+    let activated = commit_card_activation(
+        state,
+        caller,
+        card_uid,
+        &completion_state.manifests,
+        &blob_uri,
+        completion_state.card.card_blob_uri.is_none(),
+    )
+    .await?;
     load_card_registration_outcome(
         state,
         caller,
@@ -895,7 +979,14 @@ pub async fn abort_card(
 ) -> Result<CardRegistrationOutcome, WyrdError> {
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_abort_status(&completion_state.card, card_uid)?;
-    let cleanup_failures = cleanup_card_artifacts(state, caller, &completion_state.manifests).await;
+    let cleanup_failures = cleanup_card_artifacts(
+        state,
+        caller,
+        card_uid,
+        &completion_state.card,
+        &completion_state.manifests,
+    )
+    .await;
     commit_card_failure(state, caller, card_uid, cleanup_failures.is_empty()).await?;
     if !cleanup_failures.is_empty() {
         return Err(WyrdError::RegistryArtifactVerifyFailed {
@@ -934,7 +1025,7 @@ async fn load_card_completion_state(
 
 /// Validate the completion lifecycle state.
 fn validate_card_completion_status(
-    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+    card: &ParsedCardRow,
     card_uid: &CardUid,
 ) -> Result<(), WyrdError> {
     if card.status == CardStatus::Active {
@@ -954,7 +1045,7 @@ async fn verify_card_manifests(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+    manifests: &[CardManifestCompletionRow],
 ) -> Result<(), WyrdError> {
     for manifest in manifests {
         verify_manifest_storage(state, caller, card_uid, manifest).await?;
@@ -966,7 +1057,7 @@ async fn verify_card_manifests(
 async fn ensure_card_blob(
     state: &AppState,
     caller: &Caller,
-    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+    card: &ParsedCardRow,
 ) -> Result<String, WyrdError> {
     match &card.card_blob_uri {
         Some(uri) => Ok(uri.clone()),
@@ -979,7 +1070,7 @@ async fn commit_card_activation(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+    manifests: &[CardManifestCompletionRow],
     blob_uri: &str,
     record_blob: bool,
 ) -> Result<bool, WyrdError> {
@@ -993,9 +1084,7 @@ async fn commit_card_activation(
             multipart_uploads::mark_completed_if_pending(&mut conn, upload_id)
                 .await
                 .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
-            let _ =
-                wyrd_sql::queries::cards::mark_manifest_verified(&mut conn, card_uid, upload_id)
-                    .await?;
+            let _ = mark_manifest_verified(&mut conn, card_uid, upload_id).await?;
         }
     }
     if record_blob {
@@ -1036,10 +1125,7 @@ async fn load_card_registration_outcome(
 }
 
 /// Validate that abort is legal and allow Failed cleanup retries.
-fn validate_card_abort_status(
-    card: &wyrd_sql::row_types::cards::ParsedCardRow,
-    card_uid: &CardUid,
-) -> Result<(), WyrdError> {
+fn validate_card_abort_status(card: &ParsedCardRow, card_uid: &CardUid) -> Result<(), WyrdError> {
     match card.status {
         CardStatus::Pending | CardStatus::Failed => Ok(()),
         CardStatus::Active => Err(WyrdError::Conflict {
@@ -1057,7 +1143,9 @@ fn validate_card_abort_status(
 async fn cleanup_card_artifacts(
     state: &AppState,
     caller: &Caller,
-    manifests: &[wyrd_sql::queries::cards::CardManifestCompletionRow],
+    card_uid: &CardUid,
+    card: &ParsedCardRow,
+    manifests: &[CardManifestCompletionRow],
 ) -> Vec<String> {
     let mut failures = Vec::new();
     for manifest in manifests {
@@ -1065,14 +1153,82 @@ async fn cleanup_card_artifacts(
             failures.push(error.to_string());
         }
     }
+    if let Err(error) = cleanup_card_blob(state, caller, card).await {
+        failures.push(error);
+    }
+    let open_uploads = match load_open_card_uploads(state, caller, card_uid).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            failures.push(error.to_string());
+            return failures;
+        }
+    };
+    for upload in open_uploads {
+        let upload_id = UploadId::from_uuid(upload.id);
+        if let Err(error) = upload_abort(
+            &state.storage,
+            state.postgres.wyrd(),
+            &storage_caller(caller),
+            upload_id,
+            None,
+        )
+        .await
+        {
+            failures.push(error.to_string());
+        }
+    }
     failures
+}
+
+/// Remove the deterministic blob written before a registration failure.
+async fn cleanup_card_blob(
+    state: &AppState,
+    caller: &Caller,
+    card: &ParsedCardRow,
+) -> Result<(), String> {
+    let path = card
+        .card_blob_uri
+        .as_deref()
+        .and_then(|uri| uri.strip_prefix("wyrd://"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            tenant_path::build(
+                caller.data_tenant_id,
+                &card.card_uid.to_string(),
+                &format!("blob/{}.json", card.spec_hash),
+            )
+        });
+    let validated =
+        tenant_path::validate(&path, caller.data_tenant_id).map_err(|error| error.to_string())?;
+    match state.storage.delete_object(&validated).await {
+        Ok(()) | Err(StorageError::ObjectNotFound { .. }) => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Load upload rows that were not linked to a manifest before a failure.
+async fn load_open_card_uploads(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<Vec<multipart_uploads::MultipartUploadRow>, WyrdError> {
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(registry_db_error)?;
+    let rows = multipart_uploads::find_open_for_card(&mut conn, card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(rows)
 }
 
 /// Clean one completed object or pending backend upload.
 async fn cleanup_manifest_artifact(
     state: &AppState,
     caller: &Caller,
-    manifest: &wyrd_sql::queries::cards::CardManifestCompletionRow,
+    manifest: &CardManifestCompletionRow,
 ) -> Result<(), String> {
     let Some(upload_id) = manifest.upload_id else {
         return Ok(());
@@ -1083,11 +1239,10 @@ async fn cleanup_manifest_artifact(
             if let Some(path) = manifest.storage_path.as_deref() {
                 let validated = tenant_path::validate(path, caller.data_tenant_id)
                     .map_err(|error| error.to_string())?;
-                state
-                    .storage
-                    .delete_object(&validated)
-                    .await
-                    .map_err(|error| error.to_string())?;
+                match state.storage.delete_object(&validated).await {
+                    Ok(()) | Err(StorageError::ObjectNotFound { .. }) => {}
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         Some("pending") | Some("initiating") => {
@@ -1144,7 +1299,7 @@ async fn verify_manifest_storage(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
-    manifest: &wyrd_sql::queries::cards::CardManifestCompletionRow,
+    manifest: &CardManifestCompletionRow,
 ) -> Result<(), WyrdError> {
     let valid = matches!(
         manifest.manifest_status.as_str(),
@@ -1222,7 +1377,7 @@ async fn verify_manifest_storage(
 async fn write_card_blob(
     state: &AppState,
     caller: &Caller,
-    card: &wyrd_sql::row_types::cards::ParsedCardRow,
+    card: &ParsedCardRow,
 ) -> Result<String, WyrdError> {
     let blob_path = tenant_path::build(
         caller.data_tenant_id,
@@ -1269,7 +1424,7 @@ async fn write_card_blob(
 
 /// Convert a server-tier storage error to the shared Wyrd error catalog.
 fn map_storage_error(error: StorageError) -> WyrdError {
-    wyrd_spec::error::storage::WyrdStorageError::from(error).into()
+    WyrdStorageError::from(error).into()
 }
 
 #[cfg(test)]

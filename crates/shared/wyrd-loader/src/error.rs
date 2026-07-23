@@ -197,6 +197,7 @@ impl Diagnostic {
 
 /// Return the JSON Schema for the machine-readable diagnostic contract.
 #[must_use]
+#[cfg(test)]
 pub fn diagnostic_schema() -> schemars::schema::RootSchema {
     schemars::schema_for!(Diagnostic)
 }

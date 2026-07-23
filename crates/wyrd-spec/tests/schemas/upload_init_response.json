@@ -136,7 +136,7 @@
           }
         },
         {
-          "description": "Local filesystem auth-gated upload.\n\nSignals that the upload URL is an auth-gated server route, not a presigned PUT. SDK clients must include `Authorization: Bearer` and `x-wyrd-data-tenant-id` on the PUT request.",
+          "description": "Local filesystem auth-gated upload.\n\nSignals that the upload URL is an auth-gated server route for one server-minted upload capability, not a caller-selected storage path.",
           "type": "object",
           "required": [
             "data",

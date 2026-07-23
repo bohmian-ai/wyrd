@@ -40,7 +40,7 @@ pub fn storage_router(state: &AppState) -> Router<AppState> {
 
     if matches!(state.storage.backend_config(), BackendConfig::Local { .. }) {
         router
-            .route("/cards/upload/local/{*path}", put(local_blob))
+            .route("/cards/upload/local/{*id}", put(local_blob))
             .route("/cards/download/local/{*path}", get(download_local_blob))
     } else {
         router
@@ -157,13 +157,21 @@ async fn abort(
 async fn local_blob(
     State(state): State<AppState>,
     caller: Caller,
-    Path(path): Path<String>,
+    Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<LocalBlobUploadResponse>, WyrdErrorResponse> {
     authorize_card_write(state.authz.permission_check.as_ref(), &caller)?;
-    service::upload_local_blob(&state.storage, caller.data_tenant_id, path, &body)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    let upload_id = parse_upload_id(&id)?;
+    let storage_caller = storage_caller(&caller);
+    service::upload_local_blob(
+        &state.storage,
+        state.postgres.wyrd(),
+        &storage_caller,
+        upload_id,
+        &body,
+    )
+    .await
+    .map_err(WyrdErrorResponse::from)?;
     Ok(Json(LocalBlobUploadResponse { uploaded: true }))
 }
 

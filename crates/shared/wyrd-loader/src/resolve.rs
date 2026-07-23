@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
-use super::error::{Diagnostic, LoadError};
+use super::error::Diagnostic;
 use super::parse::{AuthoredCard, card_ref_for, parse_file_with_sandbox};
 use super::path::PathSandbox;
 
@@ -19,7 +19,7 @@ pub fn resolve_tree(
     cards: &mut Vec<AuthoredCard>,
     sandbox: &PathSandbox,
     config: &wyrd_config::WyrdConfig,
-) -> Result<Vec<Diagnostic>, LoadError> {
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut path_cache: HashMap<PathBuf, CardRef> = HashMap::new();
     let mut card_refs_by_path: HashMap<PathBuf, CardRef> = cards
@@ -91,7 +91,7 @@ pub fn resolve_tree(
         index += 1;
     }
 
-    Ok(diagnostics)
+    diagnostics
 }
 
 struct PathResolver<'a> {
@@ -227,8 +227,7 @@ mod tests {
             &mut cards,
             &PathSandbox::new(root).unwrap(),
             &wyrd_config::WyrdConfig::empty(),
-        )
-        .unwrap();
+        );
 
         assert!(diagnostics.is_empty());
         assert_eq!(cards.len(), 2);

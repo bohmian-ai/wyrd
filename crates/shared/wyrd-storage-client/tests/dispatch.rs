@@ -16,7 +16,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::storage::{HeaderPair, UploadId, UploadPlan};
-use wyrd_storage_client::WyrdStorageClient;
+use wyrd_storage_client::{StorageClientError, WyrdStorageClient};
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -37,6 +37,10 @@ struct TestServer {
     uri: String,
     requests: Arc<Mutex<Vec<Request>>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+fn sha256_b64(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
 }
 
 impl TestServer {
@@ -442,4 +446,78 @@ async fn download_and_download_verified_stream_bytes_and_check_digest_and_size()
     let requests = server.requests().await;
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[0].target, "/download");
+}
+
+#[tokio::test]
+async fn façade_rejects_invalid_provider_plans_before_transfer() {
+    let server = TestServer::start(Vec::new()).await;
+    let storage = WyrdStorageClient::new(&client(server.uri()));
+    for plan in [
+        UploadPlan::S3Multipart {
+            part_count: 0,
+            part_size_bytes: 1,
+            part_url_ttl_secs: 60,
+            required_headers: Vec::new(),
+        },
+        UploadPlan::GcsResumable {
+            session_uri: format!("{}/gcs", server.uri()),
+            chunk_size_bytes: 0,
+        },
+        UploadPlan::AzureBlockBlob {
+            sas_url: format!("{}/azure", server.uri()),
+            block_size_bytes: 1,
+            block_count_planned: 0,
+        },
+    ] {
+        let error = storage
+            .upload_artifact(&UploadId::new(), &plan, b"data".to_vec(), "key")
+            .await
+            .expect_err("invalid provider plan is rejected");
+        assert!(matches!(error, StorageClientError::PlanInvalid(_)));
+    }
+    assert!(server.requests().await.is_empty());
+}
+
+#[tokio::test]
+async fn façade_preserves_backend_failure_and_download_verification_errors() {
+    let server = TestServer::start(vec![
+        response(503),
+        Response {
+            status: 200,
+            body: b"wrong".to_vec(),
+            headers: Vec::new(),
+        },
+    ])
+    .await;
+    let storage = WyrdStorageClient::new(&client(server.uri()));
+    let error = storage
+        .upload_artifact(
+            &UploadId::new(),
+            &UploadPlan::SinglePut {
+                put_url: format!("{}/single", server.uri()),
+                ttl_secs: 60,
+                required_headers: Vec::new(),
+            },
+            b"data".to_vec(),
+            "key",
+        )
+        .await
+        .expect_err("backend failure is returned");
+    let error: wyrd_spec::error::WyrdError = error.into();
+    assert_eq!(error.code(), "WYRD_STORAGE_503_BACKEND_UNAVAILABLE");
+
+    let destination = NamedTempFile::new().expect("destination");
+    let error = storage
+        .download_verified(
+            &wyrd_spec::storage::DownloadPlan {
+                get_url: format!("{}/download", server.uri()),
+                ttl_secs: 60,
+            },
+            destination.path(),
+            &sha256_b64(b"expected"),
+            8,
+        )
+        .await
+        .expect_err("download verification failure is returned");
+    assert!(matches!(error, StorageClientError::VerifyFailed { .. }));
 }

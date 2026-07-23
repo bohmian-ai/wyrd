@@ -5,6 +5,7 @@
 //! client performs all provider transfer details, and the same client streams
 //! the bytes back with digest/size verification.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +103,19 @@ fn cloud_settings(backend: BackendConfig) -> StorageSettings {
         part_size_bytes: PLANNED_PART_BYTES,
         multipart_threshold_bytes: LOW_THRESHOLD_BYTES,
         public_base_url: None,
+    }
+}
+
+fn local_settings(root: &Path) -> StorageSettings {
+    StorageSettings {
+        backend: BackendConfig::Local {
+            root: root.to_path_buf(),
+        },
+        require_encryption: false,
+        presign_ttl: Duration::from_secs(600),
+        part_size_bytes: PLANNED_PART_BYTES,
+        multipart_threshold_bytes: LOW_THRESHOLD_BYTES,
+        public_base_url: Some(String::new()),
     }
 }
 
@@ -242,16 +256,7 @@ async fn run_client_server_journey(
         )
         .await
         .expect("upload init succeeds");
-    let upload_plan = match &init.plan {
-        UploadPlan::LocalFs { ttl_secs, .. } => {
-            let base_url = srv.base_url().expect("bound server exposes base URL");
-            UploadPlan::LocalFs {
-                put_url: format!("{base_url}/v1/cards/upload/local/{}", init.storage_path),
-                ttl_secs: *ttl_secs,
-            }
-        }
-        _ => init.plan.clone(),
-    };
+    let upload_plan = init.plan.clone();
     storage
         .upload_artifact(
             &init.upload_id,
@@ -310,8 +315,72 @@ async fn local_client_server_round_trip() {
     if !enabled("WYRD_STORAGE_E2E") {
         return;
     }
-    let srv = WyrdTestServer::start_bound().await.expect("start server");
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let srv = server_from_settings(local_settings(storage_root.path())).await;
     run_client_server_journey(srv, "local/weights.bin", false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn local_upload_capability_rejects_raw_paths_and_bad_bytes() {
+    if !enabled("WYRD_STORAGE_E2E") {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let srv = server_from_settings(local_settings(storage_root.path())).await;
+    let token = bootstrap_service_jwt(&srv, "storage-local-negative").await;
+    let client = client_for(&srv, &token);
+    let content = b"good";
+    let card_uid = CardUid::new(FIXED_CARD_UID).expect("card UID");
+    let init: UploadInitResponse = client
+        .submit_with_idempotency_key(
+            reqwest::Method::POST,
+            "/v1/cards/upload/init",
+            &UploadInitRequest {
+                card_uid: card_uid.clone(),
+                relative_path: "local/negative.bin".to_owned(),
+                expected_sha256: sha256_b64(content),
+                expected_size_bytes: content.len() as u64,
+                content_type: None,
+            },
+            "storage-local-negative-001",
+        )
+        .await
+        .expect("upload init succeeds");
+    let UploadPlan::LocalFs { put_url, .. } = &init.plan else {
+        panic!("local storage returns a LocalFs capability");
+    };
+
+    let raw_path = format!("/v1/cards/upload/local/{}", init.storage_path);
+    let error = client
+        .request_stream(
+            reqwest::Method::PUT,
+            &raw_path,
+            reqwest::Body::from(content.as_slice()),
+        )
+        .await
+        .expect_err("raw storage paths are not upload capabilities");
+    assert_eq!(
+        error.code(),
+        "WYRD_STORAGE_400_INVALID_UPLOAD_ID",
+        "raw path rejection returned {error:?}"
+    );
+
+    let error = client
+        .request_stream(reqwest::Method::PUT, put_url, reqwest::Body::from("bad"))
+        .await
+        .expect_err("wrong bytes are rejected before the local write");
+    assert_eq!(error.code(), "WYRD_STORAGE_400_SIZE_MISMATCH");
+
+    WyrdStorageClient::new(&client)
+        .upload_artifact(
+            &init.upload_id,
+            &init.plan,
+            content.to_vec(),
+            "storage-local-negative-001",
+        )
+        .await
+        .expect("the opaque capability still accepts the declared bytes");
+    srv.shutdown().await.expect("test server shuts down");
 }
 
 #[tokio::test(flavor = "current_thread")]

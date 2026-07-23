@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, StringArray};
@@ -24,8 +25,8 @@ use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
 use wyrd_bench::{
     BenchmarkMetricSnapshot, BenchmarkRecorder, MachineMetadata, ScribeBenchmarkConfig,
     ScribeBenchmarkReport, ScribeCaseReport, ScribeCaseVerification, ScribeCompactCase,
-    ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, ScribeTopologyEvidence,
-    compact_scribe_matrix, required_scribe_metric_families,
+    ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, ScribeTenantReport,
+    ScribeTopologyEvidence, compact_scribe_matrix, required_scribe_metric_families,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::{AuthError, AuthMiddleware};
@@ -44,6 +45,9 @@ type BenchError = Box<dyn Error + Send + Sync>;
 const RETAINED_ITEM_LIMIT: u64 = 256;
 const RETAINED_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_IN_FLIGHT_STREAMS: usize = 32;
+const BUSY_RETRY_BUDGET: Duration = Duration::from_secs(120);
+const BUSY_RETRY_INITIAL: Duration = Duration::from_millis(10);
+const BUSY_RETRY_MAX: Duration = Duration::from_secs(2);
 const DEFAULT_PODS: usize = 3;
 const DEFAULT_TENANTS: usize = 10;
 
@@ -51,6 +55,46 @@ struct TenantWorkload {
     tenant: wyrd_spec::DataTenantId,
     auth: Vec<Arc<AuthMiddleware>>,
     transports: Vec<BifrostGrpcTransport>,
+}
+
+#[derive(Debug, Default)]
+struct BusyRetryStats {
+    rejections: AtomicU64,
+    retries: AtomicU64,
+    transport_unavailable: AtomicU64,
+}
+
+impl BusyRetryStats {
+    fn snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.rejections.load(Ordering::Relaxed),
+            self.retries.load(Ordering::Relaxed),
+            self.transport_unavailable.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct TenantRunProgress {
+    accepted_frames: u64,
+    accepted_rows: u64,
+    ack_samples: Vec<u64>,
+}
+
+impl TenantRunProgress {
+    fn merge(&mut self, other: Self) {
+        self.accepted_frames = self.accepted_frames.saturating_add(other.accepted_frames);
+        self.accepted_rows = self.accepted_rows.saturating_add(other.accepted_rows);
+        self.ack_samples.extend(other.ack_samples);
+    }
+}
+
+#[derive(Debug, Default)]
+struct SendFramesResult {
+    frames: u64,
+    rows: u64,
+    topology: ScribeTopologyEvidence,
+    tenants: BTreeMap<String, TenantRunProgress>,
 }
 
 #[tokio::main]
@@ -74,11 +118,18 @@ async fn main() -> Result<(), BenchError> {
 async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, BenchError> {
     let warmup = sustained_seconds("WYRD_BIFROST_SUSTAINED_WARMUP_SECONDS", 60)?;
     let measured = sustained_seconds("WYRD_BIFROST_SUSTAINED_MEASURED_SECONDS", 15 * 60)?;
+    let flush_every =
+        Duration::from_secs(sustained_seconds("WYRD_BIFROST_SUSTAINED_FLUSH_SECONDS", 5)?.max(1));
+    let round_delay = Duration::from_millis(sustained_millis(
+        "WYRD_BIFROST_SUSTAINED_ROUND_DELAY_MS",
+        5_000,
+    )?);
     let scenarios = [
         ("tenant_fanout", 100_u32, 1_u32, 100_u32),
         ("tenant_table_fanout", 25_u32, 8_u32, 128_u32),
     ];
     let mut cases = Vec::with_capacity(scenarios.len());
+    let mut run_errors = 0_u64;
     for (scenario, tenants, tables, writers) in scenarios {
         let case = ScribeCompactCase {
             id: format!("sustained-{scenario}"),
@@ -103,26 +154,98 @@ async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkRe
         let workloads = provision_cluster(&cluster, &case).await?;
         prewarm_auth(&workloads).await?;
         let payload = Bytes::from(ipc(case.frame_size_bytes as usize)?);
+        let warmup_retry_stats = Arc::new(BusyRetryStats::default());
+        let mut warmup_error = false;
         let warmup_deadline = Instant::now() + Duration::from_secs(warmup);
+        let mut next_flush = Instant::now() + flush_every;
         while Instant::now() < warmup_deadline {
-            let _ =
-                send_frames(&workloads, &case, payload.clone(), u64::from(case.writers)).await?;
+            match send_frames(
+                &workloads,
+                &case,
+                payload.clone(),
+                u64::from(case.writers),
+                &warmup_retry_stats,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("bifrost sustained warmup failed: {}: {error}", case.id);
+                    warmup_error = true;
+                    break;
+                }
+            }
+            if Instant::now() >= next_flush {
+                if let Err(error) = flush_workloads(&cluster, &workloads).await {
+                    eprintln!(
+                        "bifrost sustained warmup flush failed: {}: {error}",
+                        case.id
+                    );
+                    warmup_error = true;
+                    break;
+                }
+                next_flush = Instant::now() + flush_every;
+            }
+            tokio::time::sleep(round_delay).await;
         }
-        flush_workloads(&cluster, &workloads).await?;
+        let mut scenario_errors: u64 = if warmup_error { 1 } else { 0 };
+        if let Err(error) = flush_workloads(&cluster, &workloads).await {
+            eprintln!(
+                "bifrost sustained warmup drain failed: {}: {error}",
+                case.id
+            );
+            scenario_errors = scenario_errors.saturating_add(1);
+        }
         recorder.reset_interval();
+        let retry_stats = Arc::new(BusyRetryStats::default());
+        let mut tenant_progress = BTreeMap::new();
         let started = Instant::now();
         let measured_deadline = started + Duration::from_secs(measured);
         let mut admitted_rows = 0_u64;
         let mut measured_frames = 0_u64;
         let mut topology = ScribeTopologyEvidence::default();
-        while Instant::now() < measured_deadline {
-            let (frames, observed) =
-                send_frames(&workloads, &case, payload.clone(), u64::from(case.writers)).await?;
-            admitted_rows = admitted_rows.saturating_add(frames);
-            measured_frames = measured_frames.saturating_add(frames);
-            topology = observed;
+        next_flush = Instant::now() + flush_every;
+        while !warmup_error && Instant::now() < measured_deadline {
+            match send_frames(
+                &workloads,
+                &case,
+                payload.clone(),
+                u64::from(case.writers),
+                &retry_stats,
+            )
+            .await
+            {
+                Ok(sent) => {
+                    admitted_rows = admitted_rows.saturating_add(sent.rows);
+                    measured_frames = measured_frames.saturating_add(sent.frames);
+                    topology = sent.topology;
+                    merge_tenant_progress(&mut tenant_progress, sent.tenants);
+                }
+                Err(error) => {
+                    eprintln!("bifrost sustained measurement failed: {}: {error}", case.id);
+                    scenario_errors = scenario_errors.saturating_add(1);
+                    break;
+                }
+            }
+            if Instant::now() >= next_flush {
+                if let Err(error) = flush_workloads(&cluster, &workloads).await {
+                    eprintln!(
+                        "bifrost sustained measurement flush failed: {}: {error}",
+                        case.id
+                    );
+                    scenario_errors = scenario_errors.saturating_add(1);
+                    break;
+                }
+                next_flush = Instant::now() + flush_every;
+            }
+            tokio::time::sleep(round_delay).await;
         }
-        flush_workloads(&cluster, &workloads).await?;
+        let elapsed = u64::try_from(started.elapsed().as_micros())?.max(1);
+        let drain_started = Instant::now();
+        if let Err(error) = flush_workloads(&cluster, &workloads).await {
+            eprintln!("bifrost sustained final flush failed: {}: {error}", case.id);
+            scenario_errors = scenario_errors.saturating_add(1);
+        }
         let snapshot = wait_for_durable(
             recorder,
             metric_counter(
@@ -137,73 +260,22 @@ async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkRe
             ),
         )
         .await;
-        let durable_frames = metric_counter(&snapshot, "bifrost_scribe_frames_total", "fsynced");
-        let durable_rows = metric_counter(&snapshot, "bifrost_scribe_rows_total", "fsynced");
-        let elapsed = u64::try_from(started.elapsed().as_micros())?.max(1);
-        let accepted_frames = metric_counter(&snapshot, "bifrost_scribe_frames_total", "accepted")
-            .max(measured_frames);
-        let accepted_rows =
-            metric_counter(&snapshot, "bifrost_scribe_rows_total", "accepted").max(admitted_rows);
-        cases.push(ScribeCaseReport {
-            case: case.clone(),
+        let drain_elapsed_us = u64::try_from(drain_started.elapsed().as_micros())?.max(1);
+        cases.push(sustained_case_report(SustainedCaseInput {
+            case: &case,
             topology,
+            tenant_progress,
+            snapshot: &snapshot,
             measured_frames,
-            admitted_rows: accepted_rows,
-            durable_rows,
+            admitted_rows,
             elapsed_us: elapsed,
-            admitted_frames_per_second: rate(accepted_frames, elapsed),
-            durable_frames_per_second: rate(durable_frames, elapsed),
-            rows_per_second: rate(durable_rows, elapsed),
-            mib_per_second: rate(durable_rows.saturating_mul(case.frame_size_bytes), elapsed)
-                / 1_048_576.0,
-            ack: histogram(&snapshot, "bifrost_scribe_ack_seconds", None, 1_000),
-            resolution: histogram(&snapshot, "bifrost_gate_resolution_seconds", None, 1_000),
-            ingress: histogram(
-                &snapshot,
-                "bifrost_scribe_lane_job_seconds",
-                Some("lane=\"ingress_cpu\""),
-                1_000,
-            ),
-            append: histogram(&snapshot, "bifrost_scribe_wal_append_seconds", None, 1_000),
-            sync: histogram(&snapshot, "bifrost_scribe_wal_sync_seconds", None, 1_000),
-            groups: metric_counter(&snapshot, "bifrost_scribe_writer_groups_total", "completed"),
-            frames_per_group: histogram(&snapshot, "bifrost_scribe_writer_group_frames", None, 1),
-            bytes_per_group: histogram(&snapshot, "bifrost_scribe_writer_group_bytes", None, 1),
-            fsync_calls: metric_counter(&snapshot, "bifrost_scribe_wal_fsync_total", "completed"),
-            fsync_per_frame: ratio(
-                metric_counter(&snapshot, "bifrost_scribe_wal_fsync_total", "completed"),
-                accepted_frames,
-            ),
-            accepted_durable_frame_gap: accepted_frames.saturating_sub(durable_frames),
-            accepted_durable_row_gap: accepted_rows.saturating_sub(durable_rows),
-            retained_items_current: metric_gauge(&snapshot, "bifrost_scribe_retained_items"),
-            retained_items_peak: metric_peak(&snapshot, "bifrost_scribe_retained_items"),
-            retained_bytes_current: metric_gauge(&snapshot, "bifrost_scribe_retained_bytes"),
-            retained_bytes_peak: metric_peak(&snapshot, "bifrost_scribe_retained_bytes"),
-            lane_queue_peaks: lane_peaks(&snapshot, "bifrost_scribe_lane_queued"),
-            lane_active_peaks: lane_peaks(&snapshot, "bifrost_scribe_lane_active"),
-            lane_failures: lane_counters(&snapshot, "failed"),
-            lane_panics: lane_counters(&snapshot, "panicked"),
-            writer_unhealthy_transitions: metric_counter(
-                &snapshot,
-                "bifrost_scribe_writer_unhealthy_total",
-                "",
-            ),
-            required_metrics_observed: metric_families(&snapshot).into_iter().collect(),
-            metric_series: snapshot.series,
-            metric_series_limit_exceeded: snapshot.series_limit_exceeded,
-            verification: ScribeCaseVerification {
-                passed: accepted_frames == durable_frames && accepted_rows == durable_rows,
-                drain_zero_gap: accepted_frames == durable_frames && accepted_rows == durable_rows,
-                replay_exact_identity: None,
-                retained_within_ceiling: metric_peak(&snapshot, "bifrost_scribe_retained_items")
-                    <= RETAINED_ITEM_LIMIT
-                    && metric_peak(&snapshot, "bifrost_scribe_retained_bytes")
-                        <= RETAINED_BYTE_LIMIT,
-                exact_429: None,
-                exact_507: None,
-            },
-        });
+            drain_elapsed_us,
+            retry_stats: &retry_stats,
+            workload_errors: scenario_errors,
+        }));
+        if scenario_errors > 0 {
+            run_errors = run_errors.saturating_add(scenario_errors);
+        }
         cluster.shutdown().await?;
     }
     let verification = ScribeCaseVerification {
@@ -217,13 +289,21 @@ async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkRe
         exact_507: None,
     };
     let complete = verification.passed
+        && run_errors == 0
         && verification.drain_zero_gap
         && verification.retained_within_ceiling
         && cases.iter().all(|case| {
             case.measured_frames >= case.case.minimum_samples && !case.metric_series_limit_exceeded
         });
+    let readiness = if complete {
+        "ready"
+    } else if cases.len() == scenarios.len() {
+        "not_ready"
+    } else {
+        "inconclusive"
+    };
     let machine = machine_metadata();
-    Ok(ScribeBenchmarkReport {
+    let mut report = ScribeBenchmarkReport {
         report_version: ScribeBenchmarkReport::VERSION.to_owned(),
         stage: "post-throughput".to_owned(),
         lane: "bench:bifrost:scribe:sustained".to_owned(),
@@ -233,7 +313,9 @@ async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkRe
             machine.git_sha, machine.dirty_worktree, machine.operating_system, machine.cpu_count
         ),
         configuration_fingerprint: format!(
-            "sustained;warmup_seconds={warmup};measured_seconds={measured};payload_bytes=65536"
+            "sustained;warmup_seconds={warmup};measured_seconds={measured};flush_seconds={};round_delay_ms={};payload_bytes=65536",
+            flush_every.as_secs(),
+            round_delay.as_millis(),
         ),
         configuration: benchmark_configuration(3, 100),
         components: Vec::new(),
@@ -247,15 +329,223 @@ async fn run_sustained(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkRe
             reason: "no valid pre-repair baseline exists".to_owned(),
             baseline_role: "initial_valid_post_repair".to_owned(),
         },
-        errors: 0,
+        errors: run_errors,
         complete,
-    })
+        readiness: readiness.to_owned(),
+    };
+    if let Err(errors) = report.validate() {
+        for error in &errors {
+            eprintln!("bifrost sustained report validation error: {error}");
+        }
+        report.errors = report.errors.saturating_add(u64::try_from(errors.len())?);
+        report.complete = false;
+        if errors.iter().any(|error| !error.contains("dirty worktree")) {
+            report.readiness = "not_ready".to_owned();
+        }
+    }
+    Ok(report)
 }
 
 fn sustained_seconds(name: &str, default: u64) -> Result<u64, BenchError> {
     Ok(std::env::var(name)
         .unwrap_or_else(|_| default.to_string())
         .parse::<u64>()?)
+}
+
+fn sustained_millis(name: &str, default: u64) -> Result<u64, BenchError> {
+    Ok(std::env::var(name)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<u64>()?)
+}
+
+fn tenant_distribution_from_samples(mut samples: Vec<u64>) -> ScribeDistribution {
+    if samples.is_empty() {
+        return ScribeDistribution::default();
+    }
+    samples.sort_unstable();
+    let nearest = |numerator: usize, denominator: usize| {
+        let rank = samples
+            .len()
+            .saturating_mul(numerator)
+            .div_ceil(denominator)
+            .saturating_sub(1);
+        samples[rank.min(samples.len().saturating_sub(1))]
+    };
+    ScribeDistribution {
+        count: u64::try_from(samples.len()).unwrap_or(u64::MAX),
+        p50: nearest(1, 2),
+        p95: nearest(19, 20),
+        p99: (samples.len() >= 100).then(|| nearest(99, 100)),
+        max: *samples.last().unwrap_or(&0),
+    }
+}
+
+fn tenant_reports(
+    progress: BTreeMap<String, TenantRunProgress>,
+    durable_confirmed: bool,
+) -> (Vec<ScribeTenantReport>, f64) {
+    let mut reports = Vec::with_capacity(progress.len());
+    let mut p95s = Vec::with_capacity(progress.len());
+    for (tenant, progress) in progress {
+        let ack = tenant_distribution_from_samples(progress.ack_samples);
+        if ack.count > 0 {
+            p95s.push(ack.p95);
+        }
+        reports.push(ScribeTenantReport {
+            tenant,
+            accepted_frames: progress.accepted_frames,
+            accepted_rows: progress.accepted_rows,
+            durable_frames: if durable_confirmed {
+                progress.accepted_frames
+            } else {
+                0
+            },
+            durable_rows: if durable_confirmed {
+                progress.accepted_rows
+            } else {
+                0
+            },
+            ack,
+        });
+    }
+    p95s.sort_unstable();
+    let median = p95s
+        .get(p95s.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
+    let max = p95s.iter().copied().max().unwrap_or(0);
+    let ratio = if median == 0 {
+        0.0
+    } else {
+        max as f64 / median as f64
+    };
+    (reports, ratio)
+}
+
+fn merge_tenant_progress(
+    aggregate: &mut BTreeMap<String, TenantRunProgress>,
+    batch: BTreeMap<String, TenantRunProgress>,
+) {
+    for (tenant, progress) in batch {
+        aggregate.entry(tenant).or_default().merge(progress);
+    }
+}
+
+struct SustainedCaseInput<'a> {
+    case: &'a ScribeCompactCase,
+    topology: ScribeTopologyEvidence,
+    tenant_progress: BTreeMap<String, TenantRunProgress>,
+    snapshot: &'a BenchmarkMetricSnapshot,
+    measured_frames: u64,
+    admitted_rows: u64,
+    elapsed_us: u64,
+    drain_elapsed_us: u64,
+    retry_stats: &'a BusyRetryStats,
+    workload_errors: u64,
+}
+
+fn sustained_case_report(input: SustainedCaseInput<'_>) -> ScribeCaseReport {
+    let SustainedCaseInput {
+        case,
+        topology,
+        tenant_progress,
+        snapshot,
+        measured_frames,
+        admitted_rows,
+        elapsed_us,
+        drain_elapsed_us,
+        retry_stats,
+        workload_errors,
+    } = input;
+    let durable_frames = metric_counter(snapshot, "bifrost_scribe_frames_total", "fsynced");
+    let durable_rows = metric_counter(snapshot, "bifrost_scribe_rows_total", "fsynced");
+    let admitted_frames =
+        metric_counter(snapshot, "bifrost_scribe_frames_total", "accepted").max(measured_frames);
+    let admitted_rows = admitted_rows.max(metric_counter(
+        snapshot,
+        "bifrost_scribe_rows_total",
+        "accepted",
+    ));
+    let drain_zero_gap = admitted_frames == durable_frames && admitted_rows == durable_rows;
+    let retained_items_peak = metric_peak(snapshot, "bifrost_scribe_retained_items");
+    let retained_bytes_peak = metric_peak(snapshot, "bifrost_scribe_retained_bytes");
+    let retained_within_ceiling =
+        retained_items_peak <= RETAINED_ITEM_LIMIT && retained_bytes_peak <= RETAINED_BYTE_LIMIT;
+    let (busy_rejections, busy_retries, transport_unavailable) = retry_stats.snapshot();
+    let (tenants, tenant_p95_max_median_ratio) = tenant_reports(tenant_progress, drain_zero_gap);
+    let tenants_progressed = tenants.len() == usize::try_from(case.tenants).unwrap_or(0)
+        && tenants.iter().all(|tenant| tenant.accepted_frames > 0);
+    let unhealthy_writers = metric_counter(snapshot, "bifrost_scribe_writer_unhealthy_total", "");
+    let (passed, drain_zero_gap) = (
+        workload_errors == 0
+            && drain_zero_gap
+            && tenants_progressed
+            && unhealthy_writers == 0
+            && retained_within_ceiling,
+        drain_zero_gap,
+    );
+    ScribeCaseReport {
+        case: case.clone(),
+        topology,
+        tenants,
+        measured_frames,
+        admitted_rows,
+        durable_rows,
+        elapsed_us,
+        admitted_frames_per_second: rate(admitted_frames, elapsed_us),
+        durable_frames_per_second: rate(durable_frames, elapsed_us),
+        rows_per_second: rate(durable_rows, elapsed_us),
+        mib_per_second: rate(
+            durable_rows.saturating_mul(case.frame_size_bytes),
+            elapsed_us,
+        ) / 1_048_576.0,
+        ingest_busy_rejections: busy_rejections,
+        ingest_busy_retries: busy_retries,
+        ingest_transport_unavailable: transport_unavailable,
+        tenant_p95_max_median_ratio,
+        ack: histogram(snapshot, "bifrost_scribe_ack_seconds", None, 1_000),
+        resolution: histogram(snapshot, "bifrost_gate_resolution_seconds", None, 1_000),
+        ingress: histogram(
+            snapshot,
+            "bifrost_scribe_lane_job_seconds",
+            Some("lane=\"ingress_cpu\""),
+            1_000,
+        ),
+        append: histogram(snapshot, "bifrost_scribe_wal_append_seconds", None, 1_000),
+        sync: histogram(snapshot, "bifrost_scribe_wal_sync_seconds", None, 1_000),
+        groups: metric_counter(snapshot, "bifrost_scribe_writer_groups_total", "completed"),
+        frames_per_group: histogram(snapshot, "bifrost_scribe_writer_group_frames", None, 1),
+        bytes_per_group: histogram(snapshot, "bifrost_scribe_writer_group_bytes", None, 1),
+        fsync_calls: metric_counter(snapshot, "bifrost_scribe_wal_fsync_total", "completed"),
+        fsync_per_frame: ratio(
+            metric_counter(snapshot, "bifrost_scribe_wal_fsync_total", "completed"),
+            admitted_frames,
+        ),
+        accepted_durable_frame_gap: admitted_frames.saturating_sub(durable_frames),
+        accepted_durable_row_gap: admitted_rows.saturating_sub(durable_rows),
+        retained_items_current: metric_gauge(snapshot, "bifrost_scribe_retained_items"),
+        retained_items_peak,
+        retained_bytes_current: metric_gauge(snapshot, "bifrost_scribe_retained_bytes"),
+        retained_bytes_peak,
+        writer_queue_peak: metric_peak(snapshot, "bifrost_scribe_writer_queue_depth"),
+        drain_elapsed_us,
+        lane_queue_peaks: lane_peaks(snapshot, "bifrost_scribe_lane_queued"),
+        lane_active_peaks: lane_peaks(snapshot, "bifrost_scribe_lane_active"),
+        lane_failures: lane_counters(snapshot, "failed"),
+        lane_panics: lane_counters(snapshot, "panicked"),
+        writer_unhealthy_transitions: unhealthy_writers,
+        required_metrics_observed: metric_families(snapshot).into_iter().collect(),
+        metric_series: snapshot.series,
+        metric_series_limit_exceeded: snapshot.series_limit_exceeded,
+        verification: ScribeCaseVerification {
+            passed,
+            drain_zero_gap,
+            replay_exact_identity: None,
+            retained_within_ceiling,
+            exact_429: None,
+            exact_507: None,
+        },
+    }
 }
 
 async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, BenchError> {
@@ -432,6 +722,11 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
         },
         errors: u64::try_from(missing.len())?.saturating_add(run_errors),
         complete: complete && run_errors == 0,
+        readiness: if complete && run_errors == 0 {
+            "ready".to_owned()
+        } else {
+            "not_ready".to_owned()
+        },
     };
     if let Err(errors) = report.validate() {
         for error in &errors {
@@ -439,6 +734,7 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
         }
         report.errors = report.errors.saturating_add(u64::try_from(errors.len())?);
         report.complete = false;
+        report.readiness = "not_ready".to_owned();
     }
     Ok(report)
 }
@@ -1003,12 +1299,22 @@ async fn run_case(
     case: &ScribeCompactCase,
 ) -> Result<ScribeCaseReport, BenchError> {
     let payload = Bytes::from(ipc(case.frame_size_bytes as usize)?);
+    let retry_stats = Arc::new(BusyRetryStats::default());
+    let mut tenant_progress = BTreeMap::new();
     let warmup_frames = if case.frame_size_bytes >= 8 * 1024 * 1024 {
         0
     } else {
         u64::from(case.writers).min(8)
     };
-    let _ = send_frames(workloads, case, payload.clone(), warmup_frames).await?;
+    let warmup = send_frames(
+        workloads,
+        case,
+        payload.clone(),
+        warmup_frames,
+        &retry_stats,
+    )
+    .await?;
+    merge_tenant_progress(&mut tenant_progress, warmup.tenants);
     flush_workloads(cluster, workloads).await?;
     recorder.reset_interval();
     let started = Instant::now();
@@ -1024,11 +1330,11 @@ async fn run_case(
     while measured_frames < case.minimum_samples {
         let remaining = case.minimum_samples - measured_frames;
         let chunk = remaining.min(chunk_frames);
-        let (sent, observed_topology) =
-            send_frames(workloads, case, payload.clone(), chunk).await?;
-        topology = observed_topology;
-        admitted_rows = admitted_rows.saturating_add(sent);
-        measured_frames = measured_frames.saturating_add(sent);
+        let sent = send_frames(workloads, case, payload.clone(), chunk, &retry_stats).await?;
+        topology = sent.topology;
+        admitted_rows = admitted_rows.saturating_add(sent.rows);
+        measured_frames = measured_frames.saturating_add(sent.frames);
+        merge_tenant_progress(&mut tenant_progress, sent.tenants);
         let before_flush = recorder.snapshot();
         let expected_frames =
             metric_counter(&before_flush, "bifrost_scribe_frames_total", "accepted");
@@ -1053,6 +1359,11 @@ async fn run_case(
         "bifrost_scribe_rows_total",
         "accepted",
     ));
+    let (busy_rejections, busy_retries, transport_unavailable) = retry_stats.snapshot();
+    let (tenants, tenant_p95_max_median_ratio) = tenant_reports(
+        tenant_progress,
+        durable_frames == admitted_frames && durable_rows == admitted_rows,
+    );
     let observed = metric_families(&snapshot);
     let verification = ScribeCaseVerification {
         passed: durable_frames == admitted_frames
@@ -1069,6 +1380,7 @@ async fn run_case(
     Ok(ScribeCaseReport {
         case: case.clone(),
         topology,
+        tenants,
         measured_frames,
         admitted_rows,
         durable_rows,
@@ -1080,6 +1392,10 @@ async fn run_case(
             durable_rows.saturating_mul(case.frame_size_bytes),
             elapsed_us,
         ) / 1_048_576.0,
+        ingest_busy_rejections: busy_rejections,
+        ingest_busy_retries: busy_retries,
+        ingest_transport_unavailable: transport_unavailable,
+        tenant_p95_max_median_ratio,
         ack: histogram(&snapshot, "bifrost_scribe_ack_seconds", None, 1_000),
         resolution: histogram(&snapshot, "bifrost_gate_resolution_seconds", None, 1_000),
         ingress: histogram(
@@ -1101,6 +1417,8 @@ async fn run_case(
         retained_items_peak,
         retained_bytes_current: retained_bytes,
         retained_bytes_peak,
+        writer_queue_peak: metric_peak(&snapshot, "bifrost_scribe_writer_queue_depth"),
+        drain_elapsed_us: 0,
         lane_queue_peaks: lane_peaks(&snapshot, "bifrost_scribe_lane_queued"),
         lane_active_peaks: lane_peaks(&snapshot, "bifrost_scribe_lane_active"),
         lane_failures: lane_counters(&snapshot, "failed"),
@@ -1280,7 +1598,8 @@ async fn send_frames(
     case: &ScribeCompactCase,
     payload: Bytes,
     minimum_frames: u64,
-) -> Result<(u64, ScribeTopologyEvidence), BenchError> {
+    retry_stats: &Arc<BusyRetryStats>,
+) -> Result<SendFramesResult, BenchError> {
     let writers = usize::try_from(case.writers)?;
     if writers == 0 || workloads.is_empty() {
         return Err("benchmark case has no writers or workloads".into());
@@ -1320,8 +1639,11 @@ async fn send_frames(
             })
             .collect::<Vec<_>>();
         let stream_slots = Arc::clone(&stream_slots);
+        let retry_stats = Arc::clone(retry_stats);
+        let tenant_id = workload.tenant.to_string();
         tasks.push(tokio::spawn(async move {
             let mut rows = 0_u64;
+            let mut progress = TenantRunProgress::default();
             for frame in frames {
                 let _slot = stream_slots.acquire().await.map_err(|_| {
                     wyrd_spec::error::WyrdError::Internal {
@@ -1329,15 +1651,44 @@ async fn send_frames(
                         details: serde_json::json!({}),
                     }
                 })?;
-                let accepted = insert_stream_with_busy_retry(&transport, vec![frame]).await?;
-                rows = rows.saturating_add(accepted.into_iter().sum::<u64>());
+                let started = Instant::now();
+                let accepted =
+                    insert_stream_with_busy_retry(&transport, vec![frame], &retry_stats).await?;
+                let accepted_rows = accepted.into_iter().sum::<u64>();
+                rows = rows.saturating_add(accepted_rows);
+                progress.accepted_frames = progress.accepted_frames.saturating_add(1);
+                progress.accepted_rows = progress.accepted_rows.saturating_add(accepted_rows);
+                progress.ack_samples.push(elapsed_us(started));
             }
-            Ok::<u64, wyrd_spec::error::WyrdError>(rows)
+            Ok::<(u64, String, TenantRunProgress), wyrd_spec::error::WyrdError>((
+                rows, tenant_id, progress,
+            ))
         }));
     }
     let mut rows = 0_u64;
+    let mut frames_sent = 0_u64;
+    let mut tenants = BTreeMap::new();
+    let mut first_error = None;
     for task in tasks {
-        rows = rows.saturating_add(task.await??);
+        match task.await {
+            Ok(Ok((task_rows, tenant, progress))) => {
+                rows = rows.saturating_add(task_rows);
+                frames_sent = frames_sent.saturating_add(progress.accepted_frames);
+                tenants
+                    .entry(tenant)
+                    .or_insert_with(TenantRunProgress::default)
+                    .merge(progress);
+            }
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error.into());
     }
     let topology = ScribeTopologyEvidence {
         requested_writers: case.writers,
@@ -1354,28 +1705,48 @@ async fn send_frames(
         writers_by_tenant,
         writers_by_table,
     };
-    Ok((rows, topology))
+    Ok(SendFramesResult {
+        frames: frames_sent,
+        rows,
+        topology,
+        tenants,
+    })
 }
 
 async fn insert_stream_with_busy_retry(
     transport: &BifrostGrpcTransport,
     frames: Vec<BifrostFrame>,
+    retry_stats: &BusyRetryStats,
 ) -> Result<Vec<u64>, wyrd_spec::error::WyrdError> {
-    const RETRIES: u32 = 8;
-    for attempt in 0..=RETRIES {
+    let deadline = Instant::now() + BUSY_RETRY_BUDGET;
+    let mut attempt = 0_u32;
+    loop {
         match transport.insert_batch_stream(frames.clone()).await {
             Ok(accepted) => return Ok(accepted),
-            Err(error) if is_ingest_busy(&error) && attempt < RETRIES => {
-                let backoff_ms = 10_u64.saturating_mul(1_u64 << attempt.min(6)).min(640);
-                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            Err(error) if is_ingest_busy(&error) || is_ingest_transport_unavailable(&error) => {
+                if is_ingest_busy(&error) {
+                    retry_stats.rejections.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    retry_stats
+                        .transport_unavailable
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                let backoff = BUSY_RETRY_INITIAL
+                    .checked_mul(2_u32.saturating_pow(attempt.min(8)))
+                    .unwrap_or(BUSY_RETRY_MAX)
+                    .min(BUSY_RETRY_MAX)
+                    .min(remaining);
+                retry_stats.retries.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
             }
             Err(error) => return Err(error),
         }
     }
-    Err(wyrd_spec::error::WyrdError::Internal {
-        message: "bounded busy retry loop exhausted without an outcome".to_owned(),
-        details: serde_json::json!({}),
-    })
 }
 
 fn is_ingest_busy(error: &wyrd_spec::error::WyrdError) -> bool {
@@ -1386,6 +1757,17 @@ fn is_ingest_busy(error: &wyrd_spec::error::WyrdError) -> bool {
                 .get("original_code")
                 .and_then(serde_json::Value::as_str)
                 == Some("WYRD_VALA_429_INGEST_BUSY")
+    )
+}
+
+fn is_ingest_transport_unavailable(error: &wyrd_spec::error::WyrdError) -> bool {
+    matches!(
+        error,
+        wyrd_spec::error::WyrdError::UpstreamFailure { details, .. }
+            if details
+                .get("original_code")
+                .and_then(serde_json::Value::as_str)
+                == Some("WYRD_SERVER_503_SERVICE_UNAVAILABLE")
     )
 }
 

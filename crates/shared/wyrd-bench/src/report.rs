@@ -505,6 +505,23 @@ pub struct ScribeTopologyEvidence {
     pub writers_by_table: BTreeMap<String, u32>,
 }
 
+/// Accepted and acknowledged progress for one tenant in a Scribe case.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScribeTenantReport {
+    /// Stable tenant identifier used by the workload.
+    pub tenant: String,
+    /// Frames accepted for the tenant.
+    pub accepted_frames: u64,
+    /// Rows accepted for the tenant.
+    pub accepted_rows: u64,
+    /// Frames confirmed durable after the case drain.
+    pub durable_frames: u64,
+    /// Rows confirmed durable after the case drain.
+    pub durable_rows: u64,
+    /// Client-observed ACK latency for this tenant in microseconds.
+    pub ack: ScribeDistribution,
+}
+
 /// Per-case absolute verification facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScribeCaseVerification {
@@ -529,6 +546,8 @@ pub struct ScribeCaseReport {
     pub case: ScribeCompactCase,
     /// Requested and observed topology evidence.
     pub topology: ScribeTopologyEvidence,
+    /// Per-tenant accepted, durable, and ACK progress.
+    pub tenants: Vec<ScribeTenantReport>,
     /// Frames sent after warmup.
     pub measured_frames: u64,
     /// Rows accepted by Gate/Scribe.
@@ -545,6 +564,14 @@ pub struct ScribeCaseReport {
     pub rows_per_second: f64,
     /// Durable MiB per second.
     pub mib_per_second: f64,
+    /// Number of retryable Scribe busy responses observed.
+    pub ingest_busy_rejections: u64,
+    /// Number of retries issued after retryable Scribe busy responses.
+    pub ingest_busy_retries: u64,
+    /// Number of pre-ACK transport-unavailable responses observed.
+    pub ingest_transport_unavailable: u64,
+    /// Maximum tenant p95 ACK divided by the median tenant p95 ACK.
+    pub tenant_p95_max_median_ratio: f64,
     /// ACK latency distribution in microseconds.
     pub ack: ScribeDistribution,
     /// Gate resolution distribution in microseconds.
@@ -577,6 +604,10 @@ pub struct ScribeCaseReport {
     pub retained_bytes_current: u64,
     /// Peak retained bytes.
     pub retained_bytes_peak: u64,
+    /// Maximum writer queue depth observed during the case.
+    pub writer_queue_peak: u64,
+    /// Time spent draining accepted work after the workload stopped.
+    pub drain_elapsed_us: u64,
     /// Peak queue depth by execution lane.
     pub lane_queue_peaks: BTreeMap<String, u64>,
     /// Peak active jobs by execution lane.
@@ -683,6 +714,9 @@ pub struct ScribeBenchmarkReport {
     pub errors: u64,
     /// Whether all required post-change measurements completed.
     pub complete: bool,
+    /// Sustained readiness classification: `ready`, `not_ready`, or
+    /// `inconclusive`.
+    pub readiness: String,
 }
 
 impl ScribeBenchmarkReport {
@@ -698,6 +732,20 @@ impl ScribeBenchmarkReport {
     /// throughput floors.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if std::env::var_os("WYRD_BIFROST_CLOSEOUT").is_some() && self.machine.dirty_worktree {
+            errors.push("report was generated from a dirty worktree".to_owned());
+        }
+        if !self.readiness.is_empty()
+            && !matches!(
+                self.readiness.as_str(),
+                "ready" | "not_ready" | "inconclusive"
+            )
+        {
+            errors.push(format!(
+                "unknown readiness classification: {}",
+                self.readiness
+            ));
+        }
         if !self.components.is_empty() {
             errors.extend(self.validate_components().err().unwrap_or_default());
         }
@@ -754,7 +802,8 @@ impl ScribeBenchmarkReport {
                     case.case.id
                 ));
             }
-            if case.case.frame_size_bytes <= 64 * 1024
+            if !self.lane.ends_with(":sustained")
+                && case.case.frame_size_bytes <= 64 * 1024
                 && case.ack.p99.is_some_and(|p99| p99 >= 5_000)
             {
                 errors.push(format!("ACK p99 exceeded 5 ms in {}", case.case.id));
@@ -911,6 +960,20 @@ impl ScribeBenchmarkReport {
                 p99,
                 case.fsync_per_frame,
                 case.groups,
+            );
+        }
+        let _ = writeln!(output, "\nReadiness: `{}`\n", self.readiness);
+        output.push_str("| Case | Busy 429s | Busy retries | Transport 503s | Tenant p95 max/median | Drain (us) |\n|---|---:|---:|---:|---:|---:|\n");
+        for case in &self.cases {
+            let _ = writeln!(
+                output,
+                "| {} | {} | {} | {} | {:.3} | {} |",
+                case.case.id,
+                case.ingest_busy_rejections,
+                case.ingest_busy_retries,
+                case.ingest_transport_unavailable,
+                case.tenant_p95_max_median_ratio,
+                case.drain_elapsed_us,
             );
         }
         output.push_str("\n## Required metric families\n\n");

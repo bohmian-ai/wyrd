@@ -1,10 +1,7 @@
 //! Bounded Card lifecycle reconciliation worker.
 
-use std::time::Duration;
-
 use chrono::{Duration as ChronoDuration, Utc};
 use metrics::counter;
-use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_sql::OperatorPool;
@@ -17,30 +14,6 @@ use crate::state::AppState;
 
 const CLAIM_LIMIT: i64 = 32;
 const LEASE_SECONDS: i64 = 30;
-const TICK: Duration = Duration::from_secs(1);
-
-/// Spawn the bounded Card lifecycle reconciler when the audited operator pool exists.
-pub(crate) fn spawn_reconciler(
-    state: &AppState,
-    shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let operator = state.postgres.operator_pool()?;
-    let state = state.clone();
-    Some(tokio::spawn(async move {
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Err(error) = run_once(&state, &operator).await {
-                tracing::error!(code = error.code(), "card reconciliation tick failed");
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(TICK) => {}
-            }
-        }
-    }))
-}
 
 /// Run one claim-and-reconcile pass.
 pub(crate) async fn run_once(state: &AppState, operator: &OperatorPool) -> Result<(), WyrdError> {

@@ -43,8 +43,9 @@ pub struct CardReconcileClaim {
 
 /// Claim due Card lifecycle work through the audited cross-tenant operator pool.
 ///
-/// The claim transaction only stamps the lease and attempt number. Callers must
-/// commit it before performing storage IO or waiting for a retry delay.
+/// The single claim statement only stamps the lease and attempt number; its
+/// statement transaction commits before storage IO or retry delays begin.
+// tenant-isolation: cross-tenant OperatorPool
 pub async fn claim_card_reconciliation(
     operator: &OperatorPool,
     now: DateTime<Utc>,
@@ -52,10 +53,6 @@ pub async fn claim_card_reconciliation(
     limit: i64,
 ) -> Result<Vec<CardReconcileClaim>, WyrdError> {
     let lease_owner = Uuid::now_v7();
-    let mut tx = operator.pool().begin().await.map_err(|error| {
-        tracing::error!(%error, "card reconciliation claim transaction failed");
-        WyrdError::registry_unavailable("card registry unavailable")
-    })?;
     let rows = sqlx::query_as::<_, CardReconcileClaim>(
         r#"WITH candidates AS (
                 SELECT card_uid, data_tenant_id
@@ -101,14 +98,10 @@ pub async fn claim_card_reconciliation(
     .bind(limit)
     .bind(MAX_RECONCILE_ATTEMPTS)
     .bind(lease_expires_at)
-    .fetch_all(&mut *tx)
+    .fetch_all(operator.pool())
     .await
     .map_err(|error| {
         tracing::error!(%error, "card reconciliation claim failed");
-        WyrdError::registry_unavailable("card registry unavailable")
-    })?;
-    tx.commit().await.map_err(|error| {
-        tracing::error!(%error, "card reconciliation claim commit failed");
         WyrdError::registry_unavailable("card registry unavailable")
     })?;
     Ok(rows)

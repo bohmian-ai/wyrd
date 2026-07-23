@@ -17,8 +17,8 @@ use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{
     ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
-    spawn_audit_seal_worker, spawn_card_reconciler, spawn_genai_derivation_worker,
-    spawn_maintenance_scheduler, spawn_storage_sweeper,
+    spawn_audit_seal_worker, spawn_genai_derivation_worker, spawn_maintenance_scheduler,
+    spawn_reconciler, spawn_storage_sweeper,
 };
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
@@ -342,7 +342,7 @@ impl BoundServer {
                 }
             }));
         }
-        if let Some(handle) = spawn_card_reconciler(&self.state, shutdown.clone()) {
+        if let Some(handle) = spawn_reconciler(&self.state, shutdown.clone()) {
             set.spawn(worker_task(TaskId::Worker("card_reconciler"), async move {
                 if let Err(join_error) = handle.await
                     && join_error.is_panic()

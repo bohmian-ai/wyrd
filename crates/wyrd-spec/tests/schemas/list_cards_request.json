@@ -13,6 +13,7 @@
     },
     "filter": {
       "description": "Optional metadata query encoded as its canonical query-language string.",
+      "default": null,
       "anyOf": [
         {
           "$ref": "#/definitions/MetadataQuery"

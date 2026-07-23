@@ -239,14 +239,21 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
 
     let operator = OperatorPool::from(fixture.platform_admin_pool().clone());
     let first_now = Utc::now() + Duration::seconds(1);
-    let first =
-        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
-            .await
-            .expect("first claim succeeds");
+    let (left, right) = tokio::join!(
+        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32),
+        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32),
+    );
+    let left = left.expect("left concurrent claim succeeds");
+    let right = right.expect("right concurrent claim succeeds");
+    assert_eq!(
+        left.len() + right.len(),
+        1,
+        "one concurrent worker wins the claim"
+    );
+    let first = if left.is_empty() { right } else { left };
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
     assert_eq!(first[0].reconcile_attempts, 1);
-    let mut owner = first[0].reconcile_lease_owner;
 
     let immediate =
         claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
@@ -254,39 +261,46 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
             .expect("second claim succeeds");
     assert!(immediate.is_empty(), "live lease must exclude the Card");
 
-    for (attempt, now) in [
-        (1, first_now + Duration::seconds(31)),
-        (2, first_now + Duration::seconds(36)),
-    ] {
-        let mut conn = fixture
-            .tenant_conn()
-            .await
-            .expect("tenant connection opens");
-        let dead = record_card_reconciliation_failure(
-            &mut conn,
-            &card_uid,
-            owner,
-            now + Duration::seconds(1),
-            "WYRD_STORAGE_500_BACKEND",
-            "Card blob persistence failed; retry the storage transition",
-        )
-        .await
-        .expect("failure records");
-        assert!(!dead);
-        conn.commit().await.expect("failure commits");
+    let crash_recovered = claim_card_reconciliation(
+        &operator,
+        first_now + Duration::seconds(31),
+        first_now + Duration::seconds(61),
+        32,
+    )
+    .await
+    .expect("expired lease is recoverable");
+    assert_eq!(crash_recovered.len(), 1);
+    assert_eq!(crash_recovered[0].reconcile_attempts, 2);
+    let owner = crash_recovered[0].reconcile_lease_owner;
 
-        let claim = claim_card_reconciliation(
-            &operator,
-            now + Duration::seconds(2),
-            now + Duration::seconds(32),
-            32,
-        )
+    let mut conn = fixture
+        .tenant_conn()
         .await
-        .expect("retry claim succeeds");
-        assert_eq!(claim.len(), 1);
-        assert_eq!(claim[0].reconcile_attempts, attempt + 1);
-        owner = claim[0].reconcile_lease_owner;
-    }
+        .expect("tenant connection opens");
+    let dead = record_card_reconciliation_failure(
+        &mut conn,
+        &card_uid,
+        owner,
+        first_now + Duration::seconds(35),
+        "WYRD_STORAGE_500_BACKEND",
+        "Card blob persistence failed; retry the storage transition",
+    )
+    .await
+    .expect("second failure records");
+    assert!(!dead);
+    conn.commit().await.expect("failure commits");
+
+    let third = claim_card_reconciliation(
+        &operator,
+        first_now + Duration::seconds(36),
+        first_now + Duration::seconds(66),
+        32,
+    )
+    .await
+    .expect("third claim succeeds");
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].reconcile_attempts, 3);
+    let owner = third[0].reconcile_lease_owner;
 
     let mut conn = fixture
         .tenant_conn()

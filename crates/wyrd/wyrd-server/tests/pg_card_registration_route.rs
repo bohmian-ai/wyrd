@@ -10,6 +10,7 @@ use base64::Engine;
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use sha2::Digest;
+use tokio::time::sleep;
 use url::Url;
 use uuid::Uuid;
 use wyrd_client::WyrdClient;
@@ -88,6 +89,61 @@ async fn response_json(response: axum::http::Response<Body>) -> Value {
         .await
         .expect("response body reads");
     serde_json::from_slice(&bytes).expect("response body is JSON")
+}
+
+/// Read the durable reconciliation status for one Card.
+async fn reconciliation_state(server: &WyrdTestServer, card_uid: &CardUid) -> (String, i32) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let state = sqlx::query_as::<_, (String, i32)>(
+        "SELECT reconcile_status, reconcile_attempts FROM wyrd.cards WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("reconciliation state reads");
+    conn.commit().await.expect("reconciliation read commits");
+    state
+}
+
+/// Wait for one worker attempt to finish with the expected durable status.
+async fn wait_for_reconciliation_state(
+    server: &WyrdTestServer,
+    card_uid: &CardUid,
+    expected_attempts: i32,
+    expected_status: &str,
+) {
+    for _ in 0..100 {
+        let (status, attempts) = reconciliation_state(server, card_uid).await;
+        if status == expected_status && attempts == expected_attempts {
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let (status, attempts) = reconciliation_state(server, card_uid).await;
+    panic!(
+        "reconciliation did not reach status={expected_status:?}, attempts={expected_attempts}; \
+         got status={status:?}, attempts={attempts}"
+    );
+}
+
+/// Make a pending reconciliation claim immediately eligible for the next pass.
+async fn make_reconciliation_due(server: &WyrdTestServer, card_uid: &CardUid) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    sqlx::query(
+        "UPDATE wyrd.cards SET reconcile_next_attempt_at = now() - interval '1 second' \
+         WHERE card_uid = $1 AND reconcile_status = 'pending'",
+    )
+    .bind(card_uid.as_uuid())
+    .execute(&mut **conn.transaction())
+    .await
+    .expect("reconciliation becomes due");
+    conn.commit().await.expect("reconciliation update commits");
 }
 
 /// Build an authenticated registration request from a JSON payload and key.
@@ -1109,6 +1165,173 @@ async fn heavy_registration_initializes_upload_after_commit() {
     assert_eq!(replay_body["outcomes"][0]["status"], "active");
     assert_eq!(replay_body["outcomes"][0]["outcome"], "idempotent_noop");
 
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// The production reconciler retries a missing artifact and activates the Card
+/// after the object becomes available.
+#[tokio::test(flavor = "current_thread")]
+async fn card_reconciler_recovers_after_storage_retry() {
+    if !enabled() {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-reconciler-recovery", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let response = server
+        .oneshot_authenticated(&jwt, heavy_registration_request("reconcile-recovery-001"))
+        .await
+        .expect("heavy registration responds");
+    let body = response_json(response).await;
+    let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("response contains card UID");
+    let upload_url = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
+        .as_str()
+        .expect("local upload plan contains a URL");
+
+    wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
+
+    let upload_path =
+        Url::parse(upload_url).map_or_else(|_| upload_url.to_owned(), |url| url.path().to_owned());
+    let upload = Request::builder()
+        .method(Method::PUT)
+        .uri(upload_path)
+        .body(Body::from("a"))
+        .expect("local upload request builds");
+    assert_eq!(
+        server
+            .oneshot_authenticated(&jwt, upload)
+            .await
+            .expect("local upload responds")
+            .status(),
+        StatusCode::OK
+    );
+    make_reconciliation_due(&server, &card_uid).await;
+
+    for _ in 0..100 {
+        let mut conn = server
+            .tenant_conn_for(server.data_tenant_id())
+            .await
+            .expect("tenant connection opens");
+        let state: (String, String, i32) = sqlx::query_as(
+            "SELECT status, reconcile_status, reconcile_attempts \
+               FROM wyrd.cards WHERE card_uid = $1",
+        )
+        .bind(card_uid.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("card state reads");
+        conn.commit().await.expect("card state read commits");
+        if state == ("active".to_owned(), "idle".to_owned(), 0) {
+            server.shutdown().await.expect("test server shuts down");
+            return;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    panic!("reconciler did not recover the Card after the object upload");
+}
+
+/// The production reconciler dead-letters exactly the third failed attempt and
+/// writes the dead-letter audit event in the same durable state transition.
+#[tokio::test(flavor = "current_thread")]
+async fn card_reconciler_dead_letters_after_three_failures() {
+    if !enabled() {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-reconciler-dead-letter", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let response = server
+        .oneshot_authenticated(
+            &jwt,
+            heavy_registration_request("reconcile-dead-letter-001"),
+        )
+        .await
+        .expect("heavy registration responds");
+    let body = response_json(response).await;
+    let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("response contains card UID");
+
+    wait_for_reconciliation_state(&server, &card_uid, 1, "pending").await;
+    make_reconciliation_due(&server, &card_uid).await;
+    wait_for_reconciliation_state(&server, &card_uid, 2, "pending").await;
+    make_reconciliation_due(&server, &card_uid).await;
+    wait_for_reconciliation_state(&server, &card_uid, 3, "dead_lettered").await;
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let metadata: (String, String, Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT reconcile_status, reconcile_kind, reconcile_last_error_code, \
+                reconcile_last_error_message, \
+                (SELECT count(*) FROM vala.audit_outbox \
+                  WHERE operation = 'card.reconciliation.dead_letter' \
+                    AND resource = $2) \
+           FROM wyrd.cards WHERE card_uid = $1",
+    )
+    .bind(card_uid.as_uuid())
+    .bind(format!("card:{card_uid}"))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("dead-letter metadata reads");
+    assert_eq!(metadata.0, "dead_lettered");
+    assert_eq!(metadata.1, "registration");
+    assert!(
+        metadata.2.is_some(),
+        "dead letter stores the stable error code"
+    );
+    assert!(
+        metadata.3.is_some(),
+        "dead letter stores the inspectable error message"
+    );
+    assert_eq!(metadata.4, 1, "dead letter audit is appended once");
+    conn.commit().await.expect("dead-letter read commits");
+
+    sleep(Duration::from_millis(1_200)).await;
+    let (status, attempts) = reconciliation_state(&server, &card_uid).await;
+    assert_eq!(status, "dead_lettered");
+    assert_eq!(attempts, 3, "dead-lettered Card receives no fourth attempt");
     server.shutdown().await.expect("test server shuts down");
 }
 

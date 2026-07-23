@@ -16,7 +16,7 @@ use wyrd_spec::graph::{
 };
 use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
-use wyrd_spec::reference::{CardRef, CardRefIdentity};
+use wyrd_spec::reference::{CardRef, CardRefIdentity, scope_child_card_refs};
 use wyrd_spec::registry::{
     CardLifecycleStatus, CardRegistrationOutcome, CardSubmission, CardUploadEntry, CardUploadPlan,
     CreateCardRequest, CreateCardResponse, RegistrationOperationId, RegistrationOutcomeKind,
@@ -33,8 +33,9 @@ use wyrd_sql::queries::cards::{
     get_card_by_uid, insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
     lock_version_line, lookup_existing_operation, lookup_expired_operation,
     manifest_completion_rows, manifest_rows_for_init, mark_manifest_upload_initialized,
-    mark_manifest_verified, record_blob_failure, record_card_blob, registration_request_hash,
-    resolve_version, upsert_service_account_from_card,
+    mark_manifest_verified, persist_outbound_relationships, recheck_active_card_refs,
+    record_blob_failure, record_card_blob, registration_request_hash, resolve_version,
+    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::multipart_uploads;
 use wyrd_sql::row_types::cards::ParsedCardRow;
@@ -534,7 +535,7 @@ async fn write_registration(
     state: &AppState,
     caller: &Caller,
     idempotency_key: &str,
-    plan: RegistrationPlan,
+    mut plan: RegistrationPlan,
 ) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
     let mut conn = state
@@ -542,6 +543,15 @@ async fn write_registration(
         .tenant_conn(caller.data_tenant_id)
         .await
         .map_err(registry_db_error)?;
+    // Recheck before reserving idempotency so a dependency rejection rolls back
+    // the entire attempt, including its bookkeeping row. The row locks remain
+    // held while cards and relationships are written below.
+    let external_identities = plan
+        .external_refs
+        .iter()
+        .map(|(card_ref, _)| card_ref.clone())
+        .collect::<Vec<_>>();
+    plan.external_refs = recheck_active_card_refs(&mut conn, &external_identities).await?;
     let inserted = insert_registration_operation(
         &mut conn,
         NewRegistrationOperation {
@@ -602,6 +612,7 @@ async fn persist_node(
     submission: &mut CardSubmission,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
     let mut card = submission_card(submission)?;
+    let outbound_refs = scope_child_card_refs(&card.spec);
     let spec_hash = card
         .spec
         .canonical_hash()
@@ -621,6 +632,7 @@ async fn persist_node(
     )
     .await?
     {
+        persist_outbound_relationships(conn, &existing.row.card_uid, &outbound_refs).await?;
         append_registration_audit(conn, caller, &existing.row.card_uid).await?;
         return Ok(existing_row_to_response(&existing.row, existing.outcome));
     }
@@ -638,6 +650,7 @@ async fn persist_node(
         },
     )
     .await?;
+    persist_outbound_relationships(conn, &row.card_uid, &outbound_refs).await?;
     insert_artifact_manifest_rows(conn, &row.card_uid, &submission.artifacts).await?;
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         upsert_service_account_from_card(conn, &row.card_uid, &card, &caller.principal).await?;
@@ -1366,6 +1379,21 @@ async fn verify_manifest_storage(
     Ok(())
 }
 
+/// Normalize a Card into the immutable definition stored in its blob.
+///
+/// Relationships are derived from the already-bound spec, and live status plus
+/// inbound edges are deliberately excluded from this content-addressed value.
+fn immutable_card_projection(mut card: Card) -> Card {
+    card.relationships = relationships_from_spec(&card.spec);
+    card.status = None;
+    card
+}
+
+/// Serialize one immutable Card definition with deterministic JCS bytes.
+fn immutable_card_blob_bytes(card: Card) -> Result<Vec<u8>, WyrdError> {
+    serde_jcs::to_vec(&immutable_card_projection(card)).map_err(WyrdError::from_spec_serialization)
+}
+
 /// Persist the immutable resolved Card envelope and return its stable URI.
 async fn write_card_blob(
     state: &AppState,
@@ -1398,10 +1426,10 @@ async fn write_card_blob(
             origin: None,
         },
         spec: card.spec.clone(),
-        relationships: relationships_from_spec(&card.spec),
+        relationships: Default::default(),
         status: None,
     };
-    let bytes = serde_jcs::to_vec(&envelope).map_err(WyrdError::from_spec_serialization)?;
+    let bytes = immutable_card_blob_bytes(envelope)?;
     if let Err(error) = state.storage.put_object(&validated, bytes).await {
         let mut conn = state
             .postgres
@@ -1422,7 +1450,7 @@ fn map_storage_error(error: StorageError) -> WyrdError {
 
 #[cfg(test)]
 mod tests {
-    use super::{card_upload_entry, hash_request, validate_request};
+    use super::{card_upload_entry, hash_request, immutable_card_blob_bytes, validate_request};
     use uuid::Uuid;
     use wyrd_spec::registry::CreateCardRequest;
     use wyrd_spec::storage::{UploadId, UploadPlan};
@@ -1528,5 +1556,35 @@ mod tests {
             assert_eq!(entry.upload_id, upload_id);
             assert_eq!(entry.plan, plan);
         }
+    }
+
+    /// Keep blob bytes stable while mutable status and inbound edges change.
+    #[test]
+    fn immutable_blob_projection_is_deterministic_and_excludes_live_edges() {
+        let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Prompt",
+            "metadata": { "name": "blob", "version": "1.0.0", "space": "default" },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
+            "relationships": { "outbound": [], "inbound": ["live-edge"] },
+            "status": { "phase": "pending" }
+        }))
+        .expect("test_setup: blob card fixture is valid");
+
+        let first = immutable_card_blob_bytes(card.clone()).expect("blob serializes");
+        card.status = Some(wyrd_spec::envelope::Status {
+            phase: "active".to_owned(),
+            message: None,
+            updated_at: None,
+        });
+        card.relationships.inbound = vec!["different-live-edge".to_owned()];
+        let second = immutable_card_blob_bytes(card).expect("blob serializes");
+
+        assert_eq!(first, second);
+        assert!(
+            !String::from_utf8(first)
+                .expect("JCS bytes are UTF-8")
+                .contains("status")
+        );
     }
 }

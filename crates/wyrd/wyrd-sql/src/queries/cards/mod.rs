@@ -9,6 +9,7 @@ mod get;
 mod lifecycle;
 mod list;
 mod register;
+pub mod relationships;
 mod version_query;
 mod version_resolve;
 mod version_sql;
@@ -31,6 +32,7 @@ pub use register::{
     lookup_existing_operation, lookup_expired_operation, manifest_rows_for_init,
     mark_manifest_upload_initialized, registration_request_hash, select_card_uids_by_ref_batch,
 };
+pub use relationships::{persist_outbound_relationships, recheck_active_card_refs};
 pub use version_query::{get_latest_card_by_range, list_versions};
 pub use version_resolve::{Resolution, SubmittedCardIdentity, resolve_version};
 pub use version_sql::lock_version_line;

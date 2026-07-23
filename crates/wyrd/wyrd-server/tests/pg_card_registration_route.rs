@@ -11,6 +11,7 @@ use secrecy::SecretString;
 use serde_json::{Value, json};
 use sha2::Digest;
 use url::Url;
+use uuid::Uuid;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
@@ -20,7 +21,7 @@ use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
 use wyrd_registry::Cards;
 use wyrd_spec::envelope::Spec;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardUid, DataTenantId};
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
@@ -30,6 +31,36 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 /// Return whether the explicitly gated Postgres route tests should run.
 fn enabled() -> bool {
     env::var("WYRD_REG_E2E").as_deref() == Ok("1")
+}
+
+/// Seed a dependency row directly so the journey can exercise non-Active states.
+async fn seed_dependency(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    name: &str,
+    status: &str,
+) -> CardUid {
+    let uid = CardUid::from_uuid(Uuid::now_v7()).expect("test dependency UID is valid");
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        "INSERT INTO wyrd.cards \
+            (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
+         VALUES ($1, $2, 'Prompt', 'default', $3, '1.0.0', $4, $5, $6)",
+    )
+    .bind(uid.as_uuid())
+    .bind(tenant.as_uuid())
+    .bind(name)
+    .bind(json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }))
+    .bind(format!("seed-{name}"))
+    .bind(status)
+    .execute(&pool)
+    .await
+    .expect("dependency row inserts");
+    uid
 }
 
 /// Assemble the production HTTP client used by the native registry saga.
@@ -625,6 +656,110 @@ async fn unresolved_dependency_leaves_no_registration_operation() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Reject non-Active and cross-tenant targets before any registration write.
+#[tokio::test(flavor = "current_thread")]
+async fn non_active_and_cross_tenant_dependencies_leave_no_writes() {
+    if !enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-dependency-state-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    for status in ["pending", "failed", "deleted"] {
+        let child_name = format!("blocked-{status}");
+        seed_dependency(&server, server.data_tenant_id(), &child_name, status).await;
+        let operation_key = format!("blocked-{status}-operation");
+        let response = server
+            .oneshot_authenticated(
+                &jwt,
+                agent_registration_request("blocked-parent", &child_name, &operation_key),
+            )
+            .await
+            .expect("blocked registration responds");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response_json(response).await["code"],
+            "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
+        );
+        assert_no_registration_writes(&server, &operation_key, "blocked-parent").await;
+    }
+
+    let other_tenant = DataTenantId::new_v7();
+    let pool = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        "INSERT INTO platform.tenants \
+            (data_tenant_id, slug, display_name, status) VALUES ($1, $2, $3, 'active')",
+    )
+    .bind(other_tenant.as_uuid())
+    .bind(format!("cross-{}", other_tenant.as_uuid()))
+    .bind("Cross-tenant fixture")
+    .execute(&pool)
+    .await
+    .expect("cross-tenant fixture inserts");
+    let child_name = "cross-tenant-prompt";
+    seed_dependency(&server, other_tenant, child_name, "active").await;
+    let operation_key = "cross-tenant-operation";
+    let response = server
+        .oneshot_authenticated(
+            &jwt,
+            agent_registration_request("cross-tenant-parent", child_name, operation_key),
+        )
+        .await
+        .expect("cross-tenant registration responds");
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response_json(response).await["code"],
+        "WYRD_REGISTRY_422_UNRESOLVED_DEPENDENCY"
+    );
+    assert_no_registration_writes(&server, operation_key, "cross-tenant-parent").await;
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Confirm a rejected dependency did not append any durable registration state.
+async fn assert_no_registration_writes(server: &WyrdTestServer, operation_key: &str, name: &str) {
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let operation_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_registration_operations WHERE idempotency_key = $1",
+    )
+    .bind(operation_key)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("operation count reads");
+    let card_count: i64 = sqlx::query_scalar("SELECT count(*) FROM wyrd.cards WHERE name = $1")
+        .bind(name)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("card count reads");
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_relationships WHERE card_uid IN \
+         (SELECT card_uid FROM wyrd.cards WHERE name = $1)",
+    )
+    .bind(name)
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("relationship count reads");
+    assert_eq!(operation_count, 0);
+    assert_eq!(card_count, 0);
+    assert_eq!(relationship_count, 0);
+    conn.commit().await.expect("assertion transaction commits");
+}
+
 /// Reject an artifact-bearing submission when another card shares the request.
 #[tokio::test(flavor = "current_thread")]
 async fn composite_with_manifest_rejects_before_writes() {
@@ -767,6 +902,14 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     assert_eq!(body["outcomes"][0]["status"], "active");
     assert_eq!(body["outcomes"][1]["status"], "active");
     assert_eq!(body["outcomes"][2]["status"], "active");
+    let service_uid: CardUid =
+        serde_json::from_value(body["outcomes"][2]["card_ref"]["uid"].clone())
+            .expect("service outcome contains a UID");
+    let agent_uid: CardUid = serde_json::from_value(body["outcomes"][1]["card_ref"]["uid"].clone())
+        .expect("agent outcome contains a UID");
+    let prompt_uid: CardUid =
+        serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+            .expect("prompt outcome contains a UID");
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await
@@ -780,6 +923,30 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     .await
     .expect("audit count reads");
     assert_eq!(audit_count, 3);
+    let relationships: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT card_uid, target_name FROM wyrd.card_relationships \
+         WHERE card_uid IN ($1, $2) ORDER BY card_uid, target_name",
+    )
+    .bind(agent_uid.as_uuid())
+    .bind(service_uid.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("relationship rows read");
+    assert_eq!(relationships.len(), 2);
+    assert_eq!(relationships[0].0, agent_uid.as_uuid());
+    assert_eq!(relationships[0].1, "composite-prompt");
+    assert_eq!(relationships[1].0, service_uid.as_uuid());
+    assert_eq!(relationships[1].1, "composite-agent");
+    let target_uids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT target_uid FROM wyrd.card_relationships \
+         WHERE card_uid IN ($1, $2) ORDER BY card_uid, target_name",
+    )
+    .bind(agent_uid.as_uuid())
+    .bind(service_uid.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("relationship target UIDs read");
+    assert_eq!(target_uids, vec![prompt_uid.as_uuid(), agent_uid.as_uuid()]);
     conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");

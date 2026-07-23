@@ -1,8 +1,7 @@
 //! Projections from registry rows into composite registration responses.
 
 use wyrd_spec::envelope::{Relationships, Spec};
-use wyrd_spec::reference::CardRef;
-use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
+use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::RegisteredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
@@ -56,25 +55,10 @@ pub fn existing_row_to_response(
 
 /// Project the normalized outbound Card references from a resolved spec.
 pub(crate) fn relationships_from_spec(spec: &Spec) -> Relationships {
-    let mut spec = spec.clone();
-    let mut outbound = Vec::new();
-    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
-        SlotValue::Durable(reference) => {
-            if let Some(card_ref) = reference.as_card_ref() {
-                outbound.push(card_ref.to_string());
-            }
-        }
-        SlotValue::InlineablePrompt(reference) => {
-            if let Some(card_ref) = reference.as_card_ref() {
-                outbound.push(card_ref.to_string());
-            }
-        }
-        SlotValue::InlineableAgent(reference) => {
-            if let Some(card_ref) = reference.as_card_ref() {
-                outbound.push(card_ref.to_string());
-            }
-        }
-    });
+    let mut outbound = scope_child_card_refs(spec)
+        .into_iter()
+        .map(|card_ref| card_ref.to_string())
+        .collect::<Vec<_>>();
     outbound.sort();
     outbound.dedup();
     Relationships {

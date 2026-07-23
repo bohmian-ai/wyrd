@@ -7,10 +7,11 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_spec::envelope::Card;
 use wyrd_spec::ids::CardUid;
+use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation,
+    insert_registration_operation, persist_outbound_relationships, recheck_active_card_refs,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -73,7 +74,7 @@ async fn consolidated_registration_migration_has_locked_shape() {
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables \
          WHERE table_schema = 'wyrd' \
-           AND table_name IN ('card_registration_operations', 'card_artifact_manifest') \
+           AND table_name IN ('card_registration_operations', 'card_artifact_manifest', 'card_relationships') \
          ORDER BY table_name",
     )
     .fetch_all(fixture.platform_admin_pool())
@@ -81,7 +82,11 @@ async fn consolidated_registration_migration_has_locked_shape() {
     .expect("registration tables read");
     assert_eq!(
         tables,
-        vec!["card_artifact_manifest", "card_registration_operations"]
+        vec![
+            "card_artifact_manifest",
+            "card_registration_operations",
+            "card_relationships",
+        ]
     );
 }
 
@@ -168,4 +173,266 @@ async fn pending_card_and_manifest_share_registration_transaction() {
     assert_eq!(manifest_state.1, None);
     assert_eq!(manifest_state.2, None);
     conn.commit().await.expect("assertion transaction commits");
+}
+
+/// Persist a UID-bearing outbound edge atomically with its source Card row.
+#[tokio::test]
+async fn relationship_rows_preserve_exact_target_identity() {
+    if !enabled() {
+        return;
+    }
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let principal_id = PrincipalId::new(Uuid::now_v7());
+    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UUIDv7 is valid");
+    let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UUIDv7 is valid");
+    let target = prompt_card("relationship-target");
+    let source: Card = serde_json::from_value(serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": { "name": "relationship-source", "version": "1.0.0", "space": "default" },
+        "spec": { "prompt": {
+            "kind": "Prompt",
+            "name": "relationship-target",
+            "version": "1.0.0",
+            "space": "default",
+            "uid": target_uid
+        }}
+    }))
+    .expect("agent fixture must deserialize");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    for (operation_id, key) in [
+        (target_operation, "relationship-target-operation"),
+        (source_operation, "relationship-source-operation"),
+    ] {
+        assert!(
+            insert_registration_operation(
+                &mut conn,
+                NewRegistrationOperation {
+                    operation_id,
+                    principal_id,
+                    idempotency_key: key,
+                    request_hash: key,
+                },
+            )
+            .await
+            .expect("operation inserts")
+        );
+    }
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &target,
+            card_uid: target_uid.clone(),
+            principal_id,
+            operation_id: target_operation,
+            status: CardStatus::Active,
+            spec_hash: "target-spec-hash",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("target card inserts");
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &source,
+            card_uid: source_uid.clone(),
+            principal_id,
+            operation_id: source_operation,
+            status: CardStatus::Pending,
+            spec_hash: "source-spec-hash",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("source card inserts");
+    persist_outbound_relationships(&mut conn, &source_uid, &scope_child_card_refs(&source.spec))
+        .await
+        .expect("relationship inserts");
+    conn.commit()
+        .await
+        .expect("registration transaction commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let stored: (String, String, String, String, Uuid) = sqlx::query_as(
+        "SELECT target_kind, target_space, target_name, target_version, target_uid \
+         FROM wyrd.card_relationships WHERE card_uid = $1",
+    )
+    .bind(source_uid.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("relationship row reads");
+    assert_eq!(stored.0, "Prompt");
+    assert_eq!(stored.1, "default");
+    assert_eq!(stored.2, "relationship-target");
+    assert_eq!(stored.3, "1.0.0");
+    assert_eq!(stored.4, target_uid.as_uuid());
+    conn.commit().await.expect("assertion transaction commits");
+}
+
+/// Hold the target lifecycle row lock until the relationship transaction commits.
+#[tokio::test]
+async fn relationship_recheck_blocks_target_lifecycle_race() {
+    if !enabled() {
+        return;
+    }
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let principal_id = PrincipalId::new(Uuid::now_v7());
+    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UUIDv7 is valid");
+    let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UUIDv7 is valid");
+    let target = prompt_card("race-target");
+    let source: Card = serde_json::from_value(serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": { "name": "race-source", "version": "1.0.0", "space": "default" },
+        "spec": { "prompt": {
+            "kind": "Prompt",
+            "name": "race-target",
+            "version": "1.0.0",
+            "space": "default"
+        }}
+    }))
+    .expect("agent fixture must deserialize");
+
+    let mut setup_conn = fixture.tenant_conn().await.expect("setup connection opens");
+    for (operation_id, key) in [
+        (target_operation, "race-target-operation"),
+        (source_operation, "race-source-operation"),
+    ] {
+        assert!(
+            insert_registration_operation(
+                &mut setup_conn,
+                NewRegistrationOperation {
+                    operation_id,
+                    principal_id,
+                    idempotency_key: key,
+                    request_hash: key,
+                },
+            )
+            .await
+            .expect("operation inserts")
+        );
+    }
+    insert_card_row(
+        &mut setup_conn,
+        NewCardRow {
+            card: &target,
+            card_uid: target_uid.clone(),
+            principal_id,
+            operation_id: target_operation,
+            status: CardStatus::Active,
+            spec_hash: "race-target-spec-hash",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("target card inserts");
+    insert_card_row(
+        &mut setup_conn,
+        NewCardRow {
+            card: &source,
+            card_uid: source_uid.clone(),
+            principal_id,
+            operation_id: source_operation,
+            status: CardStatus::Pending,
+            spec_hash: "race-source-spec-hash",
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("source card inserts");
+    setup_conn.commit().await.expect("setup commits");
+
+    let target_ref: CardRef = serde_json::from_value(serde_json::json!({
+        "kind": "Prompt",
+        "name": "race-target",
+        "version": "1.0.0",
+        "space": "default"
+    }))
+    .expect("target reference decodes");
+    let mut registration_conn = fixture
+        .tenant_conn()
+        .await
+        .expect("registration connection opens");
+    let resolved = recheck_active_card_refs(&mut registration_conn, &[target_ref])
+        .await
+        .expect("active target rechecks");
+    assert_eq!(resolved[0].1, target_uid);
+    let resolved_refs = resolved
+        .iter()
+        .map(|(card_ref, _)| card_ref.clone())
+        .collect::<Vec<_>>();
+    persist_outbound_relationships(&mut registration_conn, &source_uid, &resolved_refs)
+        .await
+        .expect("relationship inserts");
+
+    let mut lifecycle_conn = fixture
+        .tenant_conn()
+        .await
+        .expect("lifecycle connection opens");
+    sqlx::query("SET LOCAL lock_timeout = '100ms'")
+        .execute(&mut **lifecycle_conn.transaction())
+        .await
+        .expect("lock timeout configures");
+    let lock_error = sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(target_uid.as_uuid())
+        .execute(&mut **lifecycle_conn.transaction())
+        .await
+        .expect_err("target lifecycle update waits for registration lock");
+    assert_eq!(
+        lock_error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .as_deref(),
+        Some("55P03")
+    );
+
+    drop(lifecycle_conn);
+    registration_conn
+        .commit()
+        .await
+        .expect("registration commits before lifecycle update");
+    let mut lifecycle_conn = fixture
+        .tenant_conn()
+        .await
+        .expect("lifecycle retry connection opens");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(target_uid.as_uuid())
+        .execute(&mut **lifecycle_conn.transaction())
+        .await
+        .expect("lifecycle update proceeds after registration commit");
+    lifecycle_conn.commit().await.expect("lifecycle commits");
+
+    let mut verify_conn = fixture
+        .tenant_conn()
+        .await
+        .expect("verification connection opens");
+    let status: String = sqlx::query_scalar("SELECT status FROM wyrd.cards WHERE card_uid = $1")
+        .bind(target_uid.as_uuid())
+        .fetch_one(&mut **verify_conn.transaction())
+        .await
+        .expect("target status reads");
+    let relationship_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wyrd.card_relationships \
+         WHERE card_uid = $1 AND target_uid = $2",
+    )
+    .bind(source_uid.as_uuid())
+    .bind(target_uid.as_uuid())
+    .fetch_one(&mut **verify_conn.transaction())
+    .await
+    .expect("relationship reads");
+    assert_eq!(status, "deleted");
+    assert_eq!(relationship_count, 1);
+    verify_conn.commit().await.expect("verification commits");
 }

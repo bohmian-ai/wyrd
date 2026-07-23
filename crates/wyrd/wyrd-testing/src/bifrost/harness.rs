@@ -104,7 +104,7 @@ impl BifrostHarness {
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
             );
-            let scribe = ScribeImpl::new_with_deps(
+            let scribe = ScribeImpl::new_for_embedded_with_deps(
                 Arc::clone(&operator),
                 wal,
                 node_id.to_string(),

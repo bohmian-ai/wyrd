@@ -13,12 +13,13 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Notify, Semaphore, oneshot};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::memtable::FrozenMemtable;
+use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
@@ -42,12 +43,15 @@ const WAL_IO_QUEUE_ITEMS: usize = 256;
 /// The latency-sensitive native decode lane. Its queue is application-bounded;
 /// Rayon never becomes the source of untracked backpressure.
 #[derive(Debug, Clone)]
-pub(crate) struct ScribeIngressCpuPool {
+pub struct ScribeIngressCpuPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
     saturation_events: Arc<AtomicU64>,
+    drained: Arc<Notify>,
     capacity: usize,
 }
 
@@ -59,7 +63,11 @@ impl ScribeIngressCpuPool {
     }
 
     /// Build the fixed ingress pool with an explicit application queue bound.
-    pub(crate) fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if the fixed Rayon pool cannot be constructed during boot.
+    pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
@@ -71,7 +79,10 @@ impl ScribeIngressCpuPool {
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
+            drained: Arc::new(Notify::new()),
             capacity,
         }
     }
@@ -94,7 +105,10 @@ impl ScribeIngressCpuPool {
         self.depth.fetch_add(1, Ordering::AcqRel);
         let (sender, receiver) = oneshot::channel();
         let depth = Arc::clone(&self.depth);
+        let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
+        let completed = Arc::clone(&self.completed);
+        let failed = Arc::clone(&self.failed);
         self.pool.spawn_fifo(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 decode(
@@ -106,6 +120,7 @@ impl ScribeIngressCpuPool {
                 )
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            drained.notify_waiters();
             drop(permit);
             let result = if let Ok(result) = result {
                 result
@@ -115,6 +130,54 @@ impl ScribeIngressCpuPool {
                     detail: "Scribe ingress CPU worker panicked".to_owned(),
                 })
             };
+            if result.is_ok() {
+                completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
+            let _ = sender.send(result);
+        });
+        receiver.await.map_err(|_| ScribeError::Internal {
+            detail: "Scribe ingress CPU worker dropped its result".to_owned(),
+        })?
+    }
+
+    pub(crate) async fn run<T, F>(&self, job: F) -> Result<T, ScribeError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, ScribeError> + Send + 'static,
+    {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            self.saturation_events.fetch_add(1, Ordering::Relaxed);
+            return Err(ScribeError::IngestBusy {
+                table: "ingress".to_owned(),
+            });
+        };
+        self.depth.fetch_add(1, Ordering::AcqRel);
+        let (sender, receiver) = oneshot::channel();
+        let depth = Arc::clone(&self.depth);
+        let drained = Arc::clone(&self.drained);
+        let panics = Arc::clone(&self.panics);
+        let completed = Arc::clone(&self.completed);
+        let failed = Arc::clone(&self.failed);
+        self.pool.spawn_fifo(move || {
+            let result = catch_unwind(AssertUnwindSafe(job));
+            depth.fetch_sub(1, Ordering::AcqRel);
+            drained.notify_waiters();
+            drop(permit);
+            let result = if let Ok(result) = result {
+                result
+            } else {
+                panics.fetch_add(1, Ordering::Relaxed);
+                Err(ScribeError::Internal {
+                    detail: "Scribe ingress CPU worker panicked".to_owned(),
+                })
+            };
+            if result.is_ok() {
+                completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -127,6 +190,19 @@ impl ScribeIngressCpuPool {
             depth: self.depth.load(Ordering::Acquire),
             capacity: self.capacity,
             saturation_events: self.saturation_events.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            panicked: self.panics.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) async fn drain(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.depth.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -152,28 +228,19 @@ fn decode(
     let batches = match payload {
         IngressPayload::ArrowIpc(bytes) => {
             let reader = arrow::ipc::reader::StreamReader::try_new(Cursor::new(bytes), None)
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("Arrow IPC decode failed: {error}"),
-                })?;
+                .map_err(|_| ScribeError::InvalidFrame)?;
             reader
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| ScribeError::Internal {
-                    detail: format!("Arrow IPC batch decode failed: {error}"),
-                })?
+                .map_err(|_| ScribeError::InvalidFrame)?
         }
         IngressPayload::ProjectedArrow(batches) => batches,
     };
     let schema = batches
         .first()
         .map(RecordBatch::schema)
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "ingress frame contained no record batches".to_owned(),
-        })?;
-    let rows = arrow::compute::concat_batches(&schema, &batches).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("ingress frame concatenation failed: {error}"),
-        }
-    })?;
+        .ok_or(ScribeError::InvalidFrame)?;
+    let rows =
+        arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?;
     for field in rows.schema().fields() {
         let reserved = match field.name().as_str() {
             CARD_UID | PRINCIPAL_ID | "run_id" | DATA_TENANT_ID | WYRD_BATCH_ID
@@ -184,12 +251,7 @@ fn decode(
         let projected_correlation =
             !native_payload && matches!(field.name().as_str(), CARD_UID | PRINCIPAL_ID | "run_id");
         if reserved && !projected_correlation {
-            return Err(ScribeError::Internal {
-                detail: format!(
-                    "reserved system column supplied by client: {}",
-                    field.name()
-                ),
-            });
+            return Err(ScribeError::InvalidFrame);
         }
     }
     let actual_source_fingerprint = source_schema_fingerprint(rows.schema().as_ref());
@@ -222,30 +284,20 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
         return Ok(());
     };
     let Some(scope) = principal.card_ref_scope() else {
-        return Err(ScribeError::Internal {
-            detail: "principal has no card scope".to_owned(),
-        });
+        return Err(ScribeError::CardScopeDenied);
     };
     let cards = column
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "card_ref must be a UTF-8 column".to_owned(),
-        })?;
+        .ok_or(ScribeError::CardScopeDenied)?;
     for index in 0..cards.len() {
         if cards.is_null(index) {
-            return Err(ScribeError::Internal {
-                detail: "card_ref cannot be null".to_owned(),
-            });
+            return Err(ScribeError::CardScopeDenied);
         }
         let raw = cards.value(index);
-        let card = CardRef::from_str(raw).map_err(|_| ScribeError::Internal {
-            detail: format!("card_ref is invalid: {raw}"),
-        })?;
+        let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardScopeDenied)?;
         if !scope.authorizes(&card) {
-            return Err(ScribeError::Internal {
-                detail: format!("card_ref is outside principal scope: {raw}"),
-            });
+            return Err(ScribeError::CardScopeDenied);
         }
     }
     Ok(())
@@ -281,11 +333,8 @@ fn stamp_correlation_columns(
         row_count,
         stamp_event_time,
     )?;
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("correlation stamping failed: {error}"),
-        }
-    })
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|_| ScribeError::InvalidFrame)
 }
 
 fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
@@ -335,12 +384,8 @@ fn resolve_card_uids(
         .column(index)
         .as_any()
         .downcast_ref::<StringArray>()
-        .ok_or_else(|| ScribeError::Internal {
-            detail: "card_ref must be a UTF-8 column".to_owned(),
-        })?;
-    let bound = principal.card_ref().ok_or_else(|| ScribeError::Internal {
-        detail: "card_ref cannot be resolved without a bound card".to_owned(),
-    })?;
+        .ok_or(ScribeError::CardUnresolved)?;
+    let bound = principal.card_ref().ok_or(ScribeError::CardUnresolved)?;
     let bound_card_uid = bound.uid.as_ref().map(ToString::to_string);
     (0..row_count)
         .map(|row| {
@@ -348,20 +393,14 @@ fn resolve_card_uids(
                 return Ok(None);
             }
             let raw = cards.value(row);
-            let card = CardRef::from_str(raw).map_err(|_| ScribeError::Internal {
-                detail: format!("card_ref is invalid: {raw}"),
-            })?;
+            let card = CardRef::from_str(raw).map_err(|_| ScribeError::CardUnresolved)?;
             if !bound.same_identity(&card) {
-                return Err(ScribeError::Internal {
-                    detail: format!("card_ref cannot be resolved: {raw}"),
-                });
+                return Err(ScribeError::CardUnresolved);
             }
             bound_card_uid
                 .clone()
                 .map(Some)
-                .ok_or_else(|| ScribeError::Internal {
-                    detail: format!("card_ref has no card_uid: {raw}"),
-                })
+                .ok_or(ScribeError::CardUnresolved)
         })
         .collect()
 }
@@ -439,6 +478,10 @@ pub(crate) enum ScribePostAckCpuOp {
         binding: TenantTableBinding,
         tenant: wyrd_spec::ids::DataTenantId,
     },
+    RestoreReplay {
+        memtable: Arc<Memtable>,
+        replayed: Box<ReplayedSealKey>,
+    },
 }
 
 /// Results produced by [`ScribePostAckCpuPool`].
@@ -446,16 +489,20 @@ pub(crate) enum ScribePostAckCpuOp {
 pub(crate) enum ScribePostAckCpuResult {
     Prepared(PreparedAppend),
     ParquetEncoded(ParquetEncoded),
+    ReplayRestored,
 }
 
 /// Bounded post-ACK CPU lane for day splitting and WAL serialization.
 #[derive(Debug, Clone)]
-pub(crate) struct ScribePostAckCpuPool {
+pub struct ScribePostAckCpuPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
     saturation_events: Arc<AtomicU64>,
+    drained: Arc<Notify>,
     preprocess_delay: std::time::Duration,
     capacity: usize,
 }
@@ -472,7 +519,7 @@ impl ScribePostAckCpuPool {
     }
 
     /// Build the fixed post-ACK CPU lane with an explicit queue bound.
-    pub(crate) fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
+    pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
         Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
     }
 
@@ -492,7 +539,10 @@ impl ScribePostAckCpuPool {
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
+            drained: Arc::new(Notify::new()),
             preprocess_delay,
             capacity,
         }
@@ -521,7 +571,10 @@ impl ScribePostAckCpuPool {
             }
         };
         let depth = Arc::clone(&self.depth);
+        let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
+        let completed = Arc::clone(&self.completed);
+        let failed = Arc::clone(&self.failed);
         let delay = self.preprocess_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
@@ -539,8 +592,12 @@ impl ScribePostAckCpuPool {
                     tenant,
                 } => encode_batch(&frozen, &binding, tenant)
                     .map(ScribePostAckCpuResult::ParquetEncoded),
+                ScribePostAckCpuOp::RestoreReplay { memtable, replayed } => memtable
+                    .restore_replayed(&replayed)
+                    .map(|_| ScribePostAckCpuResult::ReplayRestored),
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
                 panics.fetch_add(1, Ordering::Relaxed);
@@ -548,6 +605,11 @@ impl ScribePostAckCpuPool {
                     detail: "Scribe post-ACK CPU worker panicked".to_owned(),
                 })
             });
+            if result.is_ok() {
+                completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -560,6 +622,19 @@ impl ScribePostAckCpuPool {
             depth: self.depth.load(Ordering::Acquire),
             capacity: self.capacity,
             saturation_events: self.saturation_events.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            panicked: self.panics.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) async fn drain(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.depth.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -614,12 +689,15 @@ pub(crate) enum ScribeWalIoResult {
 
 /// Bounded filesystem lane for WAL append, sync, replay support, and retirement.
 #[derive(Debug, Clone)]
-pub(crate) struct ScribeWalIoPool {
+pub struct ScribeWalIoPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
     panics: Arc<AtomicU64>,
+    completed: Arc<AtomicU64>,
+    failed: Arc<AtomicU64>,
     saturation_events: Arc<AtomicU64>,
+    drained: Arc<Notify>,
     sync_delay: std::time::Duration,
     capacity: usize,
 }
@@ -637,7 +715,7 @@ impl ScribeWalIoPool {
     }
 
     /// Build the fixed WAL IO lane with an explicit queue bound.
-    pub(crate) fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
+    pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
         Self::with_capacity_and_delay(worker_count, capacity, std::time::Duration::ZERO)
     }
 
@@ -657,7 +735,10 @@ impl ScribeWalIoPool {
             permits: Arc::new(Semaphore::new(capacity)),
             depth: Arc::new(AtomicUsize::new(0)),
             panics: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+            failed: Arc::new(AtomicU64::new(0)),
             saturation_events: Arc::new(AtomicU64::new(0)),
+            drained: Arc::new(Notify::new()),
             sync_delay,
             capacity,
         }
@@ -686,7 +767,10 @@ impl ScribeWalIoPool {
             }
         };
         let depth = Arc::clone(&self.depth);
+        let drained = Arc::clone(&self.drained);
         let panics = Arc::clone(&self.panics);
+        let completed = Arc::clone(&self.completed);
+        let failed = Arc::clone(&self.failed);
         let delay = self.sync_delay;
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
@@ -721,6 +805,7 @@ impl ScribeWalIoPool {
                 }
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
+            drained.notify_waiters();
             drop(permit);
             let result = result.unwrap_or_else(|_| {
                 panics.fetch_add(1, Ordering::Relaxed);
@@ -728,6 +813,11 @@ impl ScribeWalIoPool {
                     detail: "Scribe WAL IO worker panicked".to_owned(),
                 })
             });
+            if result.is_ok() {
+                completed.fetch_add(1, Ordering::Relaxed);
+            } else {
+                failed.fetch_add(1, Ordering::Relaxed);
+            }
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
@@ -740,6 +830,19 @@ impl ScribeWalIoPool {
             depth: self.depth.load(Ordering::Acquire),
             capacity: self.capacity,
             saturation_events: self.saturation_events.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            panicked: self.panics.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) async fn drain(&self) {
+        loop {
+            let notified = self.drained.notified();
+            if self.depth.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -830,6 +933,26 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn ingress_cpu_runs_bounded_projection_jobs_on_its_lane() {
+        let pool = ScribeIngressCpuPool::new_with_capacity(1, 1);
+        let worker_name = pool
+            .run(|| {
+                Ok(std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_owned())
+            })
+            .await
+            .expect("projection job completes");
+        assert!(worker_name.starts_with("wyrd-scribe-ingress-cpu-"));
+        let snapshot = pool.snapshot();
+        assert_eq!(snapshot.depth, 0);
+        assert_eq!(snapshot.completed, 1);
+        assert_eq!(snapshot.failed, 0);
+        assert_eq!(snapshot.panicked, 0);
+    }
+
     #[test]
     fn post_ack_cpu_runs_on_separate_named_rayon_thread() {
         assert!(
@@ -869,10 +992,7 @@ mod tests {
             Uuid::now_v7(),
         )
         .expect_err("run_id is server-owned");
-        assert!(matches!(
-            error,
-            crate::contracts::ScribeError::Internal { .. }
-        ));
+        assert!(matches!(error, crate::contracts::ScribeError::InvalidFrame));
     }
 
     #[test]
@@ -904,7 +1024,7 @@ mod tests {
         .expect_err("card outside scope");
         assert!(matches!(
             error,
-            crate::contracts::ScribeError::Internal { .. }
+            crate::contracts::ScribeError::CardScopeDenied
         ));
     }
 

@@ -65,7 +65,12 @@ mod pg_tests {
         std::mem::forget(temp_dir);
 
         let writer_epoch = 1;
-        let scribe = ScribeImpl::new_with_deps(operator, wal, node_id.to_string(), writer_epoch);
+        let scribe = ScribeImpl::new_for_embedded_with_deps(
+            operator,
+            wal,
+            node_id.to_string(),
+            writer_epoch,
+        );
 
         (fixture, tenant, scribe)
     }

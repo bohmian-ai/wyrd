@@ -15,7 +15,7 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
-use crate::bifrost::gate::Gate;
+use crate::bifrost::catalog_adapter::ServerCatalog;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::components::health::ReadinessSnapshot;
@@ -28,7 +28,8 @@ use crate::postgres::ServerPostgres;
 /// `AppState`, the boot path, and the test harness.
 pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolver>;
 /// Production Gate specialization used by AppState.
-pub type ServerGate = Gate<SqlPermissionResolver, PgIssuerResolver>;
+pub type ServerGate =
+    vala_bifrost_redux::gate::Gate<ServerCatalog, SqlPermissionResolver, PgIssuerResolver>;
 
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]

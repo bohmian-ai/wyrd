@@ -38,7 +38,7 @@ pub struct FetchLiveTailRequest {
     pub after_lsn: WalLsn,
 }
 
-/// Arrow IPC bytes for one complete append batch.
+/// Arrow IPC bytes for one complete admitted frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArrowIpcBatch {
     /// LSN of the append on the target stream.
@@ -52,7 +52,7 @@ pub struct ArrowIpcBatch {
 /// Terminal and data frames for one bounded tail fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TailFrame {
-    /// One complete, atomically emitted append batch.
+    /// One complete, atomically emitted admitted frame.
     Batch(ArrowIpcBatch),
     /// All currently readable records after the requested LSN were emitted.
     Complete,

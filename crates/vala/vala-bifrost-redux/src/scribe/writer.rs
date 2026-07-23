@@ -417,7 +417,18 @@ impl TenantTableWriterRegistry {
             saturation_events: post_ack
                 .saturation_events
                 .saturating_add(wal_io.saturation_events),
+            completed: post_ack.completed.saturating_add(wal_io.completed),
+            failed: post_ack.failed.saturating_add(wal_io.failed),
+            panicked: post_ack.panicked.saturating_add(wal_io.panicked),
         }
+    }
+
+    pub(crate) fn post_ack_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
+        self.post_ack_cpu.snapshot()
+    }
+
+    pub(crate) fn wal_io_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
+        self.wal_io.snapshot()
     }
 
     pub(crate) fn post_ack_cpu(&self) -> ScribePostAckCpuPool {
@@ -581,6 +592,11 @@ async fn process_append(
         ScribePostAckCpuResult::ParquetEncoded(_) => {
             return Err(ScribeError::Internal {
                 detail: "post-ACK lane returned the wrong writer result".to_owned(),
+            });
+        }
+        ScribePostAckCpuResult::ReplayRestored => {
+            return Err(ScribeError::Internal {
+                detail: "post-ACK lane returned replay output during append".to_owned(),
             });
         }
     };

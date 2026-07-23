@@ -240,7 +240,8 @@ mod pg_tests {
             .expect("WAL writer"),
         );
         std::mem::forget(temp_dir);
-        let scribe = ScribeImpl::new_with_deps(operator.clone(), wal, node_id.to_string(), 1);
+        let scribe =
+            ScribeImpl::new_for_embedded_with_deps(operator.clone(), wal, node_id.to_string(), 1);
         let seal_key = SealKey::new(
             tenant_a,
             logical_table(),

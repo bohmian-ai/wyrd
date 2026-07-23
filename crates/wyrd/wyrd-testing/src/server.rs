@@ -17,9 +17,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
+use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
+use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::wal::WalWriter;
-use vala_ingest::{IngestLimits, ingest_auth_interceptor};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
 use wyrd_auth::permission_resolver::SqlPermissionResolver;
@@ -1236,17 +1237,22 @@ impl WyrdTestServerBuilder {
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
-        let scribe = Arc::new(ScribeImpl::new_with_deps(
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
             wal,
             node_id.to_string(),
             1,
         ));
-        let gate = Arc::new(wyrd_server::bifrost::gate::Gate::with_scribe(
-            Arc::clone(&bifrost),
-            Arc::clone(&scribe),
+        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+            Arc::new(wyrd_server::bifrost::catalog_adapter::ServerCatalog::new(
+                Arc::clone(&bifrost),
+            )),
+            scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
+            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+                scribe.ingress_cpu_pool(),
+            )),
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_forge_context(forge_context)

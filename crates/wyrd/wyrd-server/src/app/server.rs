@@ -453,6 +453,9 @@ impl BoundServer {
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
         let terminal = supervise(set, shutdown, drain).await;
 
+        if let Some(gate) = &self.state.gate {
+            gate.close();
+        }
         if let Some(scribe) = &self.state.scribe {
             scribe.shutdown().await;
         }
@@ -475,8 +478,9 @@ mod pg_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tempfile::tempdir;
     use uuid::Uuid;
+    use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
+    use vala_bifrost_redux::gate::limits::IngestLimits;
     use vala_bifrost_redux::scribe::{ScribeImpl, wal::WalWriter};
-    use vala_ingest::{IngestLimits, ingest_auth_interceptor};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -523,17 +527,22 @@ mod pg_tests {
             WalWriter::new(wal_root.path(), *Uuid::now_v7().as_bytes(), 1, tenant, None)
                 .expect("wal initializes"),
         );
-        let scribe = Arc::new(ScribeImpl::new_with_deps(
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
             wal,
             Uuid::now_v7().to_string(),
             1,
         ));
-        let gate = Arc::new(crate::bifrost::gate::Gate::with_scribe(
-            Arc::clone(&catalog),
-            Arc::clone(&scribe),
+        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+            Arc::new(crate::bifrost::catalog_adapter::ServerCatalog::new(
+                Arc::clone(&catalog),
+            )),
+            scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
+            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+                scribe.ingress_cpu_pool(),
+            )),
         ));
         AppState::new(postgres, storage, catalog)
             .with_scribe(scribe)

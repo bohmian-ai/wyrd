@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use wyrd_spec::ids::DataTenantId;
 
-use crate::error::IngestError;
+use super::error::IngestError;
 
 /// Hard aggregate bounds enforced as frames arrive, before any commit.
 #[derive(Clone, Debug)]
@@ -39,7 +39,7 @@ impl Default for IngestLimits {
             max_stream_rows: 50_000_000,
             max_stream_frames: 100_000,
             idle_deadline: Duration::from_secs(30),
-            total_deadline: Duration::from_secs(600),
+            total_deadline: Duration::from_mins(10),
             max_concurrent_streams_per_tenant: 16,
             max_decoding_message_size: 32 * 1024 * 1024 + 64 * 1024,
         }

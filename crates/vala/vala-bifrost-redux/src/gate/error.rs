@@ -5,7 +5,6 @@
 //! `google.rpc.ErrorInfo` (`tonic-types`), so the Wyrd client maps a gRPC
 //! `Status` and an HTTP `problem+json` to the same taxonomy.
 
-use vala_bifrost::BifrostError;
 use wyrd_runtime::PermissionDenyReason;
 use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
@@ -13,13 +12,24 @@ use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 /// Error domain used in the attached `google.rpc.ErrorInfo`.
 const WYRD_ERROR_DOMAIN: &str = "wyrd.dev";
 
+/// Failures returned by the server's catalog adapter.
+#[derive(Debug, thiserror::Error)]
+pub enum CatalogError {
+    #[error("bifrost table not found: {0}")]
+    TableNotFound(String),
+    #[error("schema fingerprint mismatch: {0}")]
+    FingerprintMismatch(String),
+    #[error("catalog failure: {0}")]
+    Internal(String),
+}
+
 /// Failures raised while serving a Bifrost ingest stream.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     /// Bearer token missing, malformed, or rejected by the verifier.
     #[error("ingest authentication failed: {0}")]
     Unauthenticated(String),
-    /// Frame sequence violated the stream contract (mismatched table/batch_id,
+    /// Frame sequence violated the stream contract (mismatched `table/batch_id`,
     /// too many frames, malformed batch id).
     #[error("ingest stream protocol violation: {0}")]
     StreamProtocolViolation(String),
@@ -37,7 +47,7 @@ pub enum IngestError {
     },
     /// A per-row `card_ref` was present but could not be resolved to a `card_uid`
     /// by the server (unknown card, cross-tenant, or uid not available). Fail-closed
-    /// (M-11): an authenticated write with an unresolvable card_ref is always rejected.
+    /// (M-11): an authenticated write with an unresolvable `card_ref` is always rejected.
     #[error("card_ref {card_ref} cannot be resolved to card_uid (WYRD_VALA_403_CARD_UNRESOLVED)")]
     CardUnresolved {
         /// Canonical string form of the unresolvable card reference.
@@ -117,23 +127,31 @@ pub enum IngestError {
 impl IngestError {
     /// Map a queued Redux Scribe result onto the transport-neutral ingest
     /// taxonomy used by HTTP and gRPC adapters.
-    pub fn from_scribe(error: vala_bifrost_redux::contracts::ScribeError) -> Self {
+    pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
         match error {
-            vala_bifrost_redux::contracts::ScribeError::IngestBusy { .. } => Self::WriterBusy,
-            vala_bifrost_redux::contracts::ScribeError::PayloadTooLarge { bytes } => {
-                Self::PayloadTooLarge {
-                    bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
-                    limit: u64::try_from(vala_bifrost_redux::scribe::admission::MAX_REQUEST_BYTES)
-                        .unwrap_or(u64::MAX),
-                }
-            }
-            vala_bifrost_redux::contracts::ScribeError::FingerprintMismatch { table } => {
+            crate::contracts::ScribeError::IngestBusy { .. } => Self::WriterBusy,
+            crate::contracts::ScribeError::PayloadTooLarge { bytes } => Self::PayloadTooLarge {
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+                limit: u64::try_from(crate::scribe::admission::MAX_REQUEST_BYTES)
+                    .unwrap_or(u64::MAX),
+            },
+            crate::contracts::ScribeError::FingerprintMismatch { table } => {
                 Self::SchemaMismatch { table }
             }
-            vala_bifrost_redux::contracts::ScribeError::TooManyRows { rows, limit } => {
+            crate::contracts::ScribeError::TooManyRows { rows, limit } => {
                 Self::TooManyRows { rows, limit }
             }
-            vala_bifrost_redux::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
+            crate::contracts::ScribeError::InvalidFrame => {
+                Self::Decode("ingest frame validation failed".to_owned())
+            }
+            crate::contracts::ScribeError::CardScopeDenied => Self::CardScopeDenied {
+                card_ref: "<server-validation>".to_owned(),
+            },
+            crate::contracts::ScribeError::CardUnresolved => Self::CardUnresolved {
+                card_ref: "<server-validation>".to_owned(),
+            },
+            crate::contracts::ScribeError::IngressClosed => Self::WriterClosed,
+            crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
                 tracing::error!(error = %other, "Scribe ingest failed after transport validation");
                 Self::Internal("Scribe ingest failed".to_owned())
@@ -171,23 +189,22 @@ impl IngestError {
     #[must_use]
     pub fn grpc_code(&self) -> Code {
         match self {
-            Self::Unauthenticated(_) => Code::Unauthenticated,
+            Self::Unauthenticated(_) | Self::PrincipalUnresolved => Code::Unauthenticated,
             Self::StreamProtocolViolation(_) | Self::Decode(_) => Code::InvalidArgument,
             Self::SystemTableWriteDenied { .. }
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. }
             | Self::RbacDenied { .. } => Code::PermissionDenied,
-            Self::PrincipalUnresolved => Code::Unauthenticated,
             Self::TableNotFound { .. } => Code::NotFound,
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
             Self::BatchTooLarge { .. }
             | Self::TooManyRows { .. }
             | Self::PayloadTooLarge { .. }
             | Self::TooManyStreams
-            | Self::WriterBusy => Code::ResourceExhausted,
+            | Self::WriterBusy
+            | Self::WalDiskFull => Code::ResourceExhausted,
             Self::StreamIdle => Code::DeadlineExceeded,
             Self::WriterClosed => Code::Aborted,
-            Self::WalDiskFull => Code::ResourceExhausted,
             Self::Internal(_) => Code::Internal,
         }
     }
@@ -215,18 +232,13 @@ impl IngestError {
         }
     }
 
-    /// Map an engine [`BifrostError`] surfaced by the writer into an ingest error.
+    /// Map a server catalog lookup failure into an ingest error.
     #[must_use]
-    pub fn from_engine(error: BifrostError) -> Self {
+    pub fn from_catalog(error: CatalogError) -> Self {
         match error {
-            BifrostError::WriterUnavailable(_) => Self::WriterClosed,
-            BifrostError::IngestBusy(_) => Self::WriterBusy,
-            BifrostError::TableNotFound(table) => Self::TableNotFound { table },
-            BifrostError::FingerprintMismatch(table) => Self::SchemaMismatch { table },
-            BifrostError::ReservedColumn(column) => Self::StreamProtocolViolation(format!(
-                "batch carries reserved system column {column}"
-            )),
-            other => Self::Internal(other.to_string()),
+            CatalogError::TableNotFound(table) => Self::TableNotFound { table },
+            CatalogError::FingerprintMismatch(table) => Self::SchemaMismatch { table },
+            CatalogError::Internal(detail) => Self::Internal(detail),
         }
     }
 }

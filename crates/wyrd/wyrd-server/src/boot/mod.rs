@@ -15,7 +15,10 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::WalWriter;
-use vala_bifrost_redux::scribe::{ScribeImpl, ScribeLaneConfig};
+use vala_bifrost_redux::scribe::{
+    ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
+    ScribePostAckCpuPool, ScribeWalIoPool,
+};
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
 use wyrd_semver::VersionBlock;
@@ -302,15 +305,6 @@ pub async fn build_app_state_from_boot_with_config(
                 ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
             })?,
     );
-    let lane_config = ScribeLaneConfig {
-        ingress_cpu_threads: scribe_config.ingress_cpu_threads,
-        post_ack_cpu_threads: scribe_config.post_ack_cpu_threads,
-        wal_io_threads: scribe_config.wal_io_threads,
-        ingress_queue_items: scribe_config.ingress_queue_items,
-        ingress_queue_bytes: scribe_config.ingress_queue_bytes,
-        post_ack_queue_items: scribe_config.post_ack_queue_items,
-        wal_io_queue_items: scribe_config.wal_io_queue_items,
-    };
     let admission = AdmissionConfig {
         max_items: scribe_config.retained_frame_items,
         max_bytes: scribe_config.retained_frame_bytes,
@@ -319,14 +313,33 @@ pub async fn build_app_state_from_boot_with_config(
         writer_idle_ttl: std::time::Duration::from_secs(scribe_config.writer_idle_ttl_secs),
         memory_limit_bytes: scribe_config.retained_frame_bytes,
     };
-    let scribe = Arc::new(ScribeImpl::new_with_runtime_config_and_admission(
+    let execution_pools = ScribeExecutionPools::new(
+        ScribeIngressCpuPool::new_with_capacity(
+            scribe_config.ingress_cpu_threads,
+            scribe_config.ingress_queue_items,
+        ),
+        ScribePostAckCpuPool::new_with_capacity(
+            scribe_config.post_ack_cpu_threads,
+            scribe_config.post_ack_queue_items,
+        ),
+        ScribeWalIoPool::new_with_capacity(
+            scribe_config.wal_io_threads,
+            scribe_config.wal_io_queue_items,
+        ),
+    );
+    let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
         Arc::new(storage.operator().clone()),
         wal,
         stream.node_id.to_string(),
         stream.writer_epoch.as_i64(),
-        lane_config,
-        admission,
-        coordination_runtime.handle().clone(),
+        ScribeBuildConfig {
+            admission,
+            telemetry: None,
+            coordination_runtime: coordination_runtime.handle().clone(),
+            execution_pools,
+            ingress_queue_items: scribe_config.ingress_queue_items,
+            ingress_queue_bytes: scribe_config.ingress_queue_bytes,
+        },
     ));
     let replayed_generations = scribe
         .replay_wal_async()
@@ -400,11 +413,16 @@ pub async fn build_state(
         .scribe
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires Scribe".to_owned()))?;
-    let gate = Arc::new(crate::bifrost::gate::Gate::with_scribe(
-        state.bifrost.clone(),
-        scribe,
-        vala_ingest::ingest_auth_interceptor(verifier),
-        vala_ingest::IngestLimits::default(),
+    let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+        Arc::new(crate::bifrost::catalog_adapter::ServerCatalog::new(
+            state.bifrost.clone(),
+        )),
+        scribe.clone(),
+        vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
+        vala_bifrost_redux::gate::limits::IngestLimits::default(),
+        Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+            scribe.ingress_cpu_pool(),
+        )),
     ));
     let state = state.with_gate(gate);
     seed_federation(&state, config, sealing_key.as_deref()).await?;

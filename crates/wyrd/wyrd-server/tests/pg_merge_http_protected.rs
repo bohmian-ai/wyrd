@@ -19,8 +19,9 @@ mod pg_tests {
     use chrono::Duration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tower::ServiceExt;
+    use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
+    use vala_bifrost_redux::gate::limits::IngestLimits;
     use vala_bifrost_redux::scribe::{ScribeImpl, wal::WalWriter};
-    use vala_ingest::{IngestLimits, ingest_auth_interceptor};
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -79,17 +80,22 @@ mod pg_tests {
             )
             .expect("wal initializes"),
         );
-        let scribe = Arc::new(ScribeImpl::new_with_deps(
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
             wal,
             uuid::Uuid::now_v7().to_string(),
             1,
         ));
-        let gate = Arc::new(wyrd_server::bifrost::gate::Gate::with_scribe(
-            Arc::clone(&catalog),
-            Arc::clone(&scribe),
+        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+            Arc::new(wyrd_server::bifrost::catalog_adapter::ServerCatalog::new(
+                Arc::clone(&catalog),
+            )),
+            scribe.clone(),
             ingest_auth_interceptor(Arc::clone(&verifier)),
             IngestLimits::default(),
+            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+                scribe.ingress_cpu_pool(),
+            )),
         ));
         AppState::new(postgres, storage, catalog)
             .with_scribe(scribe)

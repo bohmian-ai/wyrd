@@ -4,7 +4,7 @@
 //! accepts both `application/x-protobuf` (the OTLP default) and
 //! `application/json` (OTLP protobuf-JSON), decodes the payload into the same
 //! `ExportTraceServiceRequest` the gRPC collector uses, and drives Task B's
-//! shared decode→write core [`vala_ingest::ingest_resource_spans`]. There is one
+//! shared decode→write core in `vala_bifrost_redux::gate`. There is one
 //! RBAC + map + `commit_one` core; this module only owns the HTTP framing.
 //!
 //! Content-Type handling (shared by all three signals):
@@ -19,7 +19,7 @@
 //! `Export*ServiceResponse`, including `partial_success` when spans were
 //! rejected.
 //!
-//! Backpressure: [`vala_ingest::IngestError::WriterBusy`] maps to HTTP `503`
+//! Backpressure: [`vala_bifrost_redux::gate::IngestError::WriterBusy`] maps to HTTP `503`
 //! (retryable), never to `partial_success` — no rows from a busy request are
 //! written. The gRPC edge maps the same condition to gRPC
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
@@ -30,7 +30,8 @@
 //!
 //! `/v1/metrics` and `/v1/logs` share the same three-step shape as `/v1/traces`:
 //! Content-Type decode, the shared decode→write core
-//! ([`vala_ingest::ingest_resource_metrics`] / [`vala_ingest::ingest_resource_logs`]),
+//! (`vala_bifrost_redux::gate::Gate::ingest_resource_metrics` /
+//! `Gate::ingest_resource_logs`),
 //! then a response encoded in the request's encoding with `partial_success` for
 //! per-item rejections.
 
@@ -42,8 +43,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use vala_ingest::IngestError;
-use vala_ingest::auth::AuthContext;
+use vala_bifrost_redux::gate::{AuthContext, IngestError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
@@ -408,7 +408,7 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
 mod tests {
     use super::{OtlpEncoding, OtlpSignal, ingest_error_to_response, ingest_error_to_wyrd};
     use axum::http::{HeaderMap, StatusCode, header};
-    use vala_ingest::IngestError;
+    use vala_bifrost_redux::gate::IngestError;
     use wyrd_spec::vala::error::BifrostError;
 
     fn headers_with(content_type: &str) -> HeaderMap {

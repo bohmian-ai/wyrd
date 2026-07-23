@@ -10,12 +10,18 @@ use crate::scribe::writer::WriterHealthSnapshot;
 /// Compatibility-shaped aggregate queue metrics for runtime dashboards.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutorSnapshot {
-    /// Operations currently queued or executing across post-ACK and WAL lanes.
+    /// Operations currently queued or executing on this lane.
     pub depth: usize,
-    /// Aggregate application queue capacity.
+    /// Application queue capacity for this lane.
     pub capacity: usize,
     /// Number of submissions that encountered lane saturation.
     pub saturation_events: u64,
+    /// Work items completed successfully.
+    pub completed: u64,
+    /// Work items that returned an error.
+    pub failed: u64,
+    /// Work items terminated by a worker panic.
+    pub panicked: u64,
 }
 
 /// One completed Scribe stage sample.
@@ -38,6 +44,12 @@ pub struct ScribeRuntimeSnapshot {
     pub admission: AdmissionSnapshot,
     /// Aggregate execution-lane queue metrics.
     pub executor: ExecutorSnapshot,
+    /// Pre-ACK decode and projection lane.
+    pub ingress: ExecutorSnapshot,
+    /// Post-ACK preprocessing and reconstruction lane.
+    pub post_ack: ExecutorSnapshot,
+    /// WAL filesystem lane.
+    pub wal_io: ExecutorSnapshot,
     /// Active writer queue and health metrics.
     pub writers: WriterHealthSnapshot,
     /// Accepted and fsynced frame counters used to expose the durability gap.

@@ -318,6 +318,7 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         },
         BifrostError::QueryTimeout,
         BifrostError::QueryResultTooLarge,
+        BifrostError::PayloadTooLarge { bytes: 0 },
         BifrostError::Internal {
             detail: String::new(),
         },

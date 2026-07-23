@@ -235,6 +235,9 @@ impl SealDriver {
             ScribePostAckCpuResult::Prepared(_) => Err(ScribeError::Internal {
                 detail: "post-ACK lane returned the wrong seal result".to_owned(),
             }),
+            ScribePostAckCpuResult::ReplayRestored => Err(ScribeError::Internal {
+                detail: "post-ACK lane returned replay output during seal".to_owned(),
+            }),
         }
     }
 

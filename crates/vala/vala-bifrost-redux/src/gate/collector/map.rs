@@ -19,16 +19,13 @@
 
 use std::sync::Arc;
 
+use super::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
 use arrow::array::{
     ArrayRef, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use chrono::{DateTime, Utc};
-use vala_bifrost::tables::logs::RecordsTable;
-use vala_bifrost::tables::metrics::PointsTable;
-use vala_bifrost::tables::traces::SpansTable;
-use vala_bifrost::tables::{CorrelationPolicy, DomainTable};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::logs::record::LogRecord;
 use wyrd_spec::vala::metrics::record::{
@@ -50,7 +47,7 @@ use wyrd_tonic::otlp::metrics::v1::{
 use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
 use wyrd_tonic::otlp::trace::v1::{ResourceSpans, Span as OtlpSpan, span, status::StatusCode};
 
-/// OTel `service.*` resource semantic-convention attribute keys promoted to
+/// `OTel` `service.*` resource semantic-convention attribute keys promoted to
 /// typed [`Resource`] columns.
 const SERVICE_NAME: &str = "service.name";
 const SERVICE_NAMESPACE: &str = "service.namespace";
@@ -299,8 +296,7 @@ fn any_value_to_json(value: Option<&AnyValue>) -> serde_json::Value {
         any_value::Value::BoolValue(b) => serde_json::Value::Bool(*b),
         any_value::Value::IntValue(i) => serde_json::Value::from(*i),
         any_value::Value::DoubleValue(d) => serde_json::Number::from_f64(*d)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
         any_value::Value::ArrayValue(array) => serde_json::Value::Array(
             array
                 .values
@@ -380,9 +376,12 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
     let flags = Arc::new(UInt32Array::from_iter_values(
         records.iter().map(|r| r.flags),
     )) as ArrayRef;
-    let trace_state = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| Some(r.trace_state.clone())),
-    )) as ArrayRef;
+    let trace_state = Arc::new(
+        records
+            .iter()
+            .map(|r| Some(r.trace_state.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
     let name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.name.clone()),
     )) as ArrayRef;
@@ -411,9 +410,12 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
         records.iter().map(|r| status_str(&r.status)),
     )) as ArrayRef;
 
-    let attributes = Arc::new(StringViewArray::from_iter(
-        records.iter().map(|r| Some(attrs_json(&r.attributes))),
-    )) as ArrayRef;
+    let attributes = Arc::new(
+        records
+            .iter()
+            .map(|r| Some(attrs_json(&r.attributes)))
+            .collect::<StringViewArray>(),
+    ) as ArrayRef;
 
     let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
         records.iter().map(|r| r.dropped_attributes_count),
@@ -425,12 +427,18 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
         records.iter().map(|r| r.dropped_links_count),
     )) as ArrayRef;
 
-    let scope_name = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| Some(r.scope.name.clone())),
-    )) as ArrayRef;
-    let scope_version = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.scope.version.clone()),
-    )) as ArrayRef;
+    let scope_name = Arc::new(
+        records
+            .iter()
+            .map(|r| Some(r.scope.name.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let scope_version = Arc::new(
+        records
+            .iter()
+            .map(|r| r.scope.version.clone())
+            .collect::<StringArray>(),
+    ) as ArrayRef;
     let service_name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.resource.service_name.clone()),
     )) as ArrayRef;
@@ -687,7 +695,9 @@ fn push_number_point(
     };
     let value = match point.value.as_ref() {
         Some(number_data_point::Value::AsDouble(v)) => *v,
-        Some(number_data_point::Value::AsInt(v)) => *v as f64,
+        Some(number_data_point::Value::AsInt(v)) => {
+            serde_json::Number::from(*v).as_f64().unwrap_or(f64::NAN)
+        }
         None => {
             out.rejected.push(RejectedPoint {
                 reason: format!("metric {} number point carries no value", metric.name),
@@ -835,7 +845,9 @@ fn map_exemplar(exemplar: &OtlpExemplar) -> Result<MetricExemplar, String> {
         .ok_or_else(|| "exemplar time_unix_nano out of representable range".to_owned())?;
     let value = match exemplar.value.as_ref() {
         Some(exemplar::Value::AsDouble(v)) => *v,
-        Some(exemplar::Value::AsInt(v)) => *v as f64,
+        Some(exemplar::Value::AsInt(v)) => {
+            serde_json::Number::from(*v).as_f64().unwrap_or(f64::NAN)
+        }
         None => 0.0,
     };
     let trace_id = if exemplar.trace_id.is_empty() {
@@ -947,34 +959,80 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
     );
     let n = records.len();
 
+    let mut columns = metric_scalar_columns(records);
+    columns.extend(metric_opaque_columns(records));
+    columns.extend([
+        Arc::new(StringArray::new_null(n)) as ArrayRef,
+        Arc::new(StringArray::new_null(n)) as ArrayRef,
+        Arc::new(StringArray::new_null(n)) as ArrayRef,
+    ]);
+
+    RecordBatch::try_new(metrics_write_schema(), columns).map_err(|error| error.to_string())
+}
+
+fn metric_scalar_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
     let metric_name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.metric_name.clone()),
     )) as ArrayRef;
     let time = ts_micros_col(records.iter().map(|r| Some(r.time)));
     let start_time = ts_micros_col(records.iter().map(|r| r.start_time));
-    let description = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.description.clone()),
-    )) as ArrayRef;
-    let unit = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.unit.clone()),
-    )) as ArrayRef;
+    let description = Arc::new(
+        records
+            .iter()
+            .map(|r| r.description.clone())
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let unit = Arc::new(
+        records
+            .iter()
+            .map(|r| r.unit.clone())
+            .collect::<StringArray>(),
+    ) as ArrayRef;
     let metric_type = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| metric_type_str(r.metric_type)),
     )) as ArrayRef;
-    let temporality = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.temporality.map(temporality_str)),
-    )) as ArrayRef;
-    let is_monotonic = Arc::new(BooleanArray::from_iter(
-        records.iter().map(|r| r.is_monotonic),
-    )) as ArrayRef;
-    let flags = Arc::new(UInt32Array::from_iter(records.iter().map(|r| r.flags))) as ArrayRef;
-    let value = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.value))) as ArrayRef;
-    let count = Arc::new(Int64Array::from_iter(
-        records.iter().map(|r| r.count.map(u64_to_i64)),
-    )) as ArrayRef;
-    let sum = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.sum))) as ArrayRef;
-    let min = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.min))) as ArrayRef;
-    let max = Arc::new(Float64Array::from_iter(records.iter().map(|r| r.max))) as ArrayRef;
+    let temporality = Arc::new(
+        records
+            .iter()
+            .map(|r| r.temporality.map(temporality_str))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let is_monotonic = Arc::new(
+        records
+            .iter()
+            .map(|r| r.is_monotonic)
+            .collect::<BooleanArray>(),
+    ) as ArrayRef;
+    let flags = Arc::new(records.iter().map(|r| r.flags).collect::<UInt32Array>()) as ArrayRef;
+    let value = Arc::new(records.iter().map(|r| r.value).collect::<Float64Array>()) as ArrayRef;
+    let count = Arc::new(
+        records
+            .iter()
+            .map(|r| r.count.map(u64_to_i64))
+            .collect::<Int64Array>(),
+    ) as ArrayRef;
+    let sum = Arc::new(records.iter().map(|r| r.sum).collect::<Float64Array>()) as ArrayRef;
+    let min = Arc::new(records.iter().map(|r| r.min).collect::<Float64Array>()) as ArrayRef;
+    let max = Arc::new(records.iter().map(|r| r.max).collect::<Float64Array>()) as ArrayRef;
+    vec![
+        metric_name,
+        time,
+        start_time,
+        description,
+        unit,
+        metric_type,
+        temporality,
+        is_monotonic,
+        flags,
+        value,
+        count,
+        sum,
+        min,
+        max,
+    ]
+}
+
+fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
     let bucket_counts = json_view_col(
         records
             .iter()
@@ -985,13 +1043,19 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
             .iter()
             .map(|r| r.explicit_bounds.as_ref().map(json_of)),
     );
-    let scale = Arc::new(Int32Array::from_iter(records.iter().map(|r| r.scale))) as ArrayRef;
-    let zero_count = Arc::new(Int64Array::from_iter(
-        records.iter().map(|r| r.zero_count.map(u64_to_i64)),
-    )) as ArrayRef;
-    let zero_threshold = Arc::new(Float64Array::from_iter(
-        records.iter().map(|r| r.zero_threshold),
-    )) as ArrayRef;
+    let scale = Arc::new(records.iter().map(|r| r.scale).collect::<Int32Array>()) as ArrayRef;
+    let zero_count = Arc::new(
+        records
+            .iter()
+            .map(|r| r.zero_count.map(u64_to_i64))
+            .collect::<Int64Array>(),
+    ) as ArrayRef;
+    let zero_threshold = Arc::new(
+        records
+            .iter()
+            .map(|r| r.zero_threshold)
+            .collect::<Float64Array>(),
+    ) as ArrayRef;
     let positive_buckets = json_view_col(
         records
             .iter()
@@ -1014,40 +1078,29 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
             Some(json_of(&r.exemplars))
         }
     }));
-    let attributes = Arc::new(StringViewArray::from_iter(
-        records.iter().map(|r| Some(attrs_json(&r.attributes))),
-    )) as ArrayRef;
+    let attributes = Arc::new(
+        records
+            .iter()
+            .map(|r| Some(attrs_json(&r.attributes)))
+            .collect::<StringViewArray>(),
+    ) as ArrayRef;
     let service_name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.resource.service_name.clone()),
     )) as ArrayRef;
-    let scope_name = Arc::new(StringArray::from_iter(
+    let scope_name = Arc::new(
         records
             .iter()
-            .map(|r| r.scope.as_ref().map(|s| s.name.clone())),
-    )) as ArrayRef;
-    let scope_version = Arc::new(StringArray::from_iter(
+            .map(|r| r.scope.as_ref().map(|s| s.name.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let scope_version = Arc::new(
         records
             .iter()
-            .map(|r| r.scope.as_ref().and_then(|s| s.version.clone())),
-    )) as ArrayRef;
+            .map(|r| r.scope.as_ref().and_then(|s| s.version.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
 
-    let null_utf8 = || Arc::new(StringArray::new_null(n)) as ArrayRef;
-
-    let columns: Vec<ArrayRef> = vec![
-        metric_name,
-        time,
-        start_time,
-        description,
-        unit,
-        metric_type,
-        temporality,
-        is_monotonic,
-        flags,
-        value,
-        count,
-        sum,
-        min,
-        max,
+    vec![
         bucket_counts,
         explicit_bounds,
         scale,
@@ -1061,12 +1114,7 @@ pub fn metrics_to_record_batch(records: &[MetricRecord]) -> Result<RecordBatch, 
         service_name,
         scope_name,
         scope_version,
-        null_utf8(),
-        null_utf8(),
-        null_utf8(),
-    ];
-
-    RecordBatch::try_new(metrics_write_schema(), columns).map_err(|error| error.to_string())
+    ]
 }
 
 // ─── logs ────────────────────────────────────────────────────────────────────
@@ -1163,7 +1211,7 @@ fn map_log(
     Ok(record)
 }
 
-/// `0`/`UNSPECIFIED` maps to `None`; any other value is the OTel SeverityNumber
+/// `0`/`UNSPECIFIED` maps to `None`; any other value is the `OTel` `SeverityNumber`
 /// (1..=24), narrowed to the record's `u8`.
 fn severity_number_from_i32(severity: i32) -> Option<u8> {
     match SeverityNumber::try_from(severity).unwrap_or(SeverityNumber::Unspecified) {
@@ -1203,21 +1251,33 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
 
     let time = ts_micros_col(records.iter().map(|r| r.time));
     let observed_time = ts_micros_col(records.iter().map(|r| Some(r.observed_time)));
-    let severity_number = Arc::new(UInt32Array::from_iter(
-        records.iter().map(|r| r.severity_number.map(u32::from)),
-    )) as ArrayRef;
-    let severity_text = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.severity_text.clone()),
-    )) as ArrayRef;
-    let event_name = Arc::new(StringArray::from_iter(
-        records.iter().map(|r| r.event_name.clone()),
-    )) as ArrayRef;
+    let severity_number = Arc::new(
+        records
+            .iter()
+            .map(|r| r.severity_number.map(u32::from))
+            .collect::<UInt32Array>(),
+    ) as ArrayRef;
+    let severity_text = Arc::new(
+        records
+            .iter()
+            .map(|r| r.severity_text.clone())
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let event_name = Arc::new(
+        records
+            .iter()
+            .map(|r| r.event_name.clone())
+            .collect::<StringArray>(),
+    ) as ArrayRef;
     let body = json_view_col(records.iter().map(|r| r.body.as_ref().map(json_of)));
     let trace_id = fixed16(records.iter().map(|r| r.trace_id.map(|id| *id.as_bytes())))?;
     let span_id = fixed8(records.iter().map(|r| r.span_id.map(|id| *id.as_bytes())))?;
-    let trace_flags = Arc::new(UInt32Array::from_iter(
-        records.iter().map(|r| r.trace_flags.map(u32::from)),
-    )) as ArrayRef;
+    let trace_flags = Arc::new(
+        records
+            .iter()
+            .map(|r| r.trace_flags.map(u32::from))
+            .collect::<UInt32Array>(),
+    ) as ArrayRef;
     let attributes = json_view_col(records.iter().map(|r| {
         if r.attributes.is_empty() {
             None
@@ -1228,20 +1288,24 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
     let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
         records.iter().map(|r| r.dropped_attributes_count),
     )) as ArrayRef;
-    let service_name =
-        Arc::new(StringArray::from_iter(records.iter().map(|r| {
-            r.resource.as_ref().map(|res| res.service_name.clone())
-        }))) as ArrayRef;
-    let scope_name = Arc::new(StringArray::from_iter(
+    let service_name = Arc::new(
         records
             .iter()
-            .map(|r| r.scope.as_ref().map(|s| s.name.clone())),
-    )) as ArrayRef;
-    let scope_version = Arc::new(StringArray::from_iter(
+            .map(|r| r.resource.as_ref().map(|res| res.service_name.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let scope_name = Arc::new(
         records
             .iter()
-            .map(|r| r.scope.as_ref().and_then(|s| s.version.clone())),
-    )) as ArrayRef;
+            .map(|r| r.scope.as_ref().map(|s| s.name.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
+    let scope_version = Arc::new(
+        records
+            .iter()
+            .map(|r| r.scope.as_ref().and_then(|s| s.version.clone()))
+            .collect::<StringArray>(),
+    ) as ArrayRef;
 
     let null_utf8 = || Arc::new(StringArray::new_null(n)) as ArrayRef;
 
@@ -1274,14 +1338,16 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
 /// timestamps (null where `None`).
 fn ts_micros_col(values: impl Iterator<Item = Option<DateTime<Utc>>>) -> ArrayRef {
     Arc::new(
-        TimestampMicrosecondArray::from_iter(values.map(|v| v.map(micros)))
+        values
+            .map(|v| v.map(micros))
+            .collect::<TimestampMicrosecondArray>()
             .with_timezone("UTC".to_string()),
     ) as ArrayRef
 }
 
 /// Build a `Utf8View` column from an iterator of optional JSON strings.
 fn json_view_col(values: impl Iterator<Item = Option<String>>) -> ArrayRef {
-    Arc::new(StringViewArray::from_iter(values)) as ArrayRef
+    Arc::new(values.collect::<StringViewArray>()) as ArrayRef
 }
 
 /// Serialize a value to its compact JSON string form for an opaque `Utf8View`
@@ -1666,7 +1732,7 @@ mod tests {
         // Exemplar carried through, span/trace ids preserved.
         assert_eq!(record.exemplars.len(), 1);
         let ex = &record.exemplars[0];
-        assert_eq!(ex.value, 41.0);
+        assert!((ex.value - 41.0).abs() < f64::EPSILON);
         assert_eq!(
             ex.trace_id.expect("trace id").as_bytes(),
             &(1u8..=16).collect::<Vec<_>>()[..]
@@ -1720,7 +1786,7 @@ mod tests {
             .as_any()
             .downcast_ref::<Float64Array>()
             .unwrap();
-        assert_eq!(value.value(0), 42.0);
+        assert!((value.value(0) - 42.0).abs() < f64::EPSILON);
 
         let is_monotonic = batch
             .column_by_name("is_monotonic")
@@ -1738,7 +1804,7 @@ mod tests {
             .downcast_ref::<StringViewArray>()
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(exemplars.value(0)).expect("json");
-        assert!(parsed.as_array().map(|a| a.len()) == Some(1));
+        assert!(parsed.as_array().map(std::vec::Vec::len) == Some(1));
 
         let service_name = batch
             .column_by_name("service_name")
@@ -1750,6 +1816,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "covers all OTLP aggregate encodings in one projection test"
+    )]
     fn histogram_and_exp_histogram_and_summary_map_and_encode() {
         // One of each aggregating type, to exercise every points column.
         let histogram = Metric {

@@ -17,7 +17,7 @@
 //! commits under bursty concurrency, the saturation mapping is pinned by unit
 //! tests in `wyrd-server/src/http/otlp.rs` — `writer_busy_maps_to_503` for the
 //! HTTP path and `writer_busy_table_name_is_per_signal` for per-signal table
-//! naming — plus the gRPC mapping in `vala-ingest/src/error.rs`
+//! naming — plus the gRPC mapping in `vala-bifrost-redux/src/gate/error.rs`
 //! (`IngestError::WriterBusy → Code::ResourceExhausted` with
 //! `WYRD_VALA_429_INGEST_BUSY`).
 //!

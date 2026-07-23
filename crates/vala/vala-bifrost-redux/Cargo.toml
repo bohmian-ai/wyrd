@@ -14,6 +14,8 @@ wyrd-sql = { workspace = true }
 vala-sql = { workspace = true }
 
 async-trait = { workspace = true }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
@@ -26,6 +28,11 @@ datafusion = { workspace = true }
 opendal = { workspace = true }
 crc32c = { workspace = true }
 uuid = { workspace = true }
+base64 = { workspace = true }
+secrecy = { workspace = true }
+wyrd-auth-oidc = { workspace = true }
+wyrd-auth-verify = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["server"] }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 ulid = { workspace = true }

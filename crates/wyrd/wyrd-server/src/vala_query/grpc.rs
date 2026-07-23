@@ -61,10 +61,10 @@ async fn caller_from_metadata(
         .token_verifier
         .clone()
         .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-    let auth = vala_ingest::auth::authenticate(verifier.as_ref(), metadata)
+    let auth = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
         .await
         .map_err(|e| Status::unauthenticated(e.to_string()))?;
-    let request_id = vala_ingest::auth::read_or_mint_request_id(metadata);
+    let request_id = vala_bifrost_redux::gate::auth::read_or_mint_request_id(metadata);
     Ok(Caller {
         data_tenant_id: auth.tenant,
         principal: auth.principal,

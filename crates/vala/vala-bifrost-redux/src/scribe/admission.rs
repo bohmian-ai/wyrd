@@ -557,9 +557,6 @@ impl Drop for RetainedFrameReservation {
     }
 }
 
-/// Compatibility name for internal callers that have not yet been migrated.
-pub type AdmissionReservation = RetainedFrameReservation;
-
 /// A writer-count reservation held by one registry entry.
 #[derive(Debug)]
 pub struct WriterLease {

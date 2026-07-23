@@ -9,7 +9,7 @@
 //! enforcement is the service's job, not the interceptor's.
 //!
 //! `wyrd-request-id`: the interceptor reads the inbound correlator or mints a
-//! UUIDv7 when absent, so `olap_commits` attribution and the C5 audit event
+//! `UUIDv7` when absent, so `olap_commits` attribution and the C5 audit event
 //! carry the same id the HTTP routes use.
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
 use wyrd_tonic::tonic::metadata::MetadataMap;
 
-use crate::error::IngestError;
+use super::error::IngestError;
 
 /// gRPC metadata key for the Wyrd request correlator (the gRPC spelling of the
 /// HTTP `Wyrd-Request-Id` header). Independent of `traceparent`.
@@ -72,7 +72,7 @@ fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, Inge
     Ok(claims.principal.tenant_id)
 }
 
-/// Read `wyrd-request-id` from the inbound metadata, or mint a UUIDv7 when it is
+/// Read `wyrd-request-id` from the inbound metadata, or mint a `UUIDv7` when it is
 /// absent or malformed.
 #[must_use]
 pub fn read_or_mint_request_id(metadata: &MetadataMap) -> RequestId {
@@ -95,13 +95,13 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
 ) -> Result<AuthContext, IngestError> {
     let token = extract_bearer(metadata)?;
     let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
-    let verified = verifier
+    let verified_token = verifier
         .verify(&token, &expected_tenant)
         .await
         .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
     let request_id = read_or_mint_request_id(metadata);
     Ok(AuthContext {
-        principal: verified.principal.clone(),
+        principal: verified_token.principal.clone(),
         tenant: expected_tenant,
         request_id,
     })
@@ -112,10 +112,19 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
 /// S3.C2 injects the concrete `SqlPermissionResolver`-backed verifier at mount
 /// and wires [`authenticate`] into request-extension population; this type keeps
 /// the verifier seam in one place so ingest can never grow a second auth path.
-#[derive(Clone)]
 pub struct IngestAuthInterceptor<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
 {
     verifier: Arc<TokenVerifier<R, I>>,
+}
+
+impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static> Clone
+    for IngestAuthInterceptor<R, I>
+{
+    fn clone(&self) -> Self {
+        Self {
+            verifier: Arc::clone(&self.verifier),
+        }
+    }
 }
 
 impl<R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>

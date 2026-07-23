@@ -5,6 +5,7 @@ pub mod audit_envelope;
 pub mod execution_lanes;
 pub mod file_list_writer;
 pub mod filename;
+mod ingress;
 pub mod manifest;
 pub mod memtable;
 pub mod parquet_writer;
@@ -25,22 +26,18 @@ mod acceptance;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
-use crate::scribe::admission::{
-    AdmissionConfig, AdmissionController, IngressQueueBudget, IngressQueueConfig,
-    IngressQueueReservation, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
+use crate::scribe::admission::{AdmissionConfig, AdmissionController};
+pub use crate::scribe::execution_lanes::{
+    ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool,
 };
-use crate::scribe::execution_lanes::{ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool};
 use crate::scribe::memtable::Memtable;
-use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{ScribeRuntimeSnapshot, ScribeTelemetry};
 use crate::scribe::writer::TenantTableWriterRegistry;
 use async_trait::async_trait;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
 use vala_sql::TenantConn;
 
 /// Memtable key for per-bucket row-count inspection.
@@ -48,6 +45,34 @@ use vala_sql::TenantConn;
 /// Type alias for [`SealKey`] — memtable buckets are keyed by
 /// (`tenant`, `table`, `event_day`).
 pub type MemtableKey = SealKey;
+
+/// The three concrete execution lanes owned by the Bifrost server boot path.
+///
+/// Scribe accepts this value but never constructs or sizes a lane itself. The
+/// concrete types keep the lane boundary narrow and preserve the distinct
+/// worker pools required by the write lifecycle.
+#[derive(Debug, Clone)]
+pub struct ScribeExecutionPools {
+    ingress_cpu: ScribeIngressCpuPool,
+    post_ack_cpu: ScribePostAckCpuPool,
+    wal_io: ScribeWalIoPool,
+}
+
+impl ScribeExecutionPools {
+    /// Assemble the server-owned execution lanes for one Scribe instance.
+    #[must_use]
+    pub fn new(
+        ingress_cpu: ScribeIngressCpuPool,
+        post_ack_cpu: ScribePostAckCpuPool,
+        wal_io: ScribeWalIoPool,
+    ) -> Self {
+        Self {
+            ingress_cpu,
+            post_ack_cpu,
+            wal_io,
+        }
+    }
+}
 
 /// Explicit boot-time execution-lane provisioning for Scribe.
 #[derive(Debug, Clone, Copy)]
@@ -113,6 +138,8 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and writer admission counters.
     admission: AdmissionController,
+    /// Bounded post-ACK CPU lane retained for replay and seal preparation.
+    post_ack_cpu: ScribePostAckCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
     wal_io: ScribeWalIoPool,
     /// Bounded Rayon lane for pre-ACK native decode and projection work.
@@ -120,148 +147,49 @@ pub struct ScribeImpl {
     /// Atomic get-or-create registry for tenant/table FIFO writers.
     registry: Arc<TenantTableWriterRegistry>,
     /// Bounded global raw-ingress dispatcher.
-    ingress_queue: ScribeIngressQueue,
+    ingress_queue: ingress::ScribeIngressQueue,
     /// Optional stage recorder used by benchmark and journey harnesses.
     telemetry: Option<Arc<ScribeTelemetry>>,
 }
 
-struct ScribeBuildConfig {
-    admission: AdmissionConfig,
-    telemetry: Option<Arc<ScribeTelemetry>>,
-    coordination_runtime: Handle,
-    post_ack_cpu: ScribePostAckCpuPool,
-    wal_io: ScribeWalIoPool,
-    ingress_cpu: ScribeIngressCpuPool,
-    ingress_queue_items: usize,
-    ingress_queue_bytes: usize,
-}
-
-struct IngressJob {
-    frame: ScribeIngressFrame,
-    reservation: IngressQueueReservation,
-    response: oneshot::Sender<Result<FrameAdmission, ScribeError>>,
-}
-
-#[derive(Debug)]
-struct ScribeIngressQueue {
-    sender: mpsc::Sender<IngressJob>,
-    budget: IngressQueueBudget,
-    telemetry: Arc<Mutex<Option<Arc<ScribeTelemetry>>>>,
-    _task: tokio::task::JoinHandle<()>,
-}
-
-impl ScribeIngressQueue {
-    fn new(
-        items: usize,
-        bytes: usize,
-        admission: AdmissionController,
-        ingress_cpu: ScribeIngressCpuPool,
-        registry: Arc<TenantTableWriterRegistry>,
-        telemetry: Option<Arc<ScribeTelemetry>>,
-        coordination_runtime: Handle,
-    ) -> Self {
-        let capacity = items.max(1);
-        let budget = IngressQueueBudget::with_config(IngressQueueConfig {
-            max_items: capacity,
-            max_bytes: bytes,
-        });
-        let telemetry_slot = Arc::new(Mutex::new(telemetry));
-        let task_telemetry = Arc::clone(&telemetry_slot);
-        let (sender, mut receiver) = mpsc::channel(capacity);
-        let task = coordination_runtime.spawn(async move {
-            while let Some(job) = receiver.recv().await {
-                let IngressJob {
-                    frame,
-                    mut reservation,
-                    response,
-                } = job;
-                let telemetry = task_telemetry
-                    .lock()
-                    .ok()
-                    .and_then(|telemetry| telemetry.clone());
-                let result = process_ingress_frame(
-                    frame,
-                    &mut reservation,
-                    &admission,
-                    &ingress_cpu,
-                    &registry,
-                    telemetry.as_ref(),
-                )
-                .await;
-                let _ = response.send(result);
-            }
-        });
-        Self {
-            sender,
-            budget,
-            telemetry: telemetry_slot,
-            _task: task,
-        }
-    }
-
-    fn set_telemetry(&self, telemetry: Arc<ScribeTelemetry>) {
-        if let Ok(mut slot) = self.telemetry.lock() {
-            *slot = Some(telemetry);
-        }
-    }
-
-    async fn submit(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
-            return Err(ScribeError::PayloadTooLarge {
-                bytes: frame.measured_wire_bytes,
-            });
-        }
-        let table = frame.binding.table_ref.fqn();
-        let bytes = frame
-            .measured_wire_bytes
-            .saturating_add(REQUEST_OVERHEAD_BYTES);
-        let reservation = self.budget.try_reserve(table.clone(), bytes)?;
-        let (response, result) = oneshot::channel();
-        match self.sender.try_send(IngressJob {
-            frame,
-            reservation,
-            response,
-        }) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                return Err(ScribeError::IngestBusy { table });
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(ScribeError::Internal {
-                    detail: "ingress dispatcher is closed".to_owned(),
-                });
-            }
-        }
-        result.await.map_err(|_| ScribeError::Internal {
-            detail: "ingress dispatcher dropped its frame result".to_owned(),
-        })?
-    }
+pub struct ScribeBuildConfig {
+    /// Admission bounds for retained frames and active writers.
+    pub admission: AdmissionConfig,
+    /// Optional stage recorder for benchmarks and journey harnesses.
+    pub telemetry: Option<Arc<ScribeTelemetry>>,
+    /// Runtime used for Scribe coordination tasks.
+    pub coordination_runtime: Handle,
+    /// Server-provisioned CPU and WAL execution pools.
+    pub execution_pools: ScribeExecutionPools,
+    /// Maximum number of queued ingress items.
+    pub ingress_queue_items: usize,
+    /// Maximum bytes represented by queued ingress items.
+    pub ingress_queue_bytes: usize,
 }
 
 impl ScribeImpl {
     /// Construct a new `ScribeImpl` with empty memtable and provided dependencies.
-    pub fn new_with_deps(
+    pub fn new_for_embedded_with_deps(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
         node_id: String,
         writer_epoch: i64,
     ) -> Self {
-        Self::new_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
+        Self::new_for_embedded_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
     }
 
     /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
     ///
-    /// Server deployments pass the handle for their dedicated WAL coordination
-    /// runtime here. Tests and embedded callers can use [`Self::new_with_deps`]
-    /// to schedule consumers on the current runtime.
-    pub fn new_with_runtime(
+    /// Server deployments use [`Self::new_with_execution_pools`]. Tests and
+    /// embedded callers may use this constructor on the current runtime.
+    pub fn new_for_embedded_with_runtime(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
         node_id: String,
         writer_epoch: i64,
         coordination_runtime: Handle,
     ) -> Self {
-        Self::new_with_runtime_config(
+        Self::new_for_embedded_with_runtime_config(
             operator,
             wal,
             node_id,
@@ -272,7 +200,7 @@ impl ScribeImpl {
     }
 
     /// Construct Scribe with explicitly provisioned execution lanes.
-    pub fn new_with_runtime_config(
+    pub fn new_for_embedded_with_runtime_config(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
         node_id: String,
@@ -280,7 +208,7 @@ impl ScribeImpl {
         lane_config: ScribeLaneConfig,
         coordination_runtime: Handle,
     ) -> Self {
-        Self::new_with_runtime_config_and_admission(
+        Self::new_for_embedded_with_runtime_config_and_admission(
             operator,
             wal,
             node_id,
@@ -292,7 +220,7 @@ impl ScribeImpl {
     }
 
     /// Construct Scribe with explicit execution lanes and admission bounds.
-    pub fn new_with_runtime_config_and_admission(
+    pub fn new_for_embedded_with_runtime_config_and_admission(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
         node_id: String,
@@ -310,22 +238,35 @@ impl ScribeImpl {
                 admission,
                 telemetry: None,
                 coordination_runtime,
-                post_ack_cpu: ScribePostAckCpuPool::new_with_capacity(
-                    lane_config.post_ack_cpu_threads,
-                    lane_config.post_ack_queue_items,
-                ),
-                wal_io: ScribeWalIoPool::new_with_capacity(
-                    lane_config.wal_io_threads,
-                    lane_config.wal_io_queue_items,
-                ),
-                ingress_cpu: ScribeIngressCpuPool::new_with_capacity(
-                    lane_config.ingress_cpu_threads,
-                    lane_config.ingress_queue_items,
+                execution_pools: ScribeExecutionPools::new(
+                    ScribeIngressCpuPool::new_with_capacity(
+                        lane_config.ingress_cpu_threads,
+                        lane_config.ingress_queue_items,
+                    ),
+                    ScribePostAckCpuPool::new_with_capacity(
+                        lane_config.post_ack_cpu_threads,
+                        lane_config.post_ack_queue_items,
+                    ),
+                    ScribeWalIoPool::new_with_capacity(
+                        lane_config.wal_io_threads,
+                        lane_config.wal_io_queue_items,
+                    ),
                 ),
                 ingress_queue_items: lane_config.ingress_queue_items,
                 ingress_queue_bytes: lane_config.ingress_queue_bytes,
             },
         )
+    }
+
+    /// Construct Scribe from execution lanes provisioned by server boot.
+    pub fn new_with_execution_pools(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        config: ScribeBuildConfig,
+    ) -> Self {
+        Self::new_with_components(operator, wal, node_id, writer_epoch, config)
     }
 
     fn new_with_components(
@@ -340,13 +281,16 @@ impl ScribeImpl {
         let ScribeBuildConfig {
             telemetry,
             coordination_runtime,
-            post_ack_cpu,
-            wal_io,
-            ingress_cpu,
+            execution_pools,
             ingress_queue_items,
             ingress_queue_bytes,
             ..
         } = config;
+        let ScribeExecutionPools {
+            ingress_cpu,
+            post_ack_cpu,
+            wal_io,
+        } = execution_pools;
         let registry = TenantTableWriterRegistry::new_with_runtime(
             admission.clone(),
             Arc::clone(&memtable),
@@ -356,14 +300,14 @@ impl ScribeImpl {
             telemetry.clone(),
             coordination_runtime.clone(),
         );
-        let ingress_queue = ScribeIngressQueue::new(
+        let ingress_queue = ingress::ScribeIngressQueue::new(
             ingress_queue_items,
             ingress_queue_bytes,
             admission.clone(),
             ingress_cpu.clone(),
             Arc::clone(&registry),
             telemetry.clone(),
-            coordination_runtime,
+            &coordination_runtime,
         );
         Self {
             memtable,
@@ -372,6 +316,7 @@ impl ScribeImpl {
             node_id,
             writer_epoch,
             admission,
+            post_ack_cpu,
             wal_io,
             ingress_cpu,
             registry,
@@ -438,9 +383,11 @@ impl ScribeImpl {
                 admission: admission_config,
                 telemetry: None,
                 coordination_runtime: Handle::current(),
-                post_ack_cpu,
-                wal_io,
-                ingress_cpu: ScribeIngressCpuPool::new(1),
+                execution_pools: ScribeExecutionPools::new(
+                    ScribeIngressCpuPool::new(1),
+                    post_ack_cpu,
+                    wal_io,
+                ),
                 ingress_queue_items: 256,
                 ingress_queue_bytes: 512 * 1024 * 1024,
             },
@@ -458,7 +405,15 @@ impl ScribeImpl {
 
     /// Stop accepting new writer work and drain the bounded execution lanes.
     pub async fn shutdown(&self) {
+        let started = std::time::Instant::now();
+        self.ingress_queue.close_and_drain().await;
         self.registry.shutdown().await;
+        self.post_ack_cpu.drain().await;
+        self.wal_io.drain().await;
+        self.ingress_cpu.drain().await;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record("shutdown", started.elapsed(), 0, 0);
+        }
     }
 
     /// Retire idle writers after the pod lifecycle scanner's tick.
@@ -475,8 +430,10 @@ impl ScribeImpl {
     /// Return the current admission, lane, and writer health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
-        let lanes = self.registry.lane_snapshot();
+        let post_ack = self.registry.post_ack_snapshot();
+        let wal_io = self.registry.wal_io_snapshot();
         let ingress = self.ingress_cpu.snapshot();
+        let lanes = self.registry.lane_snapshot();
         ScribeRuntimeSnapshot {
             admission: self.admission.snapshot(),
             executor: crate::scribe::telemetry::ExecutorSnapshot {
@@ -485,7 +442,13 @@ impl ScribeImpl {
                 saturation_events: lanes
                     .saturation_events
                     .saturating_add(ingress.saturation_events),
+                completed: lanes.completed.saturating_add(ingress.completed),
+                failed: lanes.failed.saturating_add(ingress.failed),
+                panicked: lanes.panicked.saturating_add(ingress.panicked),
             },
+            ingress,
+            post_ack,
+            wal_io,
             writers: self.registry.health_snapshot(),
             durability: self
                 .telemetry
@@ -559,83 +522,6 @@ impl Scribe for ScribeImpl {
     }
 }
 
-async fn process_ingress_frame(
-    frame: ScribeIngressFrame,
-    raw_reservation: &mut IngressQueueReservation,
-    admission: &AdmissionController,
-    ingress_cpu: &ScribeIngressCpuPool,
-    registry: &TenantTableWriterRegistry,
-    telemetry: Option<&Arc<ScribeTelemetry>>,
-) -> Result<FrameAdmission, ScribeError> {
-    let append_started = Instant::now();
-    frame
-        .binding
-        .validate_authenticated_tenant(frame.principal.tenant_id)
-        .map_err(|error| ScribeError::Internal {
-            detail: error.to_string(),
-        })?;
-    let rows = ingress_cpu
-        .decode(
-            frame.payload,
-            frame.principal.clone(),
-            frame.expected_schema_fingerprint,
-            frame.request_id.clone(),
-            frame.batch_id,
-        )
-        .await?;
-    let append_rows = rows.num_rows();
-    let total_rows = frame
-        .stream_rows_before
-        .saturating_add(u64::try_from(append_rows).unwrap_or(u64::MAX));
-    if total_rows > frame.stream_rows_limit {
-        return Err(ScribeError::TooManyRows {
-            rows: total_rows,
-            limit: frame.stream_rows_limit,
-        });
-    }
-    let append_wire_bytes = frame.measured_wire_bytes;
-    let estimated_bytes = rows
-        .get_array_memory_size()
-        .saturating_add(frame.measured_wire_bytes)
-        .saturating_add(REQUEST_OVERHEAD_BYTES);
-    let reservation = raw_reservation.transfer_to_retained(
-        admission,
-        frame.binding.table_ref.fqn(),
-        estimated_bytes,
-    )?;
-    let admitted = AdmittedAppend {
-        request_id: frame.request_id,
-        batch_id: frame.batch_id,
-        frame_sequence: frame.frame_sequence,
-        audit_event: frame.audit_event,
-        rows,
-        measured_wire_bytes: frame.measured_wire_bytes,
-        admitted_bytes: reservation.bytes(),
-        reservation,
-        tenant: frame.principal.tenant_id,
-        table: frame.binding.table_ref.clone(),
-        queued_at: Instant::now(),
-    };
-    let rows_accepted = admitted.rows.num_rows() as u64;
-    let (writer, created) = registry.get_or_create(frame.binding)?;
-    if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
-        if created {
-            registry.remove_if(&writer.key, writer.instance_id);
-        }
-        return Err(error);
-    }
-    if let Some(telemetry) = telemetry {
-        telemetry.record_accepted(append_rows);
-        telemetry.record(
-            "append",
-            append_started.elapsed(),
-            append_rows,
-            append_wire_bytes,
-        );
-    }
-    Ok(FrameAdmission { rows_accepted })
-}
-
 impl ScribeImpl {
     /// Sum of pending (un-fsynced or un-truncated) WAL bytes on this pod.
     #[must_use]
@@ -661,6 +547,12 @@ impl ScribeImpl {
     #[must_use]
     pub fn admission_snapshot(&self) -> admission::AdmissionSnapshot {
         self.admission.snapshot()
+    }
+
+    /// Return the bounded ingress CPU pool for Gate protocol projection.
+    #[must_use]
+    pub fn ingress_cpu_pool(&self) -> ScribeIngressCpuPool {
+        self.ingress_cpu.clone()
     }
 
     /// Return the number of active tenant/table writer actors.
@@ -831,6 +723,7 @@ impl ScribeImpl {
 
     /// Replay WAL through the bounded filesystem lane before readiness.
     pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
+        let started = std::time::Instant::now();
         let crate::scribe::execution_lanes::ScribeWalIoResult::Replayed(replayed) = self
             .wal_io
             .submit(
@@ -844,12 +737,31 @@ impl ScribeImpl {
                 detail: "WAL IO lane returned the wrong replay result".to_owned(),
             });
         };
-        let restored = replayed
-            .values()
-            .map(|state| self.restore_replayed(state).map(|_| ()))
-            .collect::<Result<Vec<_>, _>>()?
-            .len();
+        let mut restored = 0;
+        for state in replayed.values() {
+            let result = self
+                .post_ack_cpu
+                .submit(
+                    crate::scribe::execution_lanes::ScribePostAckCpuOp::RestoreReplay {
+                        memtable: Arc::clone(&self.memtable),
+                        replayed: Box::new(state.clone()),
+                    },
+                )
+                .await?;
+            if !matches!(
+                result,
+                crate::scribe::execution_lanes::ScribePostAckCpuResult::ReplayRestored
+            ) {
+                return Err(ScribeError::Internal {
+                    detail: "post-ACK CPU lane returned the wrong replay result".to_owned(),
+                });
+            }
+            restored += 1;
+        }
         self.memtable_stats()?;
+        if let Some(telemetry) = &self.telemetry {
+            telemetry.record("replay_wal", started.elapsed(), restored, 0);
+        }
         Ok(restored)
     }
 

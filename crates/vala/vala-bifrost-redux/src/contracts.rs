@@ -120,6 +120,18 @@ pub enum ScribeError {
     #[error("ingest stream too many rows: {rows} > {limit}")]
     TooManyRows { rows: u64, limit: u64 },
 
+    #[error("ingest frame validation failed")]
+    InvalidFrame,
+
+    #[error("ingest card scope validation failed")]
+    CardScopeDenied,
+
+    #[error("ingest card identity could not be resolved")]
+    CardUnresolved,
+
+    #[error("ingress dispatcher is closed")]
+    IngressClosed,
+
     #[error("object store PUT failed")]
     ObjectStorePutFailed(#[source] opendal::Error),
 
@@ -148,6 +160,14 @@ impl ScribeError {
             },
             Self::TooManyRows { rows, limit } => BifrostError::Internal {
                 detail: format!("ingest stream too many rows: {rows} > {limit}"),
+            },
+            Self::InvalidFrame | Self::CardScopeDenied | Self::CardUnresolved => {
+                BifrostError::Internal {
+                    detail: "ingest frame validation failed".to_owned(),
+                }
+            }
+            Self::IngressClosed => BifrostError::Internal {
+                detail: "ingress dispatcher is closed".to_owned(),
             },
             Self::ObjectStorePutFailed(e) => BifrostError::Internal {
                 detail: format!("object store PUT failed: {e}"),

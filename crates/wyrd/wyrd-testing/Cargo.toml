@@ -43,7 +43,6 @@ wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
-vala-ingest = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }

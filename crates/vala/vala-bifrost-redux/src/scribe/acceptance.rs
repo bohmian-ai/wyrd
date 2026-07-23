@@ -370,7 +370,7 @@ async fn boot_replay_restores_pending_generation() {
     handle.append_frame(&frame).expect("append");
     handle.sync_data().expect("fsync");
 
-    let recovered = ScribeImpl::new_with_deps(
+    let recovered = ScribeImpl::new_for_embedded_with_deps(
         test_operator(),
         wal,
         "00000000-0000-0000-0000-000000000000".to_owned(),
@@ -543,6 +543,9 @@ async fn post_ack_lane_saturation_preserves_cross_writer_progress() {
                 Ok(ScribePostAckCpuResult::Prepared(_)) => Ok(()),
                 Ok(ScribePostAckCpuResult::ParquetEncoded(_)) => {
                     Err("post-ACK lane returned parquet result".to_owned())
+                }
+                Ok(ScribePostAckCpuResult::ReplayRestored) => {
+                    Err("post-ACK lane returned replay result".to_owned())
                 }
                 Err(error) => Err(error.to_string()),
             }

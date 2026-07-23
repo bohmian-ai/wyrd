@@ -16,7 +16,6 @@ use vala_sdk::{BifrostFrame, BifrostGrpcTransport, IngestTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::TableScopeWire;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
 
@@ -51,7 +50,6 @@ async fn run_closeout_journey(
                 Field::new("id", DataType::Int64, false),
                 Field::new("value", DataType::Utf8, false),
             ],
-            scope: TableScopeWire::TenantOwned,
             tenant,
             audit: None,
         })

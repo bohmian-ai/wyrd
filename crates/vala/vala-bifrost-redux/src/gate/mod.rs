@@ -50,6 +50,15 @@ use crate::schema::fingerprint::SchemaFingerprint;
 /// adapter; Gate does not depend on a concrete catalog implementation.
 #[async_trait]
 pub trait Catalog: Send + Sync {
+    async fn ensure_builtin_for_table(
+        &self,
+        _namespace: BifrostNamespace,
+        _table: &str,
+        _tenant: DataTenantId,
+    ) -> Result<(), CatalogError> {
+        Ok(())
+    }
+
     async fn table_schema_fingerprint(
         &self,
         namespace: BifrostNamespace,
@@ -60,6 +69,24 @@ pub trait Catalog: Send + Sync {
 
 #[async_trait]
 impl Catalog for BifrostCatalog {
+    async fn ensure_builtin_for_table(
+        &self,
+        namespace: BifrostNamespace,
+        table: &str,
+        tenant: DataTenantId,
+    ) -> Result<(), CatalogError> {
+        let Some(definition) = crate::tables::builtin_table(
+            namespace.as_str().strip_prefix("vala.").unwrap_or_default(),
+            table,
+        ) else {
+            return Ok(());
+        };
+        self.ensure_builtin(tenant, definition)
+            .await
+            .map(|_| ())
+            .map_err(|error| CatalogError::Internal(error.to_string()))
+    }
+
     async fn table_schema_fingerprint(
         &self,
         namespace: BifrostNamespace,
@@ -358,6 +385,13 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 table: table_fqn.to_owned(),
             });
         }
+        self.catalog
+            .ensure_builtin_for_table(namespace, &name, auth.tenant)
+            .await
+            .map_err(|error| {
+                record_gate_event("catalog_failure");
+                IngestError::from_catalog(error)
+            })?;
         let registered_fingerprint = self
             .catalog
             .table_schema_fingerprint(namespace, &name, auth.tenant)
@@ -457,6 +491,14 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         if namespace == BifrostNamespace::System {
             return Err(IngestError::SystemTableWriteDenied { table: frame.table });
         }
+        self.catalog
+            .ensure_builtin_for_table(namespace, &name, auth.tenant)
+            .await
+            .map_err(|error| {
+                record_gate_event("catalog_failure");
+                metrics::counter!("bifrost_gate_frames_total", "status" => "rejected").increment(1);
+                IngestError::from_catalog(error)
+            })?;
         let registered_fingerprint = self
             .catalog
             .table_schema_fingerprint(namespace, &name, auth.tenant)

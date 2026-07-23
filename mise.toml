@@ -422,21 +422,8 @@ run = "bash scripts/checks/pyo3-scope.sh"
 
 [tasks."check:redux-isolation"]
 hide = true
-description = "Assert Redux has no legacy Bifrost, server, transport, or auth dependencies"
-run = """
-if rg -n --glob 'Cargo.toml' --glob '*.rs' \\
-  -e 'vala-bifrost' \\
-  -e '\\bwyrd-auth-verify\\b' \\
-  -e '\\bwyrd-tonic\\b' \\
-  -e '\\btonic::' \\
-  -e '\\baxum::' \\
-  -e '\\bhyper::' \\
-  -e '\\bwyrd-server\\b' \\
-  crates/vala/vala-bifrost-redux/Cargo.toml crates/vala/vala-bifrost-redux/src | \\
-  grep -v 'vala-bifrost-redux'; then
-  exit 1
-fi
-"""
+description = "Assert Redux has no legacy Bifrost dependency and run the negative self-test"
+run = "bash scripts/checks/redux-isolation.sh"
 
 [tasks."check:mocks-scope"]
 hide = true

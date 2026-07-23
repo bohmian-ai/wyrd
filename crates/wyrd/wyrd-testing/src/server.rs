@@ -21,6 +21,7 @@ use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -107,6 +108,7 @@ pub struct WyrdTestServerBuilder {
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
     wal_sync_delay: Duration,
+    scribe_admission: Option<AdmissionConfig>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -123,6 +125,7 @@ impl Default for WyrdTestServerBuilder {
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
             wal_sync_delay: Duration::ZERO,
+            scribe_admission: None,
         }
     }
 }
@@ -268,6 +271,14 @@ impl WyrdTestServer {
             .flush_scribe_for_test(conn)
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))
+    }
+
+    /// Trip the server-owned WAL breaker for a deterministic benchmark probe.
+    pub fn trip_bifrost_wal_disk_full_for_test(&self) -> Result<(), WyrdTestServerError> {
+        self.inner
+            .state
+            .trip_scribe_wal_disk_full_for_test()
+            .map_err(WyrdTestServerError::Start)
     }
 
     /// Return the base URL when bound to a real socket.
@@ -1097,6 +1108,13 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Override Scribe admission limits for deterministic test-tier probes.
+    #[must_use]
+    pub fn with_scribe_admission_for_test(mut self, admission: AdmissionConfig) -> Self {
+        self.scribe_admission = Some(admission);
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1267,19 +1285,32 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let scribe = if self.wal_sync_delay.is_zero() {
-            ScribeImpl::new_for_embedded_with_deps(
-                Arc::new(storage.operator().clone()),
-                wal,
-                node_id.to_string(),
-                1,
-            )
+            if let Some(admission) = self.scribe_admission {
+                ScribeImpl::new_for_embedded_with_runtime_config_and_admission(
+                    Arc::new(storage.operator().clone()),
+                    wal,
+                    node_id.to_string(),
+                    1,
+                    vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                    admission,
+                    tokio::runtime::Handle::current(),
+                )
+            } else {
+                ScribeImpl::new_for_embedded_with_deps(
+                    Arc::new(storage.operator().clone()),
+                    wal,
+                    node_id.to_string(),
+                    1,
+                )
+            }
         } else {
-            ScribeImpl::try_new_for_embedded_with_wal_sync_delay(
+            ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
                 Arc::new(storage.operator().clone()),
                 wal,
                 node_id.to_string(),
                 1,
                 self.wal_sync_delay,
+                self.scribe_admission.unwrap_or_default(),
             )
             .map_err(WyrdTestServerError::Start)?
         };

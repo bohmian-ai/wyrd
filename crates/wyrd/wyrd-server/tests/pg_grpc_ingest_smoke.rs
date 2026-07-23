@@ -5,7 +5,7 @@
 //! token passes auth (the empty stream then terminates without an Unauthenticated
 //! error). Reuses the same key/verifier setup as `router_smoke.rs`.
 
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;

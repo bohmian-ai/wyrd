@@ -8,9 +8,7 @@ use iceberg::TableCreation;
 use iceberg::spec::FormatVersion;
 use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{
-    AuditEvent, BifrostTableDescription, BifrostTableEntry, TableScopeWire,
-};
+use wyrd_spec::vala::api::{AuditEvent, BifrostTableDescription, BifrostTableEntry};
 use wyrd_storage::settings::BackendConfig;
 
 use crate::catalog::error::BifrostCatalogError;
@@ -20,7 +18,9 @@ use crate::catalog::wire::{
     entry_from_row, fields_from_stored_schema, reject_reserved_field_names,
 };
 use crate::catalog::{TableRef, TenantTableBinding, build_partition_spec};
+use crate::namespaces::BifrostNamespace;
 use crate::schema::{SchemaFingerprint, with_system_columns};
+use crate::tables::{BuiltinTableDefinition, builtin_table};
 
 /// Opaque 16-byte table identity stored in `vala.bifrost_tables`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,8 +50,6 @@ pub struct CreateTableRequest {
     pub table: TableRef,
     /// User fields before Redux appends server-owned columns.
     pub user_fields: Vec<Field>,
-    /// Public registration scope retained as control-plane metadata.
-    pub scope: TableScopeWire,
     /// Authenticated organization that owns the registration and physical table.
     pub tenant: DataTenantId,
     /// Optional audit event committed with the tenant-scoped control row.
@@ -110,6 +108,86 @@ impl BifrostCatalog {
         &self,
         request: CreateTableRequest,
     ) -> Result<TableUid, BifrostCatalogError> {
+        if builtin_table(
+            request
+                .table
+                .namespace
+                .as_str()
+                .strip_prefix("vala.")
+                .unwrap_or_default(),
+            &request.table.name,
+        )
+        .is_some()
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "built-in tables must be provisioned with ensure_builtin".to_owned(),
+            ));
+        }
+        self.create_table_locked(request, None).await
+    }
+
+    /// Register a caller-owned dataset in the tenant-qualified dataset namespace.
+    ///
+    /// # Errors
+    /// Returns a typed catalog error when the dataset name, schema, physical table,
+    /// control row, or audit event is invalid.
+    pub async fn register_dataset(
+        &self,
+        tenant: DataTenantId,
+        table: TableRef,
+        user_fields: Vec<Field>,
+        audit: Option<AuditEvent>,
+    ) -> Result<TableUid, BifrostCatalogError> {
+        if table.namespace != BifrostNamespace::Datasets {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "caller-owned registrations must use vala.datasets".to_owned(),
+            ));
+        }
+        self.create_table_locked(
+            CreateTableRequest {
+                table,
+                user_fields,
+                tenant,
+                audit,
+            },
+            None,
+        )
+        .await
+    }
+
+    /// Ensure one canonical built-in exists for a tenant.
+    ///
+    /// Built-ins are lazy: this method is the only path that creates one, and
+    /// callers choose when a tenant first needs the table.
+    pub async fn ensure_builtin(
+        &self,
+        tenant: DataTenantId,
+        definition: &'static BuiltinTableDefinition,
+    ) -> Result<TableUid, BifrostCatalogError> {
+        let namespace =
+            BifrostNamespace::from_domain_namespace(definition.namespace).ok_or_else(|| {
+                BifrostCatalogError::MetadataMismatch(format!(
+                    "unknown built-in namespace: {}",
+                    definition.namespace
+                ))
+            })?;
+        self.create_table_locked(
+            CreateTableRequest {
+                table: TableRef::new(namespace, definition.name),
+                user_fields: (definition.arrow_fields)(),
+                tenant,
+                audit: None,
+            },
+            Some((definition.schema)()),
+        )
+        .await
+    }
+
+    async fn create_table_locked(
+        &self,
+        request: CreateTableRequest,
+        canonical_schema: Option<arrow::datatypes::SchemaRef>,
+    ) -> Result<TableUid, BifrostCatalogError> {
         reject_reserved_field_names(&request.user_fields)?;
         let binding = TenantTableBinding::resolve((request.tenant, request.table))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
@@ -117,50 +195,81 @@ impl BifrostCatalog {
         let fingerprint =
             SchemaFingerprint::from_arrow_schema(&Schema::new(request.user_fields.clone()));
 
-        if let Some(row) = self.lookup_table_row(&fqn, request.tenant).await? {
+        let mut conn = self.postgres.tenant_conn(request.tenant).await?;
+        acquire_table_advisory_lock(&mut conn, request.tenant, &fqn).await?;
+        let row = vala_sql::queries::olap_catalog::get_by_fqn(&mut conn, &fqn).await?;
+        let table_ident = binding.table_ident();
+        let physical_exists = self.catalog.table_exists(&table_ident).await?;
+
+        if let Some(row) = row {
             if row.fingerprint.as_slice() != fingerprint.as_ref() {
                 return Err(BifrostCatalogError::FingerprintMismatch(fqn));
             }
+            if !physical_exists {
+                return Err(BifrostCatalogError::MetadataMismatch(format!(
+                    "control registration exists without physical table: {table_ident}"
+                )));
+            }
+            let physical = self.catalog.load_table(&table_ident).await?;
+            self.validate_physical_table(
+                &physical,
+                &binding,
+                canonical_schema
+                    .as_deref()
+                    .unwrap_or(&Schema::new(with_system_columns(
+                        request.user_fields.clone(),
+                    ))),
+            )?;
+            conn.commit().await?;
             return TableUid::from_row(&row.table_uid, &row.fqn);
         }
 
         self.ensure_namespace(binding.physical_namespace()).await?;
-        let table_ident = binding.table_ident();
-        if self.catalog.table_exists(&table_ident).await? {
-            return Err(BifrostCatalogError::MetadataMismatch(format!(
-                "physical table exists without tenant registration: {table_ident}"
-            )));
+        if physical_exists {
+            let physical = self.catalog.load_table(&table_ident).await?;
+            self.validate_physical_table(
+                &physical,
+                &binding,
+                canonical_schema
+                    .as_deref()
+                    .unwrap_or(&Schema::new(with_system_columns(
+                        request.user_fields.clone(),
+                    ))),
+            )?;
+        } else {
+            let arrow_schema = canonical_schema
+                .as_deref()
+                .cloned()
+                .unwrap_or_else(|| Schema::new(with_system_columns(request.user_fields.clone())));
+            let iceberg_schema =
+                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
+            let partition_columns = binding.partition_columns();
+            let partition_spec = build_partition_spec(&iceberg_schema, &partition_columns)
+                .map_err(BifrostCatalogError::MetadataMismatch)?;
+            let location = format!(
+                "{}/{}",
+                self.warehouse.trim_end_matches('/'),
+                binding.object_prefix
+            );
+            let creation = TableCreation::builder()
+                .name(binding.table_name.clone())
+                .location(location)
+                .schema(iceberg_schema)
+                .format_version(FormatVersion::V2)
+                .partition_spec(partition_spec)
+                .build();
+            self.catalog
+                .create_table(binding.physical_namespace(), creation)
+                .await?;
         }
 
-        let arrow_schema = Schema::new(with_system_columns(request.user_fields));
-        let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
-        let partition_columns = binding.partition_columns();
-        let partition_spec = build_partition_spec(&iceberg_schema, &partition_columns)
-            .map_err(BifrostCatalogError::MetadataMismatch)?;
-        let location = format!(
-            "{}/{}",
-            self.warehouse.trim_end_matches('/'),
-            binding.object_prefix
-        );
-        let creation = TableCreation::builder()
-            .name(binding.table_name.clone())
-            .location(location)
-            .schema(iceberg_schema)
-            .format_version(FormatVersion::V2)
-            .partition_spec(partition_spec)
-            .build();
-        self.catalog
-            .create_table(binding.physical_namespace(), creation)
-            .await?;
-
         let table_uid = TableUid::new_v7();
-        let mut conn = self.postgres.tenant_conn(request.tenant).await?;
         vala_sql::queries::olap_catalog::upsert_table(
             &mut conn,
             table_uid.as_bytes(),
             &fqn,
             &fingerprint.0,
-            scope_db_value(request.scope),
+            "tenant_owned",
             &["wyrd_event_time".to_owned()],
         )
         .await?;
@@ -176,6 +285,42 @@ impl BifrostCatalog {
         }
         conn.commit().await?;
         Ok(table_uid)
+    }
+
+    fn validate_physical_table(
+        &self,
+        table: &iceberg::table::Table,
+        binding: &TenantTableBinding,
+        expected_schema: &Schema,
+    ) -> Result<(), BifrostCatalogError> {
+        let expected_location = format!(
+            "{}/{}",
+            self.warehouse.trim_end_matches('/'),
+            binding.object_prefix
+        );
+        if table.metadata().location() != expected_location {
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "physical table location mismatch: expected {expected_location}, found {}",
+                table.metadata().location()
+            )));
+        }
+        let actual_schema =
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?;
+        if !schema_shape_matches(expected_schema, &actual_schema) {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "physical table schema mismatch".to_owned(),
+            ));
+        }
+        let fields = table.metadata().default_partition_spec().fields();
+        if fields.len() != 1
+            || fields[0].name != "wyrd_event_time_day"
+            || fields[0].transform != iceberg::spec::Transform::Day
+        {
+            return Err(BifrostCatalogError::MetadataMismatch(
+                "physical table partition spec mismatch".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Return the registered user-schema fingerprint for one tenant/logical table.
@@ -266,9 +411,51 @@ impl BifrostCatalog {
     }
 }
 
-const fn scope_db_value(scope: TableScopeWire) -> &'static str {
-    match scope {
-        TableScopeWire::TenantOwned => "tenant_owned",
-        TableScopeWire::SystemShared => "system_shared",
+fn schema_shape_matches(expected: &Schema, actual: &Schema) -> bool {
+    expected.fields().len() == actual.fields().len()
+        && expected
+            .fields()
+            .iter()
+            .zip(actual.fields())
+            .all(|(expected, actual)| {
+                expected.name() == actual.name()
+                    && expected.is_nullable() == actual.is_nullable()
+                    && data_type_shape_matches(expected.data_type(), actual.data_type())
+            })
+}
+
+fn data_type_shape_matches(
+    expected: &arrow::datatypes::DataType,
+    actual: &arrow::datatypes::DataType,
+) -> bool {
+    if expected.equals_datatype(actual) {
+        return true;
     }
+    match (expected, actual) {
+        (
+            arrow::datatypes::DataType::Timestamp(expected_unit, Some(expected_timezone)),
+            arrow::datatypes::DataType::Timestamp(actual_unit, Some(actual_timezone)),
+        ) => {
+            expected_unit == actual_unit
+                && ((expected_timezone.as_ref() == "UTC" && actual_timezone.as_ref() == "+00:00")
+                    || (expected_timezone.as_ref() == "+00:00"
+                        && actual_timezone.as_ref() == "UTC"))
+        }
+        _ => false,
+    }
+}
+
+async fn acquire_table_advisory_lock(
+    conn: &mut wyrd_sql::TenantConn<'_>,
+    tenant: DataTenantId,
+    fqn: &str,
+) -> Result<(), BifrostCatalogError> {
+    let lock_key = format!("{}:{fqn}", tenant.as_uuid());
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+        .bind(lock_key)
+        .execute(&mut **conn.transaction())
+        .await
+        .map(|_| ())
+        .map_err(vala_sql::SqlError::from)
+        .map_err(BifrostCatalogError::Sql)
 }

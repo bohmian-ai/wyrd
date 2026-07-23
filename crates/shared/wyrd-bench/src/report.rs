@@ -217,7 +217,7 @@ pub struct ForgeMeasurements {
     pub peak_candidates: u64,
 }
 
-/// One required Scribe workload configuration from the Task 13 matrix.
+/// One required Scribe workload configuration from the full benchmark matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScribeMatrixCase {
     /// Approximate canonical batch size. `1` represents the one-row case.
@@ -243,10 +243,16 @@ pub struct ScribeCompactCase {
     pub frame_size_bytes: u64,
     /// Concurrent public SDK streams used by the case.
     pub writers: u32,
+    /// Requested tenant count.
+    pub tenants: u32,
+    /// Requested pod count.
+    pub pods: u32,
     /// Number of tables receiving frames in the case.
     pub tables: u32,
     /// Table distribution: all streams share one table or are dispersed.
     pub table_distribution: String,
+    /// Explicit writer routing mode.
+    pub routing_mode: String,
     /// Fsync mode declared by the case.
     pub fsync_mode: String,
     /// Injected fsync delay in milliseconds.
@@ -255,109 +261,202 @@ pub struct ScribeCompactCase {
     pub minimum_samples: u64,
 }
 
-/// Return the twelve-case compact Scribe matrix required by task 13d.
+type CompactCaseDefinition = (
+    &'static str,
+    u64,
+    u32,
+    u32,
+    u32,
+    u32,
+    &'static str,
+    &'static str,
+    u64,
+    u64,
+);
+
+const COMPACT_CASES: [CompactCaseDefinition; 12] = [
+    (
+        "tiny-w1-t1-p1-tbl1-same",
+        1,
+        1,
+        1,
+        1,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "tiny-w64-t1-p1-tbl1-same",
+        1,
+        64,
+        1,
+        1,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w1-t1-p1-tbl1-same",
+        64 * 1024,
+        1,
+        1,
+        1,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w64-t1-p1-tbl1-same",
+        64 * 1024,
+        64,
+        1,
+        1,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w64-t1-p3-tbl1-same",
+        64 * 1024,
+        64,
+        1,
+        3,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w64-t10-p3-tbl1-same",
+        64 * 1024,
+        64,
+        10,
+        3,
+        1,
+        "same",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w64-t10-p3-tbl8-dispersed",
+        64 * 1024,
+        64,
+        10,
+        3,
+        8,
+        "dispersed",
+        "normal",
+        0,
+        1_000,
+    ),
+    (
+        "64k-w64-t10-p3-tbl1-delayed",
+        64 * 1024,
+        64,
+        10,
+        3,
+        1,
+        "same",
+        "delayed_test_only",
+        60,
+        1_000,
+    ),
+    (
+        "1m-w32-t4-p3-tbl1-same",
+        1024 * 1024,
+        32,
+        4,
+        3,
+        1,
+        "same",
+        "normal",
+        0,
+        256,
+    ),
+    (
+        "8m-w8-t4-p3-tbl8-dispersed",
+        8 * 1024 * 1024,
+        8,
+        4,
+        3,
+        8,
+        "dispersed",
+        "normal",
+        0,
+        64,
+    ),
+    (
+        "32m-w1-t1-p1-tbl1-same",
+        32 * 1024 * 1024,
+        1,
+        1,
+        1,
+        1,
+        "same",
+        "normal",
+        0,
+        16,
+    ),
+    (
+        "32m-w4-t4-p3-tbl4-dispersed",
+        32 * 1024 * 1024,
+        4,
+        4,
+        3,
+        4,
+        "dispersed",
+        "delayed_test_only",
+        60,
+        16,
+    ),
+];
+
+/// Return the twelve-case compact Scribe matrix required by the closeout.
 #[must_use]
 pub fn compact_scribe_matrix() -> Vec<ScribeCompactCase> {
-    [
-        ("tiny-1-normal", 1, 1, 1, "same", "normal", 0, 1_000),
-        ("tiny-64-normal", 1, 64, 1, "same", "normal", 0, 1_000),
-        ("64k-1-normal", 64 * 1024, 1, 1, "same", "normal", 0, 1_000),
-        (
-            "64k-64-normal",
-            64 * 1024,
-            64,
-            1,
-            "same",
-            "normal",
-            0,
-            1_000,
-        ),
-        (
-            "64k-64-64-normal",
-            64 * 1024,
-            64,
-            64,
-            "dispersed",
-            "normal",
-            0,
-            1_000,
-        ),
-        (
-            "64k-64-delayed",
-            64 * 1024,
-            64,
-            1,
-            "same",
-            "delayed",
-            60,
-            1_000,
-        ),
-        ("1m-1-normal", 1024 * 1024, 1, 1, "same", "normal", 0, 256),
-        ("1m-32-normal", 1024 * 1024, 32, 1, "same", "normal", 0, 256),
-        (
-            "8m-1-normal",
-            8 * 1024 * 1024,
-            1,
-            1,
-            "same",
-            "normal",
-            0,
-            64,
-        ),
-        (
-            "8m-8-8-normal",
-            8 * 1024 * 1024,
-            8,
-            8,
-            "dispersed",
-            "normal",
-            0,
-            64,
-        ),
-        (
-            "32m-1-normal",
-            32 * 1024 * 1024,
-            1,
-            1,
-            "same",
-            "normal",
-            0,
-            16,
-        ),
-        (
-            "32m-4-4-delayed",
-            32 * 1024 * 1024,
-            4,
-            4,
-            "dispersed",
-            "delayed",
-            60,
-            16,
-        ),
-    ]
-    .into_iter()
-    .map(
-        |(
-            id,
-            frame_size_bytes,
-            writers,
-            tables,
-            table_distribution,
-            fsync_mode,
-            fsync_delay_ms,
-            minimum_samples,
-        )| ScribeCompactCase {
-            id: id.to_owned(),
-            frame_size_bytes,
-            writers,
-            tables,
-            table_distribution: table_distribution.to_owned(),
-            fsync_mode: fsync_mode.to_owned(),
-            fsync_delay_ms,
-            minimum_samples,
-        },
-    )
-    .collect()
+    COMPACT_CASES
+        .into_iter()
+        .map(
+            |(
+                id,
+                frame_size_bytes,
+                writers,
+                tenants,
+                pods,
+                tables,
+                table_distribution,
+                fsync_mode,
+                fsync_delay_ms,
+                minimum_samples,
+            )| ScribeCompactCase {
+                id: id.to_owned(),
+                frame_size_bytes,
+                writers,
+                tenants,
+                pods,
+                tables,
+                table_distribution: table_distribution.to_owned(),
+                routing_mode: if table_distribution == "same" {
+                    "same_logical_table".to_owned()
+                } else {
+                    "dispersed_tenant_table_pod".to_owned()
+                },
+                fsync_mode: fsync_mode.to_owned(),
+                fsync_delay_ms,
+                minimum_samples,
+            },
+        )
+        .collect()
 }
 
 /// A distribution captured from a production metric series.
@@ -373,6 +472,37 @@ pub struct ScribeDistribution {
     pub p99: Option<u64>,
     /// Maximum observed value.
     pub max: u64,
+}
+
+/// Requested and observed writer placement for one case.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScribeTopologyEvidence {
+    /// Requested writer count.
+    pub requested_writers: u32,
+    /// Writers actually launched.
+    pub actual_writers: u32,
+    /// Requested tenant count.
+    pub requested_tenants: u32,
+    /// Tenants actually provisioned.
+    pub actual_tenants: u32,
+    /// Requested pod count.
+    pub requested_pods: u32,
+    /// Pods actually used.
+    pub actual_pods: u32,
+    /// Requested logical table count.
+    pub requested_logical_tables: u32,
+    /// Logical tables actually routed.
+    pub actual_logical_tables: u32,
+    /// Physical tables observed after provisioning.
+    pub actual_physical_tables: u32,
+    /// Explicit routing mode.
+    pub routing_mode: String,
+    /// Writer counts by pod.
+    pub writers_by_pod: BTreeMap<String, u32>,
+    /// Writer counts by tenant.
+    pub writers_by_tenant: BTreeMap<String, u32>,
+    /// Writer counts by logical table.
+    pub writers_by_table: BTreeMap<String, u32>,
 }
 
 /// Per-case absolute verification facts.
@@ -397,6 +527,8 @@ pub struct ScribeCaseVerification {
 pub struct ScribeCaseReport {
     /// Workload declaration.
     pub case: ScribeCompactCase,
+    /// Requested and observed topology evidence.
+    pub topology: ScribeTopologyEvidence,
     /// Frames sent after warmup.
     pub measured_frames: u64,
     /// Rows accepted by Gate/Scribe.
@@ -504,6 +636,8 @@ pub struct ScribeComparisonStatus {
     pub status: String,
     /// Human-readable reason for an unavailable comparison.
     pub reason: String,
+    /// Role of this artifact when no comparable baseline exists.
+    pub baseline_role: String,
 }
 
 /// Complete post-repair Scribe benchmark artifact.
@@ -548,6 +682,89 @@ impl ScribeBenchmarkReport {
     /// Serialize the report as stable pretty JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
+    }
+
+    /// Validate the closeout evidence without applying machine-dependent
+    /// throughput floors.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if self.comparison.baseline_available
+            || self.comparison.status != "unavailable"
+            || self.comparison.reason != "no valid pre-repair baseline exists"
+            || self.comparison.baseline_role != "initial_valid_post_repair"
+        {
+            errors.push("comparison metadata is not the explicit no-baseline state".to_owned());
+        }
+        let required = self
+            .required_metric_families
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        for case in &self.cases {
+            if case.topology.requested_writers != case.topology.actual_writers
+                || case.topology.requested_tenants != case.topology.actual_tenants
+                || case.topology.requested_pods != case.topology.actual_pods
+                || case.topology.requested_logical_tables != case.topology.actual_logical_tables
+                || case.topology.actual_physical_tables == 0
+                || case.topology.actual_physical_tables
+                    > case
+                        .topology
+                        .actual_tenants
+                        .saturating_mul(case.topology.requested_logical_tables)
+            {
+                errors.push(format!("topology mismatch in case {}", case.case.id));
+            }
+            if !required.is_subset(
+                &case
+                    .required_metrics_observed
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+            ) {
+                errors.push(format!(
+                    "required metric families missing in case {}",
+                    case.case.id
+                ));
+            }
+            if case.measured_frames < case.case.minimum_samples
+                || case.metric_series_limit_exceeded
+                || !case.verification.passed
+                || !case.verification.drain_zero_gap
+                || !case.verification.retained_within_ceiling
+            {
+                errors.push(format!("verification incomplete in case {}", case.case.id));
+            }
+            if case.case.fsync_mode == "delayed_test_only"
+                && case.case.frame_size_bytes == 64 * 1024
+                && case.fsync_per_frame > 0.25
+            {
+                errors.push(format!(
+                    "delayed fsync grouping exceeded the ceiling in {}",
+                    case.case.id
+                ));
+            }
+            if case.case.frame_size_bytes <= 64 * 1024
+                && case.ack.p99.is_some_and(|p99| p99 >= 5_000)
+            {
+                errors.push(format!("ACK p99 exceeded 5 ms in {}", case.case.id));
+            }
+        }
+        if self.verification.replay_exact_identity != Some(true)
+            || self.verification.exact_429 != Some(true)
+            || self.verification.exact_507 != Some(true)
+        {
+            errors.push("top-level negative-flow evidence is incomplete".to_owned());
+        }
+        if self
+            .required_metric_families
+            .iter()
+            .any(|metric| !self.metrics.contains_family(metric))
+        {
+            errors.push("report metric snapshot is missing a required family".to_owned());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     /// Write JSON and its adjacent concise Markdown summary.
@@ -610,7 +827,7 @@ impl ScribeBenchmarkReport {
     }
 }
 
-/// Every production metric family required by task 13d.
+/// Every production metric family required by the closeout.
 #[must_use]
 pub fn required_scribe_metric_families() -> Vec<String> {
     [
@@ -644,7 +861,7 @@ pub fn required_scribe_metric_families() -> Vec<String> {
     .collect()
 }
 
-/// Return the complete required Task 13 matrix (240 configurations).
+/// Return the complete required Scribe matrix (240 configurations).
 #[must_use]
 pub fn required_scribe_matrix() -> Vec<ScribeMatrixCase> {
     [
@@ -823,8 +1040,8 @@ mod tests {
     fn compact_scribe_matrix_has_the_locked_twelve_cases() {
         let matrix = compact_scribe_matrix();
         assert_eq!(matrix.len(), 12);
-        assert_eq!(matrix[5].fsync_delay_ms, 60);
-        assert_eq!(matrix[5].minimum_samples, 1_000);
+        assert_eq!(matrix[7].fsync_delay_ms, 60);
+        assert_eq!(matrix[7].minimum_samples, 1_000);
         assert_eq!(matrix[10].frame_size_bytes, 32 * 1024 * 1024);
         assert_eq!(matrix[11].writers, 4);
         assert_eq!(matrix[11].tables, 4);
@@ -839,6 +1056,7 @@ mod tests {
             comparison: ScribeComparisonStatus {
                 status: "unavailable".to_owned(),
                 reason: "pre-repair baseline was not captured".to_owned(),
+                baseline_role: "initial_valid_post_repair".to_owned(),
                 ..ScribeComparisonStatus::default()
             },
             ..ScribeBenchmarkReport::default()
@@ -846,5 +1064,26 @@ mod tests {
         let json = report.to_json().expect("scribe report serializes");
         assert!(json.contains("post-throughput"));
         assert!(report.to_markdown().contains("unavailable"));
+    }
+
+    #[test]
+    fn scribe_report_validation_rejects_missing_topology_metrics_and_negative_flows() {
+        let report = ScribeBenchmarkReport {
+            cases: vec![ScribeCaseReport {
+                case: compact_scribe_matrix()
+                    .into_iter()
+                    .next()
+                    .expect("compact case"),
+                ..ScribeCaseReport::default()
+            }],
+            required_metric_families: vec!["bifrost_gate_frames_total".to_owned()],
+            ..ScribeBenchmarkReport::default()
+        };
+        let errors = report
+            .validate()
+            .expect_err("incomplete evidence must fail closed");
+        assert!(errors.iter().any(|error| error.contains("topology")));
+        assert!(errors.iter().any(|error| error.contains("metric")));
+        assert!(errors.iter().any(|error| error.contains("negative-flow")));
     }
 }

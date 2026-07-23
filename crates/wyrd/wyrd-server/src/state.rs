@@ -273,6 +273,16 @@ impl AppState {
         })?;
         scribe.complete_post_commit(post_commit)
     }
+
+    /// Trip the Scribe WAL breaker for a deterministic test-tier probe.
+    #[cfg(feature = "test-support")]
+    pub fn trip_scribe_wal_disk_full_for_test(&self) -> Result<(), String> {
+        let Some(scribe) = &self.scribe else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        scribe.trip_wal_disk_full_for_test();
+        Ok(())
+    }
 }
 
 /// Errors raised by [`AppState::production_validate`].

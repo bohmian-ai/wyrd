@@ -2,9 +2,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
-use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, TableScopeWire, TableStatus, TimeUnit,
-};
+use wyrd_spec::vala::api::{BifrostTableEntry, DataTypeSpec, FieldSpec, TableStatus, TimeUnit};
 use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_system_column};
 
 use crate::catalog::BifrostCatalogError;
@@ -35,7 +33,6 @@ pub fn entry_from_row(row: &BifrostTableRow) -> Result<BifrostTableEntry, Bifros
         namespace: namespace.to_owned(),
         name: name.to_owned(),
         table_uid: to_hex(&row.table_uid),
-        scope: scope_from_db(&row.scope)?,
         status: status_from_db(&row.status)?,
         fingerprint: to_hex(&row.fingerprint),
         partition_columns: row.partition_columns.clone(),
@@ -62,16 +59,6 @@ pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, Bifr
         fields.push(spec);
     }
     Ok(fields)
-}
-
-fn scope_from_db(scope: &str) -> Result<TableScopeWire, BifrostCatalogError> {
-    match scope {
-        "tenant_owned" => Ok(TableScopeWire::TenantOwned),
-        "system_shared" => Ok(TableScopeWire::SystemShared),
-        other => Err(BifrostCatalogError::MetadataMismatch(format!(
-            "unknown table scope: {other}"
-        ))),
-    }
 }
 
 fn status_from_db(status: &str) -> Result<TableStatus, BifrostCatalogError> {

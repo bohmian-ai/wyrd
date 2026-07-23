@@ -6,14 +6,12 @@
 //! rendered by the single `WyrdErrorResponse`.
 
 use arrow::datatypes::Field;
-use vala_bifrost_redux::catalog::{
-    BifrostCatalog, BifrostCatalogError, CreateTableRequest, TableRef,
-};
+use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, TableRef};
 use wyrd_runtime::Permission;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditResult, BifrostTableDescription, BifrostTableEntry, RegisterOutcome,
-    RegisterTableRequest, RegisterTableResponse, TableScopeWire,
+    RegisterTableRequest, RegisterTableResponse,
 };
 
 use wyrd_runtime::PermissionVerdict;
@@ -81,26 +79,25 @@ async fn authorize_audited(
 
 /// Register (idempotently create) a Bifrost table.
 ///
-/// `SystemShared` registration requires `bifrost_table:install`; `TenantOwned`
-/// requires `bifrost_table:write`. A matching-fingerprint re-register returns
+/// Dataset registration requires `bifrost_table:write`. A matching-fingerprint re-register returns
 /// `AlreadyExists`; a conflicting schema is `WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH`.
 pub async fn register_table(
     state: &AppState,
     caller: Caller,
     body: RegisterTableRequest,
 ) -> Result<RegisterTableResponse, WyrdError> {
-    let required = match body.scope {
-        TableScopeWire::SystemShared => Permission::bifrost_table_install(),
-        TableScopeWire::TenantOwned => Permission::bifrost_table_write(),
-    };
-    let operation = match body.scope {
-        TableScopeWire::SystemShared => "vala.bifrost.install",
-        TableScopeWire::TenantOwned => "vala.bifrost.register",
-    };
+    let required = Permission::bifrost_table_write();
+    let operation = "vala.bifrost.register";
     let fqn_for_audit = format!("{}.{}", body.namespace, body.name);
     authorize_audited(state, &caller, &required, operation, &fqn_for_audit).await?;
 
     let ns = convert::namespace_from_wire(&body.namespace)?;
+    if ns != vala_bifrost_redux::namespaces::BifrostNamespace::Datasets {
+        return Err(WyrdError::Validation {
+            message: "only vala.datasets registrations are caller-owned".to_owned(),
+            details: serde_json::json!({ "table": fqn_for_audit }),
+        });
+    }
     let user_fields: Vec<Field> = body.fields.iter().map(convert::field_to_arrow).collect();
     let fingerprint = convert::fingerprint_hex(&user_fields);
 
@@ -150,13 +147,7 @@ pub async fn register_table(
                 "bifrost table registered",
             );
             let table_uid = catalog
-                .create_table(CreateTableRequest {
-                    table,
-                    user_fields,
-                    scope: body.scope,
-                    tenant: caller.data_tenant_id,
-                    audit: Some(event),
-                })
+                .register_dataset(caller.data_tenant_id, table, user_fields, Some(event))
                 .await
                 .map_err(map_engine_error)?;
             Ok(RegisterTableResponse {
@@ -265,11 +256,10 @@ mod pg_tests {
 
     fn register_req(name: &str, fields: Vec<FieldSpec>) -> RegisterTableRequest {
         RegisterTableRequest {
-            namespace: "vala.bifrost".to_owned(),
+            namespace: "vala.datasets".to_owned(),
             name: name.to_owned(),
             fields,
             partition_columns: vec![],
-            scope: TableScopeWire::TenantOwned,
         }
     }
 
@@ -344,27 +334,16 @@ mod pg_tests {
     }
 
     #[test]
-    fn bifrost_tables_register_system_shared_requires_install() {
+    fn bifrost_tables_register_reserved_namespace_is_rejected() {
         wyrd_runtime::runtime().block_on(async {
             let state = test_state().await;
-
-            // A write-only caller may not install a SystemShared table.
             let writer = caller_with([Permission::bifrost_table_write()]).await;
             let mut denied = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
-            denied.scope = TableScopeWire::SystemShared;
+            denied.namespace = "vala.traces".to_owned();
             let err = register_table(&state, writer, denied)
                 .await
-                .expect_err("write cannot install SystemShared");
-            assert_eq!(err.status(), 403);
-
-            // An install-capable caller can.
-            let installer = caller_with([Permission::bifrost_table_install()]).await;
-            let mut allowed = register_req(&unique_name(), vec![field("id", DataTypeSpec::Int64)]);
-            allowed.scope = TableScopeWire::SystemShared;
-            let created = register_table(&state, installer, allowed)
-                .await
-                .expect("install creates SystemShared");
-            assert_eq!(created.outcome, RegisterOutcome::Created);
+                .expect_err("built-in namespace is not caller-owned");
+            assert_eq!(err.status(), 400);
         });
     }
 
@@ -391,13 +370,14 @@ mod pg_tests {
             assert!(
                 entries
                     .iter()
-                    .any(|e| e.name == name && e.namespace == "vala.bifrost"),
+                    .any(|e| e.name == name && e.namespace == "vala.datasets"),
                 "registered table is listed"
             );
 
-            let described = describe_table(&state, caller, "vala.bifrost".to_owned(), name.clone())
-                .await
-                .expect("describe");
+            let described =
+                describe_table(&state, caller, "vala.datasets".to_owned(), name.clone())
+                    .await
+                    .expect("describe");
             assert_eq!(described.entry.name, name);
             assert!(
                 described

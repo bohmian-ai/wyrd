@@ -57,8 +57,8 @@ use wyrd_spec::vala::api::{
     AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
     BifrostTableDescription, BifrostTableEntry, DataTypeSpec, ExecutorAvailability,
     FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec, PartitionTransformWire, QueryParam,
-    RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableScopeWire,
-    TableStatus, TimeUnit,
+    RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableStatus,
+    TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -188,7 +188,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 3 C2a: Bifrost wire contract (table management + query).
     write::<BifrostTableEntry>(out, golden, "bifrost_table_entry")?;
     write::<BifrostTableDescription>(out, golden, "bifrost_table_description")?;
-    write::<TableScopeWire>(out, golden, "bifrost_table_scope")?;
     write::<TableStatus>(out, golden, "bifrost_table_status")?;
     write::<DataTypeSpec>(out, golden, "bifrost_data_type_spec")?;
     write::<BifrostFieldSpec>(out, golden, "bifrost_field_spec")?;

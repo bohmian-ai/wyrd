@@ -12,7 +12,6 @@ use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::TableScopeWire;
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
 
@@ -53,7 +52,6 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
                     Field::new("id", DataType::Int64, false),
                     Field::new("value", DataType::Utf8, false),
                 ],
-                scope: TableScopeWire::TenantOwned,
                 tenant: *tenant,
                 audit: None,
             })

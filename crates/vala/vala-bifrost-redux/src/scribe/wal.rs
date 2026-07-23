@@ -914,6 +914,17 @@ impl WalHandle {
             .append_and_fsync(batch_id, audit_payload, data_payload)
     }
 
+    /// Append paired records for deterministic test-tier replay probes.
+    pub fn append_and_fsync_for_test(
+        &self,
+        batch_id: [u8; 16],
+        audit_payload: &[u8],
+        data_payload: &[u8],
+    ) -> Result<WalLsn, ScribeError> {
+        self.writer
+            .append_and_fsync(batch_id, audit_payload, data_payload)
+    }
+
     pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
         self.writer.sync_data()
     }
@@ -965,6 +976,11 @@ impl WalWriter {
         // file-list replay keys cannot collide between independent writers.
         writer.next_lsn = Arc::clone(&self.next_lsn);
         Ok(WalHandle::new(Arc::new(writer), key))
+    }
+
+    /// Open a keyed WAL handle for deterministic test-tier replay probes.
+    pub fn handle_for_seal_key_for_test(&self, key: SealKey) -> Result<WalHandle, ScribeError> {
+        self.handle_for_seal_key(key)
     }
 
     /// Append paired (audit, data) records and fsync.

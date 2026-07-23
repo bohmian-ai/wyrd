@@ -16,3 +16,4 @@ pub mod parquet;
 pub mod provider;
 pub mod schema;
 pub mod scribe;
+pub mod tables;

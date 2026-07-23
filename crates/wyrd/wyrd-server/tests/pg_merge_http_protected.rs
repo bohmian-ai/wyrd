@@ -5,7 +5,7 @@
 //! panic→500 mapping, body-limit enforcement, and authenticated `Principal`.
 //! Also contrasts `merge_http` (unprotected) as a negative baseline.
 
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;

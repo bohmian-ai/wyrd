@@ -6,6 +6,7 @@ use opendal::Operator;
 use thiserror::Error;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use wyrd_auth::seed::seed_builtin_roles_for_tenant;
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::DataTenantId;
@@ -102,6 +103,30 @@ impl WyrdTestCluster {
         topology: BifrostTopology,
         wal_sync_delay: std::time::Duration,
     ) -> Result<Self, ClusterError> {
+        Self::start_with_wal_sync_delay_and_admission(pods, topology, wal_sync_delay, None).await
+    }
+
+    /// Start a cluster with explicit test-tier Scribe admission limits.
+    pub async fn start_with_admission(
+        pods: usize,
+        topology: BifrostTopology,
+        admission: AdmissionConfig,
+    ) -> Result<Self, ClusterError> {
+        Self::start_with_wal_sync_delay_and_admission(
+            pods,
+            topology,
+            std::time::Duration::ZERO,
+            Some(admission),
+        )
+        .await
+    }
+
+    async fn start_with_wal_sync_delay_and_admission(
+        pods: usize,
+        topology: BifrostTopology,
+        wal_sync_delay: std::time::Duration,
+        scribe_admission: Option<AdmissionConfig>,
+    ) -> Result<Self, ClusterError> {
         topology.validate(pods)?;
         if pods == 0 {
             return Err(ClusterError::Resource(
@@ -149,8 +174,13 @@ impl WyrdTestCluster {
         for _ in 0..pods {
             let wal_dir =
                 tempfile::tempdir().map_err(|error| ClusterError::Resource(error.to_string()))?;
-            let server = WyrdTestServerBuilder::default()
-                .with_wal_sync_delay(wal_sync_delay)
+            let builder = WyrdTestServerBuilder::default().with_wal_sync_delay(wal_sync_delay);
+            let builder = if let Some(admission) = scribe_admission {
+                builder.with_scribe_admission_for_test(admission)
+            } else {
+                builder
+            };
+            let server = builder
                 .start_with_resources(
                     Arc::clone(&fixture),
                     Arc::clone(&storage),

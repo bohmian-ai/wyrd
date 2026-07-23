@@ -8,13 +8,10 @@
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
-use wyrd_spec::vala::api::{
-    BifrostTableEntry, DataTypeSpec, FieldSpec, TableScopeWire, TableStatus, TimeUnit,
-};
+use wyrd_spec::vala::api::{BifrostTableEntry, DataTypeSpec, FieldSpec, TableStatus, TimeUnit};
 use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_system_column};
 
 use crate::error::BifrostError;
-use crate::types::TableScope;
 
 /// Metadata key flagging a describe field as a client-supplied correlation
 /// column, distinct from user fields and from server-stamped system columns.
@@ -30,14 +27,6 @@ fn to_hex(bytes: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-/// Decode the persisted table scope string into the public wire enum.
-fn scope_wire_from_db(scope: &str) -> Result<TableScopeWire, BifrostError> {
-    match TableScope::from_db_str(scope)? {
-        TableScope::TenantOwned => Ok(TableScopeWire::TenantOwned),
-        TableScope::SystemShared => Ok(TableScopeWire::SystemShared),
-    }
 }
 
 /// Decode the persisted lifecycle status string, rejecting unknown values.
@@ -66,7 +55,6 @@ pub fn entry_from_row(row: &BifrostTableRow) -> Result<BifrostTableEntry, Bifros
         namespace: namespace.to_string(),
         name: name.to_string(),
         table_uid: to_hex(&row.table_uid),
-        scope: scope_wire_from_db(&row.scope)?,
         status: status_from_db(&row.status)?,
         fingerprint: to_hex(&row.fingerprint),
         partition_columns: row.partition_columns.clone(),
@@ -224,15 +212,14 @@ mod tests {
         assert_eq!(entry.name, "events");
         assert_eq!(entry.table_uid, "ab".repeat(16));
         assert_eq!(entry.fingerprint, "01".repeat(32));
-        assert_eq!(entry.scope, TableScopeWire::TenantOwned);
         assert_eq!(entry.status, TableStatus::Active);
         assert_eq!(entry.partition_columns, vec!["day".to_string()]);
     }
 
     #[test]
-    fn list_tables_entry_from_row_rejects_bad_scope_and_status() {
+    fn list_tables_entry_from_row_rejects_bad_status() {
         let mut row = sample_row();
-        row.scope = "bogus".to_string();
+        row.status = "bogus".to_string();
         assert!(entry_from_row(&row).is_err());
 
         let mut row = sample_row();

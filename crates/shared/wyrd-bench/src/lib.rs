@@ -13,8 +13,8 @@ pub use report::{
     PhaseMeasurement, PodMetadata, QueryMeasurements, ReportError, ScribeBenchmarkConfig,
     ScribeBenchmarkReport, ScribeCaseReport, ScribeCaseVerification, ScribeCompactCase,
     ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, ScribeMatrixCase,
-    StageMeasurements, StorageMeasurements, VerificationMeasurements, compact_scribe_matrix,
-    required_scribe_matrix, required_scribe_metric_families,
+    ScribeTopologyEvidence, StageMeasurements, StorageMeasurements, VerificationMeasurements,
+    compact_scribe_matrix, required_scribe_matrix, required_scribe_metric_families,
 };
 pub use slo::{SloError, SloGate, SloMeasurement, SloResult, SloThreshold};
 pub use workload::{

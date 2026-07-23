@@ -56,20 +56,6 @@ fn default_true() -> bool {
 
 // ── Table registration / describe wire types ────────────────────────────────
 
-/// Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so
-/// `wyrd-spec` carries no engine dependency; the engine maps between the two.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum TableScopeWire {
-    /// Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.
-    #[default]
-    TenantOwned,
-    /// Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.
-    SystemShared,
-}
-
 /// Lifecycle status of a registered Bifrost table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -96,8 +82,6 @@ pub struct BifrostTableEntry {
     pub name: String,
     /// Lower-case hex of the 16-byte table uid.
     pub table_uid: String,
-    /// Table scope (wire enum, not the engine type).
-    pub scope: TableScopeWire,
     /// Lifecycle status.
     pub status: TableStatus,
     /// Lower-case hex of the 32-byte user-schema fingerprint.
@@ -314,9 +298,6 @@ pub struct RegisterTableRequest {
     /// Declared partition columns.
     #[serde(default)]
     pub partition_columns: Vec<PartitionColumnSpec>,
-    /// Table scope; defaults to `TenantOwned`.
-    #[serde(default)]
-    pub scope: TableScopeWire,
 }
 
 /// Whether a register call created a new table or matched an existing one.
@@ -1432,8 +1413,7 @@ mod bifrost_wire_tests {
         AsyncJobState, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription,
         BifrostTableEntry, DataTypeSpec, ExecutorAvailability, FieldSpec, JobUid,
         PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome,
-        RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableScopeWire, TableStatus,
-        TimeUnit,
+        RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableStatus, TimeUnit,
     };
     use schemars::schema_for;
 
@@ -1488,17 +1468,11 @@ mod bifrost_wire_tests {
     }
 
     #[test]
-    fn bifrost_wire_table_scope_wire_defaults_to_tenant_owned() {
-        assert_eq!(TableScopeWire::default(), TableScopeWire::TenantOwned);
-    }
-
-    #[test]
-    fn bifrost_wire_register_request_defaults_partition_and_scope() {
+    fn bifrost_wire_register_request_defaults_partition() {
         let req: RegisterTableRequest =
             serde_json::from_str(r#"{"namespace":"vala.bifrost","name":"events","fields":[]}"#)
                 .expect("deserialize");
         assert!(req.partition_columns.is_empty());
-        assert_eq!(req.scope, TableScopeWire::TenantOwned);
     }
 
     #[test]
@@ -1534,7 +1508,6 @@ mod bifrost_wire_tests {
             namespace: "vala.bifrost".to_string(),
             name: "events".to_string(),
             table_uid: "ab".repeat(16),
-            scope: TableScopeWire::SystemShared,
             status: TableStatus::Active,
             fingerprint: "01".repeat(32),
             partition_columns: vec!["day".to_string()],

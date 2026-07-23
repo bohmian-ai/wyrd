@@ -223,6 +223,26 @@ impl ScribeImpl {
         writer_epoch: i64,
         sync_delay: std::time::Duration,
     ) -> Result<Self, String> {
+        Self::try_new_for_embedded_with_wal_sync_delay_and_admission(
+            operator,
+            wal,
+            node_id,
+            writer_epoch,
+            sync_delay,
+            AdmissionConfig::default(),
+        )
+    }
+
+    /// Construct the embedded Scribe with deterministic sync delay and
+    /// explicit test-tier admission limits.
+    pub fn try_new_for_embedded_with_wal_sync_delay_and_admission(
+        operator: Arc<opendal::Operator>,
+        wal: Arc<wal::WalWriter>,
+        node_id: String,
+        writer_epoch: i64,
+        sync_delay: std::time::Duration,
+        admission: AdmissionConfig,
+    ) -> Result<Self, String> {
         let lane = ScribeLaneConfig::resolved();
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
@@ -248,7 +268,7 @@ impl ScribeImpl {
             node_id,
             writer_epoch,
             ScribeBuildConfig {
-                admission: AdmissionConfig::default(),
+                admission,
                 coordination_runtime: Handle::current(),
                 execution_pools,
                 ingress_queue_items: lane.ingress_queue_items,
@@ -601,6 +621,11 @@ impl ScribeImpl {
     #[must_use]
     pub fn admission_snapshot(&self) -> admission::AdmissionSnapshot {
         self.admission.snapshot()
+    }
+
+    /// Trip the WAL availability breaker for deterministic test-tier probes.
+    pub fn trip_wal_disk_full_for_test(&self) {
+        self.admission.trip_wal_disk_full();
     }
 
     /// Return the resolved writer group limits used by every active writer.

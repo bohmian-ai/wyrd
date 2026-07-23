@@ -14,7 +14,7 @@
 //! - RBAC gate: in-tenant principal lacking `evals:run` → denied at open;
 //!   principal holding `evals:run` opens successfully (tightened past card_write)
 
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;

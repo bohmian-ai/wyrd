@@ -1,4 +1,4 @@
-//! Bifrost namespace enum — copied from vala-bifrost and extended with `Datasets`.
+//! Redux Bifrost namespace enum, including caller-owned datasets.
 
 use iceberg::NamespaceIdent;
 

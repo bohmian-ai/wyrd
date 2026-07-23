@@ -28,10 +28,26 @@ for symbol in WyrdTestCluster BifrostHarness run_maintenance_tick reqwest Benchm
   fi
 done
 
-if ! rg -n -w "ScribeTelemetry" \
+scribe_runner="crates/wyrd/wyrd-testing/benches/bench_ingest_ack_latency.rs"
+if [[ ! -f "$scribe_runner" ]]; then
+  echo "Scribe SLO lane is missing $scribe_runner" >&2
+  exit 1
+fi
+for symbol in compact_scribe_matrix WyrdTestCluster register_dataset ScribeBenchmarkReport ScribeTopologyEvidence; do
+  if ! rg -n -w "$symbol" "$scribe_runner" >/dev/null; then
+    echo "Scribe benchmark runner is missing required path: $symbol" >&2
+    exit 1
+  fi
+done
+if rg -n 'TABLE_COUNT|bench_scribe_matrix|task-13d' "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
+  echo "Scribe benchmark runner contains stale topology or matrix vocabulary" >&2
+  exit 1
+fi
+
+if ! rg -n -w "ScribeRuntimeSnapshot" \
   crates/wyrd/wyrd-testing/src/bifrost/harness.rs \
   crates/vala/vala-bifrost-redux/src/scribe/telemetry.rs >/dev/null; then
-  echo "real Bifrost benchmark harness is missing ScribeTelemetry" >&2
+  echo "real Bifrost benchmark harness is missing ScribeRuntimeSnapshot" >&2
   exit 1
 fi
 

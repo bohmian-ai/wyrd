@@ -69,6 +69,19 @@ pub struct BenchmarkMetricSnapshot {
     pub series_limit_exceeded: bool,
 }
 
+impl BenchmarkMetricSnapshot {
+    /// Return whether any recorded series belongs to a metric family.
+    #[must_use]
+    pub fn contains_family(&self, family: &str) -> bool {
+        self.counters
+            .keys()
+            .chain(self.gauges.keys())
+            .chain(self.gauge_peaks.keys())
+            .chain(self.histograms.keys())
+            .any(|key| key == family || key.starts_with(&format!("{family}{{")))
+    }
+}
+
 impl BenchmarkRecorder {
     #[must_use]
     pub fn new() -> Self {

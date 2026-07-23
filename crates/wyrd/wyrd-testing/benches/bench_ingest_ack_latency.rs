@@ -1,6 +1,6 @@
 //! Public SDK-to-server Scribe matrix benchmark.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,25 +10,35 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use chrono::NaiveDate;
+use vala_bifrost_redux::catalog::TableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
+use vala_bifrost_redux::scribe::replay::replay_wal_directory;
+use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::stream_identity::NodeId;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_sdk::{BifrostFrame, BifrostGrpcTransport};
 use wyrd_bench::{
     BenchmarkMetricSnapshot, BenchmarkRecorder, MachineMetadata, ScribeBenchmarkConfig,
     ScribeBenchmarkReport, ScribeCaseReport, ScribeCaseVerification, ScribeCompactCase,
-    ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, compact_scribe_matrix,
-    required_scribe_metric_families,
+    ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, ScribeTopologyEvidence,
+    compact_scribe_matrix, required_scribe_metric_families,
 };
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
-use wyrd_spec::vala::api::TableScopeWire;
+use wyrd_runtime::PrincipalId;
+use wyrd_spec::auth::PrincipalKindTag;
+use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 use wyrd_testing::Bootstrap;
-use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
+use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster, full_bifrost_topology};
 
 type BenchError = Box<dyn Error + Send + Sync>;
 
-const TABLE_COUNT: usize = 64;
 const RETAINED_ITEM_LIMIT: u64 = 256;
 const RETAINED_BYTE_LIMIT: u64 = 512 * 1024 * 1024;
 const MAX_IN_FLIGHT_STREAMS: usize = 32;
@@ -54,14 +64,14 @@ async fn main() -> Result<(), BenchError> {
 
 async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, BenchError> {
     let matrix = compact_scribe_matrix();
-    let pods = argument("pods")
+    let requested_pods = argument("pods")
         .unwrap_or_else(|| DEFAULT_PODS.to_string())
         .parse::<usize>()?;
-    let tenant_count = argument("tenants")
+    let requested_tenants = argument("tenants")
         .unwrap_or_else(|| DEFAULT_TENANTS.to_string())
         .parse::<usize>()?;
-    if tenant_count == 0 {
-        return Err("benchmark requires at least one tenant".into());
+    if requested_tenants == 0 || requested_pods == 0 {
+        return Err("benchmark requires at least one tenant and pod".into());
     }
     let only_cases = std::env::var("WYRD_BIFROST_CASES")
         .ok()
@@ -69,6 +79,9 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
     let mut cases = Vec::with_capacity(matrix.len());
     let mut observed = BTreeSet::new();
     let mut run_errors = 0_u64;
+    let mut replay_exact_identity = false;
+    let mut exact_429 = false;
+    let mut exact_507 = false;
 
     for delay_ms in [0_u64, 60_u64] {
         let selected = matrix
@@ -85,30 +98,43 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
             continue;
         }
         for case in selected {
+            let effective_case = ScribeCompactCase {
+                pods: if std::env::var_os("WYRD_BIFROST_CASES").is_some() {
+                    u32::try_from(requested_pods)?
+                } else {
+                    case.pods
+                },
+                tenants: if std::env::var_os("WYRD_BIFROST_CASES").is_some() {
+                    u32::try_from(requested_tenants)?
+                } else {
+                    case.tenants
+                },
+                ..case
+            };
             let cluster = WyrdTestCluster::start_with_wal_sync_delay(
-                pods,
-                full_bifrost_topology(),
+                usize::try_from(effective_case.pods)?,
+                topology_for_pods(effective_case.pods),
                 Duration::from_millis(delay_ms),
             )
             .await?;
-            let workloads = provision_cluster(&cluster, tenant_count).await?;
+            let workloads = provision_cluster(&cluster, &effective_case).await?;
             observed.extend(metric_families(&recorder.snapshot()));
-            eprintln!("bifrost scribe case start: {}", case.id);
+            eprintln!("bifrost scribe case start: {}", effective_case.id);
             recorder.reset_interval();
-            let report = match run_case(&cluster, &workloads, recorder, &case).await {
+            let report = match run_case(&cluster, &workloads, recorder, &effective_case).await {
                 Ok(report) => {
                     eprintln!(
                         "bifrost scribe case complete: {} frames={} durable={}",
-                        case.id, report.measured_frames, report.durable_rows
+                        effective_case.id, report.measured_frames, report.durable_rows
                     );
                     report
                 }
                 Err(error) => {
                     run_errors = run_errors.saturating_add(1);
                     let busy = error.to_string().contains("writer busy");
-                    eprintln!("bifrost scribe case failed: {}: {error}", case.id);
+                    eprintln!("bifrost scribe case failed: {}: {error}", effective_case.id);
                     ScribeCaseReport {
-                        case: case.clone(),
+                        case: effective_case.clone(),
                         required_metrics_observed: metric_families(&recorder.snapshot())
                             .into_iter()
                             .collect(),
@@ -117,18 +143,48 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
                         verification: ScribeCaseVerification {
                             passed: false,
                             exact_429: Some(busy),
+                            replay_exact_identity: Some(false),
+                            exact_507: Some(false),
                             ..ScribeCaseVerification::default()
                         },
                         ..ScribeCaseReport::default()
                     }
                 }
             };
+            if !replay_exact_identity {
+                replay_exact_identity = replay_identity_probe()?;
+            }
+            if !exact_507 {
+                let server = cluster.server(0).ok_or("missing benchmark pod")?;
+                server.trip_bifrost_wal_disk_full_for_test()?;
+                exact_507 = probe_exact_507(&workloads, &effective_case).await?;
+            }
             observed.extend(report.required_metrics_observed.iter().cloned());
             cases.push(report);
             observed.extend(metric_families(&recorder.snapshot()));
             cluster.shutdown().await?;
             observed.extend(metric_families(&recorder.snapshot()));
         }
+    }
+
+    if !exact_429 {
+        let probe_case = matrix
+            .first()
+            .cloned()
+            .ok_or("compact Scribe matrix is empty")?;
+        let probe_cluster = WyrdTestCluster::start_with_admission(
+            1,
+            BifrostTopology::OnePod,
+            AdmissionConfig {
+                max_writers: 0,
+                writer_queue_items: 1,
+                ..AdmissionConfig::default()
+            },
+        )
+        .await?;
+        let probe_workloads = provision_cluster(&probe_cluster, &probe_case).await?;
+        exact_429 = probe_exact_429(&probe_workloads, &probe_case).await?;
+        probe_cluster.shutdown().await?;
     }
 
     let required = required_scribe_metric_families();
@@ -140,16 +196,12 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
     let verification = ScribeCaseVerification {
         passed: !cases.is_empty() && cases.iter().all(|case| case.verification.passed),
         drain_zero_gap: cases.iter().all(|case| case.verification.drain_zero_gap),
-        replay_exact_identity: None,
+        replay_exact_identity: Some(replay_exact_identity),
         retained_within_ceiling: cases
             .iter()
             .all(|case| case.verification.retained_within_ceiling),
-        exact_429: Some(
-            cases
-                .iter()
-                .any(|case| case.verification.exact_429 == Some(true)),
-        ),
-        exact_507: None,
+        exact_507: Some(exact_507),
+        exact_429: Some(exact_429),
     };
     let complete = verification.passed
         && missing.is_empty()
@@ -157,8 +209,8 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
             case.measured_frames >= case.case.minimum_samples && !case.metric_series_limit_exceeded
         });
     let machine = machine_metadata();
-    let configuration = benchmark_configuration(pods, tenant_count);
-    Ok(ScribeBenchmarkReport {
+    let configuration = benchmark_configuration(requested_pods, requested_tenants);
+    let mut report = ScribeBenchmarkReport {
         report_version: ScribeBenchmarkReport::VERSION.to_owned(),
         stage: std::env::var("WYRD_BIFROST_STAGE").unwrap_or_else(|_| "post-throughput".to_owned()),
         lane: "bench:bifrost:scribe:slo".to_owned(),
@@ -177,18 +229,30 @@ async fn run(recorder: &BenchmarkRecorder) -> Result<ScribeBenchmarkReport, Benc
         comparison: ScribeComparisonStatus {
             baseline_available: false,
             status: "unavailable".to_owned(),
-            reason: "no pre-repair baseline exists for this checkout".to_owned(),
+            reason: "no valid pre-repair baseline exists".to_owned(),
+            baseline_role: "initial_valid_post_repair".to_owned(),
         },
         errors: u64::try_from(missing.len())?.saturating_add(run_errors),
         complete: complete && run_errors == 0,
-    })
+    };
+    if let Err(errors) = report.validate() {
+        for error in &errors {
+            eprintln!("bifrost scribe report validation error: {error}");
+        }
+        report.errors = report.errors.saturating_add(u64::try_from(errors.len())?);
+        report.complete = false;
+    }
+    Ok(report)
 }
 
 async fn provision_cluster(
     cluster: &WyrdTestCluster,
-    tenant_count: usize,
+    case: &ScribeCompactCase,
 ) -> Result<Vec<TenantWorkload>, BenchError> {
     let server = cluster.server(0).ok_or("missing benchmark pod")?;
+    let tenant_count = usize::try_from(case.tenants)?;
+    let table_count = usize::try_from(case.tables)?;
+    let routed_pairs = routed_pairs(case)?;
     let mut workloads = Vec::with_capacity(tenant_count);
     for index in 0..tenant_count {
         let tenant = if index == 0 {
@@ -206,19 +270,21 @@ async fn provision_cluster(
             .bifrost_redux
             .as_ref()
             .ok_or("missing Redux benchmark catalog")?;
-        for table_index in 0..TABLE_COUNT {
+        for table_index in 0..table_count {
+            if !routed_pairs.contains(&(index, table_index)) {
+                continue;
+            }
             let name = table_name(table_index);
             catalog
-                .create_table(CreateTableRequest {
-                    table: TableRef::new(BifrostNamespace::Bifrost, name),
-                    user_fields: vec![
+                .register_dataset(
+                    tenant,
+                    TableRef::new(BifrostNamespace::Datasets, name),
+                    vec![
                         Field::new("id", DataType::Int64, false),
                         Field::new("value", DataType::Utf8, false),
                     ],
-                    scope: TableScopeWire::TenantOwned,
-                    tenant,
-                    audit: None,
-                })
+                    None,
+                )
                 .await?;
         }
         let bootstrap = server
@@ -269,6 +335,7 @@ async fn run_case(
     let started = Instant::now();
     let mut admitted_rows = 0_u64;
     let mut measured_frames = 0_u64;
+    let mut topology = ScribeTopologyEvidence::default();
     let chunk_frames = if case.frame_size_bytes >= 8 * 1024 * 1024 {
         1
     } else {
@@ -278,7 +345,9 @@ async fn run_case(
     while measured_frames < case.minimum_samples {
         let remaining = case.minimum_samples - measured_frames;
         let chunk = remaining.min(chunk_frames);
-        let sent = send_frames(workloads, case, payload.clone(), chunk).await?;
+        let (sent, observed_topology) =
+            send_frames(workloads, case, payload.clone(), chunk).await?;
+        topology = observed_topology;
         admitted_rows = admitted_rows.saturating_add(sent);
         measured_frames = measured_frames.saturating_add(sent);
         let before_flush = recorder.snapshot();
@@ -312,14 +381,15 @@ async fn run_case(
             && retained_items_peak <= RETAINED_ITEM_LIMIT
             && retained_bytes_peak <= RETAINED_BYTE_LIMIT,
         drain_zero_gap: durable_frames == admitted_frames && durable_rows == admitted_rows,
-        replay_exact_identity: None,
+        replay_exact_identity: Some(false),
         retained_within_ceiling: retained_items_peak <= RETAINED_ITEM_LIMIT
             && retained_bytes_peak <= RETAINED_BYTE_LIMIT,
-        exact_429: None,
-        exact_507: None,
+        exact_429: Some(false),
+        exact_507: Some(false),
     };
     Ok(ScribeCaseReport {
         case: case.clone(),
+        topology,
         measured_frames,
         admitted_rows,
         durable_rows,
@@ -368,6 +438,135 @@ async fn run_case(
     })
 }
 
+fn topology_for_pods(pods: u32) -> BifrostTopology {
+    if pods == 1 {
+        BifrostTopology::OnePod
+    } else {
+        full_bifrost_topology()
+    }
+}
+
+async fn probe_exact_429(
+    workloads: &[TenantWorkload],
+    case: &ScribeCompactCase,
+) -> Result<bool, BenchError> {
+    let Some(workload) = workloads.first() else {
+        return Ok(false);
+    };
+    let Some(transport) = workload.transports.first() else {
+        return Ok(false);
+    };
+    let payload = Bytes::from(ipc(64 * 1024)?);
+    let probe_count = 512_usize;
+    let barrier = Arc::new(tokio::sync::Barrier::new(probe_count + 1));
+    let mut tasks = Vec::with_capacity(probe_count);
+    for _ in 0..probe_count {
+        let barrier = Arc::clone(&barrier);
+        let transport = transport.clone();
+        let frame = BifrostFrame {
+            table: table_fqn(0),
+            batch_id: uuid::Uuid::now_v7().into_bytes(),
+            frame_sequence: 0,
+            arrow_ipc: payload.clone(),
+        };
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            transport.insert_batch_stream(vec![frame]).await
+        }));
+    }
+    barrier.wait().await;
+    let mut observed_busy = false;
+    for task in tasks {
+        if let Ok(Err(error)) = task.await {
+            observed_busy |= is_ingest_busy(&error);
+        }
+    }
+    eprintln!(
+        "bifrost scribe exact-429 probe: case={} observed={observed_busy}",
+        case.id
+    );
+    Ok(observed_busy)
+}
+
+async fn probe_exact_507(
+    workloads: &[TenantWorkload],
+    case: &ScribeCompactCase,
+) -> Result<bool, BenchError> {
+    let Some(workload) = workloads.first() else {
+        return Ok(false);
+    };
+    let Some(transport) = workload.transports.first() else {
+        return Ok(false);
+    };
+    let result = transport
+        .insert_batch_stream(vec![BifrostFrame {
+            table: table_fqn(0),
+            batch_id: uuid::Uuid::now_v7().into_bytes(),
+            frame_sequence: 0,
+            arrow_ipc: Bytes::from(ipc(64 * 1024)?),
+        }])
+        .await;
+    let observed = matches!(
+        result,
+        Err(wyrd_spec::error::WyrdError::UpstreamFailure { details, .. })
+            if details
+                .get("original_code")
+                .and_then(serde_json::Value::as_str)
+                == Some("WYRD_VALA_507_INGEST_WAL_UNAVAILABLE")
+    );
+    eprintln!(
+        "bifrost scribe exact-507 probe: case={} observed={observed}",
+        case.id
+    );
+    Ok(observed)
+}
+
+fn replay_identity_probe() -> Result<bool, BenchError> {
+    let temp_dir = tempfile::tempdir()?;
+    let tenant = DataTenantId::SYSTEM_OWNER;
+    let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+    let seal_key = SealKey::new(
+        tenant,
+        table,
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).ok_or("invalid probe date")?),
+    );
+    let node_id = NodeId::generate();
+    let wal = WalWriter::new(
+        temp_dir.path(),
+        *node_id.as_bytes(),
+        1,
+        tenant,
+        WalConfig::default(),
+    )?;
+    let writer = wal.handle_for_seal_key_for_test(seal_key)?;
+    for (operation, payload) in [("append-1", b"data-1"), ("append-2", b"data-2")] {
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: operation.to_owned(),
+            resource: "benchmark".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:append".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "replay probe".to_owned(),
+            detail: None,
+        };
+        let audit = encode_audit_event(&event)?;
+        writer.append_and_fsync_for_test([42_u8; 16], &audit, payload)?;
+    }
+    let replayed = replay_wal_directory(temp_dir.path())?;
+    let Some(state) = replayed.values().next() else {
+        return Ok(false);
+    };
+    Ok(state.audit_events.len() == 1
+        && state.data_records.len() == 1
+        && state.audit_events[0].operation == "append-1")
+}
+
 async fn flush_workloads(
     cluster: &WyrdTestCluster,
     workloads: &[TenantWorkload],
@@ -402,20 +601,37 @@ async fn send_frames(
     case: &ScribeCompactCase,
     payload: Bytes,
     minimum_frames: u64,
-) -> Result<u64, BenchError> {
-    let writers = usize::try_from(case.writers)?.max(workloads.len());
+) -> Result<(u64, ScribeTopologyEvidence), BenchError> {
+    let writers = usize::try_from(case.writers)?;
+    if writers == 0 || workloads.is_empty() {
+        return Err("benchmark case has no writers or workloads".into());
+    }
+    let tables = usize::try_from(case.tables)?;
+    let pods = usize::try_from(case.pods)?;
     let frames_per_writer = minimum_frames.div_ceil(u64::try_from(writers)?);
     let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_STREAMS));
     let mut tasks = Vec::with_capacity(writers);
+    let mut writers_by_pod = BTreeMap::new();
+    let mut writers_by_tenant = BTreeMap::new();
+    let mut writers_by_table = BTreeMap::new();
     for writer in 0..writers {
         let tenant_index = writer % workloads.len();
         let workload = &workloads[tenant_index];
-        let transport = workload.transports[writer % workload.transports.len()].clone();
-        let table = table_fqn(if case.table_distribution == "same" {
+        let pod_index = writer % pods;
+        let transport = workload.transports[pod_index % workload.transports.len()].clone();
+        let table_index = if case.table_distribution == "same" {
             0
         } else {
-            writer % usize::try_from(case.tables)?
-        });
+            (writer * 3) % tables
+        };
+        let table = table_fqn(table_index);
+        *writers_by_pod
+            .entry(format!("pod-{pod_index}"))
+            .or_insert(0) += 1;
+        *writers_by_tenant
+            .entry(workload.tenant.to_string())
+            .or_insert(0) += 1;
+        *writers_by_table.entry(table.clone()).or_insert(0) += 1;
         let frames = (0..frames_per_writer)
             .map(|_| BifrostFrame {
                 table: table.clone(),
@@ -444,7 +660,22 @@ async fn send_frames(
     for task in tasks {
         rows = rows.saturating_add(task.await??);
     }
-    Ok(rows)
+    let topology = ScribeTopologyEvidence {
+        requested_writers: case.writers,
+        actual_writers: u32::try_from(writers)?,
+        requested_tenants: case.tenants,
+        actual_tenants: u32::try_from(workloads.len())?,
+        requested_pods: case.pods,
+        actual_pods: u32::try_from(pods)?,
+        requested_logical_tables: case.tables,
+        actual_logical_tables: u32::try_from(writers_by_table.len())?,
+        actual_physical_tables: u32::try_from(routed_pairs(case)?.len())?,
+        routing_mode: case.routing_mode.clone(),
+        writers_by_pod,
+        writers_by_tenant,
+        writers_by_table,
+    };
+    Ok((rows, topology))
 }
 
 async fn insert_stream_with_busy_retry(
@@ -664,11 +895,30 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 }
 
 fn table_name(table_index: usize) -> String {
-    format!("bench_scribe_matrix_{table_index}")
+    format!("scribe_bench_{table_index}")
+}
+
+fn routed_pairs(case: &ScribeCompactCase) -> Result<BTreeSet<(usize, usize)>, BenchError> {
+    let writers = usize::try_from(case.writers)?;
+    let tenants = usize::try_from(case.tenants)?;
+    let tables = usize::try_from(case.tables)?;
+    if writers == 0 || tenants == 0 || tables == 0 {
+        return Err("benchmark topology must have writers, tenants, and tables".into());
+    }
+    Ok((0..writers)
+        .map(|writer| {
+            let table = if case.table_distribution == "same" {
+                0
+            } else {
+                (writer * 3) % tables
+            };
+            (writer % tenants, table)
+        })
+        .collect())
 }
 
 fn table_fqn(table_index: usize) -> String {
-    format!("vala.bifrost.{}", table_name(table_index))
+    format!("vala.datasets.{}", table_name(table_index))
 }
 
 fn ipc(target_bytes: usize) -> Result<Vec<u8>, BenchError> {
@@ -707,7 +957,7 @@ fn benchmark_configuration(pods: usize, tenants: usize) -> ScribeBenchmarkConfig
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect(),
-        matrix: "task-13d-compact-v1".to_owned(),
+        matrix: "scribe-closeout-compact-v1".to_owned(),
     }
 }
 
@@ -750,13 +1000,36 @@ fn git_command(arguments: &[&str]) -> Option<String> {
 }
 
 fn emit_report(report: &ScribeBenchmarkReport) -> Result<(), BenchError> {
-    if let Some(path) = std::env::var_os("WYRD_BIFROST_OUTPUT") {
-        if let Some(parent) = std::path::Path::new(&path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        report.write_artifacts(path)?;
-    } else {
-        println!("{}", report.to_json()?);
+    let path = std::env::var_os("WYRD_BIFROST_OUTPUT").map_or_else(
+        || {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join("target/bifrost-benchmarks/post-throughput/reports/scribe.json")
+        },
+        std::path::PathBuf::from,
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    report.write_artifacts(&path)?;
+    let components_path = path.with_file_name("components.json");
+    std::fs::write(
+        &components_path,
+        format!("{}\n", serde_json::to_string_pretty(&report.components)?),
+    )?;
+    let components_markdown = path.with_file_name("components.md");
+    let mut markdown = String::from("# Bifrost Scribe component benchmarks\n\n");
+    markdown.push_str("| Component | Operations | Bytes | p99 (us) |\n|---|---:|---:|---:|\n");
+    for component in &report.components {
+        let p99 = component
+            .distribution
+            .p99
+            .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+        markdown.push_str(&format!(
+            "| {} | {} | {} | {} |\n",
+            component.name, component.operations, component.bytes, p99
+        ));
+    }
+    std::fs::write(components_markdown, markdown)?;
     Ok(())
 }

@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;

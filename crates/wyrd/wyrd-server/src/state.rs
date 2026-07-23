@@ -2,14 +2,6 @@
 
 use std::sync::Arc;
 
-use arc_swap::ArcSwap;
-use tokio_util::sync::CancellationToken;
-use vala_bifrost::catalog::WyrdCatalog;
-use wyrd_auth_verify::TokenVerifier;
-use wyrd_storage::StorageHandle;
-use wyrd_telemetry::TelemetryGuard;
-use wyrd_tonic::tonic_health::server::HealthReporter;
-
 use crate::auth::permission_resolver::SqlPermissionResolver;
 use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::components::auth::{ServerAuth, ServerAuthz};
@@ -17,6 +9,21 @@ use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter,
 use crate::components::health::ReadinessSnapshot;
 use crate::config::DeploymentProfile;
 use crate::postgres::ServerPostgres;
+use arc_swap::ArcSwap;
+use tokio_util::sync::CancellationToken;
+use vala_bifrost::catalog::WyrdCatalog;
+use wyrd_auth_verify::TokenVerifier;
+use wyrd_spec::error::WyrdError;
+use wyrd_storage::StorageHandle;
+use wyrd_storage::service::map_sql_error;
+use wyrd_telemetry::TelemetryGuard;
+use wyrd_tonic::tonic_health::server::HealthReporter;
+
+/// Redact database failures at the public registry boundary.
+fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
+    tracing::error!(%error, "card registration database operation failed");
+    WyrdError::registry_unavailable("card registry unavailable")
+}
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
 /// (`SqlPermissionResolver`) plus Postgres-backed issuer resolution
@@ -176,6 +183,18 @@ impl AppState {
     pub fn with_storage(mut self, storage: Arc<StorageHandle>) -> Self {
         self.storage = storage;
         self
+    }
+
+    /// Get a tenant-scoped Postgres connection for registry operations. Redacts DB errors.
+    #[must_use]
+    pub async fn registry_tenant_conn(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<wyrd_sql::TenantConn<'_>, WyrdError> {
+        self.postgres
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(registry_db_error)
     }
 }
 

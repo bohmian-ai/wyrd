@@ -148,6 +148,28 @@ pub async fn record_blob_failure(
     Ok(())
 }
 
+/// Lock a Card and confirm that it is still pending before finalization writes.
+pub async fn lock_pending_card_for_activation(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+) -> Result<bool, WyrdError> {
+    let status = sqlx::query_scalar::<_, String>(
+        r#"SELECT status
+             FROM wyrd.cards
+            WHERE data_tenant_id = wyrd.current_tenant()
+              AND card_uid = $1
+            FOR UPDATE"#,
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card activation state recheck failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(status.as_deref() == Some("pending"))
+}
+
 /// Activate a Card only when its blob and every manifest entry are durable.
 pub async fn activate_card(
     conn: &mut TenantConn<'_>,

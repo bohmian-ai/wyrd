@@ -69,6 +69,20 @@ struct StorageServiceState<'a> {
     postgres: &'a WyrdPostgres,
 }
 
+impl StorageServiceState<'_> {
+    /// Get a tenant-scoped Postgres connection for storage operations.
+    #[must_use]
+    pub async fn storage_tenant_conn(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<wyrd_sql::TenantConn<'_>, WyrdError> {
+        self.postgres
+            .tenant_conn(tenant_id)
+            .await
+            .map_err(|error| map_sql_error(&error))
+    }
+}
+
 struct InitReplay {
     upload_id: UploadId,
     backend: StorageBackendKind,
@@ -142,11 +156,7 @@ pub async fn upload_init(
         return remint_replayed_upload_init(&state, response).await;
     }
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let prior_abort = find_and_mark_prior_pending(&mut conn, &body).await?;
 
     let upload_id = UploadId::new();
@@ -283,11 +293,7 @@ pub async fn upload_part_url(
     let state = StorageServiceState { storage, postgres };
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let row = load_upload(&mut conn, upload_uuid).await?;
     if row.status != UploadStatus::Pending {
         return Err(conflict_error(
@@ -359,11 +365,7 @@ pub async fn upload_complete(
     let state = StorageServiceState { storage, postgres };
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let row = load_pending_upload(&mut conn, upload_uuid).await?;
     let validated =
         tenant_path::validate(&row.storage_path, caller.data_tenant_id).map_err(map_tenant_path)?;
@@ -380,11 +382,7 @@ pub async fn upload_complete(
     let head = verified_object_head(&state, caller, upload_uuid, &validated, &row).await?;
     verify_object_head(&state, caller, upload_uuid, &validated, &row, &head).await?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     persist_completed_upload(&mut conn, caller, upload_uuid, &validated, &row, &head).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
@@ -419,11 +417,7 @@ pub async fn upload_abort(
     let state = StorageServiceState { storage, postgres };
     let upload_uuid = upload_id_uuid(&upload_id)?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let row = load_upload(&mut conn, upload_uuid).await?;
     if matches!(
         row.status,
@@ -446,11 +440,7 @@ pub async fn upload_abort(
         tracing::warn!(error = %error, upload_id = %upload_id, "best-effort backend abort failed");
     }
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let aborted =
         match multipart_uploads::mark_aborted(&mut conn, upload_uuid, Some("client-abort")).await {
             Ok(()) => true,
@@ -549,11 +539,7 @@ pub async fn download_init(
     let state = StorageServiceState { storage, postgres };
     let validated = validated_download_path(caller, &body)?;
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     let metadata = load_artifact_metadata(&mut conn, &validated).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
@@ -565,11 +551,7 @@ pub async fn download_init(
         request_ttl_secs
     };
 
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(|error| map_sql_error(&error))?;
+    let mut conn = state.storage_tenant_conn(caller.data_tenant_id).await?;
     audit::write(
         &mut conn,
         caller,

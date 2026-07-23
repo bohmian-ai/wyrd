@@ -31,11 +31,11 @@ use wyrd_sql::queries::cards::{
     NewRegistrationOperation, Resolution, SubmittedCardIdentity, activate_card,
     artifact_manifest_hash, commit_registration_operation, fail_card, find_card_by_ref,
     get_card_by_uid, insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    lock_version_line, lookup_existing_operation, lookup_expired_operation,
-    manifest_completion_rows, manifest_rows_for_init, mark_manifest_upload_initialized,
-    mark_manifest_verified, persist_outbound_relationships, recheck_active_card_refs,
-    record_blob_failure, record_card_blob, registration_request_hash, resolve_version,
-    upsert_service_account_from_card,
+    lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
+    lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
+    mark_manifest_upload_initialized, mark_manifest_verified, persist_outbound_relationships,
+    recheck_active_card_refs, record_blob_failure, record_card_blob, registration_request_hash,
+    resolve_version, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::multipart_uploads;
 use wyrd_sql::row_types::cards::ParsedCardRow;
@@ -100,11 +100,7 @@ async fn replay(
     idempotency_key: &str,
     request_hash: &str,
 ) -> Result<Option<(RegistrationOperationId, RegistrationReplaySeed)>, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let operation = match lookup_existing_operation(&mut conn, caller.principal.id, idempotency_key)
         .await?
     {
@@ -354,11 +350,7 @@ async fn load_manifest_rows(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let rows = manifest_rows_for_init(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(rows)
@@ -412,11 +404,7 @@ async fn initialize_manifest_row(
             return Err(error);
         }
     };
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let event = audit_event(
         caller,
         "card.artifact.upload_init.success",
@@ -497,11 +485,7 @@ async fn resolve_external(
     caller: &Caller,
     submissions: &[CardSubmission],
 ) -> Result<ResolvedRefs, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let resolved = resolve_card_references(&mut conn, submissions).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(resolved)
@@ -538,11 +522,7 @@ async fn write_registration(
     mut plan: RegistrationPlan,
 ) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     // Recheck before reserving idempotency so a dependency rejection rolls back
     // the entire attempt, including its bookkeeping row. The row locks remain
     // held while cards and relationships are written below.
@@ -899,12 +879,6 @@ fn idempotency_conflict(idempotency_key: &str) -> WyrdError {
     }
 }
 
-/// Redact database failures at the public registry boundary.
-fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
-    tracing::error!(%error, "card registration database operation failed");
-    WyrdError::registry_unavailable("card registry unavailable")
-}
-
 /// Card and manifest state loaded before completion or abort storage IO.
 struct CardCompletionState {
     card: ParsedCardRow,
@@ -1018,11 +992,7 @@ async fn load_card_completion_state(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<CardCompletionState, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let card = get_card_by_uid(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
@@ -1080,11 +1050,11 @@ async fn commit_card_activation(
     blob_uri: &str,
     record_blob: bool,
 ) -> Result<bool, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    if !lock_pending_card_for_activation(&mut conn, card_uid).await? {
+        conn.commit().await.map_err(registry_db_error)?;
+        return Ok(false);
+    }
     for manifest in manifests {
         if let Some(upload_id) = manifest.upload_id {
             multipart_uploads::mark_completed_if_pending(&mut conn, upload_id)
@@ -1120,11 +1090,7 @@ async fn load_card_registration_outcome(
     card_uid: &CardUid,
     outcome: RegistrationOutcomeKind,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let card = get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(existing_row_to_response(&card, outcome))
@@ -1218,11 +1184,7 @@ async fn load_open_card_uploads(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<Vec<multipart_uploads::MultipartUploadRow>, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let rows = multipart_uploads::find_open_for_card(&mut conn, card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
@@ -1274,11 +1236,7 @@ async fn commit_card_failure(
     card_uid: &CardUid,
     cleanup_succeeded: bool,
 ) -> Result<bool, WyrdError> {
-    let mut conn = state
-        .postgres
-        .tenant_conn(caller.data_tenant_id)
-        .await
-        .map_err(registry_db_error)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
     let failed = fail_card(&mut conn, card_uid).await?;
     if failed {
         let event = audit_event(
@@ -1436,7 +1394,17 @@ async fn write_card_blob(
             .tenant_conn(caller.data_tenant_id)
             .await
             .map_err(registry_db_error)?;
+        let event = audit_event(
+            caller,
+            "card.registration.blob_write.failed",
+            &format!("card:{}", card.card_uid),
+            "card:write",
+            AuditDecision::Allow,
+            AuditResult::Failure,
+            "card blob persistence failed",
+        );
         record_blob_failure(&mut conn, &card.card_uid).await?;
+        append_on(&mut conn, &event).await?;
         conn.commit().await.map_err(registry_db_error)?;
         return Err(map_storage_error(error));
     }

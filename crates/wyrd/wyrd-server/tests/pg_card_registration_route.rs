@@ -959,7 +959,19 @@ async fn heavy_registration_initializes_upload_after_commit() {
     if !enabled() {
         return;
     }
-    let server = WyrdTestServer::start_in_process()
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
         .await
         .expect("test server starts");
     let Bootstrap::User { jwt, .. } = server
@@ -1002,6 +1014,154 @@ async fn heavy_registration_initializes_upload_after_commit() {
     assert!(manifest.1.is_some());
     conn.commit().await.expect("assertion transaction commits");
 
+    let complete_request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/cards/{card_uid}/complete"))
+            .header("Idempotency-Key", "heavy-only-001")
+            .body(Body::empty())
+            .expect("card completion request builds")
+    };
+    let missing = server
+        .oneshot_authenticated(&jwt, complete_request())
+        .await
+        .expect("missing-object completion responds");
+    let missing_body = response_json(missing).await;
+    assert_eq!(missing_body["code"], "WYRD_STORAGE_404_OBJECT_NOT_FOUND");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let pending_after_missing: (String, Option<String>) =
+        sqlx::query_as("SELECT status, card_blob_uri FROM wyrd.cards WHERE card_uid = $1")
+            .bind(card_uid.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("card state reads after missing object");
+    assert_eq!(pending_after_missing.0, "pending");
+    assert!(pending_after_missing.1.is_none());
+    conn.commit().await.expect("assertion transaction commits");
+
+    let upload_url = body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
+        .as_str()
+        .expect("local upload plan contains a URL");
+    let upload_path =
+        Url::parse(upload_url).map_or_else(|_| upload_url.to_owned(), |url| url.path().to_owned());
+    let upload = Request::builder()
+        .method(Method::PUT)
+        .uri(upload_path.clone())
+        .body(Body::from("a"))
+        .expect("local upload request builds");
+    let upload_response = server
+        .oneshot_authenticated(&jwt, upload)
+        .await
+        .expect("local upload responds");
+    assert_eq!(upload_response.status(), StatusCode::OK);
+
+    std::fs::write(
+        storage_root
+            .path()
+            .join(server.data_tenant_id().to_string())
+            .join("cards")
+            .join(card_uid.to_string())
+            .join("prompt.txt"),
+        b"ab",
+    )
+    .expect("stored object is changed for size-mismatch coverage");
+
+    let mismatch = server
+        .oneshot_authenticated(&jwt, complete_request())
+        .await
+        .expect("size-mismatch completion responds");
+    let mismatch_body = response_json(mismatch).await;
+    assert_eq!(
+        mismatch_body["code"],
+        "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED"
+    );
+
+    let upload = Request::builder()
+        .method(Method::PUT)
+        .uri(upload_path)
+        .body(Body::from("a"))
+        .expect("corrected local upload request builds");
+    let upload_response = server
+        .oneshot_authenticated(&jwt, upload)
+        .await
+        .expect("corrected local upload responds");
+    assert_eq!(upload_response.status(), StatusCode::OK);
+
+    let complete_response = server
+        .oneshot_authenticated(&jwt, complete_request())
+        .await
+        .expect("card completion responds");
+    assert_eq!(complete_response.status(), StatusCode::OK);
+    let complete_body = response_json(complete_response).await;
+    assert_eq!(complete_body["outcomes"][0]["status"], "active");
+    assert_eq!(complete_body["outcomes"][0]["outcome"], "registered");
+
+    let replay = server
+        .oneshot_authenticated(&jwt, complete_request())
+        .await
+        .expect("completion replay responds");
+    let replay_body = response_json(replay).await;
+    assert_eq!(replay_body["outcomes"][0]["status"], "active");
+    assert_eq!(replay_body["outcomes"][0]["outcome"], "idempotent_noop");
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Activation and its audit row roll back together when the audit append fails.
+#[tokio::test(flavor = "current_thread")]
+async fn completion_audit_failure_keeps_card_pending() {
+    if !enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-completion-audit-failure", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_card_completion_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'card.registration.complete' THEN
+               RAISE EXCEPTION 'injected completion audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r#"CREATE TRIGGER test_fail_card_completion_audit
+           BEFORE INSERT ON vala.audit_outbox
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_completion_audit()"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+
+    let response = server
+        .oneshot_authenticated(&jwt, heavy_registration_request("completion-audit-001"))
+        .await
+        .expect("heavy registration responds");
+    let body = response_json(response).await;
+    let card_uid: CardUid = serde_json::from_value(body["outcomes"][0]["card_ref"]["uid"].clone())
+        .expect("response contains card UID");
     let upload_path = Url::parse(
         body["upload_plans"][0]["entries"][0]["plan"]["data"]["put_url"]
             .as_str()
@@ -1015,26 +1175,127 @@ async fn heavy_registration_initializes_upload_after_commit() {
         .uri(upload_path)
         .body(Body::from("a"))
         .expect("local upload request builds");
-    let upload_response = server
-        .oneshot_authenticated(&jwt, upload)
-        .await
-        .expect("local upload responds");
-    assert_eq!(upload_response.status(), StatusCode::OK);
+    assert_eq!(
+        server
+            .oneshot_authenticated(&jwt, upload)
+            .await
+            .expect("local upload responds")
+            .status(),
+        StatusCode::OK
+    );
 
     let complete = Request::builder()
         .method(Method::POST)
         .uri(format!("/v1/cards/{card_uid}/complete"))
-        .header("Idempotency-Key", "heavy-only-001")
+        .header("Idempotency-Key", "completion-audit-001")
         .body(Body::empty())
         .expect("card completion request builds");
-    let complete_response = server
+    let completion = server
         .oneshot_authenticated(&jwt, complete)
         .await
-        .expect("card completion responds");
-    assert_eq!(complete_response.status(), StatusCode::OK);
-    let complete_body = response_json(complete_response).await;
-    assert_eq!(complete_body["outcomes"][0]["status"], "active");
-    assert_eq!(complete_body["outcomes"][0]["outcome"], "registered");
+        .expect("completion responds");
+    let completion_status = completion.status();
+    let completion_body = response_json(completion).await;
+    assert_eq!(completion_status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(completion_body["code"], "WYRD_VALA_500_AUDIT_UNAVAILABLE");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let card_state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, card_blob_uri FROM wyrd.cards WHERE card_uid = $1")
+            .bind(card_uid.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("card state reads");
+    assert_eq!(card_state.0, "pending");
+    assert!(card_state.1.is_none());
+    let complete_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox WHERE operation = 'card.registration.complete'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("completion audit count reads");
+    assert_eq!(complete_audits, 0);
+    conn.commit().await.expect("assertion transaction commits");
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// A blob storage failure leaves durable failure state and an audit record.
+#[tokio::test(flavor = "current_thread")]
+async fn blob_storage_failure_is_audited_without_leaking_sql() {
+    if !enabled() {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root)
+        .expect("storage root moves out of the configured path");
+    std::fs::write(storage_root.path(), b"not a directory")
+        .expect("broken storage root is created");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-blob-storage-failure", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let response = server
+        .oneshot_authenticated(
+            &jwt,
+            prompt_registration_request("blob-storage-failure", "blob-storage-failure-001"),
+        )
+        .await
+        .expect("registration responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_ne!(status, StatusCode::CREATED);
+    assert!(body["code"].as_str().is_some());
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens after storage failure");
+    let failure_state: (
+        String,
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT status, card_blob_uri, blob_failed_at FROM wyrd.cards \
+             WHERE name = 'blob-storage-failure'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("failed card state reads");
+    assert_eq!(failure_state.0, "failed");
+    assert!(failure_state.1.is_none());
+    assert!(failure_state.2.is_some());
+    let blob_failure_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox \
+         WHERE operation = 'card.registration.blob_write.failed'",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("blob failure audit count reads");
+    assert_eq!(blob_failure_audits, 1);
+    conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");
 }

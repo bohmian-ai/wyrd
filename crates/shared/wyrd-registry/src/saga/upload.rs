@@ -7,13 +7,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::registry::{CardUploadEntry, CreateCardResponse, RelativeArtifactPath};
-use wyrd_storage_client::{FileSource, WyrdStorageClient};
+use wyrd_storage_client::{
+    ArtifactSource, FileSource, UploadProgress, UploadProgressSink, WyrdStorageClient,
+};
 
 use crate::error::RegistryEngineError;
+use crate::progress::{RegistrationProgressEvent, RegistrationProgressSink};
 
 /// Transfer every server-minted artifact entry with bounded concurrency.
 pub(crate) async fn upload_artifacts(
@@ -21,16 +25,34 @@ pub(crate) async fn upload_artifacts(
     response: &CreateCardResponse,
     sources: &BTreeMap<RelativeArtifactPath, PathBuf>,
     idempotency_key: &str,
+    progress: Option<RegistrationProgressSink>,
 ) -> Result<(), RegistryEngineError> {
     let entries = collect_upload_entries(response);
     validate_artifact_sources(&entries, sources)?;
 
     let results = stream::iter(entries)
-        .map(|entry| async move {
-            let source = sources
-                .get(&entry.relative_path)
-                .ok_or_else(|| WyrdError::internal("validated artifact source disappeared"))?;
-            upload_artifact_entry(storage, &entry, source, idempotency_key).await
+        .map(|entry| {
+            let progress = progress.clone();
+            async move {
+                let source = sources
+                    .get(&entry.relative_path)
+                    .ok_or_else(|| WyrdError::internal("validated artifact source disappeared"))?;
+                let result = upload_artifact_entry(
+                    storage,
+                    &entry,
+                    source,
+                    idempotency_key,
+                    progress.clone(),
+                )
+                .await;
+                if let Some(progress) = &progress {
+                    progress(RegistrationProgressEvent::ArtifactFinished {
+                        artifact: entry.relative_path.clone(),
+                        success: result.is_ok(),
+                    });
+                }
+                result
+            }
         })
         .buffer_unordered(4)
         .collect::<Vec<_>>()
@@ -82,10 +104,34 @@ async fn upload_artifact_entry(
     entry: &CardUploadEntry,
     source: &Path,
     idempotency_key: &str,
+    progress: Option<RegistrationProgressSink>,
 ) -> Result<(), RegistryEngineError> {
     let source = FileSource::open(source).await?;
+    let total_bytes = source.size_hint();
+    if let Some(progress) = &progress {
+        progress(RegistrationProgressEvent::ArtifactStarted {
+            artifact: entry.relative_path.clone(),
+            total_bytes,
+        });
+    }
+    let storage_progress = progress.map(|progress| {
+        let artifact = entry.relative_path.clone();
+        Arc::new(move |event: UploadProgress| {
+            progress(RegistrationProgressEvent::ArtifactProgress {
+                artifact: artifact.clone(),
+                uploaded_bytes: event.uploaded_bytes,
+                total_bytes: event.total_bytes,
+            });
+        }) as UploadProgressSink
+    });
     storage
-        .upload_artifact(&entry.upload_id, &entry.plan, source, idempotency_key)
+        .upload_artifact_with_progress(
+            &entry.upload_id,
+            &entry.plan,
+            source,
+            idempotency_key,
+            storage_progress,
+        )
         .await
         .map_err(Into::into)
 }

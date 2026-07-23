@@ -14,11 +14,22 @@ use wyrd_spec::registry::{CardLifecycleStatus, CreateCardResponse, RegistrationR
 
 use crate::engine::RegistryEngine;
 use crate::error::RegistryEngineError;
+use crate::progress::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
 
-/// Drive one declarative registration input through its server-owned lifecycle:
-/// resolve authored input, build a typed request, register the composite,
-/// upload planned artifacts through [`WyrdStorageClient`], complete artifact
-/// Cards, verify Active outcomes, and abort pending Cards after failure.
+/// Drive one declarative registration input through the ordered registration
+/// lifecycle:
+///
+/// 1. resolve and prepare authored input;
+/// 2. mint an idempotency key and submit the flat composite request;
+/// 3. upload planned artifacts with bounded concurrency;
+/// 4. ask the server to verify and complete uploaded Cards;
+/// 5. verify that every outcome is Active.
+///
+/// If artifact upload or completion fails, pending or failed Cards are aborted
+/// on a best-effort basis and the original saga error is returned. The client
+/// owns orchestration and local transfer calls; `wyrd-server` owns durable
+/// manifest, lifecycle, activation, audit, and cleanup state. This saga is not
+/// transactionally atomic across those external boundaries.
 ///
 /// The loader owns local source resolution. `WyrdClient` owns authenticated
 /// control-plane transport and registration idempotency. `WyrdStorageClient`
@@ -28,33 +39,50 @@ use crate::error::RegistryEngineError;
 pub(crate) async fn register(
     engine: &RegistryEngine,
     input: &RegistrationInput,
+    progress: Option<RegistrationProgressSink>,
 ) -> Result<RegistrationReceipt, RegistryEngineError> {
+    emit_phase(&progress, RegistrationPhase::Preparing);
     let prepared = build_submission::prepare(input).await?;
     let idempotency_key = idempotency::mint();
+    emit_phase(&progress, RegistrationPhase::Submitting);
     let mut response =
-        submit::registration(&engine.client, &prepared.request, &idempotency_key).await?;
+        submit::submit_card_registration(&engine.client, &prepared.request, &idempotency_key)
+            .await?;
 
+    emit_phase(&progress, RegistrationPhase::Uploading);
     if let Err(error) = upload::upload_artifacts(
         &engine.storage,
         &response,
         &prepared.artifact_sources,
         &idempotency_key,
+        progress.clone(),
     )
     .await
     {
+        emit_phase(&progress, RegistrationPhase::CleaningUp);
         abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
         return Err(error);
     }
 
+    emit_phase(&progress, RegistrationPhase::Completing);
     match complete::complete_uploaded_cards(&engine.client, &response, &idempotency_key).await {
         Ok(finalized) => response = finalized,
         Err(error) => {
+            emit_phase(&progress, RegistrationPhase::CleaningUp);
             abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
             return Err(error);
         }
     }
+    emit_phase(&progress, RegistrationPhase::Verifying);
     ensure_active(&response)?;
     Ok(response.into())
+}
+
+/// Forward one phase event without changing the no-progress registration path.
+fn emit_phase(progress: &Option<RegistrationProgressSink>, phase: RegistrationPhase) {
+    if let Some(progress) = progress {
+        progress(RegistrationProgressEvent::Phase(phase));
+    }
 }
 
 /// Reject a response that has not reached a server-owned terminal success.

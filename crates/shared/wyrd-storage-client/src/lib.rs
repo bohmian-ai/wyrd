@@ -10,6 +10,7 @@
 #![deny(missing_docs)]
 
 use std::path::Path;
+use std::sync::Arc;
 
 use wyrd_client::WyrdClient;
 use wyrd_spec::storage::{
@@ -25,7 +26,7 @@ pub mod upload;
 
 pub use download::DownloadOutcome;
 pub use error::StorageClientError;
-pub use upload::{ArtifactSource, FileSource};
+pub use upload::{ArtifactSource, FileSource, UploadProgress, UploadProgressSink};
 
 /// Storage transfer handle that dispatches every HTTP call through a shared
 /// [`WyrdClient`].
@@ -51,9 +52,9 @@ impl WyrdStorageClient {
     /// Upload one server-planned artifact and complete its server-owned upload
     /// record when the backend protocol requires a completion request.
     ///
-    /// This is the only artifact-upload operation exposed to registry callers.
-    /// Provider-specific dispatch, part URL minting, backend outcomes, and the
-    /// server completion request remain inside this client.
+    /// This is the default no-progress artifact-upload operation exposed to
+    /// registry callers. Provider-specific dispatch, part URL minting, backend
+    /// outcomes, and the server completion request remain inside this client.
     ///
     /// # Errors
     /// Returns a storage-client error when the plan is invalid, the source
@@ -65,14 +66,47 @@ impl WyrdStorageClient {
         source: S,
         idempotency_key: &str,
     ) -> Result<(), StorageClientError> {
+        self.upload_artifact_with_progress(upload_id, plan, source, idempotency_key, None)
+            .await
+    }
+
+    /// Upload one artifact and forward provider progress to an optional
+    /// caller-owned sink.
+    ///
+    /// Progress is reported after each source chunk is accepted by the
+    /// provider request. Chunked providers report after each successful chunk;
+    /// single-request providers report as their request body consumes chunks.
+    /// An unknown source size is represented by `None` rather than a sentinel
+    /// byte count.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::upload_artifact`].
+    pub async fn upload_artifact_with_progress<S: ArtifactSource>(
+        &self,
+        upload_id: &UploadId,
+        plan: &UploadPlan,
+        source: S,
+        idempotency_key: &str,
+        progress: Option<UploadProgressSink>,
+    ) -> Result<(), StorageClientError> {
         let part_url_minter = upload::s3_part_url_minter(self, upload_id, plan);
+        let progress_callback = progress.map(|sink| {
+            let upload_id = upload_id.clone();
+            Arc::new(move |uploaded_bytes, total_bytes| {
+                sink(UploadProgress {
+                    upload_id: upload_id.clone(),
+                    uploaded_bytes,
+                    total_bytes,
+                });
+            }) as upload::ProgressCallback
+        });
         let outcome = self
             .upload(
                 plan,
                 source,
                 upload::UploadHooks {
                     idempotency_key,
-                    progress: None,
+                    progress: progress_callback,
                     part_url_minter,
                 },
             )

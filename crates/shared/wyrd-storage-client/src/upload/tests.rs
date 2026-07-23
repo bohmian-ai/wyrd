@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
@@ -7,7 +8,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 
-use super::{UploadHooks, UploadOutcome, validate_plan};
+use super::{ProgressCallback, UploadHooks, UploadOutcome, report, validate_plan};
 use crate::WyrdStorageClient;
 use crate::error::StorageClientError;
 use wyrd_spec::storage::{S3MultipartComplete, UploadCompleteRequest};
@@ -65,6 +66,26 @@ fn malformed_dimensions_fail_before_dispatch() {
         validate_plan(&plan),
         Err(StorageClientError::PlanInvalid(_))
     ));
+}
+
+#[test]
+fn progress_preserves_known_and_unknown_totals() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&seen);
+    let callback: ProgressCallback = Arc::new(move |uploaded, total| {
+        captured
+            .lock()
+            .expect("test mutex is not poisoned")
+            .push((uploaded, total));
+    });
+
+    report(Some(&callback), 4, Some(10));
+    report(Some(&callback), 7, None);
+
+    assert_eq!(
+        *seen.lock().expect("test mutex is not poisoned"),
+        vec![(4, Some(10)), (7, None)]
+    );
 }
 
 #[tokio::test]

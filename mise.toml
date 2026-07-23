@@ -710,10 +710,17 @@ hide = true
 description = "Run the split-registry gateway workflow example (Rust)"
 run = "cargo run -p wyrd-rust-examples --bin workflow_gateway"
 
+[tasks."examples:cli:registration-progress"]
+description = "Show Card registration terminal progress rendering"
+run = "cargo run --locked -p wyrd-cli --example registration_progress"
+
 [tasks."check:examples"]
 hide = true
 description = "Build all example binaries"
-run = "cargo build -p skald-workflow --examples --features otel"
+run = [
+  "cargo build -p skald-workflow --examples --features otel",
+  "cargo check --locked -p wyrd-cli --example registration_progress",
+]
 
 [tasks."dev:backend"]
 description = "Build and run wyrd-server on :8080"

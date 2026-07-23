@@ -18,6 +18,7 @@ use crate::config;
 use crate::download;
 use crate::engine::RegistryEngine;
 use crate::error::RegistryEngineError;
+use crate::progress::RegistrationProgressSink;
 use crate::reads;
 
 /// A read-time Card lookup request.
@@ -179,7 +180,28 @@ impl Cards {
         &self,
         input: &RegistrationInput,
     ) -> Result<crate::RegistrationReceipt, WyrdError> {
-        crate::saga::register(&self.engine, input)
+        crate::saga::register(&self.engine, input, None)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Register a loader-produced composite input and forward typed progress
+    /// events to the caller while the saga runs.
+    ///
+    /// The callback may be invoked concurrently for up to four active
+    /// artifact transfers. Callers that update shared state must provide their
+    /// own synchronization; the callback itself must be safe to call from
+    /// multiple asynchronous tasks.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when validation, registration, artifact upload, or
+    /// server-owned completion fails.
+    pub async fn register_with_progress(
+        &self,
+        input: &RegistrationInput,
+        progress: RegistrationProgressSink,
+    ) -> Result<crate::RegistrationReceipt, WyrdError> {
+        crate::saga::register(&self.engine, input, Some(progress))
             .await
             .map_err(Into::into)
     }

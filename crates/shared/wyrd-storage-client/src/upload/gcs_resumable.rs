@@ -60,7 +60,7 @@ pub(crate) async fn upload(
             return Err(map_backend_response(response).await);
         }
         offset = end + 1;
-        report(hooks, offset, total);
+        report(hooks.progress.as_ref(), offset, total);
     }
     // V-004: reject an undersize source. Some backends will commit a truncated
     // object silently; the artifact-hash / expected_size contract requires

@@ -8,10 +8,12 @@ mod download;
 mod engine;
 mod error;
 mod handle;
+mod progress;
 mod reads;
 mod saga;
 
 pub use handle::{CardSelector, Cards, LoadedCard};
+pub use progress::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
 pub use wyrd_spec::registry::{
     CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,
 };

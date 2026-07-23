@@ -165,7 +165,7 @@ async fn soft_delete_card_with_expected_kind(
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         sqlx::query(
             "UPDATE wyrd.auth_service_accounts \
-                SET status = 'card_deleted', updated_at = now() \
+                SET status = 'deleted', updated_at = now() \
               WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1",
         )
         .bind(uid.as_uuid())

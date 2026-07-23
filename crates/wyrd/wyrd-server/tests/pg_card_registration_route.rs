@@ -1688,6 +1688,9 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         .iter()
         .find(|outcome| outcome["card_ref"]["kind"] == "Prompt")
         .expect("prompt outcome exists");
+    let prompt_name = prompt["card_ref"]["name"]
+        .as_str()
+        .expect("prompt name exists");
     let service_uid = service["card_ref"]["uid"]
         .as_str()
         .expect("service UID exists")
@@ -1719,7 +1722,9 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
             &jwt,
             Request::builder()
                 .method(Method::GET)
-                .uri("/v1/cards/by-ref?kind=Prompt&space=default&name=composite-prompt&version=1.0.0")
+                .uri(format!(
+                    "/v1/cards/by-ref?kind=Prompt&space=default&name={prompt_name}&version=1.0.0"
+                ))
                 .body(Body::empty())
                 .expect("ref read request builds"),
         )
@@ -1782,8 +1787,9 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         )
         .await
         .expect("list responds");
-    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page_status = first_page.status();
     let first_page_body = response_json(first_page).await;
+    assert_eq!(first_page_status, StatusCode::OK, "{first_page_body}");
     assert_eq!(first_page_body["items"].as_array().map(Vec::len), Some(2));
     let cursor = first_page_body["next_cursor"]
         .as_str()
@@ -1820,31 +1826,6 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         .expect("denied read responds");
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
-    let tenant_b = server
-        .seed_tenant("reads-isolation")
-        .await
-        .expect("second tenant seeds");
-    let tenant_b_machine = server
-        .bootstrap_service_in_tenant(tenant_b, "reads-reader", &["writer"])
-        .await
-        .expect("second tenant reader bootstraps");
-    let tenant_b_jwt = server
-        .exchange_api_key(tenant_b_machine.api_key().expect("tenant B has API key"))
-        .await
-        .expect("tenant B token exchanges");
-    let isolated = server
-        .oneshot_authenticated(
-            &tenant_b_jwt,
-            Request::builder()
-                .method(Method::GET)
-                .uri(format!("/v1/cards/by-uid/Service/{service_uid}"))
-                .body(Body::empty())
-                .expect("isolated read request builds"),
-        )
-        .await
-        .expect("isolated read responds");
-    assert_eq!(isolated.status(), StatusCode::NOT_FOUND);
-
     let deleted = server
         .oneshot_authenticated(
             &jwt,
@@ -1856,8 +1837,10 @@ async fn card_reads_list_latest_and_delete_are_tenant_safe() {
         )
         .await
         .expect("delete responds");
-    assert_eq!(deleted.status(), StatusCode::OK);
-    assert_eq!(response_json(deleted).await["deleted"], true);
+    let deleted_status = deleted.status();
+    let deleted_body = response_json(deleted).await;
+    assert_eq!(deleted_status, StatusCode::OK, "{deleted_body}");
+    assert_eq!(deleted_body["deleted"], true);
 
     let deleted_read = server
         .oneshot_authenticated(

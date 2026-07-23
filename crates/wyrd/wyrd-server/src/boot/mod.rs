@@ -577,9 +577,7 @@ pub fn spawn_card_reconciler(
         tracing::warn!("card reconciler skipped because platform admin pool is unavailable");
         return None;
     }
-    Some(crate::components::cards::reconciler::spawn_reconciler(
-        state, shutdown,
-    )?)
+    crate::components::cards::reconciler::spawn_reconciler(state, shutdown)
 }
 
 /// Configuration for the background audit relay worker.

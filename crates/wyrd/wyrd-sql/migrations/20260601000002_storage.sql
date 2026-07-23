@@ -139,7 +139,7 @@ GRANT SELECT, UPDATE ON wyrd.storage_multipart_uploads TO wyrd_platform_admin;
 
 REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_app;
 REVOKE ALL ON TABLE wyrd.storage_artifact_metadata FROM wyrd_platform_admin;
-GRANT SELECT, INSERT, UPDATE ON wyrd.storage_artifact_metadata TO wyrd_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON wyrd.storage_artifact_metadata TO wyrd_app;
 GRANT SELECT ON wyrd.storage_artifact_metadata TO wyrd_platform_admin;
 
 REVOKE ALL ON TABLE wyrd.storage_access_ledger FROM wyrd_app;

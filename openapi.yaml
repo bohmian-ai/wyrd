@@ -10,6 +10,22 @@ info:
   version: 0.0.1
 paths:
   /v1/cards:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: List tenant-visible Card summaries with keyset pagination.
+      operationId: list_cards_http
+      responses:
+        '200':
+          description: Card summaries
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListCardsResponse'
+        '400':
+          description: Invalid list query
+        '503':
+          description: Registry unavailable
     post:
       tags:
       - crate::components::cards::routes
@@ -51,11 +67,302 @@ paths:
           description: Idempotency or version conflict
         '503':
           description: Registry unavailable
+  /v1/cards/by-ref:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: Fetch one Card by its exact kind/space/name/version identity.
+      operationId: get_card_by_ref_http
+      parameters:
+      - name: kind
+        in: query
+        description: Exact Card kind
+        required: true
+        schema:
+          type: string
+      - name: space
+        in: query
+        description: Exact Card space
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: query
+        description: Exact Card name
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: query
+        description: Exact Card version
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Hydrated Card
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetCardResponse'
+        '404':
+          description: Card not found
+        '503':
+          description: Registry unavailable
+    delete:
+      tags:
+      - crate::components::cards::routes
+      summary: Delete one Card by its exact kind/space/name/version identity.
+      operationId: delete_card_by_ref_http
+      parameters:
+      - name: kind
+        in: query
+        description: Exact Card kind
+        required: true
+        schema:
+          type: string
+      - name: space
+        in: query
+        description: Exact Card space
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: query
+        description: Exact Card name
+        required: true
+        schema:
+          type: string
+      - name: version
+        in: query
+        description: Exact Card version
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Card deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteCardResponse'
+        '404':
+          description: Card not found
+        '409':
+          description: Card has inbound references
+        '503':
+          description: Registry unavailable
+        '507':
+          description: Storage cleanup incomplete
+  /v1/cards/by-uid/{kind}/{card_uid}:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: Fetch one Card by its exact kind-qualified UID.
+      operationId: get_card_http
+      parameters:
+      - name: kind
+        in: path
+        description: Card kind namespace
+        required: true
+        schema:
+          type: string
+      - name: card_uid
+        in: path
+        description: Server-minted Card UID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Hydrated Card
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetCardResponse'
+        '401':
+          description: Authentication required
+        '403':
+          description: Card read permission required
+        '404':
+          description: Card not found
+        '503':
+          description: Registry unavailable
+    delete:
+      tags:
+      - crate::components::cards::routes
+      summary: Delete one Card by its exact UID.
+      operationId: delete_card_http
+      parameters:
+      - name: kind
+        in: path
+        description: Card kind namespace
+        required: true
+        schema:
+          type: string
+      - name: card_uid
+        in: path
+        description: Server-minted Card UID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Card deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteCardResponse'
+        '404':
+          description: Card not found
+        '409':
+          description: Card has inbound references
+        '503':
+          description: Registry unavailable
+        '507':
+          description: Storage cleanup incomplete
+  /v1/cards/download/init:
+    post:
+      tags:
+      - crate::components::storage::routes
+      summary: Create a signed or local download plan for a stored artifact.
+      operationId: download_init
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadInitRequest'
+        required: true
+      responses:
+        '200':
+          description: Download plan
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadInitResponse'
+        '403':
+          description: Card read permission required
+        '404':
+          description: Card artifact not found
+        '503':
+          description: Storage unavailable
+  /v1/cards/{card_uid}/artifacts:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: List server-authoritative stored artifacts for one Card.
+      operationId: list_artifacts_http
+      parameters:
+      - name: card_uid
+        in: path
+        description: Card UID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Artifact inventory
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtifactInventoryResponse'
+        '404':
+          description: Card not found
+        '503':
+          description: Registry unavailable
+  /v1/cards/{kind}/{space}/{name}/latest:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: Resolve the newest stable Active Card in an identity line.
+      operationId: get_latest_card_http
+      parameters:
+      - name: kind
+        in: path
+        description: Card kind
+        required: true
+        schema:
+          type: string
+      - name: space
+        in: path
+        description: Card space
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        description: Card name
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Latest Active Card
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetCardResponse'
+        '404':
+          description: Card not found
+        '503':
+          description: Registry unavailable
+  /v1/cards/{kind}/{space}/{name}/versions:
+    get:
+      tags:
+      - crate::components::cards::routes
+      summary: List versions in one exact Card identity line.
+      operationId: list_versions_http
+      parameters:
+      - name: kind
+        in: path
+        description: Card kind
+        required: true
+        schema:
+          type: string
+      - name: space
+        in: path
+        description: Card space
+        required: true
+        schema:
+          type: string
+      - name: name
+        in: path
+        description: Card name
+        required: true
+        schema:
+          type: string
+      - name: include_prerelease
+        in: query
+        description: Include prerelease versions
+        required: false
+        schema:
+          type: boolean
+      responses:
+        '200':
+          description: Card versions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListVersionsResponse'
+        '503':
+          description: Registry unavailable
 components:
   schemas:
     ApiVersion:
       type: string
       description: Canonical Wyrd API version.
+    ArtifactInventoryResponse:
+      type: object
+      description: Stored artifact inventory response.
+      required:
+      - artifacts
+      properties:
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoredArtifactEntry'
+          description: Stored artifacts.
+      additionalProperties: false
     ArtifactManifestEntry:
       type: object
       description: One heavy artifact declared by a submission.
@@ -89,6 +396,33 @@ components:
       propertyNames:
         type: string
         description: Validated key for free-form Card annotations.
+    Card:
+      type: object
+      description: Universal registered Card envelope.
+      required:
+      - kind
+      - metadata
+      - spec
+      properties:
+        apiVersion:
+          $ref: '#/components/schemas/ApiVersion'
+          description: API version. Must be `wyrd/v1` for v1 Cards.
+        kind:
+          $ref: '#/components/schemas/CardKind'
+          description: Card kind discriminator.
+        metadata:
+          $ref: '#/components/schemas/Metadata'
+          description: Card metadata.
+        relationships:
+          $ref: '#/components/schemas/Relationships'
+          description: Server-derived relationship summary.
+        spec:
+          description: Kind-specific spec payload.
+        status:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Status'
+            description: Optional server-derived status.
     CardKind:
       type: string
       description: Native Wyrd Card kind plus forward-compatible external catch-all.
@@ -223,6 +557,55 @@ components:
         spec:
           description: Kind-specific spec body.
       additionalProperties: false
+    CardSummary:
+      type: object
+      description: Metadata-only card list item.
+      required:
+      - card_uid
+      - kind
+      - space
+      - name
+      - version
+      - spec_hash
+      - status
+      - created_at
+      - updated_at
+      properties:
+        artifact_hash:
+          type:
+          - string
+          - 'null'
+          description: Optional BLAKE3-hex artifact hash.
+        card_uid:
+          $ref: '#/components/schemas/CardUid'
+          description: Card UID.
+        created_at:
+          type: string
+          format: date-time
+          description: Creation time.
+        kind:
+          $ref: '#/components/schemas/CardKind'
+          description: Card kind.
+        name:
+          $ref: '#/components/schemas/CardName'
+          description: Card name.
+        space:
+          $ref: '#/components/schemas/SpaceName'
+          description: Workspace.
+        spec_hash:
+          type: string
+          description: BLAKE3-hex spec hash.
+        status:
+          $ref: '#/components/schemas/CardLifecycleStatus'
+          description: Lifecycle status.
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update time.
+        version:
+          $ref: '#/components/schemas/VersionBlock'
+          description: Resolved version.
+      additionalProperties: false
     CardUid:
       type: string
       description: Resolved immutable Card UID.
@@ -302,6 +685,106 @@ components:
             $ref: '#/components/schemas/CardUploadPlan'
           description: Upload plans for artifact-bearing submissions.
       additionalProperties: false
+    DeleteCardResponse:
+      type: object
+      description: Soft-delete response.
+      required:
+      - card_uid
+      - deleted
+      properties:
+        card_uid:
+          $ref: '#/components/schemas/CardUid'
+          description: Card UID.
+        deleted:
+          type: boolean
+          description: True only on the first delete.
+      additionalProperties: false
+    DownloadInitRequest:
+      type: object
+      description: Client request to initialize a download.
+      required:
+      - card_uid
+      - relative_path
+      properties:
+        card_uid:
+          $ref: '#/components/schemas/CardUid'
+          description: Card that owns the stored object.
+        relative_path:
+          type: string
+          description: Object path under the card.
+        ttl_secs:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: |-
+            Optional presign TTL override in seconds.
+
+            Clamped to [60, 3600] seconds; out-of-range values are silently
+            clamped. Defaults to the configured backend presign TTL when absent.
+          minimum: 0
+      additionalProperties: false
+    DownloadInitResponse:
+      type: object
+      description: Server response to a download-init request.
+      required:
+      - plan
+      - size_bytes
+      - sha256
+      properties:
+        plan:
+          $ref: '#/components/schemas/DownloadPlan'
+          description: Backend-specific download plan.
+        sha256:
+          type: string
+          description: Expected base64-encoded SHA-256 digest.
+        size_bytes:
+          type: integer
+          format: int64
+          description: Expected object size in bytes.
+          minimum: 0
+      additionalProperties: false
+    DownloadPlan:
+      type: object
+      description: Presigned GET plan for any backend.
+      required:
+      - get_url
+      - ttl_secs
+      properties:
+        get_url:
+          type: string
+          description: Presigned GET URL or local server route URL.
+        ttl_secs:
+          type: integer
+          format: int32
+          description: |-
+            URL time-to-live in seconds.
+
+            For presigned URL backends (S3, GCS, Azure) this is the URL expiry in
+            seconds. For the local filesystem backend this field is `0` (the server
+            route does not expire).
+          minimum: 0
+      additionalProperties: false
+    GetCardResponse:
+      type: object
+      description: Full card response.
+      required:
+      - card
+      - created_at
+      - updated_at
+      properties:
+        card:
+          $ref: '#/components/schemas/Card'
+          description: Card envelope.
+        created_at:
+          type: string
+          format: date-time
+          description: Creation time.
+        updated_at:
+          type: string
+          format: date-time
+          description: Last update time.
+      additionalProperties: false
     HeaderPair:
       type: object
       description: Required HTTP header for a client upload request.
@@ -315,6 +798,35 @@ components:
         value:
           type: string
           description: Header value.
+      additionalProperties: false
+    ListCardsResponse:
+      type: object
+      description: A page of card summaries.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CardSummary'
+          description: Page items.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Opaque continuation cursor.
+      additionalProperties: false
+    ListVersionsResponse:
+      type: object
+      description: Versions available for one card identity.
+      required:
+      - versions
+      properties:
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/VersionBlock'
+          description: Resolved versions.
       additionalProperties: false
     Metadata:
       type: object
@@ -428,6 +940,20 @@ components:
       - registered
       - idempotent_noop
       - deduplicated
+    Relationships:
+      type: object
+      description: Server-derived relationship summary for graph, UI, policy, imports, and diff.
+      properties:
+        inbound:
+          type: array
+          items:
+            type: string
+          description: Inbound references as normalized display strings.
+        outbound:
+          type: array
+          items:
+            type: string
+          description: Outbound references as normalized display strings.
     RelativeArtifactPath:
       type: string
       description: A validated relative path inside a card's artifact manifest.
@@ -445,6 +971,50 @@ components:
         primitive.
 
         Wire form: 64 lowercase hex characters (BLAKE3-256 digest).
+    Status:
+      type: object
+      description: Server-derived Card status.
+      required:
+      - phase
+      properties:
+        message:
+          type:
+          - string
+          - 'null'
+          description: Human-readable status message.
+        phase:
+          type: string
+          description: Lifecycle phase such as `draft`, `active`, or `deprecated`.
+        updated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last status update timestamp.
+    StoredArtifactEntry:
+      type: object
+      description: One stored artifact.
+      required:
+      - relative_path
+      - sha256
+      - size_bytes
+      properties:
+        content_type:
+          type:
+          - string
+          - 'null'
+          description: Optional MIME type.
+        relative_path:
+          $ref: '#/components/schemas/RelativeArtifactPath'
+          description: Relative artifact path.
+        sha256:
+          type: string
+          description: Base64-encoded SHA-256.
+        size_bytes:
+          type: integer
+          format: int64
+          description: Stored byte length.
+      additionalProperties: false
     UploadId:
       type: string
       description: Typed upload identifier displayed as `wyu_{uuid_v7}`.
@@ -484,9 +1054,8 @@ components:
         description: |-
           Local filesystem auth-gated upload.
 
-          Signals that the upload URL is an auth-gated server route, not a
-          presigned PUT. SDK clients must include `Authorization: Bearer` and
-          `x-wyrd-data-tenant-id` on the PUT request.
+          Signals that the upload URL is an auth-gated server route for one
+          server-minted upload capability, not a caller-selected storage path.
         required:
         - data
         - protocol
@@ -496,9 +1065,8 @@ components:
             description: |-
               Local filesystem auth-gated upload.
 
-              Signals that the upload URL is an auth-gated server route, not a
-              presigned PUT. SDK clients must include `Authorization: Bearer` and
-              `x-wyrd-data-tenant-id` on the PUT request.
+              Signals that the upload URL is an auth-gated server route for one
+              server-minted upload capability, not a caller-selected storage path.
             required:
             - put_url
             - ttl_secs

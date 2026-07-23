@@ -11,19 +11,23 @@ order: 1
 Wyrd is the AI layer for human and agentic work. It makes AI work declarative,
 connectable, inspectable, reproducible, and operable.
 
-Concretely: Wyrd gives every component of an AI system — dataset, model, prompt,
-agent — **one typed, versioned record called a Card**. A **registry** stores those
-cards and links them into a lineage graph. The **Skald** runtime executes the
-agentic ones. What you declared is what runs, and every link between components
-is derived, not hand-maintained.
+Concretely: Wyrd connects every piece of an AI system. Declare and connect cards, record
+observations at runtime, evaluate, audit, alert and manage the system from one contract.
+Wyrd is a platform for building and running AI systems.
 
 ## The coordination problem
 
 An AI system is not one artifact. It is a dataset, the model trained on it, the
 prompt that calls the model, the agent that runs the prompt, and the workflow
-that orchestrates the agents. Each of these usually lives in a different tool with
-a different format: a feature store, a model registry, a prompt file in a repo, a
-YAML config, a notebook.
+that orchestrates the agents. It is also the pre-deployment observations
+(commits, code changes, agent traces), the post-deployment observations
+(traces, evals, logs, metrics, drift), and the glue connecting all of it.
+Most organizations never build that glue. It is fragile, hard to maintain,
+and requires wiring together systems that were never designed to coordinate.
+
+Each piece usually lives in a different tool with a different format: a
+feature store, a model registry, a prompt file in a repo, a YAML config, a
+notebook.
 
 Nothing types the boundaries between them, so nothing can answer basic questions:
 
@@ -31,9 +35,9 @@ Nothing types the boundaries between them, so nothing can answer basic questions
 - If I change this prompt, what agents depend on it?
 - Is the prompt running in production the one that was reviewed?
 
-Every team rebuilds this connective tissue by hand — naming conventions, wiki
-pages, tribal knowledge — and it rots. Wyrd's premise is that the connective
-tissue should be typed and derived, not documented.
+Every team rebuilds this connective tissue by hand with naming conventions,
+wiki pages, and tribal knowledge, and it rots. Wyrd's premise is that the
+connective tissue should be typed and derived, not documented.
 
 ## How Wyrd answers it
 

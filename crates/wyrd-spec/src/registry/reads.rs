@@ -78,6 +78,7 @@ pub struct ListCardsRequest {
     pub status: Option<CardLifecycleStatus>,
     /// Optional metadata query encoded as its canonical query-language string.
     #[serde(
+        default,
         serialize_with = "metadata_query_option::serialize",
         deserialize_with = "metadata_query_option::deserialize"
     )]

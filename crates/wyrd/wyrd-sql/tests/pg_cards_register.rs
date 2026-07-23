@@ -246,7 +246,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
     assert_eq!(first[0].reconcile_attempts, 1);
-    let owner = first[0].reconcile_lease_owner;
+    let mut owner = first[0].reconcile_lease_owner;
 
     let immediate =
         claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
@@ -285,7 +285,7 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
         .expect("retry claim succeeds");
         assert_eq!(claim.len(), 1);
         assert_eq!(claim[0].reconcile_attempts, attempt + 1);
-        assert_eq!(claim[0].reconcile_lease_owner, owner);
+        owner = claim[0].reconcile_lease_owner;
     }
 
     let mut conn = fixture

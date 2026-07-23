@@ -52,7 +52,7 @@ use crate::components::cards::resolve::{
     ResolvedRefs, bind_card_references, resolve_card_references,
 };
 use crate::components::storage::routes::storage_caller;
-use crate::state::AppState;
+use crate::state::{AppState, registry_db_error};
 
 /// Deterministic request plan produced before the write transaction opens.
 struct RegistrationPlan {
@@ -100,7 +100,7 @@ async fn replay(
     idempotency_key: &str,
     request_hash: &str,
 ) -> Result<Option<(RegistrationOperationId, RegistrationReplaySeed)>, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let operation = match lookup_existing_operation(&mut conn, caller.principal.id, idempotency_key)
         .await?
     {
@@ -350,7 +350,7 @@ async fn load_manifest_rows(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<Vec<CardArtifactManifestRow>, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let rows = manifest_rows_for_init(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(rows)
@@ -404,7 +404,7 @@ async fn initialize_manifest_row(
             return Err(error);
         }
     };
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let event = audit_event(
         caller,
         "card.artifact.upload_init.success",
@@ -485,7 +485,7 @@ async fn resolve_external(
     caller: &Caller,
     submissions: &[CardSubmission],
 ) -> Result<ResolvedRefs, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let resolved = resolve_card_references(&mut conn, submissions).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(resolved)
@@ -522,7 +522,7 @@ async fn write_registration(
     mut plan: RegistrationPlan,
 ) -> Result<(RegistrationOperationId, RegistrationReplaySeed), WyrdError> {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     // Recheck before reserving idempotency so a dependency rejection rolls back
     // the entire attempt, including its bookkeeping row. The row locks remain
     // held while cards and relationships are written below.
@@ -992,7 +992,7 @@ async fn load_card_completion_state(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<CardCompletionState, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let card = get_card_by_uid(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
@@ -1050,7 +1050,7 @@ async fn commit_card_activation(
     blob_uri: &str,
     record_blob: bool,
 ) -> Result<bool, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     if !lock_pending_card_for_activation(&mut conn, card_uid).await? {
         conn.commit().await.map_err(registry_db_error)?;
         return Ok(false);
@@ -1090,7 +1090,7 @@ async fn load_card_registration_outcome(
     card_uid: &CardUid,
     outcome: RegistrationOutcomeKind,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let card = get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(existing_row_to_response(&card, outcome))
@@ -1184,7 +1184,7 @@ async fn load_open_card_uploads(
     caller: &Caller,
     card_uid: &CardUid,
 ) -> Result<Vec<multipart_uploads::MultipartUploadRow>, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let rows = multipart_uploads::find_open_for_card(&mut conn, card_uid.as_str())
         .await
         .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
@@ -1236,7 +1236,7 @@ async fn commit_card_failure(
     card_uid: &CardUid,
     cleanup_succeeded: bool,
 ) -> Result<bool, WyrdError> {
-    let mut conn = state.registry_tenant_conn(caller.data_tenant_id)?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let failed = fail_card(&mut conn, card_uid).await?;
     if failed {
         let event = audit_event(

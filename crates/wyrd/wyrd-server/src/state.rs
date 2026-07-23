@@ -13,14 +13,14 @@ use arc_swap::ArcSwap;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use wyrd_auth_verify::TokenVerifier;
+use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_storage::StorageHandle;
-use wyrd_storage::service::map_sql_error;
 use wyrd_telemetry::TelemetryGuard;
 use wyrd_tonic::tonic_health::server::HealthReporter;
 
 /// Redact database failures at the public registry boundary.
-fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
+pub(crate) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
     tracing::error!(%error, "card registration database operation failed");
     WyrdError::registry_unavailable("card registry unavailable")
 }
@@ -186,7 +186,6 @@ impl AppState {
     }
 
     /// Get a tenant-scoped Postgres connection for registry operations. Redacts DB errors.
-    #[must_use]
     pub async fn registry_tenant_conn(
         &self,
         tenant_id: DataTenantId,

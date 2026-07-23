@@ -71,7 +71,6 @@ struct StorageServiceState<'a> {
 
 impl StorageServiceState<'_> {
     /// Get a tenant-scoped Postgres connection for storage operations.
-    #[must_use]
     pub async fn storage_tenant_conn(
         &self,
         tenant_id: DataTenantId,

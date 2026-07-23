@@ -156,9 +156,8 @@ pub async fn list_cards(
         });
     }
     let limit = match request.limit {
-        Some(value) => u32::try_from(value).map_err(|_| {
-            WyrdError::registry_list_limit_out_of_range(value.unsigned_abs(), 200)
-        })?,
+        Some(value) => u32::try_from(value)
+            .map_err(|_| WyrdError::registry_list_limit_out_of_range(value.unsigned_abs(), 200))?,
         None => DEFAULT_LIST_LIMIT,
     };
     let cursor = decode_list_cursor(request.cursor.as_deref(), limit)?;

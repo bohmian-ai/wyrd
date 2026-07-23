@@ -1642,3 +1642,235 @@ async fn wire_order_permutation_replays_identical_graph() {
 
     server.shutdown().await.expect("test server shuts down");
 }
+
+#[tokio::test(flavor = "current_thread")]
+/// Public Card reads preserve graph relationships, pagination, tenant isolation, and tombstones.
+async fn card_reads_list_latest_and_delete_are_tenant_safe() {
+    if !enabled() {
+        return;
+    }
+
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-reads-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("writer bootstrap returned a non-user principal");
+    };
+    let Bootstrap::User {
+        jwt: denied_jwt, ..
+    } = server
+        .bootstrap_user("registry-reads-denied", &[])
+        .await
+        .expect("denied user bootstraps")
+    else {
+        panic!("denied bootstrap returned a non-user principal");
+    };
+
+    let registered = server
+        .oneshot_authenticated(&jwt, three_card_composite_request("reads-001"))
+        .await
+        .expect("composite registration responds");
+    let registered_status = registered.status();
+    let registered_body = response_json(registered).await;
+    assert_eq!(registered_status, StatusCode::CREATED, "{registered_body}");
+    let outcomes = registered_body["outcomes"]
+        .as_array()
+        .expect("registration outcomes are an array");
+    let service = outcomes
+        .iter()
+        .find(|outcome| outcome["card_ref"]["kind"] == "Service")
+        .expect("service outcome exists");
+    let prompt = outcomes
+        .iter()
+        .find(|outcome| outcome["card_ref"]["kind"] == "Prompt")
+        .expect("prompt outcome exists");
+    let service_uid = service["card_ref"]["uid"]
+        .as_str()
+        .expect("service UID exists")
+        .to_owned();
+
+    let by_uid = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards/by-uid/Service/{service_uid}"))
+                .body(Body::empty())
+                .expect("UID read request builds"),
+        )
+        .await
+        .expect("UID read responds");
+    assert_eq!(by_uid.status(), StatusCode::OK);
+    let service_body = response_json(by_uid).await;
+    assert_eq!(service_body["card"]["status"]["phase"], "active");
+    assert!(
+        !service_body["card"]["relationships"]["outbound"]
+            .as_array()
+            .expect("outbound relationships are an array")
+            .is_empty()
+    );
+
+    let by_ref = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/cards/by-ref?kind=Prompt&space=default&name=composite-prompt&version=1.0.0")
+                .body(Body::empty())
+                .expect("ref read request builds"),
+        )
+        .await
+        .expect("ref read responds");
+    assert_eq!(by_ref.status(), StatusCode::OK);
+    let prompt_body = response_json(by_ref).await;
+    assert_eq!(prompt_body["card"]["metadata"]["name"], "composite-prompt");
+    assert!(
+        !prompt_body["card"]["relationships"]["inbound"]
+            .as_array()
+            .expect("inbound relationships are an array")
+            .is_empty()
+    );
+
+    let latest = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/cards/Prompt/default/composite-prompt/latest")
+                .body(Body::empty())
+                .expect("latest read request builds"),
+        )
+        .await
+        .expect("latest read responds");
+    assert_eq!(latest.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(latest).await["card"]["metadata"]["version"],
+        "1.0.0"
+    );
+
+    let versions = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/cards/Prompt/default/composite-prompt/versions")
+                .body(Body::empty())
+                .expect("versions request builds"),
+        )
+        .await
+        .expect("versions responds");
+    assert_eq!(versions.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(versions).await["versions"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let first_page = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/v1/cards?limit=2")
+                .body(Body::empty())
+                .expect("list request builds"),
+        )
+        .await
+        .expect("list responds");
+    assert_eq!(first_page.status(), StatusCode::OK);
+    let first_page_body = response_json(first_page).await;
+    assert_eq!(first_page_body["items"].as_array().map(Vec::len), Some(2));
+    let cursor = first_page_body["next_cursor"]
+        .as_str()
+        .expect("list returns a cursor");
+    let second_page = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards?limit=2&cursor={cursor}"))
+                .body(Body::empty())
+                .expect("cursor list request builds"),
+        )
+        .await
+        .expect("cursor list responds");
+    assert_eq!(second_page.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(second_page).await["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let denied = server
+        .oneshot_authenticated(
+            &denied_jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards/by-uid/Service/{service_uid}"))
+                .body(Body::empty())
+                .expect("denied read request builds"),
+        )
+        .await
+        .expect("denied read responds");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let tenant_b = server
+        .seed_tenant("reads-isolation")
+        .await
+        .expect("second tenant seeds");
+    let tenant_b_machine = server
+        .bootstrap_service_in_tenant(tenant_b, "reads-reader", &["writer"])
+        .await
+        .expect("second tenant reader bootstraps");
+    let tenant_b_jwt = server
+        .exchange_api_key(tenant_b_machine.api_key().expect("tenant B has API key"))
+        .await
+        .expect("tenant B token exchanges");
+    let isolated = server
+        .oneshot_authenticated(
+            &tenant_b_jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards/by-uid/Service/{service_uid}"))
+                .body(Body::empty())
+                .expect("isolated read request builds"),
+        )
+        .await
+        .expect("isolated read responds");
+    assert_eq!(isolated.status(), StatusCode::NOT_FOUND);
+
+    let deleted = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/v1/cards/by-ref?kind=Service&space=default&name=composite-service&version=1.0.0")
+                .body(Body::empty())
+                .expect("delete request builds"),
+        )
+        .await
+        .expect("delete responds");
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(response_json(deleted).await["deleted"], true);
+
+    let deleted_read = server
+        .oneshot_authenticated(
+            &jwt,
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("/v1/cards/by-uid/Service/{service_uid}"))
+                .body(Body::empty())
+                .expect("deleted read request builds"),
+        )
+        .await
+        .expect("deleted read responds");
+    assert_eq!(deleted_read.status(), StatusCode::NOT_FOUND);
+
+    server.shutdown().await.expect("test server shuts down");
+}

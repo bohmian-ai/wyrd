@@ -12,13 +12,13 @@ use wyrd_spec::envelope::Card;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
-use wyrd_sql::queries::cards::{
-    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION,
-    claim_card_reconciliation, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation, persist_outbound_relationships, record_card_reconciliation_failure,
-    recheck_active_card_refs, soft_delete_card_by_ref, soft_delete_card_with_state,
-};
 use wyrd_sql::OperatorPool;
+use wyrd_sql::queries::cards::{
+    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_REGISTRATION, claim_card_reconciliation,
+    insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
+    persist_outbound_relationships, recheck_active_card_refs, record_card_reconciliation_failure,
+    soft_delete_card_by_ref, soft_delete_card_with_state,
+};
 use wyrd_sql::row_types::cards::CardStatus;
 
 /// Return whether live Postgres registration tests are enabled.
@@ -206,7 +206,10 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     let operation_id = RegistrationOperationId::new(Uuid::now_v7());
     let card_uid = CardUid::from_uuid(Uuid::now_v7()).expect("UUIDv7 is a valid card UID");
     let card = prompt_card("reconcile-bounded");
-    let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
     insert_registration_operation(
         &mut conn,
         NewRegistrationOperation {
@@ -236,31 +239,29 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
 
     let operator = OperatorPool::from(fixture.platform_admin_pool().clone());
     let first_now = Utc::now() + Duration::seconds(1);
-    let first = claim_card_reconciliation(
-        &operator,
-        first_now,
-        first_now + Duration::seconds(30),
-        32,
-    )
-    .await
-    .expect("first claim succeeds");
+    let first =
+        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
+            .await
+            .expect("first claim succeeds");
     assert_eq!(first.len(), 1);
     assert_eq!(first[0].reconcile_kind, RECONCILE_KIND_REGISTRATION);
     assert_eq!(first[0].reconcile_attempts, 1);
     let owner = first[0].reconcile_lease_owner;
 
-    let immediate = claim_card_reconciliation(
-        &operator,
-        first_now,
-        first_now + Duration::seconds(30),
-        32,
-    )
-    .await
-    .expect("second claim succeeds");
+    let immediate =
+        claim_card_reconciliation(&operator, first_now, first_now + Duration::seconds(30), 32)
+            .await
+            .expect("second claim succeeds");
     assert!(immediate.is_empty(), "live lease must exclude the Card");
 
-    for (attempt, now) in [(1, first_now + Duration::seconds(31)), (2, first_now + Duration::seconds(36))] {
-        let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+    for (attempt, now) in [
+        (1, first_now + Duration::seconds(31)),
+        (2, first_now + Duration::seconds(36)),
+    ] {
+        let mut conn = fixture
+            .tenant_conn()
+            .await
+            .expect("tenant connection opens");
         let dead = record_card_reconciliation_failure(
             &mut conn,
             &card_uid,
@@ -287,7 +288,10 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
         assert_eq!(claim[0].reconcile_lease_owner, owner);
     }
 
-    let mut conn = fixture.tenant_conn().await.expect("tenant connection opens");
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
     let dead = record_card_reconciliation_failure(
         &mut conn,
         &card_uid,
@@ -309,7 +313,10 @@ async fn reconciliation_claims_are_bounded_and_lease_safe() {
     )
     .await
     .expect("bounded claim succeeds");
-    assert!(fourth.is_empty(), "dead-lettered Card must not be claimed again");
+    assert!(
+        fourth.is_empty(),
+        "dead-lettered Card must not be claimed again"
+    );
 }
 
 /// Persist a UID-bearing outbound edge atomically with its source Card row.

@@ -8,6 +8,12 @@ use utoipa::OpenApi;
     info(title = "Wyrd API", version = "0.0.1", license(name = "Apache-2.0")),
     paths(
         crate::components::cards::routes::register_card_http,
+        crate::components::cards::routes::get_card_http,
+        crate::components::cards::routes::get_card_by_ref_http,
+        crate::components::cards::routes::get_latest_card_http,
+        crate::components::cards::routes::list_versions_http,
+        crate::components::cards::routes::list_cards_http,
+        crate::components::cards::routes::list_artifacts_http,
         crate::components::cards::routes::delete_card_http,
         crate::components::cards::routes::delete_card_by_ref_http
     )

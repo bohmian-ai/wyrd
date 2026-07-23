@@ -1,4 +1,4 @@
-//! Wyrd MCP server library — exposes the Bifrost tool registration API for
-//! tests and future MCP transport integration.
+//! Wyrd MCP server library — exposes thin, typed delegates for Wyrd services.
 
 pub mod bifrost;
+pub mod cards;

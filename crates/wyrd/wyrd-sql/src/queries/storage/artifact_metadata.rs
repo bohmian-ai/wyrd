@@ -176,3 +176,16 @@ pub async fn get(
 
     row.map(ArtifactMetadataRow::try_from).transpose()
 }
+
+/// Delete artifact metadata owned by one Card after its backend objects are gone.
+pub async fn delete_for_card(conn: &mut TenantConn<'_>, card_uid: &str) -> Result<(), SqlError> {
+    sqlx::query(
+        "DELETE FROM wyrd.storage_artifact_metadata \
+          WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1",
+    )
+    .bind(card_uid)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+    Ok(())
+}

@@ -19,25 +19,26 @@ use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::reference::{CardRef, CardRefIdentity, scope_child_card_refs};
 use wyrd_spec::registry::{
     CardLifecycleStatus, CardRegistrationOutcome, CardSubmission, CardUploadEntry, CardUploadPlan,
-    CreateCardRequest, CreateCardResponse, RegistrationOperationId, RegistrationOutcomeKind,
-    RegistrationReplaySeed, RelativeArtifactPath,
+    CreateCardRequest, CreateCardResponse, DeleteCardResponse, RegistrationOperationId,
+    RegistrationOutcomeKind, RegistrationReplaySeed, RelativeArtifactPath,
 };
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    CardArtifactManifestRow, CardManifestCompletionRow, CardRegistrationOperationRow, NewCardRow,
-    NewRegistrationOperation, Resolution, SubmittedCardIdentity, activate_card,
-    artifact_manifest_hash, commit_registration_operation, fail_card, find_card_by_ref,
-    get_card_by_uid, insert_artifact_manifest_rows, insert_card_row, insert_registration_operation,
-    lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
-    lookup_expired_operation, manifest_completion_rows, manifest_rows_for_init,
-    mark_manifest_upload_initialized, mark_manifest_verified, persist_outbound_relationships,
-    recheck_active_card_refs, record_blob_failure, record_card_blob, registration_request_hash,
-    resolve_version, upsert_service_account_from_card,
+    CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow,
+    CardRegistrationOperationRow, NewCardRow, NewRegistrationOperation, Resolution,
+    SubmittedCardIdentity, activate_card, artifact_manifest_hash, commit_registration_operation,
+    fail_card, find_card_by_ref, get_card_by_uid, insert_artifact_manifest_rows, insert_card_row,
+    insert_registration_operation, lock_pending_card_for_activation, lock_version_line,
+    lookup_existing_operation, lookup_expired_operation, manifest_completion_rows,
+    manifest_rows_for_init, mark_manifest_upload_initialized, mark_manifest_verified,
+    persist_outbound_relationships, recheck_active_card_refs, record_blob_failure,
+    record_card_blob, registration_request_hash, resolve_version, soft_delete_card_by_ref,
+    soft_delete_card_with_kind, upsert_service_account_from_card,
 };
-use wyrd_sql::queries::storage::multipart_uploads;
+use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
 use wyrd_sql::row_types::cards::ParsedCardRow;
 use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
@@ -937,6 +938,89 @@ pub async fn complete_card(
         },
     )
     .await
+}
+
+/// Soft-delete one exact Card UID while asserting its kind namespace.
+///
+/// The SQL transition and audit append commit before any backend delete. If a
+/// backend cleanup fails, the deleted card and its cleanup rows remain intact
+/// so a later retry can repeat the idempotent operation.
+pub async fn delete_card_with_kind(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    kind: CardKind,
+) -> Result<DeleteCardResponse, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let delete_state = soft_delete_card_with_kind(
+        &mut conn,
+        card_uid,
+        kind,
+        &caller.principal,
+        Some(&caller.request_id),
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    finish_card_delete(state, caller, delete_state).await
+}
+
+/// Soft-delete one Card selected by its exact public CardRef.
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+pub async fn delete_card_by_ref(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<DeleteCardResponse, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let delete_state = soft_delete_card_by_ref(
+        &mut conn,
+        card_ref,
+        &caller.principal,
+        Some(&caller.request_id),
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    finish_card_delete(state, caller, delete_state).await
+}
+
+async fn finish_card_delete(
+    state: &AppState,
+    caller: &Caller,
+    delete_state: CardDeleteState,
+) -> Result<DeleteCardResponse, WyrdError> {
+    if delete_state.deleted || delete_state.card.status == CardStatus::Deleted {
+        let cleanup_failures = cleanup_card_artifacts(
+            state,
+            caller,
+            &delete_state.card.card_uid,
+            &delete_state.card,
+            &delete_state.manifests,
+        )
+        .await;
+        if !cleanup_failures.is_empty() {
+            tracing::error!(
+                card_uid = %delete_state.card.card_uid,
+                failure_count = cleanup_failures.len(),
+                "card deletion cleanup was incomplete"
+            );
+            return Err(WyrdError::RegistryArtifactVerifyFailed {
+                message: "card deletion cleanup was incomplete".to_owned(),
+                details: serde_json::json!({
+                    "card_uid": delete_state.card.card_uid,
+                    "failure_count": cleanup_failures.len(),
+                }),
+            });
+        }
+        let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+        artifact_metadata::delete_for_card(&mut conn, delete_state.card.card_uid.as_str())
+            .await
+            .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+        conn.commit().await.map_err(registry_db_error)?;
+    }
+    Ok(DeleteCardResponse {
+        card_uid: delete_state.card.card_uid,
+        deleted: delete_state.deleted,
+    })
 }
 
 /// Abort one incomplete Card and clean its upload/object state.

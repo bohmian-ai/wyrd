@@ -6,7 +6,11 @@ use utoipa::OpenApi;
 #[derive(OpenApi)]
 #[openapi(
     info(title = "Wyrd API", version = "0.0.1", license(name = "Apache-2.0")),
-    paths(crate::components::cards::routes::register_card_http)
+    paths(
+        crate::components::cards::routes::register_card_http,
+        crate::components::cards::routes::delete_card_http,
+        crate::components::cards::routes::delete_card_by_ref_http
+    )
 )]
 pub struct WyrdApiDoc;
 

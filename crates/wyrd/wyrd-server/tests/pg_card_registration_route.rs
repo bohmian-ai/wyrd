@@ -46,6 +46,7 @@ async fn seed_dependency(
         .superuser_pool()
         .await
         .expect("superuser pool opens");
+    let spec_hash = blake3::hash(name.as_bytes()).to_hex().to_string();
     sqlx::query(
         "INSERT INTO wyrd.cards \
             (card_uid, data_tenant_id, kind, space, name, version, spec, spec_hash, status) \
@@ -55,7 +56,7 @@ async fn seed_dependency(
     .bind(tenant.as_uuid())
     .bind(name)
     .bind(json!({ "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }))
-    .bind(format!("seed-{name}"))
+    .bind(spec_hash)
     .bind(status)
     .execute(&pool)
     .await
@@ -1220,6 +1221,170 @@ async fn completion_audit_failure_keeps_card_pending() {
     assert_eq!(complete_audits, 0);
     conn.commit().await.expect("assertion transaction commits");
 
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Delete audit failure rolls back the tombstone and does not append an audit row.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_audit_failure_keeps_card_active() {
+    if !enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-delete-audit-failure", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("writer bootstrap returned a non-user principal");
+    };
+    let card_uid = seed_dependency(
+        &server,
+        server.data_tenant_id(),
+        "delete-audit-failure",
+        "active",
+    )
+    .await;
+    let superuser = server
+        .pg_fixture()
+        .superuser_pool()
+        .await
+        .expect("superuser pool opens");
+    sqlx::query(
+        r#"CREATE OR REPLACE FUNCTION vala.test_fail_card_delete_audit()
+           RETURNS trigger LANGUAGE plpgsql AS $$
+           BEGIN
+             IF NEW.operation = 'card.registration' THEN
+               RAISE EXCEPTION 'injected delete audit failure';
+             END IF;
+             RETURN NEW;
+           END;
+           $$;"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure function installs");
+    sqlx::query(
+        r#"CREATE TRIGGER test_fail_card_delete_audit
+           BEFORE INSERT ON vala.audit_outbox
+           FOR EACH ROW EXECUTE FUNCTION vala.test_fail_card_delete_audit()"#,
+    )
+    .execute(&superuser)
+    .await
+    .expect("failure trigger installs");
+
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/v1/cards/by-uid/Prompt/{card_uid}"))
+        .body(Body::empty())
+        .expect("delete request builds");
+    let response = server
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("delete responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let card_status: String =
+        sqlx::query_scalar("SELECT status FROM wyrd.cards WHERE card_uid = $1")
+            .bind(card_uid.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("card state reads");
+    let delete_audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox \
+         WHERE operation = 'card.registration' AND resource = $1",
+    )
+    .bind(format!("card:{card_uid}"))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("delete audit count reads");
+    assert_eq!(card_status, "active");
+    assert_eq!(delete_audits, 0);
+    conn.commit().await.expect("assertion transaction commits");
+    server.shutdown().await.expect("test server shuts down");
+}
+
+/// Backend cleanup failure leaves a committed tombstone and retryable blob state.
+#[tokio::test(flavor = "current_thread")]
+async fn delete_storage_failure_preserves_cleanup_state() {
+    if !enabled() {
+        return;
+    }
+    let storage_root = tempfile::tempdir().expect("storage root creates");
+    let server = WyrdTestServer::builder()
+        .with_storage_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: storage_root.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: Duration::from_secs(600),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some(String::new()),
+        })
+        .start_bound()
+        .await
+        .expect("bound test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-delete-storage-failure", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("writer bootstrap returned a non-user principal");
+    };
+    let card_uid = seed_dependency(
+        &server,
+        server.data_tenant_id(),
+        "delete-storage-failure",
+        "active",
+    )
+    .await;
+    let moved_storage_root = storage_root.path().with_extension("moved");
+    std::fs::rename(storage_root.path(), &moved_storage_root)
+        .expect("storage root moves out of the configured path");
+    std::fs::write(storage_root.path(), b"not a directory")
+        .expect("broken storage root is created");
+
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/v1/cards/by-uid/Prompt/{card_uid}"))
+        .body(Body::empty())
+        .expect("delete request builds");
+    let response = server
+        .oneshot_authenticated(&jwt, request)
+        .await
+        .expect("delete responds");
+    let status = response.status();
+    let body = response_json(response).await;
+    assert_eq!(
+        status,
+        StatusCode::from_u16(507).expect("507 is a valid status")
+    );
+    assert_eq!(body["code"], "WYRD_REGISTRY_507_ARTIFACT_VERIFY_FAILED");
+
+    let mut conn = server
+        .tenant_conn_for(server.data_tenant_id())
+        .await
+        .expect("tenant connection opens");
+    let card_status: String =
+        sqlx::query_scalar("SELECT status FROM wyrd.cards WHERE card_uid = $1")
+            .bind(card_uid.as_uuid())
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("card state reads");
+    assert_eq!(card_status, "deleted");
+    conn.commit().await.expect("assertion transaction commits");
+    std::fs::remove_file(storage_root.path()).expect("broken storage root removes");
+    std::fs::rename(&moved_storage_root, storage_root.path()).expect("storage root restores");
     server.shutdown().await.expect("test server shuts down");
 }
 

@@ -15,7 +15,10 @@ mod version_resolve;
 mod version_sql;
 
 pub use auth_projection::upsert_service_account_from_card;
-pub use delete::soft_delete_card;
+pub use delete::{
+    CardDeleteState, soft_delete_card, soft_delete_card_by_ref, soft_delete_card_with_kind,
+    soft_delete_card_with_state,
+};
 pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid};
 pub use lifecycle::{
     CardManifestCompletionRow, activate_card, fail_card, lock_pending_card_for_activation,

@@ -4,14 +4,17 @@ use std::env;
 
 use uuid::Uuid;
 use wyrd_dev_fixtures::pg::PgFixture;
-use wyrd_runtime::principal::PrincipalId;
+use wyrd_runtime::PermissionSet;
+use wyrd_runtime::principal::{Principal, PrincipalId, PrincipalKind};
+use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::Card;
-use wyrd_spec::ids::CardUid;
+use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{ArtifactManifestEntry, RegistrationOperationId};
 use wyrd_sql::queries::cards::{
     NewCardRow, NewRegistrationOperation, insert_artifact_manifest_rows, insert_card_row,
     insert_registration_operation, persist_outbound_relationships, recheck_active_card_refs,
+    soft_delete_card_by_ref, soft_delete_card_with_state,
 };
 use wyrd_sql::row_types::cards::CardStatus;
 
@@ -435,4 +438,179 @@ async fn relationship_recheck_blocks_target_lifecycle_race() {
     assert_eq!(status, "deleted");
     assert_eq!(relationship_count, 1);
     verify_conn.commit().await.expect("verification commits");
+}
+
+/// Exact delete blocks visible inbound references, preserves tenant parity, and retries idempotently.
+#[tokio::test]
+async fn exact_delete_enforces_inbound_references_and_is_idempotent() {
+    if !enabled() {
+        return;
+    }
+    let fixture = PgFixture::start().await.expect("fixture starts");
+    let tenant = fixture.data_tenant_id();
+    let other_tenant = fixture
+        .seed_additional_tenant("delete-other-tenant")
+        .await
+        .expect("second tenant seeds");
+    let principal = Principal::new(
+        PrincipalId::new(Uuid::now_v7()),
+        PrincipalKind::User,
+        tenant,
+        Vec::new(),
+        PermissionSet::new(),
+    );
+    let target_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let source_operation = RegistrationOperationId::new(Uuid::now_v7());
+    let target_uid = CardUid::from_uuid(Uuid::now_v7()).expect("target UID is valid");
+    let source_uid = CardUid::from_uuid(Uuid::now_v7()).expect("source UID is valid");
+    let target = prompt_card("delete-target");
+    let source: Card = serde_json::from_value(serde_json::json!({
+        "apiVersion": "wyrd/v1",
+        "kind": "Agent",
+        "metadata": { "name": "delete-source", "version": "1.0.0", "space": "default" },
+        "spec": { "prompt": {
+            "kind": "Prompt",
+            "name": "delete-target",
+            "version": "1.0.0",
+            "space": "default",
+            "uid": target_uid
+        }}
+    }))
+    .expect("source fixture deserializes");
+    let target_ref = CardRef {
+        kind: wyrd_spec::envelope::CardKind::Prompt,
+        name: CardName::new("delete-target").expect("target name is valid"),
+        version: VersionBlock::parse("1.0.0").expect("target version is valid"),
+        space: Some(SpaceName::new("default").expect("target space is valid")),
+        uid: Some(target_uid.clone()),
+    };
+    let target_spec_hash = "a".repeat(64);
+    let source_spec_hash = "b".repeat(64);
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    for (operation_id, key) in [
+        (target_operation, "delete-target-operation"),
+        (source_operation, "delete-source-operation"),
+    ] {
+        assert!(
+            insert_registration_operation(
+                &mut conn,
+                NewRegistrationOperation {
+                    operation_id,
+                    principal_id: principal.id,
+                    idempotency_key: key,
+                    request_hash: key,
+                },
+            )
+            .await
+            .expect("operation inserts")
+        );
+    }
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &target,
+            card_uid: target_uid.clone(),
+            principal_id: principal.id,
+            operation_id: target_operation,
+            status: CardStatus::Active,
+            spec_hash: target_spec_hash.as_str(),
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("target card inserts");
+    insert_card_row(
+        &mut conn,
+        NewCardRow {
+            card: &source,
+            card_uid: source_uid.clone(),
+            principal_id: principal.id,
+            operation_id: source_operation,
+            status: CardStatus::Active,
+            spec_hash: source_spec_hash.as_str(),
+            artifact_hash: None,
+        },
+    )
+    .await
+    .expect("source card inserts");
+    persist_outbound_relationships(&mut conn, &source_uid, std::slice::from_ref(&target_ref))
+        .await
+        .expect("inbound relationship inserts");
+    conn.commit().await.expect("setup commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let error = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+        .await
+        .expect_err("visible inbound reference blocks delete");
+    assert_eq!(error.status(), 409);
+    drop(conn);
+
+    let mut conn = fixture
+        .tenant_conn_for(other_tenant)
+        .await
+        .expect("other tenant connection opens");
+    let error = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+        .await
+        .expect_err("cross-tenant UID must not resolve");
+    assert_eq!(error.code(), "WYRD_REGISTRY_404_CARD_NOT_FOUND");
+    drop(conn);
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    sqlx::query("UPDATE wyrd.cards SET status = 'deleted' WHERE card_uid = $1")
+        .bind(source_uid.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("source tombstone commits");
+    conn.commit().await.expect("source tombstone commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let deleted = soft_delete_card_by_ref(&mut conn, &target_ref, &principal, None)
+        .await
+        .expect("exact reference deletes target");
+    assert!(deleted.deleted);
+    conn.commit().await.expect("delete commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let replay = soft_delete_card_with_state(&mut conn, &target_uid, &principal, None)
+        .await
+        .expect("repeated delete is idempotent");
+    assert!(!replay.deleted);
+    conn.commit().await.expect("replay commits");
+
+    let mut conn = fixture
+        .tenant_conn()
+        .await
+        .expect("tenant connection opens");
+    let status: String = sqlx::query_scalar("SELECT status FROM wyrd.cards WHERE card_uid = $1")
+        .bind(target_uid.as_uuid())
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("deleted card reads");
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox \
+         WHERE operation = 'card.registration' AND resource = $1",
+    )
+    .bind(format!("card:{target_uid}"))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("delete audit reads");
+    assert_eq!(status, "deleted");
+    assert_eq!(audits, 1, "replay must not append a second delete audit");
+    conn.commit().await.expect("assertion transaction commits");
 }

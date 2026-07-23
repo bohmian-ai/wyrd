@@ -5,14 +5,19 @@
 //! specific to this write operation, not an authentication decision shared by
 //! every protected route.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::post;
+use axum::routing::{delete, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use wyrd_runtime::Permission;
+use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardUid, IdempotencyKey};
-use wyrd_spec::registry::{CardRegistrationOutcome, CreateCardRequest, CreateCardResponse};
+use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
+use wyrd_spec::reference::CardRef;
+use wyrd_spec::registry::{
+    CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+};
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
 
 use crate::components::auth::Caller;
@@ -26,6 +31,8 @@ pub fn cards_router() -> Router<AppState> {
         .route("/cards", post(register_card_http))
         .route("/cards/{card_uid}/complete", post(complete_card_http))
         .route("/cards/{card_uid}/abort", post(abort_card_http))
+        .route("/cards/by-uid/{kind}/{card_uid}", delete(delete_card_http))
+        .route("/cards/by-ref", delete(delete_card_by_ref_http))
 }
 
 #[utoipa::path(
@@ -145,6 +152,113 @@ async fn abort_card_http(
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(Json(single_card_response(outcome)))
+}
+
+/// Delete one Card by its exact UID.
+#[utoipa::path(
+    delete,
+    path = "/v1/cards/by-uid/{kind}/{card_uid}",
+    params(
+        ("kind" = String, Path, description = "Card kind namespace"),
+        ("card_uid" = String, Path, description = "Server-minted Card UID")
+    ),
+    responses(
+        (status = 200, description = "Card deleted", body = DeleteCardResponse),
+        (status = 404, description = "Card not found"),
+        (status = 409, description = "Card has inbound references"),
+        (status = 503, description = "Registry unavailable"),
+        (status = 507, description = "Storage cleanup incomplete")
+    )
+)]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+async fn delete_card_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((kind, card_uid)): Path<(String, String)>,
+) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
+    authorize_card_write(&state, &caller)?;
+    let kind = CardKind::from_wire_name(&kind).ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
+            "kind is not a valid Card kind",
+        ))
+    })?;
+    let card_uid = parse_card_uid(&card_uid)?;
+    service::delete_card_with_kind(&state, &caller, &card_uid, kind)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Delete one Card by its exact kind/space/name/version identity.
+#[utoipa::path(
+    delete,
+    path = "/v1/cards/by-ref",
+    params(
+        ("kind" = String, Query, description = "Exact Card kind"),
+        ("space" = String, Query, description = "Exact Card space"),
+        ("name" = String, Query, description = "Exact Card name"),
+        ("version" = String, Query, description = "Exact Card version")
+    ),
+    responses(
+        (status = 200, description = "Card deleted", body = DeleteCardResponse),
+        (status = 404, description = "Card not found"),
+        (status = 409, description = "Card has inbound references"),
+        (status = 503, description = "Registry unavailable"),
+        (status = 507, description = "Storage cleanup incomplete")
+    )
+)]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.delete"))]
+async fn delete_card_by_ref_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Query(query): Query<DeleteCardRefQuery>,
+) -> Result<Json<DeleteCardResponse>, WyrdErrorResponse> {
+    authorize_card_write(&state, &caller)?;
+    let card_ref = query.into_card_ref()?;
+    service::delete_card_by_ref(&state, &caller, &card_ref)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteCardRefQuery {
+    kind: String,
+    space: String,
+    name: String,
+    version: String,
+}
+
+impl DeleteCardRefQuery {
+    fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
+        let kind = CardKind::from_wire_name(&self.kind).ok_or_else(|| {
+            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
+                "kind is not a valid Card kind",
+            ))
+        })?;
+        let space = SpaceName::new(self.space).map_err(|error| {
+            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+                "space is invalid: {error}"
+            )))
+        })?;
+        let name = CardName::new(self.name).map_err(|error| {
+            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+                "name is invalid: {error}"
+            )))
+        })?;
+        let version = self.version.parse().map_err(|error| {
+            WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+                "version is invalid: {error}"
+            )))
+        })?;
+        Ok(CardRef {
+            kind,
+            name,
+            version,
+            space: Some(space),
+            uid: None,
+        })
+    }
 }
 
 fn single_card_response(outcome: CardRegistrationOutcome) -> CreateCardResponse {

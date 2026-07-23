@@ -923,9 +923,9 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     .await
     .expect("audit count reads");
     assert_eq!(audit_count, 3);
-    let relationships: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT card_uid, target_name FROM wyrd.card_relationships \
-         WHERE card_uid IN ($1, $2) ORDER BY card_uid, target_name",
+    let relationships: Vec<(Uuid, String, Uuid)> = sqlx::query_as(
+        "SELECT card_uid, target_name, target_uid FROM wyrd.card_relationships \
+         WHERE card_uid IN ($1, $2) ORDER BY target_name",
     )
     .bind(agent_uid.as_uuid())
     .bind(service_uid.as_uuid())
@@ -933,20 +933,21 @@ async fn composite_registration_returns_leaf_first_outcomes_and_root() {
     .await
     .expect("relationship rows read");
     assert_eq!(relationships.len(), 2);
-    assert_eq!(relationships[0].0, agent_uid.as_uuid());
-    assert_eq!(relationships[0].1, "composite-prompt");
-    assert_eq!(relationships[1].0, service_uid.as_uuid());
-    assert_eq!(relationships[1].1, "composite-agent");
-    let target_uids: Vec<Uuid> = sqlx::query_scalar(
-        "SELECT target_uid FROM wyrd.card_relationships \
-         WHERE card_uid IN ($1, $2) ORDER BY card_uid, target_name",
-    )
-    .bind(agent_uid.as_uuid())
-    .bind(service_uid.as_uuid())
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .expect("relationship target UIDs read");
-    assert_eq!(target_uids, vec![prompt_uid.as_uuid(), agent_uid.as_uuid()]);
+    assert_eq!(
+        relationships,
+        vec![
+            (
+                service_uid.as_uuid(),
+                "composite-agent".to_owned(),
+                agent_uid.as_uuid()
+            ),
+            (
+                agent_uid.as_uuid(),
+                "composite-prompt".to_owned(),
+                prompt_uid.as_uuid()
+            ),
+        ]
+    );
     conn.commit().await.expect("assertion transaction commits");
 
     server.shutdown().await.expect("test server shuts down");

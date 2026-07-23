@@ -735,7 +735,6 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
-    use wyrd_spec::ids::DataTenantId;
 
     fn make_test_batch(num_rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -773,7 +772,7 @@ mod tests {
 
     fn make_test_seal_key() -> SealKey {
         SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
         )
@@ -781,7 +780,7 @@ mod tests {
 
     fn make_file_list_key(min: u64, max: u64) -> FileListCommitKey {
         FileListCommitKey {
-            data_tenant_id: DataTenantId::SYSTEM_OWNER,
+            data_tenant_id: crate::test_support::tenant(),
             namespace: "vala.bifrost".to_owned(),
             table_name: "events".to_owned(),
             node_id: uuid::Uuid::nil(),
@@ -812,7 +811,7 @@ mod tests {
         assert_eq!(memtable.pending_generation_count().expect("pending"), 1);
         assert_eq!(
             memtable
-                .readable_batches(DataTenantId::SYSTEM_OWNER, &seal_key.table)
+                .readable_batches(crate::test_support::tenant(), &seal_key.table)
                 .expect("readable")
                 .len(),
             1
@@ -849,7 +848,7 @@ mod tests {
         assert_ne!(first.seal_id, second.seal_id);
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 2);
         let lsns: Vec<_> = memtable
-            .readable_batches(DataTenantId::SYSTEM_OWNER, &seal_key.table)
+            .readable_batches(crate::test_support::tenant(), &seal_key.table)
             .expect("readable")
             .into_iter()
             .map(|batch| batch.meta.wal_lsn_max)
@@ -1021,7 +1020,7 @@ mod tests {
     #[test]
     fn memtable_per_seal_key_isolation() {
         let memtable = Memtable::new();
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
 
         let key1 = SealKey::new(

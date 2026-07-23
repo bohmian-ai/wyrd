@@ -1071,7 +1071,7 @@ impl WalWriter {
         Ok(self.append_prepared(prepared)?.lsn)
     }
 
-    fn sync_data(&self) -> Result<(), ScribeError> {
+    pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
         let segment = self
             .state
             .lock()
@@ -1365,7 +1365,7 @@ mod tests {
     fn wal_writer_append_and_read() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = [3u8; 16];
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, WalConfig::default())
             .expect("writer");
@@ -1394,19 +1394,19 @@ mod tests {
             temp_dir.path(),
             [8u8; 16],
             1,
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             WalConfig::default(),
         )
         .expect("writer");
         let table =
             crate::catalog::TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let first = SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             table.clone(),
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 1).expect("date")),
         );
         let second = SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             table,
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date")),
         );
@@ -1425,7 +1425,7 @@ mod tests {
     fn wal_segment_rolls_on_size() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = [4u8; 16];
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         // Create writer with 500-byte max segment size
         let writer = WalWriter::new(
@@ -1468,7 +1468,7 @@ mod tests {
     fn wal_segment_roll_is_atomic_across_crash() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = [5u8; 16];
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         let writer = WalWriter::new(temp_dir.path(), node_id, 1, tenant_id, WalConfig::default())
             .expect("writer");
@@ -1518,7 +1518,7 @@ mod tests {
             temp_dir.path(),
             expected_node,
             3,
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             WalConfig::default(),
         )
         .expect("expected writer");
@@ -1533,7 +1533,7 @@ mod tests {
                 foreign_node,
                 9,
                 0,
-                *DataTenantId::SYSTEM_OWNER.as_uuid().as_bytes(),
+                *crate::test_support::tenant().as_uuid().as_bytes(),
                 0,
             ),
         )

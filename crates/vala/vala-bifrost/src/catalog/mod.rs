@@ -14,7 +14,7 @@ use crate::error::BifrostError;
 use crate::provider::WyrdTableProvider;
 use crate::registry::{CachedMeta, Registry, RegistryKey};
 use crate::schema::fingerprint::fingerprint_user_fields;
-use crate::schema::system_columns::with_system_columns;
+use crate::schema::managed_columns::with_managed_columns;
 use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
 use crate::writer::PostgresCommitNotifier;
@@ -196,7 +196,7 @@ impl WyrdCatalog {
             user_fields.clone(),
         ));
 
-        let all_fields = with_system_columns(user_fields, scope);
+        let all_fields = with_managed_columns(user_fields);
         let arrow_schema = arrow::datatypes::Schema::new(all_fields);
         let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
             .map_err(BifrostError::Iceberg)?;
@@ -244,7 +244,6 @@ impl WyrdCatalog {
             table_uid.as_bytes(),
             &fqn,
             &fingerprint.0,
-            scope.as_db_str(),
             &[],
         )
         .await
@@ -295,18 +294,11 @@ impl WyrdCatalog {
     ) -> Result<Arc<CachedMeta>, BifrostError> {
         let fqn = format!("{}.{}", ns.as_str(), name);
 
-        // Two-step lookup: try tenant bind (TenantOwned), then SYSTEM_OWNER (SystemShared).
-        let (row, owner) = if let Some(row) = self.lookup_table_row(&fqn, tenant).await? {
-            let scope = TableScope::from_db_str(&row.scope)?;
-            let owner = scope.control_bind(tenant);
-            (row, owner)
-        } else {
-            let row = self
-                .lookup_table_row(&fqn, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-                .await?
-                .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
-            (row, wyrd_spec::ids::DataTenantId::SYSTEM_OWNER)
-        };
+        let row = self
+            .lookup_table_row(&fqn, tenant)
+            .await?
+            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
+        let owner = tenant;
 
         let table_uid = TableUid(
             row.table_uid
@@ -519,12 +511,8 @@ impl WyrdCatalog {
 
     /// Open a read provider for `tenant` (the authenticated **data tenant**).
     ///
-    /// Unlike `writer()`, the caller does not supply the scope — it must be
-    /// *discovered* from the registration. The lookup is therefore two-step
-    /// (MAJOR-3): try the data tenant's bind first (resolves `TenantOwned` rows
-    /// under RLS), then `SYSTEM_OWNER` (resolves `SystemShared` rows). The resolved
-    /// `data_tenant_id` filter on a `SystemShared` scan binds this data tenant; the
-    /// control-plane binds above only decide which registration row is visible.
+    /// The caller supplies the authenticated tenant and the catalog lookup is
+    /// tenant-scoped; the provider therefore cannot cross tenant boundaries.
     pub async fn provider(
         &self,
         ns: BifrostNamespace,
@@ -532,9 +520,8 @@ impl WyrdCatalog {
         tenant: wyrd_spec::ids::DataTenantId,
     ) -> Result<WyrdTableProvider, BifrostError> {
         let meta = self.get(ns, name, tenant).await?;
-        let scope = TableScope::from_db_str(&meta.row.scope)?;
         let table = (*meta.iceberg_table).clone();
-        WyrdTableProvider::try_new(table, scope, tenant)
+        WyrdTableProvider::try_new(table, TableScope::TenantOwned, tenant)
             .await
             .map_err(BifrostError::DataFusion)
     }
@@ -725,7 +712,6 @@ impl WyrdCatalog {
             table_uid.as_bytes(),
             &fqn,
             &fingerprint,
-            TableScope::SystemShared.as_db_str(),
             &[],
         )
         .await
@@ -825,9 +811,11 @@ impl WyrdCatalog {
 
         let table_ident = fqn_to_table_ident(&row.fqn)?;
 
-        // SECURITY DEFINER recovery routines bypass RLS regardless of the bind tenant.
-        // Use SYSTEM_OWNER as a stable, always-valid bind for all recovery connections.
-        let recovery_bind = wyrd_spec::ids::DataTenantId::SYSTEM_OWNER;
+        // The recovery routines are tenant-qualified even though they execute
+        // with SECURITY DEFINER privileges. Keep the connection bind aligned
+        // with the claimed row as an additional tenant guard.
+        let recovery_bind = wyrd_spec::ids::DataTenantId::try_from(row.data_tenant_id)
+            .map_err(|_| BifrostError::Internal("recovery row has invalid tenant id".into()))?;
 
         let load_result = self.catalog.load_table(&table_ident).await;
 
@@ -839,6 +827,7 @@ impl WyrdCatalog {
                     .map_err(BifrostError::Sql)?;
                 vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
                     &mut conn,
+                    row.data_tenant_id,
                     &table_uid,
                     &batch_id,
                     fencing_token,
@@ -862,6 +851,7 @@ impl WyrdCatalog {
             RecoveryDecision::Committed(sid) => {
                 vala_sql::queries::olap_catalog::finalize_recovered_committed(
                     &mut conn,
+                    row.data_tenant_id,
                     &table_uid,
                     &batch_id,
                     sid,
@@ -873,6 +863,7 @@ impl WyrdCatalog {
             RecoveryDecision::Aborted => {
                 vala_sql::queries::olap_catalog::finalize_recovered_aborted(
                     &mut conn,
+                    row.data_tenant_id,
                     &table_uid,
                     &batch_id,
                     fencing_token,

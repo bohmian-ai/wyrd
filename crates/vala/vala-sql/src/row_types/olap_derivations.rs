@@ -18,9 +18,6 @@ pub struct DerivationRow {
     pub source_table_uid: Vec<u8>,
     /// Opaque 16-byte target table identifier.
     pub target_table_uid: Vec<u8>,
-    /// Logical commit identity spanning staging tenants (parity with
-    /// `olap_commits.control_bind`).
-    pub control_bind: Uuid,
     /// Last source commit position (`batch_id`) fully derived; `NULL` when
     /// nothing has been consumed yet.
     pub watermark: Option<Vec<u8>>,

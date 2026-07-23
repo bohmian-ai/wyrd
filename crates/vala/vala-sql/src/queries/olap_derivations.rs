@@ -93,12 +93,10 @@ pub async fn list_tenant_committed_batches(
 /// Enumerate every `committed` source commit position for `source_table_uid`,
 /// across ALL tenants, in commit order.
 ///
-/// Uses the operator pool (BYPASSRLS `wyrd_platform_admin`) because a source
-/// table is `SystemShared`: its `vala.olap_commits` rows carry per-tenant
-/// `data_tenant_id` values, and the derivation must consume the whole
-/// cross-tenant commit stream (it re-partitions the derived rows back onto each
-/// source row's own tenant at write time). This mirrors the audit relay's
-/// cross-tenant enumeration and is never called on a tenant request path.
+/// Uses the operator pool (BYPASSRLS `wyrd_platform_admin`) because the
+/// derivation worker consumes the whole cross-tenant commit stream and
+/// re-partitions derived rows back onto each source row's own tenant at write
+/// time. This is never called on a tenant request path.
 ///
 /// This is the commit-identity delta mechanism: the derivation worker maps
 /// "commits since watermark" onto this ordered ledger by opaque `batch_id`,
@@ -110,8 +108,8 @@ pub async fn list_committed_source_batches(
     op: &OperatorPool,
     source_table_uid: &[u8; 16],
 ) -> Result<Vec<CommittedSourceBatch>, SqlError> {
-    // Dynamic query is intentional: this reads the SystemShared source table's
-    // commit ledger across every tenant via the operator pool (BYPASSRLS).
+    // Dynamic query is intentional: this reads the commit ledger across every
+    // tenant via the operator pool (BYPASSRLS).
     sqlx::query_as::<_, (Vec<u8>,)>(
         r#"
         SELECT batch_id
@@ -180,8 +178,6 @@ pub struct DerivationRegistration<'a> {
     pub source_table_uid: &'a [u8; 16],
     /// Target table UID.
     pub target_table_uid: &'a [u8; 16],
-    /// Control bind: registration anchor (SYSTEM_OWNER or data tenant).
-    pub control_bind: Uuid,
     /// Fully-qualified derivation name.
     pub fqn: &'a str,
     /// Earliest source position the derivation may process.
@@ -192,7 +188,7 @@ pub struct DerivationRegistration<'a> {
 
 /// Register a derivation with immutable contract fingerprints.
 ///
-/// On first call for a `(source_table_uid, target_table_uid, control_bind)`
+/// On first call for a `(data_tenant_id, source_table_uid, target_table_uid)`
 /// triple: inserts the row with all three fingerprints and returns
 /// [`ContractOutcome::Registered`].
 ///
@@ -214,7 +210,6 @@ pub async fn register_derivation_with_contract(
         derivation_uid,
         source_table_uid,
         target_table_uid,
-        control_bind,
         fqn,
         registered_watermark,
         contract,
@@ -254,17 +249,16 @@ pub async fn register_derivation_with_contract(
         r#"
         INSERT INTO vala.olap_derivations
             (data_tenant_id, derivation_uid, source_table_uid, target_table_uid,
-             control_bind, fqn, registered_watermark,
+             fqn, registered_watermark,
              source_schema_fingerprint, transform_fingerprint, target_set_fingerprint)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
-        ON CONFLICT (data_tenant_id, source_table_uid, target_table_uid, control_bind)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (data_tenant_id, source_table_uid, target_table_uid)
         DO NOTHING
         "#,
     )
     .bind(derivation_uid.as_slice())
     .bind(source_table_uid.as_slice())
     .bind(target_table_uid.as_slice())
-    .bind(control_bind)
     .bind(fqn)
     .bind(registered_watermark.map(|w| w.as_slice()))
     .bind(contract.source_schema_fingerprint.as_slice())
@@ -279,11 +273,11 @@ pub async fn register_derivation_with_contract(
 
 /// Register a derivation idempotently.
 ///
-/// Inserts one `(source, target, control_bind)` derivation for the current
+/// Inserts one `(source, target)` derivation for the current
 /// tenant. `registered_watermark` is the earliest source position the
 /// derivation is pinned to (`None` = from the beginning). `ON CONFLICT DO
-/// NOTHING` keys on the `(data_tenant_id, source_table_uid, target_table_uid,
-/// control_bind)` unique constraint so re-registration is a no-op.
+/// NOTHING` keys on the `(data_tenant_id, source_table_uid, target_table_uid)`
+/// unique constraint so re-registration is a no-op.
 ///
 /// # Deprecated
 /// Use [`register_derivation_with_contract`] for new call sites. This function
@@ -297,7 +291,6 @@ pub async fn insert_derivation(
     derivation_uid: &[u8; 16],
     source_table_uid: &[u8; 16],
     target_table_uid: &[u8; 16],
-    control_bind: Uuid,
     fqn: &str,
     registered_watermark: Option<&[u8; 16]>,
 ) -> Result<(), SqlError> {
@@ -305,16 +298,15 @@ pub async fn insert_derivation(
         r#"
         INSERT INTO vala.olap_derivations
             (data_tenant_id, derivation_uid, source_table_uid, target_table_uid,
-             control_bind, fqn, registered_watermark)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, $6)
-        ON CONFLICT (data_tenant_id, source_table_uid, target_table_uid, control_bind)
+             fqn, registered_watermark)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5)
+        ON CONFLICT (data_tenant_id, source_table_uid, target_table_uid)
         DO NOTHING
         "#,
     )
     .bind(derivation_uid.as_slice())
     .bind(source_table_uid.as_slice())
     .bind(target_table_uid.as_slice())
-    .bind(control_bind)
     .bind(fqn)
     .bind(registered_watermark.map(|w| w.as_slice()))
     .execute(&mut **conn.transaction())
@@ -432,7 +424,6 @@ pub async fn select_derivation_candidates(
                derivation_uid,
                source_table_uid,
                target_table_uid,
-               control_bind,
                watermark,
                registered_watermark,
                derivation_state,

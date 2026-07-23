@@ -6,6 +6,8 @@ cd "$repo_root"
 
 for lane in \
   "bench:bifrost:scribe:slo" \
+  "bench:bifrost:scribe:components" \
+  "bench:bifrost:scribe:sustained" \
   "bench:bifrost:forge:slo" \
   "bench:bifrost:oracle:slo" \
   "bench:bifrost:capacity"; do
@@ -33,16 +35,23 @@ if [[ ! -f "$scribe_runner" ]]; then
   echo "Scribe SLO lane is missing $scribe_runner" >&2
   exit 1
 fi
-for symbol in compact_scribe_matrix WyrdTestCluster register_dataset ScribeBenchmarkReport ScribeTopologyEvidence; do
+for symbol in compact_scribe_matrix WyrdTestCluster register_dataset ScribeBenchmarkReport ScribeTopologyEvidence ScribeComponentReport WalBenchSupport; do
   if ! rg -n -w "$symbol" "$scribe_runner" >/dev/null; then
     echo "Scribe benchmark runner is missing required path: $symbol" >&2
     exit 1
   fi
 done
-if rg -n 'TABLE_COUNT|bench_scribe_matrix|task-13d' "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
+if rg -n 'TABLE_COUNT|bench_scribe_matrix|task-13d|component_reports|vala\.bifrost\.' "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
   echo "Scribe benchmark runner contains stale topology or matrix vocabulary" >&2
   exit 1
 fi
+
+for component in wal_prepare_crc_no_io vectored_append_no_sync sync_alone one_frame_append_sync 64_frame_append_one_sync gate_ack sdk_gate_scribe; do
+  if ! rg -n -F "\"$component\"" "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
+    echo "Scribe component benchmark is missing required component: $component" >&2
+    exit 1
+  fi
+done
 
 if ! rg -n -w "ScribeRuntimeSnapshot" \
   crates/wyrd/wyrd-testing/src/bifrost/harness.rs \

@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn seal_key_path_components() {
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
         let seal_key = SealKey::new(tenant, table, day);

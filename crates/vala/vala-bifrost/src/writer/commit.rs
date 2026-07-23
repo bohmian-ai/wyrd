@@ -156,7 +156,7 @@ pub async fn run_commit(
     // Legacy single-key path: the caller (coordinator) passes the registration
     // anchor as `tenant`, so control_bind == the bound tenant. Behavior-preserving.
     let key = CommitKey::new(tenant, batch_id);
-    let phase1 = claim_batch(pool, table_uid, &key, origin, actor, tenant, &table_fqn).await?;
+    let phase1 = claim_batch(pool, table_uid, &key, origin, actor, &table_fqn).await?;
 
     match phase1 {
         Phase1::Replay { snapshot_id } => Ok((snapshot_id, None)),
@@ -221,7 +221,7 @@ pub async fn run_group_commit(
     catalog: &SqlCatalog,
     table: &Table,
     table_uid: &TableUid,
-    scope: TableScope,
+    _scope: TableScope,
     groups: Vec<CommitGroup>,
 ) -> Result<GroupCommitOutcome, BifrostError> {
     let table_fqn = table.identifier().to_string();
@@ -232,16 +232,12 @@ pub async fn run_group_commit(
 
     // 1. Prepare: one tenant-scoped precommit txn per group.
     for group in groups {
-        // control_bind is the registration anchor (SYSTEM_OWNER for SystemShared,
-        // the data tenant for TenantOwned) = the bifrost_tables FK key; the bind
-        // stays the DATA tenant so RLS keeps each tenant on its own commit row.
         let phase1 = claim_batch(
             pool,
             table_uid,
             &group.key,
             &group.ctx.origin,
             &group.ctx.actor,
-            scope.control_bind(group.key.tenant),
             &table_fqn,
         )
         // 02.4: per-key collision isolation (fail only that key's reply and keep
@@ -428,7 +424,6 @@ async fn claim_batch(
     key: &CommitKey,
     origin: &str,
     actor: &str,
-    control_bind: DataTenantId,
     table_fqn: &str,
 ) -> Result<Phase1, BifrostError> {
     let mut conn = vala_sql::TenantConn::acquire(pool, key.tenant)
@@ -466,10 +461,9 @@ async fn claim_batch(
             Err(BifrostError::CommitConflict(table_fqn.to_string()))
         }
         None => {
-            vala_sql::queries::olap_catalog::precommit_with_bind(
+            vala_sql::queries::olap_catalog::precommit(
                 &mut conn,
                 table_uid.as_bytes(),
-                control_bind.as_uuid(),
                 &key.batch_id,
                 origin,
                 actor,
@@ -703,7 +697,7 @@ async fn write_batches(
     let mut writer = UnpartitionedWriter::new(data_file_builder);
 
     for batch in batches {
-        // Align by field name, not position: `stamp_system_columns` appends only
+        // Align by field name, not position: `stamp_managed_columns` appends only
         // the system columns and cannot know a table's per-policy correlation
         // columns (`run_id`, `card_uid`, `principal_id`), so the stamped batch is a
         // subset of the physical schema. Match each physical field by name; cast
@@ -837,10 +831,7 @@ pub async fn run_commit_with_fault(
 ) -> Result<(i64, Option<Table>), BifrostError> {
     let table_fqn = table.identifier().to_string();
     let key = CommitKey::new(tenant, batch_id);
-    let phase1 = claim_batch(
-        pool, table_uid, &key, "system", "system", tenant, &table_fqn,
-    )
-    .await?;
+    let phase1 = claim_batch(pool, table_uid, &key, "system", "system", &table_fqn).await?;
     let (owner, fencing_token) = match phase1 {
         Phase1::Replay { snapshot_id } => return Ok((snapshot_id, None)),
         Phase1::Fresh {

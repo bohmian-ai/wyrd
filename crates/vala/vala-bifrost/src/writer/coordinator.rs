@@ -38,9 +38,9 @@ use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
-use wyrd_spec::vala::system_columns::is_reserved_system_column;
+use wyrd_spec::vala::managed_columns::is_reserved_managed_column;
 
-use crate::batch_builder::stamp_system_columns;
+use crate::batch_builder::stamp_managed_columns;
 use crate::error::BifrostError;
 use crate::registry::{Registry, RegistryKey};
 use crate::tables::PayloadClass;
@@ -148,7 +148,7 @@ fn first_reserved_column(batches: &[RecordBatch]) -> Option<String> {
             .schema()
             .fields()
             .iter()
-            .find(|f| is_reserved_system_column(f.name()))
+            .find(|f| is_reserved_managed_column(f.name()))
             .map(|f| f.name().clone())
     })
 }
@@ -389,7 +389,7 @@ impl GroupCommitActor {
 
         let mut stamped: Vec<RecordBatch> = Vec::with_capacity(batches.len());
         for batch in batches {
-            let s = stamp_system_columns(batch, ingested_at_us, ctx.batch_id, stamp_tenant)
+            let s = stamp_managed_columns(batch, ingested_at_us, ctx.batch_id, stamp_tenant)
                 .map_err(BifrostError::Arrow)?;
             let s = if redact {
                 use crate::writer::redaction::BuiltinRedactionPass;

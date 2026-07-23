@@ -1,8 +1,8 @@
 -- olap_derivations — the durable registry for cross-table
 -- derivations (e.g. the genai-from-spans worker).
 --
--- One row per (source table → target table) derivation for a given tenant /
--- control bind. Each row carries a durable WATERMARK: the last source commit
+-- One row per (source table → target table) derivation for a given tenant.
+-- Each row carries a durable WATERMARK: the last source commit
 -- position (batch_id) fully consumed by the derivation. This mirrors exactly
 -- how vala.olap_commits tracks commit progress — by opaque 16-byte batch_id,
 -- never by a numeric snapshot-id compare. A source position is identified by
@@ -16,10 +16,7 @@
 -- empty/undefined start.
 --
 -- RLS mirrors vala.olap_projections: tenant isolation on data_tenant_id via
--- wyrd.current_tenant(). `control_bind` is the logical commit identity that
--- spans staging tenants (see olap_commits control_bind migration); it is stored
--- for parity with the commit path but tenant visibility is governed by
--- data_tenant_id, as in olap_projections.
+-- wyrd.current_tenant().
 
 CREATE TABLE vala.olap_derivations (
     data_tenant_id          UUID        NOT NULL REFERENCES platform.tenants(data_tenant_id),
@@ -29,10 +26,6 @@ CREATE TABLE vala.olap_derivations (
     source_table_uid        BYTEA       NOT NULL CHECK (octet_length(source_table_uid) = 16),
     -- The target table this derivation writes to (one row per target).
     target_table_uid        BYTEA       NOT NULL CHECK (octet_length(target_table_uid) = 16),
-    -- Logical commit identity spanning staging tenants (control_bind of the
-    -- source commit path). control_bind = data_tenant_id for TenantOwned tables,
-    -- nil UUID for SystemShared tables. Stored for parity with olap_commits.
-    control_bind            UUID        NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
     -- Durable watermark: the last SOURCE commit position (batch_id) fully
     -- consumed and derived into the target. NULL means nothing consumed yet.
     -- Never compared numerically; it is an opaque commit-position identity that
@@ -53,9 +46,9 @@ CREATE TABLE vala.olap_derivations (
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     PRIMARY KEY (data_tenant_id, derivation_uid),
-    -- One derivation per (source, target, control_bind) triple so registry
+    -- One derivation per (source, target) triple so registry
     -- upserts are idempotent via ON CONFLICT DO NOTHING.
-    UNIQUE (data_tenant_id, source_table_uid, target_table_uid, control_bind),
+    UNIQUE (data_tenant_id, source_table_uid, target_table_uid),
     FOREIGN KEY (data_tenant_id, source_table_uid)
         REFERENCES vala.bifrost_tables(data_tenant_id, table_uid)
 );

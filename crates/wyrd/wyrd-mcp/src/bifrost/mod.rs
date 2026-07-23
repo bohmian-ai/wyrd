@@ -279,10 +279,10 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::ReservedColumn {
             column: String::new(),
         },
-        BifrostError::MissingTenantColumn {
+        BifrostError::ReservedBuiltinWriteDenied {
             table: String::new(),
         },
-        BifrostError::UnexpectedTenantColumn {
+        BifrostError::TenantIsolationColumnMissing {
             table: String::new(),
         },
         BifrostError::TenantBindingMissing,

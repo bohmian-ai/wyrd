@@ -364,8 +364,8 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
             message: detail,
             details: serde_json::Value::Null,
         },
-        IngestError::SystemTableWriteDenied { table } => {
-            WyrdError::from(BifrostError::CardScopeDenied { card_ref: table })
+        IngestError::ReservedBuiltinWriteDenied { table } => {
+            WyrdError::from(BifrostError::ReservedBuiltinWriteDenied { table })
         }
         IngestError::CardScopeDenied { card_ref } | IngestError::CardUnresolved { card_ref } => {
             WyrdError::from(BifrostError::CardScopeDenied { card_ref })

@@ -4,7 +4,7 @@ use crate::tables::fields::{fixed_binary, float64, int32, int64, ts_us_utc, utf8
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
-use wyrd_spec::vala::system_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct RunsTable;
 

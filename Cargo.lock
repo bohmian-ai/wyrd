@@ -9824,6 +9824,7 @@ dependencies = [
  "crc32c",
  "datafusion",
  "futures-util",
+ "hex",
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-storage-opendal",

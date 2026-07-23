@@ -62,7 +62,6 @@ mod pg_tests {
             &source_uid,
             "traces.spans_fail_closed",
             &[0u8; 32],
-            "tenant_owned",
             &[],
         )
         .await
@@ -102,7 +101,6 @@ mod pg_tests {
             &derivation_uid,
             &source_uid,
             &target_uid,
-            tenant.as_uuid(),
             "genai_from_spans",
             None,
         )

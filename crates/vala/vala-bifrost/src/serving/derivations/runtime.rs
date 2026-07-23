@@ -131,8 +131,8 @@ impl DerivationRuntime {
     /// watermark advance.
     pub(super) async fn run_tick(&self) -> Result<(), BifrostError> {
         let lease_key = MaintenanceLeaseKey::cross_table_derivation(
-            &GenAiFromSpans::DERIVATION_UID,
             &Uuid::nil(),
+            &GenAiFromSpans::DERIVATION_UID,
         );
         let token = vala_sql::queries::maintenance_leases::try_acquire_lease(
             &self.op,
@@ -314,7 +314,6 @@ impl DerivationRuntime {
                 // target_table_uid records the "primary" target for registration;
                 // full target-set semantics live in target_set_fingerprint.
                 target_table_uid: &self.uids.messages,
-                control_bind: Uuid::nil(),
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: vala_sql::queries::olap_derivations::DerivationContract {

@@ -172,7 +172,6 @@ mod tests {
     use crate::scribe::stream_identity::{NodeId, WriterEpoch};
     use chrono::NaiveDate;
     use tempfile::TempDir;
-    use wyrd_spec::ids::DataTenantId;
 
     #[test]
     fn manifest_roundtrip() {
@@ -182,7 +181,7 @@ mod tests {
 
         let mut manifest = Manifest::new(identity);
 
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
         let seal_key = SealKey::new(tenant, table, day);
@@ -208,7 +207,7 @@ mod tests {
         let identity = StreamIdentity::new(node_id, WriterEpoch::new(1));
 
         let mut manifest1 = Manifest::new(identity);
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap());
         let seal_key = SealKey::new(tenant, table, day);

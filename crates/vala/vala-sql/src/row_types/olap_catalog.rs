@@ -13,8 +13,6 @@ pub struct BifrostTableRow {
     pub fqn: String,
     /// 32-byte schema fingerprint.
     pub fingerprint: Vec<u8>,
-    /// Table scope: `tenant_owned` or `system_shared`.
-    pub scope: String,
     /// Lifecycle status: `active`, `deprecated`, or `quarantined`.
     pub status: String,
     /// Declared partition columns.
@@ -76,8 +74,6 @@ pub struct ClaimedPrecommitRow {
     pub namespace: String,
     /// Name component derived from fqn.
     pub name: String,
-    /// Table scope: `tenant_owned` or `system_shared`.
-    pub scope: String,
 }
 
 /// Declared skip index row from `vala.olap_indexes`.

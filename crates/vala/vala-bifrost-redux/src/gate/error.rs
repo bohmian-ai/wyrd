@@ -33,9 +33,9 @@ pub enum IngestError {
     /// too many frames, malformed batch id).
     #[error("ingest stream protocol violation: {0}")]
     StreamProtocolViolation(String),
-    /// A write to a `SystemShared` / reserved (`vala.system.*`) table.
-    #[error("write to system/reserved table denied: {table}")]
-    SystemTableWriteDenied {
+    /// A write to a server-managed built-in table.
+    #[error("write to reserved built-in table denied: {table}")]
+    ReservedBuiltinWriteDenied {
         /// Fully-qualified table name the caller attempted to write.
         table: String,
     },
@@ -165,7 +165,9 @@ impl IngestError {
         match self {
             Self::Unauthenticated(_) => "WYRD_VALA_401_INGEST_AUTH",
             Self::StreamProtocolViolation(_) | Self::Decode(_) => "WYRD_VALA_400_INGEST_PROTO",
-            Self::SystemTableWriteDenied { .. } => "WYRD_VALA_403_BIFROST_SYSTEM_TABLE_WRITE",
+            Self::ReservedBuiltinWriteDenied { .. } => {
+                "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE"
+            }
             Self::CardScopeDenied { .. } => "WYRD_VALA_403_BIFROST_CARD_SCOPE",
             Self::CardUnresolved { .. } => "WYRD_VALA_403_CARD_UNRESOLVED",
             Self::PrincipalUnresolved => "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
@@ -191,7 +193,7 @@ impl IngestError {
         match self {
             Self::Unauthenticated(_) | Self::PrincipalUnresolved => Code::Unauthenticated,
             Self::StreamProtocolViolation(_) | Self::Decode(_) => Code::InvalidArgument,
-            Self::SystemTableWriteDenied { .. }
+            Self::ReservedBuiltinWriteDenied { .. }
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. }
             | Self::RbacDenied { .. } => Code::PermissionDenied,

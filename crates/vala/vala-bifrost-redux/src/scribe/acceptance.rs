@@ -101,7 +101,7 @@ fn test_wal(temp: &tempfile::TempDir) -> Arc<WalWriter> {
             temp.path(),
             [0; 16],
             1,
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             WalConfig::default(),
         )
         .expect("acceptance wal"),
@@ -149,7 +149,7 @@ fn admitted_append(
         reservation: admission
             .try_reserve(table.fqn(), 1)
             .expect("admission reservation"),
-        tenant: DataTenantId::SYSTEM_OWNER,
+        tenant: crate::test_support::tenant(),
         table,
         queued_at: Instant::now(),
     }
@@ -161,7 +161,7 @@ async fn ack_waits_for_writer_try_send_only() {
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 1))
+        .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("ack");
     assert!(started.elapsed() < Duration::from_millis(50));
@@ -174,7 +174,7 @@ async fn ack_does_not_split_or_encode() {
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 2))
+        .append(append(crate::test_support::tenant(), 2))
         .await
         .expect("ack");
     assert!(started.elapsed() < Duration::from_millis(50));
@@ -185,7 +185,7 @@ async fn ack_does_not_split_or_encode() {
 async fn accepted_frames_reach_the_durable_writer_path() {
     let scribe = ScribeImpl::new();
     scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 1))
+        .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("frame accepted");
     scribe.shutdown().await;
@@ -195,7 +195,7 @@ async fn accepted_frames_reach_the_durable_writer_path() {
 #[tokio::test]
 async fn retrying_the_same_frame_identity_does_not_double_write() {
     let scribe = ScribeImpl::new();
-    let request = append(DataTenantId::SYSTEM_OWNER, 1);
+    let request = append(crate::test_support::tenant(), 1);
     let table = request.table.clone();
     let batch_id = request.batch_id;
     scribe
@@ -207,7 +207,7 @@ async fn retrying_the_same_frame_identity_does_not_double_write() {
     scribe.registry.drain().await;
     let keys = scribe
         .memtable
-        .seal_keys_for_tenant(DataTenantId::SYSTEM_OWNER)
+        .seal_keys_for_tenant(crate::test_support::tenant())
         .expect("memtable keys");
     assert_eq!(keys.len(), 1, "one retained seal key for {table}");
     assert_eq!(scribe.memtable_row_count(&keys[0]), 1);
@@ -217,7 +217,7 @@ async fn retrying_the_same_frame_identity_does_not_double_write() {
 #[tokio::test]
 async fn schema_fingerprint_conflict_rejects_before_mutation() {
     let scribe = ScribeImpl::new();
-    let mut request = append(DataTenantId::SYSTEM_OWNER, 1);
+    let mut request = append(crate::test_support::tenant(), 1);
     request.schema_fingerprint = SchemaFingerprint([0; 32]);
     let error = scribe
         .append(request)
@@ -259,7 +259,7 @@ fn queue_full_rejects_before_mutation() {
 #[test]
 fn cross_day_enqueue_is_atomic() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let tenant = DataTenantId::SYSTEM_OWNER;
+    let tenant = crate::test_support::tenant();
     let table = TableRef::new(BifrostNamespace::Bifrost, "acceptance_events");
     let reservation = AdmissionController::new()
         .try_reserve(table.fqn(), 1)
@@ -299,7 +299,7 @@ fn cross_day_enqueue_is_atomic() {
 #[test]
 fn frame_identity_distinguishes_sequences_in_one_batch() {
     let seal_key = SealKey::new(
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "identity"),
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
@@ -325,7 +325,7 @@ fn append_slice_identity_distinguishes_cross_day_slices() {
         batch_id,
         frame_sequence: 0,
         seal_key: SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             table.clone(),
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
         ),
@@ -334,7 +334,7 @@ fn append_slice_identity_distinguishes_cross_day_slices() {
         batch_id,
         frame_sequence: 0,
         seal_key: SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             table,
             EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 16).expect("date")),
         ),
@@ -353,7 +353,7 @@ async fn post_ack_failure_marks_writer_unhealthy() {
         ScribeWalIoPool::new(1),
     );
     let binding = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "health"),
     ))
     .expect("binding");
@@ -370,7 +370,7 @@ async fn ack_does_not_wait_for_day_split_wal_fsync_or_parquet() {
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 1))
+        .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("ack");
     assert!(started.elapsed() < Duration::from_millis(50));
@@ -383,7 +383,7 @@ async fn boot_replay_restores_pending_generation() {
     let temp = tempfile::tempdir().expect("temp dir");
     let wal = test_wal(&temp);
     let key = SealKey::new(
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "acceptance_events"),
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
@@ -437,7 +437,7 @@ fn fsynced_frames_replay_exactly() {
     let temp = tempfile::tempdir().expect("temp dir");
     let wal = test_wal(&temp);
     let key = SealKey::new(
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "acceptance_events"),
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
@@ -473,7 +473,7 @@ fn fsynced_frames_replay_exactly() {
 #[tokio::test]
 async fn invalid_legacy_append_rejects_before_writer_admission() {
     let scribe = ScribeImpl::new();
-    let mut request = append(DataTenantId::SYSTEM_OWNER, 1);
+    let mut request = append(crate::test_support::tenant(), 1);
     request.rows = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
         "value",
         DataType::Int64,
@@ -521,7 +521,7 @@ fn recordbatch_is_not_redecoded_normally() {
         measured_wire_bytes: 1,
         admitted_bytes: 1,
         reservation,
-        tenant: DataTenantId::SYSTEM_OWNER,
+        tenant: crate::test_support::tenant(),
         table,
         queued_at: Instant::now(),
     })
@@ -543,7 +543,7 @@ async fn wal_saturation_cannot_consume_ingress_threads() {
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
     let (append_result, ()) = tokio::join!(
-        scribe.append(append(DataTenantId::SYSTEM_OWNER, 1)),
+        scribe.append(append(crate::test_support::tenant(), 1)),
         tokio::time::sleep(Duration::from_millis(1)),
     );
     append_result.expect("append");
@@ -601,7 +601,7 @@ async fn concurrent_first_write_creates_one_writer() {
         ScribeWalIoPool::new(1),
     );
     let binding = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "racing"),
     ))
     .expect("binding");
@@ -648,12 +648,12 @@ async fn known_and_dynamic_tables_share_writer_lifecycle() {
         ScribeWalIoPool::new(1),
     );
     let known = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::parse_fqn("vala.bifrost.known").expect("known table"),
     ))
     .expect("known binding");
     let dynamic = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::parse_fqn("vala.bifrost.dynamic").expect("dynamic table"),
     ))
     .expect("dynamic binding");
@@ -680,15 +680,15 @@ async fn writer_retirement_drains_reserved_send() {
         ScribePostAckCpuPool::new(1),
         ScribeWalIoPool::new(1),
     );
-    let binding =
-        TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, table.clone())).expect("binding");
+    let binding = TenantTableBinding::resolve((crate::test_support::tenant(), table.clone()))
+        .expect("binding");
     let (writer, _) = registry.get_or_create(binding).expect("writer");
     writer
         .close_with_reserved_send_for_test(admitted_append(&admission, table.clone(), 1))
         .await
         .expect("reserved send drained");
     let key = SealKey::new(
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         table,
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
@@ -706,7 +706,7 @@ async fn writer_recreates_after_idle_retirement() {
         ScribeWalIoPool::new(1),
     );
     let binding = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "retire"),
     ))
     .expect("binding");
@@ -731,7 +731,7 @@ async fn retiring_writer_never_overlaps_replacement() {
         ScribeWalIoPool::new(1),
     );
     let binding = TenantTableBinding::resolve((
-        DataTenantId::SYSTEM_OWNER,
+        crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "exclusive"),
     ))
     .expect("binding");
@@ -764,14 +764,14 @@ async fn pod_global_item_limit_rejects_tiny_batches() {
             memory_limit_bytes: 10_000,
         },
     );
-    let mut first = append(DataTenantId::SYSTEM_OWNER, 0);
+    let mut first = append(crate::test_support::tenant(), 0);
     first.table = TableRef::new(BifrostNamespace::Bifrost, "tiny-one");
-    let mut second = append(DataTenantId::SYSTEM_OWNER, 0);
+    let mut second = append(crate::test_support::tenant(), 0);
     second.table = TableRef::new(BifrostNamespace::Bifrost, "tiny-two");
     scribe.append(first).await.expect("first tiny batch");
     scribe.append(second).await.expect("second tiny batch");
     let error = scribe
-        .append(append(DataTenantId::SYSTEM_OWNER, 0))
+        .append(append(crate::test_support::tenant(), 0))
         .await
         .expect_err("third tiny batch must hit the global item limit");
     assert!(matches!(

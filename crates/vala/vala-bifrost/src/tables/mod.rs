@@ -5,14 +5,14 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use crate::catalog::WyrdCatalog;
 use crate::error::BifrostError;
 use crate::schema::fingerprint::fingerprint_fields;
-use crate::tables::system_columns::ensure_system_cols;
+use crate::tables::managed_columns::ensure_managed_columns;
 use crate::types::PartitionTransform;
-use wyrd_spec::vala::system_columns::{
-    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_system_column,
+use wyrd_spec::vala::managed_columns::{
+    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
 };
 
 pub mod fields;
-pub mod system_columns;
+pub mod managed_columns;
 
 pub mod dev;
 pub mod drift;
@@ -26,7 +26,7 @@ pub mod traces;
 /// Which universal correlation columns a pre-declared domain table carries (C-01).
 ///
 /// A single universal policy is wrong — the pre-declared set spans three shapes.
-/// Each table declares its policy; `ensure_system_cols` appends columns from the
+/// Each table declares its policy; `ensure_managed_columns` appends columns from the
 /// policy, not unconditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrelationPolicy {
@@ -136,7 +136,7 @@ pub trait DomainTable: Send + Sync + 'static {
     /// system columns. Built at runtime from `arrow_fields()` and the policy.
     /// Boot-cold (≈2 calls per table per boot) — no memoization needed.
     fn schema() -> SchemaRef {
-        SchemaRef::new(Schema::new(ensure_system_cols(
+        SchemaRef::new(Schema::new(ensure_managed_columns(
             Self::arrow_fields(),
             Self::CORRELATION_POLICY,
         )))
@@ -187,7 +187,7 @@ pub fn reject_reserved_domain_fields(
         DATA_TENANT_ID,
     ];
     for name in user_field_names {
-        if always_reserved.contains(name) || is_reserved_system_column(name) {
+        if always_reserved.contains(name) || is_reserved_managed_column(name) {
             return Err(BifrostError::ReservedColumn((*name).to_string()));
         }
         if appended.contains(name) {

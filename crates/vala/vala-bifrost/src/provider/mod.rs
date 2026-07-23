@@ -13,7 +13,7 @@ use datafusion::physical_plan::{
 use datafusion::scalar::ScalarValue;
 use iceberg::table::Table;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use arrow::datatypes::SchemaRef;
 

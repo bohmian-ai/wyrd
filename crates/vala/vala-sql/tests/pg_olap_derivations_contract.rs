@@ -33,16 +33,9 @@ mod pg_tests {
     }
 
     async fn register_source(conn: &mut TenantConn<'_>, source_table_uid: &[u8; 16]) {
-        upsert_table(
-            conn,
-            source_table_uid,
-            "spans.otlp_source",
-            &[0u8; 32],
-            "tenant_owned",
-            &[],
-        )
-        .await
-        .expect("register source table");
+        upsert_table(conn, source_table_uid, "spans.otlp_source", &[0u8; 32], &[])
+            .await
+            .expect("register source table");
     }
 
     fn fp(byte: u8) -> [u8; 32] {
@@ -55,8 +48,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
-
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("acquire");
@@ -68,7 +59,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -96,7 +86,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
         let watermark = *uuid::Uuid::now_v7().as_bytes();
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -111,7 +100,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -136,7 +124,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -175,8 +162,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
-
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("acquire");
@@ -188,7 +173,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -208,7 +192,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -241,8 +224,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
-
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("acquire");
@@ -254,7 +235,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -273,7 +253,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -306,8 +285,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
-
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("acquire");
@@ -319,7 +296,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -338,7 +314,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -371,8 +346,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
-
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
             .await
             .expect("acquire");
@@ -384,7 +357,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {
@@ -404,7 +376,6 @@ mod pg_tests {
                 derivation_uid: &derivation_uid,
                 source_table_uid: &source_uid,
                 target_table_uid: &target_uid,
-                control_bind,
                 fqn: "genai_from_spans",
                 registered_watermark: None,
                 contract: DerivationContract {

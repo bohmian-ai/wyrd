@@ -18,7 +18,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;

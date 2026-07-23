@@ -33,7 +33,7 @@ use crate::state::AppState;
 pub fn auth_router() -> Router<AppState> {
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(10)
+            .per_millisecond(100)
             .burst_size(20)
             .finish()
             .expect("static auth governor config is valid"),

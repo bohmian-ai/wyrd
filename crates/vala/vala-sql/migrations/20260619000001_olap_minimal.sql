@@ -9,7 +9,6 @@ CREATE TABLE vala.bifrost_tables (
     table_uid           BYTEA   NOT NULL CHECK (octet_length(table_uid) = 16),
     fqn                 TEXT    NOT NULL,
     fingerprint         BYTEA   NOT NULL CHECK (octet_length(fingerprint) = 32),
-    scope               TEXT    NOT NULL CHECK (scope IN ('tenant_owned', 'system_shared')),
     status              TEXT    NOT NULL CHECK (status IN ('active', 'deprecated', 'quarantined')) DEFAULT 'active',
     partition_columns   TEXT[]  NOT NULL DEFAULT ARRAY[]::TEXT[],
     registered_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -82,21 +81,3 @@ CREATE POLICY tenant_isolation ON vala.refresh_epochs
 GRANT SELECT, INSERT, UPDATE, DELETE
     ON vala.bifrost_tables, vala.olap_commits, vala.refresh_epochs
     TO wyrd_app;
-
--- Reserved system-owner tenant. SystemShared tables register their
--- bifrost_tables / olap_commits rows under this sentinel so there is exactly
--- one commit coordinator per physical table. The nil UUID is never a valid
--- UUIDv7, so it cannot collide with a real tenant.
---
--- status 'active' is required: the platform.tenants CHECK constraint only
--- permits active/suspended/deleted; 'system' would abort the migration. The
--- auth boundary is the real guard — no auth path may resolve a principal to
--- the nil UUID (wyrd_spec::DataTenantId::SYSTEM_OWNER).
-INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
-VALUES (
-    '00000000-0000-0000-0000-000000000000',
-    'wyrd-system-owner',
-    'Wyrd System Owner',
-    'active'
-)
-ON CONFLICT (data_tenant_id) DO NOTHING;

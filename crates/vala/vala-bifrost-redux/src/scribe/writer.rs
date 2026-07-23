@@ -858,7 +858,6 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
     use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
-    use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
@@ -874,7 +873,7 @@ mod tests {
                 Path::new(temp_dir.path()),
                 [0_u8; 16],
                 1,
-                DataTenantId::SYSTEM_OWNER,
+                crate::test_support::tenant(),
                 WalConfig::default(),
             )
             .expect("wal"),
@@ -896,7 +895,7 @@ mod tests {
             wal_io,
         );
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
-        let binding = TenantTableBinding::resolve((DataTenantId::SYSTEM_OWNER, table.clone()))
+        let binding = TenantTableBinding::resolve((crate::test_support::tenant(), table.clone()))
             .expect("binding");
         let (writer, _) = registry.get_or_create(binding).expect("writer");
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -936,7 +935,7 @@ mod tests {
                 measured_wire_bytes: 0,
                 admitted_bytes: 1,
                 reservation,
-                tenant: DataTenantId::SYSTEM_OWNER,
+                tenant: crate::test_support::tenant(),
                 table: table.clone(),
                 queued_at: Instant::now(),
             },
@@ -945,7 +944,7 @@ mod tests {
         registry.drain().await;
 
         let key = crate::scribe::seal_key::SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             table,
             crate::scribe::seal_key::EventDay::new(
                 chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date"),

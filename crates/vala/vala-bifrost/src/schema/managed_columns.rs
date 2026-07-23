@@ -1,6 +1,5 @@
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use crate::types::TableScope;
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
     WYRD_INGESTED_AT,
@@ -10,7 +9,7 @@ use wyrd_spec::vala::{
 /// (non-domain) table: the three universal correlation columns (`run_id`, `card_uid`,
 /// `principal_id`, all nullable) followed by the server-owned system columns.
 ///
-/// For pre-declared domain tables use `ensure_system_cols` in `tables/system_columns.rs`,
+/// For pre-declared domain tables use `ensure_managed_columns` in `tables/managed_columns.rs`,
 /// which appends only the columns the table's `CorrelationPolicy` permits.
 ///
 /// The correlation columns are server-stamped/resolved but must exist in the stored
@@ -18,7 +17,7 @@ use wyrd_spec::vala::{
 /// the internal `BifrostWriteContext::system()` path can write them as NULL. They do
 /// **not** perturb the user-fields-only [`SchemaFingerprint`], which is computed over
 /// the user fields alone in `create_table`.
-pub fn with_system_columns(mut user_fields: Vec<Field>, scope: TableScope) -> Vec<Field> {
+pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
     user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
@@ -37,8 +36,6 @@ pub fn with_system_columns(mut user_fields: Vec<Field>, scope: TableScope) -> Ve
         DataType::FixedSizeBinary(16),
         false,
     ));
-    if scope == TableScope::SystemShared {
-        user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
-    }
+    user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
     user_fields
 }

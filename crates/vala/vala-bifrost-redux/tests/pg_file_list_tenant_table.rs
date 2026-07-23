@@ -168,7 +168,6 @@ mod pg_tests {
         .fetch_all(&pool)
         .await
         .expect("file_list columns");
-        assert!(!columns.iter().any(|column| column == "tenant_bucket"));
         assert!(!columns.iter().any(|column| column == "scope"));
         let tenant_nullable: String = sqlx::query_scalar(
             "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'vala' AND table_name = 'file_list' AND column_name = 'data_tenant_id'",
@@ -560,10 +559,13 @@ mod pg_tests {
         let mut conn_b = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
             .await
             .expect("tenant B connection");
-        let error = insert_and_audit(&mut conn_b, &foreign, &[])
+        let foreign_outcome = insert_and_audit(&mut conn_b, &foreign, &[])
             .await
-            .expect_err("cross-tenant replay must fail closed");
-        assert!(error.to_string().contains("RLS-visible"));
+            .expect("tenant-qualified replay identity");
+        conn_b.commit().await.expect("tenant B commit");
+        assert_eq!(foreign_outcome.id, foreign.id);
+        assert!(!foreign_outcome.replayed);
+        assert_eq!(foreign_outcome.commit_key.data_tenant_id, tenant_b);
 
         let superuser = fixture.superuser_pool().await.expect("superuser pool");
         let audit_count: i64 = sqlx::query_scalar(

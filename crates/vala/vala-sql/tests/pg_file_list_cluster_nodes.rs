@@ -69,7 +69,6 @@ mod pg_tests {
             ("min_event_time", "timestamp with time zone", "NO"),
             ("max_event_time", "timestamp with time zone", "NO"),
             ("partition_day", "date", "NO"),
-            ("tenant_bucket", "integer", "NO"),
             ("compacted", "boolean", "NO"),
             ("committed_snapshot_id", "bigint", "YES"),
             ("node_id", "uuid", "NO"),
@@ -139,8 +138,8 @@ mod pg_tests {
             "watermark index includes table_name"
         );
         assert!(
-            def.0.contains("tenant_bucket"),
-            "watermark index includes tenant_bucket"
+            def.0.contains("data_tenant_id"),
+            "watermark index is tenant-first"
         );
         assert!(
             def.0.contains("node_id"),
@@ -172,11 +171,11 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
+                partition_day, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/path1.parquet',
-                1024, 100, now(), now(), current_date, 0,
+                1024, 100, now(), now(), current_date,
                 $3, $4, $5, $6
             )
             "#,
@@ -197,11 +196,11 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
+                partition_day, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/path2.parquet',
-                2048, 200, now(), now(), current_date, 0,
+                2048, 200, now(), now(), current_date,
                 $3, $4, $5, $6
             )
             "#,
@@ -312,11 +311,11 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
+                partition_day, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/pathA.parquet',
-                1024, 100, now(), now(), current_date, 0,
+                1024, 100, now(), now(), current_date,
                 $3, 1, 100, 200
             )
             "#,
@@ -357,11 +356,11 @@ mod pg_tests {
             INSERT INTO vala.file_list (
                 id, data_tenant_id, namespace, table_name, file_path,
                 file_size, row_count, min_event_time, max_event_time,
-                partition_day, tenant_bucket, node_id, writer_epoch,
+                partition_day, node_id, writer_epoch,
                 wal_lsn_min, wal_lsn_max
             ) VALUES (
                 $1, $2, 'vala.traces', 'spans', '/fake/operator.parquet',
-                1024, 100, now(), now(), current_date, 0,
+                1024, 100, now(), now(), current_date,
                 $3, 1, 100, 200
             )
             "#,

@@ -32,7 +32,7 @@ use arrow::array::{
 use arrow::datatypes::{Schema, SchemaRef};
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::tables::TableError;
 use crate::tables::genai::{EmbeddingsTable, MemoryTable, MessagesTable, ToolCallsTable};

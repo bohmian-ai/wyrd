@@ -34,7 +34,6 @@ mod pg_tests {
             &table_uid,
             "ns.tbl",
             &fingerprint,
-            "tenant_owned",
             &[],
         )
         .await
@@ -308,6 +307,7 @@ mod pg_tests {
             .unwrap();
         vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
             &mut conn,
+            tenant.as_uuid(),
             &table_uid,
             &batch_id,
             token,

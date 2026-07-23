@@ -99,13 +99,11 @@ pub(crate) async fn discover_tables(
                     .map_err(|error| ForgeError::SnapshotExpiry {
                         detail: error.to_string(),
                     })?;
-            let tenant = if tenant_uuid.is_nil() {
-                DataTenantId::SYSTEM_OWNER
-            } else {
-                DataTenantId::try_from(tenant_uuid).map_err(|error| ForgeError::SnapshotExpiry {
+            let tenant = DataTenantId::try_from(tenant_uuid).map_err(|error| {
+                ForgeError::SnapshotExpiry {
                     detail: error.to_string(),
-                })?
-            };
+                }
+            })?;
             let namespace: String =
                 row.try_get("namespace")
                     .map_err(|error| ForgeError::SnapshotExpiry {

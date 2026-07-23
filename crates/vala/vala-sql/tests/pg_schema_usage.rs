@@ -12,7 +12,7 @@ mod pg_tests {
     //! Run via `mise run test:sql`.
 
     use vala_sql::TenantConn;
-    use vala_sql::queries::olap_catalog::upsert_table;
+    use vala_sql::queries::olap_catalog::{precommit, upsert_table};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
@@ -45,12 +45,111 @@ mod pg_tests {
             &table_uid,
             "space.table",
             &fingerprint,
-            "tenant_owned",
             &partition_columns,
         )
         .await
         .expect("wyrd_app must reach vala.bifrost_tables once USAGE ON SCHEMA vala is granted");
 
         conn.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_schema_is_tenant_only_and_keys_are_tenant_qualified() {
+        let fixture = PgFixture::start().await.expect("fixture");
+        let superuser = fixture.superuser_pool().await.expect("superuser pool");
+        let tenant_a = DataTenantId::new_v7();
+        let tenant_b = DataTenantId::new_v7();
+        for tenant in [tenant_a, tenant_b] {
+            fixture
+                .seed_additional_tenant_with_uuid(
+                    tenant,
+                    &format!("test-{}", tenant.as_uuid().simple()),
+                )
+                .await
+                .unwrap();
+        }
+
+        for tenant in [tenant_a, tenant_b] {
+            let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
+                .await
+                .unwrap();
+            upsert_table(&mut conn, &[7; 16], "datasets.same", &[3; 32], &[])
+                .await
+                .unwrap();
+            precommit(&mut conn, &[7; 16], &[9; 16], "test", "test")
+                .await
+                .unwrap();
+            precommit(&mut conn, &[7; 16], &[9; 16], "test", "test")
+                .await
+                .unwrap();
+            conn.commit().await.unwrap();
+        }
+
+        for (table, column) in [
+            ("bifrost_tables", "scope"),
+            ("olap_commits", "control_bind"),
+            ("file_list", "tenant_bucket"),
+        ] {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_schema = 'vala' AND table_name = $1 AND column_name = $2",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "forbidden column {table}.{column} is absent");
+        }
+
+        let nil_tenant = uuid::Uuid::nil();
+        let nil_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM platform.tenants WHERE data_tenant_id = $1")
+                .bind(nil_tenant)
+                .fetch_one(&superuser)
+                .await
+                .unwrap();
+        assert_eq!(nil_count, 0, "fresh migrations do not create a nil tenant");
+
+        let table_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM vala.bifrost_tables WHERE table_uid = $1")
+                .bind([7; 16].as_slice())
+                .fetch_one(&superuser)
+                .await
+                .unwrap();
+        let commit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
+        )
+        .bind([7; 16].as_slice())
+        .bind([9; 16].as_slice())
+        .fetch_one(&superuser)
+        .await
+        .unwrap();
+        assert_eq!(
+            table_count, 2,
+            "same table identity is independent per tenant"
+        );
+        assert_eq!(
+            commit_count, 2,
+            "same batch identity is independent per tenant"
+        );
+
+        for index_name in [
+            "file_list_group_idx",
+            "file_list_tenant_idx",
+            "file_list_live_tail_watermark_idx",
+        ] {
+            let definition: String = sqlx::query_scalar(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'vala' AND indexname = $1",
+            )
+            .bind(index_name)
+            .fetch_one(&superuser)
+            .await
+            .unwrap();
+            assert!(
+                definition.replace(' ', "").contains("(data_tenant_id,"),
+                "{index_name} is tenant-first"
+            );
+        }
     }
 }

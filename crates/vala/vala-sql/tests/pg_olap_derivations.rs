@@ -31,7 +31,7 @@ mod pg_tests {
 
     /// Register a source bifrost table so the derivation FK resolves.
     async fn register_source(conn: &mut TenantConn<'_>, source_table_uid: &[u8; 16], fqn: &str) {
-        upsert_table(conn, source_table_uid, fqn, &[0u8; 32], "tenant_owned", &[])
+        upsert_table(conn, source_table_uid, fqn, &[0u8; 32], &[])
             .await
             .expect("register source table");
     }
@@ -43,7 +43,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
         let watermark = *uuid::Uuid::now_v7().as_bytes();
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -55,20 +54,18 @@ mod pg_tests {
             &derivation_uid,
             &source_uid,
             &target_uid,
-            control_bind,
             "genai.from_spans",
             None,
         )
         .await
         .expect("insert derivation");
 
-        // Idempotent re-register on the same (source, target, control_bind).
+        // Idempotent re-register on the same (source, target) identity.
         insert_derivation(
             &mut conn,
             &derivation_uid,
             &source_uid,
             &target_uid,
-            control_bind,
             "genai.from_spans",
             None,
         )
@@ -148,7 +145,6 @@ mod pg_tests {
         let derivation_uid = *uuid::Uuid::now_v7().as_bytes();
         let source_uid = *uuid::Uuid::now_v7().as_bytes();
         let target_uid = *uuid::Uuid::now_v7().as_bytes();
-        let control_bind = tenant.as_uuid();
         let registered = *uuid::Uuid::now_v7().as_bytes();
 
         let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
@@ -160,7 +156,6 @@ mod pg_tests {
             &derivation_uid,
             &source_uid,
             &target_uid,
-            control_bind,
             "genai.from_spans",
             Some(&registered),
         )

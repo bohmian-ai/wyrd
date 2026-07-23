@@ -5,7 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::system_columns::{
+use wyrd_spec::vala::managed_columns::{
     DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
 };
 
@@ -19,7 +19,7 @@ use wyrd_spec::vala::system_columns::{
 /// # Errors
 /// Returns [`ArrowError`] when building the batch-id column or assembling the
 /// stamped [`RecordBatch`] fails.
-pub fn stamp_system_columns(
+pub fn stamp_managed_columns(
     batch: &RecordBatch,
     ingested_at_us: i64,
     batch_id: [u8; 16],

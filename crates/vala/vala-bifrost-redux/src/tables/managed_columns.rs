@@ -10,13 +10,15 @@ use wyrd_spec::vala::{
 /// to the user fields of a pre-declared domain table.
 ///
 /// Column order: policy correlation columns first, then system timestamp
-/// columns, then `wyrd_batch_id`, then `data_tenant_id` (always present on
-/// domain tables, which are all `SystemShared`).
+/// columns, then `wyrd_batch_id`, then `data_tenant_id`.
 ///
 /// This is the single source of truth for what gets appended per policy.
 /// The appended columns here are excluded from `schema_fingerprint()`, which
 /// hashes `arrow_fields()` only.
-pub fn ensure_system_cols(mut user_fields: Vec<Field>, policy: CorrelationPolicy) -> Vec<Field> {
+pub fn ensure_managed_columns(
+    mut user_fields: Vec<Field>,
+    policy: CorrelationPolicy,
+) -> Vec<Field> {
     // Universal correlation columns per policy (C-01).
     match policy {
         CorrelationPolicy::Observation => {
@@ -50,7 +52,7 @@ pub fn ensure_system_cols(mut user_fields: Vec<Field>, policy: CorrelationPolicy
         DataType::FixedSizeBinary(16),
         false,
     ));
-    // All domain tables are SystemShared — data_tenant_id is always present.
+    // Every physical table carries the tenant isolation key.
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
 
     user_fields
@@ -66,7 +68,7 @@ mod tests {
 
     #[test]
     fn observation_policy_appends_all_three_then_system() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
         let names = field_names(&fields);
         assert_eq!(
             names,
@@ -84,7 +86,7 @@ mod tests {
 
     #[test]
     fn code_axis_policy_omits_run_id() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::CodeAxis);
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
         let names = field_names(&fields);
         assert!(
             !names.contains(&RUN_ID),
@@ -95,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn none_policy_only_system_columns() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::None);
+    fn none_policy_only_managed_columns() {
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
         let names = field_names(&fields);
         assert!(!names.contains(&RUN_ID));
         assert!(!names.contains(&CARD_UID));
@@ -108,7 +110,7 @@ mod tests {
     #[test]
     fn user_fields_come_before_system() {
         let user = vec![Field::new("my_col", DataType::Utf8, true)];
-        let fields = ensure_system_cols(user, CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);
         assert_eq!(fields[0].name(), "my_col");
     }
 }

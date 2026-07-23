@@ -27,7 +27,7 @@ mod pg_tests {
     use vala_bifrost::types::TableScope;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::ids::DataTenantId;
-    use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+    use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
     use wyrd_storage::settings::BackendConfig;
 
     const NS: BifrostNamespace = BifrostNamespace::Bifrost;
@@ -186,7 +186,7 @@ mod pg_tests {
 
     async fn write_rows(catalog: &WyrdCatalog, tenant: DataTenantId, payloads: &[&str]) {
         // Pre-stamp user+correlation columns for a SystemShared table.
-        // `with_system_columns` appends run_id, card_uid, principal_id before the
+        // `with_managed_columns` appends run_id, card_uid, principal_id before the
         // server-stamped wyrd_* columns. The coordinator's flush() appends
         // wyrd_event_time, wyrd_ingested_at, wyrd_batch_id, data_tenant_id.
         // Positional cast in write_batches requires the batch column order and count

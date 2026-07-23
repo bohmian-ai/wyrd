@@ -37,7 +37,7 @@ The seal itself is a pre-commit sequence followed by a single Postgres transacti
 
 1. **Freeze memtable.** Swap the mutable buffer for a fresh one; the frozen snapshot is immutable from here.
 2. **Encode Parquet.** Sort by `(data_tenant_id, wyrd_event_time)`. Build bloom filters on tenant + trace_id, write the page index.
-3. **PUT to object store.** Path: `s3://{namespace}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`. The `{pod_id}-{ulid}` suffix guarantees uniqueness across pods writing the same partition in the same second.
+3. **PUT to object store.** Path: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`. The tenant-qualified prefix and `{pod_id}-{ulid}` suffix guarantee uniqueness across tenants and pods.
 4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)` plus append the sealed audit rows for the batch. Commit or rollback as one unit.
 5. **Retire WAL bytes.** Update the seal manifest with the new `sealed_lsn`, truncate the covered WAL segments.
 
@@ -61,7 +61,6 @@ Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls 
 | `min_event_time` | `timestamptz` | Partition-pruning bound |
 | `max_event_time` | `timestamptz` | Partition-pruning bound |
 | `partition_day` | `date` | `Day(event_time)` partition |
-| `tenant_bucket` | `int` | `Bucket(tenant, 64)` partition |
 | `compacted` | `bool` | Flipped to `true` when Forge folds the file into a snapshot |
 | `committed_snapshot_id` | `bigint` | Iceberg snapshot ID after compaction; NULL until compacted |
 | `node_id` | `text` | Emitting Scribe pod |

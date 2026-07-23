@@ -29,7 +29,7 @@ use std::str::FromStr;
 use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::system_columns::{
+use wyrd_spec::vala::managed_columns::{
     CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
     WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
@@ -391,7 +391,7 @@ fn stamp_correlation_columns(
         request_id.as_str();
         row_count
     ])));
-    append_system_columns(
+    append_managed_columns(
         &mut fields,
         &mut columns,
         principal,
@@ -471,7 +471,7 @@ fn resolve_card_uids(
         .collect()
 }
 
-fn append_system_columns(
+fn append_managed_columns(
     fields: &mut Vec<Field>,
     columns: &mut Vec<ArrayRef>,
     principal: &Principal,
@@ -1030,10 +1030,9 @@ mod tests {
     use uuid::Uuid;
     use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::auth::PrincipalId;
-    use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::reference::{CardRef, CardRefScope};
     use wyrd_spec::request_id::RequestId;
-    use wyrd_spec::vala::system_columns::{
+    use wyrd_spec::vala::managed_columns::{
         CARD_REF, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
         WYRD_REQUEST_ID,
     };
@@ -1048,7 +1047,7 @@ mod tests {
         Principal::new(
             PrincipalId::new(Uuid::now_v7()),
             PrincipalKind::User,
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             Vec::new(),
             PermissionSet::new(),
         )
@@ -1160,7 +1159,7 @@ mod tests {
                 card_ref: card.clone(),
                 card_ref_scope: CardRefScope::own(&card),
             },
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             Vec::new(),
             PermissionSet::new(),
         );

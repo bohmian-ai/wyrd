@@ -7,6 +7,8 @@
 //! Per CONTRACTS §13, this crate MUST NOT depend on `vala-bifrost` in any form.
 //! Shared logic is copied, not imported.
 
+#[cfg(feature = "bench-support")]
+pub mod bench_support;
 pub mod catalog;
 pub mod contracts;
 pub mod forge;
@@ -17,3 +19,19 @@ pub mod provider;
 pub mod schema;
 pub mod scribe;
 pub mod tables;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::OnceLock;
+
+    use wyrd_spec::DataTenantId;
+
+    pub(crate) fn tenant() -> DataTenantId {
+        static TENANT: OnceLock<DataTenantId> = OnceLock::new();
+        *TENANT.get_or_init(DataTenantId::new_v7)
+    }
+
+    pub(crate) fn nil_tenant() -> DataTenantId {
+        DataTenantId::SYSTEM_OWNER
+    }
+}

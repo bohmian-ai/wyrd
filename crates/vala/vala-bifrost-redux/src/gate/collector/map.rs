@@ -28,11 +28,11 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use chrono::{DateTime, Utc};
 use wyrd_spec::vala::ids::{SpanId, TraceId};
 use wyrd_spec::vala::logs::record::LogRecord;
+use wyrd_spec::vala::managed_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 use wyrd_spec::vala::metrics::record::{
     AggregationTemporality, ExponentialBuckets, MetricExemplar, MetricRecord, MetricType,
     QuantileValue,
 };
-use wyrd_spec::vala::system_columns::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 use wyrd_spec::vala::trace::{
     InstrumentationScope, Resource, SpanEvent, SpanKind, SpanLink, SpanRecord, SpanStatus,
 };

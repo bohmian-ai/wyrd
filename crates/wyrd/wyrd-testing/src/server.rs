@@ -70,7 +70,7 @@ pub struct WyrdTestServer {
     inner: WyrdTestServerInner,
     mode: Mode,
     shutdown_token: Option<CancellationToken>,
-    serve_handle: Option<JoinHandle<()>>,
+    serve_handle: Option<JoinHandle<Result<(), wyrd_server::BootExit>>>,
 }
 
 struct WyrdTestServerInner {
@@ -954,9 +954,7 @@ impl WyrdTestServer {
             .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
 
-        let serve_handle = wyrd_runtime::runtime().spawn(async move {
-            let _ = bound.run().await;
-        });
+        let serve_handle = wyrd_runtime::runtime().spawn(async move { bound.run().await });
 
         self.shutdown_token = Some(shutdown_token);
         self.serve_handle = Some(serve_handle);
@@ -966,7 +964,17 @@ impl WyrdTestServer {
             grpc_addr,
         };
 
-        wait_for_ready(&base_url).await?;
+        if let Err(error) = wait_for_ready(&base_url).await {
+            if let Some(handle) = self.serve_handle.take()
+                && handle.is_finished()
+                && let Ok(Err(exit)) = handle.await
+            {
+                return Err(WyrdTestServerError::Start(format!(
+                    "bound Wyrd test server exited before readiness: {exit:?}"
+                )));
+            }
+            return Err(error);
+        }
 
         Ok(self)
     }
@@ -1657,13 +1665,7 @@ pub(crate) async fn test_catalog(
     )
     .await
     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    let catalog = Arc::new(catalog);
-    // Mirror server boot: provision the pre-declared OLAP domain tables so the
-    // bound test server's ingest and query paths have their physical tables.
-    vala_bifrost::tables::register_all(&catalog)
-        .await
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-    Ok(catalog)
+    Ok(Arc::new(catalog))
 }
 
 pub(crate) async fn test_redux_catalog(

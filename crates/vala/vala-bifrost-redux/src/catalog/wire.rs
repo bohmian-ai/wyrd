@@ -3,7 +3,7 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
 use wyrd_spec::vala::api::{BifrostTableEntry, DataTypeSpec, FieldSpec, TableStatus, TimeUnit};
-use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_system_column};
+use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_managed_column};
 
 use crate::catalog::BifrostCatalogError;
 
@@ -14,7 +14,7 @@ const COLUMN_CLASS_CORRELATION: &str = "correlation";
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostCatalogError> {
     for field in user_fields {
         let name = field.name();
-        if is_reserved_system_column(name) || is_reserved_correlation_column(name) {
+        if is_reserved_managed_column(name) || is_reserved_correlation_column(name) {
             return Err(BifrostCatalogError::ReservedColumn(name.clone()));
         }
     }
@@ -46,7 +46,7 @@ pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, Bifr
     let mut fields = Vec::new();
     for field in schema.fields() {
         let name = field.name();
-        if is_reserved_system_column(name) {
+        if is_reserved_managed_column(name) {
             continue;
         }
         let mut spec = field_to_spec(field)?;

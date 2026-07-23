@@ -208,7 +208,6 @@ pub async fn register_genai_derivation(
         &derivation_uid_bytes,
         &uids.source,
         &uids.messages,
-        uuid::Uuid::nil(),
         "genai_from_spans",
         None,
     )

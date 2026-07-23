@@ -14,7 +14,7 @@
 mod recovery {
     use std::sync::Arc;
 
-    use crate::batch_builder::stamp_system_columns;
+    use crate::batch_builder::stamp_managed_columns;
     use crate::catalog::WyrdCatalog;
     use crate::catalog::iceberg_sql;
     use crate::catalog::namespaces::BifrostNamespace;
@@ -119,8 +119,8 @@ mod recovery {
 
     fn make_batch(n: i64) -> RecordBatch {
         // Pre-stamp user columns for a TenantOwned table with user_fields=[val].
-        // `with_system_columns` appends run_id, card_uid, principal_id before the
-        // server-owned wyrd_* columns. stamp_system_columns then appends the three
+        // `with_managed_columns` appends run_id, card_uid, principal_id before the
+        // server-owned wyrd_* columns. stamp_managed_columns then appends the three
         // wyrd_* columns. The positional cast in write_batches requires the pre-stamp
         // column count and types to match the physical schema exactly.
         let schema = Arc::new(Schema::new(vec![
@@ -148,7 +148,7 @@ mod recovery {
         let now_us = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX));
-        stamp_system_columns(&user, now_us, batch_id, None).unwrap()
+        stamp_managed_columns(&user, now_us, batch_id, None).unwrap()
     }
 
     /// Rebuild the catalog (simulates engine restart). Recovery runs on `WyrdCatalog::new`.
@@ -1189,7 +1189,7 @@ mod recovery {
 mod group_commit {
     use std::sync::Arc;
 
-    use crate::batch_builder::stamp_system_columns;
+    use crate::batch_builder::stamp_managed_columns;
     use crate::catalog::WyrdCatalog;
     use crate::catalog::iceberg_sql;
     use crate::catalog::namespaces::BifrostNamespace;
@@ -1291,7 +1291,7 @@ mod group_commit {
                 .map_or(0, |d| d.as_micros()),
         )
         .unwrap_or(i64::MAX);
-        stamp_system_columns(&user, now_us, batch_id, tenant).unwrap()
+        stamp_managed_columns(&user, now_us, batch_id, tenant).unwrap()
     }
 
     fn ctx(batch_id: [u8; 16]) -> BifrostWriteContext {

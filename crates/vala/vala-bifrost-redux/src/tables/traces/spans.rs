@@ -5,7 +5,7 @@ use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
     SortKey,
 };
-use wyrd_spec::vala::system_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 pub struct SpansTable;
 

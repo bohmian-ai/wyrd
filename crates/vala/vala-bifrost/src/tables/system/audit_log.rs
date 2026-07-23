@@ -4,7 +4,7 @@ use crate::tables::fields::utf8;
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
-use wyrd_spec::vala::system_columns::{DATA_TENANT_ID, WYRD_EVENT_TIME};
+use wyrd_spec::vala::managed_columns::{DATA_TENANT_ID, WYRD_EVENT_TIME};
 
 /// `vala.system.audit_log` — 16 audit content columns + 4 Bifrost system
 /// columns, `CorrelationPolicy::None` (C-01). No universal correlation columns.

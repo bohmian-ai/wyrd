@@ -19,7 +19,7 @@ use crate::catalog::wire::{
 };
 use crate::catalog::{TableRef, TenantTableBinding, build_partition_spec};
 use crate::namespaces::BifrostNamespace;
-use crate::schema::{SchemaFingerprint, with_system_columns};
+use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::tables::{BuiltinTableDefinition, builtin_table};
 
 /// Opaque 16-byte table identity stored in `vala.bifrost_tables`.
@@ -216,7 +216,7 @@ impl BifrostCatalog {
                 &binding,
                 canonical_schema
                     .as_deref()
-                    .unwrap_or(&Schema::new(with_system_columns(
+                    .unwrap_or(&Schema::new(with_managed_columns(
                         request.user_fields.clone(),
                     ))),
             )?;
@@ -232,7 +232,7 @@ impl BifrostCatalog {
                 &binding,
                 canonical_schema
                     .as_deref()
-                    .unwrap_or(&Schema::new(with_system_columns(
+                    .unwrap_or(&Schema::new(with_managed_columns(
                         request.user_fields.clone(),
                     ))),
             )?;
@@ -240,7 +240,7 @@ impl BifrostCatalog {
             let arrow_schema = canonical_schema
                 .as_deref()
                 .cloned()
-                .unwrap_or_else(|| Schema::new(with_system_columns(request.user_fields.clone())));
+                .unwrap_or_else(|| Schema::new(with_managed_columns(request.user_fields.clone())));
             let iceberg_schema =
                 iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)?;
             let partition_columns = binding.partition_columns();
@@ -269,7 +269,6 @@ impl BifrostCatalog {
             table_uid.as_bytes(),
             &fqn,
             &fingerprint.0,
-            "tenant_owned",
             &["wyrd_event_time".to_owned()],
         )
         .await?;

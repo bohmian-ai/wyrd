@@ -8,7 +8,7 @@ use datafusion::logical_expr::{Expr, Filter, LogicalPlan};
 use datafusion::optimizer::analyzer::AnalyzerRule;
 use datafusion::scalar::ScalarValue;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::provider::WyrdTableProvider;
 

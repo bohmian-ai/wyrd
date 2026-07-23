@@ -4,11 +4,11 @@ mod pg_tests {
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use vala_bifrost::batch_builder::stamp_system_columns;
+    use vala_bifrost::batch_builder::stamp_managed_columns;
     use vala_bifrost::schema::bifrost_schema;
     use vala_bifrost::types::{SchemaFingerprint, TableScope};
     use wyrd_dev_fixtures::pg::PgFixture;
-    use wyrd_spec::vala::system_columns::{DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_INGESTED_AT};
+    use wyrd_spec::vala::managed_columns::{DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_INGESTED_AT};
 
     #[test]
     fn schema_has_correct_field_count_tenant_owned() {
@@ -16,7 +16,7 @@ mod pg_tests {
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
         ];
-        let schema = bifrost_schema(user_fields, TableScope::TenantOwned);
+        let schema = bifrost_schema(user_fields);
         assert_eq!(
             schema.fields().len(),
             8,
@@ -31,9 +31,9 @@ mod pg_tests {
     }
 
     #[test]
-    fn schema_has_correct_field_count_system_shared() {
+    fn schema_has_correct_field_count_includes_tenant() {
         let user_fields = vec![Field::new("metric", DataType::Int64, false)];
-        let schema = bifrost_schema(user_fields, TableScope::SystemShared);
+        let schema = bifrost_schema(user_fields);
         assert_eq!(
             schema.fields().len(),
             8,
@@ -67,7 +67,7 @@ mod pg_tests {
     }
 
     #[test]
-    fn stamp_system_columns_appends_batch_id_and_timestamps() {
+    fn stamp_managed_columns_appends_batch_id_and_timestamps() {
         let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int64, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))])
@@ -76,14 +76,14 @@ mod pg_tests {
         let batch_id = *uuid::Uuid::now_v7().as_bytes();
         let now_us = 1_700_000_000_000_000_i64;
 
-        let stamped = stamp_system_columns(&batch, now_us, batch_id, None).unwrap();
+        let stamped = stamp_managed_columns(&batch, now_us, batch_id, None).unwrap();
         assert_eq!(stamped.num_rows(), 3);
         assert!(stamped.schema().field_with_name(WYRD_BATCH_ID).is_ok());
         assert!(stamped.schema().field_with_name(DATA_TENANT_ID).is_err());
     }
 
     #[test]
-    fn stamp_system_columns_appends_tenant_id_when_provided() {
+    fn stamp_managed_columns_appends_tenant_id_when_provided() {
         use wyrd_spec::ids::DataTenantId;
 
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
@@ -92,7 +92,7 @@ mod pg_tests {
 
         let tenant = DataTenantId::new_v7();
         let stamped =
-            stamp_system_columns(&batch, 0, *uuid::Uuid::now_v7().as_bytes(), Some(tenant))
+            stamp_managed_columns(&batch, 0, *uuid::Uuid::now_v7().as_bytes(), Some(tenant))
                 .unwrap();
 
         assert!(stamped.schema().field_with_name(DATA_TENANT_ID).is_ok());

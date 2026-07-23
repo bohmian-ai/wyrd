@@ -380,8 +380,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     ) -> Result<(), IngestError> {
         self.ensure_open()?;
         let (namespace, name) = resolve_fqn(table_fqn)?;
-        if namespace == BifrostNamespace::System {
-            return Err(IngestError::SystemTableWriteDenied {
+        if namespace == BifrostNamespace::Audit {
+            return Err(IngestError::ReservedBuiltinWriteDenied {
                 table: table_fqn.to_owned(),
             });
         }
@@ -488,8 +488,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .into_result()
             .map_err(IngestError::from_rbac)?;
         let (namespace, name) = resolve_fqn(&frame.table)?;
-        if namespace == BifrostNamespace::System {
-            return Err(IngestError::SystemTableWriteDenied { table: frame.table });
+        if namespace == BifrostNamespace::Audit {
+            return Err(IngestError::ReservedBuiltinWriteDenied { table: frame.table });
         }
         self.catalog
             .ensure_builtin_for_table(namespace, &name, auth.tenant)

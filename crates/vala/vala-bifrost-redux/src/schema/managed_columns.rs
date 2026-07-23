@@ -2,7 +2,7 @@
 
 use arrow::datatypes::{DataType, Field, TimeUnit};
 
-use wyrd_spec::vala::system_columns::{
+use wyrd_spec::vala::managed_columns::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
     WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
@@ -16,7 +16,7 @@ use wyrd_spec::vala::system_columns::{
 /// the internal `BifrostWriteContext::system()` path can write them as NULL. They do
 /// **not** perturb the user-fields-only [`SchemaFingerprint`], which is computed over
 /// the user fields alone in `create_table`.
-pub fn with_system_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
+pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
     user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
@@ -45,8 +45,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_system_columns_always_includes_tenant() {
-        let fields = with_system_columns(vec![Field::new("value", DataType::UInt64, false)]);
+    fn with_managed_columns_always_includes_tenant() {
+        let fields = with_managed_columns(vec![Field::new("value", DataType::UInt64, false)]);
 
         assert_eq!(
             fields

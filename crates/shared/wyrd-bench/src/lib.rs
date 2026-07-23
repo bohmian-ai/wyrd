@@ -14,7 +14,8 @@ pub use report::{
     ScribeBenchmarkReport, ScribeCaseReport, ScribeCaseVerification, ScribeCompactCase,
     ScribeComparisonStatus, ScribeComponentReport, ScribeDistribution, ScribeMatrixCase,
     ScribeTopologyEvidence, StageMeasurements, StorageMeasurements, VerificationMeasurements,
-    compact_scribe_matrix, required_scribe_matrix, required_scribe_metric_families,
+    compact_scribe_matrix, required_scribe_components, required_scribe_matrix,
+    required_scribe_metric_families,
 };
 pub use slo::{SloError, SloGate, SloMeasurement, SloResult, SloThreshold};
 pub use workload::{

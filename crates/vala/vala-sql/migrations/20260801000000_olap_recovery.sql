@@ -98,7 +98,6 @@ RETURNS TABLE(
     fqn               text,
     namespace         text,
     name              text,
-    scope             text,
     recovery_attempts integer
 )
 LANGUAGE plpgsql
@@ -139,7 +138,6 @@ BEGIN
         bt.fqn,
         split_part(bt.fqn, '.', 1) AS namespace,
         split_part(bt.fqn, '.', 2) AS name,
-        bt.scope,
         cl.recovery_attempts
     FROM claimed cl
     JOIN vala.bifrost_tables bt
@@ -151,6 +149,7 @@ GRANT EXECUTE ON FUNCTION vala.claim_stale_precommits(uuid, int) TO vala_recover
 ALTER FUNCTION vala.claim_stale_precommits(uuid, int) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.finalize_recovered_committed(
+    p_data_tenant_id uuid,
     p_table_uid   bytea,
     p_batch_id    bytea,
     p_snapshot_id bigint,
@@ -161,14 +160,13 @@ LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, vala, platform
 AS $$
-DECLARE
-    v_tenant_id uuid;
 BEGIN
     UPDATE vala.olap_commits
        SET state        = 'committed',
            committed_at = now(),
            snapshot_id  = p_snapshot_id
      WHERE table_uid              = p_table_uid
+       AND data_tenant_id         = p_data_tenant_id
        AND batch_id               = p_batch_id
        AND state                  = 'precommit'
        AND recovery_fencing_token = p_token;
@@ -177,16 +175,6 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Scope the audit read by the recovery fencing token, matching the FSM
-    -- UPDATE above. The token is unique per claimed row (recovery_fencing_seq),
-    -- so under M02 — where two tenants may share (table_uid, batch_id) on a
-    -- SystemShared table — this reads exactly the tenant row being finalized
-    -- and cannot double-write a recovery event to the wrong tenant.
-    SELECT data_tenant_id INTO v_tenant_id
-      FROM vala.olap_commits
-     WHERE table_uid = p_table_uid AND batch_id = p_batch_id
-       AND recovery_fencing_token = p_token;
-
     INSERT INTO vala.olap_recovery_events
         (data_tenant_id, table_uid, batch_id, event_kind, old_state, new_state,
          oracle_result, snapshot_id, recovery_owner, fencing_token, recorded_at)
@@ -194,14 +182,16 @@ BEGIN
            'recovery_decision', 'precommit', 'committed',
            'snapshot_found', p_snapshot_id, recovery_owner, p_token, now()
       FROM vala.olap_commits
-     WHERE table_uid = p_table_uid AND batch_id = p_batch_id
+     WHERE data_tenant_id = p_data_tenant_id
+       AND table_uid = p_table_uid AND batch_id = p_batch_id
        AND recovery_fencing_token = p_token;
 END;
 $$;
-GRANT EXECUTE ON FUNCTION vala.finalize_recovered_committed(bytea, bytea, bigint, bigint) TO vala_recovery;
-ALTER FUNCTION vala.finalize_recovered_committed(bytea, bytea, bigint, bigint) OWNER TO vala_recovery_owner;
+GRANT EXECUTE ON FUNCTION vala.finalize_recovered_committed(uuid, bytea, bytea, bigint, bigint) TO vala_recovery;
+ALTER FUNCTION vala.finalize_recovered_committed(uuid, bytea, bytea, bigint, bigint) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.finalize_recovered_aborted(
+    p_data_tenant_id uuid,
     p_table_uid bytea,
     p_batch_id  bytea,
     p_token     bigint,
@@ -216,6 +206,7 @@ BEGIN
     UPDATE vala.olap_commits
        SET state = 'aborted'
      WHERE table_uid              = p_table_uid
+       AND data_tenant_id         = p_data_tenant_id
        AND batch_id               = p_batch_id
        AND state                  = 'precommit'
        AND recovery_fencing_token = p_token;
@@ -224,8 +215,6 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Token-scoped audit read (see finalize_recovered_committed): the fencing
-    -- token uniquely identifies the finalized tenant row under M02.
     INSERT INTO vala.olap_recovery_events
         (data_tenant_id, table_uid, batch_id, event_kind, old_state, new_state,
          oracle_result, recovery_owner, fencing_token, reason, recorded_at)
@@ -233,14 +222,16 @@ BEGIN
            'recovery_decision', 'precommit', 'aborted',
            'snapshot_absent', recovery_owner, p_token, p_reason, now()
       FROM vala.olap_commits
-     WHERE table_uid = p_table_uid AND batch_id = p_batch_id
+     WHERE data_tenant_id = p_data_tenant_id
+       AND table_uid = p_table_uid AND batch_id = p_batch_id
        AND recovery_fencing_token = p_token;
 END;
 $$;
-GRANT EXECUTE ON FUNCTION vala.finalize_recovered_aborted(bytea, bytea, bigint, text) TO vala_recovery;
-ALTER FUNCTION vala.finalize_recovered_aborted(bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
+GRANT EXECUTE ON FUNCTION vala.finalize_recovered_aborted(uuid, bytea, bytea, bigint, text) TO vala_recovery;
+ALTER FUNCTION vala.finalize_recovered_aborted(uuid, bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
 
 CREATE OR REPLACE FUNCTION vala.mark_recovery_scan_failed(
+    p_data_tenant_id uuid,
     p_table_uid bytea,
     p_batch_id  bytea,
     p_token     bigint,
@@ -254,7 +245,6 @@ AS $$
 BEGIN
     -- Audit first, while recovery_owner / recovery_fencing_token are still
     -- populated. The UPDATE below clears the token so the row can be re-claimed.
-    -- Token-scoping the read isolates the correct tenant row under M02.
     INSERT INTO vala.olap_recovery_events
         (data_tenant_id, table_uid, batch_id, event_kind, old_state, new_state,
          oracle_result, recovery_owner, fencing_token, error, recorded_at)
@@ -262,7 +252,8 @@ BEGIN
            'recovery_decision', 'precommit', 'precommit',
            'scan_failed', recovery_owner, p_token, p_error, now()
       FROM vala.olap_commits
-     WHERE table_uid = p_table_uid AND batch_id = p_batch_id
+     WHERE data_tenant_id = p_data_tenant_id
+       AND table_uid = p_table_uid AND batch_id = p_batch_id
        AND recovery_fencing_token = p_token;
 
     -- Clear the fencing token/owner so claim_stale_precommits (which filters on
@@ -273,14 +264,15 @@ BEGIN
            recovery_last_error_at = now(),
            recovery_fencing_token = NULL,
            recovery_owner         = NULL
-     WHERE table_uid              = p_table_uid
+     WHERE data_tenant_id         = p_data_tenant_id
+       AND table_uid              = p_table_uid
        AND batch_id               = p_batch_id
        AND state                  = 'precommit'
        AND recovery_fencing_token = p_token;
 END;
 $$;
-GRANT EXECUTE ON FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) TO vala_recovery;
-ALTER FUNCTION vala.mark_recovery_scan_failed(bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
+GRANT EXECUTE ON FUNCTION vala.mark_recovery_scan_failed(uuid, bytea, bytea, bigint, text) TO vala_recovery;
+ALTER FUNCTION vala.mark_recovery_scan_failed(uuid, bytea, bytea, bigint, text) OWNER TO vala_recovery_owner;
 
 -- vala_recovery_owner only needs CREATE ON SCHEMA vala for the ALTER FUNCTION
 -- OWNER transfers above. Revoke it now that all ownership transfers are done.

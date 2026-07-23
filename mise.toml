@@ -147,7 +147,7 @@ run = "cargo test --locked -p vala-bifrost-redux --tests -- --test-threads=1"
 description = """Run the current Bifrost/Scribe Rust user-journey tests (marked #[ignore]
 so they stay out of the fast lane) against live Postgres."""
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
 run = """
 cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
 cargo test --locked -p wyrd-testing --test pg_bifrost_e2e_closeout_journey -- --ignored --test-threads=1
@@ -196,8 +196,14 @@ run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload 
 [tasks."bench:bifrost:scribe:slo"]
 description = "Run the complete real Scribe SDK-to-server matrix and emit JSON plus Markdown"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
 run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --pods=3 --tenants=10"
+
+[tasks."bench:bifrost:scribe:components"]
+description = "Measure the seven independent production Scribe components"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CLOSEOUT = "1" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=components --pods=1 --tenants=1"
 
 [tasks."bench:bifrost:forge:slo"]
 description = "Run the bounded real Forge object-store rewrite and Postgres commit workload"
@@ -220,20 +226,26 @@ run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload 
 [tasks."bench:bifrost:scribe:single-tenant-single-node"]
 description = "Run Scribe with one tenant on one node"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=scribe --pods=1 --tenants=1"
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CASES = "64k-w64-t1-p1-tbl1-same" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=scribe --pods=1 --tenants=1"
 
 [tasks."bench:bifrost:scribe:multi-tenant-single-node"]
 description = "Run Scribe with multiple tenants on one node"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=scribe --pods=1 --tenants=10"
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl1-same" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=scribe --pods=1 --tenants=10"
 
 [tasks."bench:bifrost:scribe:multi-tenant-multi-node"]
 description = "Run Scribe with multiple tenants across three nodes"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "cargo bench --locked -p wyrd-testing --bench bench_real_bifrost_workload -- --lane=scribe --pods=3 --tenants=10"
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CASES = "64k-w64-t10-p3-tbl8-dispersed" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=scribe --pods=3 --tenants=10"
+
+[tasks."bench:bifrost:scribe:sustained"]
+description = "Run the gated sustained multi-tenant Scribe characterization"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CLOSEOUT = "1" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=sustained --pods=3 --tenants=100"
 
 [tasks."bench:bifrost:forge:single-tenant-single-node"]
 description = "Run Forge with one tenant on one node"
@@ -424,6 +436,11 @@ run = "bash scripts/checks/pyo3-scope.sh"
 hide = true
 description = "Assert Redux has no legacy Bifrost dependency and run the negative self-test"
 run = "bash scripts/checks/redux-isolation.sh"
+
+[tasks."check:redux-single-table-model"]
+hide = true
+description = "Fail closed on obsolete Redux scope, sentinel tenant, and synthetic benchmark vocabulary"
+run = "bash scripts/checks/redux-single-table-model.sh"
 
 [tasks."check:mocks-scope"]
 hide = true

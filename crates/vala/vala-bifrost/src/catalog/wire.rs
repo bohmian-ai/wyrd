@@ -9,7 +9,7 @@
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
 use vala_sql::row_types::olap_catalog::BifrostTableRow;
 use wyrd_spec::vala::api::{BifrostTableEntry, DataTypeSpec, FieldSpec, TableStatus, TimeUnit};
-use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_system_column};
+use wyrd_spec::vala::{is_reserved_correlation_column, is_reserved_managed_column};
 
 use crate::error::BifrostError;
 
@@ -151,7 +151,7 @@ pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, Bifr
     let mut fields = Vec::new();
     for field in schema.fields() {
         let name = field.name();
-        if is_reserved_system_column(name) {
+        if is_reserved_managed_column(name) {
             continue;
         }
         let mut spec = field_to_field_spec(field)?;
@@ -175,7 +175,7 @@ pub fn fields_from_stored_schema(schema: &Schema) -> Result<Vec<FieldSpec>, Bifr
 pub fn reject_reserved_field_names(user_fields: &[Field]) -> Result<(), BifrostError> {
     for field in user_fields {
         let name = field.name();
-        if is_reserved_system_column(name) || is_reserved_correlation_column(name) {
+        if is_reserved_managed_column(name) || is_reserved_correlation_column(name) {
             return Err(BifrostError::ReservedColumn(name.clone()));
         }
     }
@@ -195,7 +195,6 @@ mod tests {
             table_uid: vec![0xabu8; 16],
             fqn: "vala.bifrost.events".to_string(),
             fingerprint: vec![0x01u8; 32],
-            scope: "tenant_owned".to_string(),
             status: "active".to_string(),
             partition_columns: vec!["day".to_string()],
             registered_at: Utc::now(),

@@ -11,7 +11,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::scalar::ScalarValue;
 use wyrd_spec::ids::DataTenantId;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 /// Build a tenant predicate: `data_tenant_id = <tenant>`.
 ///
@@ -27,7 +27,7 @@ fn tenant_predicate(schema: &SchemaRef, tenant: DataTenantId) -> Option<Arc<dyn 
 /// Wrap `plan` (a scan whose output schema includes `data_tenant_id`) in the
 /// authoritative tenant `FilterExec`. This is the PRIMARY, non-removable
 /// boundary (N-M1/N-M2): it must isolate even with no analyzer registered.
-/// If a `SystemShared` scan ever reaches here without a bindable tenant column,
+/// If a physical scan ever reaches here without a bindable tenant column,
 /// fail closed (`vala.tenant.predicate_missing`) rather than return unfiltered
 /// rows — finding 2F, cheap insurance, never a substitute for the filter.
 ///
@@ -42,7 +42,7 @@ pub fn attach_tenant_filter(
     match tenant_predicate(&schema, tenant) {
         Some(predicate) => Ok(Arc::new(FilterExec::try_new(predicate, plan)?)),
         None => Err(DataFusionError::Internal(
-            "vala.tenant.predicate_missing: SystemShared scan reached execution \
+            "vala.tenant.predicate_missing: tenant-scoped scan reached execution \
  without a bindable data_tenant_id filter"
                 .to_string(),
         )),

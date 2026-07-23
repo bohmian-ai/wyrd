@@ -208,13 +208,9 @@ fn extract_seal_key_from_path(path: &Path) -> Result<SealKey, ScribeError> {
         .ok_or_else(|| ScribeError::Internal {
             detail: format!("invalid WAL tenant in path: {}", path.display()),
         })?;
-    let tenant = if tenant_uuid.is_nil() {
-        DataTenantId::SYSTEM_OWNER
-    } else {
-        DataTenantId::new(tenant_uuid).map_err(|error| ScribeError::Internal {
-            detail: format!("invalid WAL tenant id in path: {error}"),
-        })?
-    };
+    let tenant = DataTenantId::new(tenant_uuid).map_err(|error| ScribeError::Internal {
+        detail: format!("invalid WAL tenant id in path: {error}"),
+    })?;
     let day = components[tenant_index + 1]
         .strip_prefix("day=")
         .and_then(|value| NaiveDate::parse_from_str(value, "%Y-%m-%d").ok())
@@ -251,7 +247,7 @@ mod tests {
     fn wal_replay_rebuilds_memtable_and_audit_events() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         let wal = WalWriter::new(
             temp_dir.path(),
@@ -304,7 +300,7 @@ mod tests {
     fn wal_replay_skips_sealed_lsn_per_seal_key() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
         let wal = WalWriter::new(
             temp_dir.path(),
             *node_id.as_bytes(),
@@ -377,7 +373,7 @@ mod tests {
     fn wal_torn_tail_is_truncated_on_replay() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         let wal = WalWriter::new(
             temp_dir.path(),
@@ -435,7 +431,7 @@ mod tests {
     fn wal_replay_dedups_duplicate_batch_id() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         let wal = WalWriter::new(
             temp_dir.path(),
@@ -515,7 +511,7 @@ mod tests {
     fn wal_replay_preserves_distinct_frame_sequences_for_one_batch() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
         let wal = WalWriter::new(
             temp_dir.path(),
             *node_id.as_bytes(),
@@ -580,7 +576,7 @@ mod tests {
 
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
-        let tenant_id = DataTenantId::SYSTEM_OWNER;
+        let tenant_id = crate::test_support::tenant();
 
         // Write segments with writer_epoch=3
         let wal = WalWriter::new(

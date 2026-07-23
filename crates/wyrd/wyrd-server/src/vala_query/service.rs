@@ -35,7 +35,7 @@ use wyrd_spec::vala::api::{
     QueryEvalRequest, QueryGenAiRequest, QueryLogsRequest, QueryMetricsRequest,
     QueryRecentTracesRequest, QueryTracesRequest,
 };
-use wyrd_spec::vala::system_columns::WYRD_EVENT_TIME;
+use wyrd_spec::vala::managed_columns::WYRD_EVENT_TIME;
 
 use crate::AppState;
 use crate::components::auth::Caller;

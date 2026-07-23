@@ -604,6 +604,16 @@ pub struct ScribeComponentReport {
     pub name: String,
     /// Production path used by the measurement.
     pub path: String,
+    /// Explicit measurement provenance for the production seam.
+    pub provenance: String,
+    /// Warmup operations excluded from the measured sample.
+    pub warmup_operations: u64,
+    /// Fixture payload bytes represented by one operation.
+    pub fixture_bytes: u64,
+    /// Measured operations per second.
+    pub operations_per_second: f64,
+    /// Measured mebibytes per second.
+    pub mib_per_second: f64,
     /// Number of measured operations.
     pub operations: u64,
     /// Processed bytes.
@@ -688,6 +698,9 @@ impl ScribeBenchmarkReport {
     /// throughput floors.
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        if !self.components.is_empty() {
+            errors.extend(self.validate_components().err().unwrap_or_default());
+        }
         if self.comparison.baseline_available
             || self.comparison.status != "unavailable"
             || self.comparison.reason != "no valid pre-repair baseline exists"
@@ -747,9 +760,11 @@ impl ScribeBenchmarkReport {
                 errors.push(format!("ACK p99 exceeded 5 ms in {}", case.case.id));
             }
         }
-        if self.verification.replay_exact_identity != Some(true)
-            || self.verification.exact_429 != Some(true)
-            || self.verification.exact_507 != Some(true)
+        let negative_flow_required = !self.lane.ends_with(":sustained");
+        if negative_flow_required
+            && (self.verification.replay_exact_identity != Some(true)
+                || self.verification.exact_429 != Some(true)
+                || self.verification.exact_507 != Some(true))
         {
             errors.push("top-level negative-flow evidence is incomplete".to_owned());
         }
@@ -759,6 +774,85 @@ impl ScribeBenchmarkReport {
             .any(|metric| !self.metrics.contains_family(metric))
         {
             errors.push("report metric snapshot is missing a required family".to_owned());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// Validate the independent component evidence without applying
+    /// machine-dependent throughput floors.
+    pub fn validate_components(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        if std::env::var_os("WYRD_BIFROST_CLOSEOUT").is_some() && self.machine.dirty_worktree {
+            errors.push("component report was generated from a dirty worktree".to_owned());
+        }
+        let expected = required_scribe_components()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let actual = self
+            .components
+            .iter()
+            .map(|component| component.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if actual != expected || actual.len() != self.components.len() {
+            errors.push(format!(
+                "component set must contain exactly {expected:?} without duplicates"
+            ));
+        }
+        for component in &self.components {
+            if !expected.contains(component.name.as_str()) {
+                errors.push(format!("unknown component {}", component.name));
+            }
+            if component.path.trim().is_empty() || component.provenance.trim().is_empty() {
+                errors.push(format!(
+                    "component {} is missing measurement provenance",
+                    component.name
+                ));
+            }
+            if component.operations < 1_000 {
+                errors.push(format!(
+                    "component {} has fewer than 1000 operations",
+                    component.name
+                ));
+            }
+            if component.distribution.count != component.operations {
+                errors.push(format!(
+                    "component {} distribution count mismatch",
+                    component.name
+                ));
+            }
+            if component.fixture_bytes == 0 || component.bytes == 0 {
+                errors.push(format!(
+                    "component {} has no measured bytes",
+                    component.name
+                ));
+            }
+            if component.operations_per_second <= 0.0 || component.mib_per_second <= 0.0 {
+                errors.push(format!("component {} has no measured rate", component.name));
+            }
+            if component.elapsed_us == 0 {
+                errors.push(format!(
+                    "component {} has no measured elapsed time",
+                    component.name
+                ));
+            }
+            if component.operations >= 100 && component.distribution.p99.is_none() {
+                errors.push(format!("component {} is missing p99", component.name));
+            }
+            if component.operations < 100 && component.distribution.p99.is_some() {
+                errors.push(format!(
+                    "component {} reports p99 without 100 samples",
+                    component.name
+                ));
+            }
+            if component.name == "64_frame_append_one_sync"
+                && !component.provenance.contains("frames=64")
+            {
+                errors.push("64_frame_append_one_sync is missing exact group evidence".to_owned());
+            }
         }
         if errors.is_empty() {
             Ok(())
@@ -823,8 +917,47 @@ impl ScribeBenchmarkReport {
         for metric in &self.required_metric_families {
             let _ = writeln!(output, "- `{metric}`");
         }
+        if !self.components.is_empty() {
+            output.push_str("\n## Independent components\n\n");
+            output.push_str("| Component | Operations | Bytes | Elapsed (us) | Ops/s | MiB/s | p50 | p95 | p99 | Max |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+            for component in &self.components {
+                let p99 = component
+                    .distribution
+                    .p99
+                    .map_or_else(|| "unavailable".to_owned(), |value| value.to_string());
+                let _ = writeln!(
+                    output,
+                    "| {} | {} | {} | {} | {:.2} | {:.2} | {} | {} | {} | {} |",
+                    component.name,
+                    component.operations,
+                    component.bytes,
+                    component.elapsed_us,
+                    component.operations_per_second,
+                    component.mib_per_second,
+                    component.distribution.p50,
+                    component.distribution.p95,
+                    p99,
+                    component.distribution.max,
+                );
+            }
+            output.push_str("\n`p99` is unavailable when fewer than 100 measured samples exist.\n");
+        }
         output
     }
+}
+
+/// Exact production seams required by the component closeout report.
+#[must_use]
+pub fn required_scribe_components() -> [&'static str; 7] {
+    [
+        "wal_prepare_crc_no_io",
+        "vectored_append_no_sync",
+        "sync_alone",
+        "one_frame_append_sync",
+        "64_frame_append_one_sync",
+        "gate_ack",
+        "sdk_gate_scribe",
+    ]
 }
 
 /// Every production metric family required by the closeout.
@@ -1085,5 +1218,60 @@ mod tests {
         assert!(errors.iter().any(|error| error.contains("topology")));
         assert!(errors.iter().any(|error| error.contains("metric")));
         assert!(errors.iter().any(|error| error.contains("negative-flow")));
+    }
+
+    fn valid_component(name: &str) -> ScribeComponentReport {
+        ScribeComponentReport {
+            name: name.to_owned(),
+            path: "production seam".to_owned(),
+            provenance: if name == "64_frame_append_one_sync" {
+                "frames=64; segments=1; fsyncs=1".to_owned()
+            } else {
+                "independent wall-clock samples".to_owned()
+            },
+            warmup_operations: 100,
+            fixture_bytes: 64,
+            operations: 1_000,
+            bytes: 64_000,
+            elapsed_us: 1_000,
+            operations_per_second: 1_000_000.0,
+            mib_per_second: 61.0,
+            distribution: ScribeDistribution {
+                count: 1_000,
+                p50: 1,
+                p95: 2,
+                p99: Some(3),
+                max: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn component_report_validator_requires_exact_independent_set() {
+        let components = required_scribe_components()
+            .into_iter()
+            .map(valid_component)
+            .collect::<Vec<_>>();
+        let report = ScribeBenchmarkReport {
+            components,
+            ..ScribeBenchmarkReport::default()
+        };
+        assert!(report.validate_components().is_ok());
+
+        let mut duplicate = report.clone();
+        duplicate.components[0].name = duplicate.components[1].name.clone();
+        let errors = duplicate
+            .validate_components()
+            .expect_err("duplicate component names must fail");
+        assert!(errors.iter().any(|error| error.contains("exactly")));
+
+        let mut derived = report;
+        derived.components[0].elapsed_us =
+            derived.components[0].distribution.count * derived.components[0].distribution.p50;
+        derived.components[0].provenance.clear();
+        let errors = derived
+            .validate_components()
+            .expect_err("missing provenance must fail");
+        assert!(errors.iter().any(|error| error.contains("provenance")));
     }
 }

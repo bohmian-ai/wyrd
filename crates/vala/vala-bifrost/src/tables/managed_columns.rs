@@ -16,7 +16,10 @@ use wyrd_spec::vala::{
 /// This is the single source of truth for what gets appended per policy.
 /// The appended columns here are excluded from `schema_fingerprint()`, which
 /// hashes `arrow_fields()` only.
-pub fn ensure_system_cols(mut user_fields: Vec<Field>, policy: CorrelationPolicy) -> Vec<Field> {
+pub fn ensure_managed_columns(
+    mut user_fields: Vec<Field>,
+    policy: CorrelationPolicy,
+) -> Vec<Field> {
     // Universal correlation columns per policy (C-01).
     match policy {
         CorrelationPolicy::Observation => {
@@ -66,7 +69,7 @@ mod tests {
 
     #[test]
     fn observation_policy_appends_all_three_then_system() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
         let names = field_names(&fields);
         assert_eq!(
             names,
@@ -84,7 +87,7 @@ mod tests {
 
     #[test]
     fn code_axis_policy_omits_run_id() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::CodeAxis);
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
         let names = field_names(&fields);
         assert!(
             !names.contains(&RUN_ID),
@@ -95,8 +98,8 @@ mod tests {
     }
 
     #[test]
-    fn none_policy_only_system_columns() {
-        let fields = ensure_system_cols(vec![], CorrelationPolicy::None);
+    fn none_policy_only_managed_columns() {
+        let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
         let names = field_names(&fields);
         assert!(!names.contains(&RUN_ID));
         assert!(!names.contains(&CARD_UID));
@@ -108,7 +111,7 @@ mod tests {
     #[test]
     fn user_fields_come_before_system() {
         let user = vec![Field::new("my_col", DataType::Utf8, true)];
-        let fields = ensure_system_cols(user, CorrelationPolicy::Observation);
+        let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);
         assert_eq!(fields[0].name(), "my_col");
     }
 }

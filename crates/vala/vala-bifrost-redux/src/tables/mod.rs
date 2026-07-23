@@ -3,30 +3,30 @@
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use wyrd_spec::vala::system_columns::{
-    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_system_column,
+use wyrd_spec::vala::managed_columns::{
+    DATA_TENANT_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT, is_reserved_managed_column,
 };
 
 use crate::catalog::PartitionTransform;
 
+pub mod audit;
 pub mod dev;
 pub mod drift;
 pub mod eval;
 pub mod fields;
 pub mod genai;
 pub mod logs;
+pub mod managed_columns;
 pub mod metrics;
-pub mod system;
-pub mod system_columns;
 pub mod traces;
 
+pub use audit::AuditLogTable;
 pub use dev::AgentTracesTable;
 pub use drift::ObservationsTable;
 pub use eval::{AssertionsTable, RunsTable};
 pub use genai::{EmbeddingsTable, MemoryTable, MessagesTable, ToolCallsTable};
 pub use logs::RecordsTable;
 pub use metrics::PointsTable;
-pub use system::AuditLogTable;
 pub use traces::{EventsTable, LinksTable, SpansTable};
 
 /// Errors from pure table schema and projection operations.
@@ -160,7 +160,7 @@ pub trait DomainTable: Send + Sync + 'static {
 
     /// Full physical schema.
     fn schema() -> SchemaRef {
-        SchemaRef::new(Schema::new(system_columns::ensure_system_cols(
+        SchemaRef::new(Schema::new(managed_columns::ensure_managed_columns(
             Self::arrow_fields(),
             Self::CORRELATION_POLICY,
         )))
@@ -193,7 +193,7 @@ pub fn reject_reserved_domain_fields(
 ) -> Result<(), TableError> {
     let appended = policy.appended_correlation_columns();
     for name in user_fields {
-        if is_reserved_system_column(name)
+        if is_reserved_managed_column(name)
             || [
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,

@@ -32,29 +32,29 @@ pub enum BifrostError {
         column: String,
     },
 
-    /// A `SystemShared` table schema is missing the required `data_tenant_id` column.
-    #[error("SystemShared table missing data_tenant_id column: {table}")]
+    /// A caller attempted to write a server-managed built-in table.
+    #[error("write to reserved built-in table denied: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_MISSING_TENANT_COLUMN",
-        status = 400,
-        title = "SystemShared table missing data_tenant_id column",
-        remediation = "Add a data_tenant_id Utf8 column to the schema for SystemShared tables."
+        code = "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+        status = 403,
+        title = "Reserved built-in write denied",
+        remediation = "Write through the supported observation or audit API instead of directly targeting a reserved built-in table."
     )]
-    MissingTenantColumn {
-        /// Fully-qualified table name that is missing the tenant column.
+    ReservedBuiltinWriteDenied {
+        /// Fully-qualified table name that was refused.
         table: String,
     },
 
-    /// A TenantOwned table schema includes the `data_tenant_id` column, which is not allowed.
-    #[error("TenantOwned table must not include data_tenant_id: {table}")]
+    /// A physical table schema is missing the required tenant isolation column.
+    #[error("table missing data_tenant_id managed column: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_UNEXPECTED_TENANT_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING",
         status = 400,
-        title = "TenantOwned table must not include data_tenant_id",
-        remediation = "Remove data_tenant_id from the schema — TenantOwned tables are isolated by catalog namespace."
+        title = "Tenant isolation column missing",
+        remediation = "Add the server-managed data_tenant_id Utf8 column to the physical table schema."
     )]
-    UnexpectedTenantColumn {
-        /// Fully-qualified table name that incorrectly includes the tenant column.
+    TenantIsolationColumnMissing {
+        /// Fully-qualified table name that is missing the tenant column.
         table: String,
     },
 

@@ -176,7 +176,6 @@ mod pg_tests {
                 &source_uid,
                 "traces.spans_fencing_test",
                 &[0u8; 32],
-                "tenant_owned",
                 &[],
             )
             .await
@@ -186,7 +185,6 @@ mod pg_tests {
                 &derivation_uid,
                 &source_uid,
                 &target_uid,
-                tenant.as_uuid(),
                 "genai_from_spans",
                 None,
             )
@@ -197,8 +195,8 @@ mod pg_tests {
 
         // Owner A acquires the cross-table derivation lease.
         let key = MaintenanceLeaseKey::cross_table_derivation(
-            &vala_bifrost::tables::genai::GenAiFromSpans::DERIVATION_UID,
             &tenant.as_uuid(),
+            &vala_bifrost::tables::genai::GenAiFromSpans::DERIVATION_UID,
         );
         let owner_a = Uuid::now_v7();
         let _token_a = try_acquire_lease(&op, key.as_str(), owner_a, 60)

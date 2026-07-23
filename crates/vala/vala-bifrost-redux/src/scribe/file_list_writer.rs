@@ -318,7 +318,7 @@ pub async fn insert_and_audit(
  $13,
  $14
  )
- ON CONFLICT (node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
+ ON CONFLICT (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
  ",
     )
     .bind(row.id)

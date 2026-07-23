@@ -547,15 +547,11 @@ async fn load_reconciliation_keys(
         .collect()
 }
 
-/// Convert the database's system-owner UUID convention into a data-tenant ID.
+/// Convert a database UUID into a validated data-tenant ID.
 fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
-    if value.is_nil() {
-        Ok(DataTenantId::SYSTEM_OWNER)
-    } else {
-        DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })
-    }
+    DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
+        detail: error.to_string(),
+    })
 }
 
 /// Execute one fenced compaction operation from staged files to Iceberg.

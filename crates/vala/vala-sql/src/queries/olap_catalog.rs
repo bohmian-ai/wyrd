@@ -26,19 +26,17 @@ pub async fn upsert_table(
     table_uid: &[u8; 16],
     fqn: &str,
     fingerprint: &[u8; 32],
-    scope: &str,
     partition_columns: &[String],
 ) -> Result<(), SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.bifrost_tables
-            (data_tenant_id, table_uid, fqn, fingerprint, scope, partition_columns, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, $5, 'system', 'system')
+            (data_tenant_id, table_uid, fqn, fingerprint, partition_columns, origin, actor)
+        VALUES (wyrd.current_tenant(), $1, $2, $3, $4, 'system', 'system')
         ON CONFLICT (data_tenant_id, table_uid)
         DO UPDATE SET
             fqn               = EXCLUDED.fqn,
             fingerprint       = EXCLUDED.fingerprint,
-            scope             = EXCLUDED.scope,
             partition_columns = EXCLUDED.partition_columns,
             updated_at        = now()
         "#,
@@ -46,7 +44,6 @@ pub async fn upsert_table(
     .bind(table_uid.as_slice())
     .bind(fqn)
     .bind(fingerprint.as_slice())
-    .bind(scope)
     .bind(partition_columns)
     .execute(&mut **conn.transaction())
     .await
@@ -64,7 +61,7 @@ pub async fn get_by_fqn(
 ) -> Result<Option<BifrostTableRow>, SqlError> {
     sqlx::query_as::<_, BifrostTableRow>(
         r#"
-        SELECT data_tenant_id, table_uid, fqn, fingerprint, scope, status,
+        SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
                partition_columns, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
          WHERE fqn = $1
@@ -85,7 +82,7 @@ pub async fn list_tables_for_tenant(
 ) -> Result<Vec<BifrostTableRow>, SqlError> {
     sqlx::query_as::<_, BifrostTableRow>(
         r#"
-        SELECT data_tenant_id, table_uid, fqn, fingerprint, scope, status,
+        SELECT data_tenant_id, table_uid, fqn, fingerprint, status,
                partition_columns, registered_at, updated_at, origin, actor
           FROM vala.bifrost_tables
         "#,
@@ -154,57 +151,12 @@ pub async fn precommit(
     sqlx::query(
         r#"
         INSERT INTO vala.olap_commits
-            (data_tenant_id, table_uid, control_bind, batch_id, state, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, wyrd.current_tenant(), $2, 'precommit', $3, $4)
-        ON CONFLICT (data_tenant_id, table_uid, control_bind, batch_id) DO NOTHING
+            (data_tenant_id, table_uid, batch_id, state, origin, actor)
+        VALUES (wyrd.current_tenant(), $1, $2, 'precommit', $3, $4)
+        ON CONFLICT (data_tenant_id, table_uid, batch_id) DO NOTHING
         "#,
     )
     .bind(table_uid.as_slice())
-    .bind(batch_id.as_slice())
-    .bind(origin)
-    .bind(actor)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(SqlError::from)?;
-    Ok(())
-}
-
-/// Insert a fresh `precommit` anchor with an explicit `control_bind` registration
-/// anchor (the M02 group-commit path).
-///
-/// `data_tenant_id` is `wyrd.current_tenant()` — the RLS-bound DATA tenant, which is
-/// the dedup discriminator. `control_bind` is supplied by the caller as
-/// `scope.control_bind(tenant)`: `SYSTEM_OWNER` for a `SystemShared` table (its
-/// single `vala.bifrost_tables` registration key, and the composite FK anchor), the
-/// data tenant for a `TenantOwned` table. Two tenants presenting the same `batch_id`
-/// on a shared table therefore land on distinct
-/// `(data_tenant_id, table_uid, control_bind, batch_id)` rows instead of colliding.
-///
-/// Unlike [`precommit`] (which sets `control_bind = wyrd.current_tenant()` and is
-/// kept for the legacy single-key path + SQL-contract tests), this lets the bound
-/// data tenant differ from the registration anchor. Both converge once the legacy
-/// path is deleted (stage-5/02.4).
-///
-/// # Errors
-/// Returns [`SqlError`] when the insert fails.
-pub async fn precommit_with_bind(
-    conn: &mut TenantConn<'_>,
-    table_uid: &[u8; 16],
-    control_bind: Uuid,
-    batch_id: &[u8; 16],
-    origin: &str,
-    actor: &str,
-) -> Result<(), SqlError> {
-    sqlx::query(
-        r#"
-        INSERT INTO vala.olap_commits
-            (data_tenant_id, table_uid, control_bind, batch_id, state, origin, actor)
-        VALUES (wyrd.current_tenant(), $1, $2, $3, 'precommit', $4, $5)
-        ON CONFLICT (data_tenant_id, table_uid, control_bind, batch_id) DO NOTHING
-        "#,
-    )
-    .bind(table_uid.as_slice())
-    .bind(control_bind)
     .bind(batch_id.as_slice())
     .bind(origin)
     .bind(actor)
@@ -332,13 +284,8 @@ pub async fn lookup_idempotent(
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
 ) -> Result<Option<OlapCommitRow>, SqlError> {
-    // RLS already scopes visible rows to data_tenant_id = wyrd.current_tenant(), and
-    // for a given (data_tenant_id, table_uid) the table's scope fixes a single
-    // control_bind, so (table_uid, batch_id) under the RLS bind is the whole CommitKey
-    // identity. Do NOT filter on control_bind = wyrd.current_tenant(): on the M02
-    // group-commit path a SystemShared row's control_bind is the SYSTEM_OWNER
-    // registration anchor, not the bound data tenant, so that filter would hide the
-    // row and break idempotent replay.
+    // RLS binds the query to the authenticated data tenant, so `(table_uid,
+    // batch_id)` is the complete remaining commit identity.
     sqlx::query_as::<_, OlapCommitRow>(
         r#"
         SELECT data_tenant_id, table_uid, batch_id, snapshot_id,
@@ -582,12 +529,14 @@ pub async fn claim_stale_precommits(
 /// Returns [`SqlError`] when the query fails.
 pub async fn finalize_recovered_committed(
     conn: &mut TenantConn<'_>,
+    data_tenant_id: Uuid,
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
     snapshot_id: i64,
     token: i64,
 ) -> Result<(), SqlError> {
-    sqlx::query("SELECT vala.finalize_recovered_committed($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.finalize_recovered_committed($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid.as_slice())
         .bind(batch_id.as_slice())
         .bind(snapshot_id)
@@ -606,12 +555,14 @@ pub async fn finalize_recovered_committed(
 /// Returns [`SqlError`] when the query fails.
 pub async fn finalize_recovered_aborted(
     conn: &mut TenantConn<'_>,
+    data_tenant_id: Uuid,
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
     token: i64,
     reason: &str,
 ) -> Result<(), SqlError> {
-    sqlx::query("SELECT vala.finalize_recovered_aborted($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.finalize_recovered_aborted($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid.as_slice())
         .bind(batch_id.as_slice())
         .bind(token)
@@ -630,12 +581,14 @@ pub async fn finalize_recovered_aborted(
 /// Returns [`SqlError`] when the query fails.
 pub async fn mark_recovery_scan_failed(
     conn: &mut TenantConn<'_>,
+    data_tenant_id: Uuid,
     table_uid: &[u8; 16],
     batch_id: &[u8; 16],
     token: i64,
     error: &str,
 ) -> Result<(), SqlError> {
-    sqlx::query("SELECT vala.mark_recovery_scan_failed($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.mark_recovery_scan_failed($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid.as_slice())
         .bind(batch_id.as_slice())
         .bind(token)

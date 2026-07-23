@@ -97,6 +97,7 @@ pub async fn tick(
             Ok(Some(snapshot_id)) => {
                 if let Err(e) = finalize_committed(
                     recovery_pool,
+                    row.data_tenant_id,
                     &row.table_uid,
                     &row.batch_id,
                     snapshot_id,
@@ -119,6 +120,7 @@ pub async fn tick(
                 let reason = "snapshot absent from Iceberg catalog";
                 if let Err(e) = finalize_aborted(
                     recovery_pool,
+                    row.data_tenant_id,
                     &row.table_uid,
                     &row.batch_id,
                     row.fencing_token,
@@ -146,6 +148,7 @@ pub async fn tick(
                 );
                 let _ = mark_scan_failed(
                     recovery_pool,
+                    row.data_tenant_id,
                     &row.table_uid,
                     &row.batch_id,
                     row.fencing_token,
@@ -313,13 +316,15 @@ async fn oracle_check(
 /// Invoke `vala.finalize_recovered_committed` via the recovery pool.
 async fn finalize_committed(
     pool: &sqlx::PgPool,
+    data_tenant_id: Uuid,
     table_uid: &[u8],
     batch_id: &[u8],
     snapshot_id: i64,
     token: i64,
 ) -> Result<(), SqlError> {
     // Dynamic query is intentional: SECURITY DEFINER routine on recovery pool.
-    sqlx::query("SELECT vala.finalize_recovered_committed($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.finalize_recovered_committed($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid)
         .bind(batch_id)
         .bind(snapshot_id)
@@ -333,13 +338,15 @@ async fn finalize_committed(
 /// Invoke `vala.finalize_recovered_aborted` via the recovery pool.
 async fn finalize_aborted(
     pool: &sqlx::PgPool,
+    data_tenant_id: Uuid,
     table_uid: &[u8],
     batch_id: &[u8],
     token: i64,
     reason: &str,
 ) -> Result<(), SqlError> {
     // Dynamic query is intentional: SECURITY DEFINER routine on recovery pool.
-    sqlx::query("SELECT vala.finalize_recovered_aborted($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.finalize_recovered_aborted($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid)
         .bind(batch_id)
         .bind(token)
@@ -353,13 +360,15 @@ async fn finalize_aborted(
 /// Invoke `vala.mark_recovery_scan_failed` via the recovery pool.
 async fn mark_scan_failed(
     pool: &sqlx::PgPool,
+    data_tenant_id: Uuid,
     table_uid: &[u8],
     batch_id: &[u8],
     token: i64,
     error: &str,
 ) -> Result<(), SqlError> {
     // Dynamic query is intentional: SECURITY DEFINER routine on recovery pool.
-    sqlx::query("SELECT vala.mark_recovery_scan_failed($1, $2, $3, $4)")
+    sqlx::query("SELECT vala.mark_recovery_scan_failed($1, $2, $3, $4, $5)")
+        .bind(data_tenant_id)
         .bind(table_uid)
         .bind(batch_id)
         .bind(token)

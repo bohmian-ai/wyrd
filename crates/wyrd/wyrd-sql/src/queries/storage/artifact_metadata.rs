@@ -177,6 +177,28 @@ pub async fn get(
     row.map(ArtifactMetadataRow::try_from).transpose()
 }
 
+/// List stored artifact metadata for one Card within the current tenant.
+pub async fn list_for_card(
+    conn: &mut TenantConn<'_>,
+    card_uid: &str,
+) -> Result<Vec<ArtifactMetadataRow>, SqlError> {
+    let rows = sqlx::query_as::<_, ArtifactMetadataRowDb>(
+        "SELECT data_tenant_id, storage_path, card_uid, size_bytes, sha256, \
+                content_type, sse_marker, backend, created_at \
+           FROM wyrd.storage_artifact_metadata \
+          WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1 \
+          ORDER BY storage_path",
+    )
+    .bind(card_uid)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(SqlError::from)?;
+
+    rows.into_iter()
+        .map(ArtifactMetadataRow::try_from)
+        .collect()
+}
+
 /// Delete artifact metadata owned by one Card after its backend objects are gone.
 pub async fn delete_for_card(conn: &mut TenantConn<'_>, card_uid: &str) -> Result<(), SqlError> {
     sqlx::query(

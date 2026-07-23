@@ -92,6 +92,57 @@ pub async fn persist_outbound_relationships(
     Ok(())
 }
 
+/// Load active cards that point at `card_uid` through server-derived edges.
+///
+/// Deleted source cards are excluded so the returned inbound relationship
+/// projection reflects the live registry graph rather than tombstone history.
+pub async fn inbound_relationships(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+) -> Result<Vec<String>, WyrdError> {
+    let rows = sqlx::query_as::<_, (String, String, String, String, uuid::Uuid)>(
+        "SELECT source.kind, source.space, source.name, source.version, source.card_uid \
+           FROM wyrd.card_relationships relationship \
+           JOIN wyrd.cards source \
+             ON source.data_tenant_id = relationship.data_tenant_id \
+            AND source.card_uid = relationship.card_uid \
+          WHERE relationship.data_tenant_id = wyrd.current_tenant() \
+            AND relationship.target_uid = $1 \
+            AND source.status <> 'deleted' \
+          ORDER BY source.space, source.kind, source.name, source.version, source.card_uid",
+    )
+    .bind(card_uid.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .map_err(registry_db_error)?;
+
+    rows.into_iter()
+        .map(|(kind, space, name, version, uid)| {
+            let card_ref = CardRef {
+                kind: wyrd_spec::envelope::CardKind::from_wire_name(&kind).ok_or_else(|| {
+                    WyrdError::registry_invalid_card_spec(format!(
+                        "stored relationship source has invalid kind {kind:?}"
+                    ))
+                })?,
+                name: wyrd_spec::ids::CardName::new(name)
+                    .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?,
+                version: version.parse().map_err(|error| {
+                    WyrdError::registry_invalid_card_spec(format!(
+                        "stored relationship source has invalid version: {error}"
+                    ))
+                })?,
+                space: Some(
+                    wyrd_spec::ids::SpaceName::new(space).map_err(|error| {
+                        WyrdError::registry_invalid_card_spec(error.to_string())
+                    })?,
+                ),
+                uid: Some(CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?),
+            };
+            Ok(card_ref.to_string())
+        })
+        .collect()
+}
+
 fn unresolved_dependency(card_ref: &CardRef) -> WyrdError {
     let identity = card_ref.to_string();
     WyrdError::RegistryUnresolvedDependency {

@@ -567,6 +567,21 @@ pub fn spawn_storage_sweeper(
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
 }
 
+/// Spawn the bounded Card lifecycle reconciler when cross-tenant maintenance
+/// credentials are configured.
+pub fn spawn_card_reconciler(
+    state: &AppState,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if state.postgres.operator_pool().is_none() {
+        tracing::warn!("card reconciler skipped because platform admin pool is unavailable");
+        return None;
+    }
+    Some(crate::components::cards::reconciler::spawn(
+        state, shutdown,
+    )?)
+}
+
 /// Configuration for the background audit relay worker.
 pub struct RelayConfig {
     /// Whether the relay is enabled (`WYRD_AUDIT_RELAY_ENABLED`, default `true`).

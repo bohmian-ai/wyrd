@@ -36,7 +36,7 @@ pub async fn get_latest_card_by_range(
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
         "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards \
          WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status <> 'deleted' AND NOT version_is_prerelease AND kind = "
+           AND status = 'active' AND NOT version_is_prerelease AND kind = "
     ));
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());

@@ -4,47 +4,60 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use base64::Engine;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
-use wyrd_semver::VersionSpec;
+use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
+use wyrd_semver::{VersionBlock, VersionRange, VersionSpec};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec};
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
     topo_sort,
 };
-use wyrd_spec::ids::CardUid;
 use wyrd_spec::ids::IdempotencyKey;
+use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, scope_child_card_refs};
 use wyrd_spec::registry::{
-    CardLifecycleStatus, CardRegistrationOutcome, CardSubmission, CardUploadEntry, CardUploadPlan,
-    CreateCardRequest, CreateCardResponse, DeleteCardResponse, RegistrationOperationId,
-    RegistrationOutcomeKind, RegistrationReplaySeed, RelativeArtifactPath,
+    ArtifactInventoryResponse, CardLifecycleStatus, CardRegistrationOutcome, CardSubmission,
+    CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest, CreateCardResponse,
+    DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
+    RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed, RelativeArtifactPath,
 };
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
 use wyrd_spec::vala::api::{AuditDecision, AuditResult};
 use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
-    CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow,
-    CardRegistrationOperationRow, NewCardRow, NewRegistrationOperation, Resolution,
-    SubmittedCardIdentity, activate_card, artifact_manifest_hash, commit_registration_operation,
-    fail_card, find_card_by_ref, get_card_by_uid, insert_artifact_manifest_rows, insert_card_row,
-    insert_registration_operation, lock_pending_card_for_activation, lock_version_line,
-    lookup_existing_operation, lookup_expired_operation, manifest_completion_rows,
-    manifest_rows_for_init, mark_manifest_upload_initialized, mark_manifest_verified,
-    persist_outbound_relationships, recheck_active_card_refs, record_blob_failure,
-    record_card_blob, registration_request_hash, resolve_version, soft_delete_card_by_ref,
-    soft_delete_card_with_kind, upsert_service_account_from_card,
+    CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow, CardQuery,
+    CardReconcileClaim, CardRegistrationOperationRow, ListCursor, MAX_RECONCILE_ATTEMPTS,
+    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
+    RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION, Resolution, SubmittedCardIdentity,
+    activate_card, artifact_manifest_hash, commit_registration_operation, fail_card,
+    find_card_by_ref, get_card_by_uid as sql_get_card_by_uid, get_latest_card_by_range,
+    inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
+    insert_registration_operation, list_versions, lock_card_reconciliation_lease,
+    lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
+    lookup_expired_operation, lookup_operation_by_id, manifest_completion_rows,
+    manifest_rows_for_init, mark_card_reconciliation_succeeded, mark_manifest_upload_initialized,
+    mark_manifest_verified, persist_outbound_relationships, query_cards, recheck_active_card_refs,
+    record_blob_failure, record_card_blob, record_card_reconciliation_failure,
+    registration_request_hash, resolve_version, schedule_card_reconciliation,
+    soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
-use wyrd_sql::row_types::cards::ParsedCardRow;
+use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
 use wyrd_storage::StorageError;
 use wyrd_storage::service::{upload_abort, upload_init};
 use wyrd_storage::tenant_path;
 
-use crate::audit::{append_on, audit_event, record_audit};
+use crate::audit::{append_on, audit_event, audit_event_unauthenticated, record_audit};
 use crate::components::auth::Caller;
 use crate::components::cards::mapping::{
     existing_row_to_response, outcome_row_to_response, relationships_from_spec,
@@ -54,6 +67,281 @@ use crate::components::cards::resolve::{
 };
 use crate::components::storage::routes::storage_caller;
 use crate::state::{AppState, registry_db_error};
+
+const DEFAULT_LIST_LIMIT: u32 = 50;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CardListCursor {
+    created_at: DateTime<Utc>,
+    card_uid: CardUid,
+}
+
+/// Load a fully hydrated Card by its tenant-scoped UID.
+pub async fn get_card_by_uid(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<GetCardResponse, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let row = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    let inbound = inbound_relationships(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    hydrate_card(state, caller, row, inbound).await
+}
+
+/// Load a fully hydrated Card by its exact tenant-scoped reference.
+pub async fn get_card_by_ref(
+    state: &AppState,
+    caller: &Caller,
+    card_ref: &CardRef,
+) -> Result<GetCardResponse, WyrdError> {
+    let space = card_ref.space.as_ref().ok_or_else(|| {
+        WyrdError::registry_invalid_card_spec("CardRef.space is required for a card read")
+    })?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let row = wyrd_sql::queries::cards::get_card_by_ref(
+        &mut conn,
+        card_ref.kind.clone(),
+        space,
+        &card_ref.name,
+        &card_ref.version,
+    )
+    .await?;
+    let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    hydrate_card(state, caller, row, inbound).await
+}
+
+/// Resolve and load the newest stable Active Card in one identity line.
+pub async fn get_latest_card(
+    state: &AppState,
+    caller: &Caller,
+    kind: CardKind,
+    space: SpaceName,
+    name: CardName,
+) -> Result<GetCardResponse, WyrdError> {
+    let range = VersionRange::default();
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let row = get_latest_card_by_range(&mut conn, kind, &space, &name, &range).await?;
+    let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    hydrate_card(state, caller, row, inbound).await
+}
+
+/// List versions in one card identity line, excluding deleted rows.
+pub async fn list_card_versions(
+    state: &AppState,
+    caller: &Caller,
+    kind: CardKind,
+    space: SpaceName,
+    name: CardName,
+    include_prerelease: bool,
+) -> Result<ListVersionsResponse, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let versions = list_versions(&mut conn, kind, &space, &name, include_prerelease).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(ListVersionsResponse { versions })
+}
+
+/// List metadata-only Cards with deterministic tenant-scoped keyset pagination.
+pub async fn list_cards(
+    state: &AppState,
+    caller: &Caller,
+    request: ListCardsRequest,
+) -> Result<ListCardsResponse, WyrdError> {
+    let limit = match request.limit {
+        Some(value) => u32::try_from(value)
+            .map_err(|_| WyrdError::registry_list_limit_out_of_range(value.max(0) as u32, 200))?,
+        None => DEFAULT_LIST_LIMIT,
+    };
+    let cursor = decode_list_cursor(request.cursor.as_deref(), limit)?;
+    let query = CardQuery {
+        kind: request.kind,
+        space: request.space,
+        name: request.name,
+        version_range: request
+            .version_range
+            .map(VersionRange::parse_loose)
+            .transpose()
+            .map_err(|error| WyrdError::registry_invalid_version_block(error.to_string()))?,
+        status: request.status.map(sql_status),
+        filter: request.filter,
+        include_prerelease: request.include_prerelease,
+    };
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let page = query_cards(&mut conn, &query, cursor).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    let items = page
+        .items
+        .iter()
+        .map(summary_from_row)
+        .collect::<Result<Vec<_>, _>>()?;
+    let next_cursor = page.next.as_ref().map(encode_list_cursor).transpose()?;
+    Ok(ListCardsResponse { items, next_cursor })
+}
+
+/// Return the server-authoritative artifact inventory for one Card.
+pub async fn list_card_artifacts(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<ArtifactInventoryResponse, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let _ = sql_get_card_by_uid(&mut conn, card_uid).await?;
+    let rows = artifact_metadata::list_for_card(&mut conn, card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    conn.commit().await.map_err(registry_db_error)?;
+    let artifacts = rows
+        .into_iter()
+        .map(|row| {
+            let path = tenant_path::validate(&row.storage_path, caller.data_tenant_id)
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            if path.card_uid != card_uid.as_str() {
+                return Err(WyrdError::registry_invalid_card_spec(
+                    "stored artifact is not bound to the requested Card",
+                ));
+            }
+            Ok(wyrd_spec::registry::StoredArtifactEntry {
+                relative_path: RelativeArtifactPath::new(&path.relative_path)
+                    .map_err(WyrdError::from)?,
+                sha256: row.sha256,
+                size_bytes: row.size_bytes,
+                content_type: row.content_type,
+            })
+        })
+        .collect::<Result<Vec<_>, WyrdError>>()?;
+    Ok(ArtifactInventoryResponse { artifacts })
+}
+
+async fn hydrate_card(
+    state: &AppState,
+    caller: &Caller,
+    row: wyrd_sql::row_types::cards::ParsedCardRow,
+    inbound: Vec<String>,
+) -> Result<GetCardResponse, WyrdError> {
+    let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
+        WyrdError::registry_card_not_found(
+            "Card is not available until its immutable blob is active",
+        )
+    })?;
+    let path = uri.strip_prefix("wyrd://").ok_or_else(|| {
+        WyrdError::registry_invalid_card_spec("stored Card blob URI has an unsupported scheme")
+    })?;
+    let validated = tenant_path::validate(path, caller.data_tenant_id)
+        .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+    if validated.card_uid != row.card_uid.as_str() {
+        return Err(WyrdError::registry_invalid_card_spec(
+            "stored Card blob is not bound to its registry row",
+        ));
+    }
+    let bytes = state
+        .storage
+        .get_object(&validated)
+        .await
+        .map_err(map_storage_error)?;
+    let mut card: Card = serde_json::from_slice(&bytes).map_err(|error| {
+        WyrdError::registry_invalid_card_spec(format!("stored Card blob failed to parse: {error}"))
+    })?;
+    if card.kind != row.kind
+        || card.metadata.name != row.name
+        || card.metadata.uid.as_ref() != Some(&row.card_uid)
+        || card.metadata.resolved_pin() != Some(&row.version)
+    {
+        return Err(WyrdError::registry_invalid_card_spec(
+            "stored Card blob identity does not match its registry row",
+        ));
+    }
+    card.relationships.inbound = inbound;
+    card.status = Some(Status {
+        phase: row.status.as_db_str().to_owned(),
+        message: None,
+        updated_at: Some(row.updated_at),
+    });
+    Ok(GetCardResponse {
+        card,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
+    let status = CardStatus::from_db_str(&row.status)
+        .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+    Ok(CardSummary {
+        card_uid: CardUid::from_uuid(row.card_uid).map_err(WyrdError::from_card_uid_error)?,
+        kind: CardKind::from_wire_name(&row.kind)
+            .ok_or_else(|| WyrdError::registry_invalid_card_spec("stored Card kind is invalid"))?,
+        space: SpaceName::new(row.space.clone())
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?,
+        name: CardName::new(row.name.clone())
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?,
+        version: row
+            .version
+            .parse::<VersionBlock>()
+            .map_err(|error| WyrdError::registry_invalid_version_block(error.to_string()))?,
+        spec_hash: row.spec_hash.clone(),
+        artifact_hash: row.artifact_hash.clone(),
+        status: lifecycle_status(status)?,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+fn lifecycle_status(status: CardStatus) -> Result<CardLifecycleStatus, WyrdError> {
+    Ok(match status {
+        CardStatus::Pending => CardLifecycleStatus::Pending,
+        CardStatus::Active => CardLifecycleStatus::Active,
+        CardStatus::Deprecated => CardLifecycleStatus::Deprecated,
+        CardStatus::Deleted => CardLifecycleStatus::Deleted,
+        CardStatus::Failed => CardLifecycleStatus::Failed,
+        CardStatus::Expired => CardLifecycleStatus::Expired,
+    })
+}
+
+fn sql_status(status: CardLifecycleStatus) -> CardStatus {
+    match status {
+        CardLifecycleStatus::Pending => CardStatus::Pending,
+        CardLifecycleStatus::Active => CardStatus::Active,
+        CardLifecycleStatus::Deprecated => CardStatus::Deprecated,
+        CardLifecycleStatus::Deleted => CardStatus::Deleted,
+        CardLifecycleStatus::Failed => CardStatus::Failed,
+        CardLifecycleStatus::Expired => CardStatus::Expired,
+    }
+}
+
+fn decode_list_cursor(value: Option<&str>, limit: u32) -> Result<ListCursor, WyrdError> {
+    let Some(value) = value else {
+        return Ok(ListCursor {
+            after_created_at: None,
+            after_uid: None,
+            limit,
+        });
+    };
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| WyrdError::registry_invalid_card_spec("cursor is not valid base64"))?;
+    let token: CardListCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| WyrdError::registry_invalid_card_spec("cursor payload is invalid"))?;
+    Ok(ListCursor {
+        after_created_at: Some(token.created_at),
+        after_uid: Some(token.card_uid),
+        limit,
+    })
+}
+
+fn encode_list_cursor(cursor: &ListCursor) -> Result<String, WyrdError> {
+    let (Some(created_at), Some(card_uid)) = (cursor.after_created_at, cursor.after_uid.clone())
+    else {
+        return Err(WyrdError::internal("next card cursor is incomplete"));
+    };
+    let bytes = serde_json::to_vec(&CardListCursor {
+        created_at,
+        card_uid,
+    })
+    .map_err(|error| WyrdError::internal(format!("card cursor serialization failed: {error}")))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
 
 /// Deterministic request plan produced before the write transaction opens.
 struct RegistrationPlan {
@@ -905,9 +1193,139 @@ pub async fn complete_card(
     card_uid: &CardUid,
     idempotency_key: &str,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
+    complete_card_inner(state, caller, card_uid, idempotency_key, None, true).await
+}
+
+/// Execute completion for a reconciler claim without changing its durable lease.
+pub(crate) async fn reconcile_card_claim(
+    state: &AppState,
+    caller: &Caller,
+    claim: &CardReconcileClaim,
+) -> Result<(), WyrdError> {
+    let card_uid = CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?;
+    if claim.reconcile_attempts >= MAX_RECONCILE_ATTEMPTS {
+        return Err(WyrdError::internal(
+            "reconciliation lease expired on the final permitted attempt",
+        ));
+    }
+    if claim.reconcile_kind == RECONCILE_KIND_REGISTRATION {
+        initialize_reconciled_uploads(state, caller, claim, &card_uid).await?;
+    }
+    complete_card_inner(
+        state,
+        caller,
+        &card_uid,
+        &format!("reconciliation-{}", claim.card_uid),
+        Some(claim.reconcile_lease_owner),
+        false,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Retry cleanup for a claimed deleted or failed Card.
+pub(crate) async fn reconcile_cleanup_claim(
+    state: &AppState,
+    caller: &Caller,
+    claim: &CardReconcileClaim,
+) -> Result<(), WyrdError> {
+    let card_uid = CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?;
+    let completion_state = load_card_completion_state(state, caller, &card_uid).await?;
+    let cleanup_failures = cleanup_card_artifacts(
+        state,
+        caller,
+        &card_uid,
+        &completion_state.card,
+        &completion_state.manifests,
+    )
+    .await;
+    if !cleanup_failures.is_empty() {
+        return Err(WyrdError::RegistryArtifactVerifyFailed {
+            message: "card cleanup remains incomplete".to_owned(),
+            details: serde_json::json!({ "failure_count": cleanup_failures.len() }),
+        });
+    }
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    if !lock_card_reconciliation_lease(&mut conn, &card_uid, claim.reconcile_lease_owner).await? {
+        conn.commit().await.map_err(registry_db_error)?;
+        return Ok(());
+    }
+    artifact_metadata::delete_for_card(&mut conn, card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    mark_card_reconciliation_succeeded(&mut conn, &card_uid, Some(claim.reconcile_lease_owner))
+        .await?;
+    conn.commit().await.map_err(registry_db_error)
+}
+
+/// Record a failed reconciler attempt and append a same-transaction dead-letter audit.
+pub(crate) async fn record_reconciliation_failure(
+    state: &AppState,
+    caller: &Caller,
+    claim: &CardReconcileClaim,
+    error: &WyrdError,
+    next_attempt_at: DateTime<Utc>,
+) -> Result<bool, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let dead_lettered = record_card_reconciliation_failure(
+        &mut conn,
+        &CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?,
+        claim.reconcile_lease_owner,
+        next_attempt_at,
+        error.code(),
+        reconciliation_error_message(&claim.reconcile_kind),
+    )
+    .await?;
+    if dead_lettered {
+        let event = audit_event_unauthenticated(
+            RequestId::now_v7(),
+            "card.reconciliation.dead_letter",
+            &format!("card:{}", claim.card_uid),
+            "card:write",
+            AuditDecision::Allow,
+            AuditResult::Failure,
+            &format!(
+                "card reconciliation dead-lettered after {} attempts; kind={}",
+                claim.reconcile_attempts, claim.reconcile_kind
+            ),
+        );
+        append_on(&mut conn, &event).await?;
+    }
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(dead_lettered)
+}
+
+/// Build the internal caller used by a tenant-scoped reconciliation attempt.
+pub(crate) fn reconciliation_caller(tenant_id: DataTenantId) -> Caller {
+    Caller {
+        data_tenant_id: tenant_id,
+        principal: Principal::new(
+            PLATFORM_AUDIT_PRINCIPAL,
+            PrincipalKind::User,
+            tenant_id,
+            Vec::new(),
+            PermissionSet::new(),
+        ),
+        request_id: RequestId::now_v7(),
+    }
+}
+
+async fn complete_card_inner(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    _idempotency_key: &str,
+    lease_owner: Option<Uuid>,
+    schedule_failures: bool,
+) -> Result<CardRegistrationOutcome, WyrdError> {
     let completion_state = load_card_completion_state(state, caller, card_uid).await?;
     validate_card_completion_status(&completion_state.card, card_uid)?;
     if completion_state.card.status == CardStatus::Active {
+        if schedule_failures {
+            let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+            mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
+            conn.commit().await.map_err(registry_db_error)?;
+        }
         return load_card_registration_outcome(
             state,
             caller,
@@ -916,8 +1334,37 @@ pub async fn complete_card(
         )
         .await;
     }
-    verify_card_manifests(state, caller, card_uid, &completion_state.manifests).await?;
-    let blob_uri = ensure_card_blob(state, caller, &completion_state.card).await?;
+    if let Err(error) =
+        verify_card_manifests(state, caller, card_uid, &completion_state.manifests).await
+    {
+        if schedule_failures {
+            schedule_client_reconciliation(
+                state,
+                caller,
+                card_uid,
+                RECONCILE_KIND_FINALIZATION,
+                &error,
+            )
+            .await?;
+        }
+        return Err(error);
+    }
+    let blob_uri = match ensure_card_blob(state, caller, &completion_state.card).await {
+        Ok(uri) => uri,
+        Err(error) => {
+            if schedule_failures {
+                schedule_client_reconciliation(
+                    state,
+                    caller,
+                    card_uid,
+                    RECONCILE_KIND_BLOB,
+                    &error,
+                )
+                .await?;
+            }
+            return Err(error);
+        }
+    };
     let activated = commit_card_activation(
         state,
         caller,
@@ -925,6 +1372,7 @@ pub async fn complete_card(
         &completion_state.manifests,
         &blob_uri,
         completion_state.card.card_blob_uri.is_none(),
+        lease_owner,
     )
     .await?;
     load_card_registration_outcome(
@@ -938,6 +1386,80 @@ pub async fn complete_card(
         },
     )
     .await
+}
+
+async fn initialize_reconciled_uploads(
+    state: &AppState,
+    caller: &Caller,
+    claim: &CardReconcileClaim,
+    card_uid: &CardUid,
+) -> Result<(), WyrdError> {
+    let operation_id = claim
+        .registration_operation_id
+        .map(RegistrationOperationId::new)
+        .ok_or_else(|| WyrdError::internal("pending Card has no registration operation"))?;
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let operation = lookup_operation_by_id(&mut conn, operation_id)
+        .await?
+        .ok_or_else(|| WyrdError::internal("Card registration operation was not found"))?;
+    conn.commit().await.map_err(registry_db_error)?;
+    let stored = operation
+        .stored_response
+        .ok_or_else(|| WyrdError::internal("Card registration operation has no replay seed"))?;
+    let seed: RegistrationReplaySeed = serde_json::from_value(stored).map_err(|error| {
+        WyrdError::internal(format!("invalid Card registration replay seed: {error}"))
+    })?;
+    let card_ref = seed
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.card_ref.uid.as_ref() == Some(card_uid))
+        .map(|outcome| &outcome.card_ref)
+        .ok_or_else(|| WyrdError::internal("Card is missing from its registration replay seed"))?;
+    let paths = seed
+        .artifact_manifest_paths
+        .iter()
+        .find(|(reference, _)| reference.same_identity(card_ref))
+        .map(|(_, paths)| {
+            paths
+                .iter()
+                .map(|path| path.as_str().to_owned())
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    initialize_card_uploads(state, caller, operation_id, card_uid, &paths)
+        .await
+        .map(|_| ())
+}
+
+async fn schedule_client_reconciliation(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+    kind: &str,
+    error: &WyrdError,
+) -> Result<(), WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    schedule_card_reconciliation(
+        &mut conn,
+        card_uid,
+        kind,
+        Utc::now() + ChronoDuration::seconds(1),
+        error.code(),
+        reconciliation_error_message(kind),
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)
+}
+
+fn reconciliation_error_message(kind: &str) -> &'static str {
+    match kind {
+        RECONCILE_KIND_BLOB => "Card blob persistence failed; retry the storage transition",
+        RECONCILE_KIND_FINALIZATION => {
+            "Card artifact verification or activation failed; retry the lifecycle transition"
+        }
+        RECONCILE_KIND_CLEANUP => "Card artifact cleanup failed; retry the cleanup transition",
+        _ => "Card registration side effect failed; retry the lifecycle transition",
+    }
 }
 
 /// Soft-delete one exact Card UID while asserting its kind namespace.
@@ -1015,6 +1537,7 @@ async fn finish_card_delete(
         artifact_metadata::delete_for_card(&mut conn, delete_state.card.card_uid.as_str())
             .await
             .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+        mark_card_reconciliation_succeeded(&mut conn, &delete_state.card.card_uid, None).await?;
         conn.commit().await.map_err(registry_db_error)?;
     }
     Ok(DeleteCardResponse {
@@ -1077,7 +1600,7 @@ async fn load_card_completion_state(
     card_uid: &CardUid,
 ) -> Result<CardCompletionState, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    let card = sql_get_card_by_uid(&mut conn, card_uid).await?;
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(CardCompletionState { card, manifests })
@@ -1133,9 +1656,19 @@ async fn commit_card_activation(
     manifests: &[CardManifestCompletionRow],
     blob_uri: &str,
     record_blob: bool,
+    lease_owner: Option<Uuid>,
 ) -> Result<bool, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    if let Some(lease_owner) = lease_owner
+        && !lock_card_reconciliation_lease(&mut conn, card_uid, lease_owner).await?
+    {
+        conn.commit().await.map_err(registry_db_error)?;
+        return Ok(false);
+    }
     if !lock_pending_card_for_activation(&mut conn, card_uid).await? {
+        if lease_owner.is_some() {
+            let _ = mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
+        }
         conn.commit().await.map_err(registry_db_error)?;
         return Ok(false);
     }
@@ -1151,6 +1684,9 @@ async fn commit_card_activation(
         record_card_blob(&mut conn, card_uid, blob_uri).await?;
     }
     let activated = activate_card(&mut conn, card_uid).await?;
+    if activated || lease_owner.is_some() {
+        mark_card_reconciliation_succeeded(&mut conn, card_uid, lease_owner).await?;
+    }
     if activated {
         let event = audit_event(
             caller,
@@ -1175,7 +1711,7 @@ async fn load_card_registration_outcome(
     outcome: RegistrationOutcomeKind,
 ) -> Result<CardRegistrationOutcome, WyrdError> {
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
-    let card = get_card_by_uid(&mut conn, card_uid).await?;
+    let card = sql_get_card_by_uid(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(existing_row_to_response(&card, outcome))
 }
@@ -1323,6 +1859,9 @@ async fn commit_card_failure(
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let failed = fail_card(&mut conn, card_uid).await?;
     if failed {
+        if cleanup_succeeded {
+            mark_card_reconciliation_succeeded(&mut conn, card_uid, None).await?;
+        }
         let event = audit_event(
             caller,
             "card.registration.abort",

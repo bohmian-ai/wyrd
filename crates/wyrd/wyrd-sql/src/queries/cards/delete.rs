@@ -142,7 +142,17 @@ async fn soft_delete_card_with_expected_kind(
     }
 
     sqlx::query(
-        "UPDATE wyrd.cards SET status = 'deleted', updated_at = now() \
+        "UPDATE wyrd.cards SET status = 'deleted', \
+                reconcile_kind = 'cleanup', \
+                reconcile_status = 'pending', \
+                reconcile_attempts = 0, \
+                reconcile_next_attempt_at = now(), \
+                reconcile_lease_owner = NULL, \
+                reconcile_lease_expires_at = NULL, \
+                reconcile_last_error_code = NULL, \
+                reconcile_last_error_message = NULL, \
+                reconcile_dead_lettered_at = NULL, \
+                updated_at = now() \
           WHERE card_uid = $1 \
             AND status = 'active' \
             AND data_tenant_id = wyrd.current_tenant()",

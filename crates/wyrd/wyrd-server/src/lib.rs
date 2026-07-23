@@ -20,7 +20,7 @@ pub(crate) mod test_support;
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
 pub use boot::{
     RelayConfig, ServerBootError, StateOverrides, build_state, spawn_audit_relay,
-    spawn_storage_sweeper,
+    spawn_card_reconciler, spawn_storage_sweeper,
 };
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;

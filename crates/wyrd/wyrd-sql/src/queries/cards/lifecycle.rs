@@ -4,11 +4,287 @@
 // raw-query grep allowlist: lifecycle transitions post-date the sqlx offline cache;
 // run `mise run sqlx:prepare` to promote these tenant-bound statements to macros.
 
+use chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::CardUid;
 
+use crate::OperatorPool;
 use crate::tenant_conn::TenantConn;
+
+/// Registration side effects that can be retried by the lifecycle worker.
+pub const RECONCILE_KIND_REGISTRATION: &str = "registration";
+/// Immutable Card blob persistence side effects that can be retried.
+pub const RECONCILE_KIND_BLOB: &str = "blob";
+/// Manifest verification and Card activation side effects that can be retried.
+pub const RECONCILE_KIND_FINALIZATION: &str = "finalization";
+/// Artifact and upload cleanup side effects that can be retried.
+pub const RECONCILE_KIND_CLEANUP: &str = "cleanup";
+
+/// Maximum number of lifecycle attempts, including the initial attempt.
+pub const MAX_RECONCILE_ATTEMPTS: i32 = 3;
+
+/// One tenant-owned Card claimed for reconciliation.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CardReconcileClaim {
+    /// Card being reconciled.
+    pub card_uid: Uuid,
+    /// Tenant that owns the Card.
+    pub data_tenant_id: Uuid,
+    /// Registration operation that created the Card, when present.
+    pub registration_operation_id: Option<Uuid>,
+    /// Lifecycle side-effect category.
+    pub reconcile_kind: String,
+    /// Attempt number assigned by the claim transaction.
+    pub reconcile_attempts: i32,
+    /// Lease owner assigned to this claim batch.
+    pub reconcile_lease_owner: Uuid,
+}
+
+/// Claim due Card lifecycle work through the audited cross-tenant operator pool.
+///
+/// The claim transaction only stamps the lease and attempt number. Callers must
+/// commit it before performing storage IO or waiting for a retry delay.
+pub async fn claim_card_reconciliation(
+    operator: &OperatorPool,
+    now: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<CardReconcileClaim>, WyrdError> {
+    let lease_owner = Uuid::now_v7();
+    let mut tx = operator.pool().begin().await.map_err(|error| {
+        tracing::error!(%error, "card reconciliation claim transaction failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    let rows = sqlx::query_as::<_, CardReconcileClaim>(
+        r#"WITH candidates AS (
+                SELECT card_uid, data_tenant_id
+                  FROM wyrd.cards
+                 WHERE (
+                         (reconcile_status = 'pending'
+                          AND reconcile_next_attempt_at <= $1)
+                      OR (reconcile_status = 'leased'
+                          AND reconcile_lease_expires_at <= $1)
+                       )
+                   AND (
+                         reconcile_attempts < $4
+                      OR (reconcile_attempts = $4 AND reconcile_status = 'leased')
+                       )
+                 ORDER BY reconcile_next_attempt_at NULLS FIRST,
+                          reconcile_lease_expires_at NULLS FIRST,
+                          updated_at
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT $3
+            )
+            UPDATE wyrd.cards card
+               SET reconcile_status = 'leased',
+                   reconcile_attempts = CASE
+                       WHEN card.reconcile_attempts < $4
+                       THEN card.reconcile_attempts + 1
+                       ELSE card.reconcile_attempts
+                   END,
+                   reconcile_lease_owner = $2,
+                   reconcile_lease_expires_at = $5,
+                   updated_at = now()
+              FROM candidates
+             WHERE card.card_uid = candidates.card_uid
+               AND card.data_tenant_id = candidates.data_tenant_id
+         RETURNING card.card_uid,
+                   card.data_tenant_id,
+                   card.registration_operation_id,
+                   card.reconcile_kind,
+                   card.reconcile_attempts,
+                   card.reconcile_lease_owner"#,
+    )
+    .bind(now)
+    .bind(lease_owner)
+    .bind(limit)
+    .bind(MAX_RECONCILE_ATTEMPTS)
+    .bind(lease_expires_at)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "card reconciliation claim failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    tx.commit().await.map_err(|error| {
+        tracing::error!(%error, "card reconciliation claim commit failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(rows)
+}
+
+/// Re-check that a claimed Card still owns a live reconciliation lease.
+pub async fn lock_card_reconciliation_lease(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+    lease_owner: Uuid,
+) -> Result<bool, WyrdError> {
+    let found = sqlx::query_scalar::<_, bool>(
+        r#"SELECT true
+             FROM wyrd.cards
+            WHERE card_uid = $1
+              AND reconcile_status = 'leased'
+              AND reconcile_lease_owner = $2
+              AND reconcile_lease_expires_at > now()
+            FOR UPDATE"#,
+    )
+    .bind(card_uid.as_uuid())
+    .bind(lease_owner)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card reconciliation lease recheck failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(found.unwrap_or(false))
+}
+
+/// Schedule tenant-owned lifecycle work after a client-visible side effect failed.
+pub async fn schedule_card_reconciliation(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+    kind: &str,
+    next_attempt_at: DateTime<Utc>,
+    error_code: &str,
+    error_message: &str,
+) -> Result<bool, WyrdError> {
+    let result = sqlx::query(
+        r#"UPDATE wyrd.cards
+              SET reconcile_kind = $2,
+                  reconcile_status = 'pending',
+                  reconcile_attempts = 0,
+                  reconcile_next_attempt_at = $3,
+                  reconcile_lease_owner = NULL,
+                  reconcile_lease_expires_at = NULL,
+                  reconcile_last_error_code = $4,
+                  reconcile_last_error_message = $5,
+                  reconcile_dead_lettered_at = NULL,
+                  updated_at = now()
+            WHERE card_uid = $1
+              AND reconcile_status IN ('idle', 'pending')
+              AND status IN ('pending', 'failed', 'deleted')"#,
+    )
+    .bind(card_uid.as_uuid())
+    .bind(kind)
+    .bind(next_attempt_at)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card reconciliation schedule failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Mark claimed or client-owned lifecycle work complete and release its lease.
+pub async fn mark_card_reconciliation_succeeded(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+    lease_owner: Option<Uuid>,
+) -> Result<bool, WyrdError> {
+    let result = match lease_owner {
+        Some(lease_owner) => {
+            sqlx::query(
+                r#"UPDATE wyrd.cards
+                  SET reconcile_kind = 'registration',
+                      reconcile_status = 'idle',
+                      reconcile_attempts = 0,
+                      reconcile_next_attempt_at = NULL,
+                      reconcile_lease_owner = NULL,
+                      reconcile_lease_expires_at = NULL,
+                      reconcile_last_error_code = NULL,
+                      reconcile_last_error_message = NULL,
+                      reconcile_dead_lettered_at = NULL,
+                      updated_at = now()
+                WHERE card_uid = $1
+                  AND reconcile_status = 'leased'
+                  AND reconcile_lease_owner = $2
+                  AND reconcile_lease_expires_at > now()"#,
+            )
+            .bind(card_uid.as_uuid())
+            .bind(lease_owner)
+            .execute(&mut **conn.transaction())
+            .await
+        }
+        None => {
+            sqlx::query(
+                r#"UPDATE wyrd.cards
+                  SET reconcile_kind = 'registration',
+                      reconcile_status = 'idle',
+                      reconcile_attempts = 0,
+                      reconcile_next_attempt_at = NULL,
+                      reconcile_lease_owner = NULL,
+                      reconcile_lease_expires_at = NULL,
+                      reconcile_last_error_code = NULL,
+                      reconcile_last_error_message = NULL,
+                      reconcile_dead_lettered_at = NULL,
+                      updated_at = now()
+                WHERE card_uid = $1
+                  AND reconcile_status <> 'dead_lettered'"#,
+            )
+            .bind(card_uid.as_uuid())
+            .execute(&mut **conn.transaction())
+            .await
+        }
+    }
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card reconciliation success update failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Record a failed claimed attempt, dead-lettering exactly the third failure.
+pub async fn record_card_reconciliation_failure(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+    lease_owner: Uuid,
+    next_attempt_at: DateTime<Utc>,
+    error_code: &str,
+    error_message: &str,
+) -> Result<bool, WyrdError> {
+    let status = sqlx::query_scalar::<_, String>(
+        r#"UPDATE wyrd.cards
+              SET reconcile_status = CASE
+                      WHEN reconcile_attempts >= $3 THEN 'dead_lettered'
+                      ELSE 'pending'
+                  END,
+                  reconcile_next_attempt_at = CASE
+                      WHEN reconcile_attempts >= $3 THEN NULL
+                      ELSE $4
+                  END,
+                  reconcile_lease_owner = NULL,
+                  reconcile_lease_expires_at = NULL,
+                  reconcile_last_error_code = $5,
+                  reconcile_last_error_message = $6,
+                  reconcile_dead_lettered_at = CASE
+                      WHEN reconcile_attempts >= $3 THEN now()
+                      ELSE NULL
+                  END,
+                  updated_at = now()
+            WHERE card_uid = $1
+              AND reconcile_status = 'leased'
+              AND reconcile_lease_owner = $2
+              AND reconcile_lease_expires_at > now()
+         RETURNING reconcile_status"#,
+    )
+    .bind(card_uid.as_uuid())
+    .bind(lease_owner)
+    .bind(MAX_RECONCILE_ATTEMPTS)
+    .bind(next_attempt_at)
+    .bind(error_code)
+    .bind(error_message)
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card reconciliation failure update failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(status.as_deref() == Some("dead_lettered"))
+}
 
 /// One manifest entry plus the storage upload row bound to it.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -204,7 +480,17 @@ pub async fn activate_card(
 pub async fn fail_card(conn: &mut TenantConn<'_>, card_uid: &CardUid) -> Result<bool, WyrdError> {
     let result = sqlx::query(
         r#"UPDATE wyrd.cards
-              SET status = 'failed', updated_at = now()
+              SET status = 'failed',
+                  reconcile_kind = 'cleanup',
+                  reconcile_status = 'pending',
+                  reconcile_attempts = 0,
+                  reconcile_next_attempt_at = now(),
+                  reconcile_lease_owner = NULL,
+                  reconcile_lease_expires_at = NULL,
+                  reconcile_last_error_code = NULL,
+                  reconcile_last_error_message = NULL,
+                  reconcile_dead_lettered_at = NULL,
+                  updated_at = now()
             WHERE data_tenant_id = wyrd.current_tenant()
               AND card_uid = $1
               AND status = 'pending'"#,

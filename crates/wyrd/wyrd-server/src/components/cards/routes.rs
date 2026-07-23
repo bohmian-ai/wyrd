@@ -7,7 +7,7 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::{delete, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
@@ -16,7 +16,8 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
-    CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+    CardRef, CardRegistrationOutcome, CreateCardRequest, CreateCardResponse, DeleteCardResponse,
+    GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
 };
 use wyrd_spec::storage::IDEMPOTENCY_KEY_HEADER;
 
@@ -28,11 +29,205 @@ use crate::state::AppState;
 /// Build card routes for the `/v1` group.
 pub fn cards_router() -> Router<AppState> {
     Router::new()
-        .route("/cards", post(register_card_http))
+        .route("/cards", get(list_cards_http).post(register_card_http))
+        .route(
+            "/cards/by-uid/{kind}/{card_uid}",
+            get(get_card_http).delete(delete_card_http),
+        )
+        .route(
+            "/cards/by-ref",
+            get(get_card_by_ref_http).delete(delete_card_by_ref_http),
+        )
+        .route(
+            "/cards/{kind}/{space}/{name}/latest",
+            get(get_latest_card_http),
+        )
+        .route(
+            "/cards/{kind}/{space}/{name}/versions",
+            get(list_versions_http),
+        )
+        .route("/cards/{card_uid}/artifacts", get(list_artifacts_http))
         .route("/cards/{card_uid}/complete", post(complete_card_http))
         .route("/cards/{card_uid}/abort", post(abort_card_http))
-        .route("/cards/by-uid/{kind}/{card_uid}", delete(delete_card_http))
-        .route("/cards/by-ref", delete(delete_card_by_ref_http))
+}
+
+/// Fetch one Card by its exact kind-qualified UID.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/by-uid/{kind}/{card_uid}",
+    params(
+        ("kind" = String, Path, description = "Card kind namespace"),
+        ("card_uid" = String, Path, description = "Server-minted Card UID")
+    ),
+    responses(
+        (status = 200, description = "Hydrated Card", body = GetCardResponse),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Card read permission required"),
+        (status = 404, description = "Card not found"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.read.uid"))]
+async fn get_card_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((kind, card_uid)): Path<(String, String)>,
+) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    let kind = parse_card_kind(&kind)?;
+    let card_uid = parse_card_uid(&card_uid)?;
+    let response = service::get_card_by_uid(&state, &caller, &card_uid)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
+    if response.card.kind != kind {
+        return Err(WyrdErrorResponse::from(WyrdError::registry_card_not_found(
+            "card UID is not in the requested kind namespace",
+        )));
+    }
+    Ok(Json(response))
+}
+
+/// Fetch one Card by its exact kind/space/name/version identity.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/by-ref",
+    params(
+        ("kind" = String, Query, description = "Exact Card kind"),
+        ("space" = String, Query, description = "Exact Card space"),
+        ("name" = String, Query, description = "Exact Card name"),
+        ("version" = String, Query, description = "Exact Card version")
+    ),
+    responses(
+        (status = 200, description = "Hydrated Card", body = GetCardResponse),
+        (status = 404, description = "Card not found"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.read.ref"))]
+async fn get_card_by_ref_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Query(query): Query<CardRefQuery>,
+) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    let card_ref = query.into_card_ref()?;
+    service::get_card_by_ref(&state, &caller, &card_ref)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// Resolve the newest stable Active Card in an identity line.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/{kind}/{space}/{name}/latest",
+    params(
+        ("kind" = String, Path, description = "Card kind"),
+        ("space" = String, Path, description = "Card space"),
+        ("name" = String, Path, description = "Card name")
+    ),
+    responses(
+        (status = 200, description = "Latest Active Card", body = GetCardResponse),
+        (status = 404, description = "Card not found"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+#[tracing::instrument(skip(state, caller), fields(operation = "card.read.latest"))]
+async fn get_latest_card_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((kind, space, name)): Path<(String, String, String)>,
+) -> Result<Json<GetCardResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    let kind = parse_card_kind(&kind)?;
+    let space = parse_space(&space)?;
+    let name = parse_name(&name)?;
+    service::get_latest_card(&state, &caller, kind, space, name)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// List versions in one exact Card identity line.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/{kind}/{space}/{name}/versions",
+    params(
+        ("kind" = String, Path, description = "Card kind"),
+        ("space" = String, Path, description = "Card space"),
+        ("name" = String, Path, description = "Card name"),
+        ("include_prerelease" = Option<bool>, Query, description = "Include prerelease versions")
+    ),
+    responses(
+        (status = 200, description = "Card versions", body = ListVersionsResponse),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+async fn list_versions_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((kind, space, name)): Path<(String, String, String)>,
+    Query(query): Query<VersionListQuery>,
+) -> Result<Json<ListVersionsResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    service::list_card_versions(
+        &state,
+        &caller,
+        parse_card_kind(&kind)?,
+        parse_space(&space)?,
+        parse_name(&name)?,
+        query.include_prerelease,
+    )
+    .await
+    .map(Json)
+    .map_err(WyrdErrorResponse::from)
+}
+
+/// List tenant-visible Card summaries with keyset pagination.
+#[utoipa::path(
+    get,
+    path = "/v1/cards",
+    params(ListCardsRequest),
+    responses(
+        (status = 200, description = "Card summaries", body = ListCardsResponse),
+        (status = 400, description = "Invalid list query"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+async fn list_cards_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Query(query): Query<ListCardsRequest>,
+) -> Result<Json<ListCardsResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    service::list_cards(&state, &caller, query)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
+}
+
+/// List server-authoritative stored artifacts for one Card.
+#[utoipa::path(
+    get,
+    path = "/v1/cards/{card_uid}/artifacts",
+    params(("card_uid" = String, Path, description = "Card UID")),
+    responses(
+        (status = 200, description = "Artifact inventory", body = wyrd_spec::registry::ArtifactInventoryResponse),
+        (status = 404, description = "Card not found"),
+        (status = 503, description = "Registry unavailable")
+    )
+)]
+async fn list_artifacts_http(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(card_uid): Path<String>,
+) -> Result<Json<wyrd_spec::registry::ArtifactInventoryResponse>, WyrdErrorResponse> {
+    authorize_card_read(&state, &caller)?;
+    let card_uid = parse_card_uid(&card_uid)?;
+    service::list_card_artifacts(&state, &caller, &card_uid)
+        .await
+        .map(Json)
+        .map_err(WyrdErrorResponse::from)
 }
 
 #[utoipa::path(
@@ -229,6 +424,36 @@ struct DeleteCardRefQuery {
     version: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct CardRefQuery {
+    kind: String,
+    space: String,
+    name: String,
+    version: String,
+}
+
+impl CardRefQuery {
+    fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
+        Ok(CardRef {
+            kind: parse_card_kind(&self.kind)?,
+            space: Some(parse_space(&self.space)?),
+            name: parse_name(&self.name)?,
+            version: self.version.parse().map_err(|error| {
+                WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+                    "version is invalid: {error}"
+                )))
+            })?,
+            uid: None,
+        })
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VersionListQuery {
+    #[serde(default)]
+    include_prerelease: bool,
+}
+
 impl DeleteCardRefQuery {
     fn into_card_ref(self) -> Result<CardRef, WyrdErrorResponse> {
         let kind = CardKind::from_wire_name(&self.kind).ok_or_else(|| {
@@ -276,6 +501,39 @@ fn authorize_card_write(state: &AppState, caller: &Caller) -> Result<(), WyrdErr
         .check(&caller.principal, &Permission::card_write())
         .into_result()
         .map_err(WyrdErrorResponse::from)
+}
+
+fn authorize_card_read(state: &AppState, caller: &Caller) -> Result<(), WyrdErrorResponse> {
+    state
+        .authz
+        .permission_check
+        .check(&caller.principal, &Permission::card_read())
+        .into_result()
+        .map_err(WyrdErrorResponse::from)
+}
+
+fn parse_card_kind(value: &str) -> Result<CardKind, WyrdErrorResponse> {
+    CardKind::from_wire_name(value).ok_or_else(|| {
+        WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(
+            "kind is not a valid Card kind",
+        ))
+    })
+}
+
+fn parse_space(value: &str) -> Result<SpaceName, WyrdErrorResponse> {
+    SpaceName::new(value.to_owned()).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+            "space is invalid: {error}"
+        )))
+    })
+}
+
+fn parse_name(value: &str) -> Result<CardName, WyrdErrorResponse> {
+    CardName::new(value.to_owned()).map_err(|error| {
+        WyrdErrorResponse::from(WyrdError::registry_invalid_card_spec(format!(
+            "name is invalid: {error}"
+        )))
+    })
 }
 
 fn parse_card_uid(value: &str) -> Result<CardUid, WyrdErrorResponse> {

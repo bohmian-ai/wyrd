@@ -193,6 +193,25 @@ pub async fn lookup_expired_operation(
     .map_err(registry_db_error)
 }
 
+/// Find a committed registration operation by its server-minted identifier.
+pub async fn lookup_operation_by_id(
+    conn: &mut TenantConn<'_>,
+    operation_id: RegistrationOperationId,
+) -> Result<Option<CardRegistrationOperationRow>, WyrdError> {
+    sqlx::query_as::<_, CardRegistrationOperationRow>(
+        r#"SELECT operation_id, data_tenant_id, principal_id, idempotency_key,
+                  request_hash, stored_response, status,
+                  created_at, updated_at
+             FROM wyrd.card_registration_operations
+            WHERE data_tenant_id = wyrd.current_tenant()
+              AND operation_id = $1"#,
+    )
+    .bind(operation_id.as_uuid())
+    .fetch_optional(&mut **conn.transaction())
+    .await
+    .map_err(registry_db_error)
+}
+
 /// Reserve an idempotency key before any card, manifest, or audit write.
 pub async fn insert_registration_operation(
     conn: &mut TenantConn<'_>,
@@ -238,10 +257,13 @@ pub async fn insert_card_row(
     let created_at = sqlx::query_scalar::<_, DateTime<Utc>>(
         r#"INSERT INTO wyrd.cards
                (card_uid, data_tenant_id, kind, space, name, version, spec,
-                spec_hash, artifact_hash, labels, annotations, status, created_by,
-                registration_operation_id, pending_since)
+        spec_hash, artifact_hash, labels, annotations, status, created_by,
+                registration_operation_id, pending_since,
+                reconcile_status, reconcile_next_attempt_at)
            VALUES ($1, wyrd.current_tenant(), $2, $3, $4, $5, $6, $7, $8,
-                   $9, $10, $11, $12, $13, $14)
+                   $9, $10, $11, $12, $13, $14,
+                   CASE WHEN $11 = 'pending' THEN 'pending' ELSE 'idle' END,
+                   CASE WHEN $11 = 'pending' THEN $14 ELSE NULL END)
            RETURNING created_at"#,
     )
     .bind(input.card_uid.as_uuid())

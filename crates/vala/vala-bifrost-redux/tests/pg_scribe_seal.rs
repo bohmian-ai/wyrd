@@ -401,7 +401,7 @@ mod pg_tests {
         scribe.append(req).await.expect("append");
 
         // Force seal
-        let vala = vala_sql::ValaPostgres::from_pools(fixture.app_pool().clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pool(fixture.app_pool().clone());
         let pool = vala.pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await

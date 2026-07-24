@@ -20,9 +20,6 @@ pub const PLATFORM_ADMIN_PASSWORD_ENV: &str = "WYRD_DATABASE_PLATFORM_ADMIN_PASS
 /// `wyrd_catalog_app` password for external Postgres. Required alongside
 /// `WYRD_DATABASE_URL`; the Iceberg catalog connects with this role.
 pub const CATALOG_APP_PASSWORD_ENV: &str = "WYRD_DATABASE_CATALOG_APP_PASSWORD";
-/// `vala_recovery` password for external Postgres. Required alongside
-/// `WYRD_DATABASE_URL`; startup recovery connects with this role.
-pub const RECOVERY_PASSWORD_ENV: &str = "WYRD_DATABASE_RECOVERY_PASSWORD";
 
 /// Runtime role for RLS-enforced application traffic.
 pub const WYRD_APP_ROLE: &str = "wyrd_app";
@@ -32,8 +29,6 @@ pub const WYRD_MIGRATOR_ROLE: &str = "wyrd_migrator";
 pub const WYRD_PLATFORM_ADMIN_ROLE: &str = "wyrd_platform_admin";
 /// Bifrost Iceberg catalog application role.
 pub const WYRD_CATALOG_APP_ROLE: &str = "wyrd_catalog_app";
-/// Vala startup recovery role.
-pub const VALA_RECOVERY_ROLE: &str = "vala_recovery";
 
 const CATALOG_OPTIONS: &str =
     "options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog";
@@ -51,8 +46,6 @@ pub struct ResolvedDsns {
     pub platform_admin: Option<SecretString>,
     /// Bifrost catalog DSN using `wyrd_catalog_app` plus catalog role/search path options.
     pub catalog_app: SecretString,
-    /// Vala recovery DSN using `vala_recovery`.
-    pub recovery: SecretString,
 }
 
 impl fmt::Debug for ResolvedDsns {
@@ -65,7 +58,6 @@ impl fmt::Debug for ResolvedDsns {
                 &self.platform_admin.as_ref().map(|_| "<redacted>"),
             )
             .field("catalog_app", &"<redacted>")
-            .field("recovery", &"<redacted>")
             .finish()
     }
 }
@@ -77,8 +69,8 @@ pub enum DsnError {
     #[error(
         "mixed database configuration: set WYRD_DATABASE_URL with \
          WYRD_DATABASE_MIGRATOR_PASSWORD, WYRD_DATABASE_CATALOG_APP_PASSWORD, \
-         and WYRD_DATABASE_RECOVERY_PASSWORD (and optionally \
-         WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD) for external Postgres, or \
+	         (and optionally WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD) for external \
+	         Postgres, or \
          leave all database DSN/password vars unset for embedded mode"
     )]
     Mixed,
@@ -100,39 +92,28 @@ pub fn resolve_external_dsns(
     migrator_password: Option<SecretString>,
     platform_admin_password: Option<SecretString>,
     catalog_app_password: Option<SecretString>,
-    recovery_password: Option<SecretString>,
 ) -> Result<Option<ResolvedDsns>, DsnError> {
     match (
         app,
         migrator_password,
         platform_admin_password,
         catalog_app_password,
-        recovery_password,
     ) {
-        (
-            Some(app_url),
-            Some(migrator_pw),
-            platform_admin_pw,
-            Some(catalog_pw),
-            Some(recovery_pw),
-        ) => {
+        (Some(app_url), Some(migrator_pw), platform_admin_pw, Some(catalog_pw)) => {
             let base = Url::parse(&app_url).map_err(DsnError::InvalidUrl)?;
             let migrator_dsn = role_dsn(&base, WYRD_MIGRATOR_ROLE, &migrator_pw);
             let platform_admin_dsn = platform_admin_pw
                 .as_ref()
                 .map(|pw| role_dsn(&base, WYRD_PLATFORM_ADMIN_ROLE, pw));
             let catalog_app_dsn = catalog_role_dsn(&base, &catalog_pw);
-            let recovery_dsn = role_dsn(&base, VALA_RECOVERY_ROLE, &recovery_pw);
-
             Ok(Some(ResolvedDsns {
                 app: SecretString::from(app_url),
                 migrator: migrator_dsn,
                 platform_admin: platform_admin_dsn,
                 catalog_app: catalog_app_dsn,
-                recovery: recovery_dsn,
             }))
         }
-        (None, None, None, None, None) => Ok(None),
+        (None, None, None, None) => Ok(None),
         _ => Err(DsnError::Mixed),
     }
 }
@@ -152,7 +133,6 @@ pub fn resolve_external_dsns_from_env() -> Result<Option<ResolvedDsns>, DsnError
         env::var(CATALOG_APP_PASSWORD_ENV)
             .ok()
             .map(SecretString::from),
-        env::var(RECOVERY_PASSWORD_ENV).ok().map(SecretString::from),
     )
 }
 

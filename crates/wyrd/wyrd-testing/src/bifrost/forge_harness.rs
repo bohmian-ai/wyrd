@@ -530,16 +530,21 @@ impl ForgeFixture {
 
     /// Count one tenant/table-scoped Forge audit operation.
     pub async fn operation_count(&self, operation: &str) -> i64 {
+        let mut conn = self
+            .context
+            .vala
+            .tenant_conn(self.tenant)
+            .await
+            .expect("Forge fixture audit tenant connection");
         sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource = $2 AND operation = $3",
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1 AND operation = $2",
         )
-        .bind(self.tenant.as_uuid())
         .bind(format!(
             "bifrost://{}/{}/{}",
             self.tenant, self.binding.logical_namespace, self.binding.table_name
         ))
         .bind(operation)
-        .fetch_one(self.context.operator_pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("Forge fixture audit count")
     }

@@ -91,8 +91,6 @@ const SEGMENT_HEADER_SIZE: usize = 64;
 pub(crate) const WAL_RECORD_HEADER_SIZE: usize = 40;
 const WAL_RECORD_CRC_SIZE: usize = 4;
 #[cfg(test)]
-const APPEND_FRAME_MAGIC: [u8; 4] = *b"SWF1";
-#[cfg(test)]
 const APPEND_FRAME_MAGIC_V2: [u8; 4] = *b"SWF2";
 const FRAME_SEQUENCE_RESERVED: [u8; 3] = *b"WYD";
 
@@ -181,13 +179,6 @@ impl SegmentHeader {
             });
         }
 
-        // Reject version 1 segments (incompatible with 's batch_id field)
-        if version == 1 {
-            return Err(ScribeError::Internal {
- detail: "WAL format version 1 is incompatible with (batch_id field added). Delete WAL directory and restart.".to_string(),
- });
-        }
-
         if version != WAL_VERSION {
             return Err(ScribeError::Internal {
                 detail: format!("unsupported WAL version: {version}"),
@@ -222,8 +213,6 @@ impl SegmentHeader {
 ///
 /// Layout: `[len:u32][lsn:u64][kind:u8][reserved:u8×3][batch_id:u8×16][frame_sequence:u64][payload][crc32c:u32]`.
 ///
-/// Records written before frame sequencing used zero reserved bytes and omitted
-/// `frame_sequence`; those records remain readable and decode as sequence zero.
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     /// LSN for this record (monotonic per stream).
@@ -456,9 +445,9 @@ impl WalRecord {
             .map_err(|e| ScribeError::Internal {
                 detail: format!("WAL record reserved read error: {e}"),
             })?;
-        if reserved_buf != [0u8; 3] && reserved_buf != FRAME_SEQUENCE_RESERVED {
+        if reserved_buf != FRAME_SEQUENCE_RESERVED {
             return Err(ScribeError::Internal {
-                detail: "WAL record reserved bits non-zero".to_string(),
+                detail: "invalid WAL record format marker".to_string(),
             });
         }
 
@@ -470,17 +459,13 @@ impl WalRecord {
                 detail: format!("WAL record batch_id read error: {e}"),
             })?;
 
-        let frame_sequence = if reserved_buf == FRAME_SEQUENCE_RESERVED {
-            let mut sequence_bytes = [0u8; 8];
-            reader
-                .read_exact(&mut sequence_bytes)
-                .map_err(|e| ScribeError::Internal {
-                    detail: format!("WAL record frame sequence read error: {e}"),
-                })?;
-            u64::from_le_bytes(sequence_bytes)
-        } else {
-            0
-        };
+        let mut sequence_bytes = [0u8; 8];
+        reader
+            .read_exact(&mut sequence_bytes)
+            .map_err(|e| ScribeError::Internal {
+                detail: format!("WAL record frame sequence read error: {e}"),
+            })?;
+        let frame_sequence = u64::from_le_bytes(sequence_bytes);
 
         // Read payload
         let mut payload = vec![0u8; len as usize];
@@ -575,27 +560,17 @@ struct DecodedAppendFrame<'a> {
 
 #[cfg(test)]
 fn decode_append_frame(frame: &[u8]) -> Result<DecodedAppendFrame<'_>, ScribeError> {
-    if frame.len() < 28
-        || (frame[0..4] != APPEND_FRAME_MAGIC && frame[0..4] != APPEND_FRAME_MAGIC_V2)
-    {
+    if frame.len() < 36 || frame[0..4] != APPEND_FRAME_MAGIC_V2 {
         return Err(ScribeError::Internal {
             detail: "invalid Scribe WAL append frame".to_string(),
         });
     }
     let mut batch_id = [0_u8; 16];
     batch_id.copy_from_slice(&frame[4..20]);
-    let (frame_sequence, lengths_start) = if frame[0..4] == APPEND_FRAME_MAGIC_V2 {
-        if frame.len() < 36 {
-            return Err(ScribeError::Internal {
-                detail: "invalid Scribe WAL append frame".to_string(),
-            });
-        }
-        let mut sequence_bytes = [0_u8; 8];
-        sequence_bytes.copy_from_slice(&frame[20..28]);
-        (u64::from_le_bytes(sequence_bytes), 28)
-    } else {
-        (0, 20)
-    };
+    let mut sequence_bytes = [0_u8; 8];
+    sequence_bytes.copy_from_slice(&frame[20..28]);
+    let frame_sequence = u64::from_le_bytes(sequence_bytes);
+    let lengths_start = 28;
     let audit_len = u32::from_le_bytes([
         frame[lengths_start],
         frame[lengths_start + 1],
@@ -1360,31 +1335,6 @@ mod tests {
         assert_eq!(decoded.batch_id, batch_id);
         assert_eq!(decoded.frame_sequence, 7);
         assert_eq!(decoded.payload, b"test data");
-    }
-
-    #[test]
-    fn legacy_wal_record_decodes_with_zero_frame_sequence() {
-        let batch_id = [9u8; 16];
-        let mut encoded = Vec::new();
-        let payload = b"legacy";
-        encoded.extend_from_slice(
-            &u32::try_from(payload.len())
-                .expect("legacy WAL test payload fits record length")
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(&3_u64.to_le_bytes());
-        encoded.push(0);
-        encoded.extend_from_slice(&[0; 3]);
-        encoded.extend_from_slice(&batch_id);
-        encoded.extend_from_slice(payload);
-        let crc = crc32c_hash(&encoded);
-        encoded.extend_from_slice(&crc.to_le_bytes());
-
-        let decoded = WalRecord::decode_from(&mut std::io::Cursor::new(encoded))
-            .expect("decode legacy record")
-            .expect("non-empty");
-        assert_eq!(decoded.frame_sequence, 0);
-        assert_eq!(decoded.payload, payload);
     }
 
     #[test]

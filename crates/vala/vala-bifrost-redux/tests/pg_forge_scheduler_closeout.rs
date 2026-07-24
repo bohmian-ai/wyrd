@@ -1,6 +1,6 @@
 //! Production-surface Forge scheduler closeout tests.
 //!
-//! These tests deliberately avoid the legacy `vala-bifrost` catalog. They create
+//! These tests exercise only the current Redux catalog. They create
 //! a real SQL Iceberg catalog, local object store, staging Parquet files, and
 //! `vala.file_list` rows, then drive the exported Redux Forge surface.
 
@@ -246,10 +246,12 @@ mod pg_tests {
         }
 
         async fn operation_count(&self, operation: &str) -> i64 {
-            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = $2")
-                .bind(self.tenant.as_uuid())
+            let mut conn = vala_sql::TenantConn::acquire(self.pg.app_pool(), self.tenant)
+                .await
+                .expect("audit tenant connection");
+            sqlx::query_scalar("SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = wyrd.current_tenant() AND operation = $1")
                 .bind(operation)
-                .fetch_one(self.context.operator_pool.pool())
+                .fetch_one(&mut **conn.transaction())
                 .await
                 .expect("audit operation count")
         }
@@ -328,20 +330,10 @@ mod pg_tests {
         assert!(table.metadata().current_snapshot_id().is_some());
         assert_eq!(table.metadata().snapshots().len(), 1);
 
-        let prepared: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.prepared'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("prepared audit count");
-        let committed: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("committed audit count");
+        let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+        let committed = fixture
+            .operation_count("forge.file_compact.committed")
+            .await;
         assert_eq!(prepared, 1);
         assert_eq!(committed, 1);
     }
@@ -531,11 +523,16 @@ mod pg_tests {
             .await
             .expect("successor fence");
         conn.commit().await.expect("successor commit");
+        let mut conn = fixture
+            .context
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .expect("successor audit query transaction");
         sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.test.successor'",
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = wyrd.current_tenant() AND operation = 'forge.test.successor'",
         )
-        .bind(tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("successor audit count")
     }

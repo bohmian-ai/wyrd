@@ -52,26 +52,6 @@ pub async fn migrate(migrator_pool: &PgPool) -> Result<(), SqlError> {
             .await
             .map_err(SqlError::Connect)?;
         }
-        // Pre-commit schema grants before migrations start. PostgreSQL 17
-        // enforces that the new owner has CREATE on a function's schema during
-        // ALTER FUNCTION OWNER. Within-transaction grants are not visible to the
-        // ACL cache at that point, so we commit them here before sqlx::migrate!.
-        sqlx::query(
-            "DO $$ BEGIN
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery_owner') THEN
-                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_recovery_owner;
-                 END IF;
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_recovery') THEN
-                     GRANT USAGE ON SCHEMA vala TO vala_recovery;
-                 END IF;
-                 IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vala_audit_relay') THEN
-                     GRANT USAGE, CREATE ON SCHEMA vala TO vala_audit_relay;
-                 END IF;
-             END $$",
-        )
-        .execute(&mut *conn)
-        .await
-        .map_err(SqlError::Connect)?;
         sqlx::query(AssertSqlSafe(format!(
             "SET search_path TO {MIGRATION_SEARCH_PATH}"
         )))

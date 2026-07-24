@@ -6,8 +6,7 @@
 //! batch per `flush_max_rows` chunk, mints a stable `batch_id` per sealed batch,
 //! and ships it. On sink failure or flush-deadline timeout, the affected chunk is
 //! placed into a per-queue retry buffer (with its original `batch_id` intact) so
-//! the next `seal_and_send` re-sends it under the same id — preserving the
-//! server-side `olap_commits` dedup guarantee across retries.
+//! the next `seal_and_send` re-sends the same logical batch.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -152,8 +151,7 @@ impl RecordQueue {
     /// Drain staging, seal each `flush_max_rows` chunk into one IPC batch under a
     /// stable `batch_id`, and ship it. On sink failure or flush-deadline timeout,
     /// the affected chunk is pushed (with its original `batch_id`) into `self.retry`
-    /// so the next call resends it under the same id — preserving the server-side
-    /// `olap_commits` dedup guarantee across retries.
+    /// so the next call resends it under the same id.
     ///
     /// # Errors
     /// - [`WyrdQueueError::Sink`] if the sink rejects a batch.

@@ -15,13 +15,8 @@ use crate::provider::WyrdTableProvider;
 use crate::registry::{CachedMeta, Registry, RegistryKey};
 use crate::schema::fingerprint::fingerprint_user_fields;
 use crate::schema::managed_columns::with_managed_columns;
-use crate::tables::{DeclaredIndex, DomainTable, PayloadClass};
+use crate::tables::{DeclaredIndex, DomainTable};
 use crate::types::{PartitionTransform, SchemaFingerprint, TableScope, TableUid};
-use crate::writer::PostgresCommitNotifier;
-use crate::writer::coordinator::{
-    FlushPolicy, GroupCommitHandle, GroupCoordinatorInputs,
-    spawn_group_commit_coordinator_with_notifier,
-};
 use wyrd_storage::settings::BackendConfig;
 
 pub mod iceberg_sql;
@@ -34,7 +29,6 @@ mod wire;
 pub struct WyrdCatalog {
     catalog: Arc<SqlCatalog>,
     pool: Arc<PgPool>,
-    recovery_pool: Option<Arc<PgPool>>,
     storage_factory: Arc<dyn iceberg::io::StorageFactory>,
     storage_props: HashMap<String, String>,
     warehouse: String,
@@ -71,7 +65,7 @@ pub struct CreateTableRequest<'a> {
 }
 
 impl WyrdCatalog {
-    /// Borrow the Iceberg catalog used by all Bifrost writers and readers.
+    /// Borrow the Iceberg catalog used by Bifrost readers and registration.
     ///
     /// The returned trait object is the same catalog instance assembled during
     /// server boot. Callers that need a data-plane worker must reuse it rather
@@ -81,18 +75,11 @@ impl WyrdCatalog {
         self.catalog.clone()
     }
 
-    /// Construct the catalog and run a best-effort startup recovery pass.
-    ///
-    /// `recovery_pool` must be authenticated as `vala_recovery` (the role granted
-    /// EXECUTE on the SECURITY DEFINER recovery routines). When `None`, recovery is
-    /// disabled and startup proceeds without scanning stale precommit rows — the
-    /// `pool` (`wyrd_app` in production) lacks EXECUTE on those routines, so it is
-    /// never used for recovery.
+    /// Construct the catalog used by the current read and registration surfaces.
     pub async fn new(
         catalog_uri: &str,
         backend: &BackendConfig,
         pool: Arc<PgPool>,
-        recovery_pool: Option<Arc<PgPool>>,
     ) -> Result<Self, BifrostError> {
         let (storage_factory, storage_props) = storage::iceberg_storage_factory(backend);
         let warehouse = storage::warehouse_uri(backend);
@@ -109,16 +96,11 @@ impl WyrdCatalog {
         let this = Self {
             catalog: Arc::new(catalog),
             pool,
-            recovery_pool,
             storage_factory,
             storage_props,
             warehouse,
             registry,
         };
-
-        if let Err(e) = this.startup_recovery().await {
-            tracing::warn!(error = %e, "startup recovery pass failed (best-effort)");
-        }
 
         Ok(this)
     }
@@ -135,8 +117,8 @@ impl WyrdCatalog {
 
     /// Idempotently ensure a privileged `SystemShared` table exists.
     ///
-    /// Used for engine-owned warehouse tables (e.g. the S3.C5 audit relay's
-    /// `vala.system.audit_log`) that must be present before the first write.
+    /// Used for engine-owned warehouse tables that must be present before the
+    /// first write.
     /// A no-op when the Iceberg table already exists; otherwise creates and
     /// registers it under `SYSTEM_OWNER`. Safe to call on every boot.
     pub async fn ensure_system_table(
@@ -380,135 +362,6 @@ impl WyrdCatalog {
             .map_err(|_| BifrostError::Internal("schema fingerprint length mismatch".to_owned()))
     }
 
-    /// Open a writer for `tenant` (the authenticated **data tenant**, for both
-    /// scopes). The control-plane RLS bind for the registration lookup — and for
-    /// the commit coordinator's `vala.olap_commits` precommit/finalize rows — is
-    /// derived from `scope` (C2/N-M12), never from the caller: `SystemShared` binds
-    /// `SYSTEM_OWNER`, `TenantOwned` binds the data tenant. The data tenant itself is
-    /// what gets server-stamped into `data_tenant_id` on `SystemShared` rows; the two
-    /// values must never collapse.
-    pub async fn writer(
-        &self,
-        ns: BifrostNamespace,
-        name: &str,
-        scope: TableScope,
-        tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<GroupCommitHandle, BifrostError> {
-        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
-        let table = self.catalog.load_table(&table_ident).await?;
-        let fqn = format!("{}.{}", ns.as_str(), name);
-
-        let row = self
-            .lookup_table_row(&fqn, scope.control_bind(tenant))
-            .await?
-            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
-        let table_uid = TableUid(
-            row.table_uid
-                .try_into()
-                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
-        );
-
-        let handle = spawn_group_commit_coordinator_with_notifier(
-            GroupCoordinatorInputs {
-                table,
-                catalog: self.catalog.clone(),
-                pool: self.pool.clone(),
-                table_uid,
-                table_fqn: fqn,
-                scope,
-                registry: Arc::clone(&self.registry),
-                payload_class: PayloadClass::Standard,
-                sensitive_columns: &[],
-                flush_policy: FlushPolicy::default(),
-            },
-            Arc::new(PostgresCommitNotifier {
-                pool: (*self.pool).clone(),
-            }),
-        );
-
-        Ok(handle)
-    }
-
-    /// Open a write handle for a pre-declared domain table `T`.
-    ///
-    /// Carries the table's `PayloadClass` and `SENSITIVE_PAYLOAD_COLUMNS` into the
-    /// coordinator so redaction fires automatically on each commit.
-    pub async fn typed_writer<T: DomainTable>(
-        &self,
-        scope: TableScope,
-        tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<GroupCommitHandle, BifrostError> {
-        let ns = BifrostNamespace::from_domain_namespace(T::NAMESPACE).ok_or_else(|| {
-            BifrostError::Internal(format!("unknown namespace: {}", T::NAMESPACE))
-        })?;
-        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), T::NAME.to_string());
-        let table = self.catalog.load_table(&table_ident).await?;
-        let fqn = format!("{}.{}", ns.as_str(), T::NAME);
-
-        let row = self
-            .lookup_table_row(&fqn, scope.control_bind(tenant))
-            .await?
-            .ok_or_else(|| BifrostError::TableNotFound(fqn.clone()))?;
-        let table_uid = TableUid(
-            row.table_uid
-                .try_into()
-                .map_err(|_| BifrostError::Internal("table_uid length mismatch".to_string()))?,
-        );
-
-        let handle = spawn_group_commit_coordinator_with_notifier(
-            GroupCoordinatorInputs {
-                table,
-                catalog: self.catalog.clone(),
-                pool: self.pool.clone(),
-                table_uid,
-                table_fqn: fqn,
-                scope,
-                registry: Arc::clone(&self.registry),
-                payload_class: T::PAYLOAD_CLASS,
-                sensitive_columns: T::SENSITIVE_PAYLOAD_COLUMNS,
-                flush_policy: FlushPolicy::default(),
-            },
-            Arc::new(PostgresCommitNotifier {
-                pool: (*self.pool).clone(),
-            }),
-        );
-
-        Ok(handle)
-    }
-
-    /// Drop an Iceberg table from both the SQL catalog and the Wyrd control tables.
-    ///
-    /// Ignores not-found errors. Routes the control-table cleanup through a
-    /// `TenantConn` bound to `tenant` (the registration's owner: the data tenant
-    /// for `TenantOwned`, `SYSTEM_OWNER` for `SystemShared`) so RLS sees the rows, and
-    /// deletes in FK order via `delete_table`.
-    ///
-    /// This is an unconditionally destructive, ownership-free operation, so it is
-    /// gated to test and bench builds and must never be reachable in production.
-    #[cfg(any(test, feature = "bench-bin"))]
-    pub async fn drop_table(
-        &self,
-        ns: BifrostNamespace,
-        name: &str,
-        tenant: wyrd_spec::ids::DataTenantId,
-    ) -> Result<(), BifrostError> {
-        let fqn = format!("{}.{}", ns.as_str(), name);
-        let table_ident = iceberg::TableIdent::new(ns.to_namespace_ident(), name.to_string());
-
-        // Drop from Iceberg catalog — ignore not-found.
-        let _ = self.catalog.drop_table(&table_ident).await;
-
-        let mut conn = vala_sql::TenantConn::acquire(&self.pool, tenant)
-            .await
-            .map_err(BifrostError::Sql)?;
-        vala_sql::queries::olap_catalog::delete_table(&mut conn, &fqn)
-            .await
-            .map_err(BifrostError::Sql)?;
-        conn.commit().await.map_err(BifrostError::Sql)?;
-
-        Ok(())
-    }
-
     /// Open a read provider for `tenant` (the authenticated **data tenant**).
     ///
     /// The caller supplies the authenticated tenant and the catalog lookup is
@@ -740,150 +593,8 @@ impl WyrdCatalog {
         }
         Ok(())
     }
-
-    /// Borrow the optional recovery pool (`vala_recovery` SECURITY DEFINER).
-    ///
-    /// Returns `None` when no recovery pool was provisioned. Production boot
-    /// that requires the commit-recovery sweep must fail hard when this is
-    /// `None` (see `wyrd-server` `ServerBootError::RecoveryPoolRequired`).
-    #[must_use]
-    pub fn recovery_pool(&self) -> Option<&PgPool> {
-        self.recovery_pool.as_deref()
-    }
-
-    /// Best-effort startup recovery pass.
-    ///
-    /// Claims stale `precommit` rows (lease absent/expired) via the SECURITY
-    /// DEFINER `vala.claim_stale_precommits` function and reconciles each by
-    /// scanning Iceberg snapshot summaries for `wyrd_batch_id`. Recovery runs only
-    /// when a `recovery_pool` (authenticated as `vala_recovery`) was provided; with
-    /// no recovery pool it is disabled and returns immediately.
-    async fn startup_recovery(&self) -> Result<(), BifrostError> {
-        use crate::writer::commit::WRITER_INSTANCE;
-
-        let Some(recovery_pool) = self.recovery_pool.as_ref() else {
-            tracing::info!("startup recovery disabled — no vala_recovery pool configured");
-            return Ok(());
-        };
-
-        let engine_owner = *WRITER_INSTANCE;
-
-        let mut conn = vala_sql::TenantConn::acquire(
-            recovery_pool,
-            wyrd_spec::ids::DataTenantId::SYSTEM_OWNER,
-        )
-        .await
-        .map_err(BifrostError::Sql)?;
-        let claimed =
-            vala_sql::queries::olap_catalog::claim_stale_precommits(&mut conn, engine_owner, 100)
-                .await
-                .map_err(BifrostError::Sql)?;
-        conn.commit().await.map_err(BifrostError::Sql)?;
-
-        for row in claimed {
-            if let Err(e) = self.recover_claimed_row(recovery_pool, &row).await {
-                tracing::warn!(
-                    fqn = %row.fqn,
-                    error = %e,
-                    "recovery scan failed for claimed precommit row"
-                );
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn recover_claimed_row(
-        &self,
-        recovery_pool: &PgPool,
-        row: &vala_sql::row_types::olap_catalog::ClaimedPrecommitRow,
-    ) -> Result<(), BifrostError> {
-        let table_uid: [u8; 16] =
-            row.table_uid.as_slice().try_into().map_err(|_| {
-                BifrostError::Internal("recovery: table_uid length mismatch".into())
-            })?;
-        let batch_id: [u8; 16] = row
-            .batch_id
-            .as_slice()
-            .try_into()
-            .map_err(|_| BifrostError::Internal("recovery: batch_id length mismatch".into()))?;
-        let fencing_token = row.fencing_token;
-
-        let table_ident = fqn_to_table_ident(&row.fqn)?;
-
-        // The recovery routines are tenant-qualified even though they execute
-        // with SECURITY DEFINER privileges. Keep the connection bind aligned
-        // with the claimed row as an additional tenant guard.
-        let recovery_bind = wyrd_spec::ids::DataTenantId::try_from(row.data_tenant_id)
-            .map_err(|_| BifrostError::Internal("recovery row has invalid tenant id".into()))?;
-
-        let load_result = self.catalog.load_table(&table_ident).await;
-
-        let table = match load_result {
-            Err(e) => {
-                tracing::warn!(fqn = %row.fqn, error = %e, "recovery: iceberg load failed");
-                let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
-                    .await
-                    .map_err(BifrostError::Sql)?;
-                vala_sql::queries::olap_catalog::mark_recovery_scan_failed(
-                    &mut conn,
-                    row.data_tenant_id,
-                    &table_uid,
-                    &batch_id,
-                    fencing_token,
-                    &e.to_string(),
-                )
-                .await
-                .map_err(BifrostError::Sql)?;
-                conn.commit().await.map_err(BifrostError::Sql)?;
-                return Ok(());
-            }
-            Ok(t) => t,
-        };
-
-        let decision = decide_recovery(&table, row.data_tenant_id, &batch_id);
-
-        let mut conn = vala_sql::TenantConn::acquire(recovery_pool, recovery_bind)
-            .await
-            .map_err(BifrostError::Sql)?;
-
-        match decision {
-            RecoveryDecision::Committed(sid) => {
-                vala_sql::queries::olap_catalog::finalize_recovered_committed(
-                    &mut conn,
-                    row.data_tenant_id,
-                    &table_uid,
-                    &batch_id,
-                    sid,
-                    fencing_token,
-                )
-                .await
-                .map_err(BifrostError::Sql)?;
-            }
-            RecoveryDecision::Aborted => {
-                vala_sql::queries::olap_catalog::finalize_recovered_aborted(
-                    &mut conn,
-                    row.data_tenant_id,
-                    &table_uid,
-                    &batch_id,
-                    fencing_token,
-                    "snapshot_absent",
-                )
-                .await
-                .map_err(BifrostError::Sql)?;
-            }
-        }
-
-        conn.commit().await.map_err(BifrostError::Sql)?;
-        Ok(())
-    }
 }
 
-/// Parse a Bifrost FQN into an Iceberg `TableIdent`.
-///
-/// FQN format: `{ns.as_str()}.{table_name}`, where `ns.as_str()` may contain
-/// dots (e.g. "vala.bifrost"). Match the known namespace prefix to extract the
-/// table name — avoids relying on the buggy `split_part('.', N)` in the SQL.
 /// The Arrow schema a healthy Iceberg table for `T` reads back as.
 ///
 /// `create_domain_table` writes `arrow_schema_to_schema_auto_assign_ids(T::schema())`;
@@ -899,78 +610,4 @@ fn expected_physical_schema<T: DomainTable>() -> Option<SchemaRef> {
         iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(declared.as_ref()).ok()?;
     let roundtripped = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).ok()?;
     Some(Arc::new(roundtripped))
-}
-
-fn fqn_to_table_ident(fqn: &str) -> Result<iceberg::TableIdent, BifrostError> {
-    let namespaces = BifrostNamespace::ALL;
-    for ns in namespaces {
-        let prefix = format!("{}.", ns.as_str());
-        if let Some(table_name) = fqn.strip_prefix(&prefix)
-            && !table_name.is_empty()
-            && !table_name.contains('.')
-        {
-            return Ok(iceberg::TableIdent::new(
-                ns.to_namespace_ident(),
-                table_name.to_string(),
-            ));
-        }
-    }
-    Err(BifrostError::MetadataMismatch(format!(
-        "cannot parse fqn into known namespace: {fqn}"
-    )))
-}
-
-/// Recovery-oracle verdict for one claimed stale precommit row.
-pub(crate) enum RecoveryDecision {
-    /// A snapshot durably carries this row's commit identity — roll forward and
-    /// finalize `committed` against the discovered `snapshot_id`.
-    Committed(i64),
-    /// No snapshot carries this row's identity — the write never landed; abort.
-    Aborted,
-}
-
-/// Decide how to reconcile a claimed stale precommit row by scanning the table's
-/// snapshot history for one that durably carries the commit identity
-/// `{data_tenant_id, batch_id}`.
-///
-/// The group-commit path stamps `wyrd_commit_keys` — a JSON array with one
-/// `{"data_tenant_id","batch_id"}` object per committed key. That pair is the M02
-/// dedup identity and is AUTHORITATIVE: when a snapshot carries `wyrd_commit_keys`,
-/// recovery matches the exact pair and does NOT fall back to `wyrd_batch_id` for
-/// that snapshot. This precedence is what stops two tenants that share a
-/// `batch_id` on a `SystemShared` table from recovering each other's snapshot —
-/// matching `batch_id` alone is not enough to discriminate the data tenant.
-///
-/// A snapshot with NO `wyrd_commit_keys` is a legacy single-key snapshot; recovery
-/// falls back to matching `wyrd_batch_id` alone. (The legacy single-key write path
-/// is removed in a later slice, at which point the fallback goes with it.)
-///
-/// Both hex values are UUID simple-hex, so the pair match is an exact,
-/// escaping-free substring test against the JSON array — no JSON parser is pulled
-/// into the production library build.
-pub(crate) fn decide_recovery(
-    table: &iceberg::table::Table,
-    data_tenant_id: sqlx::types::Uuid,
-    batch_id: &[u8; 16],
-) -> RecoveryDecision {
-    let tenant_hex = data_tenant_id.simple().to_string();
-    let batch_hex = uuid::Uuid::from_bytes(*batch_id).simple().to_string();
-    let pair_needle = format!(r#"{{"data_tenant_id":"{tenant_hex}","batch_id":"{batch_hex}"}}"#);
-
-    for snapshot in table.metadata().snapshots() {
-        let props = &snapshot.summary().additional_properties;
-        match props.get("wyrd_commit_keys") {
-            Some(keys) => {
-                if keys.contains(&pair_needle) {
-                    return RecoveryDecision::Committed(snapshot.snapshot_id());
-                }
-            }
-            None => {
-                if props.get("wyrd_batch_id").map(String::as_str) == Some(batch_hex.as_str()) {
-                    return RecoveryDecision::Committed(snapshot.snapshot_id());
-                }
-            }
-        }
-    }
-    RecoveryDecision::Aborted
 }

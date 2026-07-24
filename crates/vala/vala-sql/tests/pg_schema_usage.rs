@@ -12,7 +12,7 @@ mod pg_tests {
     //! Run via `mise run test:sql`.
 
     use vala_sql::TenantConn;
-    use vala_sql::queries::olap_catalog::{precommit, upsert_table};
+    use vala_sql::queries::olap_catalog::upsert_table;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
 
@@ -76,20 +76,10 @@ mod pg_tests {
             upsert_table(&mut conn, &[7_u8; 16], "datasets.same", &[3_u8; 32], &[])
                 .await
                 .unwrap();
-            precommit(&mut conn, &[7_u8; 16], &[9_u8; 16], "test", "test")
-                .await
-                .unwrap();
-            precommit(&mut conn, &[7_u8; 16], &[9_u8; 16], "test", "test")
-                .await
-                .unwrap();
             conn.commit().await.unwrap();
         }
 
-        for (table, column) in [
-            ("bifrost_tables", "scope"),
-            ("olap_commits", "control_bind"),
-            ("file_list", "tenant_bucket"),
-        ] {
+        for (table, column) in [("bifrost_tables", "scope"), ("file_list", "tenant_bucket")] {
             let count: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM information_schema.columns
                  WHERE table_schema = 'vala' AND table_name = $1 AND column_name = $2",
@@ -117,21 +107,9 @@ mod pg_tests {
                 .fetch_one(&superuser)
                 .await
                 .unwrap();
-        let commit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
-        )
-        .bind([7_u8; 16].as_slice())
-        .bind([9_u8; 16].as_slice())
-        .fetch_one(&superuser)
-        .await
-        .unwrap();
         assert_eq!(
             table_count, 2,
             "same table identity is independent per tenant"
-        );
-        assert_eq!(
-            commit_count, 2,
-            "same batch identity is independent per tenant"
         );
 
         for index_name in [

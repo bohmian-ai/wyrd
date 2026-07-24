@@ -1,8 +1,8 @@
 mod pg_tests {
-    //! SQL integration tests for the S3.C5 transactional audit outbox.
+    //! SQL integration tests for the transactional audit outbox.
     //!
-    //! Covers the per-tenant gapless hash chain, the append-only trigger, per-tenant
-    //! isolation of chains and shipping, and the cross-tenant relay claim/ship cycle.
+    //! Covers the per-tenant gapless hash chain, append-only enforcement, tenant
+    //! isolation, and tenant-scoped reads.
     //! Run via `mise run test:sql`.
 
     mod audit_outbox {
@@ -125,132 +125,6 @@ mod pg_tests {
             .execute(&superuser)
             .await;
             assert!(tampered.is_err(), "content UPDATE must be rejected");
-        }
-
-        #[tokio::test]
-        async fn shipped_row_is_immutable() {
-            let (fixture, superuser, tenant) = setup().await;
-            append(fixture.app_pool(), tenant, "op.a").await;
-
-            let batch = [0xABu8; 16];
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
-                .await
-                .unwrap();
-            let shipped =
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &batch)
-                    .await
-                    .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(shipped, 1);
-
-            let reship = sqlx::query(
-                "UPDATE vala.audit_outbox SET shipped = true
-              WHERE data_tenant_id = $1 AND seq = 1",
-            )
-            .bind(tenant.as_uuid())
-            .execute(&superuser)
-            .await;
-            assert!(reship.is_err(), "an already-shipped row must be immutable");
-        }
-
-        #[tokio::test]
-        async fn per_tenant_chains_and_shipping_are_isolated() {
-            let (fixture, superuser, tenant_a) = setup().await;
-            let tenant_b = DataTenantId::new_v7();
-            fixture
-                .seed_additional_tenant_with_uuid(
-                    tenant_b,
-                    &format!("test-{}", tenant_b.as_uuid().simple()),
-                )
-                .await
-                .unwrap();
-
-            // Each tenant's seq is independent and starts at 1.
-            assert_eq!(append(fixture.app_pool(), tenant_a, "a.1").await, 1);
-            assert_eq!(append(fixture.app_pool(), tenant_a, "a.2").await, 2);
-            assert_eq!(append(fixture.app_pool(), tenant_b, "b.1").await, 1);
-
-            // Marking tenant A shipped must not touch tenant B's rows.
-            let batch_a = [0x0Au8; 16];
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            let shipped_a =
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &batch_a)
-                    .await
-                    .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(shipped_a, 2, "both tenant-A rows ship");
-
-            let b_unshipped: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM vala.audit_outbox
-              WHERE data_tenant_id = $1 AND NOT shipped",
-            )
-            .bind(tenant_b.as_uuid())
-            .fetch_one(&superuser)
-            .await
-            .unwrap();
-            assert_eq!(b_unshipped, 1, "tenant B is untouched by tenant A shipping");
-        }
-
-        #[tokio::test]
-        async fn relay_claims_across_tenants_then_marks_shipped() {
-            let (fixture, _superuser, tenant_a) = setup().await;
-            let tenant_b = DataTenantId::new_v7();
-            fixture
-                .seed_additional_tenant_with_uuid(
-                    tenant_b,
-                    &format!("test-{}", tenant_b.as_uuid().simple()),
-                )
-                .await
-                .unwrap();
-
-            append(fixture.app_pool(), tenant_a, "a.1").await;
-            append(fixture.app_pool(), tenant_a, "a.2").await;
-            append(fixture.app_pool(), tenant_b, "b.1").await;
-
-            // Cross-tenant claim (SECURITY DEFINER) sees every unshipped row.
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            let claimed = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
-                .await
-                .unwrap();
-            conn.commit().await.unwrap();
-            assert_eq!(claimed.len(), 3, "claim spans both tenants");
-
-            // Ship per tenant under that tenant's bind.
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            assert_eq!(
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 2, &[0x0Au8; 16])
-                    .await
-                    .unwrap(),
-                2
-            );
-            conn.commit().await.unwrap();
-
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
-                .await
-                .unwrap();
-            assert_eq!(
-                vala_sql::queries::audit_outbox::mark_audit_shipped(&mut conn, 1, 1, &[0x0Bu8; 16])
-                    .await
-                    .unwrap(),
-                1
-            );
-            conn.commit().await.unwrap();
-
-            // Nothing left to claim.
-            let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_a)
-                .await
-                .unwrap();
-            let remaining = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 100)
-                .await
-                .unwrap();
-            conn.commit().await.unwrap();
-            assert!(remaining.is_empty(), "all rows shipped");
         }
 
         #[tokio::test]

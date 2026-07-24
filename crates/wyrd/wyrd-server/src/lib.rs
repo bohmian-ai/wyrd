@@ -18,10 +18,7 @@ pub mod vala_query;
 pub(crate) mod test_support;
 
 pub use app::{BootExit, BoundServer, WyrdServer, run, serve};
-pub use boot::{
-    RelayConfig, ServerBootError, StateOverrides, build_state, spawn_audit_relay,
-    spawn_storage_sweeper,
-};
+pub use boot::{ServerBootError, StateOverrides, build_state, spawn_storage_sweeper};
 pub use config::{ServeMode, WyrdServerConfig};
 pub use http::build_router;
 pub use postgres::{ServerPostgres, ServerPostgresError};

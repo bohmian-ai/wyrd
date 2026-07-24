@@ -40,9 +40,9 @@ enterprise security review, SOC 2 audit, or EU AI Act assessment reads first.
   (`WYRD_VALA_500_AUDIT_UNAVAILABLE`).
 - **Tamper-evident.** Per-tenant gapless `seq` + hash chain
   (`entry_hash = SHA256(prev ‖ canonical(event))`) + append-only trigger + RLS.
-- **Durable + queryable.** Background relay ships events to
-  `vala.system.audit_log`, idempotent by `wyrd_batch_id`; replayable by
-  `Wyrd-Request-Id`.
+- **Durable.** Audit rows are immutable in the tenant-scoped Postgres outbox;
+  Redux defines the canonical `vala.system.audit_log` projection for analytical
+  ingestion.
 - **Decisions audited automatically.** Every `/v1/authz/check` allow/deny emits
   a `PolicyInvokeDecision` observation; Agent→Agent edges are derived from
   observed hops.
@@ -90,5 +90,5 @@ each is explicitly scoped.
   is a **dev-time** code-axis bridge for work that predates a registered card.
   It is currently unwired and deferred; it is **not** the runtime card-anchoring
   mechanism (that is the JWT `principal.card_ref`).
-- ABAC/CEL attribute policy, query admission control, and audit sealing are
-  enterprise / Stage-5 features, not in the Stage-3 data-plane floor.
+- ABAC/CEL attribute policy and query admission control are enterprise /
+  Stage-5 features, not in the Stage-3 data-plane floor.

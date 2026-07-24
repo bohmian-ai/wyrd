@@ -9,8 +9,8 @@
 //! enforcement is the service's job, not the interceptor's.
 //!
 //! `wyrd-request-id`: the interceptor reads the inbound correlator or mints a
-//! `UUIDv7` when absent, so `olap_commits` attribution and the C5 audit event
-//! carry the same id the HTTP routes use.
+//! `UUIDv7` when absent so the C5 audit event carries the same id the HTTP
+//! routes use.
 
 use std::sync::Arc;
 

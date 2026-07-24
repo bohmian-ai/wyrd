@@ -240,6 +240,16 @@ impl WyrdTestServer {
         Ok(())
     }
 
+    /// Cancel bound server workers without dropping the server-owned fixtures.
+    ///
+    /// Gated journeys use this to verify worker cleanup and then inspect or
+    /// drain durable state before [`Self::shutdown`] releases the test database.
+    pub fn cancel_bound_workers(&self) {
+        if let Some(token) = &self.shutdown_token {
+            token.cancel();
+        }
+    }
+
     /// Flush the server-owned Scribe through its normal post-commit seal path.
     ///
     /// This is intentionally test-tier only: production callers use the
@@ -1346,7 +1356,6 @@ impl WyrdTestServerBuilder {
                 trusted_issuer_resolver: Some(issuer_resolver),
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
-                audit_seal_key: None,
             });
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
@@ -1661,7 +1670,6 @@ pub(crate) async fn test_catalog(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
         Arc::new(fixture.app_pool().clone()),
-        None,
     )
     .await
     .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;

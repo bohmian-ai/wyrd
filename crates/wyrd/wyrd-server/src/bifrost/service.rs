@@ -215,7 +215,7 @@ mod pg_tests {
         .expect("local storage handle");
         let pool = crate::test_support::test_pool().await;
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         AppState::new(
             postgres,

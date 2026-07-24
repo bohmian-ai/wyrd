@@ -517,7 +517,7 @@ fn fsynced_frames_replay_exactly() {
 }
 
 #[tokio::test]
-async fn invalid_legacy_append_rejects_before_writer_admission() {
+async fn projected_append_without_event_time_rejects_before_writer_admission() {
     let scribe = ScribeImpl::new();
     let mut request = append(crate::test_support::tenant(), 1);
     request.rows = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(

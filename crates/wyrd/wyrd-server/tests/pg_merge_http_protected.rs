@@ -43,7 +43,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");

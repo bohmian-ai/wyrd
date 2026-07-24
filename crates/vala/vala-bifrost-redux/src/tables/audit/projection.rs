@@ -63,12 +63,6 @@ pub enum AuditProjectionError {
         field: &'static str,
         value: String,
     },
-    #[error("audit row {index} has a ship_batch_id with length {length}, expected 16 bytes")]
-    InvalidBatchIdLength { index: usize, length: usize },
-    #[error("audit range mixes rows with and without ship_batch_id")]
-    MixedBatchIdPresence,
-    #[error("audit range contains different ship_batch_id values")]
-    MixedBatchIds,
     #[error("audit range sequence overflow")]
     SequenceOverflow,
     #[error("audit content schema construction failed: {0}")]
@@ -81,14 +75,11 @@ pub fn project_audit_rows(
     rows: &[AuditOutboxRow],
 ) -> Result<AuditProjection, AuditProjectionError> {
     let range = validate_range(authenticated_tenant, rows)?;
-    let batch_id = range
-        .batch_id
-        .unwrap_or_else(|| derive_batch_id(authenticated_tenant, range.seq_lo, range.seq_hi));
     Ok(AuditProjection {
         tenant: authenticated_tenant,
         seq_lo: range.seq_lo,
         seq_hi: range.seq_hi,
-        batch_id,
+        batch_id: derive_batch_id(authenticated_tenant, range.seq_lo, range.seq_hi),
         rows: project_record_batch(rows)?,
     })
 }
@@ -96,7 +87,6 @@ pub fn project_audit_rows(
 struct ValidatedAuditRange {
     seq_lo: i64,
     seq_hi: i64,
-    batch_id: Option<[u8; 16]>,
 }
 
 fn validate_range(
@@ -112,9 +102,6 @@ fn validate_range(
 
     let seq_lo = rows[0].seq;
     let mut expected_seq = seq_lo;
-    let mut ship_batch_id = None;
-    let mut saw_missing_batch_id = false;
-
     for (index, row) in rows.iter().enumerate() {
         if row.data_tenant_id != authenticated_tenant.as_uuid() {
             return Err(AuditProjectionError::TenantMismatch {
@@ -147,56 +134,13 @@ fn validate_range(
         validate_enum(index, "result", &row.result, ["success", "failure"])?;
 
         let _ = (entry_hash, prev_hash);
-        validate_ship_batch_id(
-            index,
-            row.ship_batch_id.as_deref(),
-            &mut ship_batch_id,
-            &mut saw_missing_batch_id,
-        )?;
     }
 
     let seq_hi = rows
         .last()
         .map(|row| row.seq)
         .ok_or(AuditProjectionError::Empty)?;
-    Ok(ValidatedAuditRange {
-        seq_lo,
-        seq_hi,
-        batch_id: ship_batch_id,
-    })
-}
-
-fn validate_ship_batch_id(
-    index: usize,
-    bytes: Option<&[u8]>,
-    ship_batch_id: &mut Option<[u8; 16]>,
-    saw_missing_batch_id: &mut bool,
-) -> Result<(), AuditProjectionError> {
-    if let Some(bytes) = bytes {
-        if *saw_missing_batch_id {
-            return Err(AuditProjectionError::MixedBatchIdPresence);
-        }
-        let id: [u8; 16] =
-            bytes
-                .try_into()
-                .map_err(|_| AuditProjectionError::InvalidBatchIdLength {
-                    index,
-                    length: bytes.len(),
-                })?;
-        if let Some(existing) = ship_batch_id {
-            if *existing != id {
-                return Err(AuditProjectionError::MixedBatchIds);
-            }
-        } else {
-            *ship_batch_id = Some(id);
-        }
-    } else {
-        if ship_batch_id.is_some() {
-            return Err(AuditProjectionError::MixedBatchIdPresence);
-        }
-        *saw_missing_batch_id = true;
-    }
-    Ok(())
+    Ok(ValidatedAuditRange { seq_lo, seq_hi })
 }
 
 fn project_record_batch(rows: &[AuditOutboxRow]) -> Result<RecordBatch, AuditProjectionError> {
@@ -350,7 +294,7 @@ mod tests {
         DataTenantId::new(Uuid::from_bytes(bytes)).expect("UUIDv7 test tenant")
     }
 
-    fn row(tenant: DataTenantId, seq: i64, ship_batch_id: Option<Vec<u8>>) -> AuditOutboxRow {
+    fn row(tenant: DataTenantId, seq: i64) -> AuditOutboxRow {
         AuditOutboxRow {
             data_tenant_id: tenant.as_uuid(),
             seq,
@@ -373,14 +317,13 @@ mod tests {
                 .timestamp_micros(1_700_000_000_000_000 + seq)
                 .single()
                 .expect("valid test timestamp"),
-            ship_batch_id,
         }
     }
 
     #[test]
     fn projects_canonical_content_and_derives_missing_batch_id() {
         let authenticated = tenant(1);
-        let rows = vec![row(authenticated, 7, None), row(authenticated, 8, None)];
+        let rows = vec![row(authenticated, 7), row(authenticated, 8)];
         let projection = project_audit_rows(authenticated, &rows).expect("valid projection");
 
         assert_eq!(projection.tenant, authenticated);
@@ -415,18 +358,6 @@ mod tests {
     }
 
     #[test]
-    fn preserves_one_pre_stamped_batch_id() {
-        let authenticated = tenant(2);
-        let batch_id = vec![0x11; 16];
-        let rows = vec![
-            row(authenticated, 1, Some(batch_id.clone())),
-            row(authenticated, 2, Some(batch_id.clone())),
-        ];
-        let projection = project_audit_rows(authenticated, &rows).expect("valid projection");
-        assert_eq!(projection.batch_id, [0x11; 16]);
-    }
-
-    #[test]
     fn rejects_empty_rows() {
         assert!(matches!(
             project_audit_rows(tenant(1), &[]),
@@ -437,10 +368,7 @@ mod tests {
     #[test]
     fn rejects_nil_authenticated_tenant() {
         assert!(matches!(
-            project_audit_rows(
-                crate::test_support::nil_tenant(),
-                &[row(tenant(1), 1, None)]
-            ),
+            project_audit_rows(crate::test_support::nil_tenant(), &[row(tenant(1), 1)]),
             Err(AuditProjectionError::NilAuthenticatedTenant)
         ));
     }
@@ -450,7 +378,7 @@ mod tests {
         let authenticated = tenant(1);
         let other = tenant(2);
         assert!(matches!(
-            project_audit_rows(authenticated, &[row(other, 1, None)]),
+            project_audit_rows(authenticated, &[row(other, 1)]),
             Err(AuditProjectionError::TenantMismatch { index: 0, .. })
         ));
     }
@@ -461,7 +389,7 @@ mod tests {
         assert!(matches!(
             project_audit_rows(
                 authenticated,
-                &[row(authenticated, 1, None), row(authenticated, 3, None)]
+                &[row(authenticated, 1), row(authenticated, 3)]
             ),
             Err(AuditProjectionError::NonContiguousSequence {
                 index: 1,
@@ -474,7 +402,7 @@ mod tests {
     #[test]
     fn rejects_invalid_hash_and_enum_values() {
         let authenticated = tenant(1);
-        let mut bad_hash = row(authenticated, 1, None);
+        let mut bad_hash = row(authenticated, 1);
         bad_hash.entry_hash.pop();
         assert!(matches!(
             project_audit_rows(authenticated, &[bad_hash]),
@@ -484,7 +412,7 @@ mod tests {
             })
         ));
 
-        let mut bad_enum = row(authenticated, 1, None);
+        let mut bad_enum = row(authenticated, 1);
         bad_enum.decision = "maybe".to_owned();
         assert!(matches!(
             project_audit_rows(authenticated, &[bad_enum]),
@@ -492,33 +420,6 @@ mod tests {
                 field: "decision",
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_or_mixed_batch_ids() {
-        let authenticated = tenant(1);
-        let mut invalid = row(authenticated, 1, Some(vec![1; 15]));
-        assert!(matches!(
-            project_audit_rows(authenticated, &[invalid.clone()]),
-            Err(AuditProjectionError::InvalidBatchIdLength { .. })
-        ));
-
-        invalid.seq = 2;
-        invalid.ship_batch_id = Some(vec![2; 16]);
-        assert!(matches!(
-            project_audit_rows(
-                authenticated,
-                &[row(authenticated, 1, None), invalid.clone()]
-            ),
-            Err(AuditProjectionError::MixedBatchIdPresence)
-        ));
-        assert!(matches!(
-            project_audit_rows(
-                authenticated,
-                &[row(authenticated, 1, Some(vec![1; 16])), invalid]
-            ),
-            Err(AuditProjectionError::MixedBatchIds)
         ));
     }
 }

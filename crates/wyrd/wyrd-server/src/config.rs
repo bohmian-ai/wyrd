@@ -583,15 +583,6 @@ pub struct AuthConfig {
     /// and are harmless. Tracked in issue #72.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
-    /// Dedicated Ed25519 audit-seal key PEM (PKCS#8).
-    ///
-    /// Env-injected only — never read from the TOML file. Loaded at config time
-    /// from `WYRD_AUDIT_SEAL_KEY_FILE` (path to a mounted secret; primary) or
-    /// `WYRD_AUDIT_SEAL_KEY_PEM` (inline PEM; fallback). Not the JWT issuing key.
-    /// `None` when unset; `POST /v1/admin/audit/verify` returns a server error
-    /// when the key is absent.
-    #[serde(skip)]
-    pub audit_seal_key: Option<SecretString>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1080,11 +1071,6 @@ impl WyrdServerConfig {
             self.auth.sealing_key = Some(key);
         }
 
-        // auth.audit_seal_key (WYRD_AUDIT_SEAL_KEY_FILE primary, WYRD_AUDIT_SEAL_KEY_PEM fallback)
-        if let Some(key) = load_audit_seal_key()? {
-            self.auth.audit_seal_key = Some(key);
-        }
-
         Ok(())
     }
 
@@ -1397,32 +1383,6 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
             Ok(Some(SecretString::from(encoded.trim().to_owned())))
         }
         (None, Some(encoded)) => Ok(Some(SecretString::from(encoded.trim().to_owned()))),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Load the Ed25519 audit-seal key PEM from the environment.
-///
-/// `WYRD_AUDIT_SEAL_KEY_FILE` (a path to a mounted secret) is the primary
-/// source; `WYRD_AUDIT_SEAL_KEY_PEM` (inline PEM) is the fallback. Setting
-/// both is a configuration error.
-fn load_audit_seal_key() -> Result<Option<SecretString>, ConfigError> {
-    let file = env_opt("WYRD_AUDIT_SEAL_KEY_FILE")?;
-    let inline = env_opt("WYRD_AUDIT_SEAL_KEY_PEM")?;
-    match (file, inline) {
-        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
-            keys: vec![
-                "WYRD_AUDIT_SEAL_KEY_FILE".to_string(),
-                "WYRD_AUDIT_SEAL_KEY_PEM".to_string(),
-            ],
-        }),
-        (Some(path), None) => {
-            let path = PathBuf::from(path);
-            let pem = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
-            Ok(Some(SecretString::from(pem)))
-        }
-        (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
         (None, None) => Ok(None),
     }
 }

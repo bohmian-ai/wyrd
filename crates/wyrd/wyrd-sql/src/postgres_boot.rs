@@ -20,13 +20,13 @@ use sqlx::AssertSqlSafe;
 use crate::dsn::DsnError;
 use crate::pool::build_pool;
 use role_bootstrap::{
-    VALA_RECOVERY_ROLE, WYRD_APP_ROLE, WYRD_CATALOG_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE,
+    WYRD_APP_ROLE, WYRD_CATALOG_APP_ROLE, WYRD_DATABASE, WYRD_MIGRATOR_ROLE,
     WYRD_PLATFORM_ADMIN_ROLE, role_bootstrap_sql,
 };
 
 pub use crate::dsn::{
     APP_DSN_ENV, CATALOG_APP_PASSWORD_ENV, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV,
-    RECOVERY_PASSWORD_ENV, ResolvedDsns, with_catalog_options,
+    ResolvedDsns, with_catalog_options,
 };
 pub use crate::pool::PoolConfig;
 
@@ -66,8 +66,6 @@ pub enum PostgresBoot {
         platform_admin_dsn: Option<SecretString>,
         /// Bifrost catalog DSN (`wyrd_catalog_app` + role/search_path options).
         catalog_app_dsn: SecretString,
-        /// Catalog recovery DSN (`vala_recovery`).
-        recovery_dsn: SecretString,
     },
     /// Embedded Postgres handle.
     Embedded(EmbeddedPgHandle),
@@ -87,7 +85,6 @@ impl fmt::Debug for PostgresBoot {
                     &platform_admin_dsn.as_ref().map(|_| "<redacted>"),
                 )
                 .field("catalog_app_dsn", &"<redacted>")
-                .field("recovery_dsn", &"<redacted>")
                 .finish(),
             Self::Embedded(handle) => f
                 .debug_tuple("PostgresBoot::Embedded")
@@ -118,7 +115,6 @@ impl PostgresBoot {
                 migrator_dsn: dsns.migrator,
                 platform_admin_dsn: dsns.platform_admin,
                 catalog_app_dsn: dsns.catalog_app,
-                recovery_dsn: dsns.recovery,
             }),
             None => Self::embedded(EmbeddedConfig::default()).await,
         }
@@ -148,13 +144,11 @@ impl PostgresBoot {
                 migrator_dsn,
                 platform_admin_dsn,
                 catalog_app_dsn,
-                recovery_dsn,
             } => Ok(ResolvedDsns {
                 app: app_dsn.clone(),
                 migrator: migrator_dsn.clone(),
                 platform_admin: platform_admin_dsn.clone(),
                 catalog_app: catalog_app_dsn.clone(),
-                recovery: recovery_dsn.clone(),
             }),
             Self::Embedded(handle) => handle.resolved_dsns(),
         }
@@ -166,21 +160,18 @@ impl PostgresBoot {
         migrator_password: Option<SecretString>,
         platform_admin_password: Option<SecretString>,
         catalog_app_password: Option<SecretString>,
-        recovery_password: Option<SecretString>,
     ) -> Result<Self, BootError> {
         match crate::dsn::resolve_external_dsns(
             app,
             migrator_password,
             platform_admin_password,
             catalog_app_password,
-            recovery_password,
         )? {
             Some(dsns) => Ok(Self::External {
                 app_dsn: dsns.app,
                 migrator_dsn: dsns.migrator,
                 platform_admin_dsn: dsns.platform_admin,
                 catalog_app_dsn: dsns.catalog_app,
-                recovery_dsn: dsns.recovery,
             }),
             None => Self::embedded(EmbeddedConfig::default()).await,
         }
@@ -278,19 +269,11 @@ impl EmbeddedPgHandle {
             self.port,
             WYRD_DATABASE,
         )));
-        let recovery = embedded_dsn(
-            VALA_RECOVERY_ROLE,
-            self.credentials.recovery.expose_secret(),
-            self.port,
-            WYRD_DATABASE,
-        );
-
         Ok(ResolvedDsns {
             app: SecretString::from(app),
             migrator: SecretString::from(migrator),
             platform_admin: Some(SecretString::from(platform_admin)),
             catalog_app,
-            recovery: SecretString::from(recovery),
         })
     }
 
@@ -379,8 +362,6 @@ pub struct EmbeddedDataDirs {
     pub platform_admin_secret: PathBuf,
     /// Persisted `wyrd_catalog_app` password path.
     pub catalog_app_secret: PathBuf,
-    /// Persisted `vala_recovery` password path.
-    pub recovery_secret: PathBuf,
 }
 
 impl EmbeddedDataDirs {
@@ -394,7 +375,6 @@ impl EmbeddedDataDirs {
             app_secret: role_credentials.join("wyrd_app.secret"),
             platform_admin_secret: role_credentials.join("wyrd_platform_admin.secret"),
             catalog_app_secret: role_credentials.join("wyrd_catalog_app.secret"),
-            recovery_secret: role_credentials.join("vala_recovery.secret"),
             role_credentials,
             root,
         }
@@ -407,7 +387,6 @@ pub(crate) struct EmbeddedRoleCredentials {
     pub(crate) app: SecretString,
     pub(crate) platform_admin: SecretString,
     pub(crate) catalog_app: SecretString,
-    pub(crate) recovery: SecretString,
 }
 
 impl EmbeddedRoleCredentials {
@@ -429,7 +408,6 @@ impl EmbeddedRoleCredentials {
             app: read_or_create_secret(&dirs.app_secret)?,
             platform_admin: read_or_create_secret(&dirs.platform_admin_secret)?,
             catalog_app: read_or_create_secret(&dirs.catalog_app_secret)?,
-            recovery: read_or_create_secret(&dirs.recovery_secret)?,
         })
     }
 }
@@ -635,7 +613,7 @@ mod tests {
     use super::{
         APP_DSN_ENV, BootError, CATALOG_APP_PASSWORD_ENV, DsnError, EmbeddedConfig,
         EmbeddedRoleCredentials, MIGRATOR_PASSWORD_ENV, PLATFORM_ADMIN_PASSWORD_ENV, PostgresBoot,
-        RECOVERY_PASSWORD_ENV, SecretString, write_embedded_postgres_config,
+        SecretString, write_embedded_postgres_config,
     };
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -644,11 +622,9 @@ mod tests {
     const MIGRATOR_PW: &str = "migrator-secret";
     const ADMIN_PW: &str = "admin-secret";
     const CATALOG_PW: &str = "catalog-secret";
-    const RECOVERY_PW: &str = "recovery-secret";
     const EXPECTED_MIGRATOR_DSN: &str = "postgres://wyrd_migrator:migrator-secret@localhost/wyrd";
     const EXPECTED_ADMIN_DSN: &str = "postgres://wyrd_platform_admin:admin-secret@localhost/wyrd";
     const EXPECTED_CATALOG_DSN: &str = "postgres://wyrd_catalog_app:catalog-secret@localhost/wyrd?options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog";
-    const EXPECTED_RECOVERY_DSN: &str = "postgres://vala_recovery:recovery-secret@localhost/wyrd";
 
     #[tokio::test]
     async fn external_with_app_and_migrator_password_allows_dedicated_mode() {
@@ -657,7 +633,6 @@ mod tests {
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             None,
             Some(SecretString::from(CATALOG_PW.to_owned())),
-            Some(SecretString::from(RECOVERY_PW.to_owned())),
         )
         .await
         .expect("external boot resolves");
@@ -667,7 +642,6 @@ mod tests {
         assert_eq!(dsns.migrator.expose_secret(), EXPECTED_MIGRATOR_DSN);
         assert!(dsns.platform_admin.is_none());
         assert_eq!(dsns.catalog_app.expose_secret(), EXPECTED_CATALOG_DSN);
-        assert_eq!(dsns.recovery.expose_secret(), EXPECTED_RECOVERY_DSN);
     }
 
     #[tokio::test]
@@ -677,7 +651,6 @@ mod tests {
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             Some(SecretString::from(ADMIN_PW.to_owned())),
             Some(SecretString::from(CATALOG_PW.to_owned())),
-            Some(SecretString::from(RECOVERY_PW.to_owned())),
         )
         .await
         .expect("external boot resolves");
@@ -693,7 +666,6 @@ mod tests {
             EXPECTED_ADMIN_DSN
         );
         assert_eq!(dsns.catalog_app.expose_secret(), EXPECTED_CATALOG_DSN);
-        assert_eq!(dsns.recovery.expose_secret(), EXPECTED_RECOVERY_DSN);
     }
 
     #[tokio::test]
@@ -711,7 +683,6 @@ mod tests {
                 migrator.map(|pw| SecretString::from(pw.to_owned())),
                 admin.map(|pw| SecretString::from(pw.to_owned())),
                 None,
-                None,
             )
             .await;
 
@@ -726,7 +697,6 @@ mod tests {
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             None,
             Some(SecretString::from(CATALOG_PW.to_owned())),
-            Some(SecretString::from(RECOVERY_PW.to_owned())),
         )
         .await;
         assert!(matches!(
@@ -745,7 +715,6 @@ mod tests {
             Some(SecretString::from(MIGRATOR_PW.to_owned())),
             Some(SecretString::from(ADMIN_PW.to_owned())),
             Some(SecretString::from(CATALOG_PW.to_owned())),
-            Some(SecretString::from(RECOVERY_PW.to_owned())),
         )
         .await
         .expect("external boot resolves");
@@ -766,10 +735,6 @@ mod tests {
             dsns.catalog_app.expose_secret(),
             "postgres://wyrd_catalog_app:catalog-secret@db.example.com:6543/wyrd_prod?sslmode=require&options=-c%20role%3Dwyrd_catalog%20-c%20search_path%3Diceberg_catalog"
         );
-        assert_eq!(
-            dsns.recovery.expose_secret(),
-            "postgres://vala_recovery:recovery-secret@db.example.com:6543/wyrd_prod?sslmode=require"
-        );
     }
 
     #[test]
@@ -779,7 +744,6 @@ mod tests {
             migrator_dsn: EXPECTED_MIGRATOR_DSN.to_owned().into(),
             platform_admin_dsn: Some(EXPECTED_ADMIN_DSN.to_owned().into()),
             catalog_app_dsn: APP_URL.to_owned().into(),
-            recovery_dsn: APP_URL.to_owned().into(),
         };
         let rendered = format!("{boot:?}");
 
@@ -907,13 +871,11 @@ mod tests {
                 MIGRATOR_PASSWORD_ENV,
                 PLATFORM_ADMIN_PASSWORD_ENV,
                 CATALOG_APP_PASSWORD_ENV,
-                RECOVERY_PASSWORD_ENV,
             ]);
             set_env(APP_DSN_ENV, Some(APP_URL));
             set_env(MIGRATOR_PASSWORD_ENV, Some(MIGRATOR_PW));
             set_env(PLATFORM_ADMIN_PASSWORD_ENV, None);
             set_env(CATALOG_APP_PASSWORD_ENV, Some(CATALOG_PW));
-            set_env(RECOVERY_PASSWORD_ENV, Some(RECOVERY_PW));
             previous
         };
         // current_thread flavor: from_env() reads env vars before its first await,
@@ -931,7 +893,6 @@ mod tests {
         assert_eq!(dsns.app.expose_secret(), APP_URL);
         assert_eq!(dsns.migrator.expose_secret(), EXPECTED_MIGRATOR_DSN);
         assert_eq!(dsns.catalog_app.expose_secret(), EXPECTED_CATALOG_DSN);
-        assert_eq!(dsns.recovery.expose_secret(), EXPECTED_RECOVERY_DSN);
     }
 
     use std::path::PathBuf;

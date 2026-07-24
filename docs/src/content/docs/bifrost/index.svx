@@ -103,9 +103,9 @@ The `POST /v1/observations/query` endpoint accepts raw SQL against the same tabl
 ## What's next
 
 - [Quickstart](./quickstart): emit and query an observation end-to-end
-- [Architecture](./architecture): `DomainTable`, system columns, audit relay, schema fingerprinting
+- [Architecture](./architecture): `DomainTable`, system columns, audit data, schema fingerprinting
 - [Schema](./schema): the pre-declared tables and their physical schemas
 - [Writing data](./writing-data): `vala-sdk` producer, batching, governance
 - [Reading data](./reading-data): typed methods, pagination, permissions, generic SQL
 - [SLOs](./slos): performance targets
-- [Data plane internals](./data-plane-internals): WAL and seal state machine, `vala.file_list`, Forge tick, audit sealing, database privilege model
+- [Data plane internals](./data-plane-internals): WAL and seal state machine, `vala.file_list`, Forge tick, audit data, database privilege model

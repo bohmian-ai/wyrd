@@ -2,7 +2,6 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::audit::AuditCommand;
 use crate::auth::AuthCommand;
 use crate::dev::DevCommand;
 use crate::eval::run::EvalCommand;
@@ -20,9 +19,6 @@ pub struct Cli {
 /// Top-level CLI verbs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Audit log commands (verify seal checkpoints).
-    #[command(subcommand)]
-    Audit(AuditCommand),
     /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),

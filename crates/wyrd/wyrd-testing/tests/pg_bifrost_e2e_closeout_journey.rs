@@ -151,14 +151,14 @@ async fn run_closeout_journey(
         "durable readback must include every unique frame row"
     );
 
+    let mut conn = wyrd_sql::TenantConn::acquire(cluster.pg_fixture().app_pool(), tenant).await?;
     let audit_principals: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT principal_id)::bigint
            FROM vala.audit_outbox
-          WHERE data_tenant_id = $1 AND resource = $2",
+          WHERE data_tenant_id = wyrd.current_tenant() AND resource = $1",
     )
-    .bind(tenant.as_uuid())
     .bind(TABLE_FQN)
-    .fetch_one(cluster.pg_fixture().platform_admin_pool())
+    .fetch_one(&mut **conn.transaction())
     .await?;
     assert!(audit_principals >= 3, "audit rows retain verified callers");
     Ok(())

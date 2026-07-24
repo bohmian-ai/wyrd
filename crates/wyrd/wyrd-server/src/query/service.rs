@@ -475,10 +475,8 @@ mod pg_tests {
     use wyrd_spec::vala::api::AsyncJobState;
     use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
-    /// True when an audit-outbox row for `request_id` with the given `decision`
-    /// exists. Reads via the cross-tenant relay claim (SECURITY DEFINER) so the
-    /// assertion is independent of the reader's tenant bind; `request_id` is a
-    /// fresh UUIDv7 per caller, so the match is unique across the test binary.
+    /// True when a tenant-scoped query audit row for `request_id` and `decision`
+    /// exists.
     async fn has_audit(
         pool: &sqlx::PgPool,
         tenant: DataTenantId,
@@ -488,9 +486,14 @@ mod pg_tests {
         let mut conn = TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
-        let rows = vala_sql::queries::audit_outbox::claim_unshipped_audit(&mut conn, 10_000)
-            .await
-            .expect("claim audit rows");
+        let rows = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+            &mut conn,
+            "vala.query",
+            0,
+            10_000,
+        )
+        .await
+        .expect("list audit rows");
         conn.commit().await.expect("commit");
         rows.iter()
             .any(|r| r.request_id == request_id && r.decision == decision)
@@ -514,7 +517,7 @@ mod pg_tests {
         .expect("local storage handle");
         let pool = crate::test_support::test_pool().await;
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         AppState::new(
             postgres,

@@ -177,11 +177,15 @@ async fn journey_forge_scheduler_single_pod_end_to_end() {
         .await
         .expect("journey table");
     assert!(table.metadata().current_snapshot_id().is_some());
+    let mut conn = context
+        .vala
+        .tenant_conn(tenant)
+        .await
+        .expect("audit tenant connection");
     let audit_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation IN ('forge.file_compact.prepared', 'forge.file_compact.committed')",
+        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = wyrd.current_tenant() AND operation IN ('forge.file_compact.prepared', 'forge.file_compact.committed')",
     )
-    .bind(tenant.as_uuid())
-    .fetch_one(context.operator_pool.pool())
+    .fetch_one(&mut **conn.transaction())
     .await
     .expect("audit count");
     assert_eq!(audit_count, 2);

@@ -49,7 +49,6 @@ async fn shared() -> &'static SharedCatalog {
                 catalog_dsn.expose_secret(),
                 storage.backend_config(),
                 Arc::new(fixture.app_pool().clone()),
-                None,
             )
             .await
             .expect("catalog builds against embedded postgres");

@@ -6,6 +6,5 @@
 //! in process — exactly what an operator runs — instead of re-implementing the
 //! admin wire calls.
 
-pub mod audit;
 pub mod auth;
 pub mod error;

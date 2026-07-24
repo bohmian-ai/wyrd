@@ -84,7 +84,7 @@ mod pg_tests {
         assert_upload_status(&admin_pool, expired_pending, "aborted").await;
         assert_upload_status(&admin_pool, orphan_initiating, "aborted").await;
         assert_upload_status(&admin_pool, live_pending, "pending").await;
-        assert_audit_count(&admin_pool, tenant, 3).await;
+        assert_audit_count(fixture.app_pool(), tenant, 3).await;
         assert_idempotency_count(&admin_pool, "expired-key", 0).await;
         assert_idempotency_count(&admin_pool, "live-key", 1).await;
     }
@@ -128,7 +128,7 @@ mod pg_tests {
 
         sweeper.tick().await.expect("tick runs");
 
-        assert_audit_count(&admin_pool, tenant, 0).await;
+        assert_audit_count(fixture.app_pool(), tenant, 0).await;
     }
 
     async fn local_storage_handle() -> std::sync::Arc<StorageHandle> {
@@ -265,20 +265,22 @@ mod pg_tests {
     }
 
     async fn assert_audit_count(
-        admin_pool: &sqlx::PgPool,
+        app_pool: &sqlx::PgPool,
         tenant: wyrd_spec::DataTenantId,
         expected: i64,
     ) {
+        let mut conn = wyrd_sql::TenantConn::acquire(app_pool, tenant)
+            .await
+            .expect("tenant conn");
         let count = sqlx::query_scalar::<_, i64>(
             r"
         SELECT count(*)
         FROM vala.audit_outbox
-        WHERE data_tenant_id = $1
+        WHERE data_tenant_id = wyrd.current_tenant()
           AND operation = 'storage.reclaimed'
         ",
         )
-        .bind(tenant.as_uuid())
-        .fetch_one(admin_pool)
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("fetch audit count");
 

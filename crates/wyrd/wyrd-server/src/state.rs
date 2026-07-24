@@ -65,10 +65,9 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
-    /// Redux-owned tenant-qualified catalog used by Gate, Scribe, Forge, and Oracle.
+    /// Tenant-qualified catalog used by Gate, Scribe, and Forge.
     ///
-    /// The legacy catalog remains separate while old read/maintenance paths
-    /// coexist. No Redux component receives the legacy handle.
+    /// Oracle reads continue through `bifrost` until the Redux query owner lands.
     pub bifrost_redux: Option<Arc<BifrostCatalog>>,
     /// Private lifecycle handle for the booted Scribe runtime. Request handlers
     /// use `gate`; this field exists only for startup recovery and shutdown.
@@ -412,7 +411,7 @@ mod pg_tests {
     async fn test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");

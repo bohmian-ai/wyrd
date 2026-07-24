@@ -278,9 +278,11 @@ The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `Se
 
 The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
 
-## Audit relay
+## Audit data
 
-Every Bifrost write operation appends audit rows atomically with the `vala.file_list` INSERT. Audit records are hash-chained and Ed25519-signed at seal boundaries. A separate audit relay worker tails the audit outbox and ships finalized records to long-term storage on a configurable schedule.
+Audited operations append immutable, hash-chained rows to
+`vala.audit_outbox` in their Postgres transaction. Redux owns the canonical
+`vala.system.audit_log` table definition and deterministic row projection.
 
 The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.
 

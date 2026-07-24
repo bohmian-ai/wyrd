@@ -5,7 +5,6 @@ pub mod bootstrap;
 pub mod issuer;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use base64::Engine;
 use secrecy::ExposeSecret;
@@ -28,19 +27,14 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_sql::pool::{PoolConfig, build_pool};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
-
-use metrics::{counter, gauge};
-use vala_bifrost::reconcile::reconcile_audit;
-use vala_bifrost::relay::AuditRelay;
 
 use crate::auth::pg_resolvers::{PgIssuerResolver, PgWorkloadBindingResolver};
 use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
-use crate::config::{DeploymentProfile, WorkloadBindingEntry};
+use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, ProductionValidationError};
 
@@ -136,42 +130,6 @@ pub enum ServerBootError {
     /// Production-profile state validation failed.
     #[error(transparent)]
     ProductionValidation(#[from] ProductionValidationError),
-    /// `WYRD_VALA_500_AUDIT_RELAY_REQUIRED`: the audit relay is disabled or its
-    /// dependencies are unavailable in a production deployment. A server that
-    /// accepts auth/mutating writes while the audit outbox cannot drain to
-    /// `audit_log` must not boot (M-12 fail-closed).
-    #[error(
-        "WYRD_VALA_500_AUDIT_RELAY_REQUIRED: audit relay is required in production \
-         but is disabled or unavailable: {detail}"
-    )]
-    AuditRelayRequired {
-        /// Detail about why the relay could not be started.
-        detail: String,
-    },
-    /// `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`: the audit reconciler is disabled or
-    /// its dependencies are unavailable in a production deployment. A production server
-    /// cannot accept mutating writes without the durability proof running.
-    #[error(
-        "WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED: audit reconciler is required in \
-         production but is disabled or unavailable: {detail}"
-    )]
-    AuditReconcilerRequired {
-        /// Detail about why the reconciler could not be started.
-        detail: String,
-    },
-    /// `WYRD_VALA_500_RECOVERY_POOL_REQUIRED`: production boot requires a
-    /// `vala_recovery` pool for the commit-recovery sweep. A server that cannot
-    /// recover stale precommits risks permanent data loss and must not boot.
-    ///
-    /// Set `WYRD_RECOVERY_DSN` (or configure the `recovery` DSN slot) to
-    /// provision the `vala_recovery` SECURITY DEFINER pool before starting in
-    /// production.
-    #[error(
-        "WYRD_VALA_500_RECOVERY_POOL_REQUIRED: production deployment requires a \
-         recovery pool (vala_recovery DSN) for the commit-recovery sweep, \
-         but none is configured"
-    )]
-    RecoveryPoolRequired,
     /// The supervised Forge worker could not be assembled from the shared
     /// production catalog, storage operator, and operator pool.
     #[error("Forge scheduler context is unavailable: {detail}")]
@@ -228,14 +186,10 @@ pub async fn build_app_state_from_boot_with_config(
     );
     let storage = StorageHandle::from_settings(storage_settings).await?;
     tracing::info!(backend = %storage.backend(), "storage handle ready");
-    let recovery_pool = build_pool(dsns.recovery.expose_secret(), PoolConfig::default())
-        .await
-        .map_err(ServerBootError::PoolConnect)?;
     let bifrost = WyrdCatalog::new(
         dsns.catalog_app.expose_secret(),
         storage.backend_config(),
         Arc::new(postgres.app_pool().clone()),
-        Some(Arc::new(recovery_pool)),
     )
     .await?;
     let bifrost = Arc::new(bifrost);
@@ -560,8 +514,6 @@ async fn install_auth(
         }
     };
 
-    let audit_seal_key = build_audit_seal_key(config)?;
-
     Ok(state.with_auth(ServerAuth {
         allow_preview: config.auth.allow_preview,
         issuing_key: Some(issuing_key),
@@ -569,7 +521,6 @@ async fn install_auth(
         trusted_issuer_resolver: Some(Arc::clone(&issuer_resolver)),
         workload_binding_resolver: Some(binding_resolver),
         sealing_key: sealing_key.clone(),
-        audit_seal_key,
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
     }))
 }
@@ -644,21 +595,6 @@ fn build_sealing_key(
         ))
     })?;
     Ok(Some(Arc::new(SecretKey::from_bytes(key))))
-}
-
-/// Load and parse the dedicated Ed25519 audit-seal key from config.
-///
-/// Returns `None` when `WYRD_AUDIT_SEAL_KEY_FILE`/`WYRD_AUDIT_SEAL_KEY_PEM`
-/// are absent. Returns `Err` when the PEM is present but invalid.
-fn build_audit_seal_key(
-    config: &crate::config::WyrdServerConfig,
-) -> Result<Option<Arc<wyrd_auth_issue::AuditSealKey>>, ServerBootError> {
-    let Some(pem) = config.auth.audit_seal_key.as_ref() else {
-        return Ok(None);
-    };
-    let key = wyrd_auth_issue::AuditSealKey::from_pkcs8_pem(pem.expose_secret())
-        .map_err(|e| ServerBootError::SigningKey(format!("WYRD_AUDIT_SEAL_KEY is invalid: {e}")))?;
-    Ok(Some(Arc::new(key)))
 }
 
 /// Map `[[workload_bindings]]` config entries to domain [`WorkloadBinding`]s, all
@@ -769,288 +705,6 @@ pub fn spawn_storage_sweeper(
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
 }
 
-/// Configuration for the background audit relay worker.
-pub struct RelayConfig {
-    /// Whether the relay is enabled (`WYRD_AUDIT_RELAY_ENABLED`, default `true`).
-    pub enabled: bool,
-    /// How long to sleep between relay ticks in milliseconds
-    /// (`WYRD_AUDIT_RELAY_TICK_MS`, default `5000`).
-    pub tick_ms: u64,
-    /// Maximum rows to claim per tick (`WYRD_AUDIT_RELAY_CLAIM_LIMIT`, default `500`).
-    pub claim_limit: i32,
-}
-
-impl RelayConfig {
-    /// Read relay configuration from the process environment.
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("WYRD_AUDIT_RELAY_ENABLED")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        let tick_ms = std::env::var("WYRD_AUDIT_RELAY_TICK_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(5_000u64);
-        let claim_limit = std::env::var("WYRD_AUDIT_RELAY_CLAIM_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(500i32);
-        Self {
-            enabled,
-            tick_ms,
-            claim_limit,
-        }
-    }
-}
-
-/// Spawn the background audit relay that drains `vala.audit_outbox` into
-/// `vala.system.audit_log`. Mirrors `spawn_storage_sweeper`.
-///
-/// **Fail-closed in production (M-12).** If the relay is disabled or the
-/// platform admin pool is unavailable in a production deployment, boot fails
-/// with [`ServerBootError::AuditRelayRequired`]. In development/staging, a
-/// disabled relay logs a warning and returns `None`.
-///
-/// # Errors
-/// Returns [`ServerBootError::AuditRelayRequired`] when the relay cannot start
-/// in production; returns `Ok(None)` when cleanly skipped in non-production.
-pub async fn spawn_audit_relay(
-    state: &AppState,
-    shutdown: CancellationToken,
-) -> Result<Option<tokio::task::JoinHandle<()>>, ServerBootError> {
-    let cfg = RelayConfig::from_env();
-    let is_production = state.deployment_profile == DeploymentProfile::Production;
-
-    if !cfg.enabled {
-        if is_production {
-            return Err(ServerBootError::AuditRelayRequired {
-                detail: "WYRD_AUDIT_RELAY_ENABLED=false is not permitted in production".to_owned(),
-            });
-        }
-        tracing::warn!("audit relay disabled via WYRD_AUDIT_RELAY_ENABLED=false (dev/test only)");
-        return Ok(None);
-    }
-
-    let Some(admin_pool) = state.postgres.platform_admin_pool() else {
-        if is_production {
-            return Err(ServerBootError::AuditRelayRequired {
-                detail: "platform admin pool is unavailable".to_owned(),
-            });
-        }
-        tracing::warn!("audit relay skipped: platform admin pool unavailable (dev/test only)");
-        return Ok(None);
-    };
-
-    let relay = AuditRelay::new(Arc::clone(&state.bifrost), Arc::new(admin_pool.clone()));
-    relay.ensure_audit_log_table().await?;
-
-    let tick_interval = Duration::from_millis(cfg.tick_ms);
-    let claim_limit = cfg.claim_limit;
-    let handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(tick_interval) => {}
-            }
-            if shutdown.is_cancelled() {
-                break;
-            }
-            if let Err(e) = relay.tick(claim_limit).await {
-                tracing::error!(error = %e, "audit relay tick failed");
-            }
-        }
-    });
-
-    Ok(Some(handle))
-}
-
-/// Configuration for the background audit reconciler worker.
-pub struct ReconcileConfig {
-    /// Whether the reconciler is enabled (`WYRD_AUDIT_RECONCILER_ENABLED`, default `true`).
-    pub enabled: bool,
-    /// How often to run reconciliation in milliseconds
-    /// (`WYRD_AUDIT_RECONCILER_TICK_MS`, default `300000` = 5 minutes).
-    pub tick_ms: u64,
-}
-
-impl ReconcileConfig {
-    /// Read reconciler configuration from the process environment.
-    pub fn from_env() -> Self {
-        let enabled = std::env::var("WYRD_AUDIT_RECONCILER_ENABLED")
-            .map(|v| v != "false" && v != "0")
-            .unwrap_or(true);
-        let tick_ms = std::env::var("WYRD_AUDIT_RECONCILER_TICK_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(300_000u64);
-        Self { enabled, tick_ms }
-    }
-}
-
-/// Spawn the background audit reconciler that verifies durability of
-/// `vala.audit_outbox` against `vala.system.audit_log`. Mirrors
-/// `spawn_audit_relay`.
-///
-/// **Fail-closed in production (M-12).** If the reconciler is disabled or the
-/// platform admin pool is unavailable in a production deployment, boot fails
-/// with `WYRD_VALA_500_AUDIT_RECONCILER_REQUIRED`. In development/staging, a
-/// disabled reconciler logs a warning and returns `None`.
-///
-/// # Errors
-/// Returns [`ServerBootError::AuditReconcilerRequired`] when the reconciler
-/// cannot start in production; returns `Ok(None)` when cleanly skipped.
-pub async fn spawn_audit_reconciler(
-    state: &AppState,
-    shutdown: CancellationToken,
-) -> Result<Option<tokio::task::JoinHandle<()>>, ServerBootError> {
-    let cfg = ReconcileConfig::from_env();
-    let is_production = state.deployment_profile == DeploymentProfile::Production;
-
-    if !cfg.enabled {
-        if is_production {
-            return Err(ServerBootError::AuditReconcilerRequired {
-                detail: "WYRD_AUDIT_RECONCILER_ENABLED=false is not permitted in production"
-                    .to_owned(),
-            });
-        }
-        tracing::warn!(
-            "audit reconciler disabled via WYRD_AUDIT_RECONCILER_ENABLED=false (dev/test only)"
-        );
-        return Ok(None);
-    }
-
-    let Some(op) = state.postgres.operator_pool() else {
-        if is_production {
-            return Err(ServerBootError::AuditReconcilerRequired {
-                detail: "platform admin pool is unavailable".to_owned(),
-            });
-        }
-        tracing::warn!("audit reconciler skipped: platform admin pool unavailable (dev/test only)");
-        return Ok(None);
-    };
-
-    let app_pool = state.postgres.vala_pool().clone();
-    let catalog = Arc::clone(&state.bifrost);
-    let tick_interval = Duration::from_millis(cfg.tick_ms);
-
-    let handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(tick_interval) => {}
-            }
-            if shutdown.is_cancelled() {
-                break;
-            }
-
-            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    tracing::error!(error = %e, "audit reconciler: tenant enumeration failed");
-                    continue;
-                }
-            };
-
-            let mut all_clean = true;
-            for raw_id in tenant_ids {
-                let tenant_id = match DataTenantId::try_from(raw_id) {
-                    Ok(id) => id,
-                    Err(_) => continue,
-                };
-                let result = match reconcile_audit(&app_pool, &catalog, tenant_id).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        tracing::error!(
-                            tenant_id = %tenant_id,
-                            error = %e,
-                            "audit reconciler: reconciliation failed"
-                        );
-                        all_clean = false;
-                        continue;
-                    }
-                };
-
-                let tenant_str = tenant_id.to_string();
-                for gap in &result.seq_gaps {
-                    counter!(
-                        "vala_audit_reconcile_violations_total",
-                        "tenant" => tenant_str.clone(),
-                        "kind" => "seq_gap"
-                    )
-                    .increment(1);
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        gap_from = gap.gap_from,
-                        gap_to = gap.gap_to,
-                        "AUDIT INTEGRITY: seq gap detected"
-                    );
-                    all_clean = false;
-                }
-                for brk in &result.chain_breaks {
-                    counter!(
-                        "vala_audit_reconcile_violations_total",
-                        "tenant" => tenant_str.clone(),
-                        "kind" => "chain_break"
-                    )
-                    .increment(1);
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        seq = brk.seq,
-                        "AUDIT INTEGRITY: hash-chain break detected"
-                    );
-                    all_clean = false;
-                }
-                for seq in &result.parity_misses {
-                    counter!(
-                        "vala_audit_reconcile_violations_total",
-                        "tenant" => tenant_str.clone(),
-                        "kind" => "parity_miss"
-                    )
-                    .increment(1);
-                    tracing::error!(
-                        tenant_id = %tenant_id,
-                        seq,
-                        "AUDIT INTEGRITY: shipped outbox row missing from warehouse"
-                    );
-                    all_clean = false;
-                }
-                for seq in &result.orphan_warehouse_seqs {
-                    counter!(
-                        "vala_audit_reconcile_violations_total",
-                        "tenant" => tenant_str.clone(),
-                        "kind" => "parity_miss"
-                    )
-                    .increment(1);
-                    tracing::warn!(
-                        tenant_id = %tenant_id,
-                        seq,
-                        "AUDIT INTEGRITY: warehouse row has no matching shipped outbox entry"
-                    );
-                    all_clean = false;
-                }
-
-                if result.is_clean() {
-                    gauge!(
-                        "vala_audit_reconcile_last_success_timestamp",
-                        "tenant" => tenant_str
-                    )
-                    .set(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs_f64(),
-                    );
-                }
-            }
-
-            if all_clean {
-                tracing::debug!("audit reconciler: all tenants clean");
-            }
-        }
-    });
-
-    Ok(Some(handle))
-}
-
 /// Build the single supervised Redux Forge maintenance scheduler future.
 ///
 /// The returned future is the actual scheduler loop. The server inserts it
@@ -1078,150 +732,6 @@ pub fn spawn_maintenance_scheduler(
     let scheduler =
         vala_bifrost_redux::forge::ForgeScheduler::new((*context).clone(), state.forge_interval)?;
     Ok(scheduler.run(shutdown))
-}
-
-/// Spawn the audit-seal worker (slice 12).
-///
-/// On each tick it enumerates every tenant with shipped audit rows and seals
-/// the shipped range into a signed `vala.audit_seal_checkpoints` row. Sealing is
-/// idempotent (`ON CONFLICT DO NOTHING`), so concurrent pods converge on the
-/// same checkpoint; the verifier later recomputes each range hash from the
-/// Iceberg `audit_log` content columns to confirm the signature still holds.
-///
-/// Returns `None` (worker not spawned) when the dedicated audit-seal key is not
-/// configured or the platform-admin pool is unavailable — sealing needs the key
-/// to sign and the operator pool to enumerate tenants.
-#[must_use]
-pub fn spawn_audit_seal_worker(
-    state: &AppState,
-    shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(key) = state.auth.audit_seal_key.clone() else {
-        tracing::warn!("audit-seal worker skipped: no audit-seal key configured");
-        return None;
-    };
-    let Some(op) = state.postgres.operator_pool() else {
-        tracing::warn!("audit-seal worker skipped: platform admin pool unavailable");
-        return None;
-    };
-    let app_pool = state.postgres.vala_pool().clone();
-    let tick_interval =
-        Duration::from_secs(vala_bifrost::serving::audit_seal::worker::SEAL_TICK_INTERVAL_SECS);
-
-    let handle = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(tick_interval) => {}
-            }
-            if shutdown.is_cancelled() {
-                break;
-            }
-
-            let tenant_ids = match vala_sql::queries::relay::list_audit_tenant_ids(&op).await {
-                Ok(ids) => ids,
-                Err(e) => {
-                    tracing::error!(error = %e, "audit-seal worker: tenant enumeration failed");
-                    continue;
-                }
-            };
-
-            for raw_id in tenant_ids {
-                let Ok(tenant_id) = DataTenantId::try_from(raw_id) else {
-                    continue;
-                };
-                match vala_bifrost::serving::audit_seal::worker::seal_shipped_range(
-                    &app_pool, &key, tenant_id,
-                )
-                .await
-                {
-                    Ok(outcome) if !outcome.skipped => {
-                        tracing::debug!(
-                            tenant_id = %tenant_id,
-                            rows_sealed = outcome.rows_sealed,
-                            seq_lo = ?outcome.seq_lo,
-                            seq_hi = ?outcome.seq_hi,
-                            "audit-seal worker: sealed range"
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            tenant_id = %tenant_id,
-                            error = %e,
-                            "audit-seal worker: seal failed"
-                        );
-                    }
-                }
-            }
-        }
-    });
-
-    Some(handle)
-}
-
-/// Spawn the genai derivation worker (slice 05b).
-///
-/// Periodically projects committed `gen_ai.*` span attributes from
-/// `traces.spans` into the `genai.*` fact tables, watermarked in
-/// `vala.olap_derivations`. Returns `None` when the operator pool
-/// (BYPASSRLS) is unavailable — cross-tenant tenant enumeration requires it.
-#[must_use]
-pub fn spawn_genai_derivation_worker(
-    state: &crate::state::AppState,
-    shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(op) = state.postgres.operator_pool() else {
-        tracing::warn!("genai derivation worker skipped: operator pool unavailable");
-        return None;
-    };
-    let catalog = Arc::clone(&state.bifrost);
-    let pool = state.postgres.vala_pool().clone();
-
-    Some(
-        vala_bifrost::serving::derivations::spawn_genai_derivation_worker(
-            catalog, pool, op, shutdown,
-        ),
-    )
-}
-
-/// Ensure the recovery pool is present in production deployments.
-///
-/// The commit-recovery sweep requires the `vala_recovery` SECURITY DEFINER
-/// pool to claim and resolve stale precommits across all tenants. Without it
-/// unresolved precommits accumulate indefinitely, risking permanent data loss.
-///
-/// **Fail-closed in production.** If `ValaPostgres::recovery_pool()` returns
-/// `None` and the deployment profile is production, boot returns
-/// [`ServerBootError::RecoveryPoolRequired`]. In development / staging, a
-/// missing recovery pool logs a warning and returns `Ok(())`.
-///
-/// # Errors
-/// Returns [`ServerBootError::RecoveryPoolRequired`] when the recovery pool is
-/// absent in a production deployment.
-pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
-    check_recovery_pool_inner(
-        state.bifrost.recovery_pool().is_some(),
-        &state.deployment_profile,
-    )
-}
-
-/// Inner logic for [`check_recovery_pool`], accepting just the two values it needs.
-/// Extracted so the behavior can be unit-tested without constructing `AppState`.
-fn check_recovery_pool_inner(
-    has_recovery_pool: bool,
-    profile: &DeploymentProfile,
-) -> Result<(), ServerBootError> {
-    if !has_recovery_pool {
-        if profile.is_production() {
-            return Err(ServerBootError::RecoveryPoolRequired);
-        }
-        tracing::warn!(
-            "recovery pool (vala_recovery DSN) is not configured — \
-             commit-recovery sweep is disabled (dev/test only)"
-        );
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1306,7 +816,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), Some(admin_pool));
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -1391,7 +901,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let admin_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), Some(admin_pool));
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(ServerPostgres::from_parts(wyrd, vala));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -1402,47 +912,6 @@ mod pg_tests {
         assert_eq!(
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local
-        );
-    }
-}
-
-/// Slice 01 behavior-test gate: `boot::recovery_pool_required`.
-///
-/// `check_recovery_pool_inner` is a pure sync function: no Postgres, no
-/// `AppState`. Tests drive it with the two boolean/enum inputs it needs.
-///
-/// Gate: `mise exec -- cargo test --locked -p wyrd-server --all-features boot::recovery_pool_required -- --nocapture`
-#[cfg(test)]
-mod recovery_pool_required {
-    use super::*;
-
-    /// Production boot without a recovery pool must fail with `RecoveryPoolRequired`.
-    #[test]
-    fn fails_in_production() {
-        let result = check_recovery_pool_inner(false, &DeploymentProfile::Production);
-        assert!(
-            matches!(result, Err(ServerBootError::RecoveryPoolRequired)),
-            "expected RecoveryPoolRequired in production without recovery pool, got {result:?}"
-        );
-    }
-
-    /// In development profile a missing recovery pool returns `Ok(())`.
-    #[test]
-    fn missing_ok_in_development() {
-        let result = check_recovery_pool_inner(false, &DeploymentProfile::Development);
-        assert!(
-            result.is_ok(),
-            "missing recovery pool must not fail in development, got {result:?}"
-        );
-    }
-
-    /// With a recovery pool present the check always succeeds regardless of profile.
-    #[test]
-    fn present_ok_in_production() {
-        let result = check_recovery_pool_inner(true, &DeploymentProfile::Production);
-        assert!(
-            result.is_ok(),
-            "a present recovery pool must not fail in production, got {result:?}"
         );
     }
 }

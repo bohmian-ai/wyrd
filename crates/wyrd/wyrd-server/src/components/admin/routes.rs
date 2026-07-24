@@ -19,20 +19,16 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use super::audit_verify::audit_verify;
 use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::post;
 use secrecy::SecretString;
-use serde::{Deserialize, Serialize};
-use vala_bifrost::reconcile::{AuditReconcileResult, reconcile_audit};
+use serde::Deserialize;
 use wyrd_auth_oidc::{
     ClaimMapping, ClaimPath, ClientAuth, OidcProvider, TrustedIssuer, WorkloadBinding,
 };
-use wyrd_runtime::Permission;
-use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{
     ClaimMappingPayload, ClientAuthKind, CreateTrustedIssuerRequest, CreateWorkloadBindingRequest,
     IssuerTokenPolicy, IssuerUrl, TrustedIssuerView, WorkloadBindingView,
@@ -71,83 +67,6 @@ pub fn admin_router() -> Router<AppState> {
                 .get(list_workload_bindings)
                 .delete(delete_workload_binding_route),
         )
-        .route("/admin/audit/integrity", get(audit_integrity))
-        .route("/admin/audit/verify", post(audit_verify))
-}
-
-/// Per-tenant integrity report returned by `GET /v1/admin/audit/integrity`.
-#[derive(Debug, Serialize)]
-pub struct TenantIntegrityReport {
-    /// Tenant the report covers.
-    pub tenant_id: DataTenantId,
-    /// Whether all three checks passed for this tenant.
-    pub clean: bool,
-    /// Seq-gap check: first/last missing seq in each gap.
-    pub seq_gaps: Vec<(i64, i64)>,
-    /// Hash-chain breaks: seq of each broken link.
-    pub chain_breaks: Vec<i64>,
-    /// Seqs present in shipped outbox but absent in the Iceberg warehouse.
-    pub parity_misses: Vec<i64>,
-    /// Seqs present in the warehouse but absent in the shipped outbox.
-    pub orphan_warehouse_seqs: Vec<i64>,
-}
-
-impl From<AuditReconcileResult> for TenantIntegrityReport {
-    fn from(r: AuditReconcileResult) -> Self {
-        let clean = r.is_clean();
-        Self {
-            tenant_id: r.tenant_id,
-            clean,
-            seq_gaps: r
-                .seq_gaps
-                .into_iter()
-                .map(|g| (g.gap_from, g.gap_to))
-                .collect(),
-            chain_breaks: r.chain_breaks.into_iter().map(|b| b.seq).collect(),
-            parity_misses: r.parity_misses,
-            orphan_warehouse_seqs: r.orphan_warehouse_seqs,
-        }
-    }
-}
-
-/// `GET /v1/admin/audit/integrity` — run all three audit durability checks for
-/// every tenant and return the report.
-///
-/// Gated on `audit:read`. Read-only: this endpoint never modifies any state.
-async fn audit_integrity(
-    State(state): State<AppState>,
-    caller: Caller,
-) -> Result<Json<Vec<TenantIntegrityReport>>, WyrdErrorResponse> {
-    if !caller
-        .principal
-        .effective_permissions
-        .contains(&Permission::audit_read())
-    {
-        return Err(WyrdErrorResponse::from(WyrdError::PermissionDeniedRbac {
-            message: "caller lacks audit:read".to_owned(),
-            details: serde_json::json!({ "required": "audit:read" }),
-        }));
-    }
-
-    let result = reconcile_audit(
-        state.postgres.vala_pool(),
-        &state.bifrost,
-        caller.principal.tenant_id,
-    )
-    .await
-    .map_err(|e| {
-        tracing::error!(
-            error = %e,
-            tenant_id = %caller.principal.tenant_id,
-            "audit reconcile failed"
-        );
-        WyrdErrorResponse::from(WyrdError::Internal {
-            message: "audit reconciliation failed; check server logs".to_owned(),
-            details: serde_json::Value::Null,
-        })
-    })?;
-
-    Ok(Json(vec![TenantIntegrityReport::from(result)]))
 }
 
 // --------------------------------------------------------------------------

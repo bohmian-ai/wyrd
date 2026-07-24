@@ -80,6 +80,23 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         reader.await.expect("reader task");
     }
 
+    server.cancel_bound_workers();
+    let operator_pool = fixtures[0].context.operator_pool.clone();
+    let mut leases = i64::MAX;
+    for _ in 0..100 {
+        leases = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE 'forge:table:%'",
+        )
+        .fetch_one(operator_pool.pool())
+        .await
+        .expect("durable lease count");
+        if leases == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(leases, 0);
+
     for _ in 0..20 {
         for fixture in &fixtures {
             run_maintenance_tick(&fixture.context)
@@ -109,29 +126,11 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         .expect("durable row count");
         assert_eq!(rows, 24);
         assert_eq!(read_staged_parquet_rows(fixture).await, 24);
-        let committed: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed' AND resource = $2",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .bind(format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
-        ))
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("durable committed audit count");
+        let committed = fixture
+            .operation_count("forge.file_compact.committed")
+            .await;
         assert!(committed >= 1);
-        let prepared: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.prepared' AND resource = $2",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .bind(format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
-        ))
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("durable prepared audit count");
+        let prepared = fixture.operation_count("forge.file_compact.prepared").await;
         assert_eq!(prepared, committed);
         assert!(
             fixture
@@ -145,21 +144,6 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
                 .is_some()
         );
     }
-    let operator_pool = fixtures[0].context.operator_pool.clone();
-    let mut leases = i64::MAX;
-    for _ in 0..100 {
-        leases = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE 'forge:table:%'",
-        )
-        .fetch_one(operator_pool.pool())
-        .await
-        .expect("durable lease count");
-        if leases == 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(leases, 0);
     server.shutdown().await.expect("server shutdown");
 }
 

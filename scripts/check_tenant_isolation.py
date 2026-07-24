@@ -42,32 +42,13 @@ VALA_CATALOG_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/iceberg_catalog.rs",
 }
 
-# Vala query modules that perform cross-tenant relay or reconcile operations
-# using the platform admin pool (BYPASSRLS `wyrd_platform_admin`). These
-# intentionally enumerate across all tenant partitions and are never on the
-# tenant request path. Isolation is enforced at the DB-role boundary. May
-# reference tenant schemas and take PgPool by design.
-VALA_RELAY_ALLOWLIST = {
-    "crates/vala/vala-sql/src/queries/relay.rs",
-}
-
 # Vala query modules that manage cross-tenant control-plane state (maintenance
 # leases) via the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Lease keys are
 # global and carry no tenant column, so these functions take `&OperatorPool`
 # rather than a tenant-scoped `TenantConn`. Isolation is a DB-role boundary, not
-# RLS — same posture as VALA_RELAY_ALLOWLIST. Must take PgPool/OperatorPool.
+# RLS. Must take PgPool/OperatorPool.
 VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
-}
-
-# These functions intentionally enumerate the SystemShared source commit
-# ledger across tenants through OperatorPool. The rest of their mixed query
-# module remains subject to the tenant-scoped TenantConn checks below.
-VALA_OPERATOR_FUNCTION_ALLOWLIST = {
-    "crates/vala/vala-sql/src/queries/olap_derivations.rs": {
-        "list_source_commit_tenants",
-        "list_committed_source_batches",
-    },
 }
 
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
@@ -259,11 +240,6 @@ def check_vala_query_modules(failures: list[str]) -> None:
                 failures.append(f"{relative}: catalog public async fn must take PgPool or Transaction")
             continue
 
-        if relative in VALA_RELAY_ALLOWLIST:
-            if has_public_async_fn(code) and not has_platform_executor(code):
-                failures.append(f"{relative}: relay public async fn must take PgPool or Transaction")
-            continue
-
         if relative in VALA_OPERATOR_ALLOWLIST:
             if has_public_async_fn(code) and not has_platform_executor(code):
                 failures.append(f"{relative}: operator public async fn must take PgPool or OperatorPool")
@@ -278,14 +254,7 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
     if re.search(r"\.begin\s*\(", code):
         failures.append(f"{relative}: tenant query module must not open transactions")
 
-    operator_functions = VALA_OPERATOR_FUNCTION_ALLOWLIST.get(relative, set())
     for fn_name, params in public_async_fns(code):
-        if fn_name in operator_functions:
-            if not has_operator_pool(params):
-                failures.append(
-                    f"{relative}: allowlisted operator fn {fn_name} must take &OperatorPool"
-                )
-            continue
         if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
@@ -444,10 +413,6 @@ def public_async_fns(code: str) -> list[tuple[str, str]]:
 
 def has_platform_executor(code: str) -> bool:
     return re.search(r"&\s*PgPool\b|&\s*mut\s+Transaction\s*<\s*'_|&\s*OperatorPool\b", code) is not None
-
-
-def has_operator_pool(params: str) -> bool:
-    return re.search(r"&\s*OperatorPool\b", params) is not None
 
 
 def has_raw_query_marker(body: str) -> bool:

@@ -2,7 +2,7 @@
 //!
 //! This module owns protocol-to-Arrow mapping and Gate-to-Scribe frame
 //! projection. It does not authenticate requests, mount services, or expose a
-//! legacy whole-stream writer.
+//! whole-stream writer.
 
 pub mod map;
 mod tables;

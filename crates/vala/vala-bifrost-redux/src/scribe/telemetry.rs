@@ -3,7 +3,7 @@
 use crate::scribe::admission::AdmissionSnapshot;
 use crate::scribe::writer::WriterHealthSnapshot;
 
-/// Compatibility-shaped aggregate queue metrics for runtime dashboards.
+/// Aggregate queue metrics for runtime dashboards.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ExecutorSnapshot {
     /// Operations currently queued or executing on this lane.

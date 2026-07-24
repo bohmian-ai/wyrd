@@ -2,7 +2,6 @@
 
 #![deny(missing_docs)]
 
-mod audit;
 mod auth;
 mod cli;
 mod dev;
@@ -37,7 +36,6 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
     match cli.command {
-        Command::Audit(command) => crate::audit::dispatch(command).await,
         Command::Auth(command) => crate::auth::dispatch(command).await,
         Command::Dev(command) => crate::dev::dispatch(command).await,
         Command::Eval(command) => crate::eval::run::dispatch(command).await,

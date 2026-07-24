@@ -18,6 +18,8 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+GRANT USAGE ON SCHEMA vala TO wyrd_platform_admin;
+
 -- Monotonic fencing sequence. Token 0 is never issued; nextval starts at 1, so
 -- any live lease carries a strictly positive fencing token.
 CREATE SEQUENCE IF NOT EXISTS vala.maintenance_fencing_seq;

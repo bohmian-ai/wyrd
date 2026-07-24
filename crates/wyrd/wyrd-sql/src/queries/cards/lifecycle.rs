@@ -39,6 +39,8 @@ pub struct CardReconcileClaim {
     pub reconcile_attempts: i32,
     /// Lease owner assigned to this claim batch.
     pub reconcile_lease_owner: Uuid,
+    /// Lease deadline assigned by the claim transaction.
+    pub reconcile_lease_expires_at: DateTime<Utc>,
 }
 
 /// Claim due Card lifecycle work through the audited cross-tenant operator pool.
@@ -91,7 +93,8 @@ pub async fn claim_card_reconciliation(
                    card.registration_operation_id,
                    card.reconcile_kind,
                    card.reconcile_attempts,
-                   card.reconcile_lease_owner"#,
+                   card.reconcile_lease_owner,
+                   card.reconcile_lease_expires_at"#,
     )
     .bind(now)
     .bind(lease_owner)
@@ -167,6 +170,43 @@ pub async fn schedule_card_reconciliation(
     .await
     .map_err(|error| {
         tracing::error!(%error, %card_uid, "card reconciliation schedule failed");
+        WyrdError::registry_unavailable("card registry unavailable")
+    })?;
+    Ok(result.rows_affected() == 1)
+}
+
+/// Return a claimed row to the retry queue without consuming an attempt.
+pub async fn reschedule_card_reconciliation(
+    conn: &mut TenantConn<'_>,
+    card_uid: &CardUid,
+    lease_owner: Uuid,
+    next_attempt_at: DateTime<Utc>,
+    error_code: &str,
+    error_message: &str,
+) -> Result<bool, WyrdError> {
+    let result = sqlx::query(
+        r#"UPDATE wyrd.cards
+              SET reconcile_status = 'pending',
+                  reconcile_attempts = GREATEST(reconcile_attempts - 1, 0),
+                  reconcile_next_attempt_at = $3,
+                  reconcile_lease_owner = NULL,
+                  reconcile_lease_expires_at = NULL,
+                  reconcile_last_error_code = $4,
+                  reconcile_last_error_message = $5,
+                  updated_at = now()
+            WHERE card_uid = $1
+              AND reconcile_status = 'leased'
+              AND reconcile_lease_owner = $2"#,
+    )
+    .bind(card_uid.as_uuid())
+    .bind(lease_owner)
+    .bind(next_attempt_at)
+    .bind(error_code)
+    .bind(error_message)
+    .execute(&mut **conn.transaction())
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, %card_uid, "card reconciliation lease reschedule failed");
         WyrdError::registry_unavailable("card registry unavailable")
     })?;
     Ok(result.rows_affected() == 1)
@@ -306,6 +346,8 @@ pub struct CardManifestCompletionRow {
     pub storage_expected_size_bytes: Option<i64>,
     /// Storage backend bound to the upload.
     pub storage_backend: Option<String>,
+    /// Existing storage-session expiration, when an upload row is linked.
+    pub storage_expires_at: Option<DateTime<Utc>>,
 }
 
 /// Load all manifest entries and their upload rows for one Card.
@@ -325,13 +367,12 @@ pub async fn manifest_completion_rows(
                   u.status AS storage_status,
                   u.expected_sha256 AS storage_expected_sha256,
                   u.expected_size_bytes AS storage_expected_size_bytes,
-                  u.backend AS storage_backend
+                  u.backend AS storage_backend,
+                  u.expires_at AS storage_expires_at
              FROM wyrd.card_artifact_manifest m
-             LEFT JOIN wyrd.storage_multipart_uploads u
+              LEFT JOIN wyrd.storage_multipart_uploads u
                ON u.id = m.upload_id
-              AND u.data_tenant_id = wyrd.current_tenant()
-            WHERE m.data_tenant_id = wyrd.current_tenant()
-              AND m.card_uid = $1
+            WHERE m.card_uid = $1
             ORDER BY m.relative_path"#,
     )
     .bind(card_uid.as_uuid())
@@ -352,8 +393,7 @@ pub async fn mark_manifest_verified(
     let result = sqlx::query(
         r#"UPDATE wyrd.card_artifact_manifest
               SET upload_status = 'verified', verified_at = now()
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND card_uid = $1
+            WHERE card_uid = $1
               AND upload_id = $2
               AND upload_status IN ('pending', 'uploaded', 'verified')"#,
     )
@@ -377,8 +417,7 @@ pub async fn record_card_blob(
     sqlx::query(
         r#"UPDATE wyrd.cards
               SET card_blob_uri = $2, blob_failed_at = NULL, updated_at = now()
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND card_uid = $1
+            WHERE card_uid = $1
               AND status = 'pending'"#,
     )
     .bind(card_uid.as_uuid())
@@ -403,8 +442,7 @@ pub async fn record_blob_failure(
     sqlx::query(
         r#"UPDATE wyrd.cards
               SET blob_failed_at = now(), updated_at = now()
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND card_uid = $1
+            WHERE card_uid = $1
               AND status = 'pending'"#,
     )
     .bind(card_uid.as_uuid())
@@ -425,8 +463,7 @@ pub async fn lock_pending_card_for_activation(
     let status = sqlx::query_scalar::<_, String>(
         r#"SELECT status
              FROM wyrd.cards
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND card_uid = $1
+            WHERE card_uid = $1
             FOR UPDATE"#,
     )
     .bind(card_uid.as_uuid())
@@ -447,15 +484,13 @@ pub async fn activate_card(
     let result = sqlx::query(
         r#"UPDATE wyrd.cards c
               SET status = 'active', finalized_at = now(), updated_at = now()
-            WHERE c.data_tenant_id = wyrd.current_tenant()
-              AND c.card_uid = $1
+            WHERE c.card_uid = $1
               AND c.status = 'pending'
               AND c.card_blob_uri IS NOT NULL
               AND NOT EXISTS (
                     SELECT 1
                       FROM wyrd.card_artifact_manifest m
-                     WHERE m.data_tenant_id = wyrd.current_tenant()
-                       AND m.card_uid = c.card_uid
+                     WHERE m.card_uid = c.card_uid
                        AND m.upload_status <> 'verified'
               )"#,
     )
@@ -484,8 +519,7 @@ pub async fn fail_card(conn: &mut TenantConn<'_>, card_uid: &CardUid) -> Result<
                   reconcile_last_error_message = NULL,
                   reconcile_dead_lettered_at = NULL,
                   updated_at = now()
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND card_uid = $1
+            WHERE card_uid = $1
               AND status = 'pending'"#,
     )
     .bind(card_uid.as_uuid())

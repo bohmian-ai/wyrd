@@ -36,11 +36,12 @@ use wyrd_sql::CardStatus;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::cards::{
     CardArtifactManifestRow, CardDeleteState, CardManifestCompletionRow, CardQuery,
-    CardReconcileClaim, CardRegistrationOperationRow, ListCursor, MAX_RECONCILE_ATTEMPTS,
-    NewCardRow, NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
+    CardReconcileClaim, CardRegistrationOperationRow, ListCursor, NewCardRow,
+    NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
     RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION, Resolution, SubmittedCardIdentity,
     activate_card, artifact_manifest_hash, commit_registration_operation, fail_card,
-    find_card_by_ref, get_card_by_uid as sql_get_card_by_uid, get_latest_card_by_range,
+    find_card_by_ref, get_card_by_uid as sql_get_card_by_uid,
+    get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
     inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
     insert_registration_operation, list_versions, lock_card_reconciliation_lease,
     lock_pending_card_for_activation, lock_version_line, lookup_existing_operation,
@@ -48,8 +49,9 @@ use wyrd_sql::queries::cards::{
     manifest_rows_for_init, mark_card_reconciliation_succeeded, mark_manifest_upload_initialized,
     mark_manifest_verified, persist_outbound_relationships, query_cards, recheck_active_card_refs,
     record_blob_failure, record_card_blob, record_card_reconciliation_failure,
-    registration_request_hash, resolve_version, schedule_card_reconciliation,
-    soft_delete_card_by_ref, soft_delete_card_with_kind, upsert_service_account_from_card,
+    registration_request_hash, reschedule_card_reconciliation, resolve_version,
+    schedule_card_reconciliation, soft_delete_card_by_ref, soft_delete_card_with_kind,
+    upsert_service_account_from_card,
 };
 use wyrd_sql::queries::storage::{artifact_metadata, multipart_uploads};
 use wyrd_sql::row_types::cards::{CardRow, ParsedCardRow};
@@ -566,6 +568,14 @@ async fn initialize_uploads(
         let Some(card_uid) = outcome.card_ref.uid.as_ref() else {
             continue;
         };
+        let completion_state = load_card_completion_state(state, caller, card_uid).await?;
+        if completion_state
+            .manifests
+            .iter()
+            .any(|manifest| !manifest_ready_for_completion(manifest))
+        {
+            continue;
+        }
         response.outcomes[index] =
             match complete_card(state, caller, card_uid, idempotency_key).await {
                 Ok(outcome) => outcome,
@@ -1041,6 +1051,13 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
         });
     }
     for submission in &request.submissions {
+        if submission.api_version.as_str() != ApiVersion::V1 {
+            return Err(WyrdError::registry_invalid_card_spec(format!(
+                "expected apiVersion {}, got {}",
+                ApiVersion::V1,
+                submission.api_version
+            )));
+        }
         let computed = artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()
             && submission.metadata.artifact_hash.is_some()
@@ -1209,13 +1226,31 @@ pub(crate) async fn reconcile_card_claim(
     claim: &CardReconcileClaim,
 ) -> Result<(), WyrdError> {
     let card_uid = CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?;
-    if claim.reconcile_attempts >= MAX_RECONCILE_ATTEMPTS {
-        return Err(WyrdError::internal(
-            "reconciliation lease expired on the final permitted attempt",
-        ));
-    }
     if claim.reconcile_kind == RECONCILE_KIND_REGISTRATION {
         initialize_reconciled_uploads(state, caller, claim, &card_uid).await?;
+    }
+    let completion_state = load_card_reconciliation_state(state, caller, &card_uid).await?;
+    if completion_state
+        .manifests
+        .iter()
+        .any(manifest_needs_cleanup)
+    {
+        let cleanup_failures = cleanup_card_artifacts(
+            state,
+            caller,
+            &card_uid,
+            &completion_state.card,
+            &completion_state.manifests,
+        )
+        .await;
+        commit_card_failure(state, caller, &card_uid, cleanup_failures.is_empty()).await?;
+        if !cleanup_failures.is_empty() {
+            return Err(WyrdError::RegistryArtifactVerifyFailed {
+                message: "card registration cleanup remains incomplete".to_owned(),
+                details: serde_json::json!({ "failure_count": cleanup_failures.len() }),
+            });
+        }
+        return Ok(());
     }
     complete_card_inner(
         state,
@@ -1236,7 +1271,7 @@ pub(crate) async fn reconcile_cleanup_claim(
     claim: &CardReconcileClaim,
 ) -> Result<(), WyrdError> {
     let card_uid = CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?;
-    let completion_state = load_card_completion_state(state, caller, &card_uid).await?;
+    let completion_state = load_card_reconciliation_state(state, caller, &card_uid).await?;
     let cleanup_failures = cleanup_card_artifacts(
         state,
         caller,
@@ -1299,6 +1334,27 @@ pub(crate) async fn record_reconciliation_failure(
     }
     conn.commit().await.map_err(registry_db_error)?;
     Ok(dead_lettered)
+}
+
+/// Return a reconciler claim to durable retry state when its lease budget is
+/// too small for another storage operation.
+pub(crate) async fn reschedule_reconciliation_claim(
+    state: &AppState,
+    caller: &Caller,
+    claim: &CardReconcileClaim,
+    next_attempt_at: DateTime<Utc>,
+) -> Result<(), WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    reschedule_card_reconciliation(
+        &mut conn,
+        &CardUid::from_uuid(claim.card_uid).map_err(WyrdError::from_card_uid_error)?,
+        claim.reconcile_lease_owner,
+        next_attempt_at,
+        "WYRD_REGISTRY_503_RECONCILIATION_LEASE_BUDGET",
+        "reconciliation lease budget was exhausted before storage work began",
+    )
+    .await?;
+    conn.commit().await.map_err(registry_db_error)
 }
 
 /// Build the internal caller used by a tenant-scoped reconciliation attempt.
@@ -1560,11 +1616,11 @@ async fn finish_card_delete(
 #[tracing::instrument(
     skip(state, caller, idempotency_key),
     fields(
-        operation = "card.registration.abort",
+        operation = "card.registration.cleanup",
         idempotency_key_present = !idempotency_key.is_empty()
     )
 )]
-pub async fn abort_card(
+async fn abort_card(
     state: &AppState,
     caller: &Caller,
     card_uid: &CardUid,
@@ -1610,6 +1666,48 @@ async fn load_card_completion_state(
     let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
     conn.commit().await.map_err(registry_db_error)?;
     Ok(CardCompletionState { card, manifests })
+}
+
+/// Load Card lifecycle state without hiding a deleted tombstone.
+async fn load_card_reconciliation_state(
+    state: &AppState,
+    caller: &Caller,
+    card_uid: &CardUid,
+) -> Result<CardCompletionState, WyrdError> {
+    let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
+    let card = sql_get_card_for_reconciliation(&mut conn, card_uid).await?;
+    let manifests = manifest_completion_rows(&mut conn, card_uid).await?;
+    conn.commit().await.map_err(registry_db_error)?;
+    Ok(CardCompletionState { card, manifests })
+}
+
+/// Return whether a manifest has a live, resumable storage session.
+fn manifest_has_live_upload(manifest: &CardManifestCompletionRow) -> bool {
+    matches!(
+        manifest.storage_status.as_deref(),
+        Some("initiating" | "pending")
+    ) && manifest
+        .storage_expires_at
+        .is_some_and(|expires_at| expires_at > Utc::now())
+}
+
+/// Return whether the manifest has reached a storage state completion can use.
+fn manifest_ready_for_completion(manifest: &CardManifestCompletionRow) -> bool {
+    manifest.manifest_status == "verified"
+        || manifest.storage_status.as_deref() == Some("completed")
+}
+
+/// Return whether a manifest must be abandoned and cleaned up.
+fn manifest_needs_cleanup(manifest: &CardManifestCompletionRow) -> bool {
+    if manifest_ready_for_completion(manifest) || manifest_has_live_upload(manifest) {
+        return false;
+    }
+    manifest.upload_id.is_some()
+        && (manifest.storage_status.is_none()
+            || matches!(
+                manifest.storage_status.as_deref(),
+                Some("initiating" | "pending" | "failed" | "aborted")
+            ))
 }
 
 /// Validate the completion lifecycle state.
@@ -1870,7 +1968,7 @@ async fn commit_card_failure(
         }
         let event = audit_event(
             caller,
-            "card.registration.abort",
+            "card.registration.cleanup",
             &format!("card:{card_uid}"),
             "card:write",
             AuditDecision::Allow,

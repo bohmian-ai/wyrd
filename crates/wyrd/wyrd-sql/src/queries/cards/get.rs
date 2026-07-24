@@ -15,7 +15,6 @@ const SELECT_BY_UID: &str = r#"
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
     WHERE card_uid = $1 AND status != 'deleted'
-      AND data_tenant_id = wyrd.current_tenant()
 "#;
 
 const SELECT_BY_REF: &str = r#"
@@ -25,7 +24,14 @@ const SELECT_BY_REF: &str = r#"
     FROM wyrd.cards
     WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4
       AND status != 'deleted'
-      AND data_tenant_id = wyrd.current_tenant()
+"#;
+
+const SELECT_FOR_RECONCILIATION: &str = r#"
+    SELECT card_uid, data_tenant_id, kind, space, name, version,
+           spec, spec_hash, artifact_hash, labels, annotations,
+           status, created_by, created_at, updated_at, card_blob_uri
+    FROM wyrd.cards
+    WHERE card_uid = $1
 "#;
 
 /// Load one card by UID within the current tenant.
@@ -49,6 +55,28 @@ pub async fn get_card_by_uid(
         .ok_or_else(|| WyrdError::registry_card_not_found(format!("no card with uid {uid}")))?;
     ParsedCardRow::try_from(row).map_err(|e| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {e}"))
+    })
+}
+
+/// Load one Card including a retained deleted tombstone for reconciliation.
+///
+/// This is an internal lifecycle read. Public Card reads continue to exclude
+/// deleted rows through [`get_card_by_uid`].
+pub async fn get_card_for_reconciliation(
+    conn: &mut TenantConn<'_>,
+    uid: &CardUid,
+) -> Result<ParsedCardRow, WyrdError> {
+    let row = sqlx::query_as::<_, CardRow>(SELECT_FOR_RECONCILIATION)
+        .bind(uid.as_uuid())
+        .fetch_optional(&mut **conn.transaction())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, %uid, "card reconciliation lookup failed");
+            WyrdError::registry_unavailable("card registry unavailable")
+        })?
+        .ok_or_else(|| WyrdError::registry_card_not_found(format!("no card with uid {uid}")))?;
+    ParsedCardRow::try_from(row).map_err(|error| {
+        WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {error}"))
     })
 }
 

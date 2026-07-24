@@ -14,6 +14,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::audit_detail::CardRegistrationOperation;
 
+use super::registry_db_error;
 use crate::queries::cards::audit::{CardRegistrationAuditInput, record_card_registration_audit};
 use crate::queries::cards::lifecycle::{CardManifestCompletionRow, manifest_completion_rows};
 use crate::row_types::cards::{CardRow, CardStatus, ParsedCardRow};
@@ -24,7 +25,7 @@ const SELECT_FOR_DELETE: &str = r#"
            spec, spec_hash, artifact_hash, labels, annotations,
            status, created_by, created_at, updated_at, card_blob_uri
     FROM wyrd.cards
-    WHERE card_uid = $1 AND data_tenant_id = wyrd.current_tenant()
+    WHERE card_uid = $1
     FOR UPDATE
 "#;
 
@@ -123,14 +124,13 @@ async fn soft_delete_card_with_expected_kind(
            JOIN wyrd.cards source \
              ON source.data_tenant_id = relationship.data_tenant_id \
             AND source.card_uid = relationship.card_uid \
-          WHERE relationship.data_tenant_id = wyrd.current_tenant() \
-            AND relationship.target_uid = $1 \
+          WHERE relationship.target_uid = $1 \
             AND source.status <> 'deleted'",
     )
     .bind(uid.as_uuid())
     .fetch_one(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
     if inbound_references > 0 {
         return Err(WyrdError::Conflict {
             message: "card is referenced by another visible card".to_owned(),
@@ -154,24 +154,23 @@ async fn soft_delete_card_with_expected_kind(
                 reconcile_dead_lettered_at = NULL, \
                 updated_at = now() \
           WHERE card_uid = $1 \
-            AND status = 'active' \
-            AND data_tenant_id = wyrd.current_tenant()",
+            AND status = 'active'",
     )
     .bind(uid.as_uuid())
     .execute(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+    .map_err(registry_db_error)?;
 
     if matches!(card.kind, CardKind::Service | CardKind::Agent) {
         sqlx::query(
             "UPDATE wyrd.auth_service_accounts \
                 SET status = 'deleted', updated_at = now() \
-              WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1",
+              WHERE card_uid = $1",
         )
         .bind(uid.as_uuid())
         .execute(&mut **conn.transaction())
         .await
-        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
+        .map_err(registry_db_error)?;
     }
 
     record_card_registration_audit(
@@ -209,7 +208,6 @@ pub async fn soft_delete_card_by_ref(
     let uid = sqlx::query_scalar::<_, uuid::Uuid>(
         "SELECT card_uid FROM wyrd.cards \
           WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
-            AND data_tenant_id = wyrd.current_tenant() \
           FOR UPDATE",
     )
     .bind(card_ref.kind.wire_name())
@@ -218,7 +216,7 @@ pub async fn soft_delete_card_by_ref(
     .bind(card_ref.version.as_str())
     .fetch_optional(&mut **conn.transaction())
     .await
-    .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?
+    .map_err(registry_db_error)?
     .ok_or_else(|| WyrdError::registry_card_not_found("card reference was not found"))?;
     let uid = CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?;
     soft_delete_card_with_state(conn, &uid, actor, request_id).await
@@ -232,7 +230,7 @@ async fn load_card_for_delete(
         .bind(uid.as_uuid())
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?
+        .map_err(registry_db_error)?
         .ok_or_else(|| WyrdError::registry_card_not_found(format!("no card with uid {uid}")))?;
     ParsedCardRow::try_from(row).map_err(|error| {
         WyrdError::registry_invalid_card_spec(format!("stored card failed to parse: {error}"))

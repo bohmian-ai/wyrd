@@ -24,15 +24,12 @@ pub const SWEEPER_LEADER_LOCK_KEY: i64 = 0x5759_7264_5374_6f72_i64;
 pub const DEFAULT_TICK: Duration = Duration::from_mins(1);
 /// Default maximum multipart rows processed per tick.
 pub const DEFAULT_BATCH_SIZE: u64 = 100;
-/// Default age after which `initiating` rows are treated as orphaned.
-pub const DEFAULT_INIT_GRACE: Duration = Duration::from_secs(30);
 /// Default maximum idempotency rows deleted per tick.
 pub const DEFAULT_IDEMPOTENCY_BATCH_SIZE: u64 = 500;
 
 const ENV_ENABLED: &str = "WYRD_STORAGE_SWEEPER_ENABLED";
 const ENV_TICK_SECS: &str = "WYRD_STORAGE_SWEEPER_TICK_SECS";
 const ENV_BATCH_SIZE: &str = "WYRD_STORAGE_SWEEPER_BATCH_SIZE";
-const ENV_INIT_GRACE_SECS: &str = "WYRD_STORAGE_SWEEPER_INIT_GRACE_SECS";
 const ENV_IDEMPOTENCY_BATCH_SIZE: &str = "WYRD_STORAGE_SWEEPER_IDEMPOTENCY_BATCH_SIZE";
 
 /// Runtime configuration for the storage sweeper.
@@ -44,8 +41,6 @@ pub struct SweeperConfig {
     pub tick: Duration,
     /// Maximum multipart upload rows swept per tick.
     pub batch_size: i64,
-    /// Age after which an `initiating` row is treated as orphaned.
-    pub init_grace: Duration,
     /// Maximum idempotency rows deleted per tick.
     pub idempotency_batch_size: i64,
 }
@@ -65,11 +60,6 @@ impl SweeperConfig {
                     .clamp(10, 3600),
             ),
             batch_size: parse_clamped_i64(ENV_BATCH_SIZE, DEFAULT_BATCH_SIZE, 1, 1000)?,
-            init_grace: Duration::from_secs(
-                parse_u64_optional(ENV_INIT_GRACE_SECS)?
-                    .unwrap_or(DEFAULT_INIT_GRACE.as_secs())
-                    .clamp(5, 600),
-            ),
             idempotency_batch_size: parse_clamped_i64(
                 ENV_IDEMPOTENCY_BATCH_SIZE,
                 DEFAULT_IDEMPOTENCY_BATCH_SIZE,
@@ -86,7 +76,6 @@ impl Default for SweeperConfig {
             enabled: true,
             tick: DEFAULT_TICK,
             batch_size: DEFAULT_BATCH_SIZE.cast_signed(),
-            init_grace: DEFAULT_INIT_GRACE,
             idempotency_batch_size: DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed(),
         }
     }
@@ -127,7 +116,6 @@ impl Sweeper {
         tracing::info!(
             tick_secs = self.cfg.tick.as_secs(),
             batch_size = self.cfg.batch_size,
-            init_grace_secs = self.cfg.init_grace.as_secs(),
             idempotency_batch_size = self.cfg.idempotency_batch_size,
             "storage sweeper starting"
         );
@@ -198,7 +186,6 @@ impl Sweeper {
         let rows = wyrd_sql::queries::storage::admin::multipart_uploads::expired_uploads_batch(
             &self.admin_pool,
             self.cfg.batch_size,
-            self.cfg.init_grace,
         )
         .await?;
 
@@ -380,9 +367,8 @@ fn classify_error(error: &StorageError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_BATCH_SIZE, DEFAULT_IDEMPOTENCY_BATCH_SIZE, DEFAULT_INIT_GRACE, DEFAULT_TICK,
-        ENV_BATCH_SIZE, ENV_ENABLED, ENV_IDEMPOTENCY_BATCH_SIZE, ENV_INIT_GRACE_SECS,
-        ENV_TICK_SECS, SweeperConfig,
+        DEFAULT_BATCH_SIZE, DEFAULT_IDEMPOTENCY_BATCH_SIZE, DEFAULT_TICK, ENV_BATCH_SIZE,
+        ENV_ENABLED, ENV_IDEMPOTENCY_BATCH_SIZE, ENV_TICK_SECS, SweeperConfig,
     };
     use crate::StorageError;
 
@@ -390,7 +376,6 @@ mod tests {
         ENV_ENABLED,
         ENV_TICK_SECS,
         ENV_BATCH_SIZE,
-        ENV_INIT_GRACE_SECS,
         ENV_IDEMPOTENCY_BATCH_SIZE,
     ];
 
@@ -402,7 +387,6 @@ mod tests {
             assert!(cfg.enabled);
             assert_eq!(cfg.tick, DEFAULT_TICK);
             assert_eq!(cfg.batch_size, DEFAULT_BATCH_SIZE.cast_signed());
-            assert_eq!(cfg.init_grace, DEFAULT_INIT_GRACE);
             assert_eq!(
                 cfg.idempotency_batch_size,
                 DEFAULT_IDEMPOTENCY_BATCH_SIZE.cast_signed()
@@ -417,7 +401,6 @@ mod tests {
                 (ENV_ENABLED, Some("false".to_owned())),
                 (ENV_TICK_SECS, Some("1".to_owned())),
                 (ENV_BATCH_SIZE, Some("0".to_owned())),
-                (ENV_INIT_GRACE_SECS, Some("9999".to_owned())),
                 (ENV_IDEMPOTENCY_BATCH_SIZE, Some("999999".to_owned())),
             ],
             || {
@@ -426,7 +409,6 @@ mod tests {
                 assert!(!cfg.enabled);
                 assert_eq!(cfg.tick.as_secs(), 10);
                 assert_eq!(cfg.batch_size, 1);
-                assert_eq!(cfg.init_grace.as_secs(), 600);
                 assert_eq!(cfg.idempotency_batch_size, 5000);
             },
         );

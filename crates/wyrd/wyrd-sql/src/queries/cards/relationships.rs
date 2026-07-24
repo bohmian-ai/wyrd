@@ -32,8 +32,7 @@ pub async fn recheck_active_card_refs(
         })?;
         let uid = sqlx::query_scalar::<_, Uuid>(
             "SELECT card_uid FROM wyrd.cards \
-             WHERE data_tenant_id = wyrd.current_tenant() \
-               AND kind = $1 AND space = $2 AND name = $3 AND version = $4 \
+             WHERE kind = $1 AND space = $2 AND name = $3 AND version = $4 \
                AND status = 'active' \
              FOR SHARE",
         )
@@ -106,8 +105,7 @@ pub async fn inbound_relationships(
            JOIN wyrd.cards source \
              ON source.data_tenant_id = relationship.data_tenant_id \
             AND source.card_uid = relationship.card_uid \
-          WHERE relationship.data_tenant_id = wyrd.current_tenant() \
-            AND relationship.target_uid = $1 \
+          WHERE relationship.target_uid = $1 \
             AND source.status <> 'deleted' \
           ORDER BY source.space, source.kind, source.name, source.version, source.card_uid",
     )

@@ -16,10 +16,11 @@ use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
 use crate::boot::{
-    ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
-    spawn_audit_seal_worker, spawn_genai_derivation_worker, spawn_maintenance_scheduler,
-    spawn_reconciler, spawn_storage_sweeper,
+    ServerBootError, check_card_recovery_pool, check_recovery_pool, spawn_audit_reconciler,
+    spawn_audit_relay, spawn_audit_seal_worker, spawn_genai_derivation_worker,
+    spawn_maintenance_scheduler, spawn_storage_sweeper,
 };
+use crate::components::cards::reconciler;
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::grpc::{
@@ -306,6 +307,7 @@ impl BoundServer {
         // Fail-fast (slice 01): a production deployment without the recovery pool
         // cannot resolve stale precommits and would leak them indefinitely.
         check_recovery_pool(&self.state).map_err(|e| BootExit::Other(Box::new(e)))?;
+        check_card_recovery_pool(&self.state).map_err(|e| BootExit::Other(Box::new(e)))?;
 
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
@@ -342,14 +344,11 @@ impl BoundServer {
                 }
             }));
         }
-        if let Some(handle) = spawn_reconciler(&self.state, shutdown.clone()) {
-            set.spawn(worker_task(TaskId::Worker("card_reconciler"), async move {
-                if let Err(join_error) = handle.await
-                    && join_error.is_panic()
-                {
-                    std::panic::resume_unwind(join_error.into_panic());
-                }
-            }));
+        if let Some(operator) = self.state.postgres.operator_pool() {
+            set.spawn(worker_task(
+                TaskId::Worker("card_reconciler"),
+                reconciler::run(self.state.clone(), operator, shutdown.clone()),
+            ));
         }
         if let Some(handle) = spawn_audit_relay(&self.state, shutdown.clone())
             .await

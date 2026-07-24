@@ -14,6 +14,14 @@ pub(crate) async fn get(
     client: &WyrdClient,
     selector: &CardSelector,
 ) -> Result<Card, RegistryEngineError> {
+    Ok(get_response(client, selector).await?.card)
+}
+
+/// Fetch a complete Card response while retaining server timestamps.
+pub(crate) async fn get_response(
+    client: &WyrdClient,
+    selector: &CardSelector,
+) -> Result<GetCardResponse, RegistryEngineError> {
     let response: GetCardResponse = match selector {
         CardSelector::Uid { kind, uid, .. } => {
             let path = format!("/v1/cards/by-uid/{}/{}", kind.wire_name(), uid);
@@ -76,7 +84,7 @@ pub(crate) async fn get(
         }
     };
     assert_selector_identity(selector, &response.card)?;
-    Ok(response.card)
+    Ok(response)
 }
 
 /// Convert an exact selector into the wire reference shape.

@@ -1,6 +1,5 @@
 //! Private Card registration saga.
 
-mod abort;
 mod build_submission;
 mod complete;
 mod hash_artifacts;
@@ -25,11 +24,12 @@ use crate::progress::{RegistrationPhase, RegistrationProgressEvent, Registration
 /// 4. ask the server to verify and complete uploaded Cards;
 /// 5. verify that every outcome is Active.
 ///
-/// If artifact upload or completion fails, pending or failed Cards are aborted
-/// on a best-effort basis and the original saga error is returned. The client
-/// owns orchestration and local transfer calls; `wyrd-server` owns durable
-/// manifest, lifecycle, activation, audit, and cleanup state. This saga is not
-/// transactionally atomic across those external boundaries.
+/// If artifact upload or completion fails, the server-owned reconciliation
+/// state remains available for cleanup and the original saga error is
+/// returned. The client owns orchestration and local transfer calls;
+/// `wyrd-server` owns durable manifest, lifecycle, activation, audit, and
+/// cleanup state. This saga is not transactionally atomic across those
+/// external boundaries.
 ///
 /// The loader owns local source resolution. `WyrdClient` owns authenticated
 /// control-plane transport and registration idempotency. `WyrdStorageClient`
@@ -59,8 +59,6 @@ pub(crate) async fn register(
     )
     .await
     {
-        emit_phase(&progress, RegistrationPhase::CleaningUp);
-        abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
         return Err(error);
     }
 
@@ -68,8 +66,6 @@ pub(crate) async fn register(
     match complete::complete_uploaded_cards(&engine.client, &response, &idempotency_key).await {
         Ok(finalized) => response = finalized,
         Err(error) => {
-            emit_phase(&progress, RegistrationPhase::CleaningUp);
-            abort::abort_pending_cards(&engine.client, &response, &idempotency_key).await;
             return Err(error);
         }
     }

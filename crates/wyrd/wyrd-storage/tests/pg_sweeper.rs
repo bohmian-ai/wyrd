@@ -24,7 +24,6 @@ mod pg_tests {
                 enabled: true,
                 tick: Duration::from_mins(1),
                 batch_size: 10,
-                init_grace: Duration::from_secs(30),
                 idempotency_batch_size: 10,
             },
             shutdown_rx,
@@ -63,7 +62,7 @@ mod pg_tests {
             -60,
         )
         .await;
-        let orphan_initiating = insert_upload(
+        let live_initiating = insert_upload(
             fixture.app_pool(),
             tenant,
             "orphan.bin",
@@ -81,9 +80,9 @@ mod pg_tests {
 
         assert_upload_status(&admin_pool, blocked_upload, "aborted").await;
         assert_upload_status(&admin_pool, expired_pending, "aborted").await;
-        assert_upload_status(&admin_pool, orphan_initiating, "aborted").await;
+        assert_upload_status(&admin_pool, live_initiating, "initiating").await;
         assert_upload_status(&admin_pool, live_pending, "pending").await;
-        assert_audit_count(&admin_pool, tenant, 3).await;
+        assert_audit_count(&admin_pool, tenant, 2).await;
         assert_idempotency_count(&admin_pool, "expired-key", 0).await;
         assert_idempotency_count(&admin_pool, "live-key", 1).await;
     }
@@ -102,7 +101,6 @@ mod pg_tests {
                 enabled: true,
                 tick: Duration::from_mins(1),
                 batch_size: 10,
-                init_grace: Duration::from_secs(30),
                 idempotency_batch_size: 10,
             },
             shutdown_rx,

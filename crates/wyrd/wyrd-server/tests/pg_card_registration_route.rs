@@ -20,9 +20,9 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_loader::{build_registration_input, load};
-use wyrd_registry::Cards;
-use wyrd_spec::envelope::Spec;
-use wyrd_spec::ids::{CardUid, DataTenantId};
+use wyrd_registry::{CardSelector, Cards, ListCardsRequest};
+use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::ids::{CardName, CardUid, DataTenantId, SpaceName};
 use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::get_card_by_uid;
@@ -404,6 +404,55 @@ async fn client_registration_saga_returns_active_receipt() {
         .uid
         .clone()
         .expect("artifact receipt contains a Card UID");
+    let selected = cards
+        .get(CardSelector::uid(CardKind::Prompt, card_uid.clone()))
+        .await
+        .expect("public Cards get reads the registered card");
+    assert_eq!(selected.metadata.uid, Some(card_uid.clone()));
+
+    let listed = cards
+        .list(ListCardsRequest {
+            kind: Some(CardKind::Prompt),
+            space: Some(SpaceName::new("default").expect("test space is valid")),
+            name: Some(CardName::new("client-prompt").expect("test name is valid")),
+            version_range: None,
+            status: Some(CardLifecycleStatus::Active),
+            filter: None,
+            include_prerelease: false,
+            limit: None,
+            cursor: None,
+        })
+        .await
+        .expect("public Cards list reads the registered card");
+    assert_eq!(listed.items.len(), 1);
+    assert_eq!(listed.items[0].card_uid, card_uid);
+
+    let latest = cards
+        .resolve_latest(
+            CardKind::Prompt,
+            SpaceName::new("default").expect("test space is valid"),
+            CardName::new("client-prompt").expect("test name is valid"),
+        )
+        .await
+        .expect("public Cards latest resolves the registered card");
+    assert_eq!(latest.uid, Some(card_uid.clone()));
+
+    let load_destination = tempfile::tempdir().expect("load destination creates");
+    let loaded = cards
+        .load(
+            CardSelector::uid(CardKind::Prompt, card_uid.clone()),
+            Some(load_destination.path()),
+        )
+        .await
+        .expect("public Cards load downloads the registered artifact");
+    assert_eq!(loaded.card.metadata.uid, Some(card_uid.clone()));
+    assert_eq!(
+        tokio::fs::read(load_destination.path().join("prompt.txt"))
+            .await
+            .expect("loaded artifact reads"),
+        artifact
+    );
+
     let mut conn = server
         .tenant_conn_for(server.data_tenant_id())
         .await

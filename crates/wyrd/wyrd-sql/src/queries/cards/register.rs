@@ -160,8 +160,7 @@ pub async fn lookup_existing_operation(
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND status <> 'expired'
+            WHERE status <> 'expired'
               AND principal_id = $1 AND idempotency_key = $2"#,
     )
     .bind(principal_id.as_uuid())
@@ -182,8 +181,7 @@ pub async fn lookup_expired_operation(
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND status = 'expired'
+            WHERE status = 'expired'
               AND principal_id = $1 AND idempotency_key = $2"#,
     )
     .bind(principal_id.as_uuid())
@@ -203,8 +201,7 @@ pub async fn lookup_operation_by_id(
                   request_hash, stored_response, status,
                   created_at, updated_at
              FROM wyrd.card_registration_operations
-            WHERE data_tenant_id = wyrd.current_tenant()
-              AND operation_id = $1"#,
+            WHERE operation_id = $1"#,
     )
     .bind(operation_id.as_uuid())
     .fetch_optional(&mut **conn.transaction())
@@ -346,7 +343,7 @@ pub async fn insert_artifact_manifest_rows(
     Ok(())
 }
 
-/// Load manifest rows that need post-commit initialization or replay.
+/// Load manifest rows that still need post-commit initialization.
 pub async fn manifest_rows_for_init(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
@@ -355,8 +352,8 @@ pub async fn manifest_rows_for_init(
         r#"SELECT card_uid, manifest_id, relative_path, expected_sha256, size_bytes,
                   content_type, upload_status, upload_id
              FROM wyrd.card_artifact_manifest
-            WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1
-              AND upload_status IN ('awaiting_init', 'pending')
+            WHERE card_uid = $1
+              AND upload_status = 'awaiting_init'
             ORDER BY relative_path"#,
     )
     .bind(card_uid.as_uuid())
@@ -375,7 +372,7 @@ pub async fn mark_manifest_upload_initialized(
     sqlx::query(
         r#"UPDATE wyrd.card_artifact_manifest
               SET upload_status = 'pending', upload_id = $3
-            WHERE data_tenant_id = wyrd.current_tenant() AND card_uid = $1
+            WHERE card_uid = $1
               AND relative_path = $2 AND upload_status IN ('awaiting_init', 'pending')"#,
     )
     .bind(card_uid.as_uuid())
@@ -397,8 +394,7 @@ pub async fn commit_registration_operation(
     let result = sqlx::query(
         r#"UPDATE wyrd.card_registration_operations
               SET stored_response = $1, status = 'committed', updated_at = now()
-            WHERE operation_id = $2 AND data_tenant_id = wyrd.current_tenant()
-              AND status = 'pending'"#,
+            WHERE operation_id = $2 AND status = 'pending'"#,
     )
     .bind(stored_response)
     .bind(operation_id.as_uuid())
@@ -445,7 +441,7 @@ pub async fn select_card_uids_by_ref_batch(
     });
     query.push(
         ") AS refs(kind, space, name, version) LEFT JOIN wyrd.cards cards \
-         ON cards.data_tenant_id = wyrd.current_tenant() AND cards.kind = refs.kind \
+         ON cards.kind = refs.kind \
          AND cards.space = refs.space AND cards.name = refs.name AND cards.version = refs.version \
               AND cards.status = 'active'",
     );

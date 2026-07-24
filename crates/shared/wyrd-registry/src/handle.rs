@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use reqwest::Method;
 use secrecy::SecretString;
 use tempfile::TempDir;
 use wyrd_client::WyrdClient;
@@ -13,6 +14,7 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{ListCardsRequest, ListCardsResponse};
+use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
 use crate::config;
 use crate::download;
@@ -217,6 +219,20 @@ impl Cards {
             .map_err(Into::into)
     }
 
+    /// Fetch one Card response with its server-derived timestamps.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the selector is invalid, the Card is absent,
+    /// or the server request fails.
+    pub async fn get_response(
+        &self,
+        selector: CardSelector,
+    ) -> Result<wyrd_spec::registry::GetCardResponse, WyrdError> {
+        reads::get_response(&self.engine.client, &selector)
+            .await
+            .map_err(Into::into)
+    }
+
     /// List metadata-only Card summaries through the typed server query.
     ///
     /// # Errors
@@ -226,6 +242,23 @@ impl Cards {
         reads::list(&self.engine.client, request)
             .await
             .map_err(Into::into)
+    }
+
+    /// Plan one authorized artifact download through the typed storage
+    /// contract.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the Card or artifact is absent, unauthorized,
+    /// or the server cannot mint a download plan.
+    pub async fn download_init(
+        &self,
+        request: DownloadInitRequest,
+    ) -> Result<DownloadInitResponse, WyrdError> {
+        self.engine
+            .client
+            .request_json(Method::POST, "/v1/cards/download/init", Some(&request))
+            .await
+            .map_err(WyrdError::from)
     }
 
     /// Soft-delete one Card. Named selectors must include an exact version.

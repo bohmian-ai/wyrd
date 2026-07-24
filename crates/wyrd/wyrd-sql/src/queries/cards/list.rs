@@ -2,7 +2,7 @@
 #![deny(missing_docs)]
 // raw-query grep allowlist: list/lookup uses QueryBuilder for dynamic filters and
 // column projection. Every statement runs on a TenantConn (RLS) and filters
-// `data_tenant_id = wyrd.current_tenant()`; run `mise run sqlx:prepare` to promote
+// FORCE RLS scopes every statement; run `mise run sqlx:prepare` to promote
 // static shapes to macros.
 
 use chrono::{DateTime, Utc};
@@ -14,6 +14,7 @@ use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::{MetadataQuery, QueryFieldErrorDetail};
 
 use crate::queries::cards::field_resolver::CardFieldResolver;
+use crate::queries::cards::registry_db_error;
 use crate::queries::cards::version_sql::push_bounds;
 use crate::query::compile_query;
 use crate::row_types::cards::{CARD_ROW_COLUMNS, CardRow, CardStatus};
@@ -105,11 +106,10 @@ pub async fn query_cards(
     sqlx::query("SET LOCAL statement_timeout = '5s'")
         .execute(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+        .map_err(registry_db_error)?;
 
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards WHERE data_tenant_id = wyrd.current_tenant()"
-    ));
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards"));
     push_card_filters(&mut qb, query)?;
     push_keyset_cursor(&mut qb, &cursor);
     qb.push(" ORDER BY created_at ASC, card_uid ASC LIMIT ");
@@ -142,7 +142,7 @@ pub async fn find_card_by_spec_hash(
 ) -> Result<Option<CardRow>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
         "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() AND status <> 'deleted' AND kind = "
+         WHERE status <> 'deleted' AND kind = "
     ));
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
@@ -153,7 +153,7 @@ pub async fn find_card_by_spec_hash(
     qb.build_query_as::<CardRow>()
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))
+        .map_err(registry_db_error)
 }
 
 /// True when a card with this uid exists in the tenant, including deleted rows.
@@ -161,14 +161,12 @@ pub async fn find_card_by_spec_hash(
 /// # Errors
 /// Returns `WYRD_REGISTRY_503_REGISTRY_UNAVAILABLE` on database errors.
 pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Result<bool, WyrdError> {
-    let found: Option<(i32,)> = sqlx::query_as(
-        "SELECT 1 FROM wyrd.cards \
-         WHERE card_uid = $1 AND data_tenant_id = wyrd.current_tenant() LIMIT 1",
-    )
-    .bind(uid.as_uuid())
-    .fetch_optional(&mut **conn.transaction())
-    .await
-    .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+    let found: Option<(i32,)> =
+        sqlx::query_as("SELECT 1 FROM wyrd.cards WHERE card_uid = $1 LIMIT 1")
+            .bind(uid.as_uuid())
+            .fetch_optional(&mut **conn.transaction())
+            .await
+            .map_err(registry_db_error)?;
     Ok(found.is_some())
 }
 
@@ -180,12 +178,12 @@ pub async fn check_uid_exists(conn: &mut TenantConn<'_>, uid: &CardUid) -> Resul
 pub async fn get_unique_spaces(conn: &mut TenantConn<'_>) -> Result<Vec<SpaceName>, WyrdError> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT DISTINCT space FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() AND status <> 'deleted' \
+         WHERE status <> 'deleted' \
          ORDER BY space ASC",
     )
     .fetch_all(&mut **conn.transaction())
     .await
-    .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+    .map_err(registry_db_error)?;
     rows.into_iter()
         .map(|(space,)| {
             SpaceName::new(space).map_err(|e| WyrdError::registry_invalid_card_spec(e.to_string()))
@@ -258,7 +256,7 @@ fn map_query_db_error(e: sqlx::Error) -> WyrdError {
             },
         );
     }
-    WyrdError::registry_unavailable(e.to_string())
+    registry_db_error(e)
 }
 
 fn build_page(mut rows: Vec<CardRow>, cursor: ListCursor) -> ListPage<CardRow> {

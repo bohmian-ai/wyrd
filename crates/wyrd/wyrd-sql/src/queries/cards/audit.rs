@@ -66,7 +66,6 @@ pub(crate) async fn record_card_registration_audit(
     let (last_seq, prev_hash): (i64, Vec<u8>) = sqlx::query_as(
         r#"SELECT last_seq, head_hash
            FROM vala.audit_chain_head
-           WHERE data_tenant_id = wyrd.current_tenant()
            FOR UPDATE"#,
     )
     .fetch_one(&mut **conn.transaction())
@@ -121,8 +120,7 @@ pub(crate) async fn record_card_registration_audit(
 
     sqlx::query(
         r#"UPDATE vala.audit_chain_head
-           SET last_seq = $1, head_hash = $2, updated_at = now()
-           WHERE data_tenant_id = wyrd.current_tenant()"#,
+           SET last_seq = $1, head_hash = $2, updated_at = now()"#,
     )
     .bind(seq)
     .bind(entry_hash.as_slice())

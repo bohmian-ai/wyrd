@@ -12,6 +12,28 @@ pub mod derive {
     pub use wyrd_error_derive::WyrdError;
 }
 
+/// RFC 9457 problem value emitted by every public Wyrd error boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WyrdProblem {
+    /// Problem type URI.
+    #[serde(rename = "type")]
+    pub r#type: String,
+    /// Short problem title.
+    pub title: String,
+    /// HTTP status.
+    pub status: u16,
+    /// Human-readable problem detail.
+    pub detail: String,
+    /// Stable Wyrd error code.
+    pub code: String,
+    /// Structured machine-readable details.
+    pub details: serde_json::Value,
+    /// Remediation guidance.
+    pub remediation: String,
+}
+
 /// Public storage error catalog.
 pub mod storage {
     use serde::{Deserialize, Serialize};
@@ -2584,6 +2606,13 @@ pub enum WyrdError {
 }
 
 impl WyrdError {
+    /// Return the typed RFC 9457 problem value for this error.
+    #[must_use]
+    pub fn problem(&self) -> WyrdProblem {
+        serde_json::from_value(self.as_problem_json())
+            .expect("WyrdError problem JSON must match WyrdProblem")
+    }
+
     /// RFC 9457 JSON problem payload.
     #[must_use]
     pub fn as_problem_json(&self) -> serde_json::Value {
@@ -3673,6 +3702,19 @@ mod error_registry_tests {
             assert!(problem["status"].as_u64().unwrap() >= 400);
             assert!(problem["title"].as_str().is_some());
         }
+    }
+
+    #[test]
+    fn typed_problem_matches_problem_json() {
+        let error = WyrdError::RegistryUnavailable {
+            message: "transient".to_owned(),
+            details: serde_json::json!({"retryable": true}),
+        };
+
+        assert_eq!(
+            serde_json::to_value(error.problem()).expect("problem serializes"),
+            error.as_problem_json()
+        );
     }
 
     #[test]

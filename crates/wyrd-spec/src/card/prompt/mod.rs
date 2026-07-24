@@ -574,7 +574,7 @@ mod prompt_declarative_tests {
     }
 
     #[test]
-    fn api_version_default_when_omitted() {
+    fn api_version_is_required() {
         let yaml = r#"
     kind: Prompt
     metadata:
@@ -586,8 +586,8 @@ mod prompt_declarative_tests {
       messages:
         - Hello
     "#;
-        let card: Card = format::yaml::from_str(yaml).unwrap();
-        assert_eq!(card.api_version.as_str(), "wyrd/v1");
+        let result: Result<Card, _> = format::yaml::from_str(yaml);
+        assert!(result.is_err(), "apiVersion must be explicit");
     }
 
     #[test]
@@ -610,6 +610,7 @@ mod prompt_declarative_tests {
     #[test]
     fn anthropic_declarative_compiles() {
         let yaml = r#"
+    apiVersion: wyrd/v1
     kind: Prompt
     metadata:
       name: test-anthropic

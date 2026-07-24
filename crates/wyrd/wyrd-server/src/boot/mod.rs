@@ -163,6 +163,11 @@ pub enum ServerBootError {
          but none is configured"
     )]
     RecoveryPoolRequired,
+    /// Production Card recovery requires a cross-tenant Wyrd operator pool.
+    #[error(
+        "WYRD_REGISTRY_500_OPERATOR_POOL_REQUIRED: production deployment requires a Wyrd operator pool for Card recovery"
+    )]
+    CardRecoveryPoolRequired,
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -565,35 +570,6 @@ pub fn spawn_storage_sweeper(
     let sweeper =
         wyrd_storage::sweeper::Sweeper::new(Arc::clone(&state.storage), admin_pool, cfg, shutdown);
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
-}
-
-/// Spawn the bounded Card lifecycle reconciler when cross-tenant maintenance
-/// credentials are configured.
-pub fn spawn_reconciler(
-    state: &AppState,
-    shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(operator) = state.postgres.operator_pool() else {
-        tracing::warn!("card reconciler skipped because platform admin pool is unavailable");
-        return None;
-    };
-    let state = state.clone();
-    Some(tokio::spawn(async move {
-        loop {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Err(error) =
-                crate::components::cards::reconciler::run_once(&state, &operator).await
-            {
-                tracing::error!(code = error.code(), "card reconciliation tick failed");
-            }
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-        }
-    }))
 }
 
 /// Configuration for the background audit relay worker.
@@ -1038,6 +1014,29 @@ pub fn check_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
         state.bifrost.recovery_pool().is_some(),
         &state.deployment_profile,
     )
+}
+
+/// Ensure production Card recovery can run through the Wyrd operator pool.
+pub fn check_card_recovery_pool(state: &AppState) -> Result<(), ServerBootError> {
+    check_card_recovery_pool_inner(
+        state.postgres.operator_pool().is_some(),
+        &state.deployment_profile,
+    )
+}
+
+fn check_card_recovery_pool_inner(
+    has_operator_pool: bool,
+    profile: &DeploymentProfile,
+) -> Result<(), ServerBootError> {
+    if !has_operator_pool {
+        if profile.is_production() {
+            return Err(ServerBootError::CardRecoveryPoolRequired);
+        }
+        tracing::warn!(
+            "Wyrd operator pool is not configured — Card recovery is disabled (dev/test only)"
+        );
+    }
+    Ok(())
 }
 
 /// Inner logic for [`check_recovery_pool`], accepting just the two values it needs.

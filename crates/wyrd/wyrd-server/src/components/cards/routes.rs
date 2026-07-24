@@ -12,7 +12,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use wyrd_runtime::Permission;
 use wyrd_spec::envelope::CardKind;
-use wyrd_spec::error::WyrdError;
+use wyrd_spec::error::{WyrdError, WyrdProblem};
 use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{
@@ -48,7 +48,6 @@ pub fn cards_router() -> Router<AppState> {
         )
         .route("/cards/{card_uid}/artifacts", get(list_artifacts_http))
         .route("/cards/{card_uid}/complete", post(complete_card_http))
-        .route("/cards/{card_uid}/abort", post(abort_card_http))
 }
 
 /// Fetch one Card by its exact kind-qualified UID.
@@ -187,10 +186,23 @@ async fn list_versions_http(
 #[utoipa::path(
     get,
     path = "/v1/cards",
+    params(
+        ("kind" = Option<String>, Query, description = "Filter by Card kind"),
+        ("space" = Option<String>, Query, description = "Filter by Card space"),
+        ("name" = Option<String>, Query, description = "Filter by Card name"),
+        ("version_range" = Option<String>, Query, description = "Filter by semver range"),
+        ("status" = Option<String>, Query, description = "Filter by lifecycle status"),
+        ("filter" = Option<String>, Query, description = "Metadata query filter"),
+        ("include_prerelease" = Option<bool>, Query, description = "Include prerelease versions"),
+        ("limit" = Option<i32>, Query, description = "Maximum result count"),
+        ("cursor" = Option<String>, Query, description = "Opaque continuation cursor")
+    ),
     responses(
         (status = 200, description = "Card summaries", body = ListCardsResponse),
-        (status = 400, description = "Invalid list query"),
-        (status = 503, description = "Registry unavailable")
+        (status = 400, description = "Invalid list query", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Card read permission required", body = WyrdProblem),
+        (status = 503, description = "Registry unavailable", body = WyrdProblem)
     )
 )]
 async fn list_cards_http(
@@ -238,11 +250,11 @@ async fn list_artifacts_http(
     ),
     responses(
         (status = 201, description = "Card registered", body = wyrd_spec::registry::CreateCardResponse),
-        (status = 400, description = "Invalid request"),
-        (status = 401, description = "Authentication required"),
-        (status = 403, description = "Card write permission required"),
-        (status = 409, description = "Idempotency or version conflict"),
-        (status = 503, description = "Registry unavailable")
+        (status = 400, description = "Invalid request", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Card write permission required", body = WyrdProblem),
+        (status = 409, description = "Idempotency or version conflict", body = WyrdProblem),
+        (status = 503, description = "Registry unavailable", body = WyrdProblem)
     )
 )]
 #[tracing::instrument(
@@ -293,8 +305,13 @@ pub(crate) async fn register_card_http(
     ),
     responses(
         (status = 200, description = "Card completed", body = CreateCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 507, description = "Artifact verification failed")
+        (status = 400, description = "Invalid Card UID or idempotency key", body = WyrdProblem),
+        (status = 401, description = "Authentication required", body = WyrdProblem),
+        (status = 403, description = "Card write permission required", body = WyrdProblem),
+        (status = 404, description = "Card not found", body = WyrdProblem),
+        (status = 409, description = "Card is not pending", body = WyrdProblem),
+        (status = 503, description = "Registry unavailable", body = WyrdProblem),
+        (status = 507, description = "Artifact verification failed", body = WyrdProblem)
     )
 )]
 #[tracing::instrument(skip(state, caller), fields(operation = "card.registration.complete"))]
@@ -308,41 +325,6 @@ async fn complete_card_http(
     let idempotency_key = extract_required_idempotency_key(&headers)?;
     let card_uid = parse_card_uid(&card_uid)?;
     let outcome = service::complete_card(&state, &caller, &card_uid, idempotency_key.as_str())
-        .await
-        .map_err(WyrdErrorResponse::from)?;
-    Ok(Json(single_card_response(outcome)))
-}
-
-/// Clean up an incomplete Card registration by Card UID.
-///
-/// Pending and Failed Cards may be retried through this endpoint. The server
-/// attempts every manifest cleanup, records the Failed transition and audit
-/// event transactionally, and returns a stable failure count without exposing
-/// provider credentials or URLs.
-#[utoipa::path(
-    post,
-    path = "/v1/cards/{card_uid}/abort",
-    params(
-        ("card_uid" = String, Path, description = "Server-minted Card UID"),
-        ("Idempotency-Key" = String, Header, description = "Registration key reused for retries", example = "card-register-001")
-    ),
-    responses(
-        (status = 200, description = "Card cleanup completed", body = CreateCardResponse),
-        (status = 404, description = "Card not found"),
-        (status = 409, description = "Card is already active")
-    )
-)]
-#[tracing::instrument(skip(state, caller), fields(operation = "card.registration.abort"))]
-async fn abort_card_http(
-    State(state): State<AppState>,
-    caller: Caller,
-    headers: HeaderMap,
-    Path(card_uid): Path<String>,
-) -> Result<Json<CreateCardResponse>, WyrdErrorResponse> {
-    authorize_card_write(&state, &caller)?;
-    let idempotency_key = extract_required_idempotency_key(&headers)?;
-    let card_uid = parse_card_uid(&card_uid)?;
-    let outcome = service::abort_card(&state, &caller, &card_uid, idempotency_key.as_str())
         .await
         .map_err(WyrdErrorResponse::from)?;
     Ok(Json(single_card_response(outcome)))

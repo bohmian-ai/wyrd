@@ -675,13 +675,9 @@ mod pg_tests {
         .await
         .expect("expired upload row inserts");
 
-        let rows = storage::admin::multipart_uploads::expired_uploads_batch(
-            store.pool(),
-            10,
-            Duration::from_secs(900),
-        )
-        .await
-        .expect("expired upload query succeeds");
+        let rows = storage::admin::multipart_uploads::expired_uploads_batch(store.pool(), 10)
+            .await
+            .expect("expired upload query succeeds");
         assert!(
             rows.iter().any(|row| row.id == upload_id),
             "expired upload must be selected for sweeping"

@@ -16,6 +16,7 @@ path = "src/lib.rs"
 
 [dependencies]
 wyrd-client = { workspace = true }
+wyrd-registry = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 skald-tool = { workspace = true }
@@ -23,7 +24,6 @@ async-trait = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-serde_urlencoded = { workspace = true }
 strum = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true }

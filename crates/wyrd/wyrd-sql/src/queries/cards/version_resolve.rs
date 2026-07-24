@@ -47,8 +47,7 @@ async fn latest_stable_in_line(
 ) -> Result<Option<LatestInLine>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT version, spec_hash, artifact_hash FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status = 'active' AND NOT version_is_prerelease AND kind = ",
+         WHERE status = 'active' AND NOT version_is_prerelease AND kind = ",
     );
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());

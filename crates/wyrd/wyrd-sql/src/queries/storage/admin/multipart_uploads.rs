@@ -5,7 +5,6 @@ use crate::error::SqlError;
 use serde::Serialize;
 use sqlx::PgPool;
 use sqlx::types::{Uuid, chrono};
-use std::time::Duration;
 
 /// Upload row selected for sweeper reclamation.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -30,14 +29,13 @@ pub struct ExpiredUpload {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
-/// Fetch expired pending uploads and stale initiating rows for the sweeper.
+/// Fetch upload sessions whose persisted expiration has passed.
 ///
 /// # Errors
 /// Returns [`SqlError`] when Postgres rejects the query.
 pub async fn expired_uploads_batch(
     admin_pool: &PgPool,
     limit: i64,
-    init_grace: Duration,
 ) -> Result<Vec<ExpiredUpload>, SqlError> {
     let rows = sqlx::query_as::<_, ExpiredUpload>(
         r#"
@@ -52,18 +50,13 @@ pub async fn expired_uploads_batch(
             expires_at,
             created_at
         FROM wyrd.storage_multipart_uploads
-        WHERE (status = 'pending' AND expires_at < now())
-           OR (status = 'initiating' AND created_at < now() - ($2::text || ' seconds')::interval)
-        ORDER BY
-            CASE
-                WHEN status = 'pending' THEN expires_at
-                ELSE created_at + ($2::text || ' seconds')::interval
-            END ASC
+        WHERE status IN ('pending', 'initiating')
+          AND expires_at < now()
+        ORDER BY expires_at ASC
         LIMIT $1
         "#,
     )
     .bind(limit)
-    .bind(init_grace.as_secs() as i64)
     .fetch_all(admin_pool)
     .await
     .map_err(SqlError::from)?;

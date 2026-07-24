@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use schemars::r#gen::SchemaGenerator;
-use schemars::schema::{InstanceType, Metadata as SchemaMetadata, Schema, SchemaObject};
+use schemars::schema::{
+    InstanceType, Metadata as SchemaMetadata, Schema, SchemaObject, SubschemaValidation,
+};
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::json;
@@ -128,15 +130,13 @@ pub enum SpecCanonicalizationError {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub struct Card {
     /// API version. Must be `wyrd/v1` for v1 Cards.
-    #[serde(rename = "apiVersion", default)]
+    #[serde(rename = "apiVersion")]
     pub api_version: ApiVersion,
     /// Card kind discriminator.
     pub kind: CardKind,
     /// Card metadata.
     pub metadata: Metadata,
     /// Kind-specific spec payload.
-    #[schemars(with = "serde_json::Value")]
-    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     pub spec: Spec,
     /// Server-derived relationship summary.
     #[serde(default)]
@@ -224,7 +224,6 @@ impl Metadata {
 
 /// Kind-specific Card spec payload.
 #[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 // justification: public Card contract used by every kind; boxing variants would break call sites throughout the codebase and defeats the flat pattern-match shape that this contract exposes to consumers
 #[allow(clippy::large_enum_variant)]
 pub enum Spec {
@@ -241,7 +240,6 @@ pub enum Spec {
     /// Workflow card spec.
     Workflow(WorkflowSpec),
     /// Eval card spec.
-    #[cfg_attr(feature = "server", schema(value_type = serde_json::Value))]
     Eval(EvalSpec),
     /// Drift card spec.
     Drift(DriftSpec),
@@ -263,6 +261,131 @@ pub enum Spec {
     Operator(OperatorSpec),
     /// Source card spec.
     Source(SourceSpec),
+}
+
+#[cfg(feature = "server")]
+fn eval_spec_openapi_schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+    use utoipa::openapi::schema::{ObjectBuilder, Schema, Type};
+
+    let opaque_object = Schema::Object(ObjectBuilder::new().schema_type(Type::Object).build());
+    utoipa::openapi::RefOr::T(Schema::Object(
+        ObjectBuilder::new()
+            .description(Some("Evaluation Card spec."))
+            .property("dataset", opaque_object.clone())
+            .property("tasks", opaque_object.clone())
+            .property("workflow", opaque_object.clone())
+            .property("sampling", opaque_object.clone())
+            .property("pass_gate", opaque_object.clone())
+            .property("context_capture", opaque_object)
+            .required("tasks")
+            .schema_type(Type::Object)
+            .build(),
+    ))
+}
+
+#[cfg(feature = "server")]
+impl utoipa::PartialSchema for Spec {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::schema::OneOfBuilder::new()
+            .item(<DataSpec as utoipa::PartialSchema>::schema())
+            .item(<ModelSpec as utoipa::PartialSchema>::schema())
+            .item(<ExperimentSpec as utoipa::PartialSchema>::schema())
+            .item(<PromptSpec as utoipa::PartialSchema>::schema())
+            .item(<AgentSpec as utoipa::PartialSchema>::schema())
+            .item(<WorkflowSpec as utoipa::PartialSchema>::schema())
+            .item(eval_spec_openapi_schema())
+            .item(<DriftSpec as utoipa::PartialSchema>::schema())
+            .item(<ServiceSpec as utoipa::PartialSchema>::schema())
+            .item(<PolicySpec as utoipa::PartialSchema>::schema())
+            .item(<McpSpec as utoipa::PartialSchema>::schema())
+            .item(<AuditSpec as utoipa::PartialSchema>::schema())
+            .item(<ArtifactSpec as utoipa::PartialSchema>::schema())
+            .item(<TriggerSpec as utoipa::PartialSchema>::schema())
+            .item(<OperatorSpec as utoipa::PartialSchema>::schema())
+            .item(<SourceSpec as utoipa::PartialSchema>::schema())
+            .title(Some("Spec"))
+            .description(Some("One typed Wyrd Card spec variant."))
+            .into()
+    }
+}
+
+#[cfg(feature = "server")]
+impl utoipa::ToSchema for Spec {
+    fn name() -> std::borrow::Cow<'static, str> {
+        std::borrow::Cow::Borrowed("Spec")
+    }
+
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        macro_rules! add_schema {
+            ($schema:ty) => {
+                schemas.push((
+                    <$schema as utoipa::ToSchema>::name().into(),
+                    <$schema as utoipa::PartialSchema>::schema(),
+                ));
+            };
+        }
+
+        add_schema!(DataSpec);
+        add_schema!(ModelSpec);
+        add_schema!(ExperimentSpec);
+        add_schema!(PromptSpec);
+        add_schema!(AgentSpec);
+        add_schema!(WorkflowSpec);
+        add_schema!(DriftSpec);
+        add_schema!(ServiceSpec);
+        add_schema!(PolicySpec);
+        add_schema!(McpSpec);
+        add_schema!(AuditSpec);
+        add_schema!(ArtifactSpec);
+        add_schema!(TriggerSpec);
+        add_schema!(OperatorSpec);
+        add_schema!(SourceSpec);
+    }
+}
+
+impl schemars::JsonSchema for Spec {
+    fn schema_name() -> String {
+        "Spec".to_owned()
+    }
+
+    fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+        let variants = vec![
+            generator.subschema_for::<DataSpec>(),
+            generator.subschema_for::<ModelSpec>(),
+            generator.subschema_for::<ExperimentSpec>(),
+            generator.subschema_for::<PromptSpec>(),
+            generator.subschema_for::<AgentSpec>(),
+            generator.subschema_for::<WorkflowSpec>(),
+            generator.subschema_for::<EvalSpec>(),
+            generator.subschema_for::<DriftSpec>(),
+            generator.subschema_for::<ServiceSpec>(),
+            generator.subschema_for::<PolicySpec>(),
+            generator.subschema_for::<McpSpec>(),
+            generator.subschema_for::<AuditSpec>(),
+            generator.subschema_for::<ArtifactSpec>(),
+            generator.subschema_for::<TriggerSpec>(),
+            generator.subschema_for::<OperatorSpec>(),
+            generator.subschema_for::<SourceSpec>(),
+        ];
+        SchemaObject {
+            metadata: Some(Box::new(SchemaMetadata {
+                title: Some(Self::schema_name()),
+                description: Some("One typed Wyrd Card spec variant.".to_owned()),
+                ..SchemaMetadata::default()
+            })),
+            subschemas: Some(Box::new(SubschemaValidation {
+                one_of: Some(variants),
+                ..SubschemaValidation::default()
+            })),
+            ..SchemaObject::default()
+        }
+        .into()
+    }
 }
 
 impl Spec {
@@ -614,7 +737,7 @@ impl<'de> Deserialize<'de> for Card {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         struct CardHelper {
-            #[serde(rename = "apiVersion", default)]
+            #[serde(rename = "apiVersion")]
             api_version: ApiVersion,
             kind: CardKind,
             metadata: Metadata,
@@ -626,6 +749,13 @@ impl<'de> Deserialize<'de> for Card {
         }
 
         let helper = CardHelper::deserialize(deserializer)?;
+        if helper.api_version.as_str() != ApiVersion::V1 {
+            return Err(D::Error::custom(format!(
+                "expected apiVersion {}, got {}",
+                ApiVersion::V1,
+                helper.api_version
+            )));
+        }
         let spec =
             spec_from_kind_value(&helper.kind, helper.spec).map_err(serde::de::Error::custom)?;
 

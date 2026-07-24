@@ -278,11 +278,8 @@ def check_tenant_query_file(relative: str, body: str, code: str, failures: list[
                 continue
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
-    if references_tenant_schema(code) and not (
-        re.search(r"data_tenant_id\s*=\s*\$", code)
-        or re.search(r"wyrd\.current_tenant\(\)", code)
-    ):
-        failures.append(f"{relative}: tenant table query is missing data_tenant_id predicate")
+    if references_tenant_schema(code) and not re.search(r"TenantConn\s*<'_", code):
+        failures.append(f"{relative}: tenant table query must use TenantConn under FORCE RLS")
 
     if re.search(r"sqlx::query(?:_as|_scalar)?\s*\(", code) and not has_raw_query_marker(body):
         failures.append(f"{relative}: raw sqlx::query* requires an explicit justification comment")

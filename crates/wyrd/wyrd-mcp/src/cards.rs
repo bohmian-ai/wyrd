@@ -1,52 +1,27 @@
 //! Card registry MCP delegates.
 //!
-//! These tools project the existing Card HTTP contract into the Skald tool
-//! registry. The server remains responsible for validation, authorization,
-//! lifecycle transitions, storage, tenancy, and audit.
+//! These tools project the existing typed Card registry contract into the
+//! Skald tool registry. The server remains responsible for validation,
+//! authorization, lifecycle transitions, storage, tenancy, and audit.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use reqwest::Method;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
-use wyrd_client::WyrdClient;
+use wyrd_registry::{CardSelector, Cards};
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::ids::{CardName, CardUid, IdempotencyKey, SpaceName};
-use wyrd_spec::registry::{
-    CardLocator, CreateCardRequest, CreateCardResponse, GetCardResponse, ListCardsRequest,
-    ListCardsResponse,
-};
+use wyrd_spec::ids::{CardName, SpaceName};
+use wyrd_spec::registry::{CardLocator, GetCardResponse, ListCardsRequest, ListCardsResponse};
 use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
 const CARDS_GET: &str = "cards.get";
 const CARDS_LIST: &str = "cards.list";
 const CARDS_LATEST: &str = "cards.latest";
 const CARDS_LOAD: &str = "cards.load";
-const CARDS_REGISTER: &str = "cards.register";
-const CARDS_FINALIZE: &str = "cards.finalize";
-const CARDS_DELETE: &str = "cards.delete";
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct RegisterInput {
-    /// Existing composite registration request.
-    pub request: CreateCardRequest,
-    /// Stable key reused when finalizing the same registration.
-    pub idempotency_key: IdempotencyKey,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct FinalizeInput {
-    /// Server-minted Card UID from the registration outcome.
-    pub card_uid: CardUid,
-    /// The idempotency key supplied to `cards.register`.
-    pub idempotency_key: IdempotencyKey,
-}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -60,7 +35,7 @@ struct LatestInput {
 }
 
 struct GetTool {
-    client: WyrdClient,
+    cards: Cards,
 }
 
 #[async_trait]
@@ -83,10 +58,9 @@ impl AgentTool for GetTool {
 
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
         let locator = decode(args)?;
-        let path = card_locator_path(&locator)?;
-        let response: GetCardResponse = self
-            .client
-            .request_json(Method::GET, &path, None::<&()>)
+        let response = self
+            .cards
+            .get_response(selector(locator))
             .await
             .map_err(invocation)?;
         serialize(response)
@@ -94,7 +68,7 @@ impl AgentTool for GetTool {
 }
 
 struct ListTool {
-    client: WyrdClient,
+    cards: Cards,
 }
 
 #[async_trait]
@@ -117,24 +91,13 @@ impl AgentTool for ListTool {
 
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
         let request: ListCardsRequest = decode(args)?;
-        let query = serde_urlencoded::to_string(&request)
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-        let path = if query.is_empty() {
-            "/v1/cards".to_owned()
-        } else {
-            format!("/v1/cards?{query}")
-        };
-        let response: ListCardsResponse = self
-            .client
-            .request_json(Method::GET, &path, None::<&()>)
-            .await
-            .map_err(invocation)?;
+        let response = self.cards.list(request).await.map_err(invocation)?;
         serialize(response)
     }
 }
 
 struct LatestTool {
-    client: WyrdClient,
+    cards: Cards,
 }
 
 #[async_trait]
@@ -157,15 +120,9 @@ impl AgentTool for LatestTool {
 
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
         let input: LatestInput = decode(args)?;
-        let path = format!(
-            "/v1/cards/{}/{}/{}/latest",
-            input.kind.wire_name(),
-            input.space,
-            input.name
-        );
-        let response: GetCardResponse = self
-            .client
-            .request_json(Method::GET, &path, None::<&()>)
+        let response = self
+            .cards
+            .get_response(CardSelector::named(input.kind, input.space, input.name))
             .await
             .map_err(invocation)?;
         serialize(response)
@@ -173,7 +130,7 @@ impl AgentTool for LatestTool {
 }
 
 struct LoadTool {
-    client: WyrdClient,
+    cards: Cards,
 }
 
 #[async_trait]
@@ -183,7 +140,7 @@ impl AgentTool for LoadTool {
     }
 
     fn description(&self) -> &str {
-        "Plan one authorized Card artifact download using the shared storage contract. Reads require the cards:read permission."
+        "Plan one authorized Card artifact download using the shared typed storage contract. Reads require the cards:read permission."
     }
 
     fn input_schema(&self) -> Value {
@@ -196,170 +153,38 @@ impl AgentTool for LoadTool {
 
     async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
         let request: DownloadInitRequest = decode(args)?;
-        let response: DownloadInitResponse = self
-            .client
-            .request_json(Method::POST, "/v1/cards/download/init", Some(&request))
+        let response = self
+            .cards
+            .download_init(request)
             .await
             .map_err(invocation)?;
         serialize(response)
     }
 }
 
-struct RegisterTool {
-    client: WyrdClient,
-}
-
-#[async_trait]
-impl AgentTool for RegisterTool {
-    fn name(&self) -> &str {
-        CARDS_REGISTER
-    }
-
-    fn description(&self) -> &str {
-        "Register Cards through the composite registry service. Registration requires the cards:write permission; artifact upload plans remain an internal transfer seam."
-    }
-
-    fn input_schema(&self) -> Value {
-        schema::<RegisterInput>()
-    }
-
-    fn output_schema(&self) -> Value {
-        schema::<CreateCardResponse>()
-    }
-
-    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let input: RegisterInput = decode(args)?;
-        let response: CreateCardResponse = self
-            .client
-            .submit_with_idempotency_key(
-                Method::POST,
-                "/v1/cards",
-                &input.request,
-                input.idempotency_key.as_str(),
-            )
-            .await
-            .map_err(invocation)?;
-        serialize(response)
-    }
-}
-
-struct FinalizeTool {
-    client: WyrdClient,
-}
-
-#[async_trait]
-impl AgentTool for FinalizeTool {
-    fn name(&self) -> &str {
-        CARDS_FINALIZE
-    }
-
-    fn description(&self) -> &str {
-        "Finalize a pending Card after its storage transfer using the registration service. Finalization requires the cards:write permission."
-    }
-
-    fn input_schema(&self) -> Value {
-        schema::<FinalizeInput>()
-    }
-
-    fn output_schema(&self) -> Value {
-        schema::<CreateCardResponse>()
-    }
-
-    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let input: FinalizeInput = decode(args)?;
-        let path = format!("/v1/cards/{}/complete", input.card_uid);
-        let response: CreateCardResponse = self
-            .client
-            .submit_with_idempotency_key(
-                Method::POST,
-                &path,
-                &json!({}),
-                input.idempotency_key.as_str(),
-            )
-            .await
-            .map_err(invocation)?;
-        serialize(response)
-    }
-}
-
-struct DeleteTool {
-    client: WyrdClient,
-}
-
-#[async_trait]
-impl AgentTool for DeleteTool {
-    fn name(&self) -> &str {
-        CARDS_DELETE
-    }
-
-    fn description(&self) -> &str {
-        "Delete one exact Card by UID or CardRef through the registry service. Deletion requires the explicit cards:write permission used by the registry route."
-    }
-
-    fn input_schema(&self) -> Value {
-        schema::<CardLocator>()
-    }
-
-    fn output_schema(&self) -> Value {
-        schema::<wyrd_spec::registry::DeleteCardResponse>()
-    }
-
-    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
-        let locator = decode(args)?;
-        let path = card_locator_path(&locator)?;
-        let response: wyrd_spec::registry::DeleteCardResponse = self
-            .client
-            .request_json(Method::DELETE, &path, None::<&()>)
-            .await
-            .map_err(invocation)?;
-        serialize(response)
-    }
-}
-
-/// Register all Card registry delegates in `registry`.
-pub fn register_card_tools(registry: &ToolRegistry, client: WyrdClient) -> Result<(), ToolError> {
+/// Register the read-only Card registry delegates in `registry`.
+pub fn register_card_tools(
+    registry: &ToolRegistry,
+    client: wyrd_client::WyrdClient,
+) -> Result<(), ToolError> {
+    let cards = Cards::with_client(client);
     registry.register(Arc::new(GetTool {
-        client: client.clone(),
+        cards: cards.clone(),
     }))?;
     registry.register(Arc::new(ListTool {
-        client: client.clone(),
+        cards: cards.clone(),
     }))?;
     registry.register(Arc::new(LatestTool {
-        client: client.clone(),
+        cards: cards.clone(),
     }))?;
-    registry.register(Arc::new(LoadTool {
-        client: client.clone(),
-    }))?;
-    registry.register(Arc::new(RegisterTool {
-        client: client.clone(),
-    }))?;
-    registry.register(Arc::new(FinalizeTool {
-        client: client.clone(),
-    }))?;
-    registry.register(Arc::new(DeleteTool { client }))?;
+    registry.register(Arc::new(LoadTool { cards }))?;
     Ok(())
 }
 
-fn card_locator_path(locator: &CardLocator) -> Result<String, ToolError> {
+fn selector(locator: CardLocator) -> CardSelector {
     match locator {
-        CardLocator::Uid { kind, uid } => {
-            Ok(format!("/v1/cards/by-uid/{}/{}", kind.wire_name(), uid))
-        }
-        CardLocator::Ref(card_ref) => {
-            let Some(space) = &card_ref.space else {
-                return Err(ToolError::InvalidInput(
-                    "exact CardRef must include space".to_owned(),
-                ));
-            };
-            let query = serde_urlencoded::to_string([
-                ("kind", card_ref.kind.wire_name().to_owned()),
-                ("space", space.to_string()),
-                ("name", card_ref.name.to_string()),
-                ("version", card_ref.version.to_string()),
-            ])
-            .map_err(|error| ToolError::InvalidInput(error.to_string()))?;
-            Ok(format!("/v1/cards/by-ref?{query}"))
-        }
+        CardLocator::Uid { kind, uid } => CardSelector::uid(kind, uid),
+        CardLocator::Ref(card_ref) => CardSelector::exact(card_ref),
     }
 }
 
@@ -394,11 +219,11 @@ mod tests {
     use super::register_card_tools;
 
     fn dummy_client() -> WyrdClient {
-        WyrdClient::with_config(ClientConfig {
+        let config = ClientConfig {
             api_key: Some("test_key_placeholder".to_owned().into()),
             ..ClientConfig::default()
-        })
-        .expect("test client builds")
+        };
+        WyrdClient::with_config(config).expect("test client builds")
     }
 
     #[test]
@@ -408,15 +233,7 @@ mod tests {
 
         assert_eq!(
             registry.names(),
-            vec![
-                "cards.delete",
-                "cards.finalize",
-                "cards.get",
-                "cards.latest",
-                "cards.list",
-                "cards.load",
-                "cards.register",
-            ]
+            vec!["cards.get", "cards.latest", "cards.list", "cards.load"]
         );
     }
 
@@ -440,7 +257,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_ref_without_space_is_rejected_before_transport() {
+    fn exact_ref_without_space_preserves_shared_selector_problem() {
         let registry = ToolRegistry::new();
         register_card_tools(&registry, dummy_client()).expect("registration succeeds");
         let tool = registry.resolve("cards.get").expect("get resolves");
@@ -455,6 +272,11 @@ mod tests {
             })))
             .expect_err("space is required for exact API refs");
 
-        assert_eq!(error.code(), "SKALD_TOOL_422_INPUT");
+        let skald_tool::ToolError::Invocation { detail, .. } = error else {
+            panic!("expected shared selector problem, got {error:?}");
+        };
+        let problem: serde_json::Value =
+            serde_json::from_str(&detail).expect("invocation detail is problem JSON");
+        assert_eq!(problem["code"], "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
     }
 }

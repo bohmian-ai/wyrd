@@ -7,6 +7,7 @@ use wyrd_spec::envelope::CardKind;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, SpaceName};
 
+use crate::queries::cards::registry_db_error;
 use crate::queries::cards::version_sql::push_bounds;
 use crate::row_types::cards::{CARD_ROW_COLUMNS, CardRow, ParsedCardRow};
 use crate::tenant_conn::TenantConn;
@@ -35,8 +36,7 @@ pub async fn get_latest_card_by_range(
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
         "SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status = 'active' AND NOT version_is_prerelease AND kind = "
+         WHERE status = 'active' AND NOT version_is_prerelease AND kind = "
     ));
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
@@ -48,7 +48,7 @@ pub async fn get_latest_card_by_range(
         .build_query_as::<CardRow>()
         .fetch_optional(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?
+        .map_err(registry_db_error)?
         .ok_or_else(|| {
             WyrdError::registry_card_not_found(format!(
                 "no stable {}/{}/{} matching {range}",
@@ -78,8 +78,7 @@ pub async fn list_versions(
 ) -> Result<Vec<VersionBlock>, WyrdError> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT version FROM wyrd.cards \
-         WHERE data_tenant_id = wyrd.current_tenant() \
-           AND status <> 'deleted' AND kind = ",
+         WHERE status <> 'deleted' AND kind = ",
     );
     qb.push_bind(kind.wire_name());
     qb.push(" AND space = ").push_bind(space.as_str());
@@ -96,7 +95,7 @@ pub async fn list_versions(
         .build_query_as::<(String,)>()
         .fetch_all(&mut **conn.transaction())
         .await
-        .map_err(|e| WyrdError::registry_unavailable(e.to_string()))?;
+        .map_err(registry_db_error)?;
 
     rows.into_iter()
         .map(|(version,)| {

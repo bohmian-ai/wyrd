@@ -15,6 +15,62 @@ paths:
       - crate::components::cards::routes
       summary: List tenant-visible Card summaries with keyset pagination.
       operationId: list_cards_http
+      parameters:
+      - name: kind
+        in: query
+        description: Filter by Card kind
+        required: false
+        schema:
+          type: string
+      - name: space
+        in: query
+        description: Filter by Card space
+        required: false
+        schema:
+          type: string
+      - name: name
+        in: query
+        description: Filter by Card name
+        required: false
+        schema:
+          type: string
+      - name: version_range
+        in: query
+        description: Filter by semver range
+        required: false
+        schema:
+          type: string
+      - name: status
+        in: query
+        description: Filter by lifecycle status
+        required: false
+        schema:
+          type: string
+      - name: filter
+        in: query
+        description: Metadata query filter
+        required: false
+        schema:
+          type: string
+      - name: include_prerelease
+        in: query
+        description: Include prerelease versions
+        required: false
+        schema:
+          type: boolean
+      - name: limit
+        in: query
+        description: Maximum result count
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: cursor
+        in: query
+        description: Opaque continuation cursor
+        required: false
+        schema:
+          type: string
       responses:
         '200':
           description: Card summaries
@@ -24,8 +80,28 @@ paths:
                 $ref: '#/components/schemas/ListCardsResponse'
         '400':
           description: Invalid list query
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Card read permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
     post:
       tags:
       - crate::components::cards::routes
@@ -59,14 +135,34 @@ paths:
                 $ref: '#/components/schemas/CreateCardResponse'
         '400':
           description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '401':
           description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '403':
           description: Card write permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '409':
           description: Idempotency or version conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
         '503':
           description: Registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/cards/by-ref:
     get:
       tags:
@@ -270,6 +366,80 @@ paths:
           description: Card not found
         '503':
           description: Registry unavailable
+  /v1/cards/{card_uid}/complete:
+    post:
+      tags:
+      - crate::components::cards::routes
+      summary: Complete a Pending Card after the client-side storage transfer finishes.
+      description: |-
+        The server rechecks every manifest and stores the immutable Card blob before
+        activating the Card. Repeating the request with the registration key is an
+        idempotent Active no-op; provider URLs and transfer details never cross
+        this lifecycle boundary.
+      operationId: complete_card_http
+      parameters:
+      - name: card_uid
+        in: path
+        description: Server-minted Card UID
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        description: Registration key reused for retries
+        required: true
+        schema:
+          type: string
+        example: card-register-001
+      responses:
+        '200':
+          description: Card completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateCardResponse'
+        '400':
+          description: Invalid Card UID or idempotency key
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '403':
+          description: Card write permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '404':
+          description: Card not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '409':
+          description: Card is not pending
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '503':
+          description: Registry unavailable
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
+        '507':
+          description: Artifact verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WyrdProblem'
   /v1/cards/{kind}/{space}/{name}/latest:
     get:
       tags:
@@ -348,6 +518,28 @@ paths:
           description: Registry unavailable
 components:
   schemas:
+    AgentSpec:
+      type: object
+      description: Agent authoring body inside a Wyrd Agent Card envelope.
+      required:
+      - prompt
+      properties:
+        prompt:
+          description: Prompt reference preserved on disk and resolved by `skald-agent`.
+        publishes_to:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Eval and Drift cards that receive observations from this agent.
+        run_config:
+          $ref: '#/components/schemas/AgentRunConfigSpec'
+          description: Agent run configuration.
+        tool_names:
+          type: array
+          items:
+            type: string
+          description: Runtime-local tool names resolved from a local Skald tool registry.
+      additionalProperties: false
     ApiVersion:
       type: string
       description: Canonical Wyrd API version.
@@ -388,6 +580,90 @@ components:
           description: Declared artifact size in bytes.
           minimum: 0
       additionalProperties: false
+    ArtifactSpec:
+      type: object
+      description: Versioned artifact descriptor.
+      required:
+      - artifact_kind
+      properties:
+        artifact_kind:
+          type: string
+          description: Artifact kind.
+        artifact_uris:
+          type: array
+          items:
+            type: string
+          description: Artifact URIs.
+        content_type:
+          type:
+          - string
+          - 'null'
+          description: MIME content type.
+        external_uri:
+          type:
+          - string
+          - 'null'
+          description: External URI.
+        framework_adapter:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/FrameworkAdapterRef'
+            description: Framework adapter metadata for runtime loaders.
+        integrity:
+          type:
+          - string
+          - 'null'
+          description: Integrity digest.
+        metadata:
+          type: object
+          description: Artifact metadata.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        schema_ref:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Ref'
+            description: Schema Card reference.
+        size_bytes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Size in bytes.
+          minimum: 0
+    AuditSpec:
+      type: object
+      description: Audit artifact or evidence bundle metadata.
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Audit description.
+        details:
+          type: object
+          description: Free-form details.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        evidence_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Evidence artifact references.
+        policy_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Policy references.
+        subject_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Subject Card references.
     BTreeMap:
       type: object
       additionalProperties:
@@ -400,6 +676,7 @@ components:
       type: object
       description: Universal registered Card envelope.
       required:
+      - apiVersion
       - kind
       - metadata
       - spec
@@ -417,6 +694,7 @@ components:
           $ref: '#/components/schemas/Relationships'
           description: Server-derived relationship summary.
         spec:
+          $ref: '#/components/schemas/Spec'
           description: Kind-specific spec payload.
         status:
           oneOf:
@@ -685,6 +963,52 @@ components:
             $ref: '#/components/schemas/CardUploadPlan'
           description: Upload plans for artifact-bearing submissions.
       additionalProperties: false
+    DataSpec:
+      type: object
+      description: Pure-data contract for a Data Card.
+      required:
+      - interface
+      - schema
+      - stats
+      properties:
+        card_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Durable Artifact card references linked to this data card.
+        interface:
+          $ref: '#/components/schemas/DataInterface'
+          description: Declared interface family and interface-specific metadata.
+        publishes_to:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Eval and Drift cards that receive observations from this data card.
+        schema:
+          $ref: '#/components/schemas/DataSchema'
+          description: Ordered schema fields for tabular interfaces.
+        splits:
+          type: object
+          description: Declared split strategies by stable split label.
+          additionalProperties:
+            $ref: '#/components/schemas/DataSplit'
+          propertyNames:
+            type: string
+            description: DataCard split label.
+        sql:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SqlLogic'
+            description: Optional SQL query bundle for SQL-backed data.
+        stats:
+          $ref: '#/components/schemas/DataStats'
+          description: Local or durable byte statistics captured for this data source.
+        target_columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ColumnName'
+          description: Target columns for supervised workflows.
+      additionalProperties: false
     DeleteCardResponse:
       type: object
       description: Soft-delete response.
@@ -765,6 +1089,96 @@ components:
             route does not expire).
           minimum: 0
       additionalProperties: false
+    DriftSpec:
+      type: object
+      description: DriftCard spec body.
+      required:
+      - method
+      - signal
+      - condition
+      properties:
+        condition:
+          $ref: '#/components/schemas/DriftCondition'
+          description: When a sample becomes an emittable observation.
+        description:
+          type:
+          - string
+          - 'null'
+          description: Free-text description authored on the card.
+        details:
+          type: object
+          description: Free-form non-secret authoring metadata.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        method:
+          $ref: '#/components/schemas/DriftMethod'
+          description: Drift detection method. Drives which `DriftProfile` variant is allowed.
+        profile:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/DriftProfile'
+            description: |-
+              Method-specific math configuration. Required for `Psi | Spc | Custom`,
+              forbidden for `External`.
+        signal:
+          $ref: '#/components/schemas/DriftSignal'
+          description: How the measurement enters the monitor.
+      additionalProperties: false
+    ExperimentSpec:
+      type: object
+      description: Grouping and comparison context for related runs.
+      properties:
+        best_run_ref:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RunRef'
+            description: Best run reference.
+        card_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Artifact references.
+        default_parameters:
+          type: object
+          description: Default parameters applied to runs.
+          additionalProperties:
+            $ref: '#/components/schemas/ParameterValue'
+          propertyNames:
+            type: string
+        description:
+          type:
+          - string
+          - 'null'
+          description: Experiment description.
+        details:
+          type: object
+          description: Free-form details.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        experiment_type:
+          type:
+          - string
+          - 'null'
+          description: Experiment type.
+        run_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunRef'
+          description: Associated runs.
+        summary_metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricEntry'
+          description: Summary metrics for comparison.
+        target_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Primary target Cards.
     GetCardResponse:
       type: object
       description: Full card response.
@@ -828,6 +1242,42 @@ components:
             $ref: '#/components/schemas/VersionBlock'
           description: Resolved versions.
       additionalProperties: false
+    McpSpec:
+      type: object
+      description: MCP server or tool catalog metadata.
+      required:
+      - server_name
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: MCP description.
+        details:
+          type: object
+          description: Free-form details.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Required scopes.
+        server_name:
+          type: string
+          description: Server name.
+        tool_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Tool references.
+        transport:
+          type:
+          - string
+          - 'null'
+          description: Transport descriptor.
     Metadata:
       type: object
       description: |-
@@ -908,6 +1358,64 @@ components:
               partial scope (`"1"` / `"1.0"` — bump within the prefix line), or a
               full triple pin (`"1.4.2"`). Always populated and always a pin
               post-register.
+    ModelSpec:
+      type: object
+      description: |-
+        Body of a Model card.
+
+        This pure contract describes which framework loads the model, which task it
+        performs, which fields it consumes and produces, and which Artifact cards
+        hold model-related bytes.
+      required:
+      - interface
+      - task_type
+      - signature
+      properties:
+        card_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Durable Artifact card references linked to this model card.
+        interface:
+          $ref: '#/components/schemas/ModelInterface'
+          description: Framework interface tag and per-interface config metadata.
+        publishes_to:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Eval and Drift cards that receive observations from this model card.
+        sample_input:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/SampleInput'
+            description: Optional canonical sample input description.
+        signature:
+          $ref: '#/components/schemas/ModelSignature'
+          description: Typed input and output schema.
+        task_type:
+          $ref: '#/components/schemas/TaskType'
+          description: Closed Wyrd ML task taxonomy.
+      additionalProperties: false
+    OperatorSpec:
+      type: object
+      description: A server-owned side-effect template.
+      required:
+      - action
+      properties:
+        action:
+          $ref: '#/components/schemas/OperatorAction'
+          description: The single action performed when this operator fires.
+        budget:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/OperatorBudget'
+            description: Optional execution limits.
+        description:
+          type:
+          - string
+          - 'null'
+          description: Optional human-readable purpose.
+      additionalProperties: false
     Origin:
       type: object
       description: |-
@@ -933,6 +1441,45 @@ components:
         repo:
           type: string
           description: Normalized repository identifier, e.g. `github.com/org/repo`.
+    PolicySpec:
+      type: object
+      description: Declarative policy rule set.
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Policy description.
+        details:
+          type: object
+          description: Free-form details.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        enforcement:
+          type:
+          - string
+          - 'null'
+          description: Enforcement mode.
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/PolicyRule'
+          description: Policy rules.
+    PromptSpec:
+      allOf:
+      - description: Native authored prompt. Provider-specific request shape lives here.
+      description: |-
+        PromptCard spec body wrapping the native Skald prompt.
+
+        Serializes with the `prompt` fields flattened directly into the spec body
+        (no `prompt:` nesting key on the wire). Accepts two input forms:
+
+        - **Declarative** (`provider` present, `request` absent): a `PromptDraft`
+          that is compiled into the native provider request.
+        - **Native** (`request` present): the stored native `Prompt` shape, as
+          produced by `save()`.
     RegistrationOutcomeKind:
       type: string
       description: Result of a registration write.
@@ -957,9 +1504,642 @@ components:
     RelativeArtifactPath:
       type: string
       description: A validated relative path inside a card's artifact manifest.
+    ServiceSpec:
+      type: object
+      description: Composition of cards used by an application or deployment.
+      properties:
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceComponent'
+          description: Alias-bound components.
+        content_hash:
+          type:
+          - string
+          - 'null'
+          description: Content hash.
+        credential_refs:
+          type: array
+          items:
+            $ref: '#/components/schemas/CredentialRef'
+          description: Credential references required by this service.
+        deployment:
+          type: object
+          description: Deployment metadata.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        description:
+          type:
+          - string
+          - 'null'
+          description: Service description.
+        entry_point:
+          type:
+          - string
+          - 'null'
+          description: Entry point descriptor.
+        lock_hash:
+          type:
+          - string
+          - 'null'
+          description: Lock hash.
+        metadata:
+          type: object
+          description: Free-form metadata.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        publishes_to:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ref'
+          description: Eval and Drift cards that receive observations from this service.
+        runtime:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ServiceRuntime'
+            description: Optional server-side runtime declaration.
+        service_config:
+          type: object
+          description: Service config.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        service_type:
+          type:
+          - string
+          - 'null'
+          description: Service type.
+      additionalProperties: false
+    SourceSpec:
+      type: object
+      description: Read-side reference to an external data system. Wyrd reads, never writes.
+      required:
+      - source
+      properties:
+        defaults:
+          type: object
+          description: Non-secret read defaults (projection, page size, time-window hints).
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        description:
+          type:
+          - string
+          - 'null'
+          description: Source description.
+        source:
+          $ref: '#/components/schemas/SourceKind'
+          description: Read-shape bucket plus its vendor connection.
     SpaceName:
       type: string
       description: Human-visible namespace for Cards and Runs.
+    Spec:
+      oneOf:
+      - type: object
+        description: Pure-data contract for a Data Card.
+        required:
+        - interface
+        - schema
+        - stats
+        properties:
+          card_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Durable Artifact card references linked to this data card.
+          interface:
+            $ref: '#/components/schemas/DataInterface'
+            description: Declared interface family and interface-specific metadata.
+          publishes_to:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Eval and Drift cards that receive observations from this data card.
+          schema:
+            $ref: '#/components/schemas/DataSchema'
+            description: Ordered schema fields for tabular interfaces.
+          splits:
+            type: object
+            description: Declared split strategies by stable split label.
+            additionalProperties:
+              $ref: '#/components/schemas/DataSplit'
+            propertyNames:
+              type: string
+              description: DataCard split label.
+          sql:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/SqlLogic'
+              description: Optional SQL query bundle for SQL-backed data.
+          stats:
+            $ref: '#/components/schemas/DataStats'
+            description: Local or durable byte statistics captured for this data source.
+          target_columns:
+            type: array
+            items:
+              $ref: '#/components/schemas/ColumnName'
+            description: Target columns for supervised workflows.
+        additionalProperties: false
+      - type: object
+        description: |-
+          Body of a Model card.
+
+          This pure contract describes which framework loads the model, which task it
+          performs, which fields it consumes and produces, and which Artifact cards
+          hold model-related bytes.
+        required:
+        - interface
+        - task_type
+        - signature
+        properties:
+          card_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Durable Artifact card references linked to this model card.
+          interface:
+            $ref: '#/components/schemas/ModelInterface'
+            description: Framework interface tag and per-interface config metadata.
+          publishes_to:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Eval and Drift cards that receive observations from this model card.
+          sample_input:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/SampleInput'
+              description: Optional canonical sample input description.
+          signature:
+            $ref: '#/components/schemas/ModelSignature'
+            description: Typed input and output schema.
+          task_type:
+            $ref: '#/components/schemas/TaskType'
+            description: Closed Wyrd ML task taxonomy.
+        additionalProperties: false
+      - type: object
+        description: Grouping and comparison context for related runs.
+        properties:
+          best_run_ref:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/RunRef'
+              description: Best run reference.
+          card_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Artifact references.
+          default_parameters:
+            type: object
+            description: Default parameters applied to runs.
+            additionalProperties:
+              $ref: '#/components/schemas/ParameterValue'
+            propertyNames:
+              type: string
+          description:
+            type:
+            - string
+            - 'null'
+            description: Experiment description.
+          details:
+            type: object
+            description: Free-form details.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          experiment_type:
+            type:
+            - string
+            - 'null'
+            description: Experiment type.
+          run_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/RunRef'
+            description: Associated runs.
+          summary_metrics:
+            type: array
+            items:
+              $ref: '#/components/schemas/MetricEntry'
+            description: Summary metrics for comparison.
+          target_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Primary target Cards.
+      - allOf:
+        - description: Native authored prompt. Provider-specific request shape lives here.
+        description: |-
+          PromptCard spec body wrapping the native Skald prompt.
+
+          Serializes with the `prompt` fields flattened directly into the spec body
+          (no `prompt:` nesting key on the wire). Accepts two input forms:
+
+          - **Declarative** (`provider` present, `request` absent): a `PromptDraft`
+            that is compiled into the native provider request.
+          - **Native** (`request` present): the stored native `Prompt` shape, as
+            produced by `save()`.
+      - type: object
+        description: Agent authoring body inside a Wyrd Agent Card envelope.
+        required:
+        - prompt
+        properties:
+          prompt:
+            description: Prompt reference preserved on disk and resolved by `skald-agent`.
+          publishes_to:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Eval and Drift cards that receive observations from this agent.
+          run_config:
+            $ref: '#/components/schemas/AgentRunConfigSpec'
+            description: Agent run configuration.
+          tool_names:
+            type: array
+            items:
+              type: string
+            description: Runtime-local tool names resolved from a local Skald tool registry.
+        additionalProperties: false
+      - type: object
+        description: Declarative workflow definition.
+        properties:
+          description:
+            type:
+            - string
+            - 'null'
+            description: Workflow description.
+          details:
+            type: object
+            description: Free-form details.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          governance:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Governance'
+              description: Governance and audit controls.
+          inputs:
+            type: object
+            description: Typed workflow inputs.
+            additionalProperties:
+              $ref: '#/components/schemas/ParameterValue'
+            propertyNames:
+              type: string
+          observation_hooks:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ObservationHooks'
+              description: Observation hooks.
+          outputs:
+            type: object
+            description: Output descriptors.
+            additionalProperties: {}
+            propertyNames:
+              type: string
+          steps:
+            type: array
+            items:
+              $ref: '#/components/schemas/WorkflowStep'
+            description: Workflow steps.
+      - type: object
+        description: Evaluation Card spec.
+        required:
+        - tasks
+        properties:
+          context_capture:
+            type: object
+          dataset:
+            type: object
+          pass_gate:
+            type: object
+          sampling:
+            type: object
+          tasks:
+            type: object
+          workflow:
+            type: object
+      - type: object
+        description: DriftCard spec body.
+        required:
+        - method
+        - signal
+        - condition
+        properties:
+          condition:
+            $ref: '#/components/schemas/DriftCondition'
+            description: When a sample becomes an emittable observation.
+          description:
+            type:
+            - string
+            - 'null'
+            description: Free-text description authored on the card.
+          details:
+            type: object
+            description: Free-form non-secret authoring metadata.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          method:
+            $ref: '#/components/schemas/DriftMethod'
+            description: Drift detection method. Drives which `DriftProfile` variant is allowed.
+          profile:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/DriftProfile'
+              description: |-
+                Method-specific math configuration. Required for `Psi | Spc | Custom`,
+                forbidden for `External`.
+          signal:
+            $ref: '#/components/schemas/DriftSignal'
+            description: How the measurement enters the monitor.
+        additionalProperties: false
+      - type: object
+        description: Composition of cards used by an application or deployment.
+        properties:
+          components:
+            type: array
+            items:
+              $ref: '#/components/schemas/ServiceComponent'
+            description: Alias-bound components.
+          content_hash:
+            type:
+            - string
+            - 'null'
+            description: Content hash.
+          credential_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/CredentialRef'
+            description: Credential references required by this service.
+          deployment:
+            type: object
+            description: Deployment metadata.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          description:
+            type:
+            - string
+            - 'null'
+            description: Service description.
+          entry_point:
+            type:
+            - string
+            - 'null'
+            description: Entry point descriptor.
+          lock_hash:
+            type:
+            - string
+            - 'null'
+            description: Lock hash.
+          metadata:
+            type: object
+            description: Free-form metadata.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          publishes_to:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Eval and Drift cards that receive observations from this service.
+          runtime:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/ServiceRuntime'
+              description: Optional server-side runtime declaration.
+          service_config:
+            type: object
+            description: Service config.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          service_type:
+            type:
+            - string
+            - 'null'
+            description: Service type.
+        additionalProperties: false
+      - type: object
+        description: Declarative policy rule set.
+        properties:
+          description:
+            type:
+            - string
+            - 'null'
+            description: Policy description.
+          details:
+            type: object
+            description: Free-form details.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          enforcement:
+            type:
+            - string
+            - 'null'
+            description: Enforcement mode.
+          rules:
+            type: array
+            items:
+              $ref: '#/components/schemas/PolicyRule'
+            description: Policy rules.
+      - type: object
+        description: MCP server or tool catalog metadata.
+        required:
+        - server_name
+        properties:
+          description:
+            type:
+            - string
+            - 'null'
+            description: MCP description.
+          details:
+            type: object
+            description: Free-form details.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          scopes:
+            type: array
+            items:
+              type: string
+            description: Required scopes.
+          server_name:
+            type: string
+            description: Server name.
+          tool_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Tool references.
+          transport:
+            type:
+            - string
+            - 'null'
+            description: Transport descriptor.
+      - type: object
+        description: Audit artifact or evidence bundle metadata.
+        properties:
+          description:
+            type:
+            - string
+            - 'null'
+            description: Audit description.
+          details:
+            type: object
+            description: Free-form details.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          evidence_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Evidence artifact references.
+          policy_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Policy references.
+          subject_refs:
+            type: array
+            items:
+              $ref: '#/components/schemas/Ref'
+            description: Subject Card references.
+      - type: object
+        description: Versioned artifact descriptor.
+        required:
+        - artifact_kind
+        properties:
+          artifact_kind:
+            type: string
+            description: Artifact kind.
+          artifact_uris:
+            type: array
+            items:
+              type: string
+            description: Artifact URIs.
+          content_type:
+            type:
+            - string
+            - 'null'
+            description: MIME content type.
+          external_uri:
+            type:
+            - string
+            - 'null'
+            description: External URI.
+          framework_adapter:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/FrameworkAdapterRef'
+              description: Framework adapter metadata for runtime loaders.
+          integrity:
+            type:
+            - string
+            - 'null'
+            description: Integrity digest.
+          metadata:
+            type: object
+            description: Artifact metadata.
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          schema_ref:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/Ref'
+              description: Schema Card reference.
+          size_bytes:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            description: Size in bytes.
+            minimum: 0
+      - type: object
+        description: Declarative schedule and optional observation source for an Operator.
+        required:
+        - schedule
+        - operator_ref
+        properties:
+          description:
+            type:
+            - string
+            - 'null'
+            description: Optional human-readable purpose.
+          operator_ref:
+            $ref: '#/components/schemas/Ref'
+            description: Operator fired when the source matches, or on every tick without a source.
+          schedule:
+            $ref: '#/components/schemas/TriggerSchedule'
+            description: Required evaluation schedule.
+          source:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/TriggerSource'
+              description: Optional observation stream to evaluate on each schedule tick.
+        additionalProperties: false
+      - type: object
+        description: A server-owned side-effect template.
+        required:
+        - action
+        properties:
+          action:
+            $ref: '#/components/schemas/OperatorAction'
+            description: The single action performed when this operator fires.
+          budget:
+            oneOf:
+            - type: 'null'
+            - $ref: '#/components/schemas/OperatorBudget'
+              description: Optional execution limits.
+          description:
+            type:
+            - string
+            - 'null'
+            description: Optional human-readable purpose.
+        additionalProperties: false
+      - type: object
+        description: Read-side reference to an external data system. Wyrd reads, never writes.
+        required:
+        - source
+        properties:
+          defaults:
+            type: object
+            description: Non-secret read defaults (projection, page size, time-window hints).
+            additionalProperties:
+              $ref: '#/components/schemas/NonSecretValue'
+            propertyNames:
+              type: string
+          description:
+            type:
+            - string
+            - 'null'
+            description: Source description.
+          source:
+            $ref: '#/components/schemas/SourceKind'
+            description: Read-shape bucket plus its vendor connection.
+      title: Spec
+      description: One typed Wyrd Card spec variant.
     SpecHash:
       type: string
       description: |-
@@ -1014,6 +2194,30 @@ components:
           type: integer
           format: int64
           description: Stored byte length.
+      additionalProperties: false
+    TriggerSpec:
+      type: object
+      description: Declarative schedule and optional observation source for an Operator.
+      required:
+      - schedule
+      - operator_ref
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Optional human-readable purpose.
+        operator_ref:
+          $ref: '#/components/schemas/Ref'
+          description: Operator fired when the source matches, or on every tick without a source.
+        schedule:
+          $ref: '#/components/schemas/TriggerSchedule'
+          description: Required evaluation schedule.
+        source:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/TriggerSource'
+            description: Optional observation stream to evaluate on each schedule tick.
       additionalProperties: false
     UploadId:
       type: string
@@ -1251,3 +2455,82 @@ components:
     VersionSpec:
       type: string
       description: Authored version on the card-registration path. Either a full semver triple pin (e.g. "1.4.2", "1.4.2-rc.1+meta") or a bare partial scope (e.g. "1", "1.0"). Range comparators (^, ~, *, >=, ...) are rejected on this path.
+    WorkflowSpec:
+      type: object
+      description: Declarative workflow definition.
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Workflow description.
+        details:
+          type: object
+          description: Free-form details.
+          additionalProperties:
+            $ref: '#/components/schemas/NonSecretValue'
+          propertyNames:
+            type: string
+        governance:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Governance'
+            description: Governance and audit controls.
+        inputs:
+          type: object
+          description: Typed workflow inputs.
+          additionalProperties:
+            $ref: '#/components/schemas/ParameterValue'
+          propertyNames:
+            type: string
+        observation_hooks:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/ObservationHooks'
+            description: Observation hooks.
+        outputs:
+          type: object
+          description: Output descriptors.
+          additionalProperties: {}
+          propertyNames:
+            type: string
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkflowStep'
+          description: Workflow steps.
+    WyrdProblem:
+      type: object
+      description: RFC 9457 problem value emitted by every public Wyrd error boundary.
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - code
+      - details
+      - remediation
+      properties:
+        code:
+          type: string
+          description: Stable Wyrd error code.
+        detail:
+          type: string
+          description: Human-readable problem detail.
+        details:
+          description: Structured machine-readable details.
+        remediation:
+          type: string
+          description: Remediation guidance.
+        status:
+          type: integer
+          format: int32
+          description: HTTP status.
+          minimum: 0
+        title:
+          type: string
+          description: Short problem title.
+        type:
+          type: string
+          description: Problem type URI.
+      additionalProperties: false

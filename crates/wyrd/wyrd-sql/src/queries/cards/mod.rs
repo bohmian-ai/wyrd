@@ -1,6 +1,14 @@
 //! Tenant-scoped CRUD for `wyrd.cards`.
 #![deny(missing_docs)]
 
+use wyrd_spec::error::WyrdError;
+
+/// Redact database diagnostics at the public registry boundary.
+pub(super) fn registry_db_error(error: impl std::fmt::Display) -> WyrdError {
+    tracing::error!(%error, "card registry database operation failed");
+    WyrdError::registry_unavailable("card registry unavailable")
+}
+
 mod audit;
 mod auth_projection;
 mod delete;
@@ -19,14 +27,15 @@ pub use delete::{
     CardDeleteState, soft_delete_card, soft_delete_card_by_ref, soft_delete_card_with_kind,
     soft_delete_card_with_state,
 };
-pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid};
+pub use get::{find_card_by_ref, get_card_by_ref, get_card_by_uid, get_card_for_reconciliation};
 pub use lifecycle::{
     CardManifestCompletionRow, CardReconcileClaim, MAX_RECONCILE_ATTEMPTS, RECONCILE_KIND_BLOB,
     RECONCILE_KIND_CLEANUP, RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION,
     activate_card, claim_card_reconciliation, fail_card, lock_card_reconciliation_lease,
     lock_pending_card_for_activation, manifest_completion_rows, mark_card_reconciliation_succeeded,
     mark_manifest_verified, record_blob_failure, record_card_blob,
-    record_card_reconciliation_failure, schedule_card_reconciliation,
+    record_card_reconciliation_failure, reschedule_card_reconciliation,
+    schedule_card_reconciliation,
 };
 pub use list::{
     CardQuery, ListCursor, ListPage, MAX_LIST_LIMIT, check_uid_exists, find_card_by_spec_hash,

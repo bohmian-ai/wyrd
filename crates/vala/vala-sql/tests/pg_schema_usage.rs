@@ -73,13 +73,13 @@ mod pg_tests {
             let mut conn = TenantConn::acquire(fixture.app_pool(), tenant)
                 .await
                 .unwrap();
-            upsert_table(&mut conn, &[7; 16], "datasets.same", &[3; 32], &[])
+            upsert_table(&mut conn, &[7_u8; 16], "datasets.same", &[3_u8; 32], &[])
                 .await
                 .unwrap();
-            precommit(&mut conn, &[7; 16], &[9; 16], "test", "test")
+            precommit(&mut conn, &[7_u8; 16], &[9_u8; 16], "test", "test")
                 .await
                 .unwrap();
-            precommit(&mut conn, &[7; 16], &[9; 16], "test", "test")
+            precommit(&mut conn, &[7_u8; 16], &[9_u8; 16], "test", "test")
                 .await
                 .unwrap();
             conn.commit().await.unwrap();
@@ -113,15 +113,15 @@ mod pg_tests {
 
         let table_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM vala.bifrost_tables WHERE table_uid = $1")
-                .bind([7; 16].as_slice())
+                .bind([7_u8; 16].as_slice())
                 .fetch_one(&superuser)
                 .await
                 .unwrap();
         let commit_count: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM vala.olap_commits WHERE table_uid = $1 AND batch_id = $2",
         )
-        .bind([7; 16].as_slice())
-        .bind([9; 16].as_slice())
+        .bind([7_u8; 16].as_slice())
+        .bind([9_u8; 16].as_slice())
         .fetch_one(&superuser)
         .await
         .unwrap();

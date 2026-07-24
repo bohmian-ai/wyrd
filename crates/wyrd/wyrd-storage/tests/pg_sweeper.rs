@@ -20,6 +20,7 @@ mod pg_tests {
         let sweeper = Sweeper::new(
             handle,
             admin_pool.clone(),
+            fixture.app_pool().clone(),
             SweeperConfig {
                 enabled: true,
                 tick: Duration::from_mins(1),
@@ -98,6 +99,7 @@ mod pg_tests {
         let sweeper = Sweeper::new(
             handle,
             admin_pool.clone(),
+            fixture.app_pool().clone(),
             SweeperConfig {
                 enabled: true,
                 tick: Duration::from_mins(1),
@@ -270,10 +272,9 @@ mod pg_tests {
         let count = sqlx::query_scalar::<_, i64>(
             r"
         SELECT count(*)
-        FROM wyrd.storage_access_ledger
+        FROM vala.audit_outbox
         WHERE data_tenant_id = $1
-          AND subject_id = 'storage-sweeper'
-          AND operation = 'sweeper_abort'
+          AND operation = 'storage.reclaimed'
         ",
         )
         .bind(tenant.as_uuid())

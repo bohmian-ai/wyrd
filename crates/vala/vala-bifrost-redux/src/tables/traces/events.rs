@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, utf8};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -22,7 +22,7 @@ impl DomainTable for EventsTable {
             ts_us_utc("timestamp", false),
             utf8("name", false),
             utf8("attributes", true),
-            uint32("dropped_attributes_count", false),
+            int64("dropped_attributes_count", false),
         ]
     }
 

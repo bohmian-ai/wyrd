@@ -159,7 +159,7 @@ cargo test --locked -p wyrd-testing --test pg_bifrost_forge_scheduler_closeout_j
 [tasks."test:fuzz:bifrost"]
 description = "Run the Postgres-backed Bifrost interleaving replay tests"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
 run = """
 cargo test --locked -p wyrd-testing --test interleaving_smoke -- --test-threads=1
 cargo test --locked -p wyrd-testing --test bifrost_interleavings -- --test-threads=1
@@ -170,7 +170,7 @@ cargo test --locked -p wyrd-testing --test forge_maintenance_interleaving -- --t
 [tasks."test:bifrost:sustained"]
 description = "Run the gated sustained-load Bifrost journey against WyrdTestServer"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
 run = """
 cargo test --locked -p wyrd-testing --test pg_bifrost_sustained_journey -- --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test load_smoke -- --ignored --test-threads=1
@@ -251,7 +251,13 @@ run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- 
 description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
-run = "cargo bench --locked -p wyrd-testing --bench bench_otlp_span_ingest -- --pods=3 --tenants=10 --target-spans-per-second=10000 --spans-per-request=100 --warmup-seconds=5 --measured-seconds=60 --max-in-flight=256 --verify-samples=3"
+run = "cargo bench --locked -p wyrd-testing --bench bench_otlp_span_ingest -- --pods=3 --tenants=10 --target-spans-per-second=10000 --spans-per-request=100 --warmup-seconds=5 --measured-seconds=60 --max-in-flight=256 --verify-samples=0"
+
+[tasks."bench:bifrost:otlp:ingest:rewrite"]
+description = "Run the maintainable OTLP span ingestion load test"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_otlp_span_ingest_rewrite -- --pods=3 --tenants=10 --target-spans-per-second=10000 --spans-per-request=100 --warmup-seconds=5 --measurement-seconds=60 --max-in-flight=256 --verify-samples=0"
 
 [tasks."bench:bifrost:forge:single-tenant-single-node"]
 description = "Run Forge with one tenant on one node"

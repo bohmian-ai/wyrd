@@ -53,12 +53,12 @@ Source type: `SpanRecord` (`wyrd-spec::vala::traces`).
 | `trace_id` | `FixedSizeBinary(16)` | 128-bit trace ID |
 | `span_id` | `FixedSizeBinary(8)` | 64-bit span ID |
 | `parent_span_id` | `FixedSizeBinary(8)` nullable | Absent for root span |
-| `flags` | `UInt32` | OpenTelemetry span flags |
+| `flags` | `Int64` | OpenTelemetry span flags; Iceberg has no unsigned integer type |
 | `name` | `Utf8` | Span operation name |
 | `kind` | `Utf8` | `SERVER`, `CLIENT`, `INTERNAL`, etc. |
 | `start_time` | `Timestamp(µs, UTC)` | Span start |
 | `end_time` | `Timestamp(µs, UTC)` | Span end |
-| `duration_ms` | `UInt64` | `(end_time - start_time) / 1000` |
+| `duration_ms` | `Int64` | `(end_time - start_time) / 1000` |
 | `status` | `Utf8` | `OK`, `ERROR`, `UNSET` |
 | `attributes` | `Utf8` nullable | JSON-serialized span attributes, **payload-gated** |
 | `service_name` | `Utf8` | Emitting service |
@@ -98,8 +98,8 @@ Source type: `GenAiSpanRecord`.
 | `provider_name` | `Utf8` | e.g. `openai`, `anthropic` |
 | `request_model` | `Utf8` | Model name as requested |
 | `conversation_id` | `Utf8` nullable | |
-| `usage_input_tokens` | `UInt32` nullable | |
-| `usage_output_tokens` | `UInt32` nullable | |
+| `usage_input_tokens` | `Int64` nullable | |
+| `usage_output_tokens` | `Int64` nullable | |
 | `input_messages` | `Utf8` nullable | **payload-gated** |
 | `output_messages` | `Utf8` nullable | **payload-gated** |
 | + system columns | |
@@ -125,7 +125,7 @@ Source type: `LogRecord`.
 |---|---|
 | `time` | `Timestamp(µs, UTC)` nullable |
 | `observed_time` | `Timestamp(µs, UTC)` |
-| `severity_number` | `UInt32` nullable |
+| `severity_number` | `Int64` nullable |
 | `severity_text` | `Utf8` nullable |
 | `event_name` | `Utf8` nullable, **payload-gated** |
 | `body` | `Utf8` nullable, **payload-gated** |
@@ -184,5 +184,5 @@ Source type: `AgentTraceRecord`.
 | `FixedSizeBinary(8)` | `String` (lowercase hex) | span_id |
 | `Timestamp(µs, UTC)` | `DateTime<Utc>` (RFC3339) | All timestamps |
 | `Utf8` | `String` or `serde_json::Value` | Attributes are JSON-parsed |
-| `UInt32` nullable | `Option<i64>` | Token counts |
+| `Int64` nullable | `Option<i64>` | Token counts, counts, and other unsigned OTLP values |
 | `Float64` nullable | `Option<f64>` | Scores, values |

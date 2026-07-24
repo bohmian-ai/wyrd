@@ -6,7 +6,8 @@
 
 use crate::env_parse::{parse_bool_optional, parse_clamped_i64, parse_u64_optional};
 use crate::error::StorageError;
-use crate::{StorageHandle, tenant_path};
+use crate::service::{StorageCaller, StoragePrincipalKind, StorageSubject};
+use crate::{StorageHandle, audit, tenant_path};
 use sqlx::PgPool;
 use sqlx::pool::PoolConnection;
 use std::str::FromStr;
@@ -15,6 +16,8 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::PLATFORM_AUDIT_PRINCIPAL;
+use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{StorageBackendKind, WireProtocol};
 
 /// Session-level Postgres advisory lock key for sweeper leadership.
@@ -96,6 +99,7 @@ impl Default for SweeperConfig {
 pub struct Sweeper {
     handle: Arc<StorageHandle>,
     admin_pool: PgPool,
+    app_pool: PgPool,
     cfg: SweeperConfig,
     shutdown: CancellationToken,
 }
@@ -106,12 +110,14 @@ impl Sweeper {
     pub fn new(
         handle: Arc<StorageHandle>,
         admin_pool: PgPool,
+        app_pool: PgPool,
         cfg: SweeperConfig,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             handle,
             admin_pool,
+            app_pool,
             cfg,
             shutdown,
         }
@@ -313,9 +319,13 @@ impl Sweeper {
             }
         };
 
+        let conn = wyrd_sql::TenantConn::acquire(&self.app_pool, data_tenant_id)
+            .await
+            .map_err(StorageError::Sql)?;
+        let mut conn = conn;
         let rows_updated =
             wyrd_sql::queries::storage::admin::multipart_uploads::mark_aborted_admin(
-                &self.admin_pool,
+                &mut conn,
                 row.id,
                 "sweeper-ttl-expired",
             )
@@ -329,41 +339,43 @@ impl Sweeper {
             return Ok(());
         }
 
-        self.audit_abort(data_tenant_id, row, backend, status_code, error_code)
-            .await
+        commit_reclamation(conn, data_tenant_id, row, backend, status_code, error_code).await
     }
+}
 
-    async fn audit_abort(
-        &self,
-        data_tenant_id: DataTenantId,
-        row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
-        backend: StorageBackendKind,
-        status_code: i32,
-        error_code: Option<&str>,
-    ) -> Result<(), StorageError> {
-        let mut conn = wyrd_sql::TenantConn::acquire(&self.admin_pool, data_tenant_id)
-            .await
-            .map_err(StorageError::Sql)?;
-        let request_id = format!("storage-sweeper-{}", row.id);
-
-        wyrd_sql::queries::platform::audit_log::write_storage_event(
-            &mut conn,
-            wyrd_sql::queries::platform::audit_log::StorageAuditEvent {
-                subject_id: "storage-sweeper",
-                operation: "sweeper_abort",
-                storage_path: row.storage_path.as_str(),
-                status_code,
-                error_code,
-                request_id: request_id.as_str(),
-                backend,
-                upload_id: Some(row.id),
-            },
-        )
-        .await?;
-        conn.commit().await?;
-
-        Ok(())
-    }
+async fn commit_reclamation(
+    mut conn: wyrd_sql::TenantConn<'_>,
+    data_tenant_id: DataTenantId,
+    row: &wyrd_sql::queries::storage::admin::multipart_uploads::ExpiredUpload,
+    backend: StorageBackendKind,
+    status_code: i32,
+    error_code: Option<&str>,
+) -> Result<(), StorageError> {
+    let caller = StorageCaller {
+        data_tenant_id,
+        subject: StorageSubject {
+            principal_id: PLATFORM_AUDIT_PRINCIPAL.as_uuid(),
+            kind: StoragePrincipalKind::Service,
+        },
+        request_id: RequestId::now_v7(),
+    };
+    audit::write(
+        &mut conn,
+        &caller,
+        audit::UploadAuditOperation::Reclaimed,
+        Some(row.id),
+        &row.storage_path,
+        backend,
+        status_code,
+        error_code,
+    )
+    .await
+    .map_err(|error| StorageError::Backend {
+        backend,
+        op: "audit_reclaimed",
+        message: error.to_string(),
+    })?;
+    conn.commit().await.map_err(StorageError::Sql)
 }
 
 fn classify_error(error: &StorageError) -> &'static str {

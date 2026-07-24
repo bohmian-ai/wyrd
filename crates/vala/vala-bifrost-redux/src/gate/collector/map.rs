@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
 use arrow::array::{
     ArrayRef, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray, UInt32Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use chrono::{DateTime, Utc};
@@ -373,8 +373,8 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
             .map(|r| r.parent_span_id.map(|id| *id.as_bytes())),
     )?;
 
-    let flags = Arc::new(UInt32Array::from_iter_values(
-        records.iter().map(|r| r.flags),
+    let flags = Arc::new(Int64Array::from_iter_values(
+        records.iter().map(|r| i64::from(r.flags)),
     )) as ArrayRef;
     let trace_state = Arc::new(
         records
@@ -417,14 +417,16 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
             .collect::<StringArray>(),
     ) as ArrayRef;
 
-    let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
-        records.iter().map(|r| r.dropped_attributes_count),
+    let dropped_attributes_count = Arc::new(Int64Array::from_iter_values(
+        records
+            .iter()
+            .map(|r| i64::from(r.dropped_attributes_count)),
     )) as ArrayRef;
-    let dropped_events_count = Arc::new(UInt32Array::from_iter_values(
-        records.iter().map(|r| r.dropped_events_count),
+    let dropped_events_count = Arc::new(Int64Array::from_iter_values(
+        records.iter().map(|r| i64::from(r.dropped_events_count)),
     )) as ArrayRef;
-    let dropped_links_count = Arc::new(UInt32Array::from_iter_values(
-        records.iter().map(|r| r.dropped_links_count),
+    let dropped_links_count = Arc::new(Int64Array::from_iter_values(
+        records.iter().map(|r| i64::from(r.dropped_links_count)),
     )) as ArrayRef;
 
     let scope_name = Arc::new(
@@ -1003,7 +1005,12 @@ fn metric_scalar_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
             .map(|r| r.is_monotonic)
             .collect::<BooleanArray>(),
     ) as ArrayRef;
-    let flags = Arc::new(records.iter().map(|r| r.flags).collect::<UInt32Array>()) as ArrayRef;
+    let flags = Arc::new(
+        records
+            .iter()
+            .map(|r| r.flags.map(i64::from))
+            .collect::<Int64Array>(),
+    ) as ArrayRef;
     let value = Arc::new(records.iter().map(|r| r.value).collect::<Float64Array>()) as ArrayRef;
     let count = Arc::new(
         records
@@ -1254,8 +1261,8 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
     let severity_number = Arc::new(
         records
             .iter()
-            .map(|r| r.severity_number.map(u32::from))
-            .collect::<UInt32Array>(),
+            .map(|r| r.severity_number.map(|value| i64::from(u32::from(value))))
+            .collect::<Int64Array>(),
     ) as ArrayRef;
     let severity_text = Arc::new(
         records
@@ -1275,8 +1282,8 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
     let trace_flags = Arc::new(
         records
             .iter()
-            .map(|r| r.trace_flags.map(u32::from))
-            .collect::<UInt32Array>(),
+            .map(|r| r.trace_flags.map(|value| i64::from(u32::from(value))))
+            .collect::<Int64Array>(),
     ) as ArrayRef;
     let attributes = json_col(records.iter().map(|r| {
         if r.attributes.is_empty() {
@@ -1285,8 +1292,10 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
             Some(attrs_json(&r.attributes))
         }
     }));
-    let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
-        records.iter().map(|r| r.dropped_attributes_count),
+    let dropped_attributes_count = Arc::new(Int64Array::from_iter_values(
+        records
+            .iter()
+            .map(|r| i64::from(r.dropped_attributes_count)),
     )) as ArrayRef;
     let service_name = Arc::new(
         records
@@ -2076,7 +2085,7 @@ mod tests {
             .column_by_name("severity_number")
             .unwrap()
             .as_any()
-            .downcast_ref::<UInt32Array>()
+            .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(sev.value(0), 17);
 

@@ -18,7 +18,11 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memtable::Memtable;
+use crate::scribe::persistence::{
+    ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
+};
 use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedSlice};
+use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalHandle, WalWriter};
 
 const CONTROL_QUEUE_CAPACITY: usize = 256;
@@ -32,25 +36,32 @@ struct WriterState {
     reserved_sends: AtomicUsize,
     terminal_errors: AtomicUsize,
     last_activity: Mutex<Instant>,
+    stopping: AtomicBool,
+    finished: AtomicBool,
     stopped: Notify,
 }
 
 #[derive(Debug)]
-enum WriterControl {
-    PersistenceCompleted,
-    GraceExpired,
+pub(crate) enum WriterControl {
+    PersistenceComplete(PersistenceCompletion),
+    GraceExpired(PersistenceCompletion),
     Shutdown,
 }
 
 #[derive(Debug)]
 struct WriterRuntime {
     writer_identity: String,
+    writer_key: TenantTableKey,
+    binding: TenantTableBinding,
+    instance_id: Uuid,
+    stream: StreamIdentity,
     state: Arc<WriterState>,
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
+    persistence: Option<Arc<PersistenceRuntime>>,
     commit_config: crate::scribe::ScribeCommitConfig,
 }
 
@@ -61,10 +72,19 @@ struct WriterDependencies {
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
+    persistence: Option<Arc<PersistenceRuntime>>,
+    stream: StreamIdentity,
     coordination_runtime: Handle,
     writer_queue_items: usize,
     writer_idle_ttl: std::time::Duration,
     commit_config: crate::scribe::ScribeCommitConfig,
+}
+
+pub(crate) struct WriterRegistryRuntime {
+    pub(crate) coordination_runtime: Handle,
+    pub(crate) commit_config: crate::scribe::ScribeCommitConfig,
+    pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
+    pub(crate) stream: StreamIdentity,
 }
 
 /// One FIFO writer for a tenant/table binding.
@@ -90,12 +110,15 @@ impl TenantTableWriter {
         dependencies: WriterDependencies,
     ) -> Arc<Self> {
         let writer_identity = format!("{}:{}", binding.tenant, binding.table_ref.fqn());
+        let instance_id = Uuid::now_v7();
         let WriterDependencies {
             admission,
             memtable,
             wal,
             post_ack_cpu,
             wal_io,
+            persistence,
+            stream,
             commit_config,
             coordination_runtime,
             writer_queue_items,
@@ -111,24 +134,37 @@ impl TenantTableWriter {
             reserved_sends: AtomicUsize::new(0),
             terminal_errors: AtomicUsize::new(0),
             last_activity: Mutex::new(Instant::now()),
+            stopping: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
             stopped: Notify::new(),
         });
         let runtime = WriterRuntime {
             writer_identity,
+            writer_key: (binding.tenant, binding.table_ref.clone()),
+            binding: binding.clone(),
+            instance_id,
+            stream,
             state: Arc::clone(&state),
             admission,
             memtable,
             wal,
             post_ack_cpu,
             wal_io,
+            persistence,
             commit_config,
         };
-        let task = coordination_runtime.spawn(run_writer(runtime, data_rx, control_rx, age_rx));
+        let task = coordination_runtime.spawn(run_writer(
+            runtime,
+            data_rx,
+            control_rx,
+            age_rx,
+            control_tx.clone(),
+        ));
         let key = (binding.tenant, binding.table_ref.clone());
         Arc::new(Self {
             key,
             binding,
-            instance_id: Uuid::now_v7(),
+            instance_id,
             state,
             data_tx,
             control_tx,
@@ -168,6 +204,7 @@ impl TenantTableWriter {
     }
 
     fn close_admission(&self) {
+        self.state.stopping.store(true, Ordering::Release);
         self.state.accepting.store(false, Ordering::Release);
     }
 
@@ -236,6 +273,8 @@ pub(crate) struct TenantTableWriterRegistry {
     wal: Arc<WalWriter>,
     post_ack_cpu: ScribePostAckCpuPool,
     wal_io: ScribeWalIoPool,
+    persistence: Option<Arc<PersistenceRuntime>>,
+    stream: StreamIdentity,
     coordination_runtime: Handle,
     drained: Notify,
     commit_config: crate::scribe::ScribeCommitConfig,
@@ -256,8 +295,15 @@ impl TenantTableWriterRegistry {
             wal,
             post_ack_cpu,
             wal_io,
-            Handle::current(),
-            crate::scribe::ScribeCommitConfig::default(),
+            WriterRegistryRuntime {
+                coordination_runtime: Handle::current(),
+                commit_config: crate::scribe::ScribeCommitConfig::default(),
+                persistence: None,
+                stream: StreamIdentity::new(
+                    crate::scribe::stream_identity::NodeId::new(Uuid::nil()),
+                    crate::scribe::stream_identity::WriterEpoch::new(0),
+                ),
+            },
         )
     }
 
@@ -267,8 +313,7 @@ impl TenantTableWriterRegistry {
         wal: Arc<WalWriter>,
         post_ack_cpu: ScribePostAckCpuPool,
         wal_io: ScribeWalIoPool,
-        coordination_runtime: Handle,
-        commit_config: crate::scribe::ScribeCommitConfig,
+        runtime: WriterRegistryRuntime,
     ) -> Arc<Self> {
         Arc::new(Self {
             entries: Mutex::new(HashMap::new()),
@@ -277,9 +322,11 @@ impl TenantTableWriterRegistry {
             wal,
             post_ack_cpu,
             wal_io,
-            coordination_runtime,
+            persistence: runtime.persistence,
+            stream: runtime.stream,
+            coordination_runtime: runtime.coordination_runtime,
             drained: Notify::new(),
-            commit_config,
+            commit_config: runtime.commit_config,
         })
     }
 
@@ -313,6 +360,8 @@ impl TenantTableWriterRegistry {
                 wal: Arc::clone(&self.wal),
                 post_ack_cpu: self.post_ack_cpu.clone(),
                 wal_io: self.wal_io.clone(),
+                persistence: self.persistence.clone(),
+                stream: self.stream,
                 commit_config: self.commit_config,
                 coordination_runtime: self.coordination_runtime.clone(),
                 writer_queue_items: self.admission.config().writer_queue_items,
@@ -454,14 +503,29 @@ impl TenantTableWriterRegistry {
         };
         for writer in &writers {
             writer.close_admission();
-            let _ = writer
-                .send_control(WriterControl::PersistenceCompleted)
-                .await;
-            let _ = writer.send_control(WriterControl::GraceExpired).await;
         }
         self.drain().await;
         for writer in writers {
-            let _ = writer.send_control(WriterControl::Shutdown).await;
+            let stopped = writer.state.stopped.notified();
+            if writer.state.finished.load(Ordering::Acquire) {
+                continue;
+            }
+            if writer.send_control(WriterControl::Shutdown).await.is_ok()
+                && !writer.state.finished.load(Ordering::Acquire)
+            {
+                stopped.await;
+            }
+        }
+    }
+
+    /// Publish the latest lifecycle age value to every writer watch channel.
+    pub(crate) fn publish_age(&self, now: Instant) {
+        let writers = match self.entries.lock() {
+            Ok(entries) => entries.values().cloned().collect::<Vec<_>>(),
+            Err(_) => Vec::new(),
+        };
+        for writer in writers {
+            let _ = writer.age_tx.send(now);
         }
     }
 
@@ -507,46 +571,92 @@ pub struct WriterHealthSnapshot {
     pub terminal_errors: usize,
 }
 
+struct WriterLoopState {
+    seen_slices: HashSet<AppendSliceId>,
+    wal_handles: HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    wal_bytes: HashMap<crate::scribe::seal_key::SealKey, usize>,
+    pending_jobs: Vec<PersistenceJob>,
+    retained: Option<AdmittedAppend>,
+    group: Vec<AdmittedAppend>,
+    max_frames: usize,
+}
+
+impl WriterLoopState {
+    fn new(max_frames: usize) -> Self {
+        Self {
+            seen_slices: HashSet::new(),
+            wal_handles: HashMap::new(),
+            wal_bytes: HashMap::new(),
+            pending_jobs: Vec::new(),
+            retained: None,
+            group: Vec::with_capacity(max_frames),
+            max_frames,
+        }
+    }
+}
+
 /// Run one writer's control and data queues on the dedicated coordination runtime.
 async fn run_writer(
     runtime: WriterRuntime,
     mut data_rx: mpsc::Receiver<AdmittedAppend>,
     mut control_rx: mpsc::Receiver<WriterControl>,
     mut age_rx: watch::Receiver<Instant>,
+    control_tx: mpsc::Sender<WriterControl>,
 ) {
-    let mut seen_slices = HashSet::<AppendSliceId>::new();
-    let mut wal_handles = HashMap::<crate::scribe::seal_key::SealKey, WalHandle>::new();
-    let mut retained = None;
     let mut controls_closed = false;
     let mut shutdown_requested = false;
     let max_frames = runtime.commit_config.max_group_frames;
     let max_bytes = runtime.commit_config.max_group_bytes;
-    let mut group = Vec::with_capacity(max_frames);
+    let mut state = WriterLoopState::new(max_frames);
 
     loop {
         if shutdown_requested
             && runtime.state.pending.load(Ordering::Acquire) == 0
             && runtime.state.reserved_sends.load(Ordering::Acquire) == 0
         {
+            let _ = rotate_all(
+                &runtime,
+                &state.wal_handles,
+                &mut state.wal_bytes,
+                &mut state.pending_jobs,
+                &control_tx,
+            )
+            .await;
+            submit_pending(&runtime, &mut state.pending_jobs);
             break;
         }
-        let first = if retained.is_some() {
-            retained.take()
+        let first = if state.retained.is_some() {
+            state.retained.take()
         } else {
             tokio::select! {
                 biased;
-                control = control_rx.recv(), if !controls_closed && !shutdown_requested => {
+                control = control_rx.recv(), if !controls_closed => {
                     match control {
                         Some(WriterControl::Shutdown) => {
                             runtime.state.accepting.store(false, Ordering::Release);
                             shutdown_requested = true;
                         }
-                        Some(WriterControl::PersistenceCompleted | WriterControl::GraceExpired) => {}
+                        Some(control) => {
+                            process_control(&runtime, control, &control_tx).await;
+                        }
                         None => controls_closed = true,
                     }
                     None
                 }
-                _ = age_rx.changed() => None,
+                _ = age_rx.changed() => {
+                    let now = *age_rx.borrow();
+                    let _ = rotate_expired(
+                        &runtime,
+                        now,
+                        &state.wal_handles,
+                        &mut state.wal_bytes,
+                        &mut state.pending_jobs,
+                        &control_tx,
+                    )
+                    .await;
+                    submit_pending(&runtime, &mut state.pending_jobs);
+                    None
+                }
                 append = data_rx.recv() => append,
             }
         };
@@ -557,63 +667,333 @@ async fn run_writer(
             continue;
         };
 
-        let group_bytes = fill_group(
+        if !process_group_and_rotate(
+            &runtime,
             &mut data_rx,
             first,
-            &mut retained,
-            &mut group,
-            max_frames,
+            &mut state,
             max_bytes,
-        );
-
-        let group_len = group.len();
-        let result = process_group(
-            &runtime,
-            &mut group,
-            group_bytes,
-            &mut seen_slices,
-            &mut wal_handles,
+            &control_tx,
         )
-        .await;
-        for _ in 0..group_len {
-            runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
-        }
-        metrics::gauge!("bifrost_scribe_writer_queue_depth").set(
-            runtime
-                .state
-                .pending
-                .load(Ordering::Acquire)
-                .to_f64()
-                .unwrap_or(f64::MAX),
-        );
-        if let Err(error) = result {
-            runtime.state.healthy.store(false, Ordering::Release);
-            runtime.state.terminal_errors.fetch_add(1, Ordering::AcqRel);
-            if matches!(&error, ScribeError::WalDiskFull) {
-                runtime.admission.trip_wal_disk_full();
-            }
-            tracing::error!(error = %error, group_frames = group_len, group_bytes, stage = "wal_group", "Scribe writer became unhealthy");
-            metrics::counter!("bifrost_scribe_writer_groups_total", "status" => "failed")
-                .increment(1);
-            metrics::counter!("bifrost_scribe_writer_unhealthy_total", "reason" => "wal_group")
-                .increment(1);
-            while let Ok(queued) = data_rx.try_recv() {
-                drop(queued);
-                runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
-            }
-            if retained.take().is_some() {
-                runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
-            }
+        .await
+        {
             break;
         }
     }
-    for (_, wal) in wal_handles {
-        let _ = runtime
-            .wal_io
-            .submit(ScribeWalIoOp::RetireWal { wal })
-            .await;
-    }
+    runtime.state.finished.store(true, Ordering::Release);
     runtime.state.stopped.notify_waiters();
+}
+
+async fn process_group_and_rotate(
+    runtime: &WriterRuntime,
+    data_rx: &mut mpsc::Receiver<AdmittedAppend>,
+    first: AdmittedAppend,
+    state: &mut WriterLoopState,
+    max_bytes: usize,
+    control_tx: &mpsc::Sender<WriterControl>,
+) -> bool {
+    let group_bytes = fill_group(
+        data_rx,
+        first,
+        &mut state.retained,
+        &mut state.group,
+        state.max_frames,
+        max_bytes,
+    );
+    let group_len = state.group.len();
+    let result = process_group(
+        runtime,
+        &mut state.group,
+        group_bytes,
+        &mut state.seen_slices,
+        &mut state.wal_handles,
+        &mut state.wal_bytes,
+    )
+    .await;
+    for _ in 0..group_len {
+        runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
+    }
+    metrics::gauge!("bifrost_scribe_writer_queue_depth").set(
+        runtime
+            .state
+            .pending
+            .load(Ordering::Acquire)
+            .to_f64()
+            .unwrap_or(f64::MAX),
+    );
+    if let Err(error) = result {
+        runtime.state.healthy.store(false, Ordering::Release);
+        runtime.state.terminal_errors.fetch_add(1, Ordering::AcqRel);
+        if matches!(&error, ScribeError::WalDiskFull) {
+            runtime.admission.trip_wal_disk_full();
+        }
+        tracing::error!(error = %error, group_frames = group_len, group_bytes, stage = "wal_group", "Scribe writer became unhealthy");
+        metrics::counter!("bifrost_scribe_writer_groups_total", "status" => "failed").increment(1);
+        metrics::counter!("bifrost_scribe_writer_unhealthy_total", "reason" => "wal_group")
+            .increment(1);
+        while let Ok(queued) = data_rx.try_recv() {
+            drop(queued);
+            runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        if state.retained.take().is_some() {
+            runtime.state.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        return false;
+    }
+    for seal_key in append_stats_keys(runtime, &state.wal_bytes) {
+        let due = state.wal_bytes.get(&seal_key).copied().unwrap_or(0)
+            >= crate::scribe::memtable::WAL_ROTATION_BYTES
+            || runtime.memtable.should_seal(&seal_key).unwrap_or(false);
+        if due {
+            let _ = rotate_one(
+                runtime,
+                &seal_key,
+                &state.wal_handles,
+                &mut state.wal_bytes,
+                &mut state.pending_jobs,
+                control_tx,
+            )
+            .await;
+        }
+    }
+    submit_pending(runtime, &mut state.pending_jobs);
+    true
+}
+
+fn append_stats_keys(
+    _runtime: &WriterRuntime,
+    wal_bytes: &HashMap<crate::scribe::seal_key::SealKey, usize>,
+) -> Vec<crate::scribe::seal_key::SealKey> {
+    wal_bytes.keys().cloned().collect()
+}
+
+fn submit_pending(runtime: &WriterRuntime, pending_jobs: &mut Vec<PersistenceJob>) {
+    let Some(persistence) = &runtime.persistence else {
+        pending_jobs.clear();
+        return;
+    };
+    let mut remaining = Vec::with_capacity(pending_jobs.len());
+    for job in pending_jobs.drain(..) {
+        if let Err(job) = persistence.try_submit(job) {
+            remaining.push(*job);
+        }
+    }
+    *pending_jobs = remaining;
+}
+
+async fn rotate_expired(
+    runtime: &WriterRuntime,
+    now: Instant,
+    wal_handles: &HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, usize>,
+    pending_jobs: &mut Vec<PersistenceJob>,
+    control_tx: &mpsc::Sender<WriterControl>,
+) -> Result<(), ScribeError> {
+    let keys = runtime
+        .memtable
+        .expired_seal_keys_for_table(&runtime.writer_key, now)?;
+    for seal_key in keys {
+        rotate_one(
+            runtime,
+            &seal_key,
+            wal_handles,
+            wal_bytes,
+            pending_jobs,
+            control_tx,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn rotate_all(
+    runtime: &WriterRuntime,
+    wal_handles: &HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, usize>,
+    pending_jobs: &mut Vec<PersistenceJob>,
+    control_tx: &mpsc::Sender<WriterControl>,
+) -> Result<(), ScribeError> {
+    let mut keys = runtime.memtable.seal_keys_for_table(&runtime.writer_key)?;
+    keys.extend(wal_bytes.keys().cloned());
+    keys.sort_by_key(ToString::to_string);
+    keys.dedup();
+    for seal_key in keys {
+        if runtime.memtable.has_writable(&seal_key)? {
+            rotate_one(
+                runtime,
+                &seal_key,
+                wal_handles,
+                wal_bytes,
+                pending_jobs,
+                control_tx,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn rotate_one(
+    runtime: &WriterRuntime,
+    seal_key: &crate::scribe::seal_key::SealKey,
+    wal_handles: &HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, usize>,
+    pending_jobs: &mut Vec<PersistenceJob>,
+    control_tx: &mpsc::Sender<WriterControl>,
+) -> Result<(), ScribeError> {
+    if !runtime.memtable.has_writable(seal_key)? {
+        return Ok(());
+    }
+    if runtime.memtable.immutable_count(seal_key)? >= 2 {
+        runtime.state.accepting.store(false, Ordering::Release);
+        metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "immutable_bound")
+            .increment(1);
+        return Err(ScribeError::IngestBusy {
+            table: seal_key.table.fqn(),
+        });
+    }
+
+    let wal = wal_handles.get(seal_key).cloned();
+    let wal_segments = if let Some(wal) = &wal {
+        if let Some(segment) = wal.current_segment()? {
+            match runtime
+                .wal_io
+                .submit(ScribeWalIoOp::SyncWal {
+                    segments: vec![Arc::clone(&segment)],
+                })
+                .await?
+            {
+                ScribeWalIoResult::WalSynced => {}
+                _ => {
+                    return Err(ScribeError::Internal {
+                        detail: "WAL IO lane returned the wrong rotation sync result".to_owned(),
+                    });
+                }
+            }
+            vec![segment.reference()]
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let Some(wal) = wal else {
+        return Ok(());
+    };
+    let frozen = runtime.memtable.freeze(seal_key)?;
+    runtime
+        .admission
+        .transfer_active_to_immutable(frozen.arrow_bytes);
+    let generation = Arc::new(ImmutableGeneration::from_frozen(
+        &frozen,
+        runtime.writer_key.clone(),
+        runtime.instance_id,
+        runtime.stream,
+        wal_segments,
+        wal,
+    ));
+    wal_bytes.insert(seal_key.clone(), 0);
+    metrics::histogram!("bifrost_scribe_generation_swap_seconds").record(
+        generation
+            .closed_at
+            .duration_since(generation.opened_at)
+            .as_secs_f64(),
+    );
+
+    let Some(persistence) = &runtime.persistence else {
+        return Ok(());
+    };
+    let job = PersistenceJob {
+        generation,
+        binding: runtime.binding.clone(),
+        completion_tx: control_tx.clone(),
+    };
+    if let Err(job) = persistence.try_submit(job) {
+        pending_jobs.push(*job);
+    }
+    Ok(())
+}
+
+async fn process_control(
+    runtime: &WriterRuntime,
+    control: WriterControl,
+    control_tx: &mpsc::Sender<WriterControl>,
+) {
+    match control {
+        WriterControl::Shutdown => {
+            runtime.state.stopping.store(true, Ordering::Release);
+            runtime.state.accepting.store(false, Ordering::Release);
+        }
+        WriterControl::PersistenceComplete(completion) => {
+            if completion.writer_instance_id != runtime.instance_id
+                || completion.seal_key.table != runtime.writer_key.1
+                || completion.seal_key.tenant != runtime.writer_key.0
+            {
+                metrics::counter!("bifrost_scribe_stale_completion_total").increment(1);
+                return;
+            }
+            if let Some(error) = completion.error {
+                tracing::warn!(
+                    writer_instance_id = %completion.writer_instance_id,
+                    generation_id = completion.generation_id.0,
+                    error,
+                    "immutable generation persistence failed; retaining WAL and rows"
+                );
+                return;
+            }
+            let Some(file_list_key) = completion.file_list_key.clone() else {
+                return;
+            };
+            if let Err(error) = runtime
+                .memtable
+                .complete_post_commit(completion.generation_id.0, file_list_key)
+            {
+                tracing::warn!(error = %error, "persistence completion could not mark generation published");
+                return;
+            }
+            let tx = control_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(crate::scribe::memtable::ACTIVE_GENERATION_MAX_AGE / 10).await;
+                let _ = tx.send(WriterControl::GraceExpired(completion)).await;
+            });
+        }
+        WriterControl::GraceExpired(completion) => {
+            if completion.writer_instance_id != runtime.instance_id {
+                metrics::counter!("bifrost_scribe_stale_completion_total").increment(1);
+                return;
+            }
+            let now = Instant::now();
+            match runtime
+                .memtable
+                .retire_generation_at(completion.generation_id.0, now)
+            {
+                Ok(Some(_)) => {
+                    runtime.admission.release_immutable(completion.arrow_bytes);
+                    let grace_seconds = now
+                        .saturating_duration_since(completion.published_at)
+                        .as_secs_f64();
+                    metrics::histogram!("bifrost_scribe_generation_grace_seconds")
+                        .record(grace_seconds);
+                    if !runtime.state.stopping.load(Ordering::Acquire)
+                        && runtime.state.healthy.load(Ordering::Acquire)
+                    {
+                        runtime.state.accepting.store(true, Ordering::Release);
+                    }
+                    let _ = runtime
+                        .wal_io
+                        .submit(ScribeWalIoOp::RetireWal {
+                            wal: completion.wal,
+                            segments: completion.wal_segments,
+                        })
+                        .await;
+                    metrics::histogram!("bifrost_scribe_wal_retirement_delay_seconds")
+                        .record(grace_seconds);
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(error = %error, "immutable grace retirement failed"),
+            }
+        }
+    }
 }
 
 fn fill_group(
@@ -656,6 +1036,7 @@ async fn process_group(
     group_bytes: usize,
     seen_slices: &mut HashSet<AppendSliceId>,
     wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, usize>,
 ) -> Result<(), ScribeError> {
     let span = tracing::info_span!(
         "scribe_wal_group",
@@ -670,6 +1051,10 @@ async fn process_group(
     let mut prepared = prepare_group(runtime, group).await?;
 
     let append_stats = append_group(runtime, &mut prepared, seen_slices, wal_handles).await?;
+    for (seal_key, bytes) in append_stats.by_key {
+        let entry = wal_bytes.entry(seal_key).or_default();
+        *entry = entry.saturating_add(bytes);
+    }
     let touched = append_stats.touched;
     let durable_frames = append_stats.durable_frames;
     let durable_rows = append_stats.durable_rows;
@@ -743,6 +1128,7 @@ struct AppendGroupStats {
     durable_frames: u64,
     durable_rows: u64,
     wal_bytes: u64,
+    by_key: HashMap<crate::scribe::seal_key::SealKey, usize>,
     elapsed: std::time::Duration,
 }
 
@@ -758,95 +1144,119 @@ async fn append_group(
         durable_frames: 0,
         durable_rows: 0,
         wal_bytes: 0,
+        by_key: HashMap::new(),
         elapsed: std::time::Duration::ZERO,
     };
     for prepared_append in prepared {
         let batch_id = *prepared_append.batch_id.as_bytes();
-        let slices = std::mem::take(&mut prepared_append.slices);
-        let mut frame_had_work = false;
-        for slice in slices {
-            if seen_slices.contains(&slice.id) {
-                continue;
-            }
-            if seen_slices.len() >= MAX_DEDUPE_SLICES {
-                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "dedupe_capacity")
-                    .increment(1);
-                return Err(ScribeError::IngestBusy {
-                    table: slice.seal_key.table.fqn(),
-                });
-            }
-            seen_slices.insert(slice.id.clone());
-            metrics::gauge!("bifrost_scribe_dedupe_bytes").set(
-                seen_slices
-                    .len()
-                    .saturating_mul(256)
-                    .to_f64()
-                    .unwrap_or(f64::MAX),
-            );
-            frame_had_work = true;
-            let seal_key = slice.seal_key.clone();
-            let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
-                handle.clone()
-            } else {
-                let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
-                wal_handles.insert(seal_key.clone(), handle.clone());
-                handle
-            };
-            let PreparedSlice {
-                audit_event,
-                rows,
-                wal_append,
-                memtable_bytes,
-                ..
-            } = slice;
-            let ScribeWalIoResult::WalWritten { wal, result } = runtime
-                .wal_io
-                .submit(ScribeWalIoOp::WritePrepared {
-                    wal: wal_handle,
-                    append: wal_append,
-                })
-                .await?
-            else {
-                return Err(ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong write result".to_owned(),
-                });
-            };
-            let lsn = result.lsn;
-            stats.wal_bytes = stats.wal_bytes.saturating_add(result.encoded_bytes);
-            for segment in result.touched_segments {
-                stats
-                    .touched
-                    .insert(segment.path().to_path_buf(), (wal.clone(), segment));
-            }
-            let row_count = rows.num_rows();
-            stats.durable_rows = stats
-                .durable_rows
-                .saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
-            runtime
-                .admission
-                .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
-            if let Err(error) = runtime.memtable.insert(
-                &seal_key,
-                audit_event,
-                ScribeAppendMeta {
-                    batch_id,
-                    rows_accepted: row_count,
-                    wal_lsn_min: lsn,
-                    wal_lsn_max: lsn,
-                    seal_key: seal_key.as_path_components(),
-                },
-                rows,
-            ) {
-                runtime.admission.release_active(memtable_bytes);
-                return Err(error);
-            }
-        }
-        if frame_had_work {
+        if append_prepared(
+            runtime,
+            prepared_append,
+            batch_id,
+            seen_slices,
+            wal_handles,
+            &mut stats,
+        )
+        .await?
+        {
             stats.durable_frames = stats.durable_frames.saturating_add(1);
         }
     }
     stats.elapsed = started.elapsed();
     Ok(stats)
+}
+
+async fn append_prepared(
+    runtime: &WriterRuntime,
+    prepared_append: &mut crate::scribe::preprocess::PreparedAppend,
+    batch_id: [u8; 16],
+    seen_slices: &mut HashSet<AppendSliceId>,
+    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
+    stats: &mut AppendGroupStats,
+) -> Result<bool, ScribeError> {
+    let slices = std::mem::take(&mut prepared_append.slices);
+    let mut frame_had_work = false;
+    for slice in slices {
+        if seen_slices.contains(&slice.id) {
+            continue;
+        }
+        if seen_slices.len() >= MAX_DEDUPE_SLICES {
+            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "dedupe_capacity")
+                .increment(1);
+            return Err(ScribeError::IngestBusy {
+                table: slice.seal_key.table.fqn(),
+            });
+        }
+        seen_slices.insert(slice.id.clone());
+        metrics::gauge!("bifrost_scribe_dedupe_bytes").set(
+            seen_slices
+                .len()
+                .saturating_mul(256)
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
+        frame_had_work = true;
+        let seal_key = slice.seal_key.clone();
+        let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
+            handle.clone()
+        } else {
+            let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
+            wal_handles.insert(seal_key.clone(), handle.clone());
+            handle
+        };
+        let PreparedSlice {
+            audit_event,
+            rows,
+            wal_append,
+            memtable_bytes,
+            ..
+        } = slice;
+        let ScribeWalIoResult::WalWritten { wal, result } = runtime
+            .wal_io
+            .submit(ScribeWalIoOp::WritePrepared {
+                wal: wal_handle,
+                append: wal_append,
+            })
+            .await?
+        else {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong write result".to_owned(),
+            });
+        };
+        let lsn = result.lsn;
+        stats.wal_bytes = stats.wal_bytes.saturating_add(result.encoded_bytes);
+        let key_bytes = usize::try_from(result.encoded_bytes).unwrap_or(usize::MAX);
+        let entry = stats.by_key.entry(seal_key.clone()).or_default();
+        *entry = entry.saturating_add(key_bytes);
+        for segment in result.touched_segments {
+            stats
+                .touched
+                .insert(segment.path().to_path_buf(), (wal.clone(), segment));
+        }
+        let row_count = rows.num_rows();
+        stats.durable_rows = stats
+            .durable_rows
+            .saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+        runtime
+            .admission
+            .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+        if let Err(error) = runtime.memtable.insert(
+            &seal_key,
+            audit_event,
+            ScribeAppendMeta {
+                batch_id,
+                rows_accepted: row_count,
+                wal_lsn_min: lsn,
+                wal_lsn_max: lsn,
+                seal_key: seal_key.as_path_components(),
+            },
+            rows,
+        ) {
+            runtime.admission.release_active(memtable_bytes);
+            return Err(error);
+        }
+    }
+    Ok(frame_had_work)
 }
 
 #[cfg(test)]

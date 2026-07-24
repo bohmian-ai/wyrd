@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, utf8};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -19,15 +19,15 @@ impl DomainTable for RecordsTable {
         vec![
             ts_us_utc("time", true),
             ts_us_utc("observed_time", false),
-            uint32("severity_number", true),
+            int64("severity_number", true),
             utf8("severity_text", true),
             utf8("event_name", true),
             utf8("body", true),
             fixed_binary("trace_id", 16, true),
             fixed_binary("span_id", 8, true),
-            uint32("trace_flags", true),
+            int64("trace_flags", true),
             utf8("attributes", true),
-            uint32("dropped_attributes_count", false),
+            int64("dropped_attributes_count", false),
             utf8("service_name", true),
             utf8("scope_name", true),
             utf8("scope_version", true),

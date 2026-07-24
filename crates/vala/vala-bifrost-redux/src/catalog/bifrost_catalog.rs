@@ -306,9 +306,9 @@ impl BifrostCatalog {
         let actual_schema =
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?;
         if !schema_shape_matches(expected_schema, &actual_schema) {
-            return Err(BifrostCatalogError::MetadataMismatch(
-                "physical table schema mismatch".to_owned(),
-            ));
+            return Err(BifrostCatalogError::MetadataMismatch(format!(
+                "physical table schema mismatch: expected {expected_schema:?}, actual {actual_schema:?}"
+            )));
         }
         let fields = table.metadata().default_partition_spec().fields();
         if fields.len() != 1

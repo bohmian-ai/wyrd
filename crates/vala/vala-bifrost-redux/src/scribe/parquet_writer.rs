@@ -360,6 +360,9 @@ mod tests {
             batch,
             events: vec![],
             metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
         }
     }
 
@@ -606,6 +609,9 @@ mod tests {
             batch,
             events: vec![],
             metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
 

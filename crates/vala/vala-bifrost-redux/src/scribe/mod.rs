@@ -9,6 +9,7 @@ mod ingress;
 pub mod manifest;
 pub mod memtable;
 pub mod parquet_writer;
+pub mod persistence;
 pub mod preprocess;
 pub mod registry;
 pub mod replay;
@@ -31,11 +32,13 @@ pub use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool,
 };
 use crate::scribe::memtable::Memtable;
+pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{ScribeDurabilitySnapshot, ScribeRuntimeSnapshot};
 use crate::scribe::writer::TenantTableWriterRegistry;
 use async_trait::async_trait;
+use num_traits::ToPrimitive;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
@@ -155,9 +158,8 @@ impl ScribeLaneConfig {
 ///
 /// `append` admits a complete request to a bounded writer queue. The writer
 /// consumer performs event-day splitting, serialization, WAL writes, memtable
-/// insertion, and `sync_data` in order. Seal predicate triggers freeze at first-of:
-/// 50k rows | 1s | 128 MiB | 5s inactivity. Seal state machine executes:
-/// Freeze → Parquet → PUT → PG tx (`file_list` + audit) → manifest → retire WAL.
+/// insertion, and `sync_data` in order. Rotation is a consumer-owned state swap;
+/// immutable generations are handed to the bounded persistence runtime.
 #[derive(Debug)]
 pub struct ScribeImpl {
     /// In-memory memtable keyed by seal-key.
@@ -183,6 +185,8 @@ pub struct ScribeImpl {
     ingress_queue: ingress::ScribeIngressQueue,
     /// Resolved opportunistic WAL group limits.
     commit_config: ScribeCommitConfig,
+    /// Optional server-provisioned immutable persistence runtime.
+    persistence: Option<Arc<persistence::PersistenceRuntime>>,
 }
 
 pub struct ScribeBuildConfig {
@@ -198,6 +202,8 @@ pub struct ScribeBuildConfig {
     pub ingress_queue_bytes: usize,
     /// Opportunistic writer group limits.
     pub commit_config: ScribeCommitConfig,
+    /// Optional server-provisioned immutable persistence dependencies.
+    pub persistence: Option<ScribePersistenceConfig>,
 }
 
 impl ScribeImpl {
@@ -274,6 +280,7 @@ impl ScribeImpl {
                 ingress_queue_items: lane.ingress_queue_items,
                 ingress_queue_bytes: lane.ingress_queue_bytes,
                 commit_config: ScribeCommitConfig::default(),
+                persistence: None,
             },
         ))
     }
@@ -354,6 +361,7 @@ impl ScribeImpl {
                 ingress_queue_items: lane_config.ingress_queue_items,
                 ingress_queue_bytes: lane_config.ingress_queue_bytes,
                 commit_config: ScribeCommitConfig::default(),
+                persistence: None,
             },
         )
     }
@@ -384,21 +392,46 @@ impl ScribeImpl {
             ingress_queue_items,
             ingress_queue_bytes,
             commit_config,
-            ..
+            persistence: persistence_config,
+            admission: _,
         } = config;
         let ScribeExecutionPools {
             ingress_cpu,
             post_ack_cpu,
             wal_io,
         } = execution_pools;
+        let persistence = persistence_config.map(|config| {
+            persistence::PersistenceRuntime::start(
+                config,
+                persistence::PersistenceRuntimeContext {
+                    operator: Arc::clone(&operator),
+                    wal: Arc::clone(&wal),
+                    post_ack_cpu: post_ack_cpu.clone(),
+                    wal_io: wal_io.clone(),
+                    node_id: node_id.clone(),
+                    writer_epoch,
+                },
+                &coordination_runtime,
+            )
+        });
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(
+                uuid::Uuid::parse_str(&node_id).unwrap_or(uuid::Uuid::nil()),
+            ),
+            stream_identity::WriterEpoch::new(writer_epoch),
+        );
         let registry = TenantTableWriterRegistry::new_with_runtime(
             admission.clone(),
             Arc::clone(&memtable),
             Arc::clone(&wal),
             post_ack_cpu.clone(),
             wal_io.clone(),
-            coordination_runtime.clone(),
-            commit_config,
+            writer::WriterRegistryRuntime {
+                coordination_runtime: coordination_runtime.clone(),
+                commit_config,
+                persistence: persistence.clone(),
+                stream,
+            },
         );
         let ingress_queue = ingress::ScribeIngressQueue::new(
             ingress_queue_items,
@@ -421,6 +454,7 @@ impl ScribeImpl {
             registry,
             ingress_queue,
             commit_config,
+            persistence,
         }
     }
 
@@ -489,6 +523,7 @@ impl ScribeImpl {
                 ingress_queue_items: 256,
                 ingress_queue_bytes: 512 * 1024 * 1024,
                 commit_config: ScribeCommitConfig::default(),
+                persistence: None,
             },
         )
     }
@@ -498,6 +533,9 @@ impl ScribeImpl {
         let started = std::time::Instant::now();
         self.ingress_queue.close_and_drain().await;
         self.registry.shutdown().await;
+        if let Some(persistence) = &self.persistence {
+            persistence.close_and_drain().await;
+        }
         self.post_ack_cpu.drain().await;
         self.wal_io.drain().await;
         self.ingress_cpu.drain().await;
@@ -508,6 +546,11 @@ impl ScribeImpl {
     /// Retire idle writers after the pod lifecycle scanner's tick.
     pub async fn retire_idle(&self, now: std::time::Instant) {
         self.registry.retire_idle(now).await;
+    }
+
+    /// Publish one coalescing lifecycle age tick to every writer consumer.
+    pub fn check_age(&self, now: std::time::Instant) {
+        self.registry.publish_age(now);
     }
 
     /// Return the current admission, lane, and writer health metrics.
@@ -614,6 +657,12 @@ impl ScribeImpl {
         let stats = self.memtable.stats()?;
         self.admission
             .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+        metrics::gauge!("bifrost_scribe_active_memtable_bytes")
+            .set(stats.writable_bytes.to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_immutable_memtable_bytes")
+            .set(stats.immutable_bytes.to_f64().unwrap_or(f64::MAX));
+        metrics::gauge!("bifrost_scribe_immutable_generation_count")
+            .set(stats.immutable_generations.to_f64().unwrap_or(f64::MAX));
         Ok(stats)
     }
 

@@ -193,6 +193,43 @@ async fn accepted_frames_reach_the_durable_writer_path() {
 }
 
 #[tokio::test]
+async fn age_scanner_rotates_on_the_writer_consumer() {
+    let scribe = ScribeImpl::new();
+    scribe
+        .append(append(crate::test_support::tenant(), 1))
+        .await
+        .expect("frame accepted");
+    scribe.registry.drain().await;
+
+    scribe.check_age(Instant::now() + super::memtable::ACTIVE_GENERATION_MAX_AGE);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if scribe
+                .memtable_stats()
+                .expect("memtable stats")
+                .immutable_generations
+                == 1
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("age rotation reaches the writer consumer");
+
+    assert_eq!(
+        scribe
+            .memtable_stats()
+            .expect("memtable stats")
+            .writable_rows,
+        0
+    );
+    scribe.shutdown().await;
+}
+
+#[tokio::test]
 async fn retrying_the_same_frame_identity_does_not_double_write() {
     let scribe = ScribeImpl::new();
     let request = append(crate::test_support::tenant(), 1);
@@ -210,7 +247,16 @@ async fn retrying_the_same_frame_identity_does_not_double_write() {
         .seal_keys_for_tenant(crate::test_support::tenant())
         .expect("memtable keys");
     assert_eq!(keys.len(), 1, "one retained seal key for {table}");
-    assert_eq!(scribe.memtable_row_count(&keys[0]), 1);
+    assert_eq!(
+        scribe
+            .memtable
+            .readable_batches(crate::test_support::tenant(), &keys[0].table)
+            .expect("readable batches")
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
     assert_eq!(batch_id.get_version(), Some(uuid::Version::SortRand));
 }
 
@@ -692,7 +738,15 @@ async fn writer_retirement_drains_reserved_send() {
         table,
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
-    assert_eq!(memtable.row_count(&key).expect("row count"), 1);
+    assert_eq!(
+        memtable
+            .readable_batches(crate::test_support::tenant(), &key.table)
+            .expect("readable batches")
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        1
+    );
 }
 
 #[tokio::test]

@@ -435,16 +435,16 @@ mod fingerprint_drift {
     }
 
     const TRACES_SPANS: [u8; 32] = [
-        36, 142, 14, 187, 242, 20, 200, 146, 94, 229, 41, 38, 179, 255, 236, 100, 50, 163, 88, 225,
-        148, 24, 111, 227, 159, 174, 242, 18, 103, 4, 49, 88,
+        186, 210, 229, 84, 173, 0, 199, 222, 51, 157, 215, 110, 7, 245, 51, 97, 228, 169, 191, 159,
+        183, 97, 229, 135, 85, 86, 177, 156, 140, 169, 0, 221,
     ];
     const TRACES_EVENTS: [u8; 32] = [
-        51, 28, 164, 3, 147, 200, 241, 16, 16, 115, 89, 147, 146, 197, 159, 135, 87, 158, 226, 15,
-        112, 33, 72, 76, 123, 171, 178, 143, 40, 211, 49, 223,
+        246, 64, 78, 217, 141, 234, 169, 127, 230, 16, 52, 186, 169, 111, 58, 150, 199, 55, 127,
+        152, 237, 183, 185, 43, 109, 92, 221, 74, 251, 198, 60, 145,
     ];
     const TRACES_LINKS: [u8; 32] = [
-        180, 192, 43, 75, 41, 58, 54, 144, 147, 165, 193, 211, 25, 23, 107, 118, 126, 233, 165, 91,
-        166, 58, 157, 60, 224, 179, 144, 213, 36, 63, 184, 179,
+        218, 102, 54, 134, 68, 244, 170, 121, 162, 195, 178, 131, 241, 106, 205, 135, 185, 147,
+        111, 185, 40, 3, 45, 38, 14, 166, 127, 45, 45, 72, 21, 144,
     ];
     const GENAI_MESSAGES: [u8; 32] = [
         128, 122, 240, 100, 194, 15, 164, 24, 150, 110, 66, 203, 237, 136, 26, 203, 196, 101, 96,
@@ -463,12 +463,12 @@ mod fingerprint_drift {
         11, 187, 0, 102, 12, 222, 134, 220, 237, 248, 69, 52,
     ];
     const METRICS_POINTS: [u8; 32] = [
-        250, 146, 24, 169, 107, 86, 1, 11, 75, 201, 30, 147, 45, 233, 85, 128, 26, 118, 226, 121,
-        26, 210, 33, 200, 13, 10, 39, 232, 100, 18, 31, 127,
+        178, 127, 233, 154, 100, 54, 109, 116, 103, 118, 116, 143, 244, 241, 47, 195, 119, 192, 94,
+        116, 180, 225, 133, 77, 166, 19, 96, 93, 214, 78, 164, 207,
     ];
     const LOGS_RECORDS: [u8; 32] = [
-        243, 65, 135, 233, 200, 34, 2, 184, 106, 25, 140, 14, 206, 168, 21, 153, 238, 110, 130, 42,
-        179, 62, 249, 222, 112, 239, 19, 67, 41, 43, 51, 54,
+        136, 144, 62, 77, 182, 64, 115, 223, 107, 148, 27, 23, 24, 47, 25, 115, 85, 89, 229, 81,
+        113, 1, 141, 82, 200, 20, 122, 78, 26, 212, 212, 112,
     ];
     const EVAL_RUNS: [u8; 32] = [
         29, 98, 55, 184, 150, 212, 123, 19, 59, 154, 128, 159, 195, 169, 198, 153, 78, 118, 247,
@@ -547,7 +547,7 @@ mod fingerprint_drift {
             Field::new("trace_id", DataType::FixedSizeBinary(16), false),
             Field::new("span_id", DataType::FixedSizeBinary(8), false),
             Field::new("parent_span_id", DataType::FixedSizeBinary(8), true),
-            Field::new("flags", DataType::UInt32, false),
+            Field::new("flags", DataType::Int64, false),
             Field::new("trace_state", DataType::Utf8, true),
             Field::new("name", DataType::Utf8, false),
             Field::new("kind", DataType::Utf8, false),
@@ -564,9 +564,9 @@ mod fingerprint_drift {
             Field::new("duration_ms", DataType::Int64, false),
             Field::new("status", DataType::Utf8, false),
             Field::new("attributes", DataType::Utf8, true),
-            Field::new("dropped_attributes_count", DataType::UInt32, false),
-            Field::new("dropped_events_count", DataType::UInt32, false),
-            Field::new("dropped_links_count", DataType::UInt32, false),
+            Field::new("dropped_attributes_count", DataType::Int64, false),
+            Field::new("dropped_events_count", DataType::Int64, false),
+            Field::new("dropped_links_count", DataType::Int64, false),
             Field::new("scope_name", DataType::Utf8, true),
             Field::new("scope_version", DataType::Utf8, true),
             Field::new("service_name", DataType::Utf8, false),
@@ -599,7 +599,7 @@ mod fingerprint_drift {
             ),
             Field::new("name", DataType::Utf8, false),
             Field::new("attributes", DataType::Utf8, true),
-            Field::new("dropped_attributes_count", DataType::UInt32, false),
+            Field::new("dropped_attributes_count", DataType::Int64, false),
             Field::new("run_id", DataType::Utf8, true),
             Field::new("card_uid", DataType::Utf8, true),
             Field::new("principal_id", DataType::Utf8, true),
@@ -625,9 +625,9 @@ mod fingerprint_drift {
             Field::new("linked_trace_id", DataType::FixedSizeBinary(16), false),
             Field::new("linked_span_id", DataType::FixedSizeBinary(8), false),
             Field::new("trace_state", DataType::Utf8, true),
-            Field::new("flags", DataType::UInt32, false),
+            Field::new("flags", DataType::Int64, false),
             Field::new("attributes", DataType::Utf8, true),
-            Field::new("dropped_attributes_count", DataType::UInt32, false),
+            Field::new("dropped_attributes_count", DataType::Int64, false),
             Field::new("run_id", DataType::Utf8, true),
             Field::new("card_uid", DataType::Utf8, true),
             Field::new("principal_id", DataType::Utf8, true),
@@ -884,7 +884,7 @@ mod fingerprint_drift {
             Field::new("metric_type", DataType::Utf8, false),
             Field::new("temporality", DataType::Utf8, true),
             Field::new("is_monotonic", DataType::Boolean, true),
-            Field::new("flags", DataType::UInt32, true),
+            Field::new("flags", DataType::Int64, true),
             Field::new("value", DataType::Float64, true),
             Field::new("count", DataType::Int64, true),
             Field::new("sum", DataType::Float64, true),
@@ -933,15 +933,15 @@ mod fingerprint_drift {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
                 false,
             ),
-            Field::new("severity_number", DataType::UInt32, true),
+            Field::new("severity_number", DataType::Int64, true),
             Field::new("severity_text", DataType::Utf8, true),
             Field::new("event_name", DataType::Utf8, true),
             Field::new("body", DataType::Utf8, true),
             Field::new("trace_id", DataType::FixedSizeBinary(16), true),
             Field::new("span_id", DataType::FixedSizeBinary(8), true),
-            Field::new("trace_flags", DataType::UInt32, true),
+            Field::new("trace_flags", DataType::Int64, true),
             Field::new("attributes", DataType::Utf8, true),
-            Field::new("dropped_attributes_count", DataType::UInt32, false),
+            Field::new("dropped_attributes_count", DataType::Int64, false),
             Field::new("service_name", DataType::Utf8, true),
             Field::new("scope_name", DataType::Utf8, true),
             Field::new("scope_version", DataType::Utf8, true),

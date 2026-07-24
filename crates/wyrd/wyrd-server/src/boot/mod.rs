@@ -18,7 +18,7 @@ use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeCommitConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
-    ScribePostAckCpuPool, ScribeWalIoPool,
+    ScribePersistenceConfig, ScribePostAckCpuPool, ScribeWalIoPool,
 };
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
@@ -362,6 +362,11 @@ pub async fn build_app_state_from_boot_with_config(
                 scribe_config.commit_group_bytes,
             )
             .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
+            persistence: Some(ScribePersistenceConfig::new(
+                Arc::new(postgres.vala().clone()),
+                scribe_config.wal_io_queue_items,
+                scribe_config.wal_io_threads,
+            )),
         },
     ));
     let replayed_generations = scribe
@@ -754,8 +759,13 @@ pub fn spawn_storage_sweeper(
         return Ok(None);
     };
 
-    let sweeper =
-        wyrd_storage::sweeper::Sweeper::new(Arc::clone(&state.storage), admin_pool, cfg, shutdown);
+    let sweeper = wyrd_storage::sweeper::Sweeper::new(
+        Arc::clone(&state.storage),
+        admin_pool,
+        state.postgres.app_pool().clone(),
+        cfg,
+        shutdown,
+    );
     Ok(Some(tokio::spawn(async move { sweeper.run().await })))
 }
 

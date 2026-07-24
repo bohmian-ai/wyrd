@@ -344,6 +344,21 @@ impl BoundServer {
                 shutdown.clone(),
             ),
         ));
+        if let Some(scribe) = self.state.scribe.clone() {
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("scribe_age_scanner"),
+                async move {
+                    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticks.tick() => scribe.check_age(std::time::Instant::now()),
+                        }
+                    }
+                },
+            ));
+        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {

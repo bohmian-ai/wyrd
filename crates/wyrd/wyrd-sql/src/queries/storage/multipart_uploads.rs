@@ -212,7 +212,7 @@ pub async fn insert_initiating(
     let backend = row.backend.to_string();
     let wire_protocol = row.wire_protocol.to_string();
 
-    sqlx::query(
+    let result = sqlx::query(
         r#"
         INSERT INTO wyrd.storage_multipart_uploads (
             id,
@@ -267,7 +267,7 @@ pub async fn insert_initiating(
     .await
     .map_err(SqlError::from)?;
 
-    Ok(())
+    ensure_one_row(result.rows_affected(), "mark upload failed")
 }
 
 /// Mark an initiating row as pending after backend initialization succeeds.

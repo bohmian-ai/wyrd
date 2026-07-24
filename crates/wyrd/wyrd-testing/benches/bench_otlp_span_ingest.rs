@@ -324,12 +324,27 @@ async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Re
     } else {
         "not_ready"
     };
+    let queryability_boundary = if config.verify_samples == 0 {
+        "not run (verify-samples=0)"
+    } else {
+        "sampled ValaQueryService.GetTrace after flushing every pod"
+    };
+    let mut notes = vec![
+        "This is an open-loop bounded load test; the target is offered spans per second, not a server limit.",
+        "Accepted spans per second is measured from successful OTLP responses and excludes rejected or failed requests.",
+        "Forge and Oracle are not required for this Gate-to-Scribe ingest lane; their end-to-end stages need separate read/compaction benchmarks.",
+    ];
+    if config.verify_samples == 0 {
+        notes.push(
+            "Query verification was disabled; the current ValaQuery route still targets the legacy shared catalog while Redux writes tenant-qualified tables.",
+        );
+    }
     Ok(Report {
         schema_version: 1,
         lane: "otlp-span-ingest",
         ack_boundary: "Gate accepted the OTLP export and Scribe admitted the projected frame",
         durability_boundary: "post-run Scribe flush committed file-list rows; WAL fsync timing is not the client ACK",
-        queryability_boundary: "sampled ValaQueryService.GetTrace after flushing every pod",
+        queryability_boundary,
         config: ReportConfig {
             pods: config.pods,
             tenants: config.tenants,
@@ -346,11 +361,7 @@ async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Re
         measurement: phase_report(&measurement, config),
         verification,
         readiness,
-        notes: vec![
-            "This is an open-loop bounded load test; the target is offered spans per second, not a server limit.",
-            "Accepted spans per second is measured from successful OTLP responses and excludes rejected or failed requests.",
-            "Forge and Oracle are not required for this Gate-to-Scribe ingest lane; their end-to-end stages need separate read/compaction benchmarks.",
-        ],
+        notes,
     })
 }
 
@@ -443,6 +454,9 @@ async fn run_phase(
         interval.tick().await;
         if Instant::now() >= deadline {
             break;
+        }
+        while let Some(result) = tasks.try_join_next() {
+            stats.record(result??, retain_samples);
         }
         if tasks.len() >= config.max_in_flight {
             stats.schedule_misses = stats.schedule_misses.saturating_add(1);
@@ -641,7 +655,7 @@ async fn verify_run(
     }
     verification.file_list_rows = file_list_rows;
     verification.query_latency_us = LatencyPercentiles::from_samples(&query_latencies);
-    verification.file_list_rows_match = file_list_rows == measurement.accepted_spans;
+    verification.file_list_rows_match = file_list_rows == verification.expected_accepted_spans;
     verification.passed = verification.query_errors.is_empty()
         && verification.file_list_rows_match
         && (verification.query_samples_requested == 0

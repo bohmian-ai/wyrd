@@ -640,6 +640,13 @@ pub struct WalSegment {
     header: SegmentHeader,
 }
 
+/// Stable filesystem identity for one closed WAL segment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WalSegmentRef {
+    /// Segment path retained until manifest publication and grace expiry.
+    pub path: PathBuf,
+}
+
 impl WalSegment {
     /// Create a new WAL segment file at the given path.
     pub fn create(path: impl AsRef<Path>, header: SegmentHeader) -> Result<Self, ScribeError> {
@@ -808,6 +815,14 @@ impl WalSegment {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Return the immutable identity used by persistence and retirement.
+    #[must_use]
+    pub fn reference(&self) -> WalSegmentRef {
+        WalSegmentRef {
+            path: self.path.clone(),
+        }
+    }
 }
 
 fn write_record_vectored(
@@ -885,6 +900,17 @@ impl WalHandle {
     #[must_use]
     pub fn seal_key(&self) -> &SealKey {
         &self.seal_key
+    }
+
+    /// Return the current segment, if this handle has received an append.
+    pub(crate) fn current_segment(&self) -> Result<Option<Arc<WalSegment>>, ScribeError> {
+        self.writer
+            .state
+            .lock()
+            .map(|state| state.current_segment.clone())
+            .map_err(|_| ScribeError::Internal {
+                detail: "WAL state lock poisoned (current_segment)".to_owned(),
+            })
     }
 
     #[cfg(test)]

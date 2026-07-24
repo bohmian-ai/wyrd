@@ -1,8 +1,8 @@
 //! In-memory row buffer keyed by seal-key with seal predicate.
 //!
 //! The memtable holds Arrow buffers + paired `AuditEvent` lists per
-//! `SealKey = (DataTenantId, TableRef, EventDay)`. Seal predicate triggers
-//! freeze at first-of: 50k rows | 1s wall-time | 128 MiB | 5s inactivity.
+//! `SealKey = (DataTenantId, TableRef, EventDay)`. Rotation is driven by
+//! encoded WAL size, Arrow memory size, or active-generation age.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -20,11 +20,12 @@ use crate::scribe::file_list_writer::FileListCommitKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
-/// Seal predicate thresholds (hardcoded constants for ).
-const SEAL_ROWS_THRESHOLD: usize = 50_000;
-const SEAL_BYTES_THRESHOLD: usize = 128 * 1024 * 1024; // 128 MiB
-const SEAL_INTERVAL_SECS: u64 = 1;
-const SEAL_INACTIVITY_SECS: u64 = 5;
+/// Encoded WAL bytes at which the active generation rotates.
+pub const WAL_ROTATION_BYTES: usize = 512 * 1024 * 1024;
+/// Estimated Arrow bytes at which the active generation rotates.
+pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum age of an active generation before the lifecycle scanner requests rotation.
+pub const ACTIVE_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 
 /// Memtable — in-memory row buffer keyed by seal-key.
 ///
@@ -183,6 +184,9 @@ impl Memtable {
             batches,
             events: replayed.audit_events.clone(),
             metas,
+            opened_at: Instant::now(),
+            closed_at: Instant::now(),
+            arrow_bytes: replayed.data_records.iter().map(Vec::len).sum(),
         };
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
@@ -225,26 +229,23 @@ impl Memtable {
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or if
     /// the seal-key does not exist.
     pub fn freeze(&self, seal_key: &SealKey) -> Result<FrozenMemtable, ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable immutable lock poisoned: {e}"),
-        })?;
-        if let Some(entry) = immutable
-            .get(seal_key)
-            .and_then(|entries| entries.iter().find(|entry| entry.is_pending()))
-        {
-            return Ok(entry.frozen.clone());
-        }
-        drop(immutable);
-
         let mut buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
-        let bucket = buckets
-            .remove(seal_key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: format!("seal-key not found: {seal_key}"),
+        let Some(bucket) = buckets.remove(seal_key) else {
+            drop(buckets);
+            let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {e}"),
             })?;
+            return immutable
+                .get(seal_key)
+                .and_then(|entries| entries.iter().find(|entry| entry.is_pending()))
+                .map(|entry| entry.frozen.clone())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: format!("seal-key not found: {seal_key}"),
+                });
+        };
 
         let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
         let frozen = bucket.freeze(seal_id)?;
@@ -328,6 +329,67 @@ impl Memtable {
         keys.sort_by_key(ToString::to_string);
         keys.dedup();
         Ok(keys)
+    }
+
+    /// Snapshot writable seal-keys for one logical tenant/table.
+    pub(crate) fn seal_keys_for_table(
+        &self,
+        key: &crate::catalog::TenantTableKey,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .keys()
+            .filter(|seal_key| seal_key.tenant == key.0 && seal_key.table == key.1)
+            .cloned()
+            .collect())
+    }
+
+    /// Snapshot active seal-keys whose generation age has elapsed.
+    pub(crate) fn expired_seal_keys_for_table(
+        &self,
+        key: &crate::catalog::TenantTableKey,
+        now: Instant,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .iter()
+            .filter(|(seal_key, bucket)| {
+                seal_key.tenant == key.0 && seal_key.table == key.1 && bucket.is_age_expired(now)
+            })
+            .map(|(seal_key, _)| seal_key.clone())
+            .collect())
+    }
+
+    /// Return the number of immutable generations retained for one seal-key.
+    pub(crate) fn immutable_count(&self, seal_key: &SealKey) -> Result<usize, ScribeError> {
+        let immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        Ok(immutable.get(seal_key).map_or(0, Vec::len))
+    }
+
+    /// Return whether a writable bucket currently exists for the key.
+    pub(crate) fn has_writable(&self, seal_key: &SealKey) -> Result<bool, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets.contains_key(seal_key))
     }
 
     /// Return writable and immutable append batches for one tenant/table.
@@ -435,6 +497,36 @@ impl Memtable {
         }
         immutable.retain(|_, entries| !entries.is_empty());
         Ok(retired)
+    }
+
+    /// Retire one published generation after its grace period.
+    pub(crate) fn retire_generation_at(
+        &self,
+        seal_id: u64,
+        now: Instant,
+    ) -> Result<Option<WalRange>, ScribeError> {
+        let mut immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        for entries in immutable.values_mut() {
+            let Some(index) = entries.iter().position(|entry| {
+                entry.seal_id() == seal_id
+                    && matches!(
+                        &entry.state,
+                        ImmutableState::Committed { observed_at, .. }
+                            if now.saturating_duration_since(*observed_at) >= self.retention_grace
+                    )
+            }) else {
+                continue;
+            };
+            let entry = entries.remove(index);
+            return Ok(Some(entry.wal_range()));
+        }
+        immutable.retain(|_, entries| !entries.is_empty());
+        Ok(None)
     }
 
     /// Number of immutable generations currently retained.
@@ -546,14 +638,16 @@ impl MemtableBucket {
     }
 
     fn should_seal(&self) -> bool {
-        let now = Instant::now();
-        let elapsed_since_first = now.duration_since(self.first_insert_at).as_secs();
-        let elapsed_since_last = now.duration_since(self.last_insert_at).as_secs();
+        self.should_seal_at(Instant::now())
+    }
 
-        self.row_count >= SEAL_ROWS_THRESHOLD
-            || self.bytes_accumulated >= SEAL_BYTES_THRESHOLD
-            || elapsed_since_first >= SEAL_INTERVAL_SECS
-            || elapsed_since_last >= SEAL_INACTIVITY_SECS
+    fn should_seal_at(&self, now: Instant) -> bool {
+        self.bytes_accumulated >= MEMTABLE_ROTATION_BYTES
+            || now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
+    }
+
+    fn is_age_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
     }
 
     fn freeze(self, seal_id: u64) -> Result<FrozenMemtable, ScribeError> {
@@ -575,6 +669,10 @@ impl MemtableBucket {
             })?
         };
 
+        let opened_at = self.first_insert_at;
+        let closed_at = Instant::now();
+        let arrow_bytes = self.bytes_accumulated;
+
         Ok(FrozenMemtable {
             seal_id,
             seal_key: self.seal_key,
@@ -583,6 +681,9 @@ impl MemtableBucket {
             batches,
             events: self.events,
             metas: self.metas,
+            opened_at,
+            closed_at,
+            arrow_bytes,
         })
     }
 
@@ -700,6 +801,12 @@ pub struct FrozenMemtable {
     pub events: Vec<AuditEvent>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
+    /// Monotonic time at which the active generation first received a row.
+    pub opened_at: Instant,
+    /// Monotonic time at which the generation was detached.
+    pub closed_at: Instant,
+    /// Estimated Arrow memory retained by the generation.
+    pub arrow_bytes: usize,
 }
 
 impl FrozenMemtable {
@@ -733,7 +840,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::NaiveDate;
     use std::sync::Arc;
-    use std::thread;
     use std::time::Duration;
 
     fn make_test_batch(num_rows: usize) -> RecordBatch {
@@ -908,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn memtable_seal_predicate_rows() {
+    fn row_count_does_not_trigger_generation_rotation() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
@@ -920,66 +1026,60 @@ mod tests {
                 .expect("insert");
         }
 
-        assert!(memtable.should_seal(&seal_key).expect("should_seal"));
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
         assert_eq!(memtable.row_count(&seal_key).expect("row_count"), 60_000);
     }
 
     #[test]
-    fn memtable_seal_predicate_interval() {
+    fn active_generation_age_is_the_only_time_predicate() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
-        // Insert 1 row, then wait >1s (30% margin for CI stability)
         let batch = make_test_batch(1);
         memtable
             .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
             .expect("insert");
 
-        thread::sleep(Duration::from_millis(1300));
+        let mut buckets = memtable.writable.lock().expect("writable lock");
+        buckets.get_mut(&seal_key).expect("bucket").first_insert_at = Instant::now()
+            .checked_sub(ACTIVE_GENERATION_MAX_AGE)
+            .expect("test clock supports age offset");
+        drop(buckets);
 
         assert!(
             memtable.should_seal(&seal_key).expect("should_seal"),
-            "1s interval triggers seal"
+            "600s active age triggers rotation"
         );
     }
 
     #[test]
-    fn memtable_seal_predicate_bytes() {
+    fn historical_128_mib_predicate_is_removed() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
-        // Insert batches totaling >128 MiB
-        // Each Int64 array with 1M rows ≈ 8MB
-        for i in 0..20 {
-            let batch = make_test_batch(1_000_000);
-            memtable
-                .insert(&seal_key, make_test_event(), make_test_meta(i), batch)
-                .expect("insert");
-        }
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(0),
+                make_test_batch(1),
+            )
+            .expect("insert");
 
-        assert!(
-            memtable.should_seal(&seal_key).expect("should_seal"),
-            "128 MiB threshold triggers seal"
-        );
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
     }
 
     #[test]
-    fn memtable_seal_predicate_inactivity() {
+    fn inactivity_does_not_trigger_generation_rotation() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
-        // Insert 1 row, then wait >5s (40% margin for CI stability)
         let batch = make_test_batch(1);
         memtable
             .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
             .expect("insert");
 
-        thread::sleep(Duration::from_secs(7));
-
-        assert!(
-            memtable.should_seal(&seal_key).expect("should_seal"),
-            "5s inactivity triggers seal"
-        );
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
     }
 
     #[test]

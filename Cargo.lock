@@ -11024,6 +11024,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "vala-sql",
  "wyrd-dev-fixtures",
  "wyrd-spec",
  "wyrd-sql",

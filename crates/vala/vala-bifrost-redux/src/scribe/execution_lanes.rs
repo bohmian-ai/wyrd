@@ -24,7 +24,11 @@ use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
 use crate::scribe::replay::ReplayedSealKey;
-use crate::scribe::wal::{PreparedWalAppend, WalAppendResult, WalHandle, WalSegment};
+use crate::scribe::seal_key::SealKey;
+use crate::scribe::stream_identity::StreamIdentity;
+use crate::scribe::wal::{
+    PreparedWalAppend, WalAppendResult, WalHandle, WalSegment, WalSegmentRef,
+};
 use std::str::FromStr;
 use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
@@ -768,11 +772,18 @@ pub(crate) enum ScribeWalIoOp {
         path: PathBuf,
         contents: Bytes,
     },
+    AdvanceManifest {
+        path: PathBuf,
+        stream: StreamIdentity,
+        seal_key: SealKey,
+        sealed_lsn: crate::scribe::wal::WalLsn,
+    },
     ReplayDirectory {
         path: PathBuf,
     },
     RetireWal {
         wal: WalHandle,
+        segments: Vec<WalSegmentRef>,
     },
 }
 
@@ -906,31 +917,7 @@ impl ScribeWalIoPool {
                 depth.load(Ordering::Acquire),
                 active.load(Ordering::Acquire),
             );
-            let result = catch_unwind(AssertUnwindSafe(|| match operation {
-                ScribeWalIoOp::WritePrepared { wal, append } => {
-                    let result = wal.append_prepared(append)?;
-                    Ok(ScribeWalIoResult::WalWritten { wal, result })
-                }
-                ScribeWalIoOp::SyncWal { segments } => {
-                    if !delay.is_zero() {
-                        std::thread::sleep(delay);
-                    }
-                    WalHandle::sync_segments(&segments)?;
-                    Ok(ScribeWalIoResult::WalSynced)
-                }
-                ScribeWalIoOp::ReplaceManifest { path, contents } => {
-                    replace_manifest(&path, &contents)?;
-                    Ok(ScribeWalIoResult::Completed)
-                }
-                ScribeWalIoOp::ReplayDirectory { path } => {
-                    crate::scribe::replay::replay_wal_directory(path)
-                        .map(ScribeWalIoResult::Replayed)
-                }
-                ScribeWalIoOp::RetireWal { wal } => {
-                    wal.sync_data()?;
-                    Ok(ScribeWalIoResult::Completed)
-                }
-            }));
+            let result = catch_unwind(AssertUnwindSafe(|| execute_wal_io(operation, delay)));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_state(
@@ -988,6 +975,56 @@ impl ScribeWalIoPool {
                 .unwrap_or("unnamed")
                 .to_owned()
         })
+    }
+}
+
+fn execute_wal_io(
+    operation: ScribeWalIoOp,
+    delay: std::time::Duration,
+) -> Result<ScribeWalIoResult, ScribeError> {
+    match operation {
+        ScribeWalIoOp::WritePrepared { wal, append } => {
+            let result = wal.append_prepared(append)?;
+            Ok(ScribeWalIoResult::WalWritten { wal, result })
+        }
+        ScribeWalIoOp::SyncWal { segments } => {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+            WalHandle::sync_segments(&segments)?;
+            Ok(ScribeWalIoResult::WalSynced)
+        }
+        ScribeWalIoOp::ReplaceManifest { path, contents } => {
+            replace_manifest(&path, &contents)?;
+            Ok(ScribeWalIoResult::Completed)
+        }
+        ScribeWalIoOp::AdvanceManifest {
+            path,
+            stream,
+            seal_key,
+            sealed_lsn,
+        } => {
+            let mut manifest = crate::scribe::manifest::read_manifest(&path)?
+                .unwrap_or_else(|| crate::scribe::manifest::Manifest::new(stream));
+            manifest.update_sealed_lsn(&seal_key, sealed_lsn);
+            let contents = manifest.serialize()?;
+            replace_manifest(&path, &contents)?;
+            Ok(ScribeWalIoResult::Completed)
+        }
+        ScribeWalIoOp::ReplayDirectory { path } => {
+            crate::scribe::replay::replay_wal_directory(path).map(ScribeWalIoResult::Replayed)
+        }
+        ScribeWalIoOp::RetireWal { wal, segments } => {
+            wal.sync_data()?;
+            for segment in segments {
+                if segment.path.exists() {
+                    std::fs::remove_file(&segment.path).map_err(|error| ScribeError::Internal {
+                        detail: format!("WAL segment retirement failed: {error}"),
+                    })?;
+                }
+            }
+            Ok(ScribeWalIoResult::Completed)
+        }
     }
 }
 

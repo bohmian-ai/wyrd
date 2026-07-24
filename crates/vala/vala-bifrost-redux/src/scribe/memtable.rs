@@ -21,7 +21,7 @@ use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
 /// Encoded WAL bytes at which the active generation rotates.
-pub const WAL_ROTATION_BYTES: usize = 512 * 1024 * 1024;
+pub const WAL_ROTATION_BYTES: usize = 64 * 1024 * 1024;
 /// Estimated Arrow bytes at which the active generation rotates.
 pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
 /// Maximum age of an active generation before the lifecycle scanner requests rotation.
@@ -37,6 +37,7 @@ pub struct Memtable {
     pub(crate) immutable: Arc<Mutex<HashMap<SealKey, Vec<ImmutableEntry>>>>,
     next_seal_id: Arc<AtomicU64>,
     retention_grace: Duration,
+    rotation_bytes: usize,
 }
 
 /// Aggregate memory and generation state for a Scribe pod.
@@ -66,11 +67,18 @@ impl Memtable {
     /// Construct a memtable with an explicit immutable-generation grace period.
     #[must_use]
     pub fn new_with_retention(retention_grace: Duration) -> Self {
+        Self::new_with_limits(retention_grace, MEMTABLE_ROTATION_BYTES)
+    }
+
+    /// Construct a memtable with explicit retention and active-bucket limits.
+    #[must_use]
+    pub fn new_with_limits(retention_grace: Duration, rotation_bytes: usize) -> Self {
         Self {
             writable: Arc::new(Mutex::new(HashMap::new())),
             immutable: Arc::new(Mutex::new(HashMap::new())),
             next_seal_id: Arc::new(AtomicU64::new(1)),
             retention_grace,
+            rotation_bytes,
         }
     }
 
@@ -210,7 +218,7 @@ impl Memtable {
         })?;
 
         if let Some(bucket) = buckets.get(seal_key) {
-            Ok(bucket.should_seal())
+            Ok(bucket.should_seal_at(Instant::now(), self.rotation_bytes))
         } else {
             Ok(false)
         }
@@ -273,6 +281,13 @@ impl Memtable {
     }
 
     /// Return whether this table has any active writable or immutable state.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by test-only legacy writer lifecycle probes"
+        )
+    )]
     pub(crate) fn has_state_for_table(&self, key: &crate::catalog::TenantTableKey) -> bool {
         let writable_has_state = match self.writable.lock() {
             Ok(buckets) => buckets
@@ -332,6 +347,13 @@ impl Memtable {
     }
 
     /// Snapshot writable seal-keys for one logical tenant/table.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by test-only legacy writer lifecycle probes"
+        )
+    )]
     pub(crate) fn seal_keys_for_table(
         &self,
         key: &crate::catalog::TenantTableKey,
@@ -350,6 +372,13 @@ impl Memtable {
     }
 
     /// Snapshot active seal-keys whose generation age has elapsed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by test-only legacy writer lifecycle probes"
+        )
+    )]
     pub(crate) fn expired_seal_keys_for_table(
         &self,
         key: &crate::catalog::TenantTableKey,
@@ -370,7 +399,41 @@ impl Memtable {
             .collect())
     }
 
+    /// Snapshot all writable buckets whose active generation age elapsed.
+    pub(crate) fn expired_seal_keys(&self, now: Instant) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .iter()
+            .filter(|(_, bucket)| bucket.is_age_expired(now))
+            .map(|(seal_key, _)| seal_key.clone())
+            .collect())
+    }
+
+    /// Count logical tenant/table owners represented by writable buckets.
+    pub(crate) fn logical_writer_count(&self) -> usize {
+        let Ok(buckets) = self.writable.lock() else {
+            return 0;
+        };
+        let mut keys = std::collections::HashSet::new();
+        for seal_key in buckets.keys() {
+            keys.insert((seal_key.tenant, seal_key.table.clone()));
+        }
+        keys.len()
+    }
+
     /// Return the number of immutable generations retained for one seal-key.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by test-only legacy writer lifecycle probes"
+        )
+    )]
     pub(crate) fn immutable_count(&self, seal_key: &SealKey) -> Result<usize, ScribeError> {
         let immutable = self
             .immutable
@@ -382,6 +445,13 @@ impl Memtable {
     }
 
     /// Return whether a writable bucket currently exists for the key.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "retained by test-only legacy writer lifecycle probes"
+        )
+    )]
     pub(crate) fn has_writable(&self, seal_key: &SealKey) -> Result<bool, ScribeError> {
         let buckets = self
             .writable
@@ -637,12 +707,8 @@ impl MemtableBucket {
         self.last_insert_at = Instant::now();
     }
 
-    fn should_seal(&self) -> bool {
-        self.should_seal_at(Instant::now())
-    }
-
-    fn should_seal_at(&self, now: Instant) -> bool {
-        self.bytes_accumulated >= MEMTABLE_ROTATION_BYTES
+    fn should_seal_at(&self, now: Instant, rotation_bytes: usize) -> bool {
+        self.bytes_accumulated >= rotation_bytes
             || now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
     }
 

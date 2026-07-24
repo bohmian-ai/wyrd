@@ -809,20 +809,20 @@ fn measure_wal_components() -> Result<Vec<ScribeComponentReport>, BenchError> {
     let prepare_dir = tempfile::tempdir()?;
     let prepare = WalBenchSupport::new(prepare_dir.path(), tenant)?;
     for index in 0..COMPONENT_WARMUP {
-        let fixture = prepare.prepare(batch_id_for(index), index, audit, &data)?;
+        let fixture = prepare.prepare(batch_id_for(index), audit, &data)?;
         let _ = fixture.crc32();
     }
     let prepare_started = Instant::now();
     let mut prepare_samples = Vec::with_capacity(usize::try_from(COMPONENT_SAMPLES)?);
     for index in COMPONENT_WARMUP..(COMPONENT_WARMUP + COMPONENT_SAMPLES) {
         let started = Instant::now();
-        let fixture = prepare.prepare(batch_id_for(index), index, audit, &data)?;
+        let fixture = prepare.prepare(batch_id_for(index), audit, &data)?;
         let _ = fixture.crc32();
         prepare_samples.push(elapsed_us(started));
     }
     let prepare_report = component_report(
         "wal_prepare_crc_no_io",
-        "production PreparedWalAppend header construction and crc32c; no filesystem IO",
+        "production PreparedWalAppend v3 payload construction and crc32c; no filesystem IO",
         "PreparedWalAppend::new + PreparedWalAppendFixture::crc32; fixture_bytes=66",
         ComponentMeasurement {
             samples: prepare_samples,
@@ -854,8 +854,8 @@ fn measure_wal_components() -> Result<Vec<ScribeComponentReport>, BenchError> {
     }
     append.sync_alone()?;
     let append_report = component_report(
-        "vectored_append_no_sync",
-        "production WalWriter::append_prepared/write_vectored before sync_data",
+        "wal_append_no_sync",
+        "production WalWriter::append_prepared before sync_data",
         "WalWriter::append_prepared; sync_data excluded from timed region",
         ComponentMeasurement {
             samples: append_samples,
@@ -914,7 +914,7 @@ fn measure_wal_components() -> Result<Vec<ScribeComponentReport>, BenchError> {
     let one_report = component_report(
         "one_frame_append_sync",
         "production WalWriter::append_prepared plus one segment sync",
-        "one prepared paired frame + one sync_data per operation",
+        "one self-describing v3 record + one sync_data per operation",
         ComponentMeasurement {
             samples: one_samples,
             bytes: one_bytes.saturating_sub(fixture_bytes * COMPONENT_WARMUP),
@@ -997,7 +997,7 @@ fn prepared_fixtures(
     count: u64,
 ) -> Result<Vec<vala_bifrost_redux::bench_support::PreparedWalAppendFixture>, BenchError> {
     (0..count)
-        .map(|index| Ok(support.prepare(batch_id_for(index), index, audit, data)?))
+        .map(|index| Ok(support.prepare(batch_id_for(index), audit, data)?))
         .collect()
 }
 
@@ -1018,12 +1018,11 @@ async fn measure_public_components(
         warmup.push(BifrostFrame {
             table: table_fqn(0),
             batch_id: uuid::Uuid::now_v7().into_bytes(),
-            frame_sequence: 0,
             arrow_ipc: payload.clone(),
         });
     }
     for frame in warmup {
-        let _ = transport.insert_batch_stream(vec![frame]).await?;
+        transport.send_frame(frame).await?;
     }
 
     let mut gate_samples = Vec::with_capacity(usize::try_from(COMPONENT_SAMPLES)?);
@@ -1032,17 +1031,16 @@ async fn measure_public_components(
         let frame = BifrostFrame {
             table: table_fqn(0),
             batch_id: uuid::Uuid::now_v7().into_bytes(),
-            frame_sequence: 0,
             arrow_ipc: payload.clone(),
         };
         let started = Instant::now();
-        let _ = transport.insert_batch_stream(vec![frame]).await?;
+        transport.send_frame(frame).await?;
         gate_samples.push(elapsed_us(started));
     }
     let gate_report = component_report(
         "gate_ack",
         "public gRPC transport through server Gate admission to Scribe ACK",
-        "BifrostGrpcTransport::insert_batch_stream; frame construction excluded",
+        "BifrostGrpcTransport::send_frame; frame construction excluded",
         ComponentMeasurement {
             samples: gate_samples,
             bytes: u64::try_from(payload.len())?.saturating_mul(COMPONENT_SAMPLES),
@@ -1059,16 +1057,15 @@ async fn measure_public_components(
         let frame = BifrostFrame {
             table: table_fqn(0),
             batch_id: uuid::Uuid::now_v7().into_bytes(),
-            frame_sequence: 0,
             arrow_ipc: payload.clone(),
         };
-        let _ = transport.insert_batch_stream(vec![frame]).await?;
+        transport.send_frame(frame).await?;
         sdk_samples.push(elapsed_us(started));
     }
     let sdk_report = component_report(
         "sdk_gate_scribe",
         "public SDK -> gRPC -> wyrd-server -> Gate -> Scribe admission",
-        "BifrostGrpcTransport::insert_batch_stream; frame construction included",
+        "BifrostGrpcTransport::send_frame; frame construction included",
         ComponentMeasurement {
             samples: sdk_samples,
             bytes: u64::try_from(payload.len())?.saturating_mul(COMPONENT_SAMPLES),
@@ -1463,12 +1460,11 @@ async fn probe_exact_429(
         let frame = BifrostFrame {
             table: table_fqn(0),
             batch_id: uuid::Uuid::now_v7().into_bytes(),
-            frame_sequence: 0,
             arrow_ipc: payload.clone(),
         };
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
-            transport.insert_batch_stream(vec![frame]).await
+            transport.send_frame(frame).await
         }));
     }
     barrier.wait().await;
@@ -1496,12 +1492,11 @@ async fn probe_exact_507(
         return Ok(false);
     };
     let result = transport
-        .insert_batch_stream(vec![BifrostFrame {
+        .send_frame(BifrostFrame {
             table: table_fqn(0),
             batch_id: uuid::Uuid::now_v7().into_bytes(),
-            frame_sequence: 0,
             arrow_ipc: Bytes::from(ipc(64 * 1024)?),
-        }])
+        })
         .await;
     let observed = matches!(
         result,
@@ -1634,7 +1629,6 @@ async fn send_frames(
             .map(|_| BifrostFrame {
                 table: table.clone(),
                 batch_id: uuid::Uuid::now_v7().into_bytes(),
-                frame_sequence: 0,
                 arrow_ipc: payload.clone(),
             })
             .collect::<Vec<_>>();
@@ -1721,8 +1715,8 @@ async fn insert_stream_with_busy_retry(
     let deadline = Instant::now() + BUSY_RETRY_BUDGET;
     let mut attempt = 0_u32;
     loop {
-        match transport.insert_batch_stream(frames.clone()).await {
-            Ok(accepted) => return Ok(accepted),
+        match transport.send_frames(frames.clone()).await {
+            Ok(()) => return Ok(vec![0; frames.len()]),
             Err(error) if is_ingest_busy(&error) || is_ingest_transport_unavailable(&error) => {
                 if is_ingest_busy(&error) {
                     retry_stats.rejections.fetch_add(1, Ordering::Relaxed);

@@ -19,7 +19,7 @@ use crate::scribe::execution_lanes::{
 };
 use crate::scribe::memtable::Memtable;
 use crate::scribe::persistence::{
-    ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
+    ImmutableGeneration, PersistenceJob, PersistenceRuntime, WriterControl,
 };
 use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedSlice};
 use crate::scribe::stream_identity::StreamIdentity;
@@ -39,13 +39,6 @@ struct WriterState {
     stopping: AtomicBool,
     finished: AtomicBool,
     stopped: Notify,
-}
-
-#[derive(Debug)]
-pub(crate) enum WriterControl {
-    PersistenceComplete(PersistenceCompletion),
-    GraceExpired(PersistenceCompletion),
-    Shutdown,
 }
 
 #[derive(Debug)]
@@ -469,33 +462,6 @@ impl TenantTableWriterRegistry {
         }
     }
 
-    pub(crate) fn lane_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
-        let post_ack = self.post_ack_cpu.snapshot();
-        let wal_io = self.wal_io.snapshot();
-        crate::scribe::telemetry::ExecutorSnapshot {
-            depth: post_ack.depth.saturating_add(wal_io.depth),
-            capacity: post_ack.capacity.saturating_add(wal_io.capacity),
-            saturation_events: post_ack
-                .saturation_events
-                .saturating_add(wal_io.saturation_events),
-            completed: post_ack.completed.saturating_add(wal_io.completed),
-            failed: post_ack.failed.saturating_add(wal_io.failed),
-            panicked: post_ack.panicked.saturating_add(wal_io.panicked),
-        }
-    }
-
-    pub(crate) fn post_ack_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
-        self.post_ack_cpu.snapshot()
-    }
-
-    pub(crate) fn wal_io_snapshot(&self) -> crate::scribe::telemetry::ExecutorSnapshot {
-        self.wal_io.snapshot()
-    }
-
-    pub(crate) fn post_ack_cpu(&self) -> ScribePostAckCpuPool {
-        self.post_ack_cpu.clone()
-    }
-
     pub(crate) async fn shutdown(&self) {
         let writers = match self.entries.lock() {
             Ok(entries) => entries.values().cloned().collect::<Vec<_>>(),
@@ -515,17 +481,6 @@ impl TenantTableWriterRegistry {
             {
                 stopped.await;
             }
-        }
-    }
-
-    /// Publish the latest lifecycle age value to every writer watch channel.
-    pub(crate) fn publish_age(&self, now: Instant) {
-        let writers = match self.entries.lock() {
-            Ok(entries) => entries.values().cloned().collect::<Vec<_>>(),
-            Err(_) => Vec::new(),
-        };
-        for writer in writers {
-            let _ = writer.age_tx.send(now);
         }
     }
 
@@ -1048,9 +1003,18 @@ async fn process_group(
         touched_segment_count = tracing::field::Empty,
     );
     let _entered = span.enter();
-    let mut prepared = prepare_group(runtime, group).await?;
+    let mut prepared = match prepare_group(runtime, group).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Err(error),
+    };
 
-    let append_stats = append_group(runtime, &mut prepared, seen_slices, wal_handles).await?;
+    let append_stats = match append_group(runtime, &mut prepared, seen_slices, wal_handles).await {
+        Ok(stats) => stats,
+        Err(error) => {
+            notify_durable_failure(&mut prepared, &error);
+            return Err(error);
+        }
+    };
     for (seal_key, bytes) in append_stats.by_key {
         let entry = wal_bytes.entry(seal_key).or_default();
         *entry = entry.saturating_add(bytes);
@@ -1062,20 +1026,39 @@ async fn process_group(
     let append_duration = append_stats.elapsed;
     span.record("append_duration_us", append_duration.as_micros());
     let sync_started = Instant::now();
-    for (_, segment) in touched.values() {
-        match runtime
+    if !touched.is_empty() {
+        let segments = touched
+            .values()
+            .map(|(_, segment)| Arc::clone(segment))
+            .collect();
+        let sync_result = match runtime
             .wal_io
-            .submit(ScribeWalIoOp::SyncWal {
-                segments: vec![Arc::clone(segment)],
-            })
-            .await?
+            .submit(ScribeWalIoOp::SyncWal { segments })
+            .await
         {
-            ScribeWalIoResult::WalSynced => {}
-            _ => {
-                return Err(ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong sync result".to_owned(),
-                });
+            Ok(result) => result,
+            Err(error) => {
+                notify_durable_failure(&mut prepared, &error);
+                return Err(error);
             }
+        };
+        if let ScribeWalIoResult::WalSynced = sync_result {
+        } else {
+            let error = ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong sync result".to_owned(),
+            };
+            notify_durable_failure(&mut prepared, &error);
+            return Err(error);
+        }
+    }
+    for prepared_append in &mut prepared {
+        if let Some(sender) = prepared_append.durable_ack.take() {
+            let rows = prepared_append
+                .slices
+                .iter()
+                .map(|slice| u64::try_from(slice.rows.num_rows()).unwrap_or(u64::MAX))
+                .sum();
+            let _ = sender.send(Ok(rows));
         }
     }
     let sync_duration = sync_started.elapsed();
@@ -1098,6 +1081,24 @@ async fn process_group(
         drop(prepared_append.reservation);
     }
     Ok(())
+}
+
+fn notify_durable_failure(
+    prepared: &mut [crate::scribe::preprocess::PreparedAppend],
+    error: &ScribeError,
+) {
+    for append in prepared {
+        if let Some(sender) = append.durable_ack.take() {
+            let failure = if matches!(error, ScribeError::WalDiskFull) {
+                ScribeError::WalDiskFull
+            } else {
+                ScribeError::Internal {
+                    detail: error.to_string(),
+                }
+            };
+            let _ = sender.send(Err(failure));
+        }
+    }
 }
 
 async fn prepare_group(
@@ -1200,7 +1201,7 @@ async fn append_prepared(
         let wal_handle = if let Some(handle) = wal_handles.get(&seal_key) {
             handle.clone()
         } else {
-            let handle = runtime.wal.handle_for_seal_key(seal_key.clone())?;
+            let handle = runtime.wal.handle_for_seal_key(seal_key.clone());
             wal_handles.insert(seal_key.clone(), handle.clone());
             handle
         };
@@ -1325,7 +1326,6 @@ mod tests {
             &writer,
             AdmittedAppend {
                 batch_id: Uuid::now_v7(),
-                frame_sequence: 0,
                 audit_event: AuditEvent {
                     request_id: RequestId::now_v7(),
                     trace_id: None,
@@ -1348,6 +1348,7 @@ mod tests {
                 tenant: crate::test_support::tenant(),
                 table: table.clone(),
                 queued_at: Instant::now(),
+                durable_ack: None,
             },
         )
         .expect("enqueue");

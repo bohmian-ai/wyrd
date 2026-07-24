@@ -130,15 +130,48 @@ impl ImmutableGeneration {
 /// Completion sent through a writer's reliable control queue.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistenceCompletion {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "legacy writer identity is used by test-only lifecycle probes"
+        )
+    )]
     pub(crate) writer_instance_id: Uuid,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "legacy writer identity is used by test-only lifecycle probes"
+        )
+    )]
     pub(crate) seal_key: SealKey,
     pub(crate) generation_id: GenerationId,
     pub(crate) file_list_key: Option<FileListCommitKey>,
     pub(crate) wal_segments: Vec<WalSegmentRef>,
     pub(crate) wal: crate::scribe::wal::WalHandle,
     pub(crate) arrow_bytes: usize,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "legacy writer timing is used by test-only lifecycle probes"
+        )
+    )]
     pub(crate) published_at: std::time::Instant,
     pub(crate) error: Option<String>,
+}
+
+/// Completion controls shared by shard owners and persistence workers.
+#[derive(Debug)]
+pub(crate) enum WriterControl {
+    PersistenceComplete(PersistenceCompletion),
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "legacy writer grace control is test-only")
+    )]
+    GraceExpired(PersistenceCompletion),
+    Shutdown,
 }
 
 /// One immutable generation submitted to the bounded persistence queue.
@@ -146,7 +179,7 @@ pub(crate) struct PersistenceCompletion {
 pub(crate) struct PersistenceJob {
     pub(crate) generation: Arc<ImmutableGeneration>,
     pub(crate) binding: TenantTableBinding,
-    pub(crate) completion_tx: mpsc::Sender<crate::scribe::writer::WriterControl>,
+    pub(crate) completion_tx: mpsc::Sender<WriterControl>,
 }
 
 /// Server-provisioned persistence dependencies.
@@ -386,9 +419,7 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
     };
     if job
         .completion_tx
-        .send(crate::scribe::writer::WriterControl::PersistenceComplete(
-            completion,
-        ))
+        .send(WriterControl::PersistenceComplete(completion))
         .await
         .is_err()
     {

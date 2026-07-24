@@ -4,16 +4,14 @@ package wyrd.v1;
 // One typed service per observation type. Bifrost ingest only in Stage 3;
 // drift / agent-trace / otel / eval get their own typed services later.
 service BifrostIngestService {
-  // Bidirectional streaming: each frame is independently validated, admitted,
-  // and acknowledged. ACK is bounded admission, not WAL durability.
-  rpc InsertBatch(stream InsertBatchRequest) returns (stream InsertBatchResponse);
+  // One sealed Arrow payload is durably acknowledged as one logical batch.
+  rpc InsertBatch(InsertBatchRequest) returns (InsertBatchResponse);
 }
 
 message InsertBatchRequest {
-  string table          = 1;   // fqn "namespace.name"; repeated on every frame
-  bytes  arrow_ipc      = 2;   // one frame's Arrow IPC payload
-  bytes  wyrd_batch_id  = 3;   // exactly 16 bytes; UUIDv7; repeated on every frame
-  uint64 frame_sequence = 4;   // starts at zero and increments by one
+  string table          = 1;   // fqn "namespace.name"
+  bytes  arrow_ipc      = 2;   // one sealed Arrow IPC payload
+  bytes  wyrd_batch_id  = 3;   // exactly 16 bytes; UUIDv7
 }
 // NOTE: the proto deliberately carries only frame-grain transport metadata.
 // `card_ref` and `run_id` are PER-ROW correlation COLUMNS inside `arrow_ipc`,
@@ -21,9 +19,7 @@ message InsertBatchRequest {
 // stream- or frame-grain metadata.
 
 message InsertBatchResponse {
-  bytes  wyrd_batch_id  = 1;   // echoes the admitted frame identity
-  uint64 frame_sequence = 2;
-  uint64 rows_accepted   = 3;  // rows admitted for this frame
+  bytes  wyrd_batch_id  = 1;   // echoes the durably acknowledged batch identity
 }
 
 // Typed read surface for Vala observation tables. One unary rpc per query

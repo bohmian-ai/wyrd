@@ -9811,6 +9811,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "blake3",
  "bytes",
  "chrono",
  "crc32c",

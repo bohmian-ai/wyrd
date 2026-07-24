@@ -1,7 +1,19 @@
 //! Optional stage measurements for real Scribe workload runs.
 
 use crate::scribe::admission::AdmissionSnapshot;
-use crate::scribe::writer::WriterHealthSnapshot;
+
+/// Point-in-time health and queue metrics for active logical writers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterHealthSnapshot {
+    /// Active tenant/table consumers.
+    pub writers: usize,
+    /// Consumers that have failed after admission.
+    pub unhealthy_writers: usize,
+    /// Items retained in writer data queues or being processed.
+    pub pending_items: usize,
+    /// Terminal post-ACK consumer errors.
+    pub terminal_errors: usize,
+}
 
 /// Aggregate queue metrics for runtime dashboards.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

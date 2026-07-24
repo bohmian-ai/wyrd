@@ -5,14 +5,11 @@ pub mod collector;
 pub mod error;
 pub mod limits;
 
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::record_batch::RecordBatch;
-use async_stream::try_stream;
 use async_trait::async_trait;
-use futures_util::Stream;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
@@ -27,7 +24,7 @@ use wyrd_tonic::otlp::metrics_service::{
 use wyrd_tonic::otlp::trace_service::trace_service_server::TraceService;
 use wyrd_tonic::otlp::trace_service::{ExportTraceServiceRequest, ExportTraceServiceResponse};
 use wyrd_tonic::tonic::metadata::MetadataMap;
-use wyrd_tonic::tonic::{Request, Response, Status, Streaming};
+use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::bifrost_ingest_service_server::{
     BifrostIngestService, BifrostIngestServiceServer,
 };
@@ -42,9 +39,10 @@ pub use crate::gate::collector::{
     source_schema_fingerprint,
 };
 pub use crate::gate::error::{CatalogError, IngestError};
-pub use crate::gate::limits::{IngestLimits, StreamSemaphores};
+pub use crate::gate::limits::{BatchSemaphores, IngestLimits};
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::routing::shard_for;
 
 /// Catalog lookup capability required by Gate. Server integrations provide the
 /// adapter; Gate does not depend on a concrete catalog implementation.
@@ -146,7 +144,7 @@ pub struct Gate<
     oracle: Option<Arc<dyn Oracle>>,
     limits: IngestLimits,
     projection: Arc<dyn ProjectionExecutor>,
-    semaphores: Arc<StreamSemaphores>,
+    semaphores: Arc<BatchSemaphores>,
     auth: IngestAuthInterceptor<R, I>,
     closed: Arc<AtomicBool>,
 }
@@ -162,8 +160,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
-        let semaphores = Arc::new(StreamSemaphores::new(
-            limits.max_concurrent_streams_per_tenant,
+        let semaphores = Arc::new(BatchSemaphores::new(
+            limits.max_concurrent_batches_per_tenant,
         ));
         Self {
             catalog,
@@ -401,6 +399,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
+        let _shard = shard_for(auth.tenant, &table);
         let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
             .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {
@@ -425,11 +424,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 expected_schema_fingerprint: registered_fingerprint,
                 request_id: auth.request_id.clone(),
                 batch_id: uuid::Uuid::now_v7(),
-                frame_sequence: 0,
                 audit_event,
                 measured_wire_bytes,
-                stream_rows_before: 0,
-                stream_rows_limit: u64::MAX,
                 payload: IngressPayload::ProjectedArrow(vec![rows]),
             })
             .await
@@ -440,22 +436,20 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .map(|_| ())
     }
 
-    /// Resolve, authorize, stamp, and dispatch one native frame to Scribe.
+    /// Resolve, authorize, stamp, and dispatch one native batch to Scribe.
     ///
-    /// Gate owns permission, catalog, binding, audit, and whole-stream dispatch
+    /// Gate owns permission, catalog, binding, audit, and batch dispatch
     /// decisions; the server only supplies the catalog adapter and mounts this
     /// service.
     #[tracing::instrument(
         skip_all,
-        fields(tenant = %auth.tenant, table = %frame.table, request_id = %auth.request_id,
-               frame_sequence = frame.frame_sequence)
+        fields(tenant = %auth.tenant, table = %frame.table, request_id = %auth.request_id)
     )]
     async fn dispatch_native_frame(
         &self,
         limits: &IngestLimits,
         auth: &AuthContext,
         frame: InsertBatchRequest,
-        stream_rows_before: u64,
     ) -> Result<u64, IngestError> {
         self.ensure_open()?;
         let resolution_started = std::time::Instant::now();
@@ -509,12 +503,13 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 IngestError::from_catalog(error)
             })?;
         let table = TableRef::new(namespace, name);
+        let _shard = shard_for(auth.tenant, &table);
         let binding = TenantTableBinding::resolve((auth.tenant, table.clone()))
             .map_err(|_| IngestError::Internal("invalid tenant/table binding".to_owned()))?;
         let audit_event = wyrd_spec::vala::api::AuditEvent {
             request_id: auth.request_id.clone(),
             trace_id: None,
-            operation: "bifrost.ingest_frame".to_owned(),
+            operation: "bifrost.ingest_batch".to_owned(),
             resource: table.fqn(),
             card_ref: auth.principal.card_ref().cloned(),
             principal_id: auth.principal.id,
@@ -523,7 +518,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             permission: "bifrost:record:write".to_owned(),
             decision: wyrd_spec::vala::api::AuditDecision::Allow,
             result: wyrd_spec::vala::api::AuditResult::Success,
-            payload_summary: "one bounded native frame".to_owned(),
+            payload_summary: "one bounded native batch".to_owned(),
             detail: None,
         };
         let admission = self
@@ -534,11 +529,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
                 expected_schema_fingerprint: registered_fingerprint,
                 request_id: auth.request_id.clone(),
                 batch_id,
-                frame_sequence: frame.frame_sequence,
                 audit_event,
                 measured_wire_bytes: frame.arrow_ipc.len(),
-                stream_rows_before,
-                stream_rows_limit: limits.max_stream_rows,
                 payload: IngressPayload::ArrowIpc(frame.arrow_ipc),
             })
             .await
@@ -578,75 +570,24 @@ fn map_otlp_error(error: IngestError) -> Status {
 impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResolver + 'static>
     BifrostIngestService for Gate<C, R, I>
 {
-    type InsertBatchStream =
-        Pin<Box<dyn Stream<Item = Result<InsertBatchResponse, Status>> + Send>>;
-
     async fn insert_batch(
         &self,
-        request: Request<Streaming<InsertBatchRequest>>,
-    ) -> Result<Response<Self::InsertBatchStream>, Status> {
+        request: Request<InsertBatchRequest>,
+    ) -> Result<Response<InsertBatchResponse>, Status> {
         let auth = self
             .authenticate(request.metadata())
             .await
             .map_err(Status::from)?;
         let _permit = self.semaphores.acquire(auth.tenant)?;
-        let mut stream = request.into_inner();
-        let gate = Self {
-            catalog: Arc::clone(&self.catalog),
-            scribe: Arc::clone(&self.scribe),
-            oracle: self.oracle.clone(),
-            limits: self.limits.clone(),
-            projection: Arc::clone(&self.projection),
-            semaphores: Arc::clone(&self.semaphores),
-            auth: self.auth.clone(),
-            closed: Arc::clone(&self.closed),
-        };
-        let limits = self.limits.clone();
-        let auth_context = auth.clone();
-        let output = try_stream! {
-            let started = std::time::Instant::now();
-            let mut expected_sequence = 0_u64;
-            let mut frame_count = 0_u64;
-            let mut total_bytes = 0_u64;
-            let mut total_rows = 0_u64;
-            let mut stream_table: Option<String> = None;
-            let mut stream_batch_id: Option<Vec<u8>> = None;
-            while let Some(frame) = tokio::time::timeout(limits.idle_deadline, stream.message())
-                .await
-                .map_err(|_| IngestError::StreamIdle)?
-                .map_err(|status| IngestError::StreamProtocolViolation(status.to_string()))? {
-                if started.elapsed() > limits.total_deadline {
-                    Err(IngestError::StreamIdle)?;
-                }
-                let (next_sequence, next_count, next_bytes) = validate_frame(
-                    &frame,
-                    &limits,
-                    expected_sequence,
-                    frame_count,
-                    total_bytes,
-                    &mut stream_table,
-                    &mut stream_batch_id,
-                )?;
-                expected_sequence = next_sequence;
-                frame_count = next_count;
-                total_bytes = next_bytes;
-                let rows = gate.dispatch_native_frame(
-                    &limits,
-                    &auth_context,
-                    frame.clone(),
-                    total_rows,
-                ).await.inspect_err(|_error| {
-                    record_gate_event("native_rejection");
-                })?;
-                total_rows = total_rows.saturating_add(rows);
-                yield InsertBatchResponse {
-                    wyrd_batch_id: frame.wyrd_batch_id,
-                    frame_sequence: frame.frame_sequence,
-                    rows_accepted: rows,
-                };
-            }
-        };
-        let mut response = Response::new(Box::pin(output) as Self::InsertBatchStream);
+        let frame = request.into_inner();
+        validate_batch(&frame, &self.limits).map_err(Status::from)?;
+        self.dispatch_native_frame(&self.limits, &auth, frame.clone())
+            .await
+            .inspect_err(|_error| record_gate_event("native_rejection"))
+            .map_err(Status::from)?;
+        let mut response = Response::new(InsertBatchResponse {
+            wyrd_batch_id: frame.wyrd_batch_id,
+        });
         if let Ok(value) = auth.request_id.as_str().parse() {
             response
                 .metadata_mut()
@@ -656,52 +597,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     }
 }
 
-fn validate_frame(
-    frame: &InsertBatchRequest,
-    limits: &IngestLimits,
-    expected_sequence: u64,
-    frame_count: u64,
-    total_bytes: u64,
-    stream_table: &mut Option<String>,
-    stream_batch_id: &mut Option<Vec<u8>>,
-) -> Result<(u64, u64, u64), IngestError> {
-    if frame.frame_sequence != expected_sequence {
-        return Err(IngestError::StreamProtocolViolation(format!(
-            "frame_sequence must be {expected_sequence}, got {}",
-            frame.frame_sequence
-        )));
-    }
-    let next_count = frame_count.saturating_add(1);
-    if next_count > limits.max_stream_frames {
-        return Err(IngestError::StreamProtocolViolation(format!(
-            "stream exceeded {} frames",
-            limits.max_stream_frames
-        )));
-    }
+fn validate_batch(frame: &InsertBatchRequest, limits: &IngestLimits) -> Result<(), IngestError> {
     if frame.table.is_empty() || frame.wyrd_batch_id.len() != 16 {
         return Err(IngestError::StreamProtocolViolation(
             "table and exactly 16-byte wyrd_batch_id are required on every frame".to_owned(),
         ));
-    }
-    if let Some(table) = stream_table {
-        if table != &frame.table {
-            return Err(IngestError::StreamProtocolViolation(
-                "table changed mid-stream; every frame must repeat the established table"
-                    .to_owned(),
-            ));
-        }
-    } else {
-        *stream_table = Some(frame.table.clone());
-    }
-    if let Some(batch_id) = stream_batch_id {
-        if batch_id.as_slice() != frame.wyrd_batch_id.as_ref() {
-            return Err(IngestError::StreamProtocolViolation(
-                "wyrd_batch_id changed mid-stream; every frame must repeat the established batch"
-                    .to_owned(),
-            ));
-        }
-    } else {
-        *stream_batch_id = Some(frame.wyrd_batch_id.to_vec());
     }
     let batch_id = uuid::Uuid::from_bytes(
         frame
@@ -721,14 +621,7 @@ fn validate_frame(
             limit: limits.max_frame_bytes as u64,
         });
     }
-    let next_bytes = total_bytes.saturating_add(frame.arrow_ipc.len() as u64);
-    if next_bytes > limits.max_stream_bytes {
-        return Err(IngestError::BatchTooLarge {
-            bytes: next_bytes,
-            limit: limits.max_stream_bytes,
-        });
-    }
-    Ok((expected_sequence.saturating_add(1), next_count, next_bytes))
+    Ok(())
 }
 
 #[wyrd_tonic::tonic::async_trait]
@@ -805,7 +698,7 @@ mod tests {
     use super::collector::{IngestOutcome, ProjectedExport, ProjectionExecutor};
     use super::error::CatalogError;
     use super::limits::IngestLimits;
-    use super::{AuthContext, Catalog, Gate, IngestError, oracle_unavailable, validate_frame};
+    use super::{AuthContext, Catalog, Gate, IngestError, oracle_unavailable};
     use crate::catalog::{TableRef, TenantTableBinding, TenantTableBindingError};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::fingerprint::SchemaFingerprint;
@@ -820,7 +713,6 @@ mod tests {
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
-    use wyrd_tonic::wyrd::v1::InsertBatchRequest;
 
     #[test]
     fn gate_oracle_placeholder_fails_service_unavailable() {
@@ -828,113 +720,6 @@ mod tests {
             oracle_unavailable().code(),
             "WYRD_SERVER_503_SERVICE_UNAVAILABLE"
         );
-    }
-
-    fn frame(sequence: u64, table: &str, batch_id: &[u8], bytes: usize) -> InsertBatchRequest {
-        InsertBatchRequest {
-            table: table.to_owned(),
-            arrow_ipc: bytes::Bytes::from(vec![0; bytes]),
-            wyrd_batch_id: bytes::Bytes::copy_from_slice(batch_id),
-            frame_sequence: sequence,
-        }
-    }
-
-    #[test]
-    fn frame_requires_repeated_table_and_uuidv7_batch_id() {
-        let batch_id = uuid::Uuid::now_v7().as_bytes().to_vec();
-        let mut table = None;
-        let mut identity = None;
-        validate_frame(
-            &frame(0, "vala.bifrost.events", &batch_id, 1),
-            &IngestLimits::default(),
-            0,
-            0,
-            0,
-            &mut table,
-            &mut identity,
-        )
-        .expect("first frame");
-        let error = validate_frame(
-            &frame(1, "vala.bifrost.other", &batch_id, 1),
-            &IngestLimits::default(),
-            1,
-            1,
-            1,
-            &mut table,
-            &mut identity,
-        )
-        .expect_err("changed table");
-        assert!(matches!(
-            error,
-            super::error::IngestError::StreamProtocolViolation(_)
-        ));
-        let error = validate_frame(
-            &frame(1, "vala.bifrost.events", uuid::Uuid::now_v7().as_bytes(), 1),
-            &IngestLimits::default(),
-            1,
-            1,
-            1,
-            &mut table,
-            &mut identity,
-        )
-        .expect_err("changed batch id");
-        assert!(matches!(
-            error,
-            super::error::IngestError::StreamProtocolViolation(_)
-        ));
-    }
-
-    #[test]
-    fn frame_sequence_must_be_contiguous() {
-        let mut table = None;
-        let mut identity = None;
-        let error = validate_frame(
-            &frame(2, "vala.bifrost.events", uuid::Uuid::now_v7().as_bytes(), 1),
-            &IngestLimits::default(),
-            0,
-            0,
-            0,
-            &mut table,
-            &mut identity,
-        )
-        .expect_err("sequence gap");
-        assert!(matches!(
-            error,
-            super::error::IngestError::StreamProtocolViolation(_)
-        ));
-    }
-
-    #[test]
-    fn frame_limit_accepts_32_mib_and_rejects_32_mib_plus_one() {
-        let limits = IngestLimits::default();
-        let mut table = None;
-        let mut identity = None;
-        let id = uuid::Uuid::now_v7().as_bytes().to_vec();
-        validate_frame(
-            &frame(0, "vala.bifrost.events", &id, limits.max_frame_bytes),
-            &limits,
-            0,
-            0,
-            0,
-            &mut table,
-            &mut identity,
-        )
-        .expect("aggregate validator accepts the exact stream budget");
-        assert_eq!(limits.max_frame_bytes, 32 * 1024 * 1024);
-        let error = validate_frame(
-            &frame(1, "vala.bifrost.events", &id, limits.max_frame_bytes + 1),
-            &limits,
-            1,
-            1,
-            limits.max_frame_bytes as u64,
-            &mut table,
-            &mut identity,
-        )
-        .expect_err("one byte over the frame cap");
-        assert!(matches!(
-            error,
-            super::error::IngestError::PayloadTooLarge { .. }
-        ));
     }
 
     #[derive(Debug)]

@@ -135,6 +135,20 @@ pub(crate) fn split_batch_by_event_day(
             })?);
     }
 
+    if day_indices.len() == 1 {
+        return Ok(vec![(
+            EventDay::new(
+                *day_indices
+                    .keys()
+                    .next()
+                    .ok_or_else(|| ScribeError::Internal {
+                        detail: "event-day index unexpectedly empty".to_owned(),
+                    })?,
+            ),
+            batch.clone(),
+        )]);
+    }
+
     day_indices
         .into_iter()
         .map(|(day, indices)| {

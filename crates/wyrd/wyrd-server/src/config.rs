@@ -280,7 +280,7 @@ fn default_scribe_commit_group_bytes() -> usize {
 }
 
 fn default_scribe_wal_segment_bytes() -> u64 {
-    512 * 1024 * 1024
+    64 * 1024 * 1024
 }
 
 impl Default for ScribeRuntimeConfig {

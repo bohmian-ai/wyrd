@@ -254,11 +254,10 @@ mod sdk {
             &self,
             _table: &str,
             batch_id: [u8; 16],
-            _frame_sequence: u64,
             _frames: Vec<u8>,
-        ) -> Result<u64, WyrdError> {
+        ) -> Result<(), WyrdError> {
             self.seen.lock().expect("poisoned").push(batch_id);
-            Ok(0)
+            Ok(())
         }
     }
 

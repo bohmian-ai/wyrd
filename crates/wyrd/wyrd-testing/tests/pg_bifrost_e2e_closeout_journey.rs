@@ -57,13 +57,10 @@ async fn run_closeout_journey(
 
     let admin = bootstrap_transport(first, "closeout-admin", &["admin"]).await?;
     let batch_id = uuid::Uuid::now_v7().into_bytes();
-    let acknowledgements = admin
-        .insert_batch_stream(vec![
-            frame(batch_id, 0, &[1, 2]),
-            frame(batch_id, 1, &[3, 4]),
-        ])
+    admin.send_frame(frame(batch_id, &[1, 2])).await?;
+    admin
+        .send_frame(frame(uuid::Uuid::now_v7().into_bytes(), &[3, 4]))
         .await?;
-    assert_eq!(acknowledgements, vec![2, 2]);
 
     // Exercise symmetric traffic: every independently bound server receives a
     // frame through its own public SDK connection and server-owned Gate.
@@ -71,24 +68,20 @@ async fn run_closeout_journey(
         let transport =
             bootstrap_transport(server, &format!("closeout-pod-{pod}"), &["admin"]).await?;
         let id = uuid::Uuid::now_v7().into_bytes();
-        assert_eq!(
-            transport
-                .insert_batch(TABLE_FQN, id, 0, ipc(&[10 + pod as i64]))
-                .await?,
-            1
-        );
+        transport
+            .insert_batch(TABLE_FQN, id, ipc(&[10 + pod as i64]))
+            .await?;
         server.flush_bifrost().await?;
     }
 
     // A retry of an already admitted frame is idempotent at the durable slice
     // boundary. The duplicate is intentionally flushed after the first frame.
     let retry_id = uuid::Uuid::now_v7().into_bytes();
-    let retry_frame = frame(retry_id, 0, &[99]);
+    let retry_frame = frame(retry_id, &[99]);
     admin
         .insert_batch(
             TABLE_FQN,
             retry_frame.batch_id,
-            retry_frame.frame_sequence,
             retry_frame.arrow_ipc.to_vec(),
         )
         .await?;
@@ -96,7 +89,6 @@ async fn run_closeout_journey(
         .insert_batch(
             TABLE_FQN,
             retry_frame.batch_id,
-            retry_frame.frame_sequence,
             retry_frame.arrow_ipc.to_vec(),
         )
         .await?;
@@ -107,7 +99,7 @@ async fn run_closeout_journey(
     // state because Gate rejects before Scribe admission.
     let underprivileged = bootstrap_transport(first, "closeout-underprivileged", &[]).await?;
     let denied = underprivileged
-        .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), 0, ipc(&[200]))
+        .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), ipc(&[200]))
         .await
         .expect_err("under-privileged token must be rejected");
     assert_eq!(denied.status(), 403);
@@ -116,7 +108,6 @@ async fn run_closeout_journey(
         .insert_batch(
             "vala.bifrost.unknown_closeout_table",
             uuid::Uuid::now_v7().into_bytes(),
-            0,
             ipc(&[201]),
         )
         .await
@@ -127,7 +118,6 @@ async fn run_closeout_journey(
         .insert_batch(
             TABLE_FQN,
             uuid::Uuid::now_v7().into_bytes(),
-            0,
             conflicting_ipc(),
         )
         .await
@@ -192,11 +182,10 @@ async fn bootstrap_transport(
     Ok(BifrostGrpcTransport::connect(&client).await?)
 }
 
-fn frame(batch_id: [u8; 16], sequence: u64, ids: &[i64]) -> BifrostFrame {
+fn frame(batch_id: [u8; 16], ids: &[i64]) -> BifrostFrame {
     BifrostFrame {
         table: TABLE_FQN.to_owned(),
         batch_id,
-        frame_sequence: sequence,
         arrow_ipc: ipc(ids).into(),
     }
 }

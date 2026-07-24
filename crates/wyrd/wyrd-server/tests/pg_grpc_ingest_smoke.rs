@@ -132,8 +132,12 @@ mod pg_tests {
             .expect("test jwt mints")
     }
 
-    fn empty_stream() -> tokio_stream::Iter<std::vec::IntoIter<InsertBatchRequest>> {
-        tokio_stream::iter(Vec::<InsertBatchRequest>::new())
+    fn empty_request() -> InsertBatchRequest {
+        InsertBatchRequest {
+            table: String::new(),
+            arrow_ipc: Default::default(),
+            wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        }
     }
 
     async fn bind_free_loopback() -> SocketAddr {
@@ -186,7 +190,7 @@ mod pg_tests {
 
         let mut client = connect_grpc(bind).await;
         let status = client
-            .insert_batch(Request::new(empty_stream()))
+            .insert_batch(Request::new(empty_request()))
             .await
             .expect_err("unauthenticated ingest must be rejected");
 
@@ -221,7 +225,7 @@ mod pg_tests {
         tokio::spawn(async move { serve_grpc(router, bind, token).await });
 
         let mut client = connect_grpc(bind).await;
-        let mut request = Request::new(empty_stream());
+        let mut request = Request::new(empty_request());
         request.metadata_mut().insert(
             "x-wyrd-access-token",
             format!("Bearer {jwt}").parse().expect("metadata value"),

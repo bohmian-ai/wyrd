@@ -7,19 +7,23 @@ pub mod file_list_writer;
 pub mod filename;
 mod ingress;
 pub mod manifest;
+pub mod memory;
 pub mod memtable;
 pub mod parquet_writer;
 pub mod persistence;
 pub mod preprocess;
 pub mod registry;
 pub mod replay;
+pub mod routing;
 pub mod seal;
 pub mod seal_key;
+pub mod shards;
 pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
 pub mod wal;
-pub mod writer;
+#[cfg(test)]
+mod writer;
 
 #[cfg(test)]
 mod acceptance;
@@ -36,10 +40,10 @@ pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{ScribeDurabilitySnapshot, ScribeRuntimeSnapshot};
-use crate::scribe::writer::TenantTableWriterRegistry;
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
@@ -173,14 +177,16 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and writer admission counters.
     admission: AdmissionController,
+    /// Pod-global Bifrost/Scribe memory governor.
+    memory: memory::BifrostMemoryGovernor,
     /// Bounded post-ACK CPU lane retained for replay and seal preparation.
     post_ack_cpu: ScribePostAckCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
     wal_io: ScribeWalIoPool,
     /// Bounded Rayon lane for pre-ACK native decode and projection work.
     ingress_cpu: ScribeIngressCpuPool,
-    /// Atomic get-or-create registry for tenant/table FIFO writers.
-    registry: Arc<TenantTableWriterRegistry>,
+    /// Fixed sixteen-lane shard owners for the live ingest path.
+    shards: Arc<shards::ScribeShardRuntime>,
     /// Bounded global raw-ingress dispatcher.
     ingress_queue: ingress::ScribeIngressQueue,
     /// Resolved opportunistic WAL group limits.
@@ -384,7 +390,16 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeBuildConfig,
     ) -> Self {
-        let memtable = Arc::new(Memtable::new());
+        let memory = memory::BifrostMemoryGovernor::new(config.admission.memory_limit_bytes)
+            .or_else(|_| memory::BifrostMemoryGovernor::detect(1024 * 1024 * 1024))
+            .unwrap_or_else(|_| {
+                memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
+                    .expect("one-gibibyte fallback memory budget is valid")
+            });
+        let memtable = Arc::new(Memtable::new_with_limits(
+            Duration::from_mins(1),
+            memory.active_bucket_target_bytes(),
+        ));
         let admission = AdmissionController::with_config(config.admission);
         let ScribeBuildConfig {
             coordination_runtime,
@@ -420,25 +435,25 @@ impl ScribeImpl {
             ),
             stream_identity::WriterEpoch::new(writer_epoch),
         );
-        let registry = TenantTableWriterRegistry::new_with_runtime(
-            admission.clone(),
-            Arc::clone(&memtable),
-            Arc::clone(&wal),
-            post_ack_cpu.clone(),
-            wal_io.clone(),
-            writer::WriterRegistryRuntime {
-                coordination_runtime: coordination_runtime.clone(),
-                commit_config,
+        let shards = shards::ScribeShardRuntime::start(
+            shards::ScribeShardStartConfig {
+                admission: admission.clone(),
+                memtable: Arc::clone(&memtable),
+                wal: Arc::clone(&wal),
+                post_ack_cpu: post_ack_cpu.clone(),
+                wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 stream,
             },
+            &coordination_runtime,
         );
         let ingress_queue = ingress::ScribeIngressQueue::new(
             ingress_queue_items,
             ingress_queue_bytes,
             admission.clone(),
             ingress_cpu.clone(),
-            Arc::clone(&registry),
+            memory.clone(),
+            Arc::clone(&shards),
             &coordination_runtime,
         );
         Self {
@@ -448,10 +463,11 @@ impl ScribeImpl {
             node_id,
             writer_epoch,
             admission,
+            memory,
             post_ack_cpu,
             wal_io,
             ingress_cpu,
-            registry,
+            shards,
             ingress_queue,
             commit_config,
             persistence,
@@ -532,10 +548,11 @@ impl ScribeImpl {
     pub async fn shutdown(&self) {
         let started = std::time::Instant::now();
         self.ingress_queue.close_and_drain().await;
-        self.registry.shutdown().await;
+        self.shards.drain().await;
         if let Some(persistence) = &self.persistence {
             persistence.close_and_drain().await;
         }
+        self.shards.shutdown().await;
         self.post_ack_cpu.drain().await;
         self.wal_io.drain().await;
         self.ingress_cpu.drain().await;
@@ -545,21 +562,39 @@ impl ScribeImpl {
 
     /// Retire idle writers after the pod lifecycle scanner's tick.
     pub async fn retire_idle(&self, now: std::time::Instant) {
-        self.registry.retire_idle(now).await;
+        let _ = now;
+        self.shards.drain().await;
     }
 
     /// Publish one coalescing lifecycle age tick to every writer consumer.
     pub fn check_age(&self, now: std::time::Instant) {
-        self.registry.publish_age(now);
+        let Ok(keys) = self.memtable.expired_seal_keys(now) else {
+            return;
+        };
+        for key in keys {
+            if let Ok(frozen) = self.memtable.freeze(&key) {
+                self.admission
+                    .transfer_active_to_immutable(frozen.arrow_bytes);
+            }
+        }
     }
 
     /// Return the current admission, lane, and writer health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
-        let post_ack = self.registry.post_ack_snapshot();
-        let wal_io = self.registry.wal_io_snapshot();
+        let post_ack = self.post_ack_cpu.snapshot();
+        let wal_io = self.wal_io.snapshot();
         let ingress = self.ingress_cpu.snapshot();
-        let lanes = self.registry.lane_snapshot();
+        let lanes = crate::scribe::telemetry::ExecutorSnapshot {
+            depth: post_ack.depth.saturating_add(wal_io.depth),
+            capacity: post_ack.capacity.saturating_add(wal_io.capacity),
+            saturation_events: post_ack
+                .saturation_events
+                .saturating_add(wal_io.saturation_events),
+            completed: post_ack.completed.saturating_add(wal_io.completed),
+            failed: post_ack.failed.saturating_add(wal_io.failed),
+            panicked: post_ack.panicked.saturating_add(wal_io.panicked),
+        };
         ScribeRuntimeSnapshot {
             admission: self.admission.snapshot(),
             executor: crate::scribe::telemetry::ExecutorSnapshot {
@@ -575,7 +610,12 @@ impl ScribeImpl {
             ingress,
             post_ack,
             wal_io,
-            writers: self.registry.health_snapshot(),
+            writers: crate::scribe::telemetry::WriterHealthSnapshot {
+                writers: self.memtable.logical_writer_count(),
+                unhealthy_writers: 0,
+                pending_items: 0,
+                terminal_errors: 0,
+            },
             durability: ScribeDurabilitySnapshot::default(),
         }
     }
@@ -608,7 +648,7 @@ impl ScribeImpl {
                 detail: error.to_string(),
             })?;
 
-        let driver = SealDriver::new_with_lane(self.operator.clone(), self.registry.post_ack_cpu());
+        let driver = SealDriver::new_with_lane(self.operator.clone(), self.post_ack_cpu.clone());
         driver
             .pre_commit(
                 &self.memtable,
@@ -672,6 +712,12 @@ impl ScribeImpl {
         self.admission.snapshot()
     }
 
+    /// Return pod-global Bifrost memory accounting.
+    #[must_use]
+    pub fn memory_snapshot(&self) -> memory::MemorySnapshot {
+        self.memory.snapshot()
+    }
+
     /// Trip the WAL availability breaker for deterministic test-tier probes.
     pub fn trip_wal_disk_full_for_test(&self) {
         self.admission.trip_wal_disk_full();
@@ -692,7 +738,7 @@ impl ScribeImpl {
     /// Return the number of active tenant/table writer actors.
     #[must_use]
     pub fn writer_count(&self) -> usize {
-        self.registry.writer_count()
+        self.memtable.logical_writer_count()
     }
 
     /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.
@@ -720,7 +766,7 @@ impl ScribeImpl {
         &self,
         conn: &mut TenantConn<'_>,
     ) -> Result<seal::PostCommitBatch, ScribeError> {
-        self.registry.drain().await;
+        self.shards.drain().await;
         // A `TenantConn` is bound to exactly one tenant. Seal only the
         // memtable buckets whose seal-key belongs to that tenant; the harness
         // iterates tenants and opens a fresh `TenantConn` per tenant.

@@ -163,16 +163,14 @@ mod pg_tests {
             .await
             .expect("connect public SDK transport");
         let batch_id = uuid::Uuid::now_v7().into_bytes();
-        let rows = transport
+        transport
             .insert_batch(
                 &format!("vala.bifrost.{table_name}"),
                 batch_id,
-                0,
                 native_ipc(),
             )
             .await
-            .expect("per-frame ACK");
-        assert_eq!(rows, 2, "ACK reports exactly the admitted frame rows");
+            .expect("durable batch ACK");
 
         srv.flush_bifrost()
             .await

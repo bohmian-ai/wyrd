@@ -13,6 +13,7 @@ use wyrd_spec::ids::DataTenantId;
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::contracts::ScribeError;
 use crate::scribe::memtable::{Memtable, ReadableBatch};
+use crate::scribe::routing::shard_for;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::WalLsn;
 
@@ -110,6 +111,12 @@ impl FetchLiveTailService {
     #[must_use]
     pub fn stream(&self) -> StreamIdentity {
         self.stream
+    }
+
+    /// Return the canonical pod-local shard for a live-tail scope.
+    #[must_use]
+    pub fn shard_id(&self, shard: &LiveTailShard) -> usize {
+        shard_for(shard.tenant, &shard.table)
     }
 
     /// Return the current writable and immutable batches for one shard.

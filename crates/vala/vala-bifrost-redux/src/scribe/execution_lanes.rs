@@ -1015,14 +1015,7 @@ fn execute_wal_io(
             crate::scribe::replay::replay_wal_directory(path).map(ScribeWalIoResult::Replayed)
         }
         ScribeWalIoOp::RetireWal { wal, segments } => {
-            wal.sync_data()?;
-            for segment in segments {
-                if segment.path.exists() {
-                    std::fs::remove_file(&segment.path).map_err(|error| ScribeError::Internal {
-                        detail: format!("WAL segment retirement failed: {error}"),
-                    })?;
-                }
-            }
+            wal.retire_segments(&segments)?;
             Ok(ScribeWalIoResult::Completed)
         }
     }

@@ -8,24 +8,18 @@ use wyrd_spec::ids::DataTenantId;
 use crate::contracts::ScribeError;
 use crate::scribe::wal::{PreparedWalAppend, WalConfig, WalWriter};
 
-/// A prepared paired WAL append. Preparation performs the production header
-/// construction and payload accounting, but no filesystem work.
+/// A prepared v3 WAL append. Preparation performs the production payload
+/// accounting, but no filesystem work.
 pub struct PreparedWalAppendFixture {
     append: PreparedWalAppend,
 }
 
 impl PreparedWalAppendFixture {
-    /// Compute the production CRC inputs without touching the filesystem.
+    /// Compute payload checksums without touching the filesystem.
     #[must_use]
     pub fn crc32(&self) -> (u32, u32) {
-        let audit = crc32c::crc32c_append(
-            crc32c::crc32c_append(0, &self.append.audit_header),
-            &self.append.audit,
-        );
-        let data = crc32c::crc32c_append(
-            crc32c::crc32c_append(0, &self.append.data_header),
-            &self.append.data,
-        );
+        let audit = crc32c::crc32c(&self.append.audit);
+        let data = crc32c::crc32c(&self.append.data);
         (audit, data)
     }
 }
@@ -64,11 +58,10 @@ impl WalBenchSupport {
         })
     }
 
-    /// Prepare a paired audit/data record without filesystem work.
+    /// Prepare a v3 audit/data record without filesystem work.
     pub fn prepare(
         &self,
         batch_id: [u8; 16],
-        frame_sequence: u64,
         audit: &[u8],
         data: &[u8],
     ) -> Result<PreparedWalAppendFixture, ScribeError> {
@@ -76,14 +69,13 @@ impl WalBenchSupport {
             append: PreparedWalAppend::new(
                 crate::scribe::wal::WalLsn::ZERO,
                 batch_id,
-                frame_sequence,
                 Bytes::copy_from_slice(audit),
                 Bytes::copy_from_slice(data),
-            )?,
+            ),
         })
     }
 
-    /// Append one prepared record through production vectored WAL IO.
+    /// Append one prepared record through production WAL IO.
     pub fn append_no_sync(
         &self,
         fixture: PreparedWalAppendFixture,

@@ -141,7 +141,6 @@ fn admitted_append(
 ) -> AdmittedAppend {
     AdmittedAppend {
         batch_id: Uuid::now_v7(),
-        frame_sequence: 0,
         audit_event: audit_event(&table),
         rows: rows(1_721_003_400_000_000, count),
         measured_wire_bytes: 1,
@@ -152,11 +151,12 @@ fn admitted_append(
         tenant: crate::test_support::tenant(),
         table,
         queued_at: Instant::now(),
+        durable_ack: None,
     }
 }
 
 #[tokio::test]
-async fn ack_waits_for_writer_try_send_only() {
+async fn ack_waits_for_wal_sync() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
@@ -164,12 +164,12 @@ async fn ack_waits_for_writer_try_send_only() {
         .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("ack");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(started.elapsed() >= Duration::from_millis(50));
     scribe.shutdown().await;
 }
 
 #[tokio::test]
-async fn ack_does_not_split_or_encode() {
+async fn ack_waits_for_preparation() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::from_millis(60), Duration::ZERO);
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
@@ -177,7 +177,7 @@ async fn ack_does_not_split_or_encode() {
         .append(append(crate::test_support::tenant(), 2))
         .await
         .expect("ack");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(started.elapsed() >= Duration::from_millis(50));
     scribe.shutdown().await;
 }
 
@@ -199,7 +199,7 @@ async fn age_scanner_rotates_on_the_writer_consumer() {
         .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("frame accepted");
-    scribe.registry.drain().await;
+    scribe.shards.drain().await;
 
     scribe.check_age(Instant::now() + super::memtable::ACTIVE_GENERATION_MAX_AGE);
 
@@ -241,7 +241,7 @@ async fn retrying_the_same_frame_identity_does_not_double_write() {
         .expect("first admission");
     scribe.append(request).await.expect("retry admission");
     scribe.shutdown().await;
-    scribe.registry.drain().await;
+    scribe.shards.drain().await;
     let keys = scribe
         .memtable
         .seal_keys_for_tenant(crate::test_support::tenant())
@@ -312,7 +312,6 @@ fn cross_day_enqueue_is_atomic() {
         .expect("reservation");
     let append = AdmittedAppend {
         batch_id: Uuid::now_v7(),
-        frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -335,6 +334,7 @@ fn cross_day_enqueue_is_atomic() {
         tenant,
         table,
         queued_at: Instant::now(),
+        durable_ack: None,
     };
     let prepared = prepare_append(append).expect("post-ack preparation");
     assert!(!prepared.slices.is_empty());
@@ -343,7 +343,7 @@ fn cross_day_enqueue_is_atomic() {
 }
 
 #[test]
-fn frame_identity_distinguishes_sequences_in_one_batch() {
+fn batch_identity_deduplicates_one_seal_key() {
     let seal_key = SealKey::new(
         crate::test_support::tenant(),
         TableRef::new(BifrostNamespace::Bifrost, "identity"),
@@ -352,15 +352,10 @@ fn frame_identity_distinguishes_sequences_in_one_batch() {
     let batch_id = Uuid::now_v7();
     let first = AppendSliceId {
         batch_id,
-        frame_sequence: 0,
         seal_key: seal_key.clone(),
     };
-    let second = AppendSliceId {
-        batch_id,
-        frame_sequence: 1,
-        seal_key,
-    };
-    assert_ne!(first, second);
+    let second = AppendSliceId { batch_id, seal_key };
+    assert_eq!(first, second);
 }
 
 #[test]
@@ -369,7 +364,6 @@ fn append_slice_identity_distinguishes_cross_day_slices() {
     let batch_id = Uuid::now_v7();
     let first = AppendSliceId {
         batch_id,
-        frame_sequence: 0,
         seal_key: SealKey::new(
             crate::test_support::tenant(),
             table.clone(),
@@ -378,7 +372,6 @@ fn append_slice_identity_distinguishes_cross_day_slices() {
     };
     let second = AppendSliceId {
         batch_id,
-        frame_sequence: 0,
         seal_key: SealKey::new(
             crate::test_support::tenant(),
             table,
@@ -411,7 +404,7 @@ async fn post_ack_failure_marks_writer_unhealthy() {
 }
 
 #[tokio::test]
-async fn ack_does_not_wait_for_day_split_wal_fsync_or_parquet() {
+async fn ack_waits_for_wal_sync_before_returning() {
     let (post_ack_cpu, wal_io) = test_lanes(Duration::ZERO, Duration::from_millis(60));
     let scribe = ScribeImpl::new_with_test_lanes(post_ack_cpu, wal_io);
     let started = Instant::now();
@@ -419,7 +412,7 @@ async fn ack_does_not_wait_for_day_split_wal_fsync_or_parquet() {
         .append(append(crate::test_support::tenant(), 1))
         .await
         .expect("ack");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(started.elapsed() >= Duration::from_millis(50));
     tokio::time::sleep(Duration::from_millis(150)).await;
     scribe.shutdown().await;
 }
@@ -433,7 +426,7 @@ async fn boot_replay_restores_pending_generation() {
         TableRef::new(BifrostNamespace::Bifrost, "acceptance_events"),
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
-    let handle = wal.handle_for_seal_key(key).expect("handle");
+    let handle = wal.handle_for_seal_key(key);
     let table = TableRef::new(BifrostNamespace::Bifrost, "acceptance_events");
     let audit_payload =
         super::audit_envelope::encode_audit_event(&audit_event(&table)).expect("audit");
@@ -487,7 +480,7 @@ fn fsynced_frames_replay_exactly() {
         TableRef::new(BifrostNamespace::Bifrost, "acceptance_events"),
         EventDay::new(chrono::NaiveDate::from_ymd_opt(2024, 7, 15).expect("date")),
     );
-    let handle = wal.handle_for_seal_key(key).expect("handle");
+    let handle = wal.handle_for_seal_key(key);
     let table = TableRef::new(BifrostNamespace::Bifrost, "acceptance_events");
     let audit_payload =
         super::audit_envelope::encode_audit_event(&audit_event(&table)).expect("audit");
@@ -547,7 +540,6 @@ fn recordbatch_is_not_redecoded_normally() {
     let batch_id = Uuid::now_v7();
     let prepared = prepare_append(AdmittedAppend {
         batch_id,
-        frame_sequence: 0,
         audit_event: wyrd_spec::vala::api::AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -570,13 +562,13 @@ fn recordbatch_is_not_redecoded_normally() {
         tenant: crate::test_support::tenant(),
         table,
         queued_at: Instant::now(),
+        durable_ack: None,
     })
     .expect("prepare");
     assert_eq!(
         prepared.slices[0].id,
         AppendSliceId {
             batch_id,
-            frame_sequence: 0,
             seal_key: prepared.slices[0].seal_key.clone()
         }
     );
@@ -593,7 +585,7 @@ async fn wal_saturation_cannot_consume_ingress_threads() {
         tokio::time::sleep(Duration::from_millis(1)),
     );
     append_result.expect("append");
-    assert!(started.elapsed() < Duration::from_millis(50));
+    assert!(started.elapsed() >= Duration::from_millis(50));
     scribe.shutdown().await;
 }
 
@@ -806,7 +798,7 @@ async fn retiring_writer_never_overlaps_replacement() {
 
 #[tokio::test]
 async fn pod_global_item_limit_rejects_tiny_batches() {
-    let scribe = ScribeImpl::new_with_test_config(
+    let scribe = Arc::new(ScribeImpl::new_with_test_config(
         ScribePostAckCpuPool::with_delay(1, Duration::from_millis(60)),
         ScribeWalIoPool::new(1),
         AdmissionConfig {
@@ -817,21 +809,37 @@ async fn pod_global_item_limit_rejects_tiny_batches() {
             writer_idle_ttl: std::time::Duration::from_mins(10),
             memory_limit_bytes: 10_000,
         },
-    );
+    ));
     let mut first = append(crate::test_support::tenant(), 0);
     first.table = TableRef::new(BifrostNamespace::Bifrost, "tiny-one");
     let mut second = append(crate::test_support::tenant(), 0);
     second.table = TableRef::new(BifrostNamespace::Bifrost, "tiny-two");
-    scribe.append(first).await.expect("first tiny batch");
-    scribe.append(second).await.expect("second tiny batch");
+    let first_task = tokio::spawn({
+        let scribe = scribe.clone();
+        async move { scribe.append(first).await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let second_task = tokio::spawn({
+        let scribe = scribe.clone();
+        async move { scribe.append(second).await }
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let error = scribe
         .append(append(crate::test_support::tenant(), 0))
         .await
         .expect_err("third tiny batch must hit the global item limit");
+    first_task
+        .await
+        .expect("first task")
+        .expect("first tiny batch");
+    second_task
+        .await
+        .expect("second task")
+        .expect("second tiny batch");
     assert!(matches!(
         error,
         crate::contracts::ScribeError::IngestBusy { .. }
     ));
-    assert_eq!(scribe.admission_snapshot().items, 2);
+    assert_eq!(scribe.admission_snapshot().items, 0);
     scribe.shutdown().await;
 }

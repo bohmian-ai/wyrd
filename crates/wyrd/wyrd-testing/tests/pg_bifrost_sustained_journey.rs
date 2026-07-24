@@ -90,15 +90,13 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
         };
         let transport = BifrostGrpcTransport::connect(&WyrdClient::with_config(config)?).await?;
         for _ in 0..4 {
-            let acknowledgements = transport
-                .insert_batch_stream(vec![BifrostFrame {
+            transport
+                .send_frame(BifrostFrame {
                     table: table_fqn.clone(),
                     batch_id: uuid::Uuid::now_v7().into_bytes(),
-                    frame_sequence: 0,
                     arrow_ipc: payload.clone().into(),
-                }])
+                })
                 .await?;
-            assert_eq!(acknowledgements, vec![2]);
         }
     }
 

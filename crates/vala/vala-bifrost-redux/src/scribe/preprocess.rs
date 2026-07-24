@@ -4,11 +4,13 @@ use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use std::time::Instant;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
+use crate::schema::SchemaFingerprint;
 use crate::scribe::admission::RetainedFrameReservation;
 use crate::scribe::audit_envelope::encode_audit_event;
 use crate::scribe::seal_key::{SealKey, split_batch_by_event_day};
@@ -19,7 +21,6 @@ use wyrd_spec::ids::DataTenantId;
 #[derive(Debug)]
 pub(crate) struct AdmittedAppend {
     pub batch_id: Uuid,
-    pub frame_sequence: u64,
     pub audit_event: AuditEvent,
     pub rows: RecordBatch,
     pub measured_wire_bytes: usize,
@@ -28,6 +29,7 @@ pub(crate) struct AdmittedAppend {
     pub tenant: DataTenantId,
     pub table: TableRef,
     pub queued_at: Instant,
+    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
 }
 
 /// A request after deterministic event-day splitting and serialization.
@@ -36,6 +38,7 @@ pub(crate) struct PreparedAppend {
     pub batch_id: Uuid,
     pub slices: Vec<PreparedSlice>,
     pub reservation: RetainedFrameReservation,
+    pub durable_ack: Option<oneshot::Sender<Result<u64, ScribeError>>>,
 }
 
 /// One event-day slice ready for ordered WAL and memtable processing.
@@ -53,7 +56,6 @@ pub(crate) struct PreparedSlice {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AppendSliceId {
     pub batch_id: Uuid,
-    pub frame_sequence: u64,
     pub seal_key: SealKey,
 }
 
@@ -62,7 +64,6 @@ pub struct AppendSliceId {
 pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend, ScribeError> {
     let AdmittedAppend {
         batch_id,
-        frame_sequence,
         audit_event,
         rows,
         measured_wire_bytes: _measured_wire_bytes,
@@ -71,6 +72,7 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         tenant,
         table,
         queued_at,
+        durable_ack,
     } = admitted;
 
     metrics::histogram!("bifrost_scribe_queue_wait_seconds")
@@ -104,15 +106,17 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         let wal_append = PreparedWalAppend::new(
             crate::scribe::wal::WalLsn::ZERO,
             *batch_id.as_bytes(),
-            frame_sequence,
             Bytes::from(audit_payload),
             Bytes::from(data_payload),
-        )?;
+        )
+        .for_slice(
+            seal_key.clone(),
+            SchemaFingerprint::from_arrow_schema(&day_rows.schema()).0,
+        );
         let memtable_bytes = day_rows.get_array_memory_size();
         slices.push(PreparedSlice {
             id: AppendSliceId {
                 batch_id,
-                frame_sequence,
                 seal_key: seal_key.clone(),
             },
             seal_key,
@@ -127,5 +131,6 @@ pub(crate) fn prepare_append(admitted: AdmittedAppend) -> Result<PreparedAppend,
         batch_id,
         slices,
         reservation,
+        durable_ack,
     })
 }

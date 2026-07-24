@@ -6,8 +6,9 @@ use crate::scribe::admission::{
     MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
 };
 use crate::scribe::execution_lanes::ScribeIngressCpuPool;
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory, MemoryReservation};
 use crate::scribe::preprocess::AdmittedAppend;
-use crate::scribe::writer::TenantTableWriterRegistry;
+use crate::scribe::shards::ScribeShardRuntime;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -17,6 +18,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 struct IngressJob {
     frame: ScribeIngressFrame,
     reservation: IngressQueueReservation,
+    memory: MemoryReservation,
     response: oneshot::Sender<Result<FrameAdmission, ScribeError>>,
 }
 
@@ -24,6 +26,7 @@ struct IngressJob {
 pub(super) struct ScribeIngressQueue {
     sender: Mutex<Option<mpsc::Sender<IngressJob>>>,
     budget: IngressQueueBudget,
+    memory: BifrostMemoryGovernor,
     closed: AtomicBool,
     active: Arc<AtomicUsize>,
     drained: Arc<Notify>,
@@ -36,7 +39,8 @@ impl ScribeIngressQueue {
         bytes: usize,
         admission: AdmissionController,
         ingress_cpu: ScribeIngressCpuPool,
-        registry: Arc<TenantTableWriterRegistry>,
+        memory: BifrostMemoryGovernor,
+        shards: Arc<ScribeShardRuntime>,
         coordination_runtime: &Handle,
     ) -> Self {
         let capacity = items.max(1);
@@ -58,21 +62,23 @@ impl ScribeIngressQueue {
                 task_active.fetch_add(1, Ordering::AcqRel);
                 let admission = admission.clone();
                 let ingress_cpu = ingress_cpu.clone();
-                let registry = Arc::clone(&registry);
+                let shards = Arc::clone(&shards);
                 let active = Arc::clone(&task_active);
                 let drained = Arc::clone(&task_drained);
                 let IngressJob {
                     frame,
                     mut reservation,
+                    memory,
                     response,
                 } = job;
                 tokio::spawn(async move {
                     let result = process_ingress_frame(
                         frame,
                         &mut reservation,
+                        memory,
                         &admission,
                         &ingress_cpu,
-                        &registry,
+                        &shards,
                     )
                     .await;
                     let _ = response.send(result);
@@ -92,6 +98,7 @@ impl ScribeIngressQueue {
         Self {
             sender: Mutex::new(Some(sender)),
             budget,
+            memory,
             closed: AtomicBool::new(false),
             active,
             drained,
@@ -123,6 +130,12 @@ impl ScribeIngressQueue {
             metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "raw_budget")
                 .increment(1);
         })?;
+        let memory = self
+            .memory
+            .try_reserve_ingress(MemoryCategory::Raw, bytes)
+            .map_err(|_| ScribeError::IngestBusy {
+                table: table.clone(),
+            })?;
         let (response, result) = oneshot::channel();
         let sender = self
             .sender
@@ -135,6 +148,7 @@ impl ScribeIngressQueue {
         match sender.try_send(IngressJob {
             frame,
             reservation,
+            memory,
             response,
         }) {
             Ok(()) => {}
@@ -177,9 +191,10 @@ impl ScribeIngressQueue {
 async fn process_ingress_frame(
     frame: ScribeIngressFrame,
     raw_reservation: &mut IngressQueueReservation,
+    mut memory: MemoryReservation,
     admission: &AdmissionController,
     ingress_cpu: &ScribeIngressCpuPool,
-    registry: &TenantTableWriterRegistry,
+    shards: &ScribeShardRuntime,
 ) -> Result<FrameAdmission, ScribeError> {
     let append_started = Instant::now();
     frame
@@ -195,16 +210,7 @@ async fn process_ingress_frame(
             frame.batch_id,
         )
         .await?;
-    let append_rows = rows.num_rows();
-    let total_rows = frame
-        .stream_rows_before
-        .saturating_add(u64::try_from(append_rows).unwrap_or(u64::MAX));
-    if total_rows > frame.stream_rows_limit {
-        return Err(ScribeError::TooManyRows {
-            rows: total_rows,
-            limit: frame.stream_rows_limit,
-        });
-    }
+    memory.transfer_category(MemoryCategory::Decode);
     let estimated_bytes = rows
         .get_array_memory_size()
         .saturating_add(frame.measured_wire_bytes)
@@ -214,26 +220,27 @@ async fn process_ingress_frame(
         frame.binding.table_ref.fqn(),
         estimated_bytes,
     )?;
+    let (durable_tx, durable_rx) = oneshot::channel();
+    let tenant = frame.principal.tenant_id;
+    let table = frame.binding.table_ref.clone();
     let admitted = AdmittedAppend {
         batch_id: frame.batch_id,
-        frame_sequence: frame.frame_sequence,
         audit_event: frame.audit_event,
         rows,
         measured_wire_bytes: frame.measured_wire_bytes,
         admitted_bytes: reservation.bytes(),
         reservation,
-        tenant: frame.principal.tenant_id,
-        table: frame.binding.table_ref.clone(),
+        tenant,
+        table: table.clone(),
         queued_at: Instant::now(),
+        durable_ack: Some(durable_tx),
     };
+    memory.transfer_category(MemoryCategory::Prepared);
     let rows_accepted = u64::try_from(admitted.rows.num_rows()).unwrap_or(u64::MAX);
-    let (writer, created) = registry.get_or_create(frame.binding)?;
-    if let Err(error) = TenantTableWriterRegistry::enqueue(&writer, admitted) {
-        if created {
-            registry.remove_if(&writer.key, writer.instance_id);
-        }
-        return Err(error);
-    }
+    shards.try_send(tenant, &table, admitted)?;
+    durable_rx.await.map_err(|_| ScribeError::Internal {
+        detail: "writer dropped durable batch completion".to_owned(),
+    })??;
     metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
     metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted").increment(rows_accepted);
     metrics::histogram!("bifrost_scribe_ack_seconds")

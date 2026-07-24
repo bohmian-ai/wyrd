@@ -6,7 +6,7 @@
 //!
 //! `Scribe::ingest_frame` returns a `FrameAdmission` after the frame owns a
 //! bounded writer-queue admission, not after WAL or memtable work completes.
-//! Idempotency is tracked by the frame identity `(batch_id, frame_sequence)`;
+//! Idempotency is tracked by the batch identity `batch_id` during retention;
 //! the recovery path keys off the batch and seal key.
 
 use arrow::record_batch::RecordBatch;
@@ -39,7 +39,7 @@ fn projected_source_schema_fingerprint(schema: &arrow::datatypes::Schema) -> Sch
     SchemaFingerprint::from_arrow_schema(&arrow::datatypes::Schema::new(fields))
 }
 
-/// One fully resolved frame crossing the Gate-to-Scribe boundary.
+/// One fully resolved batch crossing the Gate-to-Scribe boundary.
 #[derive(Debug)]
 pub struct ScribeIngressFrame {
     /// The server-verified principal that owns the write.
@@ -50,18 +50,12 @@ pub struct ScribeIngressFrame {
     pub expected_schema_fingerprint: SchemaFingerprint,
     /// The request correlation identifier.
     pub request_id: RequestId,
-    /// The client idempotency identifier shared by all frames in a stream.
+    /// The client idempotency identifier for this batch.
     pub batch_id: uuid::Uuid,
-    /// The contiguous frame sequence within the batch stream.
-    pub frame_sequence: u64,
-    /// The server-created audit event for this frame.
+    /// The server-created audit event for this batch.
     pub audit_event: AuditEvent,
     /// Server-measured bytes after transport decompression.
     pub measured_wire_bytes: usize,
-    /// Decoded rows admitted earlier in the same transport stream.
-    pub stream_rows_before: u64,
-    /// Aggregate decoded-row ceiling for the transport stream.
-    pub stream_rows_limit: u64,
     /// Native Arrow IPC or a protocol-specific projected Arrow payload.
     pub payload: IngressPayload,
 }
@@ -95,10 +89,10 @@ pub enum IngressPayload {
     ProjectedArrow(Vec<RecordBatch>),
 }
 
-/// The portion of a frame admission visible to the transport.
+/// The portion of a batch admission visible to the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameAdmission {
-    /// Number of rows accepted into the bounded writer queue.
+    /// Number of rows accepted into the durable ingest pipeline.
     pub rows_accepted: u64,
 }
 
@@ -248,11 +242,8 @@ pub trait Scribe: Send + Sync {
             ),
             request_id: req.request_id,
             batch_id: req.batch_id,
-            frame_sequence: 0,
             audit_event,
             measured_wire_bytes: req.measured_wire_bytes,
-            stream_rows_before: 0,
-            stream_rows_limit: u64::MAX,
             payload: IngressPayload::ProjectedArrow(vec![req.rows]),
         })
         .await

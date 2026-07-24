@@ -258,7 +258,6 @@ impl Cards {
             .client
             .request_json(Method::POST, "/v1/cards/download/init", Some(&request))
             .await
-            .map_err(WyrdError::from)
     }
 
     /// Soft-delete one Card. Named selectors must include an exact version.

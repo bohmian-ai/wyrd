@@ -50,17 +50,14 @@ pub(crate) async fn register(
             .await?;
 
     emit_phase(&progress, RegistrationPhase::Uploading);
-    if let Err(error) = upload::upload_artifacts(
+    upload::upload_artifacts(
         &engine.storage,
         &response,
         &prepared.artifact_sources,
         &idempotency_key,
         progress.clone(),
     )
-    .await
-    {
-        return Err(error);
-    }
+    .await?;
 
     emit_phase(&progress, RegistrationPhase::Completing);
     match complete::complete_uploaded_cards(&engine.client, &response, &idempotency_key).await {

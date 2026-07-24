@@ -38,6 +38,7 @@ uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth-issue = { workspace = true }
+wyrd-client = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-error-derive = { workspace = true }
 
@@ -50,8 +51,14 @@ wyrd-sql = { workspace = true, features = ["embedded-postgres"] }
 [dev-dependencies]
 assert_cmd = "2"
 axum = { workspace = true }
+base64 = { workspace = true }
 predicates = "3"
+sha2 = { workspace = true }
 tempfile = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 wiremock = { workspace = true }
+wyrd-server = { workspace = true }
+wyrd-storage = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
+wyrd-testing = { workspace = true }

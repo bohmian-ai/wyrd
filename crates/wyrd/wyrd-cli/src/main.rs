@@ -4,6 +4,7 @@
 
 mod audit;
 mod auth;
+mod card;
 mod cli;
 mod dev;
 mod error;
@@ -37,6 +38,13 @@ async fn main() -> std::process::ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
     match cli.command {
+        Command::Plan(args) => crate::card::dispatch_plan(args).await,
+        Command::Apply(args) => crate::card::dispatch_apply(args).await,
+        Command::Get(args) => crate::card::dispatch_get(args).await,
+        Command::Latest(args) => crate::card::dispatch_latest(args).await,
+        Command::List(args) => crate::card::dispatch_list(args).await,
+        Command::Load(args) => crate::card::dispatch_load(args).await,
+        Command::Delete(args) => crate::card::dispatch_delete(args).await,
         Command::Audit(command) => crate::audit::dispatch(command).await,
         Command::Auth(command) => crate::auth::dispatch(command).await,
         Command::Dev(command) => crate::dev::dispatch(command).await,

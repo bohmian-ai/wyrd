@@ -369,6 +369,105 @@ pub enum WyrdCliError {
         #[source]
         source: vala_eval::orchestrator::OrchestratorError,
     },
+
+    /// A card CLI argument could not be parsed or does not satisfy the
+    /// selector contract.
+    #[error("invalid {field} {value:?}: {expected}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_INVALID_ARGUMENT",
+        status = 400,
+        title = "Invalid CLI argument",
+        remediation = "Fix the argument and retry."
+    )]
+    InvalidArgument {
+        /// Argument name.
+        field: String,
+        /// Supplied value.
+        value: String,
+        /// Expected shape.
+        expected: String,
+    },
+
+    /// The local card loader rejected a card tree.
+    #[error("card load failed: {0}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_CARD_LOAD",
+        status = 400,
+        title = "Card load failed",
+        remediation = "Fix the card files and local references, then retry."
+    )]
+    CardLoad(#[source] wyrd_loader::LoadError),
+
+    /// A registry operation returned a stable Wyrd error.
+    #[error(transparent)]
+    #[wyrd_error(delegate)]
+    Registry {
+        /// Registry error catalog value.
+        #[from]
+        source: wyrd_spec::error::WyrdError,
+    },
+
+    /// The CLI could not construct its typed client from local configuration.
+    #[error("client configuration failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_CLIENT_CONFIG",
+        status = 400,
+        title = "Client configuration failed",
+        remediation = "Pass a valid server URL and configure a Wyrd credential."
+    )]
+    ClientConfig {
+        /// Configuration detail without secret values.
+        detail: String,
+    },
+
+    /// No credential was available for a networked card operation.
+    #[error("no Wyrd credentials available")]
+    #[wyrd_error(
+        code = "WYRD_CLI_401_NO_CREDENTIALS",
+        status = 401,
+        title = "No Wyrd credentials",
+        remediation = "Pass --token or set WYRD_ACCESS_TOKEN."
+    )]
+    NoCredentials,
+
+    /// The card client could not reach the configured server.
+    #[error("card client transport failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_503_CLIENT_TRANSPORT",
+        status = 503,
+        title = "Wyrd server unavailable",
+        remediation = "Check the server URL and network connectivity, then retry."
+    )]
+    ClientTransport {
+        /// Transport detail without credential values.
+        detail: String,
+    },
+
+    /// A successful card response could not be rendered in the requested
+    /// machine-readable format.
+    #[error("card output serialization failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_OUTPUT",
+        status = 500,
+        title = "CLI output failed",
+        remediation = "Retry the command or use --format text."
+    )]
+    Output {
+        /// Serialization detail.
+        detail: String,
+    },
+
+    /// A delete selector must identify one exact card version.
+    #[error(
+        "delete requires --uid or an explicit --version; named selectors never default to latest"
+    )]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_DELETE_SELECTOR_EXACT",
+        status = 400,
+        title = "Delete selector is not exact",
+        remediation = "Pass --uid, or pass --kind, --space, --name, and --version."
+    )]
+    DeleteSelectorRequiresExact,
 }
 
 impl WyrdCliError {
@@ -377,7 +476,12 @@ impl WyrdCliError {
     pub fn exit_code(&self) -> u8 {
         match self.status() {
             400 => 64,
+            401 | 403 => 77,
+            404 => 66,
             422 => 65,
+            409 => 73,
+            410 | 507 => 74,
+            502 | 503 => 69,
             _ => 1,
         }
     }

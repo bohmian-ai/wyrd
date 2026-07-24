@@ -1,21 +1,5 @@
 //! `wyrd` command-line entry point.
 
-#![deny(missing_docs)]
-
-mod audit;
-mod auth;
-mod card;
-mod cli;
-mod dev;
-mod error;
-mod eval;
-mod principal;
-
-use clap::Parser;
-
-use crate::cli::{Cli, Command};
-use crate::error::WyrdCliError;
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
@@ -26,29 +10,5 @@ async fn main() -> std::process::ExitCode {
         .with_writer(std::io::stderr)
         .init();
 
-    let cli = Cli::parse();
-    match dispatch(cli).await {
-        Ok(code) => code,
-        Err(error) => {
-            crate::eval::output::print_cli_error(&error);
-            std::process::ExitCode::from(error.exit_code())
-        }
-    }
-}
-
-async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
-    match cli.command {
-        Command::Plan(args) => crate::card::dispatch_plan(args).await,
-        Command::Apply(args) => crate::card::dispatch_apply(args).await,
-        Command::Get(args) => crate::card::dispatch_get(args).await,
-        Command::Latest(args) => crate::card::dispatch_latest(args).await,
-        Command::List(args) => crate::card::dispatch_list(args).await,
-        Command::Load(args) => crate::card::dispatch_load(args).await,
-        Command::Delete(args) => crate::card::dispatch_delete(args).await,
-        Command::Audit(command) => crate::audit::dispatch(command).await,
-        Command::Auth(command) => crate::auth::dispatch(command).await,
-        Command::Dev(command) => crate::dev::dispatch(command).await,
-        Command::Eval(command) => crate::eval::run::dispatch(command).await,
-        Command::Principal(command) => crate::principal::dispatch(command).await,
-    }
+    wyrd_cli::run_cli(std::env::args_os()).await
 }

@@ -14,7 +14,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::{HttpTransport, ResolvedCredential};
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
-use wyrd_registry::{CardSelector, Cards};
+use wyrd_registry::{CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -23,7 +23,6 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{CardLifecycleStatus, ListCardsRequest, ListCardsResponse};
 
 use crate::error::WyrdCliError;
-use wyrd_cli::registration;
 
 /// Output encoding for card lifecycle commands.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -110,6 +109,12 @@ pub struct GetArgs {
     /// Wyrd server and credential options.
     #[command(flatten)]
     pub connection: ConnectionArgs,
+    /// Destination directory for the hydrated bundle.
+    #[arg(long, value_name = "DIRECTORY")]
+    pub output_dir: Option<PathBuf>,
+    /// Resolve the graph and inventories without downloading payload bytes.
+    #[arg(long)]
+    pub metadata_only: bool,
     /// Output encoding.
     #[arg(long, default_value_t)]
     pub format: OutputFormat,
@@ -222,14 +227,6 @@ struct PlanCard {
 }
 
 #[derive(Debug, Serialize)]
-struct GetOutput {
-    card_ref: CardRef,
-    card: Card,
-    created_at: chrono::DateTime<chrono::Utc>,
-    updated_at: chrono::DateTime<chrono::Utc>,
-}
-
-#[derive(Debug, Serialize)]
 struct LatestOutput {
     card_ref: CardRef,
 }
@@ -271,9 +268,10 @@ pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
 /// Dispatch `wyrd apply`.
 pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
     let tree = load(&args.path).map_err(WyrdCliError::CardLoad)?;
-    let input = build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
+    build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
     let cards = build_cards(&args.connection)?;
-    let receipt = registration::register(&cards, &input)
+    let receipt = cards
+        .register_from_path(&args.path)
         .await
         .map_err(|source| WyrdCliError::Registry { source })?;
     match args.format {
@@ -286,17 +284,23 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
 /// Dispatch `wyrd get`.
 pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
     let selector = selector_from_args(&args.selector, false)?;
+    let output_dir = args.output_dir.as_deref().ok_or_else(|| {
+        invalid_argument(
+            "output-dir",
+            "<missing>",
+            "required for hydrated get output",
+        )
+    })?;
     let cards = build_cards(&args.connection)?;
-    let response = cards
-        .get_response(selector)
+    let mode = if args.metadata_only {
+        HydrationMode::MetadataOnly
+    } else {
+        HydrationMode::Complete
+    };
+    let output = cards
+        .hydrate(selector, output_dir, mode)
         .await
         .map_err(|source| WyrdCliError::Registry { source })?;
-    let output = GetOutput {
-        card_ref: exact_card_ref(&response.card)?,
-        card: response.card,
-        created_at: response.created_at,
-        updated_at: response.updated_at,
-    };
     match args.format {
         OutputFormat::Text => print_get_text(&output),
         OutputFormat::Json => print_json(&output)?,
@@ -642,13 +646,16 @@ fn print_apply_text(receipt: &wyrd_registry::RegistrationReceipt) {
     }
 }
 
-fn print_get_text(output: &GetOutput) {
-    let status = output
-        .card
-        .status
-        .as_ref()
-        .map_or("unknown", |status| status.phase.as_str());
-    println!("{} status={status}", output.card_ref);
+fn print_get_text(output: &HydrationSummary) {
+    println!(
+        "hydrated: {} destination={} mode={} cards={} artifacts={} downloaded_artifacts={}",
+        output.root,
+        output.destination.display(),
+        output.mode,
+        output.card_count,
+        output.artifact_count,
+        output.downloaded_artifact_count
+    );
 }
 
 fn print_list_text(response: &ListCardsResponse) {

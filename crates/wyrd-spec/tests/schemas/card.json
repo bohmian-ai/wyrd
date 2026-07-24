@@ -1354,6 +1354,30 @@
         }
       }
     },
+    "CardRelationship": {
+      "description": "One server-derived relationship edge.",
+      "type": "object",
+      "required": [
+        "ref"
+      ],
+      "properties": {
+        "alias": {
+          "description": "Optional user-facing alias assigned by a parent composition.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ref": {
+          "description": "Exact related Card reference.",
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ]
+        }
+      }
+    },
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
@@ -9041,11 +9065,25 @@
             "type": "string"
           }
         },
+        "inbound_refs": {
+          "description": "Exact inbound references.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRelationship"
+          }
+        },
         "outbound": {
           "description": "Outbound references as normalized display strings.",
           "type": "array",
           "items": {
             "type": "string"
+          }
+        },
+        "outbound_refs": {
+          "description": "Exact outbound references with optional user-facing aliases.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/CardRelationship"
           }
         }
       }

@@ -49,6 +49,86 @@ fn write_prompt(temp: &TempDir) -> std::path::PathBuf {
     path
 }
 
+fn write_multi_card_service(temp: &TempDir) -> std::path::PathBuf {
+    let prompt_artifact = b"shared-prompt-artifact";
+    let prompt_digest =
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(prompt_artifact));
+    std::fs::write(temp.path().join("shared-prompt.txt"), prompt_artifact)
+        .expect("shared prompt artifact writes");
+    std::fs::write(
+        temp.path().join("shared-prompt.yaml"),
+        format!(
+            "apiVersion: wyrd/v1\nkind: Prompt\nmetadata:\n  name: shared-prompt\n  version: 1.0.0\n  space: default\nspec:\n  provider: openai\n  model: gpt-4o\n  messages: [hello]\nartifacts:\n  - relative_path: shared-prompt.txt\n    sha256: {prompt_digest}\n    size_bytes: {}\n    content_type: text/plain\n",
+            prompt_artifact.len()
+        ),
+    )
+    .expect("shared prompt writes");
+
+    let model_artifact = b"shared-model-artifact";
+    let model_digest =
+        base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(model_artifact));
+    std::fs::write(temp.path().join("model.bin"), model_artifact).expect("model artifact writes");
+    std::fs::write(
+        temp.path().join("model.yaml"),
+        format!(
+            "apiVersion: wyrd/v1\nkind: Model\nmetadata:\n  name: shared-model\n  version: 1.0.0\n  space: default\nspec:\n  interface:\n    kind: Sklearn\n    meta:\n      framework_version: \"1.4.0\"\n      model_subtype: GradientBoostingClassifier\n  task_type: BinaryClassification\n  signature:\n    inputs: []\n    outputs: []\nartifacts:\n  - relative_path: model.bin\n    sha256: {model_digest}\n    size_bytes: {}\n    content_type: application/octet-stream\n",
+            model_artifact.len()
+        ),
+    )
+    .expect("model writes");
+
+    for (name, prompt_name) in [("agent-one", "agent-one"), ("agent-two", "agent-two")] {
+        std::fs::write(
+            temp.path().join(format!("{name}.yaml")),
+            format!(
+                "apiVersion: wyrd/v1\nkind: Agent\nmetadata:\n  name: {prompt_name}\n  version: 1.0.0\n  space: default\nspec:\n  prompt:\n    kind: Prompt\n    name: shared-prompt\n    version: 1.0.0\n    space: default\n  run_config:\n    max_iterations: 2\n    timeout_ms: 1000\n"
+            ),
+        )
+        .expect("agent writes");
+    }
+
+    let service = temp.path().join("service.yaml");
+    std::fs::write(
+        &service,
+        "apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: hydrated-service
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: agent-one
+      ref:
+        kind: Agent
+        name: agent-one
+        version: 1.0.0
+        space: default
+    - alias: agent-two
+      ref:
+        kind: Agent
+        name: agent-two
+        version: 1.0.0
+        space: default
+    - alias: model
+      ref:
+        kind: Model
+        name: shared-model
+        version: 1.0.0
+        space: default
+    - alias: prompt
+      ref:
+        kind: Prompt
+        name: shared-prompt
+        version: 1.0.0
+        space: default
+",
+    )
+    .expect("service writes");
+    service
+}
+
 fn first_stderr_json(output: &Output) -> Value {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let line = stderr
@@ -141,9 +221,37 @@ fn delete_rejects_ambiguous_named_selector_before_client_construction() {
     );
 }
 
+#[test]
+fn get_requires_an_output_directory_before_client_construction() {
+    let output = run_cli(&[
+        "get",
+        "--kind",
+        "Prompt",
+        "--space",
+        "default",
+        "--name",
+        "cli-prompt",
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(64));
+    assert_eq!(
+        first_stderr_json(&output)["code"],
+        "WYRD_CLI_400_INVALID_ARGUMENT"
+    );
+}
+
 #[cfg(test)]
 mod pg_tests {
     use super::*;
+    use secrecy::SecretString;
+    use std::sync::Arc;
+    use wyrd_client::WyrdClient;
+    use wyrd_client::auth::AuthMiddleware;
+    use wyrd_client::config::ClientConfig;
+    use wyrd_client::transport::{HttpTransport, ResolvedCredential};
+    use wyrd_registry::Cards;
     use wyrd_testing::Bootstrap;
 
     async fn start_cli_server() -> (
@@ -195,6 +303,19 @@ mod pg_tests {
         shutdown.cancel();
         serve_handle.await.expect("CLI test server joins");
         server.shutdown().await.expect("test server shuts down");
+    }
+
+    fn registry_cards(base_url: &str, jwt: &str) -> Cards {
+        let mut config = ClientConfig::default();
+        config.http.base_url = base_url.to_owned();
+        let auth = AuthMiddleware::new(
+            &config,
+            ResolvedCredential::BearerToken(SecretString::from(jwt.to_owned())),
+        )
+        .expect("registry auth middleware builds");
+        let transport = HttpTransport::new(&config.http, Arc::clone(&auth))
+            .expect("registry HTTP transport builds");
+        Cards::with_client(WyrdClient::from_parts(auth, transport, config.grpc))
     }
 
     #[tokio::test]
@@ -266,18 +387,133 @@ mod pg_tests {
             .expect("receipt contains a root UID")
             .to_owned();
 
+        let denied_get = run_cli_async!(
+            "get",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--output-dir",
+            temp.path()
+                .join("denied-hydration")
+                .to_str()
+                .expect("denied hydration path is UTF-8"),
+            "--server",
+            &base_url,
+            "--token",
+            &denied_jwt,
+            "--format",
+            "json",
+        );
+        assert_eq!(denied_get.status.code(), Some(77));
+        assert_eq!(first_stderr_json(&denied_get)["status"], 403);
+        assert!(!temp.path().join("denied-hydration").exists());
+
         let get = run_cli_async!(
-            "get", "--kind", "Prompt", "--uid", &uid, "--server", &base_url, "--token", &jwt,
-            "--format", "json",
+            "get",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--output-dir",
+            temp.path()
+                .join("hydrated")
+                .to_str()
+                .expect("hydration path is UTF-8"),
+            "--server",
+            &base_url,
+            "--token",
+            &jwt,
+            "--format",
+            "json",
         );
         assert!(
             get.status.success(),
             "{}",
             String::from_utf8_lossy(&get.stderr)
         );
-        let card: Value = serde_json::from_slice(&get.stdout).expect("get output is JSON");
-        assert_eq!(card["card_ref"]["uid"], uid);
-        assert_eq!(card["card"]["kind"], "Prompt");
+        let hydrated: Value = serde_json::from_slice(&get.stdout).expect("get output is JSON");
+        assert_eq!(hydrated["root"]["uid"], uid);
+        assert_eq!(hydrated["mode"], "complete");
+        assert_eq!(hydrated["card_count"], 1);
+        assert!(
+            !std::fs::read(temp.path().join("hydrated/metadata.yaml"))
+                .expect("hydrated metadata reads")
+                .is_empty()
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join("hydrated/cards/root/artifacts/prompt.txt"))
+                .expect("hydrated artifact reads"),
+            b"cli-card-artifact"
+        );
+
+        let metadata_only = run_cli_async!(
+            "get",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--output-dir",
+            temp.path()
+                .join("metadata-only")
+                .to_str()
+                .expect("metadata path is UTF-8"),
+            "--metadata-only",
+            "--server",
+            &base_url,
+            "--token",
+            &jwt,
+            "--format",
+            "json",
+        );
+        assert!(
+            metadata_only.status.success(),
+            "{}",
+            String::from_utf8_lossy(&metadata_only.stderr)
+        );
+        let metadata: Value =
+            serde_json::from_slice(&metadata_only.stdout).expect("metadata output is JSON");
+        assert_eq!(metadata["mode"], "metadata");
+        assert!(
+            !temp
+                .path()
+                .join("metadata-only/cards/root/artifacts/prompt.txt")
+                .exists()
+        );
+
+        let rerun = run_cli_async!(
+            "get",
+            "--kind",
+            "Prompt",
+            "--uid",
+            &uid,
+            "--output-dir",
+            temp.path()
+                .join("metadata-only")
+                .to_str()
+                .expect("rerun path is UTF-8"),
+            "--server",
+            &base_url,
+            "--token",
+            &jwt,
+            "--format",
+            "json",
+        );
+        assert!(
+            rerun.status.success(),
+            "{}",
+            String::from_utf8_lossy(&rerun.stderr)
+        );
+        let rerun_summary: Value = serde_json::from_slice(&rerun.stdout).expect("rerun JSON");
+        assert_eq!(rerun_summary["mode"], "complete");
+        assert_eq!(
+            std::fs::read(
+                temp.path()
+                    .join("metadata-only/cards/root/artifacts/prompt.txt")
+            )
+            .expect("rerun artifact reads"),
+            b"cli-card-artifact"
+        );
 
         let list = run_cli_async!(
             "list",
@@ -324,6 +560,38 @@ mod pg_tests {
             serde_json::from_slice(&latest.stdout).expect("latest output is JSON");
         assert_eq!(resolved["card_ref"]["uid"], uid);
 
+        let latest_dir = temp.path().join("latest-hydrated");
+        let latest_get = run_cli_async!(
+            "get",
+            "--kind",
+            "Prompt",
+            "--space",
+            "default",
+            "--name",
+            "cli-prompt",
+            "--output-dir",
+            latest_dir.to_str().expect("latest path is UTF-8"),
+            "--server",
+            &base_url,
+            "--token",
+            &jwt,
+            "--format",
+            "json",
+        );
+        assert!(
+            latest_get.status.success(),
+            "{}",
+            String::from_utf8_lossy(&latest_get.stderr)
+        );
+        let latest_summary: Value =
+            serde_json::from_slice(&latest_get.stdout).expect("latest hydration JSON");
+        assert_eq!(latest_summary["root"]["uid"], uid);
+        let latest_manifest: Value = serde_yaml::from_reader(
+            std::fs::File::open(latest_dir.join("metadata.yaml")).expect("latest manifest opens"),
+        )
+        .expect("latest manifest reads");
+        assert_eq!(latest_manifest["root"]["version"], "1.0.0");
+
         let destination = temp.path().join("loaded");
         let destination_string = destination.to_str().expect("destination path is UTF-8");
         let loaded = run_cli_async!(
@@ -367,6 +635,183 @@ mod pg_tests {
             serde_json::from_slice::<Value>(&deleted.stdout).expect("delete output is JSON")["deleted"],
             true
         );
+
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
+    #[tokio::test]
+    async fn multi_card_service_get_hydrates_complete_and_metadata_bundles() {
+        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let service_path = write_multi_card_service(&temp);
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-multi-card-writer", &["writer"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+
+        let cards = registry_cards(&base_url, &jwt);
+        for path in [
+            temp.path().join("shared-prompt.yaml"),
+            temp.path().join("model.yaml"),
+            temp.path().join("agent-one.yaml"),
+            temp.path().join("agent-two.yaml"),
+        ] {
+            cards
+                .register_from_path(&path)
+                .await
+                .expect("related Card registers through shared path API");
+        }
+        let registration = cards
+            .register_from_path(&service_path)
+            .await
+            .expect("root Service registers through shared path API");
+        let service_uid = registration
+            .root
+            .uid
+            .as_ref()
+            .expect("service UID exists")
+            .to_string();
+
+        let full_dir = temp.path().join("full-service");
+        let full = run_cli_owned(vec![
+            "get".to_owned(),
+            "--kind".to_owned(),
+            "Service".to_owned(),
+            "--uid".to_owned(),
+            service_uid.clone(),
+            "--output-dir".to_owned(),
+            full_dir.to_str().expect("full path is UTF-8").to_owned(),
+            "--server".to_owned(),
+            base_url.clone(),
+            "--token".to_owned(),
+            jwt.clone(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .await;
+        assert!(
+            full.status.success(),
+            "{}",
+            String::from_utf8_lossy(&full.stderr)
+        );
+        let full_summary: Value = serde_json::from_slice(&full.stdout).expect("full JSON");
+        assert_eq!(full_summary["mode"], "complete");
+        assert_eq!(full_summary["card_count"], 5);
+        assert_eq!(full_summary["artifact_count"], 2);
+        assert_eq!(full_summary["downloaded_artifact_count"], 2);
+        assert_eq!(
+            std::fs::read(full_dir.join("cards/model/artifacts/model.bin"))
+                .expect("model payload reads"),
+            b"shared-model-artifact"
+        );
+        assert_eq!(
+            std::fs::read(
+                full_dir
+                    .join("cards/default-Prompt-shared-prompt-1.0.0/artifacts/shared-prompt.txt")
+            )
+            .expect("prompt payload reads"),
+            b"shared-prompt-artifact"
+        );
+        let manifest: Value = serde_yaml::from_reader(
+            std::fs::File::open(full_dir.join("metadata.yaml")).expect("full manifest opens"),
+        )
+        .expect("full manifest reads");
+        let prompt_manifest = manifest["cards"]
+            .as_array()
+            .expect("manifest cards")
+            .iter()
+            .find(|card| card["card_ref"]["kind"] == "Prompt")
+            .expect("prompt manifest exists");
+        assert!(
+            prompt_manifest["aliases"]
+                .as_array()
+                .expect("prompt aliases")
+                .iter()
+                .any(|alias| alias == "prompt")
+        );
+
+        let metadata_dir = temp.path().join("metadata-service");
+        let metadata = run_cli_owned(vec![
+            "get".to_owned(),
+            "--kind".to_owned(),
+            "Service".to_owned(),
+            "--uid".to_owned(),
+            service_uid.clone(),
+            "--output-dir".to_owned(),
+            metadata_dir
+                .to_str()
+                .expect("metadata path is UTF-8")
+                .to_owned(),
+            "--metadata-only".to_owned(),
+            "--server".to_owned(),
+            base_url.clone(),
+            "--token".to_owned(),
+            jwt.clone(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .await;
+        assert!(
+            metadata.status.success(),
+            "{}",
+            String::from_utf8_lossy(&metadata.stderr)
+        );
+        let metadata_summary: Value =
+            serde_json::from_slice(&metadata.stdout).expect("metadata JSON");
+        assert_eq!(metadata_summary["mode"], "metadata");
+        assert_eq!(metadata_summary["card_count"], 5);
+        assert!(
+            !metadata_dir
+                .join("cards/model/artifacts/model.bin")
+                .exists()
+        );
+        assert!(metadata_dir.join("cards/model/artifacts.yaml").exists());
+
+        let superuser = server
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("superuser pool opens");
+        sqlx::query(
+            "UPDATE wyrd.cards SET status = 'deleted' \
+             WHERE kind = 'Prompt' AND space = 'default' AND name = 'shared-prompt' \
+               AND version = '1.0.0'",
+        )
+        .execute(&superuser)
+        .await
+        .expect("related prompt becomes unavailable");
+
+        let missing_dir = temp.path().join("missing-related");
+        let missing = run_cli_owned(vec![
+            "get".to_owned(),
+            "--kind".to_owned(),
+            "Service".to_owned(),
+            "--uid".to_owned(),
+            service_uid,
+            "--output-dir".to_owned(),
+            missing_dir
+                .to_str()
+                .expect("missing path is UTF-8")
+                .to_owned(),
+            "--metadata-only".to_owned(),
+            "--server".to_owned(),
+            base_url,
+            "--token".to_owned(),
+            jwt,
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .await;
+        assert_eq!(missing.status.code(), Some(66));
+        assert_eq!(first_stderr_json(&missing)["status"], 404);
+        assert!(!missing_dir.exists());
 
         stop_cli_server(server, shutdown, serve_handle).await;
     }

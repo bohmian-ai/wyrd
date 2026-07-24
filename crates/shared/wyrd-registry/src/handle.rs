@@ -138,7 +138,7 @@ pub struct LoadedCard {
 /// Cheap-to-clone, tenant-scoped Card registry handle.
 #[derive(Clone)]
 pub struct Cards {
-    engine: Arc<RegistryEngine>,
+    pub(crate) engine: Arc<RegistryEngine>,
 }
 
 impl Cards {

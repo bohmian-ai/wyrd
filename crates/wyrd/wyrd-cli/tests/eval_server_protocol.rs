@@ -1,5 +1,3 @@
-mod eval_support;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -15,7 +13,7 @@ use tokio::sync::Mutex;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use eval_support::{spec, write_eval_card};
+use crate::eval_support::{spec, write_eval_card};
 
 type CapturedRequest = (String, Option<String>, Option<String>);
 

@@ -537,6 +537,22 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, WyrdError> {
         .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
+#[cfg(test)]
+const FAIL_PROMOTION: u8 = 1;
+#[cfg(test)]
+const FAIL_RESTORE: u8 = 2;
+#[cfg(test)]
+const FAIL_CLEANUP: u8 = 4;
+#[cfg(test)]
+static PUBLISH_FAULTS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(test)]
+fn take_publish_fault(fault: u8) -> bool {
+    use std::sync::atomic::Ordering;
+
+    PUBLISH_FAULTS.fetch_and(!fault, Ordering::SeqCst) & fault != 0
+}
+
 async fn publish_staging(staging: &Path, destination: &Path) -> Result<(), WyrdError> {
     if tokio::fs::metadata(destination).await.is_err() {
         tokio::fs::rename(staging, destination)
@@ -558,14 +574,73 @@ async fn publish_staging(staging: &Path, destination: &Path) -> Result<(), WyrdE
         .await
         .map_err(RegistryEngineError::from)
         .map_err(WyrdError::from)?;
-    if let Err(error) = tokio::fs::rename(staging, destination).await {
-        let _ = tokio::fs::rename(&backup, destination).await;
-        return Err(WyrdError::from(RegistryEngineError::from(error)));
+    let promotion = {
+        #[cfg(test)]
+        if take_publish_fault(FAIL_PROMOTION) {
+            Err(std::io::Error::other(
+                "injected hydration promotion failure",
+            ))
+        } else {
+            tokio::fs::rename(staging, destination).await
+        }
+        #[cfg(not(test))]
+        tokio::fs::rename(staging, destination).await
+    };
+    if let Err(error) = promotion {
+        let publication_error = WyrdError::from(RegistryEngineError::from(error));
+        let restoration = {
+            #[cfg(test)]
+            if take_publish_fault(FAIL_RESTORE) {
+                Err(std::io::Error::other(
+                    "injected hydration restoration failure",
+                ))
+            } else {
+                tokio::fs::rename(&backup, destination).await
+            }
+            #[cfg(not(test))]
+            tokio::fs::rename(&backup, destination).await
+        };
+        if let Err(error) = restoration {
+            let restoration_error = RegistryEngineError::from(error);
+            tracing::error!(
+                error = %restoration_error,
+                destination = %destination.display(),
+                backup = %backup.display(),
+                "hydration publication failed and rollback failed"
+            );
+            return Err(WyrdError::Internal {
+                message: "hydration publication and rollback failed".to_owned(),
+                details: serde_json::json!({
+                    "publication_error": publication_error.to_string(),
+                    "rollback_error": restoration_error.to_string(),
+                    "destination": destination,
+                    "backup": backup,
+                }),
+            });
+        }
+        return Err(publication_error);
     }
-    tokio::fs::remove_dir_all(backup)
-        .await
-        .map_err(RegistryEngineError::from)
-        .map_err(WyrdError::from)
+    let cleanup = {
+        #[cfg(test)]
+        if take_publish_fault(FAIL_CLEANUP) {
+            Err(std::io::Error::other(
+                "injected hydration backup cleanup failure",
+            ))
+        } else {
+            tokio::fs::remove_dir_all(&backup).await
+        }
+        #[cfg(not(test))]
+        tokio::fs::remove_dir_all(&backup).await
+    };
+    if let Err(error) = cleanup {
+        tracing::warn!(
+            error = %error,
+            backup = %backup.display(),
+            destination = %destination.display(),
+            "published hydration bundle but could not remove the previous bundle"
+        );
+    }
+    Ok(())
 }
 
 fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdError> {
@@ -592,14 +667,25 @@ fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdErro
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use tempfile::TempDir;
 
     use super::{
-        HydrationMode, default_alias, register_alias, validate_alias, validate_artifact_path,
+        FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, HydrationMode, PUBLISH_FAULTS, default_alias,
+        publish_staging, register_alias, validate_alias, validate_artifact_path,
     };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
+
+    fn inject_publish_faults(faults: u8) {
+        PUBLISH_FAULTS.store(faults, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn write_bundle_marker(directory: &std::path::Path, marker: &str) {
+        std::fs::create_dir_all(directory).expect("bundle directory creates");
+        std::fs::write(directory.join("marker"), marker).expect("bundle marker writes");
+    }
 
     #[test]
     fn aliases_are_path_safe() {
@@ -652,5 +738,74 @@ mod tests {
         register_alias(&mut aliases, "shared", "first").expect("first alias registers");
         assert!(register_alias(&mut aliases, "shared", "second").is_err());
         register_alias(&mut aliases, "shared", "first").expect("same alias remains valid");
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_restores_the_previous_bundle() {
+        let temp = TempDir::new().expect("tempdir creates");
+        let destination = temp.path().join("bundle");
+        let staging = temp.path().join("missing-staging");
+        write_bundle_marker(&destination, "previous");
+
+        let error = publish_staging(&staging, &destination)
+            .await
+            .expect_err("missing staging must fail replacement");
+
+        assert!(
+            error
+                .to_string()
+                .contains("local artifact materialization failed")
+        );
+        assert_eq!(
+            std::fs::read_to_string(destination.join("marker")).expect("previous bundle reads"),
+            "previous"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_is_reported_as_unrecoverable() {
+        let temp = TempDir::new().expect("tempdir creates");
+        let destination = temp.path().join("bundle");
+        let staging = temp.path().join("staging");
+        write_bundle_marker(&destination, "previous");
+        write_bundle_marker(&staging, "new");
+        inject_publish_faults(FAIL_PROMOTION | FAIL_RESTORE);
+
+        let error = publish_staging(&staging, &destination)
+            .await
+            .expect_err("injected promotion must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("hydration publication and rollback failed")
+        );
+        assert!(!destination.exists());
+        assert!(
+            temp.path()
+                .read_dir()
+                .expect("publication parent reads")
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".previous-"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_failure_does_not_hide_a_published_bundle() {
+        let temp = TempDir::new().expect("tempdir creates");
+        let destination = temp.path().join("bundle");
+        let staging = temp.path().join("staging");
+        write_bundle_marker(&destination, "previous");
+        write_bundle_marker(&staging, "new");
+        inject_publish_faults(FAIL_CLEANUP);
+
+        publish_staging(&staging, &destination)
+            .await
+            .expect("cleanup failure is best effort");
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("marker")).expect("new bundle reads"),
+            "new"
+        );
     }
 }

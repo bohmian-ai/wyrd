@@ -426,7 +426,7 @@ pub enum WyrdCliError {
         code = "WYRD_CLI_401_NO_CREDENTIALS",
         status = 401,
         title = "No Wyrd credentials",
-        remediation = "Pass --token or set WYRD_ACCESS_TOKEN."
+        remediation = "Set WYRD_ACCESS_TOKEN, configure workload identity or WYRD_API_KEY, or add [default].api_key to ~/.config/wyrd/credentials.toml."
     )]
     NoCredentials,
 

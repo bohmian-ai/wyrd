@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::registry::{CardUploadEntry, CreateCardResponse, RelativeArtifactPath};
+use wyrd_spec::registry::{
+    CardLifecycleStatus, CardUploadEntry, CreateCardResponse, RelativeArtifactPath,
+};
 use wyrd_storage_client::{
     ArtifactSource, FileSource, UploadProgress, UploadProgressSink, WyrdStorageClient,
 };
@@ -28,6 +30,15 @@ pub(crate) async fn upload_artifacts(
     progress: Option<RegistrationProgressSink>,
 ) -> Result<(), RegistryEngineError> {
     let entries = collect_upload_entries(response);
+    if entries.is_empty()
+        && !response.outcomes.is_empty()
+        && response
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.status == CardLifecycleStatus::Active)
+    {
+        return Ok(());
+    }
     validate_artifact_sources(&entries, sources)?;
 
     let results = stream::iter(entries)

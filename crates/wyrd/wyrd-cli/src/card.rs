@@ -6,13 +6,12 @@ use std::sync::Arc;
 use std::{fmt, path::PathBuf};
 
 use clap::{Args, ValueEnum};
-use secrecy::SecretString;
 use serde::Serialize;
 use wyrd_client::WyrdClient;
 use wyrd_client::auth::AuthMiddleware;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
-use wyrd_client::transport::{HttpTransport, ResolvedCredential};
+use wyrd_client::transport::HttpTransport;
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
 use wyrd_registry::{CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_semver::VersionBlock;
@@ -49,9 +48,6 @@ pub struct ConnectionArgs {
     /// Wyrd HTTP server base URL.
     #[arg(long, value_name = "URL", env = "WYRD_SERVER_URL")]
     pub server: Option<String>,
-    /// Wyrd access token. The value is never included in CLI output.
-    #[arg(long, value_name = "TOKEN", env = "WYRD_ACCESS_TOKEN", value_parser = parse_secret)]
-    pub token: Option<SecretString>,
 }
 
 /// Selector fields shared by get, load, and delete.
@@ -103,16 +99,17 @@ pub struct ApplyArgs {
 #[derive(Debug, Args)]
 #[command(disable_version_flag = true)]
 pub struct GetArgs {
-    /// Card selector.
+    /// Root Card selector whose reachable graph will be hydrated.
     #[command(flatten)]
     pub selector: SelectorArgs,
     /// Wyrd server and credential options.
     #[command(flatten)]
     pub connection: ConnectionArgs,
-    /// Destination directory for the hydrated bundle.
+    /// Required destination directory for the hydrated bundle.
     #[arg(long, value_name = "DIRECTORY")]
     pub output_dir: Option<PathBuf>,
-    /// Resolve the graph and inventories without downloading payload bytes.
+    /// Write an inspectable metadata-only bundle without artifact payloads;
+    /// the result is not runnable. Complete artifact downloads are the default.
     #[arg(long)]
     pub metadata_only: bool,
     /// Output encoding.
@@ -268,10 +265,10 @@ pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
 /// Dispatch `wyrd apply`.
 pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
     let tree = load(&args.path).map_err(WyrdCliError::CardLoad)?;
-    build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
+    let input = build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
     let cards = build_cards(&args.connection)?;
     let receipt = cards
-        .register_from_path(&args.path)
+        .register(&input)
         .await
         .map_err(|source| WyrdCliError::Registry { source })?;
     match args.format {
@@ -410,19 +407,13 @@ pub async fn dispatch_delete(args: DeleteArgs) -> Result<ExitCode, WyrdCliError>
     Ok(ExitCode::SUCCESS)
 }
 
-fn parse_secret(value: &str) -> Result<SecretString, String> {
-    Ok(SecretString::from(value.to_owned()))
-}
-
 fn build_cards(connection: &ConnectionArgs) -> Result<Cards, WyrdCliError> {
     let mut config = ClientConfig::from_global().map_err(map_client_error)?;
     if let Some(server) = &connection.server {
         config.http.base_url.clone_from(server);
     }
-    let credential = match &connection.token {
-        Some(token) => ResolvedCredential::BearerToken(token.clone()),
-        None => config.resolve_credential().map_err(map_client_error)?,
-    };
+    config.http.validate().map_err(map_client_error)?;
+    let credential = config.resolve_credential().map_err(map_client_error)?;
     let auth = AuthMiddleware::new(&config, credential).map_err(map_client_error)?;
     let transport =
         HttpTransport::new(&config.http, Arc::clone(&auth)).map_err(map_client_error)?;

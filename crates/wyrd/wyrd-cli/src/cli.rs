@@ -25,7 +25,9 @@ pub enum Command {
     Plan(PlanArgs),
     /// Register a local card tree and run its artifact lifecycle.
     Apply(ApplyArgs),
-    /// Fetch one card by name or UID.
+    /// Hydrate a selected Card and its reachable graph into --output-dir;
+    /// complete artifact downloads are the default and --metadata-only writes
+    /// an inspectable, non-runnable bundle.
     Get(GetArgs),
     /// Resolve the latest active card version by name.
     Latest(LatestArgs),

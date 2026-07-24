@@ -191,10 +191,10 @@ impl HttpConfig {
     /// Validate the config. Returns `Err` if `base_url` is empty or
     /// `timeout_ms` is zero.
     ///
-    /// A plaintext `http://` URL to a non-loopback host logs a security warning
-    /// (not an error): the durable API key is POSTed to `{base_url}/auth/token`,
-    /// so a remote cleartext endpoint exposes it on the wire. Loopback hosts
-    /// (`localhost`, `127.0.0.1`, `[::1]`) are exempt for local development.
+    /// A plaintext `http://` URL to a non-loopback host is rejected because
+    /// credentials may be sent to `{base_url}/auth/token` or in request
+    /// headers. Loopback hosts (`localhost`, `127.0.0.1`, `[::1]`) remain
+    /// available for local development.
     pub fn validate(&self) -> Result<(), WyrdClientError> {
         if self.base_url.is_empty() {
             return Err(WyrdClientError::Config {
@@ -209,12 +209,11 @@ impl HttpConfig {
             });
         }
         if is_cleartext_remote(&self.base_url) {
-            tracing::warn!(
-                target: "wyrd.client.config",
-                base_url = %self.base_url,
-                "HTTP base_url uses plaintext http:// to a non-loopback host; the \
-                 durable API key will be sent in cleartext — use https:// in production"
-            );
+            return Err(WyrdClientError::Config {
+                field: "http_config.base_url".to_string(),
+                reason: "remote cleartext HTTP is not allowed; use https:// or a loopback host"
+                    .to_string(),
+            });
         }
         Ok(())
     }

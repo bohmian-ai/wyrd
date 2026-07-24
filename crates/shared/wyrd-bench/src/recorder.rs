@@ -190,11 +190,11 @@ impl BenchmarkRecorder {
                 SeriesKind::Histogram
             } else if matches!(
                 name.as_str(),
-                "bifrost_scribe_retained_items"
-                    | "bifrost_scribe_retained_bytes"
+                "bifrost_scribe_inflight_items"
+                    | "bifrost_scribe_inflight_bytes"
                     | "bifrost_scribe_lane_queued"
                     | "bifrost_scribe_lane_active"
-                    | "bifrost_scribe_writer_queue_depth"
+                    | "bifrost_scribe_shard_pending"
             ) {
                 SeriesKind::Gauge
             } else {

@@ -41,7 +41,7 @@ use wyrd_spec::vala::managed_columns::{
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
 #[cfg(test)]
-const POST_ACK_QUEUE_ITEMS: usize = 64;
+const PERSISTENCE_QUEUE_ITEMS: usize = 64;
 #[cfg(test)]
 const WAL_IO_QUEUE_ITEMS: usize = 256;
 
@@ -541,7 +541,7 @@ fn append_managed_columns(
 
 /// Closed set of CPU work permitted after admission has returned.
 #[derive(Debug)]
-pub(crate) enum ScribePostAckCpuOp {
+pub(crate) enum ScribePersistenceCpuOp {
     Preprocess(Box<AdmittedAppend>),
     EncodeParquet {
         frozen: Box<FrozenMemtable>,
@@ -554,17 +554,17 @@ pub(crate) enum ScribePostAckCpuOp {
     },
 }
 
-/// Results produced by [`ScribePostAckCpuPool`].
+/// Results produced by [`ScribePersistenceCpuPool`].
 #[derive(Debug)]
-pub(crate) enum ScribePostAckCpuResult {
+pub(crate) enum ScribePersistenceCpuResult {
     Prepared(PreparedAppend),
     ParquetEncoded(ParquetEncoded),
     ReplayRestored,
 }
 
-/// Bounded post-ACK CPU lane for day splitting and WAL serialization.
+/// Bounded persistence CPU lane for day splitting and WAL serialization.
 #[derive(Debug, Clone)]
-pub struct ScribePostAckCpuPool {
+pub struct ScribePersistenceCpuPool {
     pool: Arc<rayon::ThreadPool>,
     permits: Arc<Semaphore>,
     depth: Arc<AtomicUsize>,
@@ -578,26 +578,26 @@ pub struct ScribePostAckCpuPool {
     capacity: usize,
 }
 
-impl ScribePostAckCpuPool {
-    /// Build the fixed post-ACK CPU lane.
+impl ScribePersistenceCpuPool {
+    /// Build the fixed persistence CPU lane.
     pub(crate) fn new(worker_count: usize) -> Self {
         Self::new_with_capacity(worker_count, 64)
     }
 
     #[cfg(test)]
     pub(crate) fn with_delay(worker_count: usize, preprocess_delay: std::time::Duration) -> Self {
-        Self::with_capacity_and_delay(worker_count, POST_ACK_QUEUE_ITEMS, preprocess_delay)
-            .expect("test post-ACK Rayon pool must be constructible")
+        Self::with_capacity_and_delay(worker_count, PERSISTENCE_QUEUE_ITEMS, preprocess_delay)
+            .expect("test persistence Rayon pool must be constructible")
     }
 
-    /// Build the fixed post-ACK CPU lane with an explicit queue bound.
+    /// Build the fixed persistence CPU lane with an explicit queue bound.
     ///
     /// # Panics
     ///
     /// Panics if the fixed Rayon pool cannot be constructed.
     pub fn new_with_capacity(worker_count: usize, capacity: usize) -> Self {
         Self::try_new_with_capacity(worker_count, capacity)
-            .expect("Scribe post-ACK Rayon pool must be constructible")
+            .expect("Scribe persistence Rayon pool must be constructible")
     }
 
     /// Fallible pool builder used by server boot.
@@ -635,8 +635,8 @@ impl ScribePostAckCpuPool {
 
     pub(crate) async fn submit(
         &self,
-        operation: ScribePostAckCpuOp,
-    ) -> Result<ScribePostAckCpuResult, ScribeError> {
+        operation: ScribePersistenceCpuOp,
+    ) -> Result<ScribePersistenceCpuResult, ScribeError> {
         let permit = match self.permits.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(tokio::sync::TryAcquireError::NoPermits) => {
@@ -646,12 +646,12 @@ impl ScribePostAckCpuPool {
                     .acquire_owned()
                     .await
                     .map_err(|error| ScribeError::Internal {
-                        detail: format!("post-ACK CPU lane closed: {error}"),
+                        detail: format!("persistence CPU lane closed: {error}"),
                     })?
             }
             Err(tokio::sync::TryAcquireError::Closed) => {
                 return Err(ScribeError::Internal {
-                    detail: "post-ACK CPU lane closed".to_owned(),
+                    detail: "persistence CPU lane closed".to_owned(),
                 });
             }
         };
@@ -664,7 +664,7 @@ impl ScribePostAckCpuPool {
         let (sender, receiver) = oneshot::channel();
         depth.fetch_add(1, Ordering::AcqRel);
         record_lane_state(
-            "post_ack",
+            "persistence",
             depth.load(Ordering::Acquire),
             self.active.load(Ordering::Acquire),
         );
@@ -673,31 +673,31 @@ impl ScribePostAckCpuPool {
             let started = std::time::Instant::now();
             active.fetch_add(1, Ordering::AcqRel);
             record_lane_state(
-                "post_ack",
+                "persistence",
                 depth.load(Ordering::Acquire),
                 active.load(Ordering::Acquire),
             );
             let result = catch_unwind(AssertUnwindSafe(|| match operation {
-                ScribePostAckCpuOp::Preprocess(append) => {
+                ScribePersistenceCpuOp::Preprocess(append) => {
                     if !delay.is_zero() {
                         std::thread::sleep(delay);
                     }
-                    prepare_append(*append).map(ScribePostAckCpuResult::Prepared)
+                    prepare_append(*append).map(ScribePersistenceCpuResult::Prepared)
                 }
-                ScribePostAckCpuOp::EncodeParquet {
+                ScribePersistenceCpuOp::EncodeParquet {
                     frozen,
                     binding,
                     tenant,
                 } => encode_batch(&frozen, &binding, tenant)
-                    .map(ScribePostAckCpuResult::ParquetEncoded),
-                ScribePostAckCpuOp::RestoreReplay { memtable, replayed } => memtable
+                    .map(ScribePersistenceCpuResult::ParquetEncoded),
+                ScribePersistenceCpuOp::RestoreReplay { memtable, replayed } => memtable
                     .restore_replayed(&replayed)
-                    .map(|_| ScribePostAckCpuResult::ReplayRestored),
+                    .map(|_| ScribePersistenceCpuResult::ReplayRestored),
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
             record_lane_state(
-                "post_ack",
+                "persistence",
                 depth.load(Ordering::Acquire),
                 active.load(Ordering::Acquire),
             );
@@ -706,7 +706,7 @@ impl ScribePostAckCpuPool {
             let result = result.unwrap_or_else(|_| {
                 panics.fetch_add(1, Ordering::Relaxed);
                 Err(ScribeError::Internal {
-                    detail: "Scribe post-ACK CPU worker panicked".to_owned(),
+                    detail: "Scribe persistence CPU worker panicked".to_owned(),
                 })
             });
             if result.is_ok() {
@@ -714,11 +714,11 @@ impl ScribePostAckCpuPool {
             } else {
                 failed.fetch_add(1, Ordering::Relaxed);
             }
-            record_lane_job("post_ack", result.is_ok(), started.elapsed());
+            record_lane_job("persistence", result.is_ok(), started.elapsed());
             let _ = sender.send(result);
         });
         receiver.await.map_err(|_| ScribeError::Internal {
-            detail: "Scribe post-ACK CPU worker dropped its result".to_owned(),
+            detail: "Scribe persistence CPU worker dropped its result".to_owned(),
         })?
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
     };
 
     use super::{
-        ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool, decode,
+        ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool, decode,
         source_schema_fingerprint,
     };
     use crate::contracts::IngressPayload;
@@ -1139,9 +1139,9 @@ mod tests {
     }
 
     #[test]
-    fn post_ack_cpu_runs_on_separate_named_rayon_thread() {
+    fn persistence_cpu_runs_on_separate_named_rayon_thread() {
         assert!(
-            ScribePostAckCpuPool::new(1)
+            ScribePersistenceCpuPool::new(1)
                 .worker_name()
                 .starts_with("wyrd-scribe-post-ack-cpu-")
         );

@@ -16,8 +16,8 @@ use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
-    ScribeBuildConfig, ScribeCommitConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
-    ScribePersistenceConfig, ScribePostAckCpuPool, ScribeWalIoPool,
+    ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
+    ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
@@ -232,30 +232,17 @@ pub async fn build_app_state_from_boot_with_config(
             *stream.node_id.as_bytes(),
             stream.writer_epoch.as_i64(),
             DataTenantId::SYSTEM_OWNER,
-            WalConfig {
-                segment_bytes: scribe_config.wal_segment_bytes,
-            },
+            WalConfig::default(),
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
     tracing::info!(
         coordination_threads = scribe_config.coordination_threads,
         ingress_cpu_threads = scribe_config.ingress_cpu_threads,
-        post_ack_cpu_threads = scribe_config.post_ack_cpu_threads,
+        persistence_cpu_threads = scribe_config.persistence_cpu_threads,
         wal_io_threads = scribe_config.wal_io_threads,
-        ingress_queue_items = scribe_config.ingress_queue_items,
-        ingress_queue_bytes = scribe_config.ingress_queue_bytes,
-        retained_frame_items = scribe_config.retained_frame_items,
-        retained_frame_bytes = scribe_config.retained_frame_bytes,
         memory_limit_bytes = scribe_config.memory_limit_bytes,
-        post_ack_queue_items = scribe_config.post_ack_queue_items,
-        wal_io_queue_items = scribe_config.wal_io_queue_items,
-        writer_queue_items = scribe_config.writer_queue_items,
-        active_writer_limit = scribe_config.active_writer_limit,
-        writer_idle_ttl_secs = scribe_config.writer_idle_ttl_secs,
-        commit_group_frames = scribe_config.commit_group_frames,
-        commit_group_bytes = scribe_config.commit_group_bytes,
-        wal_segment_bytes = scribe_config.wal_segment_bytes,
+        wal_disk_limit_bytes = scribe_config.wal_disk_limit_bytes,
         "resolved Scribe runtime configuration"
     );
     let coordination_runtime = Arc::new(
@@ -276,27 +263,24 @@ pub async fn build_app_state_from_boot_with_config(
             })?,
     );
     let admission = AdmissionConfig {
-        max_items: scribe_config.retained_frame_items,
-        max_bytes: scribe_config.retained_frame_bytes,
-        max_writers: scribe_config.active_writer_limit,
-        writer_queue_items: scribe_config.writer_queue_items,
-        writer_idle_ttl: std::time::Duration::from_secs(scribe_config.writer_idle_ttl_secs),
-        memory_limit_bytes: scribe_config.memory_limit_bytes,
+        memory_limit_bytes: scribe_config
+            .memory_limit_bytes
+            .unwrap_or(1024 * 1024 * 1024),
     };
     let execution_pools = ScribeExecutionPools::new(
         ScribeIngressCpuPool::try_new_with_capacity(
             scribe_config.ingress_cpu_threads,
-            scribe_config.ingress_queue_items,
+            256,
         )
         .map_err(|error| ServerBootError::Scribe(format!("ingress CPU pool failed: {error}")))?,
-        ScribePostAckCpuPool::try_new_with_capacity(
-            scribe_config.post_ack_cpu_threads,
-            scribe_config.post_ack_queue_items,
+        ScribePersistenceCpuPool::try_new_with_capacity(
+            scribe_config.persistence_cpu_threads,
+            64,
         )
-        .map_err(|error| ServerBootError::Scribe(format!("post-ACK CPU pool failed: {error}")))?,
+        .map_err(|error| ServerBootError::Scribe(format!("persistence CPU pool failed: {error}")))?,
         ScribeWalIoPool::try_new_with_capacity(
             scribe_config.wal_io_threads,
-            scribe_config.wal_io_queue_items,
+            256,
         )
         .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
     );
@@ -309,16 +293,9 @@ pub async fn build_app_state_from_boot_with_config(
             admission,
             coordination_runtime: coordination_runtime.handle().clone(),
             execution_pools,
-            ingress_queue_items: scribe_config.ingress_queue_items,
-            ingress_queue_bytes: scribe_config.ingress_queue_bytes,
-            commit_config: ScribeCommitConfig::new(
-                scribe_config.commit_group_frames,
-                scribe_config.commit_group_bytes,
-            )
-            .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
             persistence: Some(ScribePersistenceConfig::new(
                 Arc::new(postgres.vala().clone()),
-                scribe_config.wal_io_queue_items,
+                64,
                 scribe_config.wal_io_threads,
             )),
         },

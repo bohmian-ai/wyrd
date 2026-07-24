@@ -17,21 +17,13 @@ pub const MAX_REQUEST_BYTES: usize = 33_554_432;
 
 /// Fixed request overhead charged to every accepted append.
 pub const REQUEST_OVERHEAD_BYTES: usize = 4 * 1024;
+/// Fixed pod-global in-flight item ceiling from the Scribe contract.
+pub const GLOBAL_INFLIGHT_ITEMS: usize = 4_096;
 
-/// Default pod-wide admission limits.
+/// Fixed pod-wide admission settings.
 #[derive(Debug, Clone, Copy)]
 pub struct AdmissionConfig {
-    /// Maximum accepted requests that have not completed processing.
-    pub max_items: usize,
-    /// Maximum byte charge for accepted requests.
-    pub max_bytes: usize,
-    /// Maximum lazily-created logical writers.
-    pub max_writers: usize,
-    /// Maximum admitted frames waiting in one tenant/table writer queue.
-    pub writer_queue_items: usize,
-    /// Duration after which an empty writer may be retired.
-    pub writer_idle_ttl: std::time::Duration,
-    /// Pod memory budget used by the 90% active/immutable breaker.
+    /// Pod memory budget used by the Scribe memory governor.
     pub memory_limit_bytes: usize,
 }
 
@@ -42,8 +34,6 @@ pub struct AdmissionConfig {
 pub struct IngressQueueConfig {
     /// Maximum raw frames in the ingress dispatcher.
     pub max_items: usize,
-    /// Maximum raw bytes in the ingress dispatcher.
-    pub max_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -90,9 +80,7 @@ impl IngressQueueBudget {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("ingress queue state lock poisoned: {error}"),
             })?;
-        if state.items >= self.inner.config.max_items
-            || bytes > self.inner.config.max_bytes.saturating_sub(state.bytes)
-        {
+        if state.items >= self.inner.config.max_items {
             return Err(ScribeError::IngestBusy { table });
         }
         state.items += 1;
@@ -119,7 +107,6 @@ impl IngressQueueBudget {
             items: state.items,
             bytes: state.bytes,
             max_items: self.inner.config.max_items,
-            max_bytes: self.inner.config.max_bytes,
         }
     }
 
@@ -144,18 +131,11 @@ pub struct IngressQueueSnapshot {
     pub bytes: usize,
     /// Configured raw frame ceiling.
     pub max_items: usize,
-    /// Configured raw byte ceiling.
-    pub max_bytes: usize,
 }
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
-            max_items: 256,
-            max_bytes: 512 * 1024 * 1024,
-            max_writers: 1_024,
-            writer_queue_items: 64,
-            writer_idle_ttl: std::time::Duration::from_mins(10),
             memory_limit_bytes: 1024 * 1024 * 1024,
         }
     }
@@ -165,7 +145,6 @@ impl Default for AdmissionConfig {
 struct AdmissionState {
     items: usize,
     bytes: usize,
-    writers: usize,
     active_bytes: usize,
     immutable_bytes: usize,
 }
@@ -251,9 +230,7 @@ impl AdmissionController {
                 detail: format!("admission state lock poisoned: {error}"),
             })?;
 
-        let exceeds_items = state.items >= self.inner.config.max_items;
-        let exceeds_bytes = bytes > self.inner.config.max_bytes.saturating_sub(state.bytes);
-        if exceeds_items || exceeds_bytes {
+        if state.items >= GLOBAL_INFLIGHT_ITEMS {
             return Err(ScribeError::IngestBusy { table });
         }
 
@@ -264,30 +241,6 @@ impl AdmissionController {
         Ok(RetainedFrameReservation {
             inner: Some(Arc::clone(&self.inner)),
             bytes,
-        })
-    }
-
-    /// Reserve one active logical-writer token without waiting.
-    ///
-    /// # Errors
-    /// Returns [`ScribeError::IngestBusy`] when the pod writer limit is full.
-    pub fn try_reserve_writer(&self, table: impl Into<String>) -> Result<WriterLease, ScribeError> {
-        let table = table.into();
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("admission state lock poisoned: {error}"),
-            })?;
-        if state.writers >= self.inner.config.max_writers {
-            return Err(ScribeError::IngestBusy { table });
-        }
-        state.writers += 1;
-        drop(state);
-
-        Ok(WriterLease {
-            inner: Some(Arc::clone(&self.inner)),
         })
     }
 
@@ -374,12 +327,9 @@ impl AdmissionController {
         AdmissionSnapshot {
             items: state.items,
             bytes: state.bytes,
-            writers: state.writers,
             active_bytes: state.active_bytes,
             immutable_bytes: state.immutable_bytes,
-            max_items: self.inner.config.max_items,
-            max_bytes: self.inner.config.max_bytes,
-            max_writers: self.inner.config.max_writers,
+            max_items: GLOBAL_INFLIGHT_ITEMS,
             memory_limit_bytes: self.inner.config.memory_limit_bytes,
             memory_breaker_bytes: self.memory_breaker_bytes(),
         }
@@ -407,11 +357,6 @@ impl AdmissionController {
         }
     }
 
-    fn release_writer(&self) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.writers = state.writers.saturating_sub(1);
-        }
-    }
 }
 
 impl Default for AdmissionController {
@@ -495,16 +440,8 @@ impl RawIngressReservation {
                     .bytes
                     .saturating_sub(self.bytes)
                     .saturating_add(retained_bytes);
-                if retained_bytes > inner.config.max_bytes
-                    || retained_total > inner.config.max_bytes
-                {
-                    Err(ScribeError::IngestBusy {
-                        table: "ingress".to_owned(),
-                    })
-                } else {
-                    state.bytes = retained_total;
-                    Ok(())
-                }
+                state.bytes = retained_total;
+                Ok(())
             }
             Err(_) => Err(ScribeError::Internal {
                 detail: "admission state lock poisoned while transferring reservation".to_owned(),
@@ -567,20 +504,6 @@ impl Drop for RetainedFrameReservation {
     }
 }
 
-/// A writer-count reservation held by one registry entry.
-#[derive(Debug)]
-pub struct WriterLease {
-    inner: Option<Arc<AdmissionInner>>,
-}
-
-impl Drop for WriterLease {
-    fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            AdmissionController { inner }.release_writer();
-        }
-    }
-}
-
 /// Read-only admission counters for inspection and telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionSnapshot {
@@ -588,18 +511,12 @@ pub struct AdmissionSnapshot {
     pub items: usize,
     /// Byte charge for accepted requests.
     pub bytes: usize,
-    /// Active logical writers.
-    pub writers: usize,
     /// Arrow bytes retained by writable memtables.
     pub active_bytes: usize,
     /// Arrow bytes retained by immutable generations.
     pub immutable_bytes: usize,
     /// Configured item limit.
     pub max_items: usize,
-    /// Configured byte limit.
-    pub max_bytes: usize,
-    /// Configured writer limit.
-    pub max_writers: usize,
     /// Configured pod memory budget.
     pub memory_limit_bytes: usize,
     /// 90% breaker threshold derived from the memory budget.
@@ -608,61 +525,40 @@ pub struct AdmissionSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     #[test]
-    fn reservations_release_items_bytes_and_writers() {
+    fn reservations_release_global_items_and_bytes() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 1,
-            max_bytes: 10,
-            max_writers: 1,
-            writer_queue_items: 64,
-            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
         let reservation = admission
             .try_reserve("vala.bifrost.events", 10)
             .expect("reserve");
-        let writer = admission
-            .try_reserve_writer("vala.bifrost.events")
-            .expect("writer reserve");
         assert_eq!(admission.snapshot().items, 1);
         assert_eq!(admission.snapshot().bytes, 10);
-        assert_eq!(admission.snapshot().writers, 1);
         drop(reservation);
-        drop(writer);
         assert_eq!(admission.snapshot().items, 0);
         assert_eq!(admission.snapshot().bytes, 0);
-        assert_eq!(admission.snapshot().writers, 0);
     }
 
     #[test]
-    fn admission_rejects_before_mutation_when_full() {
+    fn admission_rejects_after_fixed_global_item_bound() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 1,
-            max_bytes: 10,
-            max_writers: 1,
-            writer_queue_items: 64,
-            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
-        let _reservation = admission.try_reserve("events", 10).expect("reserve");
+        let mut reservations = Vec::with_capacity(GLOBAL_INFLIGHT_ITEMS);
+        for _ in 0..GLOBAL_INFLIGHT_ITEMS {
+            reservations.push(admission.try_reserve("events", 1).expect("reserve"));
+        }
         let error = admission.try_reserve("events", 1).expect_err("busy");
         assert!(matches!(error, ScribeError::IngestBusy { .. }));
-        assert_eq!(admission.snapshot().items, 1);
-        assert_eq!(admission.snapshot().bytes, 10);
+        assert_eq!(admission.snapshot().items, GLOBAL_INFLIGHT_ITEMS);
     }
 
     #[test]
     fn active_and_immutable_bytes_use_the_ninety_percent_breaker() {
         let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 10,
-            max_bytes: 100,
-            max_writers: 10,
-            writer_queue_items: 64,
-            writer_idle_ttl: Duration::from_mins(10),
             memory_limit_bytes: 100,
         });
         admission
@@ -677,52 +573,8 @@ mod tests {
     }
 
     #[test]
-    fn default_memory_budget_covers_the_compact_large_frame_workload() {
+    fn raw_to_retained_transfer_releases_exactly_once() {
         let admission = AdmissionController::default();
-        let frame_bytes = 32 * 1024 * 1024;
-        for _ in 0..16 {
-            admission
-                .try_reserve_active("events", frame_bytes)
-                .expect("compact 32 MiB workload must fit the active memory budget");
-        }
-        assert_eq!(
-            admission.snapshot().active_bytes,
-            16 * frame_bytes,
-            "the compact matrix's 16-frame ceiling must remain below the breaker"
-        );
-    }
-
-    #[test]
-    fn ingress_item_and_byte_bounds_release_on_every_error() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 1,
-            max_bytes: 16,
-            max_writers: 1,
-            writer_queue_items: 1,
-            writer_idle_ttl: Duration::from_mins(10),
-            memory_limit_bytes: 100,
-        });
-        let mut raw = admission
-            .try_reserve_raw("events", 8)
-            .expect("raw reservation");
-        assert!(raw.transfer_to_retained(17).is_err());
-        drop(raw);
-        assert_eq!(admission.snapshot().items, 0);
-        assert_eq!(admission.snapshot().bytes, 0);
-        assert!(admission.try_reserve_raw("events", 17).is_err());
-        assert_eq!(admission.snapshot().items, 0);
-    }
-
-    #[test]
-    fn retained_reservation_survives_ack_and_writer_queue_admission() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 2,
-            max_bytes: 32,
-            max_writers: 2,
-            writer_queue_items: 1,
-            writer_idle_ttl: Duration::from_mins(10),
-            memory_limit_bytes: 100,
-        });
         let mut raw = admission
             .try_reserve_raw("events", 8)
             .expect("raw reservation");
@@ -732,64 +584,5 @@ mod tests {
         drop(retained);
         assert_eq!(admission.snapshot().items, 0);
         assert_eq!(admission.snapshot().bytes, 0);
-    }
-
-    #[test]
-    fn retained_reservation_releases_on_cancel_panic_shutdown_and_replay() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 4,
-            max_bytes: 64,
-            max_writers: 4,
-            writer_queue_items: 1,
-            writer_idle_ttl: Duration::from_mins(10),
-            memory_limit_bytes: 100,
-        });
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _reservation = admission.try_reserve("events", 16).expect("reservation");
-            panic!("test cancellation path");
-        }));
-        assert!(result.is_err());
-        assert_eq!(admission.snapshot().items, 0);
-        assert_eq!(admission.snapshot().bytes, 0);
-    }
-
-    #[test]
-    fn many_writer_queues_share_one_retained_byte_ceiling() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 8,
-            max_bytes: 32,
-            max_writers: 8,
-            writer_queue_items: 1,
-            writer_idle_ttl: Duration::from_mins(10),
-            memory_limit_bytes: 100,
-        });
-        let first = admission.try_reserve("tenant_a.events", 16).expect("first");
-        let second = admission
-            .try_reserve("tenant_b.events", 16)
-            .expect("second");
-        assert!(admission.try_reserve("tenant_c.events", 1).is_err());
-        drop(first);
-        drop(second);
-        assert_eq!(admission.snapshot().bytes, 0);
-    }
-
-    #[test]
-    fn active_writer_limit_rejects_and_idle_eviction_releases_lease() {
-        let admission = AdmissionController::with_config(AdmissionConfig {
-            max_items: 8,
-            max_bytes: 64,
-            max_writers: 1,
-            writer_queue_items: 1,
-            writer_idle_ttl: Duration::from_secs(1),
-            memory_limit_bytes: 100,
-        });
-        let lease = admission
-            .try_reserve_writer("events")
-            .expect("writer lease");
-        assert!(admission.try_reserve_writer("other").is_err());
-        drop(lease);
-        admission
-            .try_reserve_writer("other")
-            .expect("released writer lease");
     }
 }

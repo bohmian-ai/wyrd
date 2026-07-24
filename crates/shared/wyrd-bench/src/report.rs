@@ -169,14 +169,14 @@ pub struct BacklogSample {
     pub admitted_items: u64,
     /// Admission bytes charged to accepted requests.
     pub admitted_bytes: u64,
-    /// Active logical tenant/table writers.
-    pub active_writers: u64,
+    /// Active logical tenant/table producers.
+    pub shard_tasks: u64,
     /// Operations retained by the fixed blocking executor.
     pub executor_depth: u64,
     /// Executor submissions that waited for capacity.
     pub executor_saturation_events: u64,
     /// Writers that have entered terminal unhealthy state.
-    pub unhealthy_writers: u64,
+    pub shard_owner_errors: u64,
     /// Eligible Forge file-list candidates.
     pub forge_candidates: u64,
 }
@@ -242,7 +242,7 @@ pub struct ScribeCompactCase {
     /// Target frame size used to construct the Arrow IPC payload.
     pub frame_size_bytes: u64,
     /// Concurrent public SDK streams used by the case.
-    pub writers: u32,
+    pub producers: u32,
     /// Requested tenant count.
     pub tenants: u32,
     /// Requested pod count.
@@ -251,7 +251,7 @@ pub struct ScribeCompactCase {
     pub tables: u32,
     /// Table distribution: all streams share one table or are dispersed.
     pub table_distribution: String,
-    /// Explicit writer routing mode.
+    /// Explicit producer routing mode.
     pub routing_mode: String,
     /// Fsync mode declared by the case.
     pub fsync_mode: String,
@@ -430,7 +430,7 @@ pub fn compact_scribe_matrix() -> Vec<ScribeCompactCase> {
             |(
                 id,
                 frame_size_bytes,
-                writers,
+                producers,
                 tenants,
                 pods,
                 tables,
@@ -441,7 +441,7 @@ pub fn compact_scribe_matrix() -> Vec<ScribeCompactCase> {
             )| ScribeCompactCase {
                 id: id.to_owned(),
                 frame_size_bytes,
-                writers,
+                producers,
                 tenants,
                 pods,
                 tables,
@@ -474,13 +474,13 @@ pub struct ScribeDistribution {
     pub max: u64,
 }
 
-/// Requested and observed writer placement for one case.
+/// Requested and observed producer placement for one case.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScribeTopologyEvidence {
-    /// Requested writer count.
-    pub requested_writers: u32,
+    /// Requested producer count.
+    pub requested_producers: u32,
     /// Writers actually launched.
-    pub actual_writers: u32,
+    pub actual_producers: u32,
     /// Requested tenant count.
     pub requested_tenants: u32,
     /// Tenants actually provisioned.
@@ -497,12 +497,12 @@ pub struct ScribeTopologyEvidence {
     pub actual_physical_tables: u32,
     /// Explicit routing mode.
     pub routing_mode: String,
-    /// Writer counts by pod.
-    pub writers_by_pod: BTreeMap<String, u32>,
-    /// Writer counts by tenant.
-    pub writers_by_tenant: BTreeMap<String, u32>,
-    /// Writer counts by logical table.
-    pub writers_by_table: BTreeMap<String, u32>,
+    /// Producer counts by pod.
+    pub shard_tasks_by_pod: BTreeMap<String, u32>,
+    /// Producer counts by tenant.
+    pub shard_tasks_by_tenant: BTreeMap<String, u32>,
+    /// Producer counts by logical table.
+    pub shard_tasks_by_table: BTreeMap<String, u32>,
 }
 
 /// Accepted and acknowledged progress for one tenant in a Scribe case.
@@ -532,7 +532,7 @@ pub struct ScribeCaseVerification {
     /// Whether replay identity was checked without duplicate rows/audits.
     pub replay_exact_identity: Option<bool>,
     /// Whether the case stayed within retained item and byte ceilings.
-    pub retained_within_ceiling: bool,
+    pub memory_within_budget: bool,
     /// Exact 429 capacity behavior when a saturation probe ran.
     pub exact_429: Option<bool>,
     /// Exact 507 WAL exhaustion behavior when a disk probe ran.
@@ -597,15 +597,15 @@ pub struct ScribeCaseReport {
     /// Accepted minus durable row count.
     pub accepted_durable_row_gap: u64,
     /// Current retained items at case end.
-    pub retained_items_current: u64,
+    pub inflight_items_current: u64,
     /// Peak retained items.
-    pub retained_items_peak: u64,
+    pub inflight_items_peak: u64,
     /// Current retained bytes at case end.
-    pub retained_bytes_current: u64,
+    pub inflight_bytes_current: u64,
     /// Peak retained bytes.
-    pub retained_bytes_peak: u64,
-    /// Maximum writer queue depth observed during the case.
-    pub writer_queue_peak: u64,
+    pub inflight_bytes_peak: u64,
+    /// Maximum producer queue depth observed during the case.
+    pub shard_pending_peak: u64,
     /// Time spent draining accepted work after the workload stopped.
     pub drain_elapsed_us: u64,
     /// Peak queue depth by execution lane.
@@ -616,8 +616,8 @@ pub struct ScribeCaseReport {
     pub lane_failures: BTreeMap<String, u64>,
     /// Panicked jobs by execution lane.
     pub lane_panics: BTreeMap<String, u64>,
-    /// Writer unhealthy transitions observed in the interval.
-    pub writer_unhealthy_transitions: u64,
+    /// Producer unhealthy transitions observed in the interval.
+    pub shard_owner_errors: u64,
     /// Required production metric names observed in the interval.
     pub required_metrics_observed: Vec<String>,
     /// Number of recorder series at case end.
@@ -721,7 +721,7 @@ pub struct ScribeBenchmarkReport {
 
 impl ScribeBenchmarkReport {
     /// Current Scribe report schema version.
-    pub const VERSION: &'static str = "wyrd.bifrost.scribe.report/v1";
+    pub const VERSION: &'static str = "wyrd.bifrost.scribe.report/v2";
 
     /// Serialize the report as stable pretty JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
@@ -761,7 +761,7 @@ impl ScribeBenchmarkReport {
             .iter()
             .collect::<std::collections::BTreeSet<_>>();
         for case in &self.cases {
-            if case.topology.requested_writers != case.topology.actual_writers
+            if case.topology.requested_producers != case.topology.actual_producers
                 || case.topology.requested_tenants != case.topology.actual_tenants
                 || case.topology.requested_pods != case.topology.actual_pods
                 || case.topology.requested_logical_tables != case.topology.actual_logical_tables
@@ -789,7 +789,7 @@ impl ScribeBenchmarkReport {
                 || case.metric_series_limit_exceeded
                 || !case.verification.passed
                 || !case.verification.drain_zero_gap
-                || !case.verification.retained_within_ceiling
+                || !case.verification.memory_within_budget
             {
                 errors.push(format!("verification incomplete in case {}", case.case.id));
             }
@@ -1032,23 +1032,23 @@ pub fn required_scribe_metric_families() -> Vec<String> {
         "bifrost_gate_resolution_seconds",
         "bifrost_scribe_ack_seconds",
         "bifrost_scribe_admission_rejections_total",
-        "bifrost_scribe_retained_items",
-        "bifrost_scribe_retained_bytes",
+        "bifrost_scribe_inflight_items",
+        "bifrost_scribe_inflight_bytes",
         "bifrost_scribe_lane_queued",
         "bifrost_scribe_lane_active",
         "bifrost_scribe_lane_jobs_total",
         "bifrost_scribe_lane_job_seconds",
-        "bifrost_scribe_writer_queue_depth",
-        "bifrost_scribe_writer_groups_total",
-        "bifrost_scribe_writer_group_frames",
-        "bifrost_scribe_writer_group_bytes",
+        "bifrost_scribe_shard_pending",
+        "bifrost_scribe_shard_groups_total",
+        "bifrost_scribe_shard_group_frames",
+        "bifrost_scribe_shard_group_bytes",
         "bifrost_scribe_wal_append_seconds",
         "bifrost_scribe_wal_sync_seconds",
         "bifrost_scribe_wal_fsync_total",
         "bifrost_scribe_wal_bytes_total",
         "bifrost_scribe_frames_total",
         "bifrost_scribe_rows_total",
-        "bifrost_scribe_writer_unhealthy_total",
+        "bifrost_scribe_shard_owner_errors_total",
         "bifrost_scribe_replay_seconds",
         "bifrost_scribe_shutdown_seconds",
     ]
@@ -1140,7 +1140,7 @@ pub struct BenchmarkReport {
 
 impl BenchmarkReport {
     /// Current structured report version.
-    pub const VERSION: &'static str = "wyrd.bifrost.report/v2";
+    pub const VERSION: &'static str = "wyrd.bifrost.report/v3";
 
     /// Serialize a report as stable, pretty JSON.
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(matrix[7].fsync_delay_ms, 60);
         assert_eq!(matrix[7].minimum_samples, 1_000);
         assert_eq!(matrix[10].frame_size_bytes, 32 * 1024 * 1024);
-        assert_eq!(matrix[11].writers, 4);
+        assert_eq!(matrix[11].producers, 4);
         assert_eq!(matrix[11].tables, 4);
     }
 

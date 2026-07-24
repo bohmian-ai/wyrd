@@ -10,33 +10,51 @@ use arrow::array::{Array, StringArray};
 use arrow::ipc::writer::StreamWriter;
 use wyrd_spec::ids::DataTenantId;
 
-use crate::catalog::{TableRef, TenantTableBinding};
+use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
-use crate::scribe::memtable::{Memtable, ReadableBatch};
+use crate::scribe::memtable::Memtable;
 use crate::scribe::routing::shard_for;
+use crate::scribe::seal_key::EventDay;
+use crate::scribe::shards::ScribeShardRuntime;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::WalLsn;
 
-/// Exact tenant/table scope for one live-tail read.
-#[derive(Debug, Clone)]
-pub struct LiveTailShard {
-    /// Canonical organization-qualified physical binding.
-    pub tenant_table: TenantTableBinding,
-    /// Logical table requested by the caller.
-    pub table: TableRef,
-    /// Data tenant requested by the caller.
-    pub tenant: DataTenantId,
-}
-
-/// Live-tail request handled by one current Scribe stream.
+/// Exact, bounded hot-read request handed from Oracle to Scribe.
 #[derive(Debug, Clone)]
 pub struct FetchLiveTailRequest {
-    /// Exact tenant/table shard to read.
-    pub shard: LiveTailShard,
+    /// Authenticated tenant/table binding resolved by Oracle.
+    pub binding: TenantTableBinding,
     /// The writer stream the caller believes it is talking to.
     pub target_stream: StreamIdentity,
+    /// Inclusive first partition day governed by the query.
+    pub start_day: EventDay,
+    /// Inclusive last partition day governed by the query.
+    pub end_day: EventDay,
     /// Emit only records with `LSN > after_lsn`.
     pub after_lsn: WalLsn,
+    /// Columns required by Oracle filters, ordering, tripwire, and projection.
+    pub required_columns: Vec<String>,
+}
+
+impl FetchLiveTailRequest {
+    /// Return the fixed shard selected by the tenant/table route.
+    #[must_use]
+    pub fn shard_id(&self) -> usize {
+        shard_for(self.binding.tenant, &self.binding.table_ref)
+    }
+}
+
+/// One shallow, structural hot snapshot returned by a shard owner.
+#[derive(Debug, Clone)]
+pub struct HotBatch {
+    /// Exact partition day owning the batch.
+    pub partition_day: EventDay,
+    /// WAL LSN of the append.
+    pub wal_lsn: WalLsn,
+    /// Idempotency identity of the append.
+    pub batch_id: [u8; 16],
+    /// Arrow rows projected to the request's required columns.
+    pub rows: arrow::record_batch::RecordBatch,
 }
 
 /// Arrow IPC bytes for one complete admitted frame.
@@ -81,6 +99,7 @@ impl Default for TailConfig {
 pub struct FetchLiveTailService {
     stream: StreamIdentity,
     memtable: Arc<Memtable>,
+    shards: Option<Arc<ScribeShardRuntime>>,
     config: TailConfig,
 }
 
@@ -101,10 +120,25 @@ impl FetchLiveTailService {
         Self {
             stream,
             memtable,
+            shards: None,
             config: TailConfig {
                 max_bytes: config.max_bytes.max(1),
             },
         }
+    }
+
+    /// Construct a production reader that submits snapshots to the owning
+    /// shard command queue instead of traversing Scribe state directly.
+    #[must_use]
+    pub(crate) fn with_runtime(
+        stream: StreamIdentity,
+        memtable: Arc<Memtable>,
+        shards: Arc<ScribeShardRuntime>,
+        config: TailConfig,
+    ) -> Self {
+        let mut service = Self::with_config(stream, memtable, config);
+        service.shards = Some(shards);
+        service
     }
 
     /// Stream identity this service serves.
@@ -115,15 +149,16 @@ impl FetchLiveTailService {
 
     /// Return the canonical pod-local shard for a live-tail scope.
     #[must_use]
-    pub fn shard_id(&self, shard: &LiveTailShard) -> usize {
-        shard_for(shard.tenant, &shard.table)
+    pub fn shard_id(&self, request: &FetchLiveTailRequest) -> usize {
+        request.shard_id()
     }
 
     /// Return the current writable and immutable batches for one shard.
     ///
-    /// Stream mismatch is checked before any memtable read. Scope validation is
-    /// performed before Arrow IPC projection, so a malformed or cross-tenant
-    /// batch cannot be serialized into a response.
+    /// Stream, scope, day range, and projection validation happen before an
+    /// Arrow response is encoded. Production calls pass through the bounded
+    /// shard command queue; the direct memtable branch is only for the narrow
+    /// in-process adapter used by unit tests.
     #[allow(
         clippy::unused_async,
         reason = "the typed service boundary remains async for the future streaming transport"
@@ -139,36 +174,89 @@ impl FetchLiveTailService {
             });
         }
 
-        if req.shard.tenant != req.shard.tenant_table.tenant
-            || req.shard.table != req.shard.tenant_table.table_ref
-        {
+        if req.start_day > req.end_day {
             return Err(ScribeError::Internal {
-                detail: "live-tail shard does not match its tenant-table binding".to_owned(),
+                detail: "live-tail start day is after end day".to_owned(),
             });
         }
 
-        let readable = self
+        let hot_batches = if let Some(shards) = &self.shards {
+            shards.snapshot(req.clone()).await?
+        } else {
+            self.memtable
+                .readable_batches_for_range(
+                    req.binding.tenant,
+                    &req.binding.table_ref,
+                    req.start_day,
+                    req.end_day,
+                    &req.required_columns,
+                )?
+                .into_iter()
+                .map(|readable| HotBatch {
+                    partition_day: readable.partition_day,
+                    wal_lsn: readable.meta.wal_lsn_max,
+                    batch_id: readable.meta.batch_id,
+                    rows: readable.batch,
+                })
+                .collect()
+        };
+        self.encode_frames(hot_batches, req.after_lsn, req.binding.tenant)
+    }
+
+    /// Return direct local Arrow handles for Oracle's `MemoryExec` path.
+    pub async fn fetch_hot_batches(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<Vec<HotBatch>, ScribeError> {
+        if request.target_stream != self.stream {
+            return Err(ScribeError::StreamMismatch {
+                requested: request.target_stream,
+                actual: self.stream,
+            });
+        }
+        if request.start_day > request.end_day {
+            return Err(ScribeError::Internal {
+                detail: "live-tail start day is after end day".to_owned(),
+            });
+        }
+        if let Some(shards) = &self.shards {
+            return shards.snapshot(request).await;
+        }
+        Ok(self
             .memtable
-            .readable_batches(req.shard.tenant, &req.shard.table)?;
-        self.encode_frames(readable, req.after_lsn, req.shard.tenant)
+            .readable_batches_for_range(
+                request.binding.tenant,
+                &request.binding.table_ref,
+                request.start_day,
+                request.end_day,
+                &request.required_columns,
+            )?
+            .into_iter()
+            .map(|readable| HotBatch {
+                partition_day: readable.partition_day,
+                wal_lsn: readable.meta.wal_lsn_max,
+                batch_id: readable.meta.batch_id,
+                rows: readable.batch,
+            })
+            .collect())
     }
 
     fn encode_frames(
         &self,
-        readable: Vec<ReadableBatch>,
+        readable: Vec<HotBatch>,
         after_lsn: WalLsn,
         tenant: DataTenantId,
     ) -> Result<Vec<TailFrame>, ScribeError> {
         let mut candidates = Vec::new();
         for readable_batch in readable {
-            let lsn = readable_batch.meta.wal_lsn_max;
+            let lsn = readable_batch.wal_lsn;
             if lsn <= after_lsn {
                 continue;
             }
-            let arrow_ipc = encode_arrow_batch(&readable_batch.batch, tenant)?;
+            let arrow_ipc = encode_arrow_batch(&readable_batch.rows, tenant)?;
             candidates.push(ArrowIpcBatch {
                 lsn,
-                batch_id: readable_batch.meta.batch_id,
+                batch_id: readable_batch.batch_id,
                 arrow_ipc,
             });
         }

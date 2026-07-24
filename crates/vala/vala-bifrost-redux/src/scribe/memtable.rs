@@ -462,16 +462,26 @@ impl Memtable {
         Ok(buckets.contains_key(seal_key))
     }
 
-    /// Return writable and immutable append batches for one tenant/table.
+    /// Return writable and immutable append batches for one exact day range.
     ///
-    /// The returned snapshots are detached from the locks. Callers must still
-    /// verify the exact seal key before projecting a batch to an external
-    /// format.
-    pub fn readable_batches(
+    /// Structural pruning happens while the memtable locks are held: tenant,
+    /// table, and partition day are compared against the exact request. The
+    /// selected columns are then projected before the detached snapshot is
+    /// returned, so a snapshot never exposes an unrelated bucket or an
+    /// unrequested Arrow column.
+    pub fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
+        start_day: crate::scribe::seal_key::EventDay,
+        end_day: crate::scribe::seal_key::EventDay,
+        required_columns: &[String],
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        if start_day > end_day {
+            return Err(ScribeError::Internal {
+                detail: "live-tail start day is after end day".to_owned(),
+            });
+        }
         let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
@@ -481,18 +491,45 @@ impl Memtable {
         let mut batches = Vec::new();
 
         for (seal_key, bucket) in writable.iter() {
-            if seal_key.tenant == tenant && seal_key.table == *table {
-                batches.extend(bucket.readable_batches());
+            if seal_key.tenant == tenant
+                && seal_key.table == *table
+                && (start_day..=end_day).contains(&seal_key.day)
+            {
+                batches.extend(bucket.readable_batches(required_columns)?);
             }
         }
         for (seal_key, entries) in immutable.iter() {
-            if seal_key.tenant == tenant && seal_key.table == *table {
+            if seal_key.tenant == tenant
+                && seal_key.table == *table
+                && (start_day..=end_day).contains(&seal_key.day)
+            {
                 for entry in entries {
-                    batches.extend(entry.frozen.readable_batches());
+                    batches.extend(entry.frozen.readable_batches(required_columns)?);
                 }
             }
         }
         Ok(batches)
+    }
+
+    /// Return all readable batches for a table, preserving the old unit-test
+    /// convenience while applying the full table scope and schema.
+    #[cfg(test)]
+    pub fn readable_batches(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        self.readable_batches_for_range(
+            tenant,
+            table,
+            crate::scribe::seal_key::EventDay::new(
+                chrono::NaiveDate::MIN,
+            ),
+            crate::scribe::seal_key::EventDay::new(
+                chrono::NaiveDate::MAX,
+            ),
+            &[],
+        )
     }
 
     /// Mark a prepared generation committed after the owning SQL transaction commits.
@@ -753,12 +790,22 @@ impl MemtableBucket {
         })
     }
 
-    fn readable_batches(&self) -> Vec<ReadableBatch> {
+    fn readable_batches(&self, required_columns: &[String]) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let projection = projection_indices(&self.schema, required_columns)?;
         self.batches
             .iter()
             .cloned()
             .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| ReadableBatch { meta, batch })
+            .map(|(batch, meta)| {
+                let batch = batch.project(&projection).map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail Arrow projection failed: {error}"),
+                })?;
+                Ok(ReadableBatch {
+                    partition_day: self.seal_key.day,
+                    meta,
+                    batch,
+                })
+            })
             .collect()
     }
 }
@@ -832,6 +879,8 @@ impl ImmutableEntry {
 /// An append batch that can be projected into a tail frame.
 #[derive(Debug, Clone)]
 pub struct ReadableBatch {
+    /// Exact partition day owning the batch.
+    pub partition_day: crate::scribe::seal_key::EventDay,
     /// WAL metadata for the append.
     pub meta: ScribeAppendMeta,
     /// Arrow rows for the append.
@@ -876,14 +925,49 @@ pub struct FrozenMemtable {
 }
 
 impl FrozenMemtable {
-    fn readable_batches(&self) -> Vec<ReadableBatch> {
+    fn readable_batches(&self, required_columns: &[String]) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let projection = projection_indices(&self.schema, required_columns)?;
         self.batches
             .iter()
             .cloned()
             .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| ReadableBatch { meta, batch })
+            .map(|(batch, meta)| {
+                let batch = batch.project(&projection).map_err(|error| ScribeError::Internal {
+                    detail: format!("live-tail Arrow projection failed: {error}"),
+                })?;
+                Ok(ReadableBatch {
+                    partition_day: self.seal_key.day,
+                    meta,
+                    batch,
+                })
+            })
             .collect()
     }
+}
+
+/// Resolve and validate the bounded projection requested by Oracle.
+fn projection_indices(
+    schema: &SchemaRef,
+    required_columns: &[String],
+) -> Result<Vec<usize>, ScribeError> {
+    if required_columns.is_empty() {
+        return Ok((0..schema.fields().len()).collect());
+    }
+    let mut indices = Vec::with_capacity(required_columns.len());
+    for name in required_columns {
+        let Some(index) = schema.index_of(name).ok() else {
+            return Err(ScribeError::Internal {
+                detail: format!("live-tail required column is not in the table schema: {name}"),
+            });
+        };
+        if indices.contains(&index) {
+            return Err(ScribeError::Internal {
+                detail: format!("live-tail required column is duplicated: {name}"),
+            });
+        }
+        indices.push(index);
+    }
+    Ok(indices)
 }
 
 /// Estimate batch size in bytes (Arrow column sizes + overhead).

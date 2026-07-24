@@ -22,18 +22,12 @@ pub mod stream_identity;
 pub mod tail_rpc;
 pub mod telemetry;
 pub mod wal;
-#[cfg(test)]
-mod writer;
-
-#[cfg(test)]
-mod acceptance;
-
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{
-    ScribeIngressCpuPool, ScribePostAckCpuPool, ScribeWalIoPool,
+    ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
 };
 use crate::scribe::memtable::Memtable;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
@@ -61,41 +55,8 @@ pub type MemtableKey = SealKey;
 #[derive(Debug, Clone)]
 pub struct ScribeExecutionPools {
     ingress_cpu: ScribeIngressCpuPool,
-    post_ack_cpu: ScribePostAckCpuPool,
+    persistence_cpu: ScribePersistenceCpuPool,
     wal_io: ScribeWalIoPool,
-}
-
-/// Bounds for one opportunistic WAL commit group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ScribeCommitConfig {
-    /// Maximum frames drained into one group.
-    pub max_group_frames: usize,
-    /// Maximum retained frame bytes drained into one group.
-    pub max_group_bytes: usize,
-}
-
-impl ScribeCommitConfig {
-    /// Construct a validated commit-group configuration.
-    pub fn new(max_group_frames: usize, max_group_bytes: usize) -> Result<Self, ScribeError> {
-        if max_group_frames == 0 || max_group_bytes == 0 {
-            return Err(ScribeError::Internal {
-                detail: "Scribe commit group limits must be greater than zero".to_owned(),
-            });
-        }
-        Ok(Self {
-            max_group_frames,
-            max_group_bytes,
-        })
-    }
-}
-
-impl Default for ScribeCommitConfig {
-    fn default() -> Self {
-        Self {
-            max_group_frames: 64,
-            max_group_bytes: 64 * 1024 * 1024,
-        }
-    }
 }
 
 impl ScribeExecutionPools {
@@ -103,12 +64,12 @@ impl ScribeExecutionPools {
     #[must_use]
     pub fn new(
         ingress_cpu: ScribeIngressCpuPool,
-        post_ack_cpu: ScribePostAckCpuPool,
+        persistence_cpu: ScribePersistenceCpuPool,
         wal_io: ScribeWalIoPool,
     ) -> Self {
         Self {
             ingress_cpu,
-            post_ack_cpu,
+            persistence_cpu,
             wal_io,
         }
     }
@@ -119,18 +80,10 @@ impl ScribeExecutionPools {
 pub struct ScribeLaneConfig {
     /// Rayon workers reserved for pre-ACK decode, validation, and projection.
     pub ingress_cpu_threads: usize,
-    /// Rayon workers reserved for post-ACK splitting and serialization.
-    pub post_ack_cpu_threads: usize,
+    /// Rayon workers reserved for persistence splitting and serialization.
+    pub persistence_cpu_threads: usize,
     /// Rayon workers reserved for WAL filesystem operations.
     pub wal_io_threads: usize,
-    /// Bounded ingress CPU submissions.
-    pub ingress_queue_items: usize,
-    /// Bounded raw ingress bytes.
-    pub ingress_queue_bytes: usize,
-    /// Bounded post-ACK CPU submissions.
-    pub post_ack_queue_items: usize,
-    /// Bounded WAL IO submissions.
-    pub wal_io_queue_items: usize,
 }
 
 impl Default for ScribeLaneConfig {
@@ -148,12 +101,8 @@ impl ScribeLaneConfig {
         let ingress_cpu_threads = (cpu_budget / 3).max(1);
         Self {
             ingress_cpu_threads,
-            post_ack_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
+            persistence_cpu_threads: cpu_budget.saturating_sub(ingress_cpu_threads).max(1),
             wal_io_threads: 4,
-            ingress_queue_items: 256,
-            ingress_queue_bytes: 512 * 1024 * 1024,
-            post_ack_queue_items: 64,
-            wal_io_queue_items: 256,
         }
     }
 }
@@ -179,8 +128,8 @@ pub struct ScribeImpl {
     admission: AdmissionController,
     /// Pod-global Bifrost/Scribe memory governor.
     memory: memory::BifrostMemoryGovernor,
-    /// Bounded post-ACK CPU lane retained for replay and seal preparation.
-    post_ack_cpu: ScribePostAckCpuPool,
+    /// Bounded persistence CPU lane retained for replay and seal preparation.
+    persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
     wal_io: ScribeWalIoPool,
     /// Bounded Rayon lane for pre-ACK native decode and projection work.
@@ -189,8 +138,6 @@ pub struct ScribeImpl {
     shards: Arc<shards::ScribeShardRuntime>,
     /// Bounded global raw-ingress dispatcher.
     ingress_queue: ingress::ScribeIngressQueue,
-    /// Resolved opportunistic WAL group limits.
-    commit_config: ScribeCommitConfig,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
 }
@@ -202,12 +149,6 @@ pub struct ScribeBuildConfig {
     pub coordination_runtime: Handle,
     /// Server-provisioned CPU and WAL execution pools.
     pub execution_pools: ScribeExecutionPools,
-    /// Maximum number of queued ingress items.
-    pub ingress_queue_items: usize,
-    /// Maximum bytes represented by queued ingress items.
-    pub ingress_queue_bytes: usize,
-    /// Opportunistic writer group limits.
-    pub commit_config: ScribeCommitConfig,
     /// Optional server-provisioned immutable persistence dependencies.
     pub persistence: Option<ScribePersistenceConfig>,
 }
@@ -259,17 +200,17 @@ impl ScribeImpl {
         let execution_pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::try_new_with_capacity(
                 lane.ingress_cpu_threads,
-                lane.ingress_queue_items,
+                256,
             )
             .map_err(|error| format!("ingress CPU pool failed: {error}"))?,
-            ScribePostAckCpuPool::try_new_with_capacity(
-                lane.post_ack_cpu_threads,
-                lane.post_ack_queue_items,
+            ScribePersistenceCpuPool::try_new_with_capacity(
+                lane.persistence_cpu_threads,
+                64,
             )
-            .map_err(|error| format!("post-ACK CPU pool failed: {error}"))?,
+            .map_err(|error| format!("persistence CPU pool failed: {error}"))?,
             ScribeWalIoPool::try_new_with_capacity_and_delay(
                 lane.wal_io_threads,
-                lane.wal_io_queue_items,
+                256,
                 sync_delay,
             )
             .map_err(|error| format!("WAL IO pool failed: {error}"))?,
@@ -283,9 +224,6 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime: Handle::current(),
                 execution_pools,
-                ingress_queue_items: lane.ingress_queue_items,
-                ingress_queue_bytes: lane.ingress_queue_bytes,
-                commit_config: ScribeCommitConfig::default(),
                 persistence: None,
             },
         ))
@@ -353,20 +291,17 @@ impl ScribeImpl {
                 execution_pools: ScribeExecutionPools::new(
                     ScribeIngressCpuPool::new_with_capacity(
                         lane_config.ingress_cpu_threads,
-                        lane_config.ingress_queue_items,
+                        256,
                     ),
-                    ScribePostAckCpuPool::new_with_capacity(
-                        lane_config.post_ack_cpu_threads,
-                        lane_config.post_ack_queue_items,
+                    ScribePersistenceCpuPool::new_with_capacity(
+                        lane_config.persistence_cpu_threads,
+                        64,
                     ),
                     ScribeWalIoPool::new_with_capacity(
                         lane_config.wal_io_threads,
-                        lane_config.wal_io_queue_items,
+                        256,
                     ),
                 ),
-                ingress_queue_items: lane_config.ingress_queue_items,
-                ingress_queue_bytes: lane_config.ingress_queue_bytes,
-                commit_config: ScribeCommitConfig::default(),
                 persistence: None,
             },
         )
@@ -404,15 +339,12 @@ impl ScribeImpl {
         let ScribeBuildConfig {
             coordination_runtime,
             execution_pools,
-            ingress_queue_items,
-            ingress_queue_bytes,
-            commit_config,
             persistence: persistence_config,
             admission: _,
         } = config;
         let ScribeExecutionPools {
             ingress_cpu,
-            post_ack_cpu,
+            persistence_cpu,
             wal_io,
         } = execution_pools;
         let persistence = persistence_config.map(|config| {
@@ -421,7 +353,7 @@ impl ScribeImpl {
                 persistence::PersistenceRuntimeContext {
                     operator: Arc::clone(&operator),
                     wal: Arc::clone(&wal),
-                    post_ack_cpu: post_ack_cpu.clone(),
+                    persistence_cpu: persistence_cpu.clone(),
                     wal_io: wal_io.clone(),
                     node_id: node_id.clone(),
                     writer_epoch,
@@ -440,7 +372,7 @@ impl ScribeImpl {
                 admission: admission.clone(),
                 memtable: Arc::clone(&memtable),
                 wal: Arc::clone(&wal),
-                post_ack_cpu: post_ack_cpu.clone(),
+                persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 stream,
@@ -448,8 +380,7 @@ impl ScribeImpl {
             &coordination_runtime,
         );
         let ingress_queue = ingress::ScribeIngressQueue::new(
-            ingress_queue_items,
-            ingress_queue_bytes,
+            256,
             admission.clone(),
             ingress_cpu.clone(),
             memory.clone(),
@@ -464,12 +395,11 @@ impl ScribeImpl {
             writer_epoch,
             admission,
             memory,
-            post_ack_cpu,
+            persistence_cpu,
             wal_io,
             ingress_cpu,
             shards,
             ingress_queue,
-            commit_config,
             persistence,
         }
     }
@@ -481,20 +411,20 @@ impl ScribeImpl {
     #[must_use]
     #[cfg(test)]
     pub fn new() -> Self {
-        Self::new_with_test_lanes(ScribePostAckCpuPool::new(1), ScribeWalIoPool::new(1))
+        Self::new_with_test_lanes(ScribePersistenceCpuPool::new(1), ScribeWalIoPool::new(1))
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_test_lanes(
-        post_ack_cpu: ScribePostAckCpuPool,
+        persistence_cpu: ScribePersistenceCpuPool,
         wal_io: ScribeWalIoPool,
     ) -> Self {
-        Self::new_with_test_config(post_ack_cpu, wal_io, AdmissionConfig::default())
+        Self::new_with_test_config(persistence_cpu, wal_io, AdmissionConfig::default())
     }
 
     #[cfg(test)]
     pub(crate) fn new_with_test_config(
-        post_ack_cpu: ScribePostAckCpuPool,
+        persistence_cpu: ScribePersistenceCpuPool,
         wal_io: ScribeWalIoPool,
         admission_config: AdmissionConfig,
     ) -> Self {
@@ -533,12 +463,9 @@ impl ScribeImpl {
                 coordination_runtime: Handle::current(),
                 execution_pools: ScribeExecutionPools::new(
                     ScribeIngressCpuPool::new(1),
-                    post_ack_cpu,
+                    persistence_cpu,
                     wal_io,
                 ),
-                ingress_queue_items: 256,
-                ingress_queue_bytes: 512 * 1024 * 1024,
-                commit_config: ScribeCommitConfig::default(),
                 persistence: None,
             },
         )
@@ -553,7 +480,7 @@ impl ScribeImpl {
             persistence.close_and_drain().await;
         }
         self.shards.shutdown().await;
-        self.post_ack_cpu.drain().await;
+        self.persistence_cpu.drain().await;
         self.wal_io.drain().await;
         self.ingress_cpu.drain().await;
         metrics::histogram!("bifrost_scribe_shutdown_seconds")
@@ -582,18 +509,18 @@ impl ScribeImpl {
     /// Return the current admission, lane, and writer health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
-        let post_ack = self.post_ack_cpu.snapshot();
+        let persistence = self.persistence_cpu.snapshot();
         let wal_io = self.wal_io.snapshot();
         let ingress = self.ingress_cpu.snapshot();
         let lanes = crate::scribe::telemetry::ExecutorSnapshot {
-            depth: post_ack.depth.saturating_add(wal_io.depth),
-            capacity: post_ack.capacity.saturating_add(wal_io.capacity),
-            saturation_events: post_ack
+            depth: persistence.depth.saturating_add(wal_io.depth),
+            capacity: persistence.capacity.saturating_add(wal_io.capacity),
+            saturation_events: persistence
                 .saturation_events
                 .saturating_add(wal_io.saturation_events),
-            completed: post_ack.completed.saturating_add(wal_io.completed),
-            failed: post_ack.failed.saturating_add(wal_io.failed),
-            panicked: post_ack.panicked.saturating_add(wal_io.panicked),
+            completed: persistence.completed.saturating_add(wal_io.completed),
+            failed: persistence.failed.saturating_add(wal_io.failed),
+            panicked: persistence.panicked.saturating_add(wal_io.panicked),
         };
         ScribeRuntimeSnapshot {
             admission: self.admission.snapshot(),
@@ -608,12 +535,12 @@ impl ScribeImpl {
                 panicked: lanes.panicked.saturating_add(ingress.panicked),
             },
             ingress,
-            post_ack,
+            persistence,
             wal_io,
-            writers: crate::scribe::telemetry::WriterHealthSnapshot {
-                writers: self.memtable.logical_writer_count(),
-                unhealthy_writers: 0,
-                pending_items: 0,
+            shards: crate::scribe::telemetry::ShardHealthSnapshot {
+                shard_tasks: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                shard_channels: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+                pending_items: self.shards.pending_items(),
                 terminal_errors: 0,
             },
             durability: ScribeDurabilitySnapshot::default(),
@@ -648,7 +575,7 @@ impl ScribeImpl {
                 detail: error.to_string(),
             })?;
 
-        let driver = SealDriver::new_with_lane(self.operator.clone(), self.post_ack_cpu.clone());
+        let driver = SealDriver::new_with_lane(self.operator.clone(), self.persistence_cpu.clone());
         driver
             .pre_commit(
                 &self.memtable,
@@ -721,12 +648,6 @@ impl ScribeImpl {
     /// Trip the WAL availability breaker for deterministic test-tier probes.
     pub fn trip_wal_disk_full_for_test(&self) {
         self.admission.trip_wal_disk_full();
-    }
-
-    /// Return the resolved writer group limits used by every active writer.
-    #[must_use]
-    pub const fn commit_config(&self) -> ScribeCommitConfig {
-        self.commit_config
     }
 
     /// Return the bounded ingress CPU pool for Gate protocol projection.
@@ -920,9 +841,9 @@ impl ScribeImpl {
         let mut restored = 0;
         for state in replayed.values() {
             let result = self
-                .post_ack_cpu
+                .persistence_cpu
                 .submit(
-                    crate::scribe::execution_lanes::ScribePostAckCpuOp::RestoreReplay {
+                    crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
                         memtable: Arc::clone(&self.memtable),
                         replayed: Box::new(state.clone()),
                     },
@@ -930,10 +851,10 @@ impl ScribeImpl {
                 .await?;
             if !matches!(
                 result,
-                crate::scribe::execution_lanes::ScribePostAckCpuResult::ReplayRestored
+                crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored
             ) {
                 return Err(ScribeError::Internal {
-                    detail: "post-ACK CPU lane returned the wrong replay result".to_owned(),
+                    detail: "persistence CPU lane returned the wrong replay result".to_owned(),
                 });
             }
             restored += 1;
@@ -962,9 +883,11 @@ impl ScribeImpl {
             stream_identity::NodeId::new(node_id),
             stream_identity::WriterEpoch::new(self.writer_epoch),
         );
-        Ok(FetchLiveTailService::new(
+        Ok(FetchLiveTailService::with_runtime(
             stream,
             Arc::clone(&self.memtable),
+            Arc::clone(&self.shards),
+            crate::scribe::tail_rpc::TailConfig::default(),
         ))
     }
 

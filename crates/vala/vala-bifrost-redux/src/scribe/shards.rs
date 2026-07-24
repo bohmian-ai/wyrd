@@ -14,7 +14,7 @@ use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::admission::AdmissionController;
 use crate::scribe::execution_lanes::{
-    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult, ScribeWalIoOp,
+    ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::memtable::Memtable;
@@ -24,6 +24,7 @@ use crate::scribe::persistence::{
 use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend, PreparedSlice};
 use crate::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
 use crate::scribe::stream_identity::StreamIdentity;
+use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
 use crate::scribe::wal::{WalHandle, WalWriter};
 
 /// Capacity of one shard command mailbox.
@@ -204,6 +205,10 @@ impl ShardItem for AdmittedAppend {
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
     Append(Box<AdmittedAppend>),
+    Snapshot {
+        request: FetchLiveTailRequest,
+        response: tokio::sync::oneshot::Sender<Result<Vec<HotBatch>, ScribeError>>,
+    },
     Shutdown,
 }
 
@@ -212,7 +217,7 @@ struct ShardDependencies {
     admission: AdmissionController,
     memtable: Arc<Memtable>,
     wal: Arc<WalWriter>,
-    post_ack_cpu: ScribePostAckCpuPool,
+    persistence_cpu: ScribePersistenceCpuPool,
     wal_io: ScribeWalIoPool,
     persistence: Option<Arc<PersistenceRuntime>>,
     completion_tx: mpsc::Sender<WriterControl>,
@@ -235,7 +240,7 @@ pub(crate) struct ScribeShardStartConfig {
     pub(crate) admission: AdmissionController,
     pub(crate) memtable: Arc<Memtable>,
     pub(crate) wal: Arc<WalWriter>,
-    pub(crate) post_ack_cpu: ScribePostAckCpuPool,
+    pub(crate) persistence_cpu: ScribePersistenceCpuPool,
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     pub(crate) stream: StreamIdentity,
@@ -248,7 +253,7 @@ impl ScribeShardRuntime {
             admission,
             memtable,
             wal,
-            post_ack_cpu,
+            persistence_cpu,
             wal_io,
             persistence,
             stream,
@@ -271,7 +276,7 @@ impl ScribeShardRuntime {
                 admission: admission.clone(),
                 memtable: Arc::clone(&memtable),
                 wal: Arc::clone(&wal),
-                post_ack_cpu: post_ack_cpu.clone(),
+                persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 completion_tx: completion_tx.clone(),
@@ -319,14 +324,43 @@ impl ScribeShardRuntime {
                     ScribeError::IngestBusy { table: table.fqn() }
                 }
                 mpsc::error::TrySendError::Closed(
-                    ShardCommand::Append(_) | ShardCommand::Shutdown,
+                    ShardCommand::Append(_)
+                        | ShardCommand::Snapshot { .. }
+                        | ShardCommand::Shutdown,
                 )
-                | mpsc::error::TrySendError::Full(ShardCommand::Shutdown) => {
+                | mpsc::error::TrySendError::Full(
+                    ShardCommand::Snapshot { .. } | ShardCommand::Shutdown,
+                ) => {
                     ScribeError::IngressClosed
                 }
             });
         }
         Ok(())
+    }
+
+    /// Submit one bounded hot snapshot to the owning shard.
+    pub(crate) async fn snapshot(
+        &self,
+        request: FetchLiveTailRequest,
+    ) -> Result<Vec<HotBatch>, ScribeError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(ScribeError::IngressClosed);
+        }
+        let shard = request.shard_id();
+        let (response, result) = tokio::sync::oneshot::channel();
+        let command = ShardCommand::Snapshot { request, response };
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            self.senders[shard].sender.send(command),
+        )
+        .await
+        .map_err(|_| ScribeError::IngestBusy {
+            table: "live-tail".to_owned(),
+        })?
+        .map_err(|_| ScribeError::IngressClosed)?;
+        result.await.map_err(|_| ScribeError::Internal {
+            detail: "shard dropped live-tail snapshot response".to_owned(),
+        })?
     }
 
     /// Wait until all accepted shard commands have completed.
@@ -338,6 +372,12 @@ impl ScribeShardRuntime {
             }
             notified.await;
         }
+    }
+
+    /// Return the number of accepted append commands not yet completed.
+    #[must_use]
+    pub(crate) fn pending_items(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
     }
 
     /// Stop all owners after draining accepted work.
@@ -372,6 +412,10 @@ async fn run_shard(
         while let Ok(command) = receiver.try_recv() {
             match command {
                 ShardCommand::Append(append) => scheduler.push(*append),
+                ShardCommand::Snapshot { request, response } => {
+                    let result = snapshot_at_owner(&dependencies, request);
+                    let _ = response.send(result);
+                }
                 ShardCommand::Shutdown => shutting_down = true,
             }
         }
@@ -399,10 +443,38 @@ async fn run_shard(
         }
         match receiver.recv().await {
             Some(ShardCommand::Append(append)) => scheduler.push(*append),
+            Some(ShardCommand::Snapshot { request, response }) => {
+                let result = snapshot_at_owner(&dependencies, request);
+                let _ = response.send(result);
+            }
             Some(ShardCommand::Shutdown) => shutting_down = true,
             None => break,
         }
     }
+}
+
+/// Execute an Oracle structural snapshot at the single-owner state boundary.
+fn snapshot_at_owner(
+    dependencies: &ShardDependencies,
+    request: FetchLiveTailRequest,
+) -> Result<Vec<HotBatch>, ScribeError> {
+    let readable = dependencies.memtable.readable_batches_for_range(
+        request.binding.tenant,
+        &request.binding.table_ref,
+        request.start_day,
+        request.end_day,
+        &request.required_columns,
+    )?;
+    Ok(readable
+        .into_iter()
+        .filter(|batch| batch.meta.wal_lsn_max > request.after_lsn)
+        .map(|batch| HotBatch {
+            partition_day: batch.partition_day,
+            wal_lsn: batch.meta.wal_lsn_max,
+            batch_id: batch.meta.batch_id,
+            rows: batch.batch,
+        })
+        .collect())
 }
 
 async fn run_persistence_controls(
@@ -529,14 +601,14 @@ async fn prepare_group(
     let mut prepared = Vec::with_capacity(group.len());
     for append in group {
         let prepared_append = match dependencies
-            .post_ack_cpu
-            .submit(ScribePostAckCpuOp::Preprocess(Box::new(append)))
+            .persistence_cpu
+            .submit(ScribePersistenceCpuOp::Preprocess(Box::new(append)))
             .await?
         {
-            ScribePostAckCpuResult::Prepared(value) => value,
-            ScribePostAckCpuResult::ParquetEncoded(_) | ScribePostAckCpuResult::ReplayRestored => {
+            ScribePersistenceCpuResult::Prepared(value) => value,
+            ScribePersistenceCpuResult::ParquetEncoded(_) | ScribePersistenceCpuResult::ReplayRestored => {
                 return Err(ScribeError::Internal {
-                    detail: "post-ACK lane returned the wrong shard result".to_owned(),
+                    detail: "persistence lane returned the wrong shard result".to_owned(),
                 });
             }
         };

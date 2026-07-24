@@ -15,7 +15,7 @@ use wyrd_spec::vala::api::AuditEvent;
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::{
-    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult, ScribeWalIoOp,
+    ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
@@ -217,7 +217,7 @@ impl ScribePersistenceConfig {
 pub(crate) struct PersistenceRuntimeContext {
     pub(crate) operator: Arc<opendal::Operator>,
     pub(crate) wal: Arc<WalWriter>,
-    pub(crate) post_ack_cpu: ScribePostAckCpuPool,
+    pub(crate) persistence_cpu: ScribePersistenceCpuPool,
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) node_id: String,
     pub(crate) writer_epoch: i64,
@@ -262,7 +262,7 @@ impl PersistenceRuntime {
             postgres: config.postgres,
             operator: context.operator,
             wal: context.wal,
-            post_ack_cpu: context.post_ack_cpu,
+            persistence_cpu: context.persistence_cpu,
             wal_io: context.wal_io,
             node_id: context.node_id,
             writer_epoch: context.writer_epoch,
@@ -369,7 +369,7 @@ struct PersistenceDependencies {
     postgres: Arc<ValaPostgres>,
     operator: Arc<opendal::Operator>,
     wal: Arc<WalWriter>,
-    post_ack_cpu: ScribePostAckCpuPool,
+    persistence_cpu: ScribePersistenceCpuPool,
     wal_io: ScribeWalIoPool,
     node_id: String,
     writer_epoch: i64,
@@ -462,18 +462,18 @@ async fn persist_once(
 ) -> Result<FileListCommitKey, ScribeError> {
     let frozen = generation.frozen_snapshot();
     let mut encoded = match dependencies
-        .post_ack_cpu
-        .submit(ScribePostAckCpuOp::EncodeParquet {
+        .persistence_cpu
+        .submit(ScribePersistenceCpuOp::EncodeParquet {
             frozen: Box::new(frozen.clone()),
             binding: binding.clone(),
             tenant: binding.tenant,
         })
         .await?
     {
-        ScribePostAckCpuResult::ParquetEncoded(encoded) => encoded,
-        ScribePostAckCpuResult::Prepared(_) | ScribePostAckCpuResult::ReplayRestored => {
+        ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
+        ScribePersistenceCpuResult::Prepared(_) | ScribePersistenceCpuResult::ReplayRestored => {
             return Err(ScribeError::Internal {
-                detail: "post-ACK lane returned the wrong persistence result".to_owned(),
+                detail: "persistence lane returned the wrong persistence result".to_owned(),
             });
         }
     };

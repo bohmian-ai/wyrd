@@ -36,7 +36,6 @@ pub(super) struct ScribeIngressQueue {
 impl ScribeIngressQueue {
     pub(super) fn new(
         items: usize,
-        bytes: usize,
         admission: AdmissionController,
         ingress_cpu: ScribeIngressCpuPool,
         memory: BifrostMemoryGovernor,
@@ -46,7 +45,6 @@ impl ScribeIngressQueue {
         let capacity = items.max(1);
         let budget = IngressQueueBudget::with_config(IngressQueueConfig {
             max_items: capacity,
-            max_bytes: bytes,
         });
         let (sender, mut receiver) = mpsc::channel(capacity);
         let processing = Arc::new(Semaphore::new(capacity));

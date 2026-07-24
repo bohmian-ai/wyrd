@@ -11,7 +11,7 @@ use wyrd_spec::ids::PodId;
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
 use crate::scribe::execution_lanes::{
-    ScribePostAckCpuOp, ScribePostAckCpuPool, ScribePostAckCpuResult,
+    ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult,
 };
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
@@ -67,25 +67,25 @@ pub struct SealCommit {
 #[derive(Debug)]
 pub struct SealDriver {
     operator: Arc<Operator>,
-    post_ack_cpu: ScribePostAckCpuPool,
+    persistence_cpu: ScribePersistenceCpuPool,
 }
 
 impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self::new_with_lane(operator, ScribePostAckCpuPool::new(1))
+        Self::new_with_lane(operator, ScribePersistenceCpuPool::new(1))
     }
 
-    /// Construct a seal driver using the boot-owned post-ACK CPU lane.
+    /// Construct a seal driver using the boot-owned persistence CPU lane.
     #[must_use]
     pub(crate) fn new_with_lane(
         operator: Arc<Operator>,
-        post_ack_cpu: ScribePostAckCpuPool,
+        persistence_cpu: ScribePersistenceCpuPool,
     ) -> Self {
         Self {
             operator,
-            post_ack_cpu,
+            persistence_cpu,
         }
     }
 
@@ -130,7 +130,7 @@ impl SealDriver {
             frozen.batch.get_array_memory_size(),
         );
 
-        // 2. WriteParquet on the boot-owned post-ACK CPU lane.
+        // 2. WriteParquet on the boot-owned persistence CPU lane.
         info!("seal stage: WriteParquet");
         let parquet_started = std::time::Instant::now();
         let encoded = self
@@ -210,20 +210,20 @@ impl SealDriver {
         tenant: wyrd_spec::ids::DataTenantId,
     ) -> Result<ParquetEncoded, ScribeError> {
         match self
-            .post_ack_cpu
-            .submit(ScribePostAckCpuOp::EncodeParquet {
+            .persistence_cpu
+            .submit(ScribePersistenceCpuOp::EncodeParquet {
                 frozen: Box::new(frozen.clone()),
                 binding: binding.clone(),
                 tenant,
             })
             .await?
         {
-            ScribePostAckCpuResult::ParquetEncoded(encoded) => Ok(encoded),
-            ScribePostAckCpuResult::Prepared(_) => Err(ScribeError::Internal {
-                detail: "post-ACK lane returned the wrong seal result".to_owned(),
+            ScribePersistenceCpuResult::ParquetEncoded(encoded) => Ok(encoded),
+            ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
+                detail: "persistence lane returned the wrong seal result".to_owned(),
             }),
-            ScribePostAckCpuResult::ReplayRestored => Err(ScribeError::Internal {
-                detail: "post-ACK lane returned replay output during seal".to_owned(),
+            ScribePersistenceCpuResult::ReplayRestored => Err(ScribeError::Internal {
+                detail: "persistence lane returned replay output during seal".to_owned(),
             }),
         }
     }

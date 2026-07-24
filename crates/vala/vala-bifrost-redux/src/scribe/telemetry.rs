@@ -2,16 +2,16 @@
 
 use crate::scribe::admission::AdmissionSnapshot;
 
-/// Point-in-time health and queue metrics for active logical writers.
+/// Point-in-time health and queue metrics for the fixed shard owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WriterHealthSnapshot {
-    /// Active tenant/table consumers.
-    pub writers: usize,
-    /// Consumers that have failed after admission.
-    pub unhealthy_writers: usize,
-    /// Items retained in writer data queues or being processed.
+pub struct ShardHealthSnapshot {
+    /// Fixed shard owner tasks.
+    pub shard_tasks: usize,
+    /// Fixed bounded shard command channels.
+    pub shard_channels: usize,
+    /// Items currently accepted by the shard runtime.
     pub pending_items: usize,
-    /// Terminal post-ACK consumer errors.
+    /// Terminal shard owner errors.
     pub terminal_errors: usize,
 }
 
@@ -32,7 +32,7 @@ pub struct ExecutorSnapshot {
     pub panicked: u64,
 }
 
-/// Point-in-time queue, admission, execution-lane, and writer health telemetry.
+/// Point-in-time queue, admission, execution-lane, and shard health telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScribeRuntimeSnapshot {
     /// Pod-global admission counters and limits.
@@ -42,11 +42,11 @@ pub struct ScribeRuntimeSnapshot {
     /// Pre-ACK decode and projection lane.
     pub ingress: ExecutorSnapshot,
     /// Post-ACK preprocessing and reconstruction lane.
-    pub post_ack: ExecutorSnapshot,
+    pub persistence: ExecutorSnapshot,
     /// WAL filesystem lane.
     pub wal_io: ExecutorSnapshot,
-    /// Active writer queue and health metrics.
-    pub writers: WriterHealthSnapshot,
+    /// Fixed shard owner topology and health metrics.
+    pub shards: ShardHealthSnapshot,
     /// Accepted and fsynced frame counters used to expose the durability gap.
     pub durability: ScribeDurabilitySnapshot,
 }

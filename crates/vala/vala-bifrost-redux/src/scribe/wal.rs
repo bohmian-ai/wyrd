@@ -369,91 +369,145 @@ pub(crate) struct DecodedSlicePayload {
     pub(crate) data: Vec<u8>,
 }
 
-pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload, ScribeError> {
-    let mut cursor = 0usize;
-    let take = |cursor: &mut usize, length: usize| -> Result<&[u8], ScribeError> {
-        let end = cursor
+/// Cursor for the length-delimited fields in one v3 slice payload.
+///
+/// The cursor centralizes bounds checking so field decoders can describe the
+/// payload schema without repeating offset arithmetic. It never advances past
+/// the supplied payload, and it rejects arithmetic overflow as corruption.
+struct SlicePayloadReader<'a> {
+    payload: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> SlicePayloadReader<'a> {
+    /// Create a reader positioned at the first payload byte.
+    fn new(payload: &'a [u8]) -> Self {
+        Self { payload, offset: 0 }
+    }
+
+    /// Take exactly `length` bytes or report a truncated/corrupt payload.
+    fn take(&mut self, length: usize) -> Result<&'a [u8], ScribeError> {
+        let end = self
+            .offset
             .checked_add(length)
             .ok_or_else(|| ScribeError::Internal {
                 detail: "WAL slice payload offset overflow".to_owned(),
             })?;
-        let value = payload
-            .get(*cursor..end)
+        let value = self
+            .payload
+            .get(self.offset..end)
             .ok_or_else(|| ScribeError::Internal {
                 detail: "WAL slice payload is truncated".to_owned(),
             })?;
-        *cursor = end;
+        self.offset = end;
         Ok(value)
-    };
-    if take(&mut cursor, 4)? != SLICE_PAYLOAD_MAGIC {
-        return Err(ScribeError::Internal {
-            detail: "WAL v3 slice magic mismatch".to_owned(),
-        });
     }
-    let mut tenant_bytes = [0u8; 16];
-    tenant_bytes.copy_from_slice(take(&mut cursor, 16)?);
+
+    /// Read a little-endian `u16` length field.
+    fn read_u16(&mut self, detail: &'static str) -> Result<usize, ScribeError> {
+        let bytes = self.take(2)?;
+        let bytes: [u8; 2] = bytes.try_into().map_err(|_| ScribeError::Internal {
+            detail: detail.to_owned(),
+        })?;
+        Ok(usize::from(u16::from_le_bytes(bytes)))
+    }
+
+    /// Read a little-endian `u32` length field.
+    fn read_u32(&mut self, detail: &'static str) -> Result<usize, ScribeError> {
+        let bytes = self.take(4)?;
+        let bytes: [u8; 4] = bytes.try_into().map_err(|_| ScribeError::Internal {
+            detail: detail.to_owned(),
+        })?;
+        usize::try_from(u32::from_le_bytes(bytes)).map_err(|_| ScribeError::Internal {
+            detail: detail.to_owned(),
+        })
+    }
+
+    /// Read a UTF-8 field and preserve the field-specific corruption detail.
+    fn read_utf8(&mut self, length: usize, field: &str) -> Result<String, ScribeError> {
+        let bytes = self.take(length)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("WAL {field} is not UTF-8: {error}"),
+            })
+    }
+
+    /// Read a length-prefixed owned byte field.
+    fn read_bytes_u32(&mut self, detail: &'static str) -> Result<Vec<u8>, ScribeError> {
+        let length = self.read_u32(detail)?;
+        Ok(self.take(length)?.to_vec())
+    }
+
+    /// Verify that the payload has no unparsed trailing bytes.
+    fn finish(self) -> Result<(), ScribeError> {
+        if self.offset != self.payload.len() {
+            return Err(ScribeError::Internal {
+                detail: "WAL v3 slice payload has trailing bytes".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Decode the tenant identity encoded in a v3 slice payload.
+fn decode_slice_tenant(bytes: &[u8]) -> Result<DataTenantId, ScribeError> {
+    let tenant_bytes: [u8; 16] = bytes.try_into().map_err(|_| ScribeError::Internal {
+        detail: "WAL tenant id decode failed".to_owned(),
+    })?;
     let tenant_uuid = uuid::Uuid::from_bytes(tenant_bytes);
-    let tenant = if tenant_uuid.is_nil() {
-        DataTenantId::SYSTEM_OWNER
-    } else {
-        DataTenantId::try_from(tenant_uuid).map_err(|error| ScribeError::Internal {
-            detail: format!("WAL v3 tenant id is invalid: {error}"),
-        })?
-    };
-    let table_len =
-        u16::from_le_bytes(
-            take(&mut cursor, 2)?
-                .try_into()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "WAL table length decode failed".to_owned(),
-                })?,
-        ) as usize;
-    let table_fqn = std::str::from_utf8(take(&mut cursor, table_len)?).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("WAL table FQN is not UTF-8: {error}"),
-        }
-    })?;
-    let day_len = usize::from(take(&mut cursor, 1)?[0]);
-    let day = std::str::from_utf8(take(&mut cursor, day_len)?).map_err(|error| {
-        ScribeError::Internal {
-            detail: format!("WAL partition day is not UTF-8: {error}"),
-        }
-    })?;
-    let mut schema_fingerprint = [0u8; 32];
-    schema_fingerprint.copy_from_slice(take(&mut cursor, 32)?);
-    let audit_len =
-        u32::from_le_bytes(
-            take(&mut cursor, 4)?
-                .try_into()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "WAL audit length decode failed".to_owned(),
-                })?,
-        ) as usize;
-    let audit = take(&mut cursor, audit_len)?.to_vec();
-    let data_len =
-        u32::from_le_bytes(
-            take(&mut cursor, 4)?
-                .try_into()
-                .map_err(|_| ScribeError::Internal {
-                    detail: "WAL Arrow length decode failed".to_owned(),
-                })?,
-        ) as usize;
-    let data = take(&mut cursor, data_len)?.to_vec();
-    if cursor != payload.len() {
-        return Err(ScribeError::Internal {
-            detail: "WAL v3 slice payload has trailing bytes".to_owned(),
-        });
+    if tenant_uuid.is_nil() {
+        return Ok(DataTenantId::SYSTEM_OWNER);
     }
-    let table = TableRef::parse_fqn(table_fqn).ok_or_else(|| ScribeError::Internal {
+    DataTenantId::try_from(tenant_uuid).map_err(|error| ScribeError::Internal {
+        detail: format!("WAL v3 tenant id is invalid: {error}"),
+    })
+}
+
+/// Decode and validate the canonical logical table reference.
+fn decode_slice_table(table_fqn: &str) -> Result<TableRef, ScribeError> {
+    TableRef::parse_fqn(table_fqn).ok_or_else(|| ScribeError::Internal {
         detail: format!("WAL table FQN is invalid: {table_fqn}"),
-    })?;
+    })
+}
+
+/// Decode and validate the partition day encoded as `YYYY-MM-DD`.
+fn decode_slice_day(day: &str) -> Result<EventDay, ScribeError> {
     let day = chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|error| {
         ScribeError::Internal {
             detail: format!("WAL partition day is invalid: {error}"),
         }
     })?;
+    Ok(EventDay::new(day))
+}
+
+/// Decode one self-describing v3 WAL slice payload.
+///
+/// The payload contains the authenticated tenant, canonical table FQN,
+/// partition day, schema fingerprint, canonical audit bytes, and Arrow IPC
+/// bytes. Structural decoding is kept separate from replay's deduplication
+/// and audit/Arrow reconstruction so this function only validates and returns
+/// the one-record representation.
+pub(crate) fn decode_slice_payload(payload: &[u8]) -> Result<DecodedSlicePayload, ScribeError> {
+    let mut reader = SlicePayloadReader::new(payload);
+    if reader.take(SLICE_PAYLOAD_MAGIC.len())? != SLICE_PAYLOAD_MAGIC {
+        return Err(ScribeError::Internal {
+            detail: "WAL v3 slice magic mismatch".to_owned(),
+        });
+    }
+    let tenant = decode_slice_tenant(reader.take(16)?)?;
+    let table_len = reader.read_u16("WAL table length decode failed")?;
+    let table_fqn = reader.read_utf8(table_len, "table FQN")?;
+    let table = decode_slice_table(&table_fqn)?;
+    let day_len = usize::from(reader.take(1)?[0]);
+    let day = decode_slice_day(&reader.read_utf8(day_len, "partition day")?)?;
+    let mut schema_fingerprint = [0u8; 32];
+    schema_fingerprint.copy_from_slice(reader.take(32)?);
+    let audit = reader.read_bytes_u32("WAL audit length decode failed")?;
+    let data = reader.read_bytes_u32("WAL Arrow length decode failed")?;
+    reader.finish()?;
     Ok(DecodedSlicePayload {
-        seal_key: SealKey::new(tenant, table, EventDay::new(day)),
+        seal_key: SealKey::new(tenant, table, day),
         schema_fingerprint,
         audit,
         data,
@@ -1223,7 +1277,7 @@ impl WalWriter {
         Ok(result.lsn)
     }
 
-    #[cfg(any(feature = "bench-support", test))]
+    #[cfg(feature = "bench-support")]
     pub(crate) fn sync_data(&self) -> Result<(), ScribeError> {
         self.sync_data_for_shard(0)
     }

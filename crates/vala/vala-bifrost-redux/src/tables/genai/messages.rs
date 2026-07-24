@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{boolean, fixed_binary, float64, int64, ts_us_utc, utf8, utf8_view};
+use crate::tables::fields::{boolean, fixed_binary, float64, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -32,7 +32,7 @@ impl DomainTable for MessagesTable {
             utf8("response_model", true),
             utf8("conversation_id", true),
             utf8("response_id", true),
-            utf8_view("response_finish_reasons", true),
+            utf8("response_finish_reasons", true),
             float64("response_time_to_first_chunk_seconds", true),
             float64("request_temperature", true),
             float64("request_top_p", true),
@@ -42,9 +42,9 @@ impl DomainTable for MessagesTable {
             float64("request_presence_penalty", true),
             int64("request_seed", true),
             int64("request_choice_count", true),
-            utf8_view("request_stop_sequences", true),
+            utf8("request_stop_sequences", true),
             boolean("request_stream", true),
-            utf8_view("request_encoding_formats", true),
+            utf8("request_encoding_formats", true),
             int64("usage_input_tokens", true),
             int64("usage_output_tokens", true),
             int64("usage_cache_creation_input_tokens", true),
@@ -53,16 +53,16 @@ impl DomainTable for MessagesTable {
             utf8("output_type", true),
             utf8("request_reasoning_level", true),
             boolean("conversation_compacted", true),
-            utf8_view("input_messages", true),
-            utf8_view("output_messages", true),
-            utf8_view("system_instructions", true),
+            utf8("input_messages", true),
+            utf8("output_messages", true),
+            utf8("system_instructions", true),
             utf8("openai_api_type", true),
             utf8("openai_request_service_tier", true),
             utf8("openai_response_service_tier", true),
             utf8("openai_response_system_fingerprint", true),
             utf8("error_type", true),
-            utf8_view("eval_results", true),
-            utf8_view("extra", true),
+            utf8("eval_results", true),
+            utf8("extra", true),
         ]
     }
 

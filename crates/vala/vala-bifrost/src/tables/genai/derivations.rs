@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use arrow::array::{
     Array, BooleanArray, FixedSizeBinaryArray, FixedSizeBinaryBuilder, Float64Array, Int64Array,
-    RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{Schema, SchemaRef};
 use uuid::Uuid;
@@ -270,33 +270,6 @@ fn classify(operation: &str) -> GenAiKind {
     }
 }
 
-/// Attribute-column reader that tolerates both `Utf8` and `Utf8View`.
-///
-/// The `attributes` column is declared `Utf8View` in the table schema
-/// (`SpansTable`), but Parquet has no `Utf8View` physical type — round-tripping
-/// through Iceberg storage surfaces it as `Utf8` on read. Support both so the
-/// derivation runs on freshly-committed-and-scanned data.
-enum AttributesArray<'a> {
-    View(&'a StringViewArray),
-    Utf8(&'a StringArray),
-}
-
-impl AttributesArray<'_> {
-    fn is_null(&self, i: usize) -> bool {
-        match self {
-            AttributesArray::View(a) => a.is_null(i),
-            AttributesArray::Utf8(a) => a.is_null(i),
-        }
-    }
-
-    fn value(&self, i: usize) -> &str {
-        match self {
-            AttributesArray::View(a) => a.value(i),
-            AttributesArray::Utf8(a) => a.value(i),
-        }
-    }
-}
-
 /// The physical span columns the derivation reads. Downcast once per batch.
 struct SpanColumns<'a> {
     trace_id: &'a FixedSizeBinaryArray,
@@ -307,7 +280,7 @@ struct SpanColumns<'a> {
     duration_ms: &'a Int64Array,
     status: &'a StringArray,
     service_name: &'a StringArray,
-    attributes: Option<AttributesArray<'a>>,
+    attributes: Option<&'a StringArray>,
     data_tenant_id: &'a StringArray,
 }
 
@@ -525,7 +498,7 @@ impl MessageRow {
             fields::utf8("response_model", true),
             fields::utf8("conversation_id", true),
             fields::utf8("response_id", true),
-            fields::utf8_view("response_finish_reasons", true),
+            fields::utf8("response_finish_reasons", true),
             fields::float64("response_time_to_first_chunk_seconds", true),
             fields::float64("request_temperature", true),
             fields::float64("request_top_p", true),
@@ -535,9 +508,9 @@ impl MessageRow {
             fields::float64("request_presence_penalty", true),
             fields::int64("request_seed", true),
             fields::int64("request_choice_count", true),
-            fields::utf8_view("request_stop_sequences", true),
+            fields::utf8("request_stop_sequences", true),
             fields::boolean("request_stream", true),
-            fields::utf8_view("request_encoding_formats", true),
+            fields::utf8("request_encoding_formats", true),
             fields::int64("usage_input_tokens", true),
             fields::int64("usage_output_tokens", true),
             fields::int64("usage_cache_creation_input_tokens", true),
@@ -546,9 +519,9 @@ impl MessageRow {
             fields::utf8("output_type", true),
             fields::utf8("request_reasoning_level", true),
             fields::boolean("conversation_compacted", true),
-            fields::utf8_view("input_messages", true),
-            fields::utf8_view("output_messages", true),
-            fields::utf8_view("system_instructions", true),
+            fields::utf8("input_messages", true),
+            fields::utf8("output_messages", true),
+            fields::utf8("system_instructions", true),
             fields::utf8("openai_api_type", true),
             fields::utf8("openai_request_service_tier", true),
             fields::utf8("openai_response_service_tier", true),
@@ -585,7 +558,7 @@ impl MessageRow {
         let conversation_id = str_col(rows.iter().map(|r| r.conversation_id.clone()));
         let response_id = str_col(rows.iter().map(|r| r.response_id.clone()));
         let response_finish_reasons =
-            str_view_col(rows.iter().map(|r| r.response_finish_reasons.clone()));
+            str_utf8_col(rows.iter().map(|r| r.response_finish_reasons.clone()));
 
         vec![
             trace_id,
@@ -618,10 +591,10 @@ impl MessageRow {
         let request_seed = i64_col(rows.iter().map(|r| r.request_seed));
         let request_choice_count = i64_col(rows.iter().map(|r| r.request_choice_count));
         let request_stop_sequences =
-            str_view_col(rows.iter().map(|r| r.request_stop_sequences.clone()));
+            str_utf8_col(rows.iter().map(|r| r.request_stop_sequences.clone()));
         let request_stream = bool_col(rows.iter().map(|r| r.request_stream));
         let request_encoding_formats =
-            str_view_col(rows.iter().map(|r| r.request_encoding_formats.clone()));
+            str_utf8_col(rows.iter().map(|r| r.request_encoding_formats.clone()));
 
         vec![
             response_time_to_first_chunk_seconds,
@@ -663,9 +636,9 @@ impl MessageRow {
         let request_reasoning_level =
             str_col(rows.iter().map(|r| r.request_reasoning_level.clone()));
         let conversation_compacted = bool_col(rows.iter().map(|r| r.conversation_compacted));
-        let input_messages = str_view_col(rows.iter().map(|r| r.input_messages.clone()));
-        let output_messages = str_view_col(rows.iter().map(|r| r.output_messages.clone()));
-        let system_instructions = str_view_col(rows.iter().map(|r| r.system_instructions.clone()));
+        let input_messages = str_utf8_col(rows.iter().map(|r| r.input_messages.clone()));
+        let output_messages = str_utf8_col(rows.iter().map(|r| r.output_messages.clone()));
+        let system_instructions = str_utf8_col(rows.iter().map(|r| r.system_instructions.clone()));
         let openai_api_type = str_col(rows.iter().map(|r| r.openai_api_type.clone()));
         let openai_request_service_tier =
             str_col(rows.iter().map(|r| r.openai_request_service_tier.clone()));
@@ -856,8 +829,8 @@ impl ToolCallRow {
             fields::utf8("tool_type", true),
             fields::utf8("tool_call_id", true),
             fields::utf8("tool_description", true),
-            fields::utf8_view("tool_call_arguments", true),
-            fields::utf8_view("tool_call_result", true),
+            fields::utf8("tool_call_arguments", true),
+            fields::utf8("tool_call_result", true),
             fields::utf8("mcp_session_id", true),
             fields::utf8("mcp_method_name", true),
             fields::utf8("mcp_protocol_version", true),
@@ -884,8 +857,8 @@ impl ToolCallRow {
         let tool_type = str_col(rows.iter().map(|r| r.tool_type.clone()));
         let tool_call_id = str_col(rows.iter().map(|r| r.tool_call_id.clone()));
         let tool_description = str_col(rows.iter().map(|r| r.tool_description.clone()));
-        let tool_call_arguments = str_view_col(rows.iter().map(|r| r.tool_call_arguments.clone()));
-        let tool_call_result = str_view_col(rows.iter().map(|r| r.tool_call_result.clone()));
+        let tool_call_arguments = str_utf8_col(rows.iter().map(|r| r.tool_call_arguments.clone()));
+        let tool_call_result = str_utf8_col(rows.iter().map(|r| r.tool_call_result.clone()));
         let mcp_session_id = str_col(rows.iter().map(|r| r.mcp_session_id.clone()));
         let mcp_method_name = str_col(rows.iter().map(|r| r.mcp_method_name.clone()));
         let mcp_protocol_version = str_col(rows.iter().map(|r| r.mcp_protocol_version.clone()));
@@ -967,7 +940,7 @@ impl MemoryRow {
             fields::utf8("memory_record_id", true),
             fields::int64("memory_record_count", true),
             fields::utf8("memory_query_text", true),
-            fields::utf8_view("memory_records", true),
+            fields::utf8("memory_records", true),
             fields::utf8("error_type", true),
         ]))
     }
@@ -989,7 +962,7 @@ impl MemoryRow {
         let memory_record_id = str_col(rows.iter().map(|r| r.memory_record_id.clone()));
         let memory_record_count = i64_col(rows.iter().map(|r| r.memory_record_count));
         let memory_query_text = str_col(rows.iter().map(|r| r.memory_query_text.clone()));
-        let memory_records = str_view_col(rows.iter().map(|r| r.memory_records.clone()));
+        let memory_records = str_utf8_col(rows.iter().map(|r| r.memory_records.clone()));
         let error_type = str_col(rows.iter().map(|r| r.error_type.clone()));
 
         RecordBatch::try_new(
@@ -1082,14 +1055,11 @@ fn string<'a>(batch: &'a RecordBatch, name: &str) -> Result<&'a StringArray, Bif
         .ok_or_else(|| BifrostError::Internal(format!("spans {name} not Utf8")))
 }
 
-fn attributes_col(batch: &RecordBatch) -> Option<AttributesArray<'_>> {
-    let col = batch.column_by_name("attributes")?;
-    if let Some(view) = col.as_any().downcast_ref::<StringViewArray>() {
-        return Some(AttributesArray::View(view));
-    }
-    col.as_any()
+fn attributes_col(batch: &RecordBatch) -> Option<&StringArray> {
+    batch
+        .column_by_name("attributes")?
+        .as_any()
         .downcast_ref::<StringArray>()
-        .map(AttributesArray::Utf8)
 }
 
 // ── column builders (write side) ─────────────────────────────────────────────
@@ -1121,8 +1091,8 @@ fn str_col(vals: impl Iterator<Item = Option<String>>) -> Arc<dyn Array> {
     Arc::new(vals.collect::<StringArray>())
 }
 
-fn str_view_col(vals: impl Iterator<Item = Option<String>>) -> Arc<dyn Array> {
-    Arc::new(vals.collect::<StringViewArray>())
+fn str_utf8_col(vals: impl Iterator<Item = Option<String>>) -> Arc<dyn Array> {
+    Arc::new(vals.collect::<StringArray>())
 }
 
 fn i64_col(vals: impl Iterator<Item = Option<i64>>) -> Arc<dyn Array> {
@@ -1154,7 +1124,7 @@ mod tests {
             fields::ts_us_utc("end_time", false),
             fields::int64("duration_ms", false),
             fields::utf8("status", false),
-            fields::utf8_view("attributes", true),
+            fields::utf8("attributes", true),
             fields::utf8("service_name", false),
             fields::utf8(DATA_TENANT_ID, false),
         ]));
@@ -1167,7 +1137,7 @@ mod tests {
         let end = ts_col(std::iter::once(2_000i64));
         let dur = Arc::new(Int64Array::from_iter_values(std::iter::once(1i64))) as Arc<dyn Array>;
         let status = str_col(std::iter::once(Some("ok".to_owned())));
-        let attrs = str_view_col(std::iter::once(Some(attributes.to_string())));
+        let attrs = str_utf8_col(std::iter::once(Some(attributes.to_string())));
         let service = str_col(std::iter::once(Some("svc".to_owned())));
         let tid = str_col(std::iter::once(Some(tenant.to_string())));
         RecordBatch::try_new(
@@ -1381,7 +1351,7 @@ mod tests {
             .column_by_name("memory_records")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         assert!(!records.is_null(0), "memory_records must be populated");
     }
@@ -1451,7 +1421,7 @@ mod tests {
             fields::ts_us_utc("end_time", false),
             fields::int64("duration_ms", false),
             fields::utf8("status", false),
-            fields::utf8_view("attributes", true),
+            fields::utf8("attributes", true),
             fields::utf8("service_name", false),
             fields::utf8(DATA_TENANT_ID, false),
         ]));
@@ -1464,7 +1434,7 @@ mod tests {
         let end = ts_col(std::iter::once(2_000i64));
         let dur = Arc::new(Int64Array::from_iter_values(std::iter::once(1i64))) as Arc<dyn Array>;
         let status = str_col(std::iter::once(Some("ok".to_owned())));
-        let attrs = str_view_col(std::iter::once(Some(attributes.to_string())));
+        let attrs = str_utf8_col(std::iter::once(Some(attributes.to_string())));
         let service = str_col(std::iter::once(Some("svc".to_owned())));
         let tid = str_col(std::iter::once(Some(tenant.to_string())));
         RecordBatch::try_new(

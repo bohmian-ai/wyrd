@@ -247,6 +247,12 @@ depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false", WYRD_BIFROST_CLOSEOUT = "1" }
 run = "cargo bench --locked -p wyrd-testing --bench bench_ingest_ack_latency -- --lane=sustained --pods=3 --tenants=100"
 
+[tasks."bench:bifrost:otlp:ingest"]
+description = "Load-test realistic OTLP span ingestion through Gate and Scribe"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw", VALA_RECOVERY_PASSWORD = "vala_recovery_pw", WYRD_AUDIT_RELAY_ENABLED = "false" }
+run = "cargo bench --locked -p wyrd-testing --bench bench_otlp_span_ingest -- --pods=3 --tenants=10 --target-spans-per-second=10000 --spans-per-request=100 --warmup-seconds=5 --measured-seconds=60 --max-in-flight=256 --verify-samples=3"
+
 [tasks."bench:bifrost:forge:single-tenant-single-node"]
 description = "Run Forge with one tenant on one node"
 depends = ["setup:postgres", "db:migrate"]

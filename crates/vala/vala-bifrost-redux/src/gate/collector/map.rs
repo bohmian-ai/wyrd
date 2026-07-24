@@ -13,7 +13,7 @@
 //!    system columns.
 //!
 //! `attributes` stays OPAQUE here: each span's attribute bag is serialized to a
-//! JSON string in the `attributes` `Utf8View` column. Redaction of that column
+//! JSON string in the `attributes` `Utf8` column. Redaction of that column
 //! happens at coordinator flush (the table is `PayloadClass::Sensitive`), never
 //! in this crate.
 
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use super::tables::{CorrelationPolicy, DomainTable, PointsTable, RecordsTable, SpansTable};
 use arrow::array::{
     ArrayRef, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, StringViewArray, TimestampMicrosecondArray, UInt32Array,
+    RecordBatch, StringArray, TimestampMicrosecondArray, UInt32Array,
 };
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use chrono::{DateTime, Utc};
@@ -414,7 +414,7 @@ pub fn spans_to_record_batch(records: &[SpanRecord]) -> Result<RecordBatch, Stri
         records
             .iter()
             .map(|r| Some(attrs_json(&r.attributes)))
-            .collect::<StringViewArray>(),
+            .collect::<StringArray>(),
     ) as ArrayRef;
 
     let dropped_attributes_count = Arc::new(UInt32Array::from_iter_values(
@@ -945,7 +945,7 @@ fn correlation_write_schema(mut fields: Vec<Field>) -> SchemaRef {
 /// Encode a slice of [`MetricRecord`]s into one Arrow [`RecordBatch`] shaped for
 /// the metrics group-commit coordinator (user fields + correlation columns).
 ///
-/// The bucket/quantile/exemplar/attribute columns carry JSON in their `Utf8View`
+/// The bucket/quantile/exemplar/attribute columns carry JSON in their `Utf8`
 /// columns, kept OPAQUE (redaction, where applicable, happens at coordinator
 /// flush). Resource `service.name` and the optional scope name/version land in
 /// the typed `service_name` / `scope_name` / `scope_version` columns.
@@ -1033,12 +1033,12 @@ fn metric_scalar_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
 }
 
 fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
-    let bucket_counts = json_view_col(
+    let bucket_counts = json_col(
         records
             .iter()
             .map(|r| r.bucket_counts.as_ref().map(json_of)),
     );
-    let explicit_bounds = json_view_col(
+    let explicit_bounds = json_col(
         records
             .iter()
             .map(|r| r.explicit_bounds.as_ref().map(json_of)),
@@ -1056,22 +1056,22 @@ fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
             .map(|r| r.zero_threshold)
             .collect::<Float64Array>(),
     ) as ArrayRef;
-    let positive_buckets = json_view_col(
+    let positive_buckets = json_col(
         records
             .iter()
             .map(|r| r.positive_buckets.as_ref().map(json_of)),
     );
-    let negative_buckets = json_view_col(
+    let negative_buckets = json_col(
         records
             .iter()
             .map(|r| r.negative_buckets.as_ref().map(json_of)),
     );
-    let quantile_values = json_view_col(
+    let quantile_values = json_col(
         records
             .iter()
             .map(|r| r.quantile_values.as_ref().map(json_of)),
     );
-    let exemplars = json_view_col(records.iter().map(|r| {
+    let exemplars = json_col(records.iter().map(|r| {
         if r.exemplars.is_empty() {
             None
         } else {
@@ -1082,7 +1082,7 @@ fn metric_opaque_columns(records: &[MetricRecord]) -> Vec<ArrayRef> {
         records
             .iter()
             .map(|r| Some(attrs_json(&r.attributes)))
-            .collect::<StringViewArray>(),
+            .collect::<StringArray>(),
     ) as ArrayRef;
     let service_name = Arc::new(StringArray::from_iter_values(
         records.iter().map(|r| r.resource.service_name.clone()),
@@ -1269,7 +1269,7 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
             .map(|r| r.event_name.clone())
             .collect::<StringArray>(),
     ) as ArrayRef;
-    let body = json_view_col(records.iter().map(|r| r.body.as_ref().map(json_of)));
+    let body = json_col(records.iter().map(|r| r.body.as_ref().map(json_of)));
     let trace_id = fixed16(records.iter().map(|r| r.trace_id.map(|id| *id.as_bytes())))?;
     let span_id = fixed8(records.iter().map(|r| r.span_id.map(|id| *id.as_bytes())))?;
     let trace_flags = Arc::new(
@@ -1278,7 +1278,7 @@ pub fn logs_to_record_batch(records: &[LogRecord]) -> Result<RecordBatch, String
             .map(|r| r.trace_flags.map(u32::from))
             .collect::<UInt32Array>(),
     ) as ArrayRef;
-    let attributes = json_view_col(records.iter().map(|r| {
+    let attributes = json_col(records.iter().map(|r| {
         if r.attributes.is_empty() {
             None
         } else {
@@ -1345,12 +1345,12 @@ fn ts_micros_col(values: impl Iterator<Item = Option<DateTime<Utc>>>) -> ArrayRe
     ) as ArrayRef
 }
 
-/// Build a `Utf8View` column from an iterator of optional JSON strings.
-fn json_view_col(values: impl Iterator<Item = Option<String>>) -> ArrayRef {
-    Arc::new(values.collect::<StringViewArray>()) as ArrayRef
+/// Build a `Utf8` column from an iterator of optional JSON strings.
+fn json_col(values: impl Iterator<Item = Option<String>>) -> ArrayRef {
+    Arc::new(values.collect::<StringArray>()) as ArrayRef
 }
 
-/// Serialize a value to its compact JSON string form for an opaque `Utf8View`
+/// Serialize a value to its compact JSON string form for an opaque `Utf8`
 /// column.
 fn json_of<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
@@ -1366,7 +1366,7 @@ fn u64_to_i64(value: u64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Array, FixedSizeBinaryArray, StringArray, StringViewArray};
+    use arrow::array::{Array, FixedSizeBinaryArray, StringArray};
     use wyrd_tonic::otlp::common::v1::{
         AnyValue, InstrumentationScope as OtlpScope, KeyValue, any_value,
     };
@@ -1617,12 +1617,12 @@ mod tests {
             .unwrap();
         assert_eq!(status.value(0), "ERROR");
 
-        // attributes is an opaque JSON string in a Utf8View column.
+        // attributes is an opaque JSON string in the storage-compatible Utf8 column.
         let attrs = batch
             .column_by_name("attributes")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(attrs.value(0)).expect("json");
         assert_eq!(
@@ -1796,12 +1796,12 @@ mod tests {
             .unwrap();
         assert!(is_monotonic.value(0));
 
-        // exemplars land as a JSON array in the exemplars Utf8View column.
+        // Exemplars land as a JSON array in the exemplars Utf8 column.
         let exemplars = batch
             .column_by_name("exemplars")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(exemplars.value(0)).expect("json");
         assert!(parsed.as_array().map(std::vec::Vec::len) == Some(1));
@@ -1936,7 +1936,7 @@ mod tests {
             .column_by_name("quantile_values")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         assert!(quantiles.is_null(0));
         assert!(!quantiles.is_null(2), "summary carries quantile_values");
@@ -2084,7 +2084,7 @@ mod tests {
             .column_by_name("body")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringViewArray>()
+            .downcast_ref::<StringArray>()
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(body.value(0)).expect("json");
         assert_eq!(parsed.as_str(), Some("boom"));

@@ -5,9 +5,9 @@
 //!
 //! Span attributes are stored as opaque `serde_json::Map<String,
 //! serde_json::Value>` on every record. Downstream (`vala-bifrost`)
-//! projects them to `Utf8View` Iceberg/Parquet columns and keeps them
+//! projects them to `Utf8` Iceberg/Parquet columns and keeps them
 //! opaque: DataFusion 54.0.0 reads a requested key from the projected
-//! `Utf8View` column, with no pre-extraction or JSON shredding into typed
+//! `Utf8` column, with no pre-extraction or JSON shredding into typed
 //! sidecar columns. The contract does not pre-extract tag or baggage
 //! attributes into separate records — see the trace-primitive README's
 //! "Storage doctrine" section for the rationale.

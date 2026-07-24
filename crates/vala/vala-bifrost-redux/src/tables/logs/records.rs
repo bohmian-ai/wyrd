@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, ts_us_utc, uint32, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -22,11 +22,11 @@ impl DomainTable for RecordsTable {
             uint32("severity_number", true),
             utf8("severity_text", true),
             utf8("event_name", true),
-            utf8_view("body", true),
+            utf8("body", true),
             fixed_binary("trace_id", 16, true),
             fixed_binary("span_id", 8, true),
             uint32("trace_flags", true),
-            utf8_view("attributes", true),
+            utf8("attributes", true),
             uint32("dropped_attributes_count", false),
             utf8("service_name", true),
             utf8("scope_name", true),

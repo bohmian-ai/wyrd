@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use arrow::array::{
     Array, FixedSizeBinaryArray, Float64Array, Int64Array, RecordBatch, StringArray,
-    StringViewArray, TimestampMicrosecondArray,
+    TimestampMicrosecondArray,
 };
 use axum::Json;
 use axum::Router;
@@ -117,27 +117,13 @@ fn get_hex(arr: Option<&FixedSizeBinaryArray>, i: usize) -> Option<String> {
     })
 }
 
-fn col_str_view<'a>(batch: &'a RecordBatch, name: &str) -> Option<&'a StringViewArray> {
-    batch
-        .column_by_name(name)
-        .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
-}
-
-fn get_str_view(arr: Option<&StringViewArray>, i: usize) -> Option<&str> {
+fn get_json_str(arr: Option<&StringArray>, i: usize) -> Option<serde_json::Value> {
     arr.and_then(|a| if a.is_null(i) { None } else { Some(a.value(i)) })
-}
-
-fn get_json_str_view(arr: Option<&StringViewArray>, i: usize) -> Option<serde_json::Value> {
-    arr.and_then(|a| {
-        if a.is_null(i) {
-            None
-        } else {
-            let s = a.value(i);
+        .and_then(|s| {
             serde_json::from_str(s)
                 .ok()
                 .or(Some(serde_json::Value::String(s.to_owned())))
-        }
-    })
+        })
 }
 
 // ─── row extractors ───────────────────────────────────────────────────────────
@@ -157,7 +143,7 @@ fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>
         let start_col = col_ts(batch, "start_time");
         let dur_col = col_i64(batch, "duration_ms");
         let status_col = col_str(batch, "status");
-        let attr_col = col_str_view(batch, "attributes");
+        let attr_col = col_str(batch, "attributes");
 
         for i in 0..batch.num_rows() {
             if let Some(filter) = trace_id_filter {
@@ -180,7 +166,7 @@ fn extract_span_rows_impl(batches: &[RecordBatch], trace_id_filter: Option<&str>
                     .map(|a| a.value(i) as f64)
                     .unwrap_or(0.0),
                 status: get_str(status_col, i).unwrap_or("").to_owned(),
-                attributes: get_json_str_view(attr_col, i),
+                attributes: get_json_str(attr_col, i),
             });
         }
     }
@@ -278,8 +264,8 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
         // `usage_*_tokens` are physically int64 in genai.messages.
         let in_tok_i64 = col_i64(batch, "usage_input_tokens");
         let out_tok_i64 = col_i64(batch, "usage_output_tokens");
-        let prompt_col = col_str_view(batch, "input_messages");
-        let completion_col = col_str_view(batch, "output_messages");
+        let prompt_col = col_str(batch, "input_messages");
+        let completion_col = col_str(batch, "output_messages");
 
         for i in 0..batch.num_rows() {
             rows.push(GenAiRow {
@@ -293,8 +279,8 @@ pub(crate) fn extract_genai_rows(batches: &[RecordBatch]) -> Vec<GenAiRow> {
                 input_tokens: in_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
                 output_tokens: out_tok_i64.filter(|a| !a.is_null(i)).map(|a| a.value(i)),
                 cost_usd: None, // Stage N placeholder — no physical column in genai.messages yet
-                prompt: get_str_view(prompt_col, i).map(|s| s.to_owned()),
-                completion: get_str_view(completion_col, i).map(|s| s.to_owned()),
+                prompt: get_str(prompt_col, i).map(|s| s.to_owned()),
+                completion: get_str(completion_col, i).map(|s| s.to_owned()),
             });
         }
     }
@@ -363,7 +349,7 @@ pub(crate) fn extract_metric_rows(batches: &[RecordBatch]) -> Vec<MetricRow> {
         let type_col = col_str(batch, "metric_type");
         let val_col = col_f64(batch, "value");
         let ts_col = col_ts(batch, "time");
-        let attr_col = col_str_view(batch, "attributes");
+        let attr_col = col_str(batch, "attributes");
 
         for i in 0..batch.num_rows() {
             rows.push(MetricRow {
@@ -377,7 +363,7 @@ pub(crate) fn extract_metric_rows(batches: &[RecordBatch]) -> Vec<MetricRow> {
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                attributes: get_json_str_view(attr_col, i),
+                attributes: get_json_str(attr_col, i),
             });
         }
     }
@@ -397,7 +383,7 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
             .column_by_name("span_id")
             .and_then(|c| c.as_any().downcast_ref::<FixedSizeBinaryArray>());
         let evt_col = col_str(batch, "event_name");
-        let body_col = col_str_view(batch, "body");
+        let body_col = col_str(batch, "body");
 
         for i in 0..batch.num_rows() {
             rows.push(LogRow {
@@ -413,7 +399,7 @@ pub(crate) fn extract_log_rows(batches: &[RecordBatch]) -> Vec<LogRow> {
                 trace_id: get_hex(trace_col, i),
                 span_id: get_hex(span_col, i),
                 event_name: get_str(evt_col, i).map(|s| s.to_owned()),
-                body: get_str_view(body_col, i).map(|s| s.to_owned()),
+                body: get_str(body_col, i).map(|s| s.to_owned()),
             });
         }
     }
@@ -429,7 +415,7 @@ pub(crate) fn extract_agent_trace_rows(batches: &[RecordBatch]) -> Vec<AgentTrac
         let branch_col = col_str(batch, "branch");
         let run_col = col_str(batch, "run_id");
         let start_col = col_ts(batch, "started_at");
-        let msgs_col = col_str_view(batch, "messages");
+        let msgs_col = col_str(batch, "messages");
 
         for i in 0..batch.num_rows() {
             rows.push(AgentTraceRow {
@@ -442,7 +428,7 @@ pub(crate) fn extract_agent_trace_rows(batches: &[RecordBatch]) -> Vec<AgentTrac
                     .filter(|a| !a.is_null(i))
                     .map(|a| ts_us_to_dt(a.value(i)))
                     .unwrap_or_default(),
-                payload: get_json_str_view(msgs_col, i),
+                payload: get_json_str(msgs_col, i),
             });
         }
     }

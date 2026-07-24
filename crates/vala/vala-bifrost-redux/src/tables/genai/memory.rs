@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -32,9 +32,9 @@ impl DomainTable for MemoryTable {
             utf8("memory_record_id", true),
             int64("memory_record_count", true),
             utf8("memory_query_text", true),
-            utf8_view("memory_records", true),
+            utf8("memory_records", true),
             utf8("error_type", true),
-            utf8_view("extra", true),
+            utf8("extra", true),
         ]
     }
 

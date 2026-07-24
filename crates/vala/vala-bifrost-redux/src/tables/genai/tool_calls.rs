@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, int64, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -33,14 +33,14 @@ impl DomainTable for ToolCallsTable {
             utf8("tool_type", true),
             utf8("tool_call_id", true),
             utf8("tool_description", true),
-            utf8_view("tool_call_arguments", true),
-            utf8_view("tool_call_result", true),
+            utf8("tool_call_arguments", true),
+            utf8("tool_call_result", true),
             utf8("mcp_session_id", true),
             utf8("mcp_method_name", true),
             utf8("mcp_protocol_version", true),
             utf8("mcp_resource_uri", true),
             utf8("error_type", true),
-            utf8_view("extra", true),
+            utf8("extra", true),
         ]
     }
 

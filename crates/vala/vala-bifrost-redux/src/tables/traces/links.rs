@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, uint32, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, uint32, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, IndexKind, PayloadClass, SortKey,
 };
@@ -23,7 +23,7 @@ impl DomainTable for LinksTable {
             fixed_binary("linked_span_id", 8, false),
             utf8("trace_state", true),
             uint32("flags", false),
-            utf8_view("attributes", true),
+            utf8("attributes", true),
             uint32("dropped_attributes_count", false),
         ]
     }

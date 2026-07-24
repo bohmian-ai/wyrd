@@ -36,7 +36,7 @@ sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -69,4 +69,8 @@ harness = false
 
 [[bench]]
 name = "bench_ingest_ack_latency"
+harness = false
+
+[[bench]]
+name = "bench_otlp_span_ingest"
 harness = false

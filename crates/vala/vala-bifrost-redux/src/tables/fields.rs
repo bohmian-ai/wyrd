@@ -9,10 +9,6 @@ pub fn utf8(name: &str, nullable: bool) -> Field {
     Field::new(name, DataType::Utf8, nullable)
 }
 
-pub fn utf8_view(name: &str, nullable: bool) -> Field {
-    Field::new(name, DataType::Utf8View, nullable)
-}
-
 pub fn ts_us_utc(name: &str, nullable: bool) -> Field {
     Field::new(
         name,

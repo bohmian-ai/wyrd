@@ -1,6 +1,6 @@
 use arrow::datatypes::Field;
 
-use crate::tables::fields::{fixed_binary, ts_us_utc, utf8, utf8_view};
+use crate::tables::fields::{fixed_binary, ts_us_utc, utf8};
 use crate::tables::{
     CorrelationPolicy, DeclaredIndex, DomainTable, EntityBoundsMapping, IndexKind, PayloadClass,
     SortKey,
@@ -27,8 +27,8 @@ impl DomainTable for AgentTracesTable {
             utf8("role", false),
             utf8("model", false),
             utf8("provider", false),
-            utf8_view("messages", false),
-            utf8_view("tool_io", true),
+            utf8("messages", false),
+            utf8("tool_io", true),
             ts_us_utc("started_at", false),
             ts_us_utc("ended_at", false),
         ]

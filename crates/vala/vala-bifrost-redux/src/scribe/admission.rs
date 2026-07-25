@@ -8,8 +8,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use num_traits::ToPrimitive;
-
 use crate::contracts::ScribeError;
 
 /// Maximum request size accepted by the Scribe seam.
@@ -25,118 +23,15 @@ pub const GLOBAL_INFLIGHT_ITEMS: usize = 4_096;
 pub struct AdmissionConfig {
     /// Pod memory budget used by the Scribe memory governor.
     pub memory_limit_bytes: usize,
-}
-
-/// Independent raw-ingress queue bounds. These bounds limit transport payloads
-/// waiting for or running through pre-ACK CPU work; retained canonical frames
-/// use [`AdmissionConfig`] instead.
-#[derive(Debug, Clone, Copy)]
-pub struct IngressQueueConfig {
-    /// Maximum raw frames in the ingress dispatcher.
-    pub max_items: usize,
-}
-
-#[derive(Debug, Default)]
-struct IngressQueueState {
-    items: usize,
-    bytes: usize,
-}
-
-#[derive(Debug)]
-struct IngressQueueInner {
-    config: IngressQueueConfig,
-    state: Mutex<IngressQueueState>,
-}
-
-/// Pod-global raw-ingress queue accounting.
-#[derive(Debug, Clone)]
-pub struct IngressQueueBudget {
-    inner: Arc<IngressQueueInner>,
-}
-
-impl IngressQueueBudget {
-    /// Construct a raw-ingress budget with explicit bounds.
-    #[must_use]
-    pub fn with_config(config: IngressQueueConfig) -> Self {
-        Self {
-            inner: Arc::new(IngressQueueInner {
-                config,
-                state: Mutex::new(IngressQueueState::default()),
-            }),
-        }
-    }
-
-    /// Reserve one raw frame without waiting.
-    pub fn try_reserve(
-        &self,
-        table: impl Into<String>,
-        bytes: usize,
-    ) -> Result<IngressQueueReservation, ScribeError> {
-        let table = table.into();
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("ingress queue state lock poisoned: {error}"),
-            })?;
-        if state.items >= self.inner.config.max_items {
-            return Err(ScribeError::IngestBusy { table });
-        }
-        state.items += 1;
-        state.bytes += bytes;
-        metrics::gauge!("bifrost_scribe_retained_items")
-            .set(state.items.to_f64().unwrap_or(f64::MAX));
-        metrics::gauge!("bifrost_scribe_retained_bytes")
-            .set(state.bytes.to_f64().unwrap_or(f64::MAX));
-        drop(state);
-        Ok(IngressQueueReservation {
-            inner: Some(Arc::clone(&self.inner)),
-            bytes,
-        })
-    }
-
-    /// Return the raw queue counters and configured bounds.
-    #[must_use]
-    pub fn snapshot(&self) -> IngressQueueSnapshot {
-        let state = match self.inner.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        IngressQueueSnapshot {
-            items: state.items,
-            bytes: state.bytes,
-            max_items: self.inner.config.max_items,
-        }
-    }
-
-    fn release(&self, bytes: usize) {
-        if let Ok(mut state) = self.inner.state.lock() {
-            state.items = state.items.saturating_sub(1);
-            state.bytes = state.bytes.saturating_sub(bytes);
-            metrics::gauge!("bifrost_scribe_retained_items")
-                .set(state.items.to_f64().unwrap_or(f64::MAX));
-            metrics::gauge!("bifrost_scribe_retained_bytes")
-                .set(state.bytes.to_f64().unwrap_or(f64::MAX));
-        }
-    }
-}
-
-/// Raw-ingress queue counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IngressQueueSnapshot {
-    /// Raw frames currently reserved.
-    pub items: usize,
-    /// Raw bytes currently reserved.
-    pub bytes: usize,
-    /// Configured raw frame ceiling.
-    pub max_items: usize,
+    /// Optional explicit Scribe child budget under the detected pod budget.
+    pub scribe_memory_limit_bytes: Option<usize>,
 }
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
         Self {
             memory_limit_bytes: 1024 * 1024 * 1024,
+            scribe_memory_limit_bytes: None,
         }
     }
 }
@@ -190,34 +85,15 @@ impl AdmissionController {
         &self,
         table: impl Into<String>,
         bytes: usize,
-    ) -> Result<RetainedFrameReservation, ScribeError> {
+    ) -> Result<InflightFrameReservation, ScribeError> {
         self.try_reserve_kind(table, bytes)
-    }
-
-    /// Reserve raw transport bytes before ingress decoding.
-    pub fn try_reserve_raw(
-        &self,
-        table: impl Into<String>,
-        bytes: usize,
-    ) -> Result<RawIngressReservation, ScribeError> {
-        let mut reservation = self.try_reserve_kind(table, bytes)?;
-        let inner = reservation
-            .inner
-            .take()
-            .ok_or_else(|| ScribeError::Internal {
-                detail: "new admission reservation did not contain state".to_owned(),
-            })?;
-        Ok(RawIngressReservation {
-            inner: Some(inner),
-            bytes: reservation.bytes,
-        })
     }
 
     fn try_reserve_kind(
         &self,
         table: impl Into<String>,
         bytes: usize,
-    ) -> Result<RetainedFrameReservation, ScribeError> {
+    ) -> Result<InflightFrameReservation, ScribeError> {
         let table = table.into();
         if !self.inner.wal_available.load(Ordering::Acquire) {
             return Err(ScribeError::WalDiskFull);
@@ -238,23 +114,23 @@ impl AdmissionController {
         state.bytes += bytes;
         drop(state);
 
-        Ok(RetainedFrameReservation {
+        Ok(InflightFrameReservation {
             inner: Some(Arc::clone(&self.inner)),
             bytes,
         })
     }
 
-    /// Reserve retained Arrow bytes for an active memtable generation.
+    /// Record Arrow bytes for an active memtable generation.
     ///
-    /// The breaker is pod-global and trips at 90% of the configured memory
-    /// budget. The caller must release the reservation if the memtable insert
-    /// fails.
+    /// The parent memory governor owns admission. These counters are a
+    /// non-reserving ownership dimension used for inspection and flush
+    /// selection; the caller must release them if insertion fails.
     pub fn try_reserve_active(
         &self,
         table: impl Into<String>,
         bytes: usize,
     ) -> Result<(), ScribeError> {
-        let table = table.into();
+        let _table = table.into();
         let mut state = self
             .inner
             .state
@@ -262,13 +138,6 @@ impl AdmissionController {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("admission state lock poisoned: {error}"),
             })?;
-        let retained = state
-            .active_bytes
-            .saturating_add(state.immutable_bytes)
-            .saturating_add(bytes);
-        if retained > self.memory_breaker_bytes() {
-            return Err(ScribeError::IngestBusy { table });
-        }
         state.active_bytes = state.active_bytes.saturating_add(bytes);
         Ok(())
     }
@@ -280,7 +149,7 @@ impl AdmissionController {
         }
     }
 
-    /// Transfer retained bytes from the active to immutable generation tier.
+    /// Transfer active bytes to the immutable generation tier.
     pub fn transfer_active_to_immutable(&self, bytes: usize) {
         if let Ok(mut state) = self.inner.state.lock() {
             let moved = bytes.min(state.active_bytes);
@@ -296,7 +165,7 @@ impl AdmissionController {
         }
     }
 
-    /// Transfer retained bytes back to the active generation after a seal
+    /// Transfer immutable bytes back to the active generation after a seal
     /// transaction rolls back.
     pub fn transfer_immutable_to_active(&self, bytes: usize) {
         if let Ok(mut state) = self.inner.state.lock() {
@@ -356,7 +225,6 @@ impl AdmissionController {
             state.bytes = state.bytes.saturating_sub(bytes);
         }
     }
-
 }
 
 impl Default for AdmissionController {
@@ -365,128 +233,47 @@ impl Default for AdmissionController {
     }
 }
 
-/// RAII reservation for one raw ingress payload.
+/// Canonical in-flight item and byte reservation carried by a shard queue.
 #[derive(Debug)]
-pub struct IngressQueueReservation {
-    inner: Option<Arc<IngressQueueInner>>,
-    bytes: usize,
-}
-
-impl IngressQueueReservation {
-    /// Transfer the raw queue reservation into the retained-frame budget.
-    ///
-    /// The raw reservation remains held when retained admission fails, so the
-    /// caller can retry or let normal RAII release the original accounting.
-    pub fn transfer_to_retained(
-        &mut self,
-        admission: &AdmissionController,
-        table: impl Into<String>,
-        retained_bytes: usize,
-    ) -> Result<RetainedFrameReservation, ScribeError> {
-        let retained = admission.try_reserve(table, retained_bytes)?;
-        self.release_inner();
-        Ok(retained)
-    }
-
-    fn release_inner(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            IngressQueueBudget { inner }.release(self.bytes);
-        }
-    }
-}
-
-impl Drop for IngressQueueReservation {
-    fn drop(&mut self) {
-        self.release_inner();
-    }
-}
-
-/// Raw transport item and byte reservation held during ingress decoding.
-#[derive(Debug)]
-pub struct RawIngressReservation {
+pub struct InflightFrameReservation {
     inner: Option<Arc<AdmissionInner>>,
     bytes: usize,
 }
 
-impl RawIngressReservation {
-    /// Return the request's charged byte count.
+impl InflightFrameReservation {
+    /// Return the in-flight byte charge.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
     }
 
-    /// Release the reservation immediately.
-    pub fn release(mut self) {
-        self.release_inner();
-    }
-
-    /// Atomically transfer this item from raw ingress bytes to retained bytes.
-    ///
-    /// The item count remains reserved while the byte charge is replaced. If
-    /// the retained charge would exceed the pod limit, the raw reservation is
-    /// left intact so the caller can release it through normal RAII.
-    pub fn transfer_to_retained(
-        &mut self,
-        retained_bytes: usize,
-    ) -> Result<RetainedFrameReservation, ScribeError> {
-        let Some(inner) = self.inner.take() else {
+    /// Resize the request charge while retaining the same global item.
+    pub fn resize(&mut self, bytes: usize) -> Result<(), ScribeError> {
+        let Some(inner) = &self.inner else {
             return Err(ScribeError::Internal {
-                detail: "raw ingress reservation was already released".to_owned(),
+                detail: "in-flight admission reservation was already released".to_owned(),
             });
         };
-        let result = match inner.state.lock() {
-            Ok(mut state) => {
-                let retained_total = state
+        let mut state = inner.state.lock().map_err(|_| ScribeError::Internal {
+            detail: "admission state lock poisoned while resizing reservation".to_owned(),
+        })?;
+        if bytes >= self.bytes {
+            let extra = bytes - self.bytes;
+            state.bytes =
+                state
                     .bytes
-                    .saturating_sub(self.bytes)
-                    .saturating_add(retained_bytes);
-                state.bytes = retained_total;
-                Ok(())
-            }
-            Err(_) => Err(ScribeError::Internal {
-                detail: "admission state lock poisoned while transferring reservation".to_owned(),
-            }),
-        };
-        match result {
-            Ok(()) => Ok(RetainedFrameReservation {
-                inner: Some(inner),
-                bytes: retained_bytes,
-            }),
-            Err(error) => {
-                self.inner = Some(inner);
-                Err(error)
-            }
+                    .checked_add(extra)
+                    .ok_or_else(|| ScribeError::IngestBusy {
+                        table: "vala.bifrost".to_owned(),
+                    })?;
+        } else {
+            state.bytes = state.bytes.saturating_sub(self.bytes - bytes);
         }
+        self.bytes = bytes;
+        Ok(())
     }
 
-    fn release_inner(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            AdmissionController { inner }.release_request(self.bytes);
-        }
-    }
-}
-
-impl Drop for RawIngressReservation {
-    fn drop(&mut self) {
-        self.release_inner();
-    }
-}
-
-/// Canonical retained item and byte reservation carried by a writer queue.
-#[derive(Debug)]
-pub struct RetainedFrameReservation {
-    inner: Option<Arc<AdmissionInner>>,
-    bytes: usize,
-}
-
-impl RetainedFrameReservation {
-    /// Return the retained byte charge.
-    #[must_use]
-    pub const fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    /// Release the retained reservation immediately.
+    /// Release the in-flight reservation immediately.
     pub fn release(mut self) {
         self.release_inner();
     }
@@ -498,7 +285,7 @@ impl RetainedFrameReservation {
     }
 }
 
-impl Drop for RetainedFrameReservation {
+impl Drop for InflightFrameReservation {
     fn drop(&mut self) {
         self.release_inner();
     }
@@ -507,7 +294,7 @@ impl Drop for RetainedFrameReservation {
 /// Read-only admission counters for inspection and telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdmissionSnapshot {
-    /// Accepted requests currently retained by Scribe.
+    /// Accepted requests currently in flight through Scribe.
     pub items: usize,
     /// Byte charge for accepted requests.
     pub bytes: usize,
@@ -531,6 +318,7 @@ mod tests {
     fn reservations_release_global_items_and_bytes() {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
+            scribe_memory_limit_bytes: None,
         });
         let reservation = admission
             .try_reserve("vala.bifrost.events", 10)
@@ -546,6 +334,7 @@ mod tests {
     fn admission_rejects_after_fixed_global_item_bound() {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
+            scribe_memory_limit_bytes: None,
         });
         let mut reservations = Vec::with_capacity(GLOBAL_INFLIGHT_ITEMS);
         for _ in 0..GLOBAL_INFLIGHT_ITEMS {
@@ -557,31 +346,32 @@ mod tests {
     }
 
     #[test]
-    fn active_and_immutable_bytes_use_the_ninety_percent_breaker() {
+    fn active_and_immutable_bytes_are_non_reserving_counters() {
         let admission = AdmissionController::with_config(AdmissionConfig {
             memory_limit_bytes: 100,
+            scribe_memory_limit_bytes: None,
         });
         admission
             .try_reserve_active("events", 90)
-            .expect("breaker allows exactly 90 percent");
-        assert!(admission.try_reserve_active("events", 1).is_err());
+            .expect("record active bytes");
+        admission
+            .try_reserve_active("events", 1)
+            .expect("counters do not reserve memory");
         admission.transfer_active_to_immutable(90);
-        assert_eq!(admission.snapshot().active_bytes, 0);
+        assert_eq!(admission.snapshot().active_bytes, 1);
         assert_eq!(admission.snapshot().immutable_bytes, 90);
         admission.release_immutable(90);
         assert_eq!(admission.snapshot().immutable_bytes, 0);
     }
 
     #[test]
-    fn raw_to_retained_transfer_releases_exactly_once() {
+    fn in_flight_resize_preserves_item_and_updates_bytes() {
         let admission = AdmissionController::default();
-        let mut raw = admission
-            .try_reserve_raw("events", 8)
-            .expect("raw reservation");
-        let retained = raw.transfer_to_retained(16).expect("retained transfer");
+        let mut reservation = admission.try_reserve("events", 8).expect("reserve");
+        reservation.resize(16).expect("resize");
         assert_eq!(admission.snapshot().items, 1);
         assert_eq!(admission.snapshot().bytes, 16);
-        drop(retained);
+        drop(reservation);
         assert_eq!(admission.snapshot().items, 0);
         assert_eq!(admission.snapshot().bytes, 0);
     }

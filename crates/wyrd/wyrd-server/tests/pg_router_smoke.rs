@@ -251,7 +251,8 @@ mod pg_tests {
         };
         let snapshot = Arc::new(ArcSwap::from_pointee(ReadinessSnapshot {
             postgres: ok_probe.clone(),
-            storage: ok_probe,
+            storage: ok_probe.clone(),
+            scribe: ok_probe,
         }));
         let state = test_state().await.with_readiness(snapshot);
 

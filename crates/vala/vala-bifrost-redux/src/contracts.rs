@@ -4,10 +4,10 @@
 //! Scribe (WAL + memtable + seal). Every method is async; every error is
 //! `ScribeError`.
 //!
-//! `Scribe::ingest_frame` returns a `FrameAdmission` after the frame owns a
-//! bounded writer-queue admission, not after WAL or memtable work completes.
-//! Idempotency is tracked by the batch identity `batch_id` during retention;
-//! the recovery path keys off the batch and seal key.
+//! `Scribe::ingest_frame` returns a `FrameAdmission` only after the batch has
+//! been WAL-synced and inserted into the active memtable. Idempotency is
+//! tracked by the batch identity `batch_id` during retention; the recovery
+//! path keys off the batch and seal key.
 
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
@@ -92,7 +92,9 @@ pub enum IngressPayload {
 /// The portion of a batch admission visible to the transport.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameAdmission {
-    /// Number of rows accepted into the durable ingest pipeline.
+    /// Exact batch identity durably admitted by Scribe.
+    pub batch_id: uuid::Uuid,
+    /// Number of rows durably admitted into the active ingest pipeline.
     pub rows_accepted: u64,
 }
 
@@ -111,7 +113,7 @@ pub enum ScribeError {
     #[error("schema fingerprint mismatch for table: {table}")]
     FingerprintMismatch { table: String },
 
-    #[error("ingest stream too many rows: {rows} > {limit}")]
+    #[error("ingest request has too many rows: {rows} > {limit}")]
     TooManyRows { rows: u64, limit: u64 },
 
     #[error("ingest frame validation failed")]
@@ -140,6 +142,40 @@ pub enum ScribeError {
 }
 
 impl ScribeError {
+    /// Create an owned completion-safe copy for every request in one failed
+    /// shard group. Transport errors may carry non-cloneable source errors,
+    /// so those are reduced to the stable internal category at this boundary.
+    pub(crate) fn completion_copy(&self) -> Self {
+        match self {
+            Self::IngestBusy { table } => Self::IngestBusy {
+                table: table.clone(),
+            },
+            Self::WalDiskFull => Self::WalDiskFull,
+            Self::PayloadTooLarge { bytes } => Self::PayloadTooLarge { bytes: *bytes },
+            Self::FingerprintMismatch { table } => Self::FingerprintMismatch {
+                table: table.clone(),
+            },
+            Self::TooManyRows { rows, limit } => Self::TooManyRows {
+                rows: *rows,
+                limit: *limit,
+            },
+            Self::InvalidFrame => Self::InvalidFrame,
+            Self::CardScopeDenied => Self::CardScopeDenied,
+            Self::CardUnresolved => Self::CardUnresolved,
+            Self::IngressClosed => Self::IngressClosed,
+            Self::ObjectStorePutFailed(error) => Self::Internal {
+                detail: format!("object store PUT failed: {error}"),
+            },
+            Self::StreamMismatch { requested, actual } => Self::StreamMismatch {
+                requested: *requested,
+                actual: *actual,
+            },
+            Self::Internal { detail } => Self::Internal {
+                detail: detail.clone(),
+            },
+        }
+    }
+
     /// Map to the corresponding `BifrostError` variant for HTTP/MCP/CLI surfaces.
     pub fn to_bifrost_error(&self) -> wyrd_spec::vala::error::BifrostError {
         use wyrd_spec::vala::error::BifrostError;
@@ -153,7 +189,7 @@ impl ScribeError {
                 table: table.clone(),
             },
             Self::TooManyRows { rows, limit } => BifrostError::Internal {
-                detail: format!("ingest stream too many rows: {rows} > {limit}"),
+                detail: format!("ingest request has too many rows: {rows} > {limit}"),
             },
             Self::InvalidFrame | Self::CardScopeDenied | Self::CardUnresolved => {
                 BifrostError::Internal {
@@ -187,17 +223,26 @@ impl From<vala_sql::SqlError> for ScribeError {
 
 /// Scribe trait — the durable write boundary.
 ///
-/// `FrameAdmission` signals bounded queue admission. WAL write, memtable
-/// insertion, and `sync_data` happen after the acknowledgment on a writer
-/// consumer.
+/// `FrameAdmission` is the durable Scribe acknowledgment. It is returned only
+/// after WAL append, grouped `sync_data`, and active memtable insertion.
 #[async_trait]
 pub trait Scribe: Send + Sync {
+    /// Report whether recovery completed and the durable write path accepts work.
+    ///
+    /// Implementations that do not have a startup recovery phase are ready by
+    /// default. The server-owned Scribe overrides this while replay is active
+    /// or has failed.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Validate, prepare, and admit one resolved frame.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError>;
 
-    /// Adapt an already-projected in-process frame to the resolved seam.
+    /// Adapt an already-projected in-process frame to the resolved seam and
+    /// return the durable batch acknowledgment.
     /// Network transports never call this method.
-    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+    async fn append_durable(&self, req: ScribeAppend) -> Result<FrameAdmission, ScribeError> {
         if req
             .rows
             .schema()
@@ -247,7 +292,12 @@ pub trait Scribe: Send + Sync {
             payload: IngressPayload::ProjectedArrow(vec![req.rows]),
         })
         .await
-        .map(|_| ())
+    }
+
+    /// Adapt an already-projected in-process frame to the resolved seam.
+    /// Network transports use the unary wire response with the same identity.
+    async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
+        self.append_durable(req).await.map(|_| ())
     }
 }
 

@@ -32,6 +32,7 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests replay safety for maintenance and orphan cleanup with real objects.
 ///
 /// Steps:
@@ -81,6 +82,7 @@ async fn forge_expiry_compaction_gc_matrix_never_deletes_live_file() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests the list-to-delete GC race with a real durable file-list reference.
 ///
 /// Steps:
@@ -131,6 +133,7 @@ async fn forge_gc_replay_preserves_live_reference() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests partial GC failure and restart recovery with real object-store state.
 ///
 /// Steps:
@@ -192,6 +195,7 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately before a destructive object-store effect.
 ///
 /// Steps:

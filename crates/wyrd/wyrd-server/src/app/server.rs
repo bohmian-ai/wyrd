@@ -485,14 +485,12 @@ mod pg_tests {
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let catalog = crate::test_support::test_catalog().await;
         let redux_catalog = crate::test_support::test_redux_catalog().await;
-        let tenant = crate::test_support::test_tenant().await;
         let wal_root = tempdir().expect("wal temp dir");
         let wal = Arc::new(
             WalWriter::new(
                 wal_root.path(),
                 *Uuid::now_v7().as_bytes(),
                 1,
-                tenant,
                 WalConfig::default(),
             )
             .expect("wal initializes"),

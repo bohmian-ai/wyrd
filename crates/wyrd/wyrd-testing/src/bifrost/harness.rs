@@ -6,6 +6,7 @@ use thiserror::Error;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
 use vala_bifrost_redux::scribe::seal::PostCommitBatch;
+use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_sql::TenantConn;
 use wyrd_spec::DataTenantId;
@@ -87,7 +88,6 @@ impl BifrostHarness {
                     *node_id.as_bytes(),
                     i64::try_from(index + 1)
                         .map_err(|error| HarnessError::Configuration(error.to_string()))?,
-                    tenants[0],
                     WalConfig::default(),
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
@@ -183,6 +183,18 @@ impl BifrostHarness {
             .iter()
             .map(|scribe| scribe.wal_bytes_on_disk())
             .sum()
+    }
+
+    /// Return one bounded ownership snapshot per real Scribe pod.
+    pub fn inspection_snapshots(&self) -> Result<Vec<ScribeInspectionSnapshot>, HarnessError> {
+        self.scribes
+            .iter()
+            .map(|scribe| {
+                scribe
+                    .inspection_snapshot()
+                    .map_err(|error| HarnessError::Scribe(error.to_string()))
+            })
+            .collect()
     }
 
     /// Return aggregate memtable state across pods.

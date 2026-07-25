@@ -1,93 +1,118 @@
-mod pg_tests {
-    //! Restart and replay tests for Scribe.
-    //!
-    //! Tests verify:
-    //! - Interleaved tenant LSNs seal correctly after crash/replay
-    //! - Replay-driven seal preserves per-append audit with correct `principal_id`
-    //! - Restart reproduces `file_list` rows with prior `writer_epoch`
-    //!
-    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
+//! Restart/replay coverage for the Task-15 Scribe WAL and immutable path.
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay + multi-tenant test harness"]
-    async fn pg_scribe_two_tenants_interleaved_lsn_crash_replay() {
-        // This test would verify correct tenant isolation during replay:
-        //
-        // 1. Start ScribeImpl with writer_epoch=1
-        // 2. Append rows for tenant A (vala.events, 2026-07-14)
-        // 3. Append rows for tenant B (vala.events, 2026-07-14) → LSNs interleave in WAL
-        // 4. Force seal for tenant A only → file_list row for A, audit rows for A
-        // 5. Simulate crash (drop ScribeImpl without sealing B)
-        // 6. Restart ScribeImpl with writer_epoch=2, same WAL directory
-        // 7. Replay reads WAL, skips A's sealed LSNs (via manifest), reconstructs B's memtable
-        // 8. Force seal for B → file_list row for B
-        //
-        // Verification:
-        // - file_list has exactly 2 rows (one per tenant)
-        // - A's row has writer_epoch=1, B's row has writer_epoch=1 (replayed epoch)
-        // - audit_outbox has correct row counts per tenant
-        // - No duplicate rows
-        //
-        // Implementation requires:
-        // - Full WAL replay (extract_seal_key_from_path with real tenant extraction)
-        // - Manifest read/write integration
-        // - Test harness that can restart ScribeImpl with shared WAL directory
-        //
-        // Deferred until WAL replay + manifest integration are complete.
-    }
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use chrono::NaiveDate;
+use opendal::services::Memory;
+use std::sync::Arc;
+use tempfile::TempDir;
+use uuid::Uuid;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
+use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::stream_identity::NodeId;
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay with stream-identity preservation"]
-    async fn pg_scribe_restart_replay_preserves_per_append_audit() {
-        // This test would verify that WAL replay preserves per-append stream identity
-        // (principal_id, request_id) across restarts:
-        //
-        // 1. Start ScribeImpl with writer_epoch=1
-        // 2. Make 5 appends from 3 distinct principals (varying principal_id)
-        // 3. Simulate crash before seal (drop ScribeImpl, leave WAL + memtable unsealed)
-        // 4. Restart ScribeImpl with writer_epoch=2, same WAL directory
-        // 5. Replay reconstructs memtable from WAL (including AuditEvent list)
-        // 6. Force seal
-        //
-        // Verification:
-        // - audit_outbox has exactly 5 rows
-        // - Each row has correct principal_id (matches original append's Principal)
-        // - Each row has correct request_id (matches original append's request_id)
-        // - file_list row has writer_epoch=1 (the epoch from original WAL writes)
-        //
-        // Implementation requires:
-        // - WAL replay that reconstructs AuditEvent list with full stream identity
-        // - Test harness that can capture original principal_id values and verify post-replay
-        //
-        // Deferred until WAL replay with stream-identity preservation lands.
-    }
+fn batch_bytes(value: i64) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![value]))],
+    )
+    .expect("test batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC finish");
+    bytes
+}
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay infrastructure"]
-    async fn pg_scribe_restart_reproduces_rows_exactly() {
-        // This test would verify that replay-driven seal produces identical file_list
-        // metadata to a non-restart seal:
-        //
-        // 1. Start ScribeImpl with writer_epoch=1
-        // 2. Append 10k rows (vala.events, 2026-07-14)
-        // 3. Simulate crash before seal
-        // 4. Restart ScribeImpl with writer_epoch=2, same WAL directory
-        // 5. Replay reconstructs memtable from WAL
-        // 6. Force seal
-        //
-        // Verification:
-        // - file_list has exactly 1 row
-        // - row_count = 10,000
-        // - wal_lsn_min, wal_lsn_max match the LSN range from original WAL writes
-        // - writer_epoch = 1 (original epoch, not restart epoch)
-        // - partition_day = 2026-07-14
-        // - Parquet file at file_path is readable and contains exact 10k rows
-        //
-        // Implementation requires:
-        // - Full WAL replay
-        // - Manifest integration (so restart knows sealed_lsn watermark)
-        // - Test harness that can restart ScribeImpl and verify file_list stability
-        //
-        // Deferred until WAL replay integration is complete.
+fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
+    AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: "vala.bifrost.task15".to_owned(),
+        card_ref: None,
+        principal_id: PrincipalId::new(Uuid::now_v7()),
+        principal_kind: PrincipalKindTag::User,
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:write".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: format!("tenant {tenant} rows"),
+        detail: None,
     }
+}
+
+fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
+    SealKey::new(
+        tenant,
+        TableRef::new(BifrostNamespace::Bifrost, table),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+    )
+}
+
+#[tokio::test]
+async fn restart_replay_restores_interleaved_tenants_into_immutable_memory() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+        .expect("WAL writer");
+    let tenant_a = DataTenantId::new_v7();
+    let tenant_b = DataTenantId::new_v7();
+    let key_a = seal_key(tenant_a, "task15_restart_a");
+    let key_b = seal_key(tenant_b, "task15_restart_b");
+    let data = batch_bytes(7);
+
+    let audit_a = encode_audit_event(&audit_event("tenant-a", tenant_a)).expect("audit");
+    let audit_b = encode_audit_event(&audit_event("tenant-b", tenant_b)).expect("audit");
+    for index in 0_u16..130 {
+        let mut batch_id = [0_u8; 16];
+        batch_id[..2].copy_from_slice(&index.to_le_bytes());
+        let (key, audit) = if index % 2 == 0 {
+            (&key_a, &audit_a)
+        } else {
+            (&key_b, &audit_b)
+        };
+        writer
+            .append_and_fsync_for_test(key, batch_id, audit, &data)
+            .expect("tenant append");
+    }
+    drop(writer);
+
+    let operator = Arc::new(
+        opendal::Operator::new(Memory::default())
+            .expect("memory object store")
+            .finish(),
+    );
+    let restarted_wal = Arc::new(
+        WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
+            .expect("restarted WAL writer"),
+    );
+    let scribe =
+        ScribeImpl::new_for_embedded_with_deps(operator, restarted_wal, node.to_string(), 2);
+
+    let restored = scribe.replay_wal_async().await.expect("replay");
+    assert!(restored > 0, "streamed replay should restore generations");
+    let stats = scribe.memtable_stats().expect("memtable stats");
+    assert_eq!(stats.immutable_rows, 130);
+    assert_eq!(stats.immutable_generations, restored);
+    assert_eq!(
+        scribe.memory_snapshot().categories[5],
+        stats.immutable_bytes
+    );
+    scribe.shutdown().await;
 }

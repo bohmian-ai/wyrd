@@ -9820,6 +9820,7 @@ dependencies = [
  "hex",
  "iceberg",
  "iceberg-catalog-sql",
+ "iceberg-datafusion",
  "iceberg-storage-opendal",
  "metrics",
  "num-traits",

@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use wyrd_auth_oidc::IssuerConfigResolver;
 use wyrd_auth_verify::PermissionResolver;
 use wyrd_runtime::PermissionCheck;
-use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_tonic::otlp::logs_service::logs_service_server::LogsService;
 use wyrd_tonic::otlp::logs_service::{ExportLogsServiceRequest, ExportLogsServiceResponse};
@@ -39,7 +38,7 @@ pub use crate::gate::collector::{
     source_schema_fingerprint,
 };
 pub use crate::gate::error::{CatalogError, IngestError};
-pub use crate::gate::limits::{BatchSemaphores, IngestLimits};
+pub use crate::gate::limits::IngestLimits;
 use crate::namespaces::BifrostNamespace;
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::routing::shard_for;
@@ -104,20 +103,6 @@ impl Catalog for BifrostCatalog {
     }
 }
 
-/// Narrow future read capability owned by the Redux Gate.
-///
-/// The read engine is intentionally not implemented by this task. Keeping the
-/// slot here prevents read handlers from silently reaching into storage while
-/// the Oracle task supplies the concrete implementation.
-pub trait Oracle: Send + Sync {}
-
-fn oracle_unavailable() -> WyrdError {
-    WyrdError::ServiceUnavailable {
-        message: "Bifrost Oracle is not available".to_owned(),
-        details: serde_json::Value::Null,
-    }
-}
-
 fn record_gate_event(event: &'static str) {
     metrics::counter!("bifrost_gate_events_total", "stage" => event).increment(1);
 }
@@ -131,8 +116,8 @@ fn record_gate_rows(accepted: i64, rejected: i64) {
 
 /// The concrete Bifrost write boundary.
 ///
-/// Gate owns authentication, stream bounds, tenant concurrency, and transport
-/// response ordering. The Scribe dependency is mandatory at construction.
+/// Gate owns authentication, request bounds, and transport response ordering.
+/// The Scribe dependency is mandatory at construction.
 #[derive(Clone)]
 pub struct Gate<
     C: Catalog + 'static,
@@ -141,10 +126,8 @@ pub struct Gate<
 > {
     catalog: Arc<C>,
     scribe: Arc<dyn Scribe>,
-    oracle: Option<Arc<dyn Oracle>>,
     limits: IngestLimits,
     projection: Arc<dyn ProjectionExecutor>,
-    semaphores: Arc<BatchSemaphores>,
     auth: IngestAuthInterceptor<R, I>,
     closed: Arc<AtomicBool>,
 }
@@ -160,16 +143,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         auth: IngestAuthInterceptor<R, I>,
         limits: IngestLimits,
     ) -> Self {
-        let semaphores = Arc::new(BatchSemaphores::new(
-            limits.max_concurrent_batches_per_tenant,
-        ));
         Self {
             catalog,
             scribe,
-            oracle: None,
             limits,
             projection: Arc::new(InlineProjectionExecutor),
-            semaphores,
             auth,
             closed: Arc::new(AtomicBool::new(false)),
         }
@@ -190,33 +168,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         gate
     }
 
-    /// Construct a Gate with an explicit future Oracle capability.
-    #[must_use]
-    pub fn with_scribe_and_oracle(
-        catalog: Arc<C>,
-        scribe: Arc<dyn Scribe>,
-        oracle: Arc<dyn Oracle>,
-        auth: IngestAuthInterceptor<R, I>,
-        limits: IngestLimits,
-    ) -> Self {
-        let mut gate = Self::with_scribe(catalog, scribe, auth, limits);
-        gate.oracle = Some(oracle);
-        gate
-    }
-
-    /// Dispatch the read slot without bypassing the future Oracle.
-    ///
-    /// Until an Oracle implementation is supplied, all read dispatches fail
-    /// with the stable service-unavailable contract.
-    pub fn dispatch_read(&self) -> Result<(), WyrdError> {
-        let _oracle = self.oracle.as_ref().ok_or_else(oracle_unavailable)?;
-        Err(WyrdError::ServiceUnavailable {
-            message: "Bifrost Oracle read dispatch is not implemented".to_owned(),
-            details: serde_json::Value::Null,
-        })
-    }
-
-    /// Stop accepting new streams and frames.
+    /// Stop accepting new ingest requests.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
             record_gate_event("close");
@@ -226,7 +178,10 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
 
     fn ensure_open(&self) -> Result<(), IngestError> {
         if self.closed.load(Ordering::Acquire) {
-            return Err(IngestError::WriterClosed);
+            return Err(IngestError::IngressClosed);
+        }
+        if !self.scribe.is_ready() {
+            return Err(IngestError::IngressClosed);
         }
         Ok(())
     }
@@ -464,13 +419,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             });
         }
         let batch_id: [u8; 16] = frame.wyrd_batch_id.as_ref().try_into().map_err(|_| {
-            IngestError::StreamProtocolViolation(
-                "wyrd_batch_id must be exactly 16 bytes".to_owned(),
-            )
+            IngestError::RequestValidation("wyrd_batch_id must be exactly 16 bytes".to_owned())
         })?;
         let batch_id = uuid::Uuid::from_bytes(batch_id);
         if batch_id.get_version() != Some(uuid::Version::SortRand) {
-            return Err(IngestError::StreamProtocolViolation(
+            return Err(IngestError::RequestValidation(
                 "wyrd_batch_id must be UUIDv7".to_owned(),
             ));
         }
@@ -557,9 +510,8 @@ fn authorize_record_write(auth: &AuthContext) -> Result<(), IngestError> {
 }
 
 fn resolve_fqn(fqn: &str) -> Result<(BifrostNamespace, String), IngestError> {
-    BifrostNamespace::split_fqn(fqn).ok_or_else(|| {
-        IngestError::StreamProtocolViolation(format!("unrecognized table fqn: {fqn}"))
-    })
+    BifrostNamespace::split_fqn(fqn)
+        .ok_or_else(|| IngestError::RequestValidation(format!("unrecognized table fqn: {fqn}")))
 }
 
 fn map_otlp_error(error: IngestError) -> Status {
@@ -578,7 +530,6 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             .authenticate(request.metadata())
             .await
             .map_err(Status::from)?;
-        let _permit = self.semaphores.acquire(auth.tenant)?;
         let frame = request.into_inner();
         validate_batch(&frame, &self.limits).map_err(Status::from)?;
         self.dispatch_native_frame(&self.limits, &auth, frame.clone())
@@ -599,7 +550,7 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
 
 fn validate_batch(frame: &InsertBatchRequest, limits: &IngestLimits) -> Result<(), IngestError> {
     if frame.table.is_empty() || frame.wyrd_batch_id.len() != 16 {
-        return Err(IngestError::StreamProtocolViolation(
+        return Err(IngestError::RequestValidation(
             "table and exactly 16-byte wyrd_batch_id are required on every frame".to_owned(),
         ));
     }
@@ -608,10 +559,10 @@ fn validate_batch(frame: &InsertBatchRequest, limits: &IngestLimits) -> Result<(
             .wyrd_batch_id
             .as_ref()
             .try_into()
-            .map_err(|_| IngestError::StreamProtocolViolation("invalid batch id".to_owned()))?,
+            .map_err(|_| IngestError::RequestValidation("invalid batch id".to_owned()))?,
     );
     if batch_id.get_version() != Some(uuid::Version::SortRand) {
-        return Err(IngestError::StreamProtocolViolation(
+        return Err(IngestError::RequestValidation(
             "wyrd_batch_id must be UUIDv7".to_owned(),
         ));
     }
@@ -698,7 +649,7 @@ mod tests {
     use super::collector::{IngestOutcome, ProjectedExport, ProjectionExecutor};
     use super::error::CatalogError;
     use super::limits::IngestLimits;
-    use super::{AuthContext, Catalog, Gate, IngestError, oracle_unavailable};
+    use super::{AuthContext, Catalog, Gate, IngestError};
     use crate::catalog::{TableRef, TenantTableBinding, TenantTableBindingError};
     use crate::namespaces::BifrostNamespace;
     use crate::schema::fingerprint::SchemaFingerprint;
@@ -713,14 +664,6 @@ mod tests {
     use wyrd_spec::ids::DataTenantId;
     use wyrd_spec::request_id::RequestId;
     use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
-
-    #[test]
-    fn gate_oracle_placeholder_fails_service_unavailable() {
-        assert_eq!(
-            oracle_unavailable().code(),
-            "WYRD_SERVER_503_SERVICE_UNAVAILABLE"
-        );
-    }
 
     #[derive(Debug)]
     struct TestCatalog;
@@ -770,7 +713,26 @@ mod tests {
             &self,
             _frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
-            Ok(crate::contracts::FrameAdmission { rows_accepted: 0 })
+            Ok(crate::contracts::FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 0,
+            })
+        }
+    }
+
+    struct NotReadyScribe;
+
+    #[async_trait]
+    impl crate::contracts::Scribe for NotReadyScribe {
+        fn is_ready(&self) -> bool {
+            false
+        }
+
+        async fn ingest_frame(
+            &self,
+            _frame: crate::contracts::ScribeIngressFrame,
+        ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
+            panic!("a not-ready Scribe must be rejected by Gate first");
         }
     }
 
@@ -785,7 +747,10 @@ mod tests {
             _frame: crate::contracts::ScribeIngressFrame,
         ) -> Result<crate::contracts::FrameAdmission, crate::contracts::ScribeError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok(crate::contracts::FrameAdmission { rows_accepted: 1 })
+            Ok(crate::contracts::FrameAdmission {
+                batch_id: uuid::Uuid::now_v7(),
+                rows_accepted: 1,
+            })
         }
     }
 
@@ -942,13 +907,12 @@ mod tests {
                 Arc::new(TestPermissionResolver),
                 wyrd_auth_verify::WyrdAuthVerifySettings::default(),
             );
-        let gate = Gate::<TestCatalog, TestPermissionResolver, TestIssuerResolver>::with_scribe(
+        let _gate = Gate::<TestCatalog, TestPermissionResolver, TestIssuerResolver>::with_scribe(
             Arc::new(TestCatalog),
             Arc::new(TestScribe),
             crate::gate::auth::ingest_auth_interceptor(Arc::new(verifier)),
             IngestLimits::default(),
         );
-        assert!(gate.dispatch_read().is_err());
     }
 
     #[tokio::test]
@@ -1058,7 +1022,28 @@ mod tests {
             .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
             .await
             .expect_err("closed Gate must reject new work");
-        assert!(matches!(error, IngestError::WriterClosed));
+        assert!(matches!(error, IngestError::IngressClosed));
+        assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn gate_rejects_ingest_when_scribe_recovery_is_incomplete() {
+        let projection_calls = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::with_scribe_and_projection(
+            Arc::new(TestCatalog),
+            Arc::new(NotReadyScribe),
+            test_interceptor(),
+            IngestLimits::default(),
+            Arc::new(FailingProjection {
+                calls: Arc::clone(&projection_calls),
+            }),
+        );
+
+        let error = gate
+            .ingest_resource_spans(&auth_context(true), ExportTraceServiceRequest::default())
+            .await
+            .expect_err("Gate must fail closed while Scribe recovery is incomplete");
+        assert!(matches!(error, IngestError::IngressClosed));
         assert_eq!(projection_calls.load(Ordering::Relaxed), 0);
     }
 }

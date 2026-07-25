@@ -868,12 +868,7 @@ async fn test_catalog(
     )
     .await
     .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-    let catalog = Arc::new(catalog);
-    // Mirror server boot: provision the pre-declared OLAP domain tables.
-    vala_bifrost::tables::register_all(&catalog)
-        .await
-        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-    Ok(catalog)
+    Ok(Arc::new(catalog))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

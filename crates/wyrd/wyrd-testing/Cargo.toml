@@ -6,10 +6,16 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+autotests = false
 
 [features]
 default = []
+bench = ["dep:wyrd-bench"]
 python = ["dep:pyo3", "dep:wyrd-utils"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 async-trait = { workspace = true }
@@ -51,7 +57,7 @@ wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-wyrd-bench = { workspace = true }
+wyrd-bench = { workspace = true, optional = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
 wyrd-client = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
@@ -64,17 +70,21 @@ wyrd-storage = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 
 [[bench]]
-name = "bench_real_bifrost_workload"
+name = "bench_bifrost_scribe"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
-name = "bench_ingest_ack_latency"
+name = "bench_bifrost_otlp"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
-name = "bench_otlp_span_ingest"
+name = "bench_bifrost_forge"
 harness = false
+required-features = ["bench"]
 
 [[bench]]
-name = "bench_otlp_span_ingest_rewrite"
+name = "bench_bifrost_oracle"
 harness = false
+required-features = ["bench"]

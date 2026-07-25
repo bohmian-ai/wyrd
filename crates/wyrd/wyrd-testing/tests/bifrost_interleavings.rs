@@ -9,7 +9,7 @@ use wyrd_testing::interleaving::Scheduler;
 #[derive(Debug, Default, Clone)]
 struct Model {
     raw_frames: usize,
-    retained_frames: usize,
+    in_flight_frames: usize,
     permits: usize,
     acknowledgements: usize,
     rejected_acknowledgements: usize,
@@ -45,12 +45,12 @@ fn run_case(case: u8) -> Model {
                 {
                     let mut state = model.borrow_mut();
                     state.raw_frames -= 1;
-                    state.retained_frames += 1;
+                    state.in_flight_frames += 1;
                     state.acknowledgements += 1;
                 }
                 post.yield_now().await;
                 let mut state = model.borrow_mut();
-                state.retained_frames -= 1;
+                state.in_flight_frames -= 1;
                 state.permits -= 1;
                 state.durable.insert((case, 0));
                 state.audit.insert((case, 0));
@@ -88,8 +88,8 @@ fn bifrost_interleavings_cover_ack_replay_cancel_shutdown_and_tenant_races() {
         let model = run_case(case);
         assert_eq!(model.raw_frames, 0, "case {case} leaked raw frames");
         assert_eq!(
-            model.retained_frames, 0,
-            "case {case} leaked retained frames"
+            model.in_flight_frames, 0,
+            "case {case} leaked in-flight frames"
         );
         assert_eq!(model.permits, 0, "case {case} leaked permits");
         assert!(

@@ -40,6 +40,7 @@ impl UploadAuditOperation {
 }
 
 /// Append one transition-level storage audit row to the Vala transactional outbox.
+// justification: the audit row must preserve the complete storage transition context as one atomic append; bundling these fields would obscure the wire-level audit contract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn write(
     conn: &mut TenantConn<'_>,

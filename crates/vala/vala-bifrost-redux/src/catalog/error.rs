@@ -29,6 +29,9 @@ pub enum BifrostCatalogError {
     /// Registration audit could not be appended atomically with the control row.
     #[error("audit outbox unavailable: {0}")]
     AuditUnavailable(String),
+    /// `DataFusion` provider construction failed.
+    #[error("datafusion provider error: {0}")]
+    DataFusion(#[from] datafusion::error::DataFusionError),
 }
 
 impl BifrostCatalogError {
@@ -45,6 +48,12 @@ impl BifrostCatalogError {
                 PublicError::MetadataMismatch { detail }
             }
             Self::AuditUnavailable(detail) => PublicError::AuditUnavailable { detail },
+            Self::DataFusion(error) => {
+                tracing::error!(error = %error, "Redux DataFusion provider construction failed");
+                PublicError::CatalogUnreachable {
+                    detail: "query provider construction failed".to_owned(),
+                }
+            }
             Self::Iceberg(error) => {
                 tracing::error!(error = %error, "Redux Iceberg catalog operation failed");
                 PublicError::CatalogUnreachable {

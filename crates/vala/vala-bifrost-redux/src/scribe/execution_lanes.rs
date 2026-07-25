@@ -1,6 +1,5 @@
 //! Bounded CPU execution lanes used by Scribe admission.
 
-use std::collections::HashMap;
 use std::io::Cursor;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
@@ -14,16 +13,17 @@ use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use num_traits::ToPrimitive;
-use tokio::sync::{Notify, Semaphore, oneshot};
+use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::schema::fingerprint::SchemaFingerprint;
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryLedger};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
-use crate::scribe::replay::ReplayedSealKey;
+use crate::scribe::replay::{ReplayChunk, ReplayedSealKey};
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{
@@ -40,8 +40,7 @@ use wyrd_spec::vala::managed_columns::{
 
 #[cfg(test)]
 const INGRESS_QUEUE_ITEMS: usize = 256;
-#[cfg(test)]
-const PERSISTENCE_QUEUE_ITEMS: usize = 64;
+pub(crate) const PERSISTENCE_QUEUE_ITEMS: usize = 64;
 #[cfg(test)]
 const WAL_IO_QUEUE_ITEMS: usize = 256;
 
@@ -550,6 +549,7 @@ pub(crate) enum ScribePersistenceCpuOp {
     },
     RestoreReplay {
         memtable: Arc<Memtable>,
+        memory_ledger: MemoryLedger,
         replayed: Box<ReplayedSealKey>,
     },
 }
@@ -559,7 +559,7 @@ pub(crate) enum ScribePersistenceCpuOp {
 pub(crate) enum ScribePersistenceCpuResult {
     Prepared(PreparedAppend),
     ParquetEncoded(ParquetEncoded),
-    ReplayRestored,
+    ReplayRestored(Box<FrozenMemtable>),
 }
 
 /// Bounded persistence CPU lane for day splitting and WAL serialization.
@@ -581,13 +581,7 @@ pub struct ScribePersistenceCpuPool {
 impl ScribePersistenceCpuPool {
     /// Build the fixed persistence CPU lane.
     pub(crate) fn new(worker_count: usize) -> Self {
-        Self::new_with_capacity(worker_count, 64)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_delay(worker_count: usize, preprocess_delay: std::time::Duration) -> Self {
-        Self::with_capacity_and_delay(worker_count, PERSISTENCE_QUEUE_ITEMS, preprocess_delay)
-            .expect("test persistence Rayon pool must be constructible")
+        Self::new_with_capacity(worker_count, PERSISTENCE_QUEUE_ITEMS)
     }
 
     /// Build the fixed persistence CPU lane with an explicit queue bound.
@@ -616,7 +610,7 @@ impl ScribePersistenceCpuPool {
         let capacity = capacity.max(1);
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count.max(1))
-            .thread_name(|index| format!("wyrd-scribe-post-ack-cpu-{index}"))
+            .thread_name(|index| format!("wyrd-scribe-persistence-cpu-{index}"))
             .build()?;
         Ok(Self {
             pool: Arc::new(pool),
@@ -690,9 +684,20 @@ impl ScribePersistenceCpuPool {
                     tenant,
                 } => encode_batch(&frozen, &binding, tenant)
                     .map(ScribePersistenceCpuResult::ParquetEncoded),
-                ScribePersistenceCpuOp::RestoreReplay { memtable, replayed } => memtable
-                    .restore_replayed(&replayed)
-                    .map(|_| ScribePersistenceCpuResult::ReplayRestored),
+                ScribePersistenceCpuOp::RestoreReplay {
+                    memtable,
+                    memory_ledger,
+                    replayed,
+                } => {
+                    let frozen = memtable.restore_replayed(&replayed)?;
+                    let arrow_bytes = frozen.arrow_bytes;
+                    memory_ledger
+                        .reserve_immutable(arrow_bytes)
+                        .inspect_err(|_error| {
+                            let _ = memtable.discard_pending_generation(frozen.seal_id);
+                        })?;
+                    Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
+                }
             }));
             depth.fetch_sub(1, Ordering::AcqRel);
             active.fetch_sub(1, Ordering::AcqRel);
@@ -762,24 +767,24 @@ pub(crate) enum ScribeWalIoOp {
         append: PreparedWalAppend,
     },
     SyncWal {
+        wal: WalHandle,
         segments: Vec<Arc<WalSegment>>,
     },
     #[expect(
         dead_code,
         reason = "task 14 persistence submits manifest replacements through this closed operation"
     )]
-    ReplaceManifest {
-        path: PathBuf,
-        contents: Bytes,
-    },
+    ReplaceManifest { path: PathBuf, contents: Bytes },
     AdvanceManifest {
         path: PathBuf,
         stream: StreamIdentity,
         seal_key: SealKey,
         sealed_lsn: crate::scribe::wal::WalLsn,
     },
-    ReplayDirectory {
+    ReplayDirectoryStream {
         path: PathBuf,
+        sender: mpsc::Sender<ReplayChunk>,
+        memory: BifrostMemoryGovernor,
     },
     RetireWal {
         wal: WalHandle,
@@ -790,13 +795,10 @@ pub(crate) enum ScribeWalIoOp {
 /// Results produced by [`ScribeWalIoPool`].
 #[derive(Debug)]
 pub(crate) enum ScribeWalIoResult {
-    WalWritten {
-        wal: WalHandle,
-        result: WalAppendResult,
-    },
+    WalWritten { result: WalAppendResult },
     WalSynced,
     Completed,
-    Replayed(HashMap<String, ReplayedSealKey>),
+    ReplayStreamCompleted,
 }
 
 /// Bounded filesystem lane for WAL append, sync, replay support, and retirement.
@@ -820,12 +822,6 @@ impl ScribeWalIoPool {
     #[cfg(test)]
     pub(crate) fn new(worker_count: usize) -> Self {
         Self::new_with_capacity(worker_count, WAL_IO_QUEUE_ITEMS)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_delay(worker_count: usize, sync_delay: std::time::Duration) -> Self {
-        Self::try_new_with_capacity_and_delay(worker_count, WAL_IO_QUEUE_ITEMS, sync_delay)
-            .expect("test WAL IO Rayon pool must be constructible")
     }
 
     /// Build the fixed WAL IO lane with an explicit queue bound.
@@ -985,13 +981,13 @@ fn execute_wal_io(
     match operation {
         ScribeWalIoOp::WritePrepared { wal, append } => {
             let result = wal.append_prepared(append)?;
-            Ok(ScribeWalIoResult::WalWritten { wal, result })
+            Ok(ScribeWalIoResult::WalWritten { result })
         }
-        ScribeWalIoOp::SyncWal { segments } => {
+        ScribeWalIoOp::SyncWal { wal, segments } => {
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }
-            WalHandle::sync_segments(&segments)?;
+            wal.sync_segments(&segments)?;
             Ok(ScribeWalIoResult::WalSynced)
         }
         ScribeWalIoOp::ReplaceManifest { path, contents } => {
@@ -1011,8 +1007,23 @@ fn execute_wal_io(
             replace_manifest(&path, &contents)?;
             Ok(ScribeWalIoResult::Completed)
         }
-        ScribeWalIoOp::ReplayDirectory { path } => {
-            crate::scribe::replay::replay_wal_directory(path).map(ScribeWalIoResult::Replayed)
+        ScribeWalIoOp::ReplayDirectoryStream {
+            path,
+            sender,
+            memory,
+        } => {
+            crate::scribe::replay::replay_wal_directory_stream_accounted(
+                path,
+                Some(&memory),
+                |chunk| {
+                    sender
+                        .blocking_send(chunk)
+                        .map_err(|_| ScribeError::Internal {
+                            detail: "replay consumer dropped the WAL chunk channel".to_owned(),
+                        })
+                },
+            )?;
+            Ok(ScribeWalIoResult::ReplayStreamCompleted)
         }
         ScribeWalIoOp::RetireWal { wal, segments } => {
             wal.retire_segments(&segments)?;
@@ -1069,7 +1080,7 @@ mod tests {
 
     use super::{
         ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool, decode,
-        source_schema_fingerprint,
+        source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::IngressPayload;
 
@@ -1085,6 +1096,25 @@ mod tests {
 
     fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("test batch")
+    }
+
+    #[test]
+    fn stamping_preserves_untouched_user_array_identity() {
+        let value = Arc::new(Int64Array::from(vec![1_i64, 2_i64])) as ArrayRef;
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::clone(&value)],
+        );
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &principal(),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            false,
+        )
+        .expect("stamp");
+        let value_index = stamped.schema().index_of("value").expect("value column");
+        assert!(Arc::ptr_eq(&value, stamped.column(value_index)));
     }
 
     #[test]
@@ -1143,7 +1173,7 @@ mod tests {
         assert!(
             ScribePersistenceCpuPool::new(1)
                 .worker_name()
-                .starts_with("wyrd-scribe-post-ack-cpu-")
+                .starts_with("wyrd-scribe-persistence-cpu-")
         );
     }
 

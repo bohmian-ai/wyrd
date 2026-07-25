@@ -4,10 +4,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use num_traits::ToPrimitive;
 use tokio::runtime::Handle;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 use vala_sql::ValaPostgres;
 use wyrd_spec::vala::api::AuditEvent;
@@ -19,6 +20,7 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -28,13 +30,11 @@ use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GenerationId(pub u64);
 
-/// Immutable state transferred from a writer consumer to persistence.
+/// Immutable state transferred from a shard owner to persistence.
 #[derive(Debug, Clone)]
 pub struct ImmutableGeneration {
     /// Logical tenant/table owning the generation.
-    pub writer_key: TenantTableKey,
-    /// Writer instance that detached the generation.
-    pub writer_instance_id: Uuid,
+    pub table_key: TenantTableKey,
     /// Event-day partition represented by the generation.
     pub seal_key: SealKey,
     /// Local generation identity.
@@ -51,8 +51,8 @@ pub struct ImmutableGeneration {
     pub wal: crate::scribe::wal::WalHandle,
     /// Original Arrow batches, shared by tail and persistence readers.
     pub rows: Vec<arrow::record_batch::RecordBatch>,
-    /// Merged Arrow batch used by the encoder.
-    pub batch: arrow::record_batch::RecordBatch,
+    /// Arrow schema shared by the original append batches.
+    pub schema: SchemaRef,
     /// Canonical audit events paired with the rows.
     pub audit_events: Vec<AuditEvent>,
     /// WAL-derived append metadata paired with the batches.
@@ -72,8 +72,7 @@ impl ImmutableGeneration {
     #[must_use]
     pub fn from_frozen(
         frozen: &FrozenMemtable,
-        writer_key: TenantTableKey,
-        writer_instance_id: Uuid,
+        table_key: TenantTableKey,
         stream: StreamIdentity,
         wal_segments: Vec<WalSegmentRef>,
         wal: crate::scribe::wal::WalHandle,
@@ -91,8 +90,7 @@ impl ImmutableGeneration {
             .max()
             .unwrap_or(WalLsn::ZERO);
         Self {
-            writer_key,
-            writer_instance_id,
+            table_key,
             seal_key: frozen.seal_key.clone(),
             generation_id: GenerationId(frozen.seal_id),
             stream,
@@ -101,10 +99,10 @@ impl ImmutableGeneration {
             wal_segments,
             wal,
             rows: frozen.batches.clone(),
-            batch: frozen.batch.clone(),
+            schema: frozen.schema.clone(),
             audit_events: frozen.events.clone(),
             append_metas: frozen.metas.clone(),
-            row_count: frozen.batch.num_rows(),
+            row_count: frozen.row_count(),
             arrow_bytes: frozen.arrow_bytes,
             opened_at: frozen.opened_at,
             closed_at: frozen.closed_at,
@@ -115,8 +113,7 @@ impl ImmutableGeneration {
         FrozenMemtable {
             seal_id: self.generation_id.0,
             seal_key: self.seal_key.clone(),
-            schema: self.batch.schema(),
-            batch: self.batch.clone(),
+            schema: self.schema.clone(),
             batches: self.rows.clone(),
             events: self.audit_events.clone(),
             metas: self.append_metas.clone(),
@@ -127,59 +124,24 @@ impl ImmutableGeneration {
     }
 }
 
-/// Completion sent through a writer's reliable control queue.
+/// Completion sent through the owning shard command queue.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistenceCompletion {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "legacy writer identity is used by test-only lifecycle probes"
-        )
-    )]
-    pub(crate) writer_instance_id: Uuid,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "legacy writer identity is used by test-only lifecycle probes"
-        )
-    )]
-    pub(crate) seal_key: SealKey,
     pub(crate) generation_id: GenerationId,
     pub(crate) file_list_key: Option<FileListCommitKey>,
     pub(crate) wal_segments: Vec<WalSegmentRef>,
     pub(crate) wal: crate::scribe::wal::WalHandle,
     pub(crate) arrow_bytes: usize,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "legacy writer timing is used by test-only lifecycle probes"
-        )
-    )]
-    pub(crate) published_at: std::time::Instant,
     pub(crate) error: Option<String>,
 }
 
-/// Completion controls shared by shard owners and persistence workers.
-#[derive(Debug)]
-pub(crate) enum WriterControl {
-    PersistenceComplete(PersistenceCompletion),
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "legacy writer grace control is test-only")
-    )]
-    GraceExpired(PersistenceCompletion),
-    Shutdown,
-}
-
 /// One immutable generation submitted to the bounded persistence queue.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct PersistenceJob {
     pub(crate) generation: Arc<ImmutableGeneration>,
     pub(crate) binding: TenantTableBinding,
-    pub(crate) completion_tx: mpsc::Sender<WriterControl>,
+    pub(crate) completion_tx: mpsc::Sender<crate::scribe::shards::ShardCommand>,
+    pub(crate) completion_waiter: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 /// Server-provisioned persistence dependencies.
@@ -221,6 +183,7 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) node_id: String,
     pub(crate) writer_epoch: i64,
+    pub(crate) memory: BifrostMemoryGovernor,
 }
 
 /// Bounded persistence queue and worker set.
@@ -266,6 +229,7 @@ impl PersistenceRuntime {
             wal_io: context.wal_io,
             node_id: context.node_id,
             writer_epoch: context.writer_epoch,
+            memory: context.memory,
             manifest_guard: tokio::sync::Mutex::new(()),
         });
         for _ in 0..config.workers {
@@ -301,7 +265,7 @@ impl PersistenceRuntime {
         runtime_state
     }
 
-    /// Try to enqueue a job without waiting in the writer consumer.
+    /// Try to enqueue a job without waiting in the shard owner.
     pub(crate) fn try_submit(&self, job: PersistenceJob) -> Result<(), Box<PersistenceJob>> {
         let sender = match self.sender.lock() {
             Ok(sender) => sender.clone(),
@@ -336,6 +300,61 @@ impl PersistenceRuntime {
                 Err(job)
             }
         }
+    }
+
+    /// Enqueue a job while honoring the bounded persistence queue.
+    ///
+    /// Boot replay uses this path because replay must pause behind downstream
+    /// publication instead of accumulating an unbounded in-memory generation
+    /// list. Normal shard flushes remain non-blocking and use [`Self::try_submit`].
+    pub(crate) async fn submit(&self, job: PersistenceJob) -> Result<(), ScribeError> {
+        let sender = match self.sender.lock() {
+            Ok(sender) => sender.clone(),
+            Err(_) => {
+                return Err(ScribeError::Internal {
+                    detail: "persistence queue lock poisoned".to_owned(),
+                });
+            }
+        };
+        let Some(sender) = sender else {
+            return Err(ScribeError::IngressClosed);
+        };
+        let queued_bytes = job.generation.arrow_bytes;
+        self.queued.fetch_add(1, Ordering::AcqRel);
+        self.queued_bytes.fetch_add(queued_bytes, Ordering::AcqRel);
+        if sender.send(Box::new(job)).await.is_err() {
+            self.queued.fetch_sub(1, Ordering::AcqRel);
+            self.queued_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
+            return Err(ScribeError::IngressClosed);
+        }
+        metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
+            self.queued
+                .load(Ordering::Acquire)
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
+        metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(
+            self.queued_bytes
+                .load(Ordering::Acquire)
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
+        Ok(())
+    }
+
+    /// Enqueue one generation and wait until its object and SQL publication
+    /// have completed. Boot replay uses this to keep WAL scanning behind the
+    /// bounded downstream publication boundary.
+    pub(crate) async fn submit_and_wait(&self, mut job: PersistenceJob) -> Result<(), ScribeError> {
+        let (sender, receiver) = oneshot::channel();
+        job.completion_waiter = Some(sender);
+        self.submit(job).await?;
+        receiver
+            .await
+            .map_err(|_| ScribeError::Internal {
+                detail: "persistence completion waiter dropped".to_owned(),
+            })?
+            .map_err(|detail| ScribeError::Internal { detail })
     }
 
     /// Stop accepting jobs and wait for queued jobs to finish.
@@ -373,20 +392,41 @@ struct PersistenceDependencies {
     wal_io: ScribeWalIoPool,
     node_id: String,
     writer_epoch: i64,
+    memory: BifrostMemoryGovernor,
     manifest_guard: tokio::sync::Mutex<()>,
 }
 
 async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies) {
     let generation = Arc::clone(&job.generation);
     tracing::debug!(
-        writer_instance_id = %generation.writer_instance_id,
         generation_id = generation.generation_id.0,
         seal_key = %generation.seal_key,
         wal_lsn_min = generation.wal_lsn_min.as_u64(),
         wal_lsn_max = generation.wal_lsn_max.as_u64(),
         "persisting immutable Scribe generation"
     );
-    let result = persist_with_retries(&generation, &job.binding, dependencies).await;
+    let workspace_bytes = generation
+        .arrow_bytes
+        .saturating_mul(2)
+        .saturating_add(8 * 1024 * 1024);
+    let result = match dependencies
+        .memory
+        .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
+    {
+        Ok(mut reservation) => {
+            reservation.attach_shard(
+                dependencies.memory.shard_accounting(),
+                crate::scribe::routing::shard_for(
+                    generation.seal_key.tenant,
+                    &generation.seal_key.table,
+                ),
+            );
+            let result = persist_with_retries(&generation, &job.binding, dependencies).await;
+            drop(reservation);
+            result
+        }
+        Err(error) => Err(error),
+    };
     let published_at = std::time::Instant::now();
     metrics::histogram!("bifrost_scribe_persistence_publication_seconds").record(
         published_at
@@ -395,31 +435,28 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
     );
     let completion = match result {
         Ok(file_list_key) => PersistenceCompletion {
-            writer_instance_id: generation.writer_instance_id,
-            seal_key: generation.seal_key.clone(),
             generation_id: generation.generation_id,
             file_list_key: Some(file_list_key),
             wal_segments: generation.wal_segments.clone(),
             wal: generation.wal.clone(),
             arrow_bytes: generation.arrow_bytes,
-            published_at,
             error: None,
         },
         Err(error) => PersistenceCompletion {
-            writer_instance_id: generation.writer_instance_id,
-            seal_key: generation.seal_key.clone(),
             generation_id: generation.generation_id,
             file_list_key: None,
             wal_segments: generation.wal_segments.clone(),
             wal: generation.wal.clone(),
             arrow_bytes: generation.arrow_bytes,
-            published_at,
             error: Some(error.to_string()),
         },
     };
     if job
         .completion_tx
-        .send(WriterControl::PersistenceComplete(completion))
+        .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
+            completion: Box::new(completion),
+            waiter: job.completion_waiter,
+        })
         .await
         .is_err()
     {
@@ -471,7 +508,7 @@ async fn persist_once(
         .await?
     {
         ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
-        ScribePersistenceCpuResult::Prepared(_) | ScribePersistenceCpuResult::ReplayRestored => {
+        ScribePersistenceCpuResult::Prepared(_) | ScribePersistenceCpuResult::ReplayRestored(_) => {
             return Err(ScribeError::Internal {
                 detail: "persistence lane returned the wrong persistence result".to_owned(),
             });

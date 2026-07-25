@@ -17,52 +17,41 @@ for lane in \
   fi
 done
 
-runner="crates/wyrd/wyrd-testing/benches/bench_real_bifrost_workload.rs"
-if [[ ! -f "$runner" ]]; then
-  echo "registered Bifrost lanes must use $runner" >&2
-  exit 1
-fi
+for runner in \
+  crates/wyrd/wyrd-testing/benches/bench_bifrost_scribe.rs \
+  crates/wyrd/wyrd-testing/benches/bench_bifrost_otlp.rs \
+  crates/wyrd/wyrd-testing/benches/bench_bifrost_forge.rs \
+  crates/wyrd/wyrd-testing/benches/bench_bifrost_oracle.rs; do
+  if [[ ! -f "$runner" ]]; then
+    echo "missing canonical Bifrost benchmark adapter: $runner" >&2
+    exit 1
+  fi
+  for symbol in BifrostLane BifrostScenario; do
+    if ! rg -n -w "$symbol" "$runner" >/dev/null; then
+      echo "$runner is missing typed scenario selection: $symbol" >&2
+      exit 1
+    fi
+  done
+done
 
-for symbol in WyrdTestCluster BifrostHarness run_maintenance_tick reqwest BenchmarkReport; do
-  if ! rg -n -w "$symbol" "$runner" >/dev/null; then
-    echo "real Bifrost benchmark runner is missing required path: $symbol" >&2
+for symbol in REPORT_SCHEMA_VERSION DurableAckSample DurableAckReport summarize_durable_acks; do
+  if ! rg -n -w "$symbol" crates/shared/wyrd-bench/src/lane.rs >/dev/null; then
+    echo "wyrd-bench is missing the versioned durable-ACK seam: $symbol" >&2
     exit 1
   fi
 done
 
-scribe_runner="crates/wyrd/wyrd-testing/benches/bench_ingest_ack_latency.rs"
-if [[ ! -f "$scribe_runner" ]]; then
-  echo "Scribe SLO lane is missing $scribe_runner" >&2
+if rg -n 'bench_real_bifrost_workload|bench_ingest_ack_latency|bench_otlp_span_ingest|otlp:ingest:rewrite' \
+  mise.toml crates/wyrd/wyrd-testing/Cargo.toml crates/wyrd/wyrd-testing/benches; then
+  echo "legacy Bifrost benchmark registration remains" >&2
   exit 1
 fi
-for symbol in compact_scribe_matrix WyrdTestCluster register_dataset ScribeBenchmarkReport ScribeTopologyEvidence ScribeComponentReport WalBenchSupport; do
-  if ! rg -n -w "$symbol" "$scribe_runner" >/dev/null; then
-    echo "Scribe benchmark runner is missing required path: $symbol" >&2
+
+for symbol in BifrostHarness WyrdTestCluster ScribeInspectionSnapshot; do
+  if ! rg -n -w "$symbol" crates/wyrd/wyrd-testing/src/bifrost >/dev/null; then
+    echo "real Bifrost harness is missing required path: $symbol" >&2
     exit 1
   fi
 done
-if rg -n 'TABLE_COUNT|bench_scribe_matrix|task-13d|component_reports|vala\.bifrost\.' "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
-  echo "Scribe benchmark runner contains stale topology or matrix vocabulary" >&2
-  exit 1
-fi
-
-for component in wal_prepare_crc_no_io vectored_append_no_sync sync_alone one_frame_append_sync 64_frame_append_one_sync gate_ack sdk_gate_scribe; do
-  if ! rg -n -F "\"$component\"" "$scribe_runner" crates/shared/wyrd-bench/src/report.rs >/dev/null; then
-    echo "Scribe component benchmark is missing required component: $component" >&2
-    exit 1
-  fi
-done
-
-if ! rg -n -w "ScribeRuntimeSnapshot" \
-  crates/wyrd/wyrd-testing/src/bifrost/harness.rs \
-  crates/vala/vala-bifrost-redux/src/scribe/telemetry.rs >/dev/null; then
-  echo "real Bifrost benchmark harness is missing ScribeRuntimeSnapshot" >&2
-  exit 1
-fi
-
-if rg -n 'Memory::default|chunks\(256\)|sort_unstable' "$runner" >/dev/null; then
-  echo "registered Bifrost runner contains a synthetic or in-memory substitute" >&2
-  exit 1
-fi
 
 echo "Bifrost benchmark registration passed"

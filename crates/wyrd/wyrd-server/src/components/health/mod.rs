@@ -47,6 +47,8 @@ pub enum ProbeReason {
     BackendError,
     /// Pre-boot warmup: the background task has not ticked yet.
     Warmup,
+    /// Scribe WAL recovery or downstream publication has not completed.
+    ScribeRecovery,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -56,6 +58,8 @@ pub struct ReadinessSnapshot {
     pub postgres: ProbeOutcome,
     /// Object storage liveness result.
     pub storage: ProbeOutcome,
+    /// Scribe recovery and write-path readiness result.
+    pub scribe: ProbeOutcome,
 }
 
 /// Per-dependency probe result.
@@ -82,13 +86,18 @@ impl ReadinessSnapshot {
         Self {
             postgres: warmup.clone(),
             storage: warmup,
+            scribe: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
         }
     }
 
     /// True when all probes passed in the most recent tick.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok
+        self.postgres.ok && self.storage.ok && self.scribe.ok
     }
 }
 
@@ -118,6 +127,28 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
     ReadinessSnapshot {
         postgres: pg,
         storage,
+        scribe: probe_scribe(state),
+    }
+}
+
+/// Read the Scribe recovery bit without touching its queues or storage.
+fn probe_scribe(state: &AppState) -> ProbeOutcome {
+    match &state.scribe {
+        Some(scribe) if scribe.is_ready() => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+        Some(_) => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeRecovery,
+            elapsed_ms: 0,
+        },
+        None => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
     }
 }
 
@@ -247,6 +278,7 @@ struct PublicReadinessReport {
 struct PublicChecks {
     postgres: PublicProbeOutcome,
     storage: PublicProbeOutcome,
+    scribe: PublicProbeOutcome,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -264,6 +296,9 @@ impl PublicReadinessReport {
                 },
                 storage: PublicProbeOutcome {
                     reason: snapshot.storage.reason,
+                },
+                scribe: PublicProbeOutcome {
+                    reason: snapshot.scribe.reason,
                 },
             },
         }
@@ -288,7 +323,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
     fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok
+        self.postgres.ok && self.storage.ok && self.scribe.ok
     }
 }
 
@@ -308,6 +343,11 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            scribe: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -323,6 +363,11 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            scribe: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -332,6 +377,7 @@ mod tests {
         assert!(!snap.all_ok());
         assert_eq!(snap.postgres.reason, ProbeReason::Warmup);
         assert_eq!(snap.storage.reason, ProbeReason::Warmup);
+        assert_eq!(snap.scribe.reason, ProbeReason::Warmup);
     }
 
     #[test]
@@ -344,6 +390,17 @@ mod tests {
     fn partial_failure_is_not_ready() {
         let snap = failing_snapshot();
         assert!(!snap.all_ok());
+    }
+
+    #[test]
+    fn failed_scribe_recovery_is_not_ready() {
+        let mut snapshot = all_ok_snapshot();
+        snapshot.scribe = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::ScribeRecovery,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
     }
 }
 

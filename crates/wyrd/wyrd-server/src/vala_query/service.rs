@@ -22,12 +22,21 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use datafusion::common::TableReference;
+use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{DataFrame, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
 use vala_bifrost::BifrostNamespace;
 use vala_bifrost::error::BifrostError as EngineBifrostError;
 use vala_bifrost::session::wyrd_session_context;
+use vala_bifrost_redux::catalog::{
+    BifrostCatalogError as ReduxCatalogError, TableRef as ReduxTableRef, TenantTableBinding,
+};
+use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
+use vala_bifrost_redux::scribe::seal_key::EventDay;
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
+use vala_bifrost_redux::scribe::wal::WalLsn;
+use vala_bifrost_redux::tables::builtin_table;
 use wyrd_runtime::{Action, Permission, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -43,6 +52,14 @@ use crate::components::auth::Caller;
 /// Default time window for `GetTrace` and listing queries (F-08: no unbounded scans).
 pub(crate) const DEFAULT_WINDOW_DAYS: i64 = 7;
 
+#[derive(Clone, Copy)]
+struct TableProviderScope<'a> {
+    tenant: wyrd_spec::ids::DataTenantId,
+    fqn: &'a str,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+}
+
 /// Ceiling on records collected before pagination (mirrors MAX_QUERY_PAGE_SIZE).
 pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
     requested
@@ -50,20 +67,120 @@ pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
         .min(MAX_QUERY_PAGE_SIZE)
 }
 
+/// Fetch the bounded active/immutable Scribe tail for one query table.
+pub(crate) async fn fetch_hot_batches(
+    state: &AppState,
+    table: &ReduxTableRef,
+    tenant: wyrd_spec::ids::DataTenantId,
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+) -> Result<Vec<arrow::record_batch::RecordBatch>, WyrdError> {
+    let Some(scribe) = state.scribe.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let now = Utc::now();
+    let start = since.unwrap_or_else(|| now - Duration::days(DEFAULT_WINDOW_DAYS));
+    let end = until.unwrap_or(now);
+    if start > end {
+        return Ok(Vec::new());
+    }
+    let binding = TenantTableBinding::resolve((tenant, table.clone())).map_err(|error| {
+        WyrdError::Internal {
+            message: "invalid tenant table binding".to_owned(),
+            details: serde_json::json!({ "detail": error.to_string() }),
+        }
+    })?;
+    let service = scribe.tail_service().map_err(|error| WyrdError::Internal {
+        message: "Scribe hot-read service unavailable".to_owned(),
+        details: serde_json::json!({ "detail": error.to_string() }),
+    })?;
+    let request = FetchLiveTailRequest {
+        binding,
+        target_stream: service.stream(),
+        start_day: EventDay::from_timestamp(start),
+        end_day: EventDay::from_timestamp(end),
+        after_lsn: WalLsn::ZERO,
+        required_columns: Vec::new(),
+    };
+    service
+        .fetch_hot_batches(request)
+        .await
+        .map(|batches| batches.into_iter().map(|batch| batch.rows).collect())
+        .map_err(|error| WyrdError::Internal {
+            message: "Scribe hot-read failed".to_owned(),
+            details: serde_json::json!({ "detail": error.to_string() }),
+        })
+}
+
 /// Register a domain table provider in `ctx`. A missing table (not yet materialized)
 /// is silently skipped — DataFusion planning will surface the error if the table is
 /// actually referenced.
+async fn attach_redux_table_provider(
+    ctx: &SessionContext,
+    state: &AppState,
+    ns: BifrostNamespace,
+    table_name: &str,
+    scope: TableProviderScope<'_>,
+) -> Result<(), WyrdError> {
+    let segment = ns.as_str().strip_prefix("vala.").unwrap_or(ns.as_str());
+    let redux_ns =
+        ReduxNamespace::from_domain_namespace(segment).ok_or_else(|| WyrdError::Internal {
+            message: "unknown Redux Bifrost namespace".to_owned(),
+            details: serde_json::json!({ "namespace": ns.as_str() }),
+        })?;
+    let table = ReduxTableRef::new(redux_ns, table_name);
+    let hot_batches =
+        fetch_hot_batches(state, &table, scope.tenant, scope.since, scope.until).await?;
+    let catalog = state
+        .bifrost_redux
+        .as_deref()
+        .ok_or_else(|| WyrdError::Internal {
+            message: "Redux Bifrost catalog is not configured".to_owned(),
+            details: serde_json::Value::Null,
+        })?;
+    match catalog
+        .provider_with_hot_batches(&table, scope.tenant, hot_batches)
+        .await
+    {
+        Ok(provider) => {
+            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(provider))
+                .map_err(|e| WyrdError::Internal {
+                    message: "failed to register domain table".to_owned(),
+                    details: serde_json::json!({ "detail": e.to_string() }),
+                })?;
+        }
+        Err(ReduxCatalogError::TableNotFound(_)) => {
+            let Some(definition) = builtin_table(segment, table_name) else {
+                return Ok(());
+            };
+            let empty = MemTable::try_new((definition.schema)(), vec![vec![]]).map_err(df_err)?;
+            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(empty))
+                .map_err(df_err)?;
+        }
+        Err(error) => {
+            return Err(WyrdError::Internal {
+                message: "bifrost provider error".to_owned(),
+                details: serde_json::json!({ "detail": error.to_string() }),
+            });
+        }
+    }
+    Ok(())
+}
+
 async fn attach_table_provider(
     ctx: &SessionContext,
     state: &AppState,
     ns: BifrostNamespace,
     table_name: &str,
-    tenant: wyrd_spec::ids::DataTenantId,
-    fqn: &str,
+    scope: TableProviderScope<'_>,
 ) -> Result<(), WyrdError> {
-    match state.bifrost.provider(ns, table_name, tenant).await {
+    if state.bifrost_redux.is_some() {
+        return attach_redux_table_provider(ctx, state, ns, table_name, scope).await;
+    }
+
+    match state.bifrost.provider(ns, table_name, scope.tenant).await {
         Ok(provider) => {
-            ctx.register_table(TableReference::bare(fqn), Arc::new(provider))
+            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(provider))
                 .map_err(|e| WyrdError::Internal {
                     message: "failed to register domain table".to_owned(),
                     details: serde_json::json!({ "detail": e.to_string() }),
@@ -165,8 +282,12 @@ pub async fn build_get_trace_plan(
         state,
         BifrostNamespace::Traces,
         "spans",
-        tenant,
-        "vala.traces.spans",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.traces.spans",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -201,8 +322,12 @@ pub async fn build_query_traces_plan(
         state,
         BifrostNamespace::Traces,
         "spans",
-        tenant,
-        "vala.traces.spans",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.traces.spans",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -235,8 +360,12 @@ pub async fn build_query_recent_traces_plan(
         state,
         BifrostNamespace::Traces,
         "spans",
-        tenant,
-        "vala.traces.spans",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.traces.spans",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -268,8 +397,12 @@ pub async fn build_query_genai_plan(
         state,
         BifrostNamespace::GenAi,
         "messages",
-        tenant,
-        "vala.genai.messages",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.genai.messages",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -306,8 +439,12 @@ pub async fn build_query_eval_plan(
         state,
         BifrostNamespace::Eval,
         "assertions",
-        tenant,
-        "vala.eval.assertions",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.eval.assertions",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -338,8 +475,12 @@ pub async fn build_query_drift_plan(
         state,
         BifrostNamespace::Drift,
         "observations",
-        tenant,
-        "vala.drift.observations",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.drift.observations",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -370,8 +511,12 @@ pub async fn build_query_metrics_plan(
         state,
         BifrostNamespace::Metrics,
         "points",
-        tenant,
-        "vala.metrics.points",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.metrics.points",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -401,8 +546,12 @@ pub async fn build_query_logs_plan(
         state,
         BifrostNamespace::Logs,
         "records",
-        tenant,
-        "vala.logs.records",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.logs.records",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 
@@ -439,8 +588,12 @@ pub async fn build_query_agent_traces_plan(
         state,
         BifrostNamespace::Dev,
         "agent_traces",
-        tenant,
-        "vala.dev.agent_traces",
+        TableProviderScope {
+            tenant,
+            fqn: "vala.dev.agent_traces",
+            since: req.window.since,
+            until: req.window.until,
+        },
     )
     .await?;
 

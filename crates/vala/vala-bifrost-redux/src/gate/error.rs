@@ -23,16 +23,15 @@ pub enum CatalogError {
     Internal(String),
 }
 
-/// Failures raised while serving a Bifrost ingest stream.
+/// Failures raised while serving a Bifrost ingest request.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     /// Bearer token missing, malformed, or rejected by the verifier.
     #[error("ingest authentication failed: {0}")]
     Unauthenticated(String),
-    /// Frame sequence violated the stream contract (mismatched `table/batch_id`,
-    /// too many frames, malformed batch id).
-    #[error("ingest stream protocol violation: {0}")]
-    StreamProtocolViolation(String),
+    /// A request field violated the native ingest contract.
+    #[error("ingest request validation failed: {0}")]
+    RequestValidation(String),
     /// A write to a server-managed built-in table.
     #[error("write to reserved built-in table denied: {table}")]
     ReservedBuiltinWriteDenied {
@@ -74,14 +73,6 @@ pub enum IngestError {
         /// Fully-qualified table name whose schema does not match.
         table: String,
     },
-    /// The stream exceeded the aggregate byte bound.
-    #[error("ingest stream too large ({bytes} > {limit} bytes)")]
-    BatchTooLarge {
-        /// Observed running byte total when the bound tripped.
-        bytes: u64,
-        /// The configured byte limit.
-        limit: u64,
-    },
     /// The server-measured canonical payload exceeded Scribe's 32 MiB limit.
     #[error("ingest payload too large ({bytes} > {limit} bytes)")]
     PayloadTooLarge {
@@ -90,29 +81,23 @@ pub enum IngestError {
         /// Scribe's fixed limit.
         limit: u64,
     },
-    /// The stream exceeded the aggregate row bound.
-    #[error("ingest stream too many rows ({rows} > {limit})")]
+    /// The request exceeded the aggregate row bound.
+    #[error("ingest request has too many rows ({rows} > {limit})")]
     TooManyRows {
         /// Observed running row total when the bound tripped.
         rows: u64,
         /// The configured row limit.
         limit: u64,
     },
-    /// An idle-frame gap or total-stream deadline elapsed.
-    #[error("ingest stream idle/deadline exceeded")]
-    StreamIdle,
-    /// The per-tenant concurrent-stream limit is saturated.
-    #[error("too many concurrent ingest streams for tenant")]
-    TooManyStreams,
-    /// The writer coordinator stopped before the commit completed.
-    #[error("ingest writer closed")]
-    WriterClosed,
-    /// The per-physical-table coordinator's local buffer is full.
+    /// The ingest coordinator stopped before the commit completed.
+    #[error("ingest coordinator closed")]
+    IngressClosed,
+    /// The bounded ingest coordinator's local buffer is full.
     ///
     /// Local backpressure only (Q5) — no rows from this request were written.
     /// Callers must back off and retry the full request.
-    #[error("ingest writer busy — local buffer full")]
-    WriterBusy,
+    #[error("ingest coordinator busy — local buffer full")]
+    IngestBusy,
     /// The pod-wide WAL disk breaker is open.
     #[error("ingest WAL storage is unavailable")]
     WalDiskFull,
@@ -129,7 +114,7 @@ impl IngestError {
     /// taxonomy used by HTTP and gRPC adapters.
     pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
         match error {
-            crate::contracts::ScribeError::IngestBusy { .. } => Self::WriterBusy,
+            crate::contracts::ScribeError::IngestBusy { .. } => Self::IngestBusy,
             crate::contracts::ScribeError::PayloadTooLarge { bytes } => Self::PayloadTooLarge {
                 bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
                 limit: u64::try_from(crate::scribe::admission::MAX_REQUEST_BYTES)
@@ -150,7 +135,7 @@ impl IngestError {
             crate::contracts::ScribeError::CardUnresolved => Self::CardUnresolved {
                 card_ref: "<server-validation>".to_owned(),
             },
-            crate::contracts::ScribeError::IngressClosed => Self::WriterClosed,
+            crate::contracts::ScribeError::IngressClosed => Self::IngressClosed,
             crate::contracts::ScribeError::WalDiskFull => Self::WalDiskFull,
             other => {
                 tracing::error!(error = %other, "Scribe ingest failed after transport validation");
@@ -164,7 +149,7 @@ impl IngestError {
     pub fn wyrd_code(&self) -> &'static str {
         match self {
             Self::Unauthenticated(_) => "WYRD_VALA_401_INGEST_AUTH",
-            Self::StreamProtocolViolation(_) | Self::Decode(_) => "WYRD_VALA_400_INGEST_PROTO",
+            Self::RequestValidation(_) | Self::Decode(_) => "WYRD_VALA_400_INGEST_PROTO",
             Self::ReservedBuiltinWriteDenied { .. } => {
                 "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE"
             }
@@ -174,14 +159,10 @@ impl IngestError {
             Self::RbacDenied { .. } => "WYRD_PERMISSION_403_DENIED_RBAC",
             Self::TableNotFound { .. } => "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
             Self::SchemaMismatch { .. } => "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-            Self::BatchTooLarge { .. } | Self::TooManyRows { .. } => {
-                "WYRD_VALA_413_INGEST_OVERSIZED"
-            }
+            Self::TooManyRows { .. } => "WYRD_VALA_413_INGEST_OVERSIZED",
             Self::PayloadTooLarge { .. } => "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-            Self::StreamIdle => "WYRD_VALA_408_INGEST_IDLE_TIMEOUT",
-            Self::TooManyStreams => "WYRD_VALA_429_INGEST_TOO_MANY_STREAMS",
-            Self::WriterClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
-            Self::WriterBusy => "WYRD_VALA_429_INGEST_BUSY",
+            Self::IngressClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
+            Self::IngestBusy => "WYRD_VALA_429_INGEST_BUSY",
             Self::WalDiskFull => "WYRD_VALA_507_INGEST_WAL_UNAVAILABLE",
             Self::Internal(_) => "WYRD_VALA_500_INGEST_INTERNAL",
         }
@@ -192,21 +173,18 @@ impl IngestError {
     pub fn grpc_code(&self) -> Code {
         match self {
             Self::Unauthenticated(_) | Self::PrincipalUnresolved => Code::Unauthenticated,
-            Self::StreamProtocolViolation(_) | Self::Decode(_) => Code::InvalidArgument,
+            Self::RequestValidation(_) | Self::Decode(_) => Code::InvalidArgument,
             Self::ReservedBuiltinWriteDenied { .. }
             | Self::CardScopeDenied { .. }
             | Self::CardUnresolved { .. }
             | Self::RbacDenied { .. } => Code::PermissionDenied,
             Self::TableNotFound { .. } => Code::NotFound,
             Self::SchemaMismatch { .. } => Code::FailedPrecondition,
-            Self::BatchTooLarge { .. }
-            | Self::TooManyRows { .. }
+            Self::TooManyRows { .. }
             | Self::PayloadTooLarge { .. }
-            | Self::TooManyStreams
-            | Self::WriterBusy
+            | Self::IngestBusy
             | Self::WalDiskFull => Code::ResourceExhausted,
-            Self::StreamIdle => Code::DeadlineExceeded,
-            Self::WriterClosed => Code::Aborted,
+            Self::IngressClosed => Code::Aborted,
             Self::Internal(_) => Code::Internal,
         }
     }

@@ -6,26 +6,45 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
-use tokio::sync::mpsc;
-use uuid::Uuid;
+use tokio::sync::{mpsc, watch};
 use wyrd_spec::ids::DataTenantId;
 
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::admission::AdmissionController;
-use crate::scribe::execution_lanes::{
-    ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
-    ScribeWalIoPool, ScribeWalIoResult,
-};
+use crate::scribe::execution_lanes::{ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult};
+use crate::scribe::memory::{MemoryCategory, MemoryLedger};
 use crate::scribe::memtable::Memtable;
 use crate::scribe::persistence::{
-    ImmutableGeneration, PersistenceJob, PersistenceRuntime, WriterControl,
+    ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
 };
-use crate::scribe::preprocess::{AdmittedAppend, AppendSliceId, PreparedAppend, PreparedSlice};
+use crate::scribe::preprocess::{AppendSliceId, PreparedAppend, PreparedSlice};
 use crate::scribe::routing::{SCRIBE_SHARD_COUNT, shard_for};
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, HotBatch};
 use crate::scribe::wal::{WalHandle, WalWriter};
+
+type WalSegmentsByKey = HashMap<
+    crate::scribe::seal_key::SealKey,
+    HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
+>;
+
+#[derive(Debug)]
+struct PendingGeneration {
+    generation: Arc<ImmutableGeneration>,
+    binding: crate::catalog::TenantTableBinding,
+    submitted: bool,
+}
+
+type PendingGenerationsByKey =
+    HashMap<crate::scribe::seal_key::SealKey, VecDeque<PendingGeneration>>;
+
+#[derive(Debug)]
+struct RetainedGeneration {
+    arrow_bytes: usize,
+    wal_segments: Vec<crate::scribe::wal::WalSegmentRef>,
+    wal: crate::scribe::wal::WalHandle,
+}
 
 /// Capacity of one shard command mailbox.
 pub const SHARD_COMMAND_CAPACITY: usize = 256;
@@ -36,11 +55,17 @@ pub const MAX_GROUP_ITEMS: usize = 64;
 /// Maximum bytes in one tenant scheduling group.
 pub const MAX_GROUP_BYTES: usize = 64 * 1024 * 1024;
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PressureSignal {
+    pub(crate) keys: Vec<crate::scribe::seal_key::SealKey>,
+    pub(crate) wal_key: Option<crate::scribe::seal_key::SealKey>,
+}
+
 /// A value that can be scheduled by a Scribe shard.
 pub trait ShardItem {
     /// Authenticated tenant owning the item.
     fn tenant(&self) -> DataTenantId;
-    /// Retained bytes charged to the item.
+    /// In-flight bytes charged to the item.
     fn bytes(&self) -> usize;
 }
 
@@ -153,33 +178,49 @@ impl<T: ShardItem> TenantRoundRobin<T> {
         }
     }
 
-    /// Drain one bounded group from the next tenant in round-robin order.
+    /// Drain one bounded group in tenant round-robin order.
+    ///
+    /// Each turn takes one complete request from the next active tenant. A
+    /// tenant with more pending work is requeued at the back, so a hot tenant
+    /// cannot fill an entire fsync group while another tenant waits behind it.
     pub fn pop_group(&mut self) -> Vec<T> {
         let mut result = Vec::new();
         let mut bytes = 0_usize;
-        let Some(tenant) = self.active_tenants.pop_front() else {
-            return result;
-        };
-        let Some(queue) = self.pending_by_tenant.get_mut(&tenant) else {
-            return result;
-        };
         while result.len() < MAX_GROUP_ITEMS {
-            let Some(item) = queue.front() else {
+            let Some(tenant) = self.active_tenants.pop_front() else {
                 break;
             };
-            if !result.is_empty() && bytes.saturating_add(item.bytes()) > MAX_GROUP_BYTES {
+            let Some(next_bytes) = self
+                .pending_by_tenant
+                .get(&tenant)
+                .and_then(|queue| queue.front())
+                .map(ShardItem::bytes)
+            else {
+                self.pending_by_tenant.remove(&tenant);
+                continue;
+            };
+            if !result.is_empty() && bytes.saturating_add(next_bytes) > MAX_GROUP_BYTES {
+                self.active_tenants.push_front(tenant);
                 break;
             }
-            let Some(item) = queue.pop_front() else {
-                break;
+            let item = self
+                .pending_by_tenant
+                .get_mut(&tenant)
+                .and_then(VecDeque::pop_front);
+            let Some(item) = item else {
+                continue;
             };
             bytes = bytes.saturating_add(item.bytes());
             result.push(item);
-        }
-        if queue.is_empty() {
-            self.pending_by_tenant.remove(&tenant);
-        } else {
-            self.active_tenants.push_back(tenant);
+            if self
+                .pending_by_tenant
+                .get(&tenant)
+                .is_some_and(|queue| !queue.is_empty())
+            {
+                self.active_tenants.push_back(tenant);
+            } else {
+                self.pending_by_tenant.remove(&tenant);
+            }
         }
         result
     }
@@ -191,23 +232,33 @@ impl<T: ShardItem> TenantRoundRobin<T> {
     }
 }
 
-impl ShardItem for AdmittedAppend {
+impl ShardItem for PreparedAppend {
     fn tenant(&self) -> DataTenantId {
         self.tenant
     }
 
     fn bytes(&self) -> usize {
-        self.admitted_bytes
+        self.prepared_bytes
     }
 }
 
 /// One command accepted by a fixed shard owner.
 #[derive(Debug)]
 pub(crate) enum ShardCommand {
-    Append(Box<AdmittedAppend>),
+    Append(Box<PreparedAppend>),
     Snapshot {
         request: FetchLiveTailRequest,
         response: tokio::sync::oneshot::Sender<Result<Vec<HotBatch>, ScribeError>>,
+    },
+    FlushExpired {
+        now: std::time::Instant,
+    },
+    PersistenceComplete {
+        completion: Box<PersistenceCompletion>,
+        waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+    FlushAll {
+        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
     Shutdown,
 }
@@ -216,34 +267,33 @@ pub(crate) enum ShardCommand {
 struct ShardDependencies {
     admission: AdmissionController,
     memtable: Arc<Memtable>,
-    wal: Arc<WalWriter>,
-    persistence_cpu: ScribePersistenceCpuPool,
     wal_io: ScribeWalIoPool,
     persistence: Option<Arc<PersistenceRuntime>>,
-    completion_tx: mpsc::Sender<WriterControl>,
+    completion_tx: mpsc::Sender<ShardCommand>,
     stream: StreamIdentity,
-    writer_instance_id: Uuid,
+    wal_handle: WalHandle,
+    memory_ledger: MemoryLedger,
 }
 
 /// The live fixed-shard Scribe runtime.
 #[derive(Debug)]
 pub(crate) struct ScribeShardRuntime {
     senders: Vec<ScribeShard<ShardCommand>>,
+    pressure_senders: Vec<watch::Sender<Option<PressureSignal>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pending: Arc<AtomicUsize>,
     drained: Arc<Notify>,
     closed: AtomicBool,
-    completion_tx: mpsc::Sender<WriterControl>,
 }
 
 pub(crate) struct ScribeShardStartConfig {
     pub(crate) admission: AdmissionController,
     pub(crate) memtable: Arc<Memtable>,
     pub(crate) wal: Arc<WalWriter>,
-    pub(crate) persistence_cpu: ScribePersistenceCpuPool,
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     pub(crate) stream: StreamIdentity,
+    pub(crate) memory_ledger: MemoryLedger,
 }
 
 impl ScribeShardRuntime {
@@ -253,41 +303,46 @@ impl ScribeShardRuntime {
             admission,
             memtable,
             wal,
-            persistence_cpu,
             wal_io,
             persistence,
             stream,
+            memory_ledger,
         } = config;
         let mut set = ScribeShardSet::<ShardCommand>::new();
         let receivers = set.take_receivers().unwrap_or_default();
-        let senders = (0..SCRIBE_SHARD_COUNT).map(|id| set.shard(id)).collect();
+        let senders: Vec<ScribeShard<ShardCommand>> =
+            (0..SCRIBE_SHARD_COUNT).map(|id| set.shard(id)).collect();
         let pending = Arc::new(AtomicUsize::new(0));
         let drained = Arc::new(Notify::new());
         let mut tasks = Vec::with_capacity(SCRIBE_SHARD_COUNT);
-        let (completion_tx, completion_rx) = mpsc::channel(256);
-        tasks.push(runtime.spawn(run_persistence_controls(
-            completion_rx,
-            Arc::clone(&memtable),
-            admission.clone(),
-            wal_io.clone(),
-        )));
+        let pressure_channels = (0..SCRIBE_SHARD_COUNT)
+            .map(|_| watch::channel(None))
+            .collect::<Vec<_>>();
+        let pressure_senders = pressure_channels
+            .iter()
+            .map(|(sender, _)| sender.clone())
+            .collect::<Vec<_>>();
         for (id, receiver) in receivers.into_iter().enumerate() {
+            let wal_handle = wal.handle_for_shard(id).unwrap_or_else(|error| {
+                panic!("fixed shard WAL handle must be constructible: {error}")
+            });
             let dependencies = ShardDependencies {
                 admission: admission.clone(),
                 memtable: Arc::clone(&memtable),
-                wal: Arc::clone(&wal),
-                persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
-                completion_tx: completion_tx.clone(),
+                completion_tx: senders[id].sender.clone(),
                 stream,
-                writer_instance_id: Uuid::now_v7(),
+                wal_handle,
+                memory_ledger: memory_ledger.clone(),
             };
             let pending_count = Arc::clone(&pending);
             let drained_signal = Arc::clone(&drained);
+            let (_, pressure_receiver) = &pressure_channels[id];
             tasks.push(runtime.spawn(run_shard(
                 id,
                 receiver,
+                pressure_receiver.clone(),
                 dependencies,
                 pending_count,
                 drained_signal,
@@ -295,25 +350,24 @@ impl ScribeShardRuntime {
         }
         Arc::new(Self {
             senders,
+            pressure_senders,
             tasks: tokio::sync::Mutex::new(tasks),
             pending,
             drained,
             closed: AtomicBool::new(false),
-            completion_tx,
         })
     }
 
     /// Enqueue a prepared request onto its deterministic shard.
-    pub(crate) fn try_send(
-        &self,
-        tenant: DataTenantId,
-        table: &TableRef,
-        append: AdmittedAppend,
-    ) -> Result<(), ScribeError> {
+    pub(crate) fn try_send(&self, mut append: PreparedAppend) -> Result<(), ScribeError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(ScribeError::IngressClosed);
         }
-        let shard = shard_for(tenant, table);
+        let shard = shard_for(append.tenant, &append.table);
+        let table_name = append.table.fqn();
+        if let Some(memory) = append.memory.as_mut() {
+            memory.transfer_category(MemoryCategory::Queued);
+        }
         self.pending.fetch_add(1, Ordering::AcqRel);
         let result = self.senders[shard].try_send(ShardCommand::Append(Box::new(append)));
         if let Err(error) = result {
@@ -321,16 +375,9 @@ impl ScribeShardRuntime {
             self.drained.notify_waiters();
             return Err(match error {
                 mpsc::error::TrySendError::Full(ShardCommand::Append(_)) => {
-                    ScribeError::IngestBusy { table: table.fqn() }
+                    ScribeError::IngestBusy { table: table_name }
                 }
-                mpsc::error::TrySendError::Closed(
-                    ShardCommand::Append(_)
-                        | ShardCommand::Snapshot { .. }
-                        | ShardCommand::Shutdown,
-                )
-                | mpsc::error::TrySendError::Full(
-                    ShardCommand::Snapshot { .. } | ShardCommand::Shutdown,
-                ) => {
+                mpsc::error::TrySendError::Closed(_) | mpsc::error::TrySendError::Full(_) => {
                     ScribeError::IngressClosed
                 }
             });
@@ -363,6 +410,57 @@ impl ScribeShardRuntime {
         })?
     }
 
+    /// Queue one age/pressure flush request per fixed shard owner.
+    pub(crate) fn request_expired_flush(&self, now: std::time::Instant) {
+        for sender in &self.senders {
+            let _ = sender.try_send(ShardCommand::FlushExpired { now });
+        }
+    }
+
+    /// Replace one coalescing pressure signal per fixed shard owner.
+    pub(crate) fn request_pressure_flush(&self, keys: Vec<crate::scribe::seal_key::SealKey>) {
+        let mut by_shard = vec![Vec::new(); SCRIBE_SHARD_COUNT];
+        for key in keys {
+            by_shard[shard_for(key.tenant, &key.table)].push(key);
+        }
+        for (shard, keys) in by_shard.into_iter().enumerate() {
+            if !keys.is_empty() {
+                self.pressure_senders[shard].send_replace(Some(PressureSignal {
+                    keys,
+                    wal_key: None,
+                }));
+            }
+        }
+    }
+
+    /// Replace one coalescing WAL pressure signal for its global victim.
+    pub(crate) fn request_wal_pressure_flush(&self, key: Option<crate::scribe::seal_key::SealKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        let shard = shard_for(key.tenant, &key.table);
+        self.pressure_senders[shard].send_replace(Some(PressureSignal {
+            keys: Vec::new(),
+            wal_key: Some(key),
+        }));
+    }
+
+    /// Flush every active bucket through its owning shard before shutdown.
+    pub(crate) async fn flush_all(&self) -> Result<(), ScribeError> {
+        for sender in &self.senders {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .sender
+                .send(ShardCommand::FlushAll { response })
+                .await
+                .map_err(|_| ScribeError::IngressClosed)?;
+            result.await.map_err(|_| ScribeError::Internal {
+                detail: "shard dropped shutdown flush response".to_owned(),
+            })??;
+        }
+        Ok(())
+    }
+
     /// Wait until all accepted shard commands have completed.
     pub(crate) async fn drain(&self) {
         loop {
@@ -380,6 +478,16 @@ impl ScribeShardRuntime {
         self.pending.load(Ordering::Acquire)
     }
 
+    /// Clone the owning shard command channel used by boot replay.
+    pub(crate) fn persistence_completion_sender(
+        &self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+    ) -> mpsc::Sender<ShardCommand> {
+        self.senders[shard_for(seal_key.tenant, &seal_key.table)]
+            .sender
+            .clone()
+    }
+
     /// Stop all owners after draining accepted work.
     pub(crate) async fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
@@ -387,7 +495,6 @@ impl ScribeShardRuntime {
         for sender in &self.senders {
             let _ = sender.try_send(ShardCommand::Shutdown);
         }
-        let _ = self.completion_tx.send(WriterControl::Shutdown).await;
         let mut tasks = self.tasks.lock().await;
         for task in tasks.drain(..) {
             let _ = task.await;
@@ -398,25 +505,46 @@ impl ScribeShardRuntime {
 async fn run_shard(
     id: usize,
     mut receiver: mpsc::Receiver<ShardCommand>,
+    mut pressure_receiver: watch::Receiver<Option<PressureSignal>>,
     dependencies: ShardDependencies,
     pending: Arc<AtomicUsize>,
     drained: Arc<Notify>,
 ) {
-    let mut scheduler = TenantRoundRobin::<AdmittedAppend>::default();
+    let mut scheduler = TenantRoundRobin::<PreparedAppend>::default();
     let mut shutting_down = false;
-    let mut seen_slices = HashSet::<AppendSliceId>::new();
-    let mut seen_rows = HashMap::<AppendSliceId, u64>::new();
-    let mut wal_handles = HashMap::<crate::scribe::seal_key::SealKey, WalHandle>::new();
-    let mut wal_bytes = HashMap::<crate::scribe::seal_key::SealKey, u64>::new();
+    let mut wal_segments = WalSegmentsByKey::new();
+    let mut synced_not_inserted = HashMap::<AppendSliceId, WalSliceState>::new();
+    let mut pending_generations = PendingGenerationsByKey::new();
+    let mut retained_generations = HashMap::<u64, RetainedGeneration>::new();
     loop {
+        if pressure_receiver.has_changed().unwrap_or(false) {
+            let signal = {
+                let borrowed = pressure_receiver.borrow_and_update();
+                borrowed.clone()
+            };
+            if let Some(signal) = signal {
+                handle_pressure_signal(
+                    signal,
+                    id,
+                    &dependencies,
+                    &mut wal_segments,
+                    &mut pending_generations,
+                );
+            }
+        }
         while let Ok(command) = receiver.try_recv() {
-            match command {
-                ShardCommand::Append(append) => scheduler.push(*append),
-                ShardCommand::Snapshot { request, response } => {
-                    let result = snapshot_at_owner(&dependencies, request);
-                    let _ = response.send(result);
-                }
-                ShardCommand::Shutdown => shutting_down = true,
+            if handle_shard_command(
+                command,
+                id,
+                &dependencies,
+                &mut scheduler,
+                &mut wal_segments,
+                &mut pending_generations,
+                &mut retained_generations,
+            )
+            .await
+            {
+                shutting_down = true;
             }
         }
         let group = scheduler.pop_group();
@@ -425,10 +553,9 @@ async fn run_shard(
             let result = process_group(
                 &dependencies,
                 group,
-                &mut seen_slices,
-                &mut seen_rows,
-                &mut wal_handles,
-                &mut wal_bytes,
+                &mut wal_segments,
+                &mut synced_not_inserted,
+                &mut pending_generations,
             )
             .await;
             if let Err(error) = result {
@@ -441,22 +568,104 @@ async fn run_shard(
         if shutting_down && scheduler.is_empty() && pending.load(Ordering::Acquire) == 0 {
             break;
         }
-        match receiver.recv().await {
-            Some(ShardCommand::Append(append)) => scheduler.push(*append),
-            Some(ShardCommand::Snapshot { request, response }) => {
-                let result = snapshot_at_owner(&dependencies, request);
-                let _ = response.send(result);
+        tokio::select! {
+            command = receiver.recv() => {
+                match command {
+                    Some(command) => {
+                        if handle_shard_command(
+                            command,
+                            id,
+                            &dependencies,
+                            &mut scheduler,
+                            &mut wal_segments,
+                            &mut pending_generations,
+                            &mut retained_generations,
+                        )
+                        .await
+                        {
+                            shutting_down = true;
+                        }
+                    }
+                    None => break,
+                }
             }
-            Some(ShardCommand::Shutdown) => shutting_down = true,
-            None => break,
+            changed = pressure_receiver.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
         }
     }
+}
+
+fn handle_pressure_signal(
+    signal: PressureSignal,
+    shard: usize,
+    dependencies: &ShardDependencies,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
+) {
+    if !signal.keys.is_empty()
+        && let Err(error) =
+            flush_keys_at_owner(dependencies, signal.keys, wal_segments, pending_generations)
+    {
+        tracing::warn!(error = %error, shard, "pressure flush failed");
+    }
+    if let Some(key) = signal.wal_key
+        && let Err(error) =
+            flush_keys_at_owner(dependencies, vec![key], wal_segments, pending_generations)
+    {
+        tracing::warn!(error = %error, shard, "WAL pressure flush failed");
+    }
+}
+
+/// Apply one command at the shard owner so both polling paths share the same
+/// ownership and error-handling behavior.
+async fn handle_shard_command(
+    command: ShardCommand,
+    id: usize,
+    dependencies: &ShardDependencies,
+    scheduler: &mut TenantRoundRobin<PreparedAppend>,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
+    retained_generations: &mut HashMap<u64, RetainedGeneration>,
+) -> bool {
+    match command {
+        ShardCommand::Append(append) => scheduler.push(*append),
+        ShardCommand::Snapshot { request, response } => {
+            let _ = response.send(snapshot_at_owner(dependencies, &request));
+        }
+        ShardCommand::FlushExpired { now } => {
+            if let Err(error) =
+                flush_expired_at_owner(dependencies, id, now, wal_segments, pending_generations)
+            {
+                tracing::warn!(error = %error, shard = id, "age flush failed");
+            }
+            retire_committed_at_owner(dependencies, now, retained_generations).await;
+        }
+        ShardCommand::FlushAll { response } => {
+            let result = flush_all_at_owner(dependencies, id, wal_segments, pending_generations);
+            let _ = response.send(result);
+        }
+        ShardCommand::PersistenceComplete { completion, waiter } => {
+            handle_persistence_completion(
+                dependencies,
+                *completion,
+                waiter,
+                pending_generations,
+                retained_generations,
+                wal_segments,
+            );
+        }
+        ShardCommand::Shutdown => return true,
+    }
+    false
 }
 
 /// Execute an Oracle structural snapshot at the single-owner state boundary.
 fn snapshot_at_owner(
     dependencies: &ShardDependencies,
-    request: FetchLiveTailRequest,
+    request: &FetchLiveTailRequest,
 ) -> Result<Vec<HotBatch>, ScribeError> {
     let readable = dependencies.memtable.readable_batches_for_range(
         request.binding.tenant,
@@ -467,7 +676,10 @@ fn snapshot_at_owner(
     )?;
     Ok(readable
         .into_iter()
-        .filter(|batch| batch.meta.wal_lsn_max > request.after_lsn)
+        .filter(|batch| {
+            request.after_lsn == crate::scribe::wal::WalLsn::ZERO
+                || batch.meta.wal_lsn_max > request.after_lsn
+        })
         .map(|batch| HotBatch {
             partition_day: batch.partition_day,
             wal_lsn: batch.meta.wal_lsn_max,
@@ -477,59 +689,325 @@ fn snapshot_at_owner(
         .collect())
 }
 
-async fn run_persistence_controls(
-    mut receiver: mpsc::Receiver<WriterControl>,
-    memtable: Arc<Memtable>,
-    admission: AdmissionController,
-    wal_io: ScribeWalIoPool,
-) {
-    while let Some(control) = receiver.recv().await {
-        match control {
-            WriterControl::Shutdown => break,
-            WriterControl::PersistenceComplete(completion) => {
-                if let Some(error) = completion.error {
-                    tracing::warn!(
-                        error,
-                        "shard persistence failed; retaining immutable generation"
-                    );
-                    continue;
-                }
-                let Some(file_list_key) = completion.file_list_key.clone() else {
-                    continue;
-                };
-                if let Err(error) =
-                    memtable.complete_post_commit(completion.generation_id.0, file_list_key)
-                {
-                    tracing::warn!(error = %error, "shard persistence completion could not publish generation");
-                    continue;
-                }
-                let memtable = Arc::clone(&memtable);
-                let admission = admission.clone();
-                let wal_io = wal_io.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(crate::scribe::memtable::ACTIVE_GENERATION_MAX_AGE / 10)
-                        .await;
-                    match memtable
-                        .retire_generation_at(completion.generation_id.0, std::time::Instant::now())
-                    {
-                        Ok(Some(_)) => {
-                            admission.release_immutable(completion.arrow_bytes);
-                            let _ = wal_io
-                                .submit(ScribeWalIoOp::RetireWal {
-                                    wal: completion.wal,
-                                    segments: completion.wal_segments,
-                                })
-                                .await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(error = %error, "shard generation retirement failed");
-                        }
-                    }
-                });
-            }
-            WriterControl::GraceExpired(_) => {}
+fn flush_expired_at_owner(
+    dependencies: &ShardDependencies,
+    shard: usize,
+    now: std::time::Instant,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
+) -> Result<(), ScribeError> {
+    let keys = dependencies
+        .memtable
+        .expired_seal_keys_for_shard(shard, now)?;
+    flush_keys_at_owner(dependencies, keys, wal_segments, pending_generations)?;
+    retry_pending_at_owner(dependencies, pending_generations, wal_segments);
+    Ok(())
+}
+
+fn flush_all_at_owner(
+    dependencies: &ShardDependencies,
+    shard: usize,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
+) -> Result<(), ScribeError> {
+    let keys = dependencies.memtable.active_seal_keys_for_shard(shard)?;
+    flush_keys_at_owner(dependencies, keys, wal_segments, pending_generations)
+}
+
+fn flush_keys_at_owner(
+    dependencies: &ShardDependencies,
+    keys: Vec<crate::scribe::seal_key::SealKey>,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
+) -> Result<(), ScribeError> {
+    for seal_key in keys {
+        if dependencies.memtable.row_count(&seal_key)? == 0 {
+            continue;
         }
+        let frozen = dependencies.memtable.freeze(&seal_key)?;
+        dependencies
+            .admission
+            .transfer_active_to_immutable(frozen.arrow_bytes);
+        dependencies
+            .memory_ledger
+            .move_active_to_immutable(frozen.arrow_bytes)?;
+        let Some(persistence) = &dependencies.persistence else {
+            continue;
+        };
+        let binding =
+            crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+        let segment_map = wal_segments.remove(&seal_key).unwrap_or_default();
+        let segment_refs = segment_map
+            .values()
+            .map(|segment| segment.reference())
+            .collect::<Vec<_>>();
+        dependencies.wal_handle.retain_segments(&segment_refs)?;
+        let generation = Arc::new(ImmutableGeneration::from_frozen(
+            &frozen,
+            (seal_key.tenant, seal_key.table.clone()),
+            dependencies.stream,
+            segment_refs.clone(),
+            dependencies.wal_handle.clone(),
+        ));
+        pending_generations
+            .entry(seal_key.clone())
+            .or_default()
+            .push_back(PendingGeneration {
+                generation,
+                binding,
+                submitted: false,
+            });
+        submit_front_at_owner(
+            dependencies,
+            &seal_key,
+            persistence,
+            pending_generations,
+            wal_segments,
+        );
+    }
+    Ok(())
+}
+
+fn submit_front_at_owner(
+    dependencies: &ShardDependencies,
+    seal_key: &crate::scribe::seal_key::SealKey,
+    persistence: &PersistenceRuntime,
+    pending_generations: &mut PendingGenerationsByKey,
+    wal_segments: &WalSegmentsByKey,
+) {
+    let Some(queue) = pending_generations.get_mut(seal_key) else {
+        return;
+    };
+    let Some(front) = queue.front_mut() else {
+        return;
+    };
+    if front.submitted {
+        return;
+    }
+    let generation = Arc::clone(&front.generation);
+    let binding = front.binding.clone();
+    if persistence
+        .try_submit(PersistenceJob {
+            generation: Arc::clone(&generation),
+            binding,
+            completion_tx: dependencies.completion_tx.clone(),
+            completion_waiter: None,
+        })
+        .is_err()
+    {
+        return;
+    }
+    front.submitted = true;
+    let active_paths = wal_segments
+        .values()
+        .flat_map(|segments| segments.keys().cloned())
+        .collect::<HashSet<_>>();
+    if let Err(error) = dependencies
+        .wal_handle
+        .close_segments_if_unowned(&generation.wal_segments, &active_paths)
+    {
+        tracing::warn!(error = %error, "closed WAL segment could not be detached after bucket rotation");
+    }
+}
+
+fn retry_pending_at_owner(
+    dependencies: &ShardDependencies,
+    pending_generations: &mut PendingGenerationsByKey,
+    wal_segments: &WalSegmentsByKey,
+) {
+    let Some(persistence) = &dependencies.persistence else {
+        return;
+    };
+    let keys = pending_generations.keys().cloned().collect::<Vec<_>>();
+    for key in keys {
+        submit_front_at_owner(
+            dependencies,
+            &key,
+            persistence,
+            pending_generations,
+            wal_segments,
+        );
+    }
+}
+
+async fn retire_committed_at_owner(
+    dependencies: &ShardDependencies,
+    now: std::time::Instant,
+    retained_generations: &mut HashMap<u64, RetainedGeneration>,
+) {
+    let generation_ids = retained_generations.keys().copied().collect::<Vec<_>>();
+    for generation_id in generation_ids {
+        let retired = match dependencies
+            .memtable
+            .retire_generation_at(generation_id, now)
+        {
+            Ok(retired) => retired,
+            Err(error) => {
+                tracing::warn!(error = %error, generation_id, "shard generation retirement failed");
+                continue;
+            }
+        };
+        if retired.is_none() {
+            continue;
+        }
+        let Some(retained) = retained_generations.remove(&generation_id) else {
+            continue;
+        };
+        dependencies
+            .admission
+            .release_immutable(retained.arrow_bytes);
+        let _ = dependencies
+            .memory_ledger
+            .release_immutable(retained.arrow_bytes);
+        if let Err(error) = dependencies
+            .wal_io
+            .submit(ScribeWalIoOp::RetireWal {
+                wal: retained.wal,
+                segments: retained.wal_segments,
+            })
+            .await
+        {
+            tracing::warn!(error = %error, generation_id, "WAL retirement submission failed");
+        }
+    }
+}
+
+fn handle_persistence_completion(
+    dependencies: &ShardDependencies,
+    completion: PersistenceCompletion,
+    waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    pending_generations: &mut PendingGenerationsByKey,
+    retained_generations: &mut HashMap<u64, RetainedGeneration>,
+    wal_segments: &WalSegmentsByKey,
+) {
+    let generation_id = completion.generation_id.0;
+    let seal_key = pending_generations.iter().find_map(|(key, queue)| {
+        queue
+            .front()
+            .filter(|front| front.generation.generation_id.0 == generation_id)
+            .map(|_| key.clone())
+    });
+    let Some(seal_key) = seal_key else {
+        handle_unowned_completion(dependencies, completion, waiter, retained_generations);
+        return;
+    };
+    if let Some(error) = completion.error.as_ref() {
+        mark_front_retryable(pending_generations, &seal_key);
+        tracing::warn!(error = %error, generation_id, "shard persistence failed; retaining immutable generation");
+        send_waiter_error(waiter, error.clone());
+        return;
+    }
+    let Some(file_list_key) = completion.file_list_key.clone() else {
+        mark_front_retryable(pending_generations, &seal_key);
+        send_waiter_error(
+            waiter,
+            "persistence completion omitted its file-list key".to_owned(),
+        );
+        return;
+    };
+    if let Err(error) = dependencies
+        .memtable
+        .complete_post_commit(generation_id, file_list_key)
+    {
+        mark_front_retryable(pending_generations, &seal_key);
+        tracing::warn!(error = %error, generation_id, "shard persistence completion could not publish generation");
+        send_waiter_error(waiter, error.to_string());
+        return;
+    }
+    let Some(queue) = pending_generations.get_mut(&seal_key) else {
+        return;
+    };
+    let Some(front) = queue.pop_front() else {
+        return;
+    };
+    if front.generation.generation_id.0 != generation_id {
+        queue.push_front(front);
+        return;
+    }
+    retained_generations.insert(
+        generation_id,
+        RetainedGeneration {
+            arrow_bytes: completion.arrow_bytes,
+            wal_segments: completion.wal_segments,
+            wal: completion.wal,
+        },
+    );
+    if queue.is_empty() {
+        pending_generations.remove(&seal_key);
+    }
+    if let Some(waiter) = waiter {
+        let _ = waiter.send(Ok(()));
+    }
+    if let Some(persistence) = &dependencies.persistence {
+        submit_front_at_owner(
+            dependencies,
+            &seal_key,
+            persistence,
+            pending_generations,
+            wal_segments,
+        );
+    }
+}
+
+fn mark_front_retryable(
+    pending_generations: &mut PendingGenerationsByKey,
+    seal_key: &crate::scribe::seal_key::SealKey,
+) {
+    if let Some(front) = pending_generations
+        .get_mut(seal_key)
+        .and_then(VecDeque::front_mut)
+    {
+        front.submitted = false;
+    }
+}
+
+fn send_waiter_error(
+    waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    detail: String,
+) {
+    if let Some(waiter) = waiter {
+        let _ = waiter.send(Err(detail));
+    }
+}
+
+fn handle_unowned_completion(
+    dependencies: &ShardDependencies,
+    completion: PersistenceCompletion,
+    waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    retained_generations: &mut HashMap<u64, RetainedGeneration>,
+) {
+    let generation_id = completion.generation_id.0;
+    if let Some(error) = completion.error {
+        send_waiter_error(waiter, error);
+        return;
+    }
+    let Some(file_list_key) = completion.file_list_key else {
+        send_waiter_error(
+            waiter,
+            "persistence completion omitted its file-list key".to_owned(),
+        );
+        return;
+    };
+    if let Err(error) = dependencies
+        .memtable
+        .complete_post_commit(generation_id, file_list_key)
+    {
+        send_waiter_error(waiter, error.to_string());
+        return;
+    }
+    retained_generations.insert(
+        generation_id,
+        RetainedGeneration {
+            arrow_bytes: completion.arrow_bytes,
+            wal_segments: completion.wal_segments,
+            wal: completion.wal,
+        },
+    );
+    if let Some(waiter) = waiter {
+        let _ = waiter.send(Ok(()));
     }
 }
 
@@ -542,44 +1020,63 @@ struct DurableSlice {
     lsn: crate::scribe::wal::WalLsn,
 }
 
+/// A WAL-synced slice whose Arrow rows have not yet reached the active
+/// memtable. Successful insertion removes the entry, so this bounded index
+/// only covers the fsync-success/memtable-failure retry window.
+struct WalSliceState {
+    lsn: crate::scribe::wal::WalLsn,
+}
+
 struct GroupWalState {
     prepared: Vec<PreparedAppend>,
     durable: Vec<DurableSlice>,
     touched: HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
-    touched_by_key: HashMap<
-        crate::scribe::seal_key::SealKey,
-        HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
-    >,
     rows_by_append: HashMap<[u8; 16], u64>,
 }
 
 async fn process_group(
     dependencies: &ShardDependencies,
-    group: Vec<AdmittedAppend>,
-    seen_slices: &mut HashSet<AppendSliceId>,
-    seen_rows: &mut HashMap<AppendSliceId, u64>,
-    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
-    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, u64>,
+    group: Vec<PreparedAppend>,
+    wal_segments: &mut WalSegmentsByKey,
+    synced_not_inserted: &mut HashMap<AppendSliceId, WalSliceState>,
+    pending_generations: &mut PendingGenerationsByKey,
 ) -> Result<(), ScribeError> {
-    let prepared = prepare_group(dependencies, group).await?;
-    let mut state = write_group(
+    let mut state = write_group(dependencies, group, wal_segments, synced_not_inserted).await?;
+    if let Err(error) = sync_group(dependencies, &state.touched).await {
+        release_active_reservations(dependencies, &state.durable);
+        mark_wal_error(dependencies, &error);
+        notify_prepared_error(&mut state.prepared, &error);
+        return Err(error);
+    }
+    for slice in &state.durable {
+        synced_not_inserted.insert(
+            AppendSliceId {
+                batch_id: uuid::Uuid::from_bytes(slice.batch_id),
+                seal_key: slice.seal_key.clone(),
+            },
+            WalSliceState { lsn: slice.lsn },
+        );
+    }
+    let touched_keys = match insert_group(
         dependencies,
-        prepared,
-        seen_slices,
-        seen_rows,
-        wal_handles,
-        wal_bytes,
-    )
-    .await?;
-    sync_group(dependencies, &state.touched).await?;
-    let touched_keys = insert_group(dependencies, state.durable, &mut state.rows_by_append)?;
-    rotate_group(
+        state.durable,
+        &mut state.rows_by_append,
+        synced_not_inserted,
+    ) {
+        Ok(keys) => keys,
+        Err(error) => {
+            notify_prepared_error(&mut state.prepared, &error);
+            return Err(error);
+        }
+    };
+    if let Err(error) = rotate_group(
         dependencies,
         touched_keys,
-        &mut state.touched_by_key,
-        wal_handles,
-        wal_bytes,
-    )?;
+        wal_segments,
+        pending_generations,
+    ) {
+        tracing::warn!(error = %error, "durable append completed but bucket rotation was deferred");
+    }
     for append in state.prepared {
         if let Some(sender) = append.durable_ack {
             let rows = state
@@ -594,112 +1091,198 @@ async fn process_group(
     Ok(())
 }
 
-async fn prepare_group(
-    dependencies: &ShardDependencies,
-    group: Vec<AdmittedAppend>,
-) -> Result<Vec<PreparedAppend>, ScribeError> {
-    let mut prepared = Vec::with_capacity(group.len());
-    for append in group {
-        let prepared_append = match dependencies
-            .persistence_cpu
-            .submit(ScribePersistenceCpuOp::Preprocess(Box::new(append)))
-            .await?
-        {
-            ScribePersistenceCpuResult::Prepared(value) => value,
-            ScribePersistenceCpuResult::ParquetEncoded(_) | ScribePersistenceCpuResult::ReplayRestored => {
-                return Err(ScribeError::Internal {
-                    detail: "persistence lane returned the wrong shard result".to_owned(),
-                });
-            }
-        };
-        prepared.push(prepared_append);
-    }
-    Ok(prepared)
-}
-
 async fn write_group(
     dependencies: &ShardDependencies,
     mut prepared: Vec<PreparedAppend>,
-    seen_slices: &mut HashSet<AppendSliceId>,
-    seen_rows: &mut HashMap<AppendSliceId, u64>,
-    wal_handles: &mut HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
-    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, u64>,
+    wal_segments: &mut WalSegmentsByKey,
+    synced_not_inserted: &HashMap<AppendSliceId, WalSliceState>,
 ) -> Result<GroupWalState, ScribeError> {
     let mut durable = Vec::new();
     let mut touched = HashMap::<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>::new();
-    let mut touched_by_key = HashMap::<
-        crate::scribe::seal_key::SealKey,
-        HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
-    >::new();
     let mut rows_by_append = HashMap::<[u8; 16], u64>::new();
     for append in &mut prepared {
+        if let Some(memory) = append.memory.as_mut() {
+            memory.transfer_category(MemoryCategory::Prepared);
+        }
         let batch_id = *append.batch_id.as_bytes();
         let slices = std::mem::take(&mut append.slices);
         for slice in slices {
-            if !seen_slices.insert(slice.id.clone()) {
-                let rows = seen_rows.get(&slice.id).copied().unwrap_or(0);
-                let entry = rows_by_append.entry(batch_id).or_default();
-                *entry = entry.saturating_add(rows);
-                continue;
+            match dependencies
+                .memtable
+                .retained_batch_rows(&slice.seal_key, *slice.id.batch_id.as_bytes())
+            {
+                Ok(Some(rows)) => {
+                    let entry = rows_by_append.entry(batch_id).or_default();
+                    *entry = entry.saturating_add(rows);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    release_active_reservations(dependencies, &durable);
+                    notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                }
             }
             let slice_id = slice.id.clone();
-            let handle = if let Some(handle) = wal_handles.get(&slice.seal_key) {
-                handle.clone()
+            let (slice, result) = match if let Some(previous) = synced_not_inserted.get(&slice_id) {
+                reuse_synced_slice(dependencies, append, slice, previous.lsn)
             } else {
-                let handle = dependencies.wal.handle_for_seal_key(slice.seal_key.clone());
-                wal_handles.insert(slice.seal_key.clone(), handle.clone());
-                handle
+                write_prepared_slice(dependencies, append, slice).await
+            } {
+                Ok(value) => value,
+                Err(error) => {
+                    release_active_reservations(dependencies, &durable);
+                    mark_wal_error(dependencies, &error);
+                    notify_prepared_error(&mut prepared, &error);
+                    return Err(error);
+                }
             };
-            let PreparedSlice {
-                seal_key,
-                audit_event,
-                rows,
-                wal_append,
-                memtable_bytes,
-                ..
-            } = slice;
-            let ScribeWalIoResult::WalWritten { wal, result } = dependencies
-                .wal_io
-                .submit(ScribeWalIoOp::WritePrepared {
-                    wal: handle,
-                    append: wal_append,
-                })
-                .await?
-            else {
-                return Err(ScribeError::Internal {
-                    detail: "WAL IO lane returned the wrong shard append result".to_owned(),
-                });
-            };
-            let encoded_bytes = result.encoded_bytes;
-            let row_count = u64::try_from(rows.num_rows()).unwrap_or(u64::MAX);
-            seen_rows.insert(slice_id, row_count);
             for segment in &result.touched_segments {
                 touched.insert(segment.path().to_path_buf(), Arc::clone(segment));
-                touched_by_key
-                    .entry(seal_key.clone())
+                wal_segments
+                    .entry(slice.seal_key.clone())
                     .or_default()
                     .insert(segment.path().to_path_buf(), Arc::clone(segment));
             }
-            let entry = wal_bytes.entry(seal_key.clone()).or_default();
-            *entry = entry.saturating_add(encoded_bytes);
-            durable.push(DurableSlice {
-                seal_key,
-                audit_event,
-                rows,
-                memtable_bytes,
-                batch_id,
-                lsn: result.lsn,
-            });
-            let _ = wal;
+            durable.push(slice);
         }
     }
     Ok(GroupWalState {
         prepared,
         durable,
         touched,
-        touched_by_key,
         rows_by_append,
     })
+}
+
+async fn write_prepared_slice(
+    dependencies: &ShardDependencies,
+    append: &mut PreparedAppend,
+    slice: PreparedSlice,
+) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
+    let PreparedSlice {
+        seal_key,
+        audit_event,
+        rows,
+        wal_append,
+        memtable_bytes,
+        ..
+    } = slice;
+    dependencies
+        .admission
+        .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+    let active_memory = if let Some(memory) = append.memory.as_mut() {
+        memory.split(memtable_bytes)
+    } else {
+        dependencies.admission.release_active(memtable_bytes);
+        return Err(ScribeError::Internal {
+            detail: "prepared append lost its memory reservation".to_owned(),
+        });
+    };
+    let mut active_memory = match active_memory {
+        Ok(value) => value,
+        Err(error) => {
+            dependencies.admission.release_active(memtable_bytes);
+            return Err(error);
+        }
+    };
+    active_memory.transfer_category(MemoryCategory::Active);
+    if let Err(error) = dependencies.memory_ledger.absorb_active(active_memory) {
+        dependencies.admission.release_active(memtable_bytes);
+        return Err(error);
+    }
+    let wal_result = dependencies
+        .wal_io
+        .submit(ScribeWalIoOp::WritePrepared {
+            wal: dependencies.wal_handle.clone(),
+            append: wal_append,
+        })
+        .await;
+    let result = match wal_result {
+        Ok(ScribeWalIoResult::WalWritten { result }) => result,
+        Ok(_) => {
+            dependencies.admission.release_active(memtable_bytes);
+            let _ = dependencies.memory_ledger.release_active(memtable_bytes);
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong shard append result".to_owned(),
+            });
+        }
+        Err(error) => {
+            dependencies.admission.release_active(memtable_bytes);
+            let _ = dependencies.memory_ledger.release_active(memtable_bytes);
+            return Err(error);
+        }
+    };
+    Ok((
+        DurableSlice {
+            seal_key,
+            audit_event,
+            rows,
+            memtable_bytes,
+            batch_id: *append.batch_id.as_bytes(),
+            lsn: result.lsn,
+        },
+        result,
+    ))
+}
+
+/// Reuse a slice whose WAL record was already synced before a prior memtable
+/// insertion failed. The retry supplies the Arrow rows again, but it must not
+/// append a second WAL record.
+fn reuse_synced_slice(
+    dependencies: &ShardDependencies,
+    append: &mut PreparedAppend,
+    slice: PreparedSlice,
+    lsn: crate::scribe::wal::WalLsn,
+) -> Result<(DurableSlice, crate::scribe::wal::WalAppendResult), ScribeError> {
+    let PreparedSlice {
+        seal_key,
+        audit_event,
+        rows,
+        memtable_bytes,
+        ..
+    } = slice;
+    dependencies
+        .admission
+        .try_reserve_active(seal_key.table.fqn(), memtable_bytes)?;
+    let active_memory = if let Some(memory) = append.memory.as_mut() {
+        memory.split(memtable_bytes)
+    } else {
+        dependencies.admission.release_active(memtable_bytes);
+        return Err(ScribeError::Internal {
+            detail: "prepared append lost its memory reservation during WAL retry".to_owned(),
+        });
+    };
+    let active_memory = match active_memory {
+        Ok(mut value) => {
+            value.transfer_category(MemoryCategory::Active);
+            value
+        }
+        Err(error) => {
+            dependencies.admission.release_active(memtable_bytes);
+            return Err(error);
+        }
+    };
+    if let Err(error) = dependencies.memory_ledger.absorb_active(active_memory) {
+        dependencies.admission.release_active(memtable_bytes);
+        return Err(error);
+    }
+    Ok((
+        DurableSlice {
+            seal_key,
+            audit_event,
+            rows,
+            memtable_bytes,
+            batch_id: *append.batch_id.as_bytes(),
+            lsn,
+        },
+        crate::scribe::wal::WalAppendResult {
+            lsn,
+            #[cfg(feature = "bench-support")]
+            encoded_bytes: 0,
+            touched_segments: Vec::new(),
+        },
+    ))
 }
 
 async fn sync_group(
@@ -712,7 +1295,10 @@ async fn sync_group(
     let segments = touched.values().cloned().collect::<Vec<_>>();
     match dependencies
         .wal_io
-        .submit(ScribeWalIoOp::SyncWal { segments })
+        .submit(ScribeWalIoOp::SyncWal {
+            wal: dependencies.wal_handle.clone(),
+            segments,
+        })
         .await?
     {
         ScribeWalIoResult::WalSynced => Ok(()),
@@ -726,13 +1312,12 @@ fn insert_group(
     dependencies: &ShardDependencies,
     durable: Vec<DurableSlice>,
     rows_by_append: &mut HashMap<[u8; 16], u64>,
+    synced_not_inserted: &mut HashMap<AppendSliceId, WalSliceState>,
 ) -> Result<HashSet<crate::scribe::seal_key::SealKey>, ScribeError> {
     let mut touched_keys = HashSet::new();
-    for slice in durable {
+    let mut slices = durable.into_iter();
+    while let Some(slice) = slices.next() {
         touched_keys.insert(slice.seal_key.clone());
-        dependencies
-            .admission
-            .try_reserve_active(slice.seal_key.table.fqn(), slice.memtable_bytes)?;
         let rows = slice.rows.num_rows();
         if let Err(error) = dependencies.memtable.insert(
             &slice.seal_key,
@@ -747,81 +1332,73 @@ fn insert_group(
             slice.rows,
         ) {
             dependencies.admission.release_active(slice.memtable_bytes);
+            let _ = dependencies
+                .memory_ledger
+                .release_active(slice.memtable_bytes);
+            for remaining in slices {
+                dependencies
+                    .admission
+                    .release_active(remaining.memtable_bytes);
+                let _ = dependencies
+                    .memory_ledger
+                    .release_active(remaining.memtable_bytes);
+            }
             return Err(error);
         }
+        synced_not_inserted.remove(&AppendSliceId {
+            batch_id: uuid::Uuid::from_bytes(slice.batch_id),
+            seal_key: slice.seal_key.clone(),
+        });
         let entry = rows_by_append.entry(slice.batch_id).or_default();
         *entry = entry.saturating_add(u64::try_from(rows).unwrap_or(u64::MAX));
     }
     Ok(touched_keys)
 }
 
+fn notify_prepared_error(prepared: &mut [PreparedAppend], error: &ScribeError) {
+    for append in prepared {
+        if let Some(sender) = append.durable_ack.take() {
+            let _ = sender.send(Err(error.completion_copy()));
+        }
+    }
+}
+
+fn release_active_reservations(dependencies: &ShardDependencies, durable: &[DurableSlice]) {
+    for slice in durable {
+        dependencies.admission.release_active(slice.memtable_bytes);
+        let _ = dependencies
+            .memory_ledger
+            .release_active(slice.memtable_bytes);
+    }
+}
+
+fn mark_wal_error(dependencies: &ShardDependencies, error: &ScribeError) {
+    if matches!(error, ScribeError::WalDiskFull) {
+        dependencies.admission.trip_wal_disk_full();
+    }
+}
+
 fn rotate_group(
     dependencies: &ShardDependencies,
     touched_keys: HashSet<crate::scribe::seal_key::SealKey>,
-    touched_by_key: &mut HashMap<
-        crate::scribe::seal_key::SealKey,
-        HashMap<std::path::PathBuf, Arc<crate::scribe::wal::WalSegment>>,
-    >,
-    wal_handles: &HashMap<crate::scribe::seal_key::SealKey, WalHandle>,
-    wal_bytes: &mut HashMap<crate::scribe::seal_key::SealKey, u64>,
+    wal_segments: &mut WalSegmentsByKey,
+    pending_generations: &mut PendingGenerationsByKey,
 ) -> Result<(), ScribeError> {
+    let mut keys = Vec::new();
     for seal_key in touched_keys {
-        let wal_due = wal_bytes.get(&seal_key).copied().unwrap_or(0)
-            >= u64::try_from(crate::scribe::memtable::WAL_ROTATION_BYTES).unwrap_or(u64::MAX);
-        if wal_due || dependencies.memtable.should_seal(&seal_key)? {
-            let frozen = dependencies.memtable.freeze(&seal_key)?;
-            dependencies
-                .admission
-                .transfer_active_to_immutable(frozen.arrow_bytes);
-            wal_bytes.remove(&seal_key);
-            if let Some(persistence) = &dependencies.persistence {
-                let binding = crate::catalog::TenantTableBinding::resolve((
-                    seal_key.tenant,
-                    seal_key.table.clone(),
-                ))
-                .map_err(|error| ScribeError::Internal {
-                    detail: error.to_string(),
-                })?;
-                let wal =
-                    wal_handles
-                        .get(&seal_key)
-                        .cloned()
-                        .ok_or_else(|| ScribeError::Internal {
-                            detail: format!("missing WAL handle for rotated seal-key {seal_key}"),
-                        })?;
-                let wal_segments = touched_by_key
-                    .remove(&seal_key)
-                    .unwrap_or_default()
-                    .into_values()
-                    .map(|segment| segment.reference())
-                    .collect();
-                let generation = Arc::new(ImmutableGeneration::from_frozen(
-                    &frozen,
-                    (seal_key.tenant, seal_key.table.clone()),
-                    dependencies.writer_instance_id,
-                    dependencies.stream,
-                    wal_segments,
-                    wal,
-                ));
-                persistence
-                    .try_submit(PersistenceJob {
-                        generation,
-                        binding,
-                        completion_tx: dependencies.completion_tx.clone(),
-                    })
-                    .map_err(|_| ScribeError::IngestBusy {
-                        table: seal_key.table.fqn(),
-                    })?;
-            }
+        if dependencies.memtable.should_seal(&seal_key)? {
+            keys.push(seal_key);
         }
     }
-    Ok(())
+    flush_keys_at_owner(dependencies, keys, wal_segments, pending_generations)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
+    use crate::scribe::seal_key::{EventDay, SealKey};
+    use chrono::NaiveDate;
 
     #[derive(Debug)]
     struct Item {
@@ -848,6 +1425,42 @@ mod tests {
     }
 
     #[test]
+    fn fixed_topology_remains_sixteen_tasks_and_channels() {
+        let set = ScribeShardSet::<Item>::new();
+        assert_eq!(set.len(), SCRIBE_SHARD_COUNT);
+        assert_eq!(SHARD_COMMAND_CAPACITY, 256);
+    }
+
+    #[test]
+    fn pressure_watch_coalesces_repeated_requests() {
+        let tenant = DataTenantId::new_v7();
+        let table = TableRef::new(BifrostNamespace::Bifrost, "events");
+        let first = SealKey::new(
+            tenant,
+            table.clone(),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
+        );
+        let second = SealKey::new(
+            tenant,
+            table,
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+        );
+        let (sender, receiver) = watch::channel(None);
+        sender.send_replace(Some(PressureSignal {
+            keys: vec![first],
+            wal_key: None,
+        }));
+        sender.send_replace(Some(PressureSignal {
+            keys: vec![second.clone()],
+            wal_key: None,
+        }));
+        assert_eq!(
+            receiver.borrow().as_ref().map(|signal| &signal.keys),
+            Some(&vec![second])
+        );
+    }
+
+    #[test]
     fn scheduler_rotates_between_tenants() {
         let first = DataTenantId::new_v7();
         let second = DataTenantId::new_v7();
@@ -868,12 +1481,13 @@ mod tests {
             sequence: 3,
         });
         let first_group = scheduler.pop_group();
-        assert_eq!(first_group.len(), 2);
+        assert_eq!(first_group.len(), 3);
         assert_eq!(first_group[0].tenant(), first);
-        assert_eq!(first_group[1].sequence, 2);
+        assert_eq!(first_group[1].tenant(), second);
+        assert_eq!(first_group[1].sequence, 3);
+        assert_eq!(first_group[2].sequence, 2);
         let second_group = scheduler.pop_group();
-        assert_eq!(second_group.len(), 1);
-        assert_eq!(second_group[0].tenant(), second);
+        assert!(second_group.is_empty());
         assert!(scheduler.pop_group().is_empty());
     }
 

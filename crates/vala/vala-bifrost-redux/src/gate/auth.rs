@@ -30,7 +30,7 @@ use super::error::IngestError;
 pub const WYRD_REQUEST_ID_METADATA: &str = "wyrd-request-id";
 const WYRD_ACCESS_TOKEN_METADATA: &str = "x-wyrd-access-token";
 
-/// Resolved identity for one ingest stream, produced by [`authenticate`] and
+/// Resolved identity for one ingest request, produced by [`authenticate`] and
 /// handed to the service via request extensions.
 #[derive(Clone, Debug)]
 pub struct AuthContext {

@@ -33,6 +33,9 @@ pub fn build_app_grpc<H>(
 where
     H: Health,
 {
+    if state.auth.token_verifier.is_none() {
+        return Err(GrpcError::MissingTokenVerifier);
+    }
     let ingest = state.gate.clone().ok_or(GrpcError::MissingScribe)?;
     let traces = wyrd_tonic::otlp::trace_service::trace_service_server::TraceServiceServer::new(
         (*ingest).clone(),

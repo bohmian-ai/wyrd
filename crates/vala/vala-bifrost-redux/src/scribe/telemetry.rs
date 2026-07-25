@@ -1,6 +1,54 @@
 //! Optional stage measurements for real Scribe workload runs.
 
 use crate::scribe::admission::AdmissionSnapshot;
+use crate::scribe::memory::MEMORY_CATEGORY_COUNT;
+use crate::scribe::seal_key::SealKey;
+
+/// Memory ownership for one bounded tenant/table/day bucket in inspection data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScribeBucketMemorySnapshot {
+    /// Exact bucket identity. This is an inspection payload, not a metric label.
+    pub seal_key: SealKey,
+    /// Writable Arrow bytes.
+    pub writable_bytes: usize,
+    /// Immutable Arrow bytes.
+    pub immutable_bytes: usize,
+}
+
+/// Complete bounded setup snapshot used by Bifrost test harnesses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScribeInspectionSnapshot {
+    /// Number of fixed shard owner tasks.
+    pub shard_task_count: usize,
+    /// Number of fixed shard command channels.
+    pub shard_channel_count: usize,
+    /// Number of currently open shard WAL streams.
+    pub open_wal_stream_count: usize,
+    /// Accepted append commands waiting in shard scheduling.
+    pub queued_items: usize,
+    /// Writable bucket count.
+    pub writable_bucket_count: usize,
+    /// Immutable bucket count.
+    pub immutable_bucket_count: usize,
+    /// Category totals in [`MemoryCategory`](crate::scribe::memory::MemoryCategory) order.
+    pub memory_by_category: [usize; MEMORY_CATEGORY_COUNT],
+    /// Memory totals distributed across the fixed shard owners.
+    pub memory_by_shard: [usize; crate::scribe::routing::SCRIBE_SHARD_COUNT],
+    /// Exact bucket-level memory ownership.
+    pub memory_by_bucket: Vec<ScribeBucketMemorySnapshot>,
+    /// Sum of all governor category totals.
+    pub total_accounted_memory: usize,
+    /// Parent Bifrost bytes currently reserved across all roles.
+    pub parent_used_memory: usize,
+    /// Parent Bifrost memory ceiling.
+    pub parent_memory_limit: usize,
+    /// Scribe child bytes currently reserved.
+    pub scribe_used_memory: usize,
+    /// Scribe child memory ceiling.
+    pub scribe_memory_limit: usize,
+    /// WAL bytes retained on disk.
+    pub wal_disk_bytes: u64,
+}
 
 /// Point-in-time health and queue metrics for the fixed shard owners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,33 +89,10 @@ pub struct ScribeRuntimeSnapshot {
     pub executor: ExecutorSnapshot,
     /// Pre-ACK decode and projection lane.
     pub ingress: ExecutorSnapshot,
-    /// Post-ACK preprocessing and reconstruction lane.
+    /// Pre-ACK preprocessing and reconstruction lane.
     pub persistence: ExecutorSnapshot,
     /// WAL filesystem lane.
     pub wal_io: ExecutorSnapshot,
     /// Fixed shard owner topology and health metrics.
     pub shards: ShardHealthSnapshot,
-    /// Accepted and fsynced frame counters used to expose the durability gap.
-    pub durability: ScribeDurabilitySnapshot,
-}
-
-/// Monotonic frame counters for the accepted-to-fsynced durability window.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ScribeDurabilitySnapshot {
-    /// Frames acknowledged after bounded writer-queue admission.
-    pub accepted_frames: u64,
-    /// Rows acknowledged after bounded writer-queue admission.
-    pub accepted_rows: u64,
-    /// Frames whose WAL data reached `sync_data`.
-    pub fsynced_frames: u64,
-    /// Rows whose WAL data reached `sync_data`.
-    pub fsynced_rows: u64,
-}
-
-impl ScribeDurabilitySnapshot {
-    /// Return the current acknowledged-but-not-fsynced frame count.
-    #[must_use]
-    pub const fn frame_gap(self) -> u64 {
-        self.accepted_frames.saturating_sub(self.fsynced_frames)
-    }
 }

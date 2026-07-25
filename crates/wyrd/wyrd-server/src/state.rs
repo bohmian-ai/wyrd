@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use datafusion::execution::memory_pool::MemoryPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::ForgeContext;
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -65,10 +67,13 @@ pub struct AppState {
     pub storage: Arc<StorageHandle>,
     /// Process-wide Bifrost OLAP catalog.
     pub bifrost: Arc<WyrdCatalog>,
-    /// Tenant-qualified catalog used by Gate, Scribe, and Forge.
-    ///
-    /// Oracle reads continue through `bifrost` until the Redux query owner lands.
+    /// Tenant-qualified Redux catalog used by Gate, Scribe, Forge, and Oracle
+    /// query paths.
     pub bifrost_redux: Option<Arc<BifrostCatalog>>,
+    /// Shared parent memory governor used by Scribe, Forge, and Oracle reads.
+    pub bifrost_memory: Option<BifrostMemoryGovernor>,
+    /// Shared DataFusion pool bounded by the Bifrost parent ceiling.
+    pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
     /// Private lifecycle handle for the booted Scribe runtime. Request handlers
     /// use `gate`; this field exists only for startup recovery and shutdown.
     pub(crate) scribe: Option<Arc<ScribeImpl>>,
@@ -117,6 +122,8 @@ impl AppState {
             storage,
             bifrost,
             bifrost_redux: None,
+            bifrost_memory: None,
+            bifrost_query_memory: None,
             scribe: None,
             gate: None,
             scribe_coordination_runtime: None,
@@ -214,6 +221,16 @@ impl AppState {
         self
     }
 
+    /// Attach the process-global Bifrost memory governor.
+    #[must_use]
+    pub fn with_bifrost_memory(mut self, memory: BifrostMemoryGovernor) -> Self {
+        self.bifrost_query_memory = Some(Arc::new(
+            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(memory.clone()),
+        ));
+        self.bifrost_memory = Some(memory);
+        self
+    }
+
     /// Attach the server-owned queued Scribe runtime.
     #[must_use]
     pub fn with_scribe(mut self, scribe: Arc<ScribeImpl>) -> Self {
@@ -281,6 +298,19 @@ impl AppState {
         };
         scribe.trip_wal_disk_full_for_test();
         Ok(())
+    }
+
+    /// Return the bounded Scribe ownership snapshot for test-tier inspection.
+    #[cfg(feature = "test-support")]
+    pub fn scribe_inspection_snapshot_for_test(
+        &self,
+    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot, String> {
+        let Some(scribe) = &self.scribe else {
+            return Err("Scribe is not configured".to_owned());
+        };
+        scribe
+            .inspection_snapshot()
+            .map_err(|error| error.to_string())
     }
 }
 

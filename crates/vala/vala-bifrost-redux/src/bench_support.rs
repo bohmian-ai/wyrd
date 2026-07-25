@@ -5,7 +5,10 @@ use std::path::Path;
 use bytes::Bytes;
 use wyrd_spec::ids::DataTenantId;
 
+use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
+use crate::namespaces::BifrostNamespace;
+use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::wal::{PreparedWalAppend, WalConfig, WalWriter};
 
 /// A prepared v3 WAL append. Preparation performs the production payload
@@ -47,6 +50,7 @@ pub struct WalGroupEvidence {
 /// Production WAL harness for independent component measurements.
 pub struct WalBenchSupport {
     writer: WalWriter,
+    tenant: DataTenantId,
 }
 
 impl WalBenchSupport {
@@ -54,7 +58,8 @@ impl WalBenchSupport {
     pub fn new(path: impl AsRef<Path>, tenant: DataTenantId) -> Result<Self, ScribeError> {
         let node_id = *uuid::Uuid::now_v7().as_bytes();
         Ok(Self {
-            writer: WalWriter::new(path, node_id, 1, tenant, WalConfig::default())?,
+            writer: WalWriter::new(path, node_id, 1, WalConfig::default())?,
+            tenant,
         })
     }
 
@@ -65,13 +70,23 @@ impl WalBenchSupport {
         audit: &[u8],
         data: &[u8],
     ) -> Result<PreparedWalAppendFixture, ScribeError> {
+        let seal_key = SealKey::new(
+            self.tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "bench"),
+            EventDay::new(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| {
+                ScribeError::Internal {
+                    detail: "benchmark WAL epoch day is invalid".to_owned(),
+                }
+            })?),
+        );
         Ok(PreparedWalAppendFixture {
             append: PreparedWalAppend::new(
                 crate::scribe::wal::WalLsn::ZERO,
                 batch_id,
                 Bytes::copy_from_slice(audit),
                 Bytes::copy_from_slice(data),
-            ),
+            )
+            .for_slice(seal_key, [0; 32]),
         })
     }
 

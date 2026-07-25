@@ -23,14 +23,26 @@ const DEFAULT_TRACE_START_TIME_NANOS: u64 = 1_700_000_000_000_000_000;
 #[derive(Debug, Clone)]
 pub struct RandomTraceGenerator {
     rng: StdRng,
+    start_time_nanos: u64,
 }
 
 impl RandomTraceGenerator {
     /// Create a reproducible generator from a caller-provided seed.
     #[must_use]
     pub fn from_seed(seed: u64) -> Self {
+        Self::from_seed_at(seed, DEFAULT_TRACE_START_TIME_NANOS)
+    }
+
+    /// Create a reproducible generator with an explicit event-time anchor.
+    ///
+    /// Benchmarks use a current-time anchor so their default bounded query
+    /// window can verify the rows they just wrote; tests can keep the stable
+    /// historical anchor from [`Self::from_seed`].
+    #[must_use]
+    pub fn from_seed_at(seed: u64, start_time_nanos: u64) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
+            start_time_nanos,
         }
     }
 
@@ -81,8 +93,9 @@ impl RandomTraceGenerator {
         let trace_id = self.random_id::<16>();
         let mut spans = Vec::with_capacity(span_count);
         let mut span_ids = Vec::with_capacity(span_count);
-        let base_time =
-            DEFAULT_TRACE_START_TIME_NANOS.saturating_add(sequence.saturating_mul(1_000_000_000));
+        let base_time = self
+            .start_time_nanos
+            .saturating_add(sequence.saturating_mul(1_000_000_000));
         for span_index in 0..span_count {
             span_ids.push(self.random_id::<8>());
             let current_span_id = span_ids[span_index];

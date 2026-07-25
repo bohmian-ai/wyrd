@@ -84,7 +84,6 @@ mod pg_tests {
                 wal_root.path(),
                 *uuid::Uuid::now_v7().as_bytes(),
                 1,
-                DataTenantId::SYSTEM_OWNER,
                 WalConfig::default(),
             )
             .expect("wal initializes"),

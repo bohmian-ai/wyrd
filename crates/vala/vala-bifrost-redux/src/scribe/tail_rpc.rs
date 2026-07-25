@@ -250,7 +250,7 @@ impl FetchLiveTailService {
         let mut candidates = Vec::new();
         for readable_batch in readable {
             let lsn = readable_batch.wal_lsn;
-            if lsn <= after_lsn {
+            if after_lsn != WalLsn::ZERO && lsn <= after_lsn {
                 continue;
             }
             let arrow_ipc = encode_arrow_batch(&readable_batch.rows, tenant)?;

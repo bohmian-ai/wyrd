@@ -31,15 +31,22 @@ pub use crate::scribe::execution_lanes::{
 };
 use crate::scribe::memtable::Memtable;
 pub use crate::scribe::persistence::ScribePersistenceConfig;
+use crate::scribe::persistence::{ImmutableGeneration, PersistenceJob};
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
-use crate::scribe::telemetry::{ScribeDurabilitySnapshot, ScribeRuntimeSnapshot};
+use crate::scribe::telemetry::{
+    ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
+};
 use async_trait::async_trait;
 use num_traits::ToPrimitive;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use vala_sql::TenantConn;
+
+const REPLAY_CHUNK_CHANNEL_CAPACITY: usize = 1;
 
 /// Memtable key for per-bucket row-count inspection.
 ///
@@ -107,12 +114,13 @@ impl ScribeLaneConfig {
     }
 }
 
-/// Scribe implementation with bounded admission, FIFO writers, WAL, memtable, and seal.
+/// Scribe implementation with bounded admission, fixed shards, WAL, memtable, and seal.
 ///
-/// `append` admits a complete request to a bounded writer queue. The writer
-/// consumer performs event-day splitting, serialization, WAL writes, memtable
-/// insertion, and `sync_data` in order. Rotation is a consumer-owned state swap;
-/// immutable generations are handed to the bounded persistence runtime.
+/// `append` decodes and prepares a complete request on the bounded CPU lanes,
+/// then admits one owned prepared packet to a fixed shard queue. The shard
+/// owner performs WAL writes, memtable insertion, and `sync_data` in order.
+/// Rotation is a consumer-owned state swap; immutable generations are handed
+/// to the bounded persistence runtime.
 #[derive(Debug)]
 pub struct ScribeImpl {
     /// In-memory memtable keyed by seal-key.
@@ -124,10 +132,12 @@ pub struct ScribeImpl {
     /// Pod identity (`node_id`, `writer_epoch`).
     node_id: String,
     writer_epoch: i64,
-    /// Pod-global request and writer admission counters.
+    /// Pod-global request and shard admission counters.
     admission: AdmissionController,
     /// Pod-global Bifrost/Scribe memory governor.
     memory: memory::BifrostMemoryGovernor,
+    /// Shared active/immutable Arrow ownership ledger.
+    memory_ledger: memory::MemoryLedger,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
     persistence_cpu: ScribePersistenceCpuPool,
     /// Bounded WAL IO lane retained for recovery and writer execution.
@@ -136,14 +146,16 @@ pub struct ScribeImpl {
     ingress_cpu: ScribeIngressCpuPool,
     /// Fixed sixteen-lane shard owners for the live ingest path.
     shards: Arc<shards::ScribeShardRuntime>,
-    /// Bounded global raw-ingress dispatcher.
-    ingress_queue: ingress::ScribeIngressQueue,
+    /// Lifecycle gate closed before shard draining begins.
+    closed: AtomicBool,
+    /// False while startup WAL recovery is active or has failed.
+    recovery_ready: AtomicBool,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
 }
 
 pub struct ScribeBuildConfig {
-    /// Admission bounds for retained frames and active writers.
+    /// Admission bounds for in-flight frames and active memory.
     pub admission: AdmissionConfig,
     /// Runtime used for Scribe coordination tasks.
     pub coordination_runtime: Handle,
@@ -151,6 +163,9 @@ pub struct ScribeBuildConfig {
     pub execution_pools: ScribeExecutionPools,
     /// Optional server-provisioned immutable persistence dependencies.
     pub persistence: Option<ScribePersistenceConfig>,
+    /// Shared parent governor provisioned by server boot for Scribe, Forge,
+    /// and Oracle allocations.
+    pub memory_governor: Option<memory::BifrostMemoryGovernor>,
 }
 
 impl ScribeImpl {
@@ -198,22 +213,12 @@ impl ScribeImpl {
     ) -> Result<Self, String> {
         let lane = ScribeLaneConfig::resolved();
         let execution_pools = ScribeExecutionPools::new(
-            ScribeIngressCpuPool::try_new_with_capacity(
-                lane.ingress_cpu_threads,
-                256,
-            )
-            .map_err(|error| format!("ingress CPU pool failed: {error}"))?,
-            ScribePersistenceCpuPool::try_new_with_capacity(
-                lane.persistence_cpu_threads,
-                64,
-            )
-            .map_err(|error| format!("persistence CPU pool failed: {error}"))?,
-            ScribeWalIoPool::try_new_with_capacity_and_delay(
-                lane.wal_io_threads,
-                256,
-                sync_delay,
-            )
-            .map_err(|error| format!("WAL IO pool failed: {error}"))?,
+            ScribeIngressCpuPool::try_new_with_capacity(lane.ingress_cpu_threads, 256)
+                .map_err(|error| format!("ingress CPU pool failed: {error}"))?,
+            ScribePersistenceCpuPool::try_new_with_capacity(lane.persistence_cpu_threads, 64)
+                .map_err(|error| format!("persistence CPU pool failed: {error}"))?,
+            ScribeWalIoPool::try_new_with_capacity_and_delay(lane.wal_io_threads, 256, sync_delay)
+                .map_err(|error| format!("WAL IO pool failed: {error}"))?,
         );
         Ok(Self::new_with_execution_pools(
             operator,
@@ -225,6 +230,7 @@ impl ScribeImpl {
                 coordination_runtime: Handle::current(),
                 execution_pools,
                 persistence: None,
+                memory_governor: None,
             },
         ))
     }
@@ -289,20 +295,15 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime,
                 execution_pools: ScribeExecutionPools::new(
-                    ScribeIngressCpuPool::new_with_capacity(
-                        lane_config.ingress_cpu_threads,
-                        256,
-                    ),
+                    ScribeIngressCpuPool::new_with_capacity(lane_config.ingress_cpu_threads, 256),
                     ScribePersistenceCpuPool::new_with_capacity(
                         lane_config.persistence_cpu_threads,
                         64,
                     ),
-                    ScribeWalIoPool::new_with_capacity(
-                        lane_config.wal_io_threads,
-                        256,
-                    ),
+                    ScribeWalIoPool::new_with_capacity(lane_config.wal_io_threads, 256),
                 ),
                 persistence: None,
+                memory_governor: None,
             },
         )
     }
@@ -325,22 +326,30 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeBuildConfig,
     ) -> Self {
-        let memory = memory::BifrostMemoryGovernor::new(config.admission.memory_limit_bytes)
+        let memory = config.memory_governor.clone().unwrap_or_else(|| {
+            memory::BifrostMemoryGovernor::new_with_scribe_limit(
+                config.admission.memory_limit_bytes,
+                config.admission.scribe_memory_limit_bytes,
+            )
             .or_else(|_| memory::BifrostMemoryGovernor::detect(1024 * 1024 * 1024))
             .unwrap_or_else(|_| {
                 memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
                     .expect("one-gibibyte fallback memory budget is valid")
-            });
+            })
+        });
         let memtable = Arc::new(Memtable::new_with_limits(
             Duration::from_mins(1),
             memory.active_bucket_target_bytes(),
         ));
+        let memory_ledger = memory::MemoryLedger::new(&memory)
+            .expect("zero-sized memory ledger reservations must be valid");
         let admission = AdmissionController::with_config(config.admission);
         let ScribeBuildConfig {
             coordination_runtime,
             execution_pools,
             persistence: persistence_config,
             admission: _,
+            memory_governor: _,
         } = config;
         let ScribeExecutionPools {
             ingress_cpu,
@@ -357,6 +366,7 @@ impl ScribeImpl {
                     wal_io: wal_io.clone(),
                     node_id: node_id.clone(),
                     writer_epoch,
+                    memory: memory.clone(),
                 },
                 &coordination_runtime,
             )
@@ -372,19 +382,11 @@ impl ScribeImpl {
                 admission: admission.clone(),
                 memtable: Arc::clone(&memtable),
                 wal: Arc::clone(&wal),
-                persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 stream,
+                memory_ledger: memory_ledger.clone(),
             },
-            &coordination_runtime,
-        );
-        let ingress_queue = ingress::ScribeIngressQueue::new(
-            256,
-            admission.clone(),
-            ingress_cpu.clone(),
-            memory.clone(),
-            Arc::clone(&shards),
             &coordination_runtime,
         );
         Self {
@@ -395,11 +397,13 @@ impl ScribeImpl {
             writer_epoch,
             admission,
             memory,
+            memory_ledger,
             persistence_cpu,
             wal_io,
             ingress_cpu,
             shards,
-            ingress_queue,
+            closed: AtomicBool::new(false),
+            recovery_ready: AtomicBool::new(true),
             persistence,
         }
     }
@@ -440,14 +444,8 @@ impl ScribeImpl {
             .as_bytes()
             .to_owned();
         let wal = Arc::new(
-            wal::WalWriter::new(
-                temp_dir.path(),
-                node_id_bytes,
-                1,
-                wyrd_spec::ids::DataTenantId::new_v7(),
-                wal::WalConfig::default(),
-            )
-            .expect("test WAL init"),
+            wal::WalWriter::new(temp_dir.path(), node_id_bytes, 1, wal::WalConfig::default())
+                .expect("test WAL init"),
         );
 
         // Leak temp_dir to keep WAL files for the test lifetime
@@ -467,14 +465,16 @@ impl ScribeImpl {
                     wal_io,
                 ),
                 persistence: None,
+                memory_governor: None,
             },
         )
     }
 
-    /// Stop accepting new writer work and drain the bounded execution lanes.
+    /// Stop accepting new shard work and drain the bounded execution lanes.
     pub async fn shutdown(&self) {
         let started = std::time::Instant::now();
-        self.ingress_queue.close_and_drain().await;
+        self.closed.store(true, Ordering::Release);
+        let _ = self.shards.flush_all().await;
         self.shards.drain().await;
         if let Some(persistence) = &self.persistence {
             persistence.close_and_drain().await;
@@ -487,26 +487,39 @@ impl ScribeImpl {
             .record(started.elapsed().as_secs_f64());
     }
 
-    /// Retire idle writers after the pod lifecycle scanner's tick.
+    /// Return whether Scribe has completed recovery and still accepts writes.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        !self.closed.load(Ordering::Acquire) && self.recovery_ready.load(Ordering::Acquire)
+    }
+
+    /// Drain shard work after the pod lifecycle scanner's tick.
     pub async fn retire_idle(&self, now: std::time::Instant) {
         let _ = now;
         self.shards.drain().await;
     }
 
-    /// Publish one coalescing lifecycle age tick to every writer consumer.
+    /// Publish one coalescing lifecycle age tick to every shard owner.
     pub fn check_age(&self, now: std::time::Instant) {
-        let Ok(keys) = self.memtable.expired_seal_keys(now) else {
-            return;
-        };
-        for key in keys {
-            if let Ok(frozen) = self.memtable.freeze(&key) {
-                self.admission
-                    .transfer_active_to_immutable(frozen.arrow_bytes);
-            }
+        self.shards.request_expired_flush(now);
+        let snapshot = self.memory.snapshot();
+        if snapshot.effective_pressure_percent() >= 75 {
+            let target = snapshot.scribe_limit_bytes.saturating_mul(65) / 100;
+            let candidates = self.memtable.pressure_candidates().unwrap_or_default();
+            let victims = memtable::Memtable::select_pressure_victims(
+                candidates,
+                snapshot.total_bytes().saturating_sub(target),
+            );
+            self.shards.request_pressure_flush(victims);
+        }
+        if self.wal.disk_pressure().soft {
+            let candidates = self.memtable.pressure_candidates().unwrap_or_default();
+            let victim = memtable::Memtable::select_oldest_wal_victim(&candidates);
+            self.shards.request_wal_pressure_flush(victim);
         }
     }
 
-    /// Return the current admission, lane, and writer health metrics.
+    /// Return the current admission, lane, and shard health metrics.
     #[must_use]
     pub fn runtime_snapshot(&self) -> ScribeRuntimeSnapshot {
         let persistence = self.persistence_cpu.snapshot();
@@ -543,7 +556,6 @@ impl ScribeImpl {
                 pending_items: self.shards.pending_items(),
                 terminal_errors: 0,
             },
-            durability: ScribeDurabilitySnapshot::default(),
         }
     }
 
@@ -598,11 +610,25 @@ impl Default for ScribeImpl {
 
 #[async_trait]
 impl Scribe for ScribeImpl {
-    // Keep this method as the Gate→Scribe composition seam. It validates and
-    // reserves synchronously, then transfers the canonical RecordBatch to the
-    // writer queue; preprocessing and all blocking WAL work happen afterward.
+    fn is_ready(&self) -> bool {
+        Self::is_ready(self)
+    }
+
+    // Keep this method as the Gate→Scribe composition seam. It prepares the
+    // request before dispatch and waits for the shard's durable completion.
     async fn ingest_frame(&self, frame: ScribeIngressFrame) -> Result<FrameAdmission, ScribeError> {
-        self.ingress_queue.submit(frame).await
+        if !self.is_ready() {
+            return Err(ScribeError::IngressClosed);
+        }
+        ingress::process_ingress_frame(
+            frame,
+            &self.admission,
+            &self.memory,
+            &self.ingress_cpu,
+            &self.persistence_cpu,
+            &self.shards,
+        )
+        .await
     }
 }
 
@@ -645,6 +671,59 @@ impl ScribeImpl {
         self.memory.snapshot()
     }
 
+    /// Return the bounded setup and ownership snapshot used by test harnesses.
+    pub fn inspection_snapshot(&self) -> Result<ScribeInspectionSnapshot, ScribeError> {
+        let stats = self.memtable_stats()?;
+        let memory = self.memory.snapshot();
+        let bucket_memory = self.memtable.bucket_memory()?;
+        let mut memory_by_shard = [0_usize; crate::scribe::routing::SCRIBE_SHARD_COUNT];
+        let mut memory_by_bucket = Vec::with_capacity(bucket_memory.len());
+        let mut bucket_total = 0_usize;
+        for bucket in bucket_memory {
+            let bytes = bucket.writable_bytes.saturating_add(bucket.immutable_bytes);
+            let shard =
+                crate::scribe::routing::shard_for(bucket.seal_key.tenant, &bucket.seal_key.table);
+            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+            bucket_total = bucket_total.saturating_add(bytes);
+            memory_by_bucket.push(ScribeBucketMemorySnapshot {
+                seal_key: bucket.seal_key,
+                writable_bytes: bucket.writable_bytes,
+                immutable_bytes: bucket.immutable_bytes,
+            });
+        }
+        for (shard, bytes) in self.memory.shard_snapshot().into_iter().enumerate() {
+            memory_by_shard[shard] = memory_by_shard[shard].saturating_add(bytes);
+        }
+        let transient_total = self.memory.shard_snapshot().into_iter().sum::<usize>();
+        if bucket_total.saturating_add(transient_total) != memory.total_bytes() {
+            return Err(ScribeError::Internal {
+                detail: format!(
+                    "inspection found {} bytes without a bucket or shard owner",
+                    memory
+                        .total_bytes()
+                        .saturating_sub(bucket_total.saturating_add(transient_total))
+                ),
+            });
+        }
+        Ok(ScribeInspectionSnapshot {
+            shard_task_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            shard_channel_count: crate::scribe::routing::SCRIBE_SHARD_COUNT,
+            open_wal_stream_count: self.wal.open_stream_count(),
+            queued_items: self.shards.pending_items(),
+            writable_bucket_count: stats.writable_buckets,
+            immutable_bucket_count: stats.immutable_buckets,
+            memory_by_category: memory.categories,
+            memory_by_shard,
+            memory_by_bucket,
+            total_accounted_memory: memory.total_bytes(),
+            parent_used_memory: memory.bifrost_total_bytes,
+            parent_memory_limit: memory.bifrost_limit_bytes,
+            scribe_used_memory: memory.scribe_total_bytes,
+            scribe_memory_limit: memory.scribe_limit_bytes,
+            wal_disk_bytes: self.wal.bytes_on_disk(),
+        })
+    }
+
     /// Trip the WAL availability breaker for deterministic test-tier probes.
     pub fn trip_wal_disk_full_for_test(&self) {
         self.admission.trip_wal_disk_full();
@@ -656,23 +735,10 @@ impl ScribeImpl {
         self.ingress_cpu.clone()
     }
 
-    /// Return the number of active tenant/table writer actors.
-    #[must_use]
-    pub fn writer_count(&self) -> usize {
-        self.memtable.logical_writer_count()
-    }
-
     /// Row count in the writable bucket for `key` on this pod; 0 if no bucket.
     #[must_use]
     pub fn memtable_row_count(&self, key: &MemtableKey) -> usize {
         self.memtable.row_count(key).unwrap_or(0)
-    }
-
-    /// Every Parquet path this pod has sealed since boot.
-    #[must_use]
-    pub fn sealed_parquet_paths(&self) -> Vec<String> {
-        // TODO : Query vala.file_list for sealed paths for this node
-        vec![]
     }
 
     /// Force-seal every non-empty writable or pending bucket on this pod.
@@ -701,6 +767,11 @@ impl ScribeImpl {
                 Ok(handle) => {
                     self.admission
                         .transfer_active_to_immutable(handle.token.memtable_bytes);
+                    self.memory_ledger
+                        .move_active_to_immutable(handle.token.memtable_bytes)
+                        .map_err(|error| ScribeError::Internal {
+                            detail: error.to_string(),
+                        })?;
                     tokens.push(handle.token);
                 }
                 Err(error) => {
@@ -735,6 +806,11 @@ impl ScribeImpl {
         for token in post_commit.into().0 {
             self.admission
                 .transfer_immutable_to_active(token.memtable_bytes);
+            self.memory_ledger
+                .move_immutable_to_active(token.memtable_bytes)
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
             self.memtable.abort_post_commit(token.seal_id)?;
         }
         Ok(())
@@ -799,13 +875,21 @@ impl ScribeImpl {
         &self,
         replayed: &replay::ReplayedSealKey,
     ) -> Result<memtable::FrozenMemtable, ScribeError> {
-        self.memtable.restore_replayed(replayed)
+        let frozen = self.memtable.restore_replayed(replayed)?;
+        if let Err(error) = self.memory_ledger.reserve_immutable(frozen.arrow_bytes) {
+            self.memtable.discard_pending_generation(frozen.seal_id)?;
+            return Err(error);
+        }
+        let stats = self.memtable.stats()?;
+        self.admission
+            .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+        Ok(frozen)
     }
 
     /// Replay every complete, unretired WAL frame into pending immutable state.
     ///
-    /// This is the boot recovery boundary: replay performs paired audit/data
-    /// validation and `(batch_id, seal_key)` deduplication before the restored
+    /// This is the boot recovery boundary: replay validates complete
+    /// audit-plus-data records and `(batch_id, seal_key)` deduplication before the restored
     /// Arrow batches become visible to the normal seal/reconciliation path.
     ///
     /// # Errors
@@ -814,8 +898,8 @@ impl ScribeImpl {
     pub fn replay_wal(&self) -> Result<usize, ScribeError> {
         let replayed = replay::replay_wal_directory(self.wal.base_dir())?;
         let restored = replayed
-            .values()
-            .map(|state| self.restore_replayed(state).map(|_| ()))
+            .into_values()
+            .map(|state| self.restore_replayed(&state).map(|_| ()))
             .collect::<Result<Vec<_>, _>>()?
             .len();
         self.memtable_stats()?;
@@ -825,33 +909,83 @@ impl ScribeImpl {
     /// Replay WAL through the bounded filesystem lane before readiness.
     pub async fn replay_wal_async(&self) -> Result<usize, ScribeError> {
         let started = std::time::Instant::now();
-        let crate::scribe::execution_lanes::ScribeWalIoResult::Replayed(replayed) = self
-            .wal_io
-            .submit(
-                crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectory {
-                    path: self.wal.base_dir().to_path_buf(),
-                },
-            )
-            .await?
-        else {
-            return Err(ScribeError::Internal {
-                detail: "WAL IO lane returned the wrong replay result".to_owned(),
-            });
-        };
+        self.recovery_ready.store(false, Ordering::Release);
+        let (sender, mut receiver) = mpsc::channel(REPLAY_CHUNK_CHANNEL_CAPACITY);
+        let wal_io = self.wal_io.clone();
+        let path = self.wal.base_dir().to_path_buf();
+        let memory = self.memory.clone();
+        let replay_future = wal_io.submit(
+            crate::scribe::execution_lanes::ScribeWalIoOp::ReplayDirectoryStream {
+                path,
+                sender,
+                memory,
+            },
+        );
+        tokio::pin!(replay_future);
         let mut restored = 0;
-        for state in replayed.values() {
+        let replay_result = loop {
+            tokio::select! {
+                chunk = receiver.recv() => {
+                    let Some(chunk) = chunk else {
+                        break replay_future.await;
+                    };
+                    let chunk_result = if self.persistence.is_some() {
+                        self.replay_and_publish_chunk(chunk).await
+                    } else {
+                        self.restore_replay_chunk(chunk).await
+                    };
+                    match chunk_result {
+                        Ok(count) => restored += count,
+                        Err(error) => {
+                            break Err(error);
+                        }
+                    }
+                }
+                result = &mut replay_future => {
+                    break result;
+                }
+            }
+        };
+        let result = match replay_result {
+            Ok(crate::scribe::execution_lanes::ScribeWalIoResult::ReplayStreamCompleted) => {
+                let stats = self.memtable_stats()?;
+                self.admission
+                    .sync_memtable_bytes(stats.writable_bytes, stats.immutable_bytes);
+                Ok(restored)
+            }
+            Ok(_) => Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong replay result".to_owned(),
+            }),
+            Err(error) => Err(error),
+        };
+        if result.is_ok() {
+            self.recovery_ready.store(true, Ordering::Release);
+            metrics::histogram!("bifrost_scribe_replay_seconds")
+                .record(started.elapsed().as_secs_f64());
+        }
+        result
+    }
+
+    async fn restore_replay_chunk(&self, chunk: replay::ReplayChunk) -> Result<usize, ScribeError> {
+        let replay::ReplayChunk {
+            states,
+            memory: _memory,
+        } = chunk;
+        let mut restored = 0;
+        for state in states.into_values() {
             let result = self
                 .persistence_cpu
                 .submit(
                     crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
                         memtable: Arc::clone(&self.memtable),
-                        replayed: Box::new(state.clone()),
+                        memory_ledger: self.memory_ledger.clone(),
+                        replayed: Box::new(state),
                     },
                 )
                 .await?;
             if !matches!(
                 result,
-                crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored
+                crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(_)
             ) {
                 return Err(ScribeError::Internal {
                     detail: "persistence CPU lane returned the wrong replay result".to_owned(),
@@ -859,9 +993,80 @@ impl ScribeImpl {
             }
             restored += 1;
         }
-        self.memtable_stats()?;
-        metrics::histogram!("bifrost_scribe_replay_seconds")
-            .record(started.elapsed().as_secs_f64());
+        Ok(restored)
+    }
+
+    async fn replay_and_publish_chunk(
+        &self,
+        chunk: replay::ReplayChunk,
+    ) -> Result<usize, ScribeError> {
+        let Some(persistence) = &self.persistence else {
+            return Err(ScribeError::Internal {
+                detail: "replay publication requires persistence runtime".to_owned(),
+            });
+        };
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(uuid::Uuid::parse_str(&self.node_id).map_err(
+                |error| ScribeError::Internal {
+                    detail: format!("invalid Scribe node_id during replay: {error}"),
+                },
+            )?),
+            stream_identity::WriterEpoch::new(self.writer_epoch),
+        );
+        let mut restored = 0;
+        let replay::ReplayChunk {
+            states,
+            memory: _memory,
+        } = chunk;
+        for state in states.into_values() {
+            let seal_key = state.seal_key.clone();
+            let completion_tx = self.shards.persistence_completion_sender(&seal_key);
+            let wal_segments = state.wal_segments.clone();
+            let result = self
+                .persistence_cpu
+                .submit(
+                    crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
+                        memtable: Arc::clone(&self.memtable),
+                        memory_ledger: self.memory_ledger.clone(),
+                        replayed: Box::new(state),
+                    },
+                )
+                .await?;
+            let crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(frozen) =
+                result
+            else {
+                return Err(ScribeError::Internal {
+                    detail: "persistence CPU lane returned the wrong replay result".to_owned(),
+                });
+            };
+            let binding = TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+                .map_err(|error| ScribeError::Internal {
+                    detail: error.to_string(),
+                })?;
+            let wal = self
+                .wal
+                .handle_for_shard(crate::scribe::routing::shard_for(
+                    seal_key.tenant,
+                    &seal_key.table,
+                ))?;
+            wal.retain_segments(&wal_segments)?;
+            let generation = Arc::new(ImmutableGeneration::from_frozen(
+                &frozen,
+                (seal_key.tenant, seal_key.table.clone()),
+                stream,
+                wal_segments,
+                wal,
+            ));
+            persistence
+                .submit_and_wait(PersistenceJob {
+                    generation,
+                    binding,
+                    completion_tx: completion_tx.clone(),
+                    completion_waiter: None,
+                })
+                .await?;
+            restored += 1;
+        }
         Ok(restored)
     }
 

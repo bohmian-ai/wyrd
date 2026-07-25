@@ -34,6 +34,7 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests replay convergence of compaction bookkeeping using real durable state.
 ///
 /// Steps:
@@ -80,6 +81,7 @@ async fn forge_compaction_pg_iceberg_bookkeeping_matrix_never_duplicates() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests tenant, physical-table, partition, and schema isolation in one
 /// production discovery tick.
 ///
@@ -171,6 +173,7 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests public-tick behavior when a competing worker already owns the table.
 ///
 /// Steps:
@@ -222,6 +225,7 @@ async fn forge_compaction_lease_contention_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests reconciliation after Iceberg commits but the caller receives an
 /// injected retryable uncertainty response.
 ///
@@ -280,6 +284,7 @@ async fn forge_compaction_replay_after_commit_is_idempotent() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately after a real Iceberg commit and before SQL
 /// bookkeeping.
 ///
@@ -355,6 +360,7 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately before a real Iceberg commit.
 ///
 /// The catalog wrapper pauses at the existing `Catalog::update_table` seam,
@@ -414,6 +420,7 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests expiry fencing after the real snapshot-expiry commit and before its
 /// recovered terminal audit append.
 ///

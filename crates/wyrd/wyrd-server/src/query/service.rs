@@ -16,12 +16,20 @@ use arrow::datatypes::Schema;
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use datafusion::common::TableReference;
+use datafusion::datasource::MemTable;
 use datafusion::error::DataFusionError;
 use datafusion::prelude::SessionContext;
 use serde_json::{Value as JsonValue, json};
 use vala_bifrost::error::BifrostError as EngineBifrostError;
-use vala_bifrost::session::wyrd_session_context;
+use vala_bifrost::session::{
+    wyrd_session_context, wyrd_session_context_with_memory, wyrd_session_context_with_pool,
+};
 use vala_bifrost::{BifrostNamespace, SchemaFingerprint};
+use vala_bifrost_redux::catalog::{
+    BifrostCatalogError as ReduxCatalogError, TableRef as ReduxTableRef,
+};
+use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
+use vala_bifrost_redux::tables::builtin_table;
 use vala_sql::TenantConn;
 use vala_sql::queries::olap_query_jobs::{NewQueryJob, enqueue_query_job, query_job_status};
 use wyrd_runtime::{Permission, PermissionVerdict};
@@ -38,6 +46,7 @@ use crate::bifrost::convert;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::query::floor;
+use crate::vala_query::service::fetch_hot_batches;
 
 /// Materialized sync-query result: the Arrow IPC stream plus the header metadata
 /// the axum adapter stamps onto the response.
@@ -129,6 +138,54 @@ fn ipc_error(error: arrow::error::ArrowError) -> WyrdError {
     }
 }
 
+/// Register one Redux-owned provider for a SQL table reference.
+async fn register_redux_provider(
+    ctx: &SessionContext,
+    state: &AppState,
+    ns: BifrostNamespace,
+    name: &str,
+    tenant: wyrd_spec::ids::DataTenantId,
+    fqn: &str,
+) -> Result<(), WyrdError> {
+    let segment = ns.as_str().strip_prefix("vala.").unwrap_or(ns.as_str());
+    let redux_ns =
+        ReduxNamespace::from_domain_namespace(segment).ok_or_else(|| WyrdError::Internal {
+            message: "unknown Redux Bifrost namespace".to_owned(),
+            details: json!({ "namespace": ns.as_str() }),
+        })?;
+    let table = ReduxTableRef::new(redux_ns, name);
+    let Some(catalog) = state.bifrost_redux.as_deref() else {
+        return Err(WyrdError::Internal {
+            message: "Redux Bifrost catalog is not configured".to_owned(),
+            details: serde_json::Value::Null,
+        });
+    };
+    let hot_batches = fetch_hot_batches(state, &table, tenant, None, None).await?;
+    match catalog
+        .provider_with_hot_batches(&table, tenant, hot_batches)
+        .await
+    {
+        Ok(provider) => ctx
+            .register_table(TableReference::bare(fqn), Arc::new(provider))
+            .map_err(map_datafusion_error)
+            .map(|_| ()),
+        Err(ReduxCatalogError::TableNotFound(_)) => {
+            let Some(definition) = builtin_table(segment, name) else {
+                return Ok(());
+            };
+            let empty = MemTable::try_new((definition.schema)(), vec![vec![]])
+                .map_err(map_datafusion_error)?;
+            ctx.register_table(TableReference::bare(fqn), Arc::new(empty))
+                .map_err(map_datafusion_error)
+                .map(|_| ())
+        }
+        Err(error) => Err(WyrdError::Internal {
+            message: "bifrost provider error".to_owned(),
+            details: json!({ "detail": error.to_string() }),
+        }),
+    }
+}
+
 /// Build a tenant-scoped `SessionContext` and register only the Bifrost tables the
 /// query references. The context carries the tenant analyzer rule and each
 /// provider enforces the physical tenant boundary; there is never a shared or
@@ -138,22 +195,34 @@ async fn build_tenant_session(
     caller: &Caller,
     sql: &str,
 ) -> Result<SessionContext, WyrdError> {
-    let ctx = wyrd_session_context(caller.data_tenant_id);
+    let ctx = if let Some(pool) = &state.bifrost_query_memory {
+        wyrd_session_context_with_pool(caller.data_tenant_id, pool.clone())
+            .map_err(map_datafusion_error)?
+    } else if let Some(memory) = &state.bifrost_memory {
+        wyrd_session_context_with_memory(caller.data_tenant_id, memory.bifrost_limit_bytes() / 4)
+            .map_err(map_datafusion_error)?
+    } else {
+        wyrd_session_context(caller.data_tenant_id)
+    };
     for fqn in floor::referenced_tables(sql) {
         let Some((ns, name)) = BifrostNamespace::split_fqn(&fqn) else {
             continue;
         };
-        match state
-            .bifrost
-            .provider(ns, &name, caller.data_tenant_id)
-            .await
-        {
-            Ok(provider) => {
-                ctx.register_table(TableReference::bare(fqn), Arc::new(provider))
-                    .map_err(map_datafusion_error)?;
+        if state.bifrost_redux.is_some() {
+            register_redux_provider(&ctx, state, ns, &name, caller.data_tenant_id, &fqn).await?;
+        } else {
+            match state
+                .bifrost
+                .provider(ns, &name, caller.data_tenant_id)
+                .await
+            {
+                Ok(provider) => {
+                    ctx.register_table(TableReference::bare(fqn), Arc::new(provider))
+                        .map_err(map_datafusion_error)?;
+                }
+                Err(EngineBifrostError::TableNotFound(_)) => continue,
+                Err(other) => return Err(map_engine_error(other)),
             }
-            Err(EngineBifrostError::TableNotFound(_)) => continue,
-            Err(other) => return Err(map_engine_error(other)),
         }
     }
     Ok(ctx)
@@ -286,7 +355,7 @@ pub async fn submit_async_query(
         &caller,
         Permission::bifrost_query_read(),
         "vala.query.async.submit",
-        "vala.query.async",
+        "vala.query",
     )
     .await?;
     floor::validate_query_sql(&body.sql)?;
@@ -313,7 +382,7 @@ pub async fn submit_async_query(
     let event = audit::audit_event(
         &caller,
         "vala.query.async.submit",
-        "vala.query.async",
+        "vala.query",
         &Permission::bifrost_query_read().to_string(),
         AuditDecision::Allow,
         AuditResult::Success,
@@ -400,7 +469,15 @@ pub async fn run_plan_query(
 
     // A fresh tenant-scoped context runs the TenantPredicateRule analyzer on the
     // incoming plan; providers are embedded in the plan's TableScan sources.
-    let ctx = vala_bifrost::session::wyrd_session_context(caller.data_tenant_id);
+    let ctx = if let Some(pool) = &state.bifrost_query_memory {
+        wyrd_session_context_with_pool(caller.data_tenant_id, pool.clone())
+            .map_err(map_datafusion_error)?
+    } else if let Some(memory) = &state.bifrost_memory {
+        wyrd_session_context_with_memory(caller.data_tenant_id, memory.bifrost_limit_bytes() / 4)
+            .map_err(map_datafusion_error)?
+    } else {
+        wyrd_session_context(caller.data_tenant_id)
+    };
     let limit_plus_one = (limit as usize).saturating_add(1);
 
     let (schema, batches) = tokio::time::timeout(floor::SYNC_QUERY_TIMEOUT, async {

@@ -9,9 +9,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailRequest, FetchLiveTailService, TailFrame,
-};
+use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};

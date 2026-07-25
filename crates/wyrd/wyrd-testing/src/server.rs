@@ -291,6 +291,17 @@ impl WyrdTestServer {
             .map_err(WyrdTestServerError::Start)
     }
 
+    /// Return the server-owned Scribe snapshot used by benchmark inspection.
+    pub fn scribe_inspection_snapshot(
+        &self,
+    ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot, WyrdTestServerError>
+    {
+        self.inner
+            .state
+            .scribe_inspection_snapshot_for_test()
+            .map_err(WyrdTestServerError::Start)
+    }
+
     /// Return the base URL when bound to a real socket.
     #[must_use]
     pub fn base_url(&self) -> Option<&str> {
@@ -1297,7 +1308,6 @@ impl WyrdTestServerBuilder {
                 scribe_wal_root.path(),
                 *node_id.as_bytes(),
                 1,
-                tenant_id,
                 WalConfig::default(),
             )
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,

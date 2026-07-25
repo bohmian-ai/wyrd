@@ -496,7 +496,6 @@ mod pg_tests {
                 temp_dir.path(),
                 *node_id.as_bytes(),
                 1,
-                tenant_a,
                 vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),

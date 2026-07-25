@@ -19,6 +19,7 @@ use crate::catalog::wire::{
 };
 use crate::catalog::{TableRef, TenantTableBinding, build_partition_spec};
 use crate::namespaces::BifrostNamespace;
+use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::tables::{BuiltinTableDefinition, builtin_table};
 
@@ -383,6 +384,39 @@ impl BifrostCatalog {
             entry: entry_from_row(&row)?,
             fields: fields_from_stored_schema(&arrow_schema)?,
         })
+    }
+
+    /// Build an execution provider for one authenticated tenant's table.
+    ///
+    /// The control-plane lookup and physical Iceberg binding both use the
+    /// authenticated tenant. The returned provider adds an execution-time
+    /// tenant predicate as a second fail-closed boundary.
+    pub async fn provider(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+        self.provider_with_hot_batches(table, tenant, Vec::new())
+            .await
+    }
+
+    /// Build a tenant-qualified provider with shallow Scribe hot batches.
+    pub async fn provider_with_hot_batches(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+        hot_batches: Vec<arrow::record_batch::RecordBatch>,
+    ) -> Result<ReduxTableProvider, BifrostCatalogError> {
+        let fqn = table.fqn();
+        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        ReduxTableProvider::try_new_with_hot_batches(iceberg_table, tenant, hot_batches)
+            .await
+            .map_err(BifrostCatalogError::DataFusion)
     }
 
     async fn ensure_namespace(

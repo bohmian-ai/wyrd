@@ -1,204 +1,55 @@
-//! Bounded raw-ingress dispatch into Scribe's pre-ACK CPU lane.
+//! Bounded pre-ACK preparation for Scribe requests.
 
 use crate::contracts::{FrameAdmission, ScribeError, ScribeIngressFrame};
-use crate::scribe::admission::{
-    AdmissionController, IngressQueueBudget, IngressQueueConfig, IngressQueueReservation,
-    MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES,
+use crate::scribe::admission::{AdmissionController, MAX_REQUEST_BYTES, REQUEST_OVERHEAD_BYTES};
+use crate::scribe::execution_lanes::{
+    ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool,
+    ScribePersistenceCpuResult,
 };
-use crate::scribe::execution_lanes::ScribeIngressCpuPool;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory, MemoryReservation};
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::shards::ScribeShardRuntime;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::runtime::Handle;
-use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 
-struct IngressJob {
+/// Prepare one request and dispatch its owned packet directly to its shard.
+///
+/// The global item reservation is acquired before decoding and remains attached
+/// to the `AdmittedAppend`. There is intentionally no raw-ingress channel in
+/// front of the fixed shard mailboxes: the Rayon ingress pool bounds CPU work,
+/// while the 4,096-item reservation bounds every request retained by Scribe.
+pub(super) async fn process_ingress_frame(
     frame: ScribeIngressFrame,
-    reservation: IngressQueueReservation,
-    memory: MemoryReservation,
-    response: oneshot::Sender<Result<FrameAdmission, ScribeError>>,
-}
-
-#[derive(Debug)]
-pub(super) struct ScribeIngressQueue {
-    sender: Mutex<Option<mpsc::Sender<IngressJob>>>,
-    budget: IngressQueueBudget,
-    memory: BifrostMemoryGovernor,
-    closed: AtomicBool,
-    active: Arc<AtomicUsize>,
-    drained: Arc<Notify>,
-    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl ScribeIngressQueue {
-    pub(super) fn new(
-        items: usize,
-        admission: AdmissionController,
-        ingress_cpu: ScribeIngressCpuPool,
-        memory: BifrostMemoryGovernor,
-        shards: Arc<ScribeShardRuntime>,
-        coordination_runtime: &Handle,
-    ) -> Self {
-        let capacity = items.max(1);
-        let budget = IngressQueueBudget::with_config(IngressQueueConfig {
-            max_items: capacity,
-        });
-        let (sender, mut receiver) = mpsc::channel(capacity);
-        let processing = Arc::new(Semaphore::new(capacity));
-        let active = Arc::new(AtomicUsize::new(0));
-        let drained = Arc::new(Notify::new());
-        let task_active = Arc::clone(&active);
-        let task_drained = Arc::clone(&drained);
-        let task = coordination_runtime.spawn(async move {
-            while let Some(job) = receiver.recv().await {
-                let Ok(permit) = processing.clone().acquire_owned().await else {
-                    break;
-                };
-                task_active.fetch_add(1, Ordering::AcqRel);
-                let admission = admission.clone();
-                let ingress_cpu = ingress_cpu.clone();
-                let shards = Arc::clone(&shards);
-                let active = Arc::clone(&task_active);
-                let drained = Arc::clone(&task_drained);
-                let IngressJob {
-                    frame,
-                    mut reservation,
-                    memory,
-                    response,
-                } = job;
-                tokio::spawn(async move {
-                    let result = process_ingress_frame(
-                        frame,
-                        &mut reservation,
-                        memory,
-                        &admission,
-                        &ingress_cpu,
-                        &shards,
-                    )
-                    .await;
-                    let _ = response.send(result);
-                    active.fetch_sub(1, Ordering::AcqRel);
-                    drop(permit);
-                    drained.notify_waiters();
-                });
-            }
-            loop {
-                let notified = task_drained.notified();
-                if task_active.load(Ordering::Acquire) == 0 {
-                    break;
-                }
-                notified.await;
-            }
-        });
-        Self {
-            sender: Mutex::new(Some(sender)),
-            budget,
-            memory,
-            closed: AtomicBool::new(false),
-            active,
-            drained,
-            task: tokio::sync::Mutex::new(Some(task)),
-        }
-    }
-
-    pub(super) async fn submit(
-        &self,
-        frame: ScribeIngressFrame,
-    ) -> Result<FrameAdmission, ScribeError> {
-        if self.closed.load(Ordering::Acquire) {
-            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "closed")
-                .increment(1);
-            return Err(ScribeError::IngressClosed);
-        }
-        if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
-            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "payload_too_large")
-                .increment(1);
-            return Err(ScribeError::PayloadTooLarge {
-                bytes: frame.measured_wire_bytes,
-            });
-        }
-        let table = frame.binding.table_ref.fqn();
-        let bytes = frame
-            .measured_wire_bytes
-            .saturating_add(REQUEST_OVERHEAD_BYTES);
-        let reservation = self.budget.try_reserve(table.clone(), bytes).inspect_err(|_| {
-            metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "raw_budget")
-                .increment(1);
-        })?;
-        let memory = self
-            .memory
-            .try_reserve_ingress(MemoryCategory::Raw, bytes)
-            .map_err(|_| ScribeError::IngestBusy {
-                table: table.clone(),
-            })?;
-        let (response, result) = oneshot::channel();
-        let sender = self
-            .sender
-            .lock()
-            .map_err(|error| ScribeError::Internal {
-                detail: format!("ingress sender lock poisoned: {error}"),
-            })?
-            .clone()
-            .ok_or(ScribeError::IngressClosed)?;
-        match sender.try_send(IngressJob {
-            frame,
-            reservation,
-            memory,
-            response,
-        }) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "ingress_queue_full")
-                    .increment(1);
-                return Err(ScribeError::IngestBusy { table });
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                metrics::counter!("bifrost_scribe_admission_rejections_total", "reason" => "closed")
-                    .increment(1);
-                return Err(ScribeError::IngressClosed);
-            }
-        }
-        result.await.map_err(|_| ScribeError::Internal {
-            detail: "ingress dispatcher dropped its frame result".to_owned(),
-        })?
-    }
-
-    /// Stop accepting new frames, drop the producer, and await every accepted
-    /// frame before writers are asked to drain.
-    pub(super) async fn close_and_drain(&self) {
-        self.closed.store(true, Ordering::Release);
-        if let Ok(mut sender) = self.sender.lock() {
-            sender.take();
-        }
-        loop {
-            let notified = self.drained.notified();
-            if self.active.load(Ordering::Acquire) == 0 {
-                break;
-            }
-            notified.await;
-        }
-        if let Some(task) = self.task.lock().await.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-async fn process_ingress_frame(
-    frame: ScribeIngressFrame,
-    raw_reservation: &mut IngressQueueReservation,
-    mut memory: MemoryReservation,
     admission: &AdmissionController,
+    memory_governor: &BifrostMemoryGovernor,
     ingress_cpu: &ScribeIngressCpuPool,
+    persistence_cpu: &ScribePersistenceCpuPool,
     shards: &ScribeShardRuntime,
 ) -> Result<FrameAdmission, ScribeError> {
     let append_started = Instant::now();
+    let table = frame.binding.table_ref.fqn();
+    let shard =
+        crate::scribe::routing::shard_for(frame.principal.tenant_id, &frame.binding.table_ref);
     frame
         .binding
         .validate_authenticated_tenant(frame.principal.tenant_id)
         .map_err(|_| ScribeError::InvalidFrame)?;
+    if frame.measured_wire_bytes > MAX_REQUEST_BYTES {
+        return Err(ScribeError::PayloadTooLarge {
+            bytes: frame.measured_wire_bytes,
+        });
+    }
+
+    let initial_bytes = frame
+        .measured_wire_bytes
+        .saturating_add(REQUEST_OVERHEAD_BYTES);
+    let mut reservation = admission.try_reserve(table.clone(), initial_bytes)?;
+    let mut memory = memory_governor
+        .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
+        .map_err(|_| ScribeError::IngestBusy {
+            table: table.clone(),
+        })?;
+    memory.attach_shard(memory_governor.shard_accounting(), shard);
+
     let rows = ingress_cpu
         .decode(
             frame.payload,
@@ -213,14 +64,17 @@ async fn process_ingress_frame(
         .get_array_memory_size()
         .saturating_add(frame.measured_wire_bytes)
         .saturating_add(REQUEST_OVERHEAD_BYTES);
-    let reservation = raw_reservation.transfer_to_retained(
-        admission,
-        frame.binding.table_ref.fqn(),
-        estimated_bytes,
-    )?;
-    let (durable_tx, durable_rx) = oneshot::channel();
+    reservation.resize(estimated_bytes)?;
+    memory
+        .resize_ingress(estimated_bytes)
+        .map_err(|_| ScribeError::IngestBusy {
+            table: table.clone(),
+        })?;
+    memory.transfer_category(MemoryCategory::Prepared);
+
+    let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
     let tenant = frame.principal.tenant_id;
-    let table = frame.binding.table_ref.clone();
+    let table_ref = frame.binding.table_ref.clone();
     let admitted = AdmittedAppend {
         batch_id: frame.batch_id,
         audit_event: frame.audit_event,
@@ -228,20 +82,35 @@ async fn process_ingress_frame(
         measured_wire_bytes: frame.measured_wire_bytes,
         admitted_bytes: reservation.bytes(),
         reservation,
+        memory,
         tenant,
-        table: table.clone(),
+        table: table_ref.clone(),
         queued_at: Instant::now(),
         durable_ack: Some(durable_tx),
     };
-    memory.transfer_category(MemoryCategory::Prepared);
     let rows_accepted = u64::try_from(admitted.rows.num_rows()).unwrap_or(u64::MAX);
-    shards.try_send(tenant, &table, admitted)?;
+    let prepared = match persistence_cpu
+        .submit(ScribePersistenceCpuOp::Preprocess(Box::new(admitted)))
+        .await?
+    {
+        ScribePersistenceCpuResult::Prepared(value) => value,
+        ScribePersistenceCpuResult::ParquetEncoded(_)
+        | ScribePersistenceCpuResult::ReplayRestored(_) => {
+            return Err(ScribeError::Internal {
+                detail: "persistence lane returned the wrong preparation result".to_owned(),
+            });
+        }
+    };
+    shards.try_send(prepared)?;
     durable_rx.await.map_err(|_| ScribeError::Internal {
-        detail: "writer dropped durable batch completion".to_owned(),
+        detail: "shard owner dropped durable batch completion".to_owned(),
     })??;
     metrics::counter!("bifrost_scribe_frames_total", "status" => "accepted").increment(1);
     metrics::counter!("bifrost_scribe_rows_total", "status" => "accepted").increment(rows_accepted);
     metrics::histogram!("bifrost_scribe_ack_seconds")
         .record(append_started.elapsed().as_secs_f64());
-    Ok(FrameAdmission { rows_accepted })
+    Ok(FrameAdmission {
+        batch_id: frame.batch_id,
+        rows_accepted,
+    })
 }

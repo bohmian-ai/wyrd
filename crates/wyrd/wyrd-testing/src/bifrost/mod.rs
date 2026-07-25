@@ -1,5 +1,15 @@
 //! Multi-pod Bifrost test harness.
 
+#[cfg(feature = "bench")]
+pub mod bench_forge;
+#[cfg(feature = "bench")]
+pub mod bench_oracle;
+#[cfg(feature = "bench")]
+pub mod bench_otlp;
+#[cfg(feature = "bench")]
+pub(crate) mod bench_report;
+#[cfg(feature = "bench")]
+pub mod bench_scribe;
 pub mod cluster;
 pub mod forge_harness;
 pub mod harness;

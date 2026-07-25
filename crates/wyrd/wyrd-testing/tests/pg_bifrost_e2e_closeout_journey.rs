@@ -124,9 +124,8 @@ async fn run_closeout_journey(
         .expect_err("schema conflict must be rejected before ACK");
     assert_eq!(conflict.status(), 409);
 
-    // The current Oracle read surface is not yet the owner of this closeout
-    // readback. The journey therefore verifies the durable server boundary
-    // directly through the fixture and the shared local object store.
+    // Assert the durable file-list and audit boundary directly; the Oracle
+    // query journey separately covers the fused hot/published read path.
     let rows: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint
            FROM vala.file_list

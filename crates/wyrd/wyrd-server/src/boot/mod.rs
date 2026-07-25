@@ -13,6 +13,7 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -231,8 +232,9 @@ pub async fn build_app_state_from_boot_with_config(
             &wal_dir,
             *stream.node_id.as_bytes(),
             stream.writer_epoch.as_i64(),
-            DataTenantId::SYSTEM_OWNER,
-            WalConfig::default(),
+            WalConfig::default()
+                .with_disk_limit(scribe_config.wal_disk_limit_bytes)
+                .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
         )
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?,
     );
@@ -262,27 +264,29 @@ pub async fn build_app_state_from_boot_with_config(
                 ServerBootError::Scribe(format!("coordination runtime failed: {error}"))
             })?,
     );
+    let pod_memory_limit = BifrostMemoryGovernor::detect(1024 * 1024 * 1024)
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?
+        .pod_limit_bytes();
+    let bifrost_memory = BifrostMemoryGovernor::new_with_scribe_limit(
+        pod_memory_limit,
+        scribe_config.memory_limit_bytes,
+    )
+    .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let admission = AdmissionConfig {
-        memory_limit_bytes: scribe_config
-            .memory_limit_bytes
-            .unwrap_or(1024 * 1024 * 1024),
+        memory_limit_bytes: pod_memory_limit,
+        scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
     };
     let execution_pools = ScribeExecutionPools::new(
-        ScribeIngressCpuPool::try_new_with_capacity(
-            scribe_config.ingress_cpu_threads,
-            256,
-        )
-        .map_err(|error| ServerBootError::Scribe(format!("ingress CPU pool failed: {error}")))?,
-        ScribePersistenceCpuPool::try_new_with_capacity(
-            scribe_config.persistence_cpu_threads,
-            64,
-        )
-        .map_err(|error| ServerBootError::Scribe(format!("persistence CPU pool failed: {error}")))?,
-        ScribeWalIoPool::try_new_with_capacity(
-            scribe_config.wal_io_threads,
-            256,
-        )
-        .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
+        ScribeIngressCpuPool::try_new_with_capacity(scribe_config.ingress_cpu_threads, 256)
+            .map_err(|error| {
+                ServerBootError::Scribe(format!("ingress CPU pool failed: {error}"))
+            })?,
+        ScribePersistenceCpuPool::try_new_with_capacity(scribe_config.persistence_cpu_threads, 64)
+            .map_err(|error| {
+                ServerBootError::Scribe(format!("persistence CPU pool failed: {error}"))
+            })?,
+        ScribeWalIoPool::try_new_with_capacity(scribe_config.wal_io_threads, 256)
+            .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
     );
     let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
         Arc::new(storage.operator().clone()),
@@ -298,13 +302,20 @@ pub async fn build_app_state_from_boot_with_config(
                 64,
                 scribe_config.wal_io_threads,
             )),
+            memory_governor: Some(bifrost_memory.clone()),
         },
     ));
-    let replayed_generations = scribe
-        .replay_wal_async()
-        .await
-        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
-    tracing::info!(replayed_generations, "Scribe WAL recovery complete");
+    match scribe.replay_wal_async().await {
+        Ok(replayed_generations) => {
+            tracing::info!(replayed_generations, "Scribe WAL recovery complete");
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "Scribe WAL recovery failed; keeping the server alive but not ready"
+            );
+        }
+    }
 
     let forge_context = ForgeContext::new(
         postgres.vala().clone(),
@@ -312,10 +323,12 @@ pub async fn build_app_state_from_boot_with_config(
         bifrost_redux.iceberg_catalog(),
         Arc::new(storage.operator().clone()),
         ForgeConfig::default(),
-    )?;
+    )?
+    .with_memory_governor(bifrost_memory.clone());
 
     Ok(AppState::new(postgres, storage, bifrost)
         .with_bifrost_redux(bifrost_redux)
+        .with_bifrost_memory(bifrost_memory)
         .with_forge_context(forge_context)
         .with_scribe(scribe)
         .with_scribe_coordination_runtime(coordination_runtime))

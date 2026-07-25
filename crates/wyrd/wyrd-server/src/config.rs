@@ -223,16 +223,16 @@ impl ScribeRuntimeConfig {
         if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
             return Err(format!("scribe.{name} must be at least 1"));
         }
-        let min_bytes = 32 * 1024 * 1024;
-        if let Some(value) = self.memory_limit_bytes {
-            if value < min_bytes {
-                return Err("scribe.memory_limit_bytes must be at least 33554432 bytes".to_owned());
-            }
+        let min_bytes = 256 * 1024 * 1024;
+        if let Some(value) = self.memory_limit_bytes
+            && value < min_bytes
+        {
+            return Err("scribe.memory_limit_bytes must be at least 268435456 bytes".to_owned());
         }
-        if let Some(value) = self.wal_disk_limit_bytes {
-            if value == 0 {
-                return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
-            }
+        if let Some(value) = self.wal_disk_limit_bytes
+            && value == 0
+        {
+            return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
         }
         Ok(())
     }
@@ -1346,30 +1346,26 @@ mod tests {
     fn scribe_runtime_defaults_match_bounded_contract() {
         let cfg = ScribeRuntimeConfig::default();
         assert_eq!(cfg.coordination_threads, 2);
-        assert_eq!(cfg.ingress_queue_items, 256);
-        assert_eq!(cfg.retained_frame_items, 256);
-        assert_eq!(cfg.memory_limit_bytes, 1024 * 1024 * 1024);
-        assert_eq!(cfg.persistence_queue_items, 64);
-        assert_eq!(cfg.wal_io_queue_items, 256);
-        assert_eq!(cfg.writer_queue_items, 64);
-        assert_eq!(cfg.active_writer_limit, 1024);
-        assert_eq!(cfg.writer_idle_ttl_secs, 600);
+        assert_eq!(cfg.memory_limit_bytes, None);
+        assert_eq!(cfg.wal_disk_limit_bytes, None);
         cfg.validate().expect("resolved defaults must validate");
     }
 
     #[test]
-    fn scribe_runtime_rejects_zero_and_small_byte_bounds() {
+    fn scribe_runtime_rejects_zero_and_small_bounds() {
         let cfg = ScribeRuntimeConfig {
-            persistence_queue_items: 0,
+            persistence_cpu_threads: 0,
             ..ScribeRuntimeConfig::default()
         };
         assert!(cfg.validate().is_err());
 
         let mut cfg = ScribeRuntimeConfig {
-            persistence_queue_items: 1,
+            memory_limit_bytes: Some(1024),
             ..ScribeRuntimeConfig::default()
         };
-        cfg.retained_frame_bytes = 1024;
+        assert!(cfg.validate().is_err());
+        cfg.memory_limit_bytes = None;
+        cfg.wal_disk_limit_bytes = Some(0);
         assert!(cfg.validate().is_err());
     }
 

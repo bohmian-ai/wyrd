@@ -126,8 +126,8 @@ impl SealDriver {
         Self::record(
             "freeze",
             freeze_started.elapsed(),
-            frozen.batch.num_rows(),
-            frozen.batch.get_array_memory_size(),
+            frozen.row_count(),
+            frozen.arrow_bytes,
         );
 
         // 2. WriteParquet on the boot-owned persistence CPU lane.
@@ -139,7 +139,7 @@ impl SealDriver {
         Self::record(
             "parquet_encode",
             parquet_started.elapsed(),
-            frozen.batch.num_rows(),
+            frozen.row_count(),
             encoded.bytes.len(),
         );
 
@@ -150,7 +150,7 @@ impl SealDriver {
         Self::record(
             "object_store_put",
             put_started.elapsed(),
-            frozen.batch.num_rows(),
+            frozen.row_count(),
             encoded.bytes.len(),
         );
 
@@ -171,7 +171,7 @@ impl SealDriver {
         Self::record(
             "file_list_transaction",
             pg_started.elapsed(),
-            frozen.batch.num_rows(),
+            frozen.row_count(),
             encoded.bytes.len(),
         );
 
@@ -196,7 +196,7 @@ impl SealDriver {
                 file_list_row_id: insert_outcome.id,
                 wal_lsn_min,
                 wal_lsn_max,
-                memtable_bytes: frozen.batch.get_array_memory_size(),
+                memtable_bytes: frozen.arrow_bytes,
             },
             binding: binding.clone(),
             parquet_path,
@@ -222,7 +222,7 @@ impl SealDriver {
             ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned the wrong seal result".to_owned(),
             }),
-            ScribePersistenceCpuResult::ReplayRestored => Err(ScribeError::Internal {
+            ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
                 detail: "persistence lane returned replay output during seal".to_owned(),
             }),
         }

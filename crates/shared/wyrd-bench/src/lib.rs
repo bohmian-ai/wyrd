@@ -1,12 +1,18 @@
 //! Shared infrastructure for SLO-gated Criterion benches.
 
 pub mod compare;
+pub mod lane;
 pub mod recorder;
 pub mod report;
 pub mod slo;
 pub mod workload;
 
 pub use compare::{BenchmarkStage, ComparisonError, ComparisonReport, Regression, compare_stages};
+pub use lane::{
+    BenchmarkReadiness, BifrostFaultProfile, BifrostLane, BifrostPayloadShape,
+    BifrostReportEnvelope, BifrostScenario, DurableAckReport, DurableAckSample,
+    REPORT_SCHEMA_VERSION, ScenarioError, compare_bifrost_stages, summarize_durable_acks,
+};
 pub use recorder::{BenchmarkMetricSnapshot, BenchmarkRecorder, HistogramSnapshot};
 pub use report::{
     BacklogSample, BenchmarkReport, ForgeMeasurements, LatencyPercentiles, MachineMetadata,

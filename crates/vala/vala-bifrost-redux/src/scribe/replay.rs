@@ -2,8 +2,8 @@
 //!
 //! On Scribe restart, replay scans the WAL directory past `manifest.sealed_lsn[K]`
 //! for each seal-key K, validates CRC/length/monotonicity, truncates torn tails,
-//! dedupes by `batch_id`, and reconstructs both the memtable state and the staged
-//! `AuditEvent` list per key.
+//! dedupes by `AppendSliceId`, and reconstructs both the memtable state and the
+//! staged `AuditEvent` list per key.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -14,11 +14,16 @@ use wyrd_spec::vala::api::AuditEvent;
 use crate::contracts::ScribeError;
 use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
+use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory, MemoryReservation};
 use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::SealKey;
 #[cfg(test)]
 use crate::scribe::wal::WalConfig;
-use crate::scribe::wal::{WalLsn, WalReader, decode_slice_payload};
+use crate::scribe::wal::{WalLsn, WalReader, WalSegmentRef, decode_slice_payload};
+
+/// Maximum accounted decode memory held by one streamed replay batch.
+pub const REPLAY_BATCH_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+const REPLAY_RECORD_OVERHEAD_BYTES: usize = 1024;
 
 /// Replayed state for one seal-key.
 #[derive(Debug, Clone)]
@@ -31,6 +36,21 @@ pub struct ReplayedSealKey {
     pub data_records: Vec<Vec<u8>>,
     /// Per-append metadata derived from WAL record headers.
     pub append_metas: Vec<ReplayedAppendMeta>,
+    /// WAL segments that contain the reconstructed records. These references
+    /// remain pinned until the replayed generation is published and its grace
+    /// period expires.
+    pub wal_segments: Vec<WalSegmentRef>,
+}
+
+/// A bounded group of replayed WAL state sent from the WAL lane to recovery.
+#[derive(Debug)]
+pub struct ReplayChunk {
+    /// Reconstructed state grouped by exact seal key.
+    pub states: HashMap<String, ReplayedSealKey>,
+    /// Decode memory retained by this handoff, when running on the production
+    /// WAL lane. Dropping the chunk releases the reservation after recovery has
+    /// transferred its Arrow ownership or publication has completed.
+    pub(crate) memory: Option<MemoryReservation>,
 }
 
 /// Per-append metadata derived during replay.
@@ -52,7 +72,8 @@ pub struct ReplayedAppendMeta {
 /// self-describing v3 slice records.
 ///
 /// Reads the manifest (if present), scans all segments, skips sealed LSNs,
-/// truncates torn tails, dedupes by `batch_id`, and groups records by `seal-key`.
+/// truncates torn tails, dedupes by `AppendSliceId`, and groups records by
+/// `SealKey`.
 ///
 /// # Errors
 /// Returns [`ScribeError::Internal`] if:
@@ -65,32 +86,119 @@ pub struct ReplayedAppendMeta {
 pub fn replay_wal_directory(
     wal_dir: impl AsRef<Path>,
 ) -> Result<HashMap<String, ReplayedSealKey>, ScribeError> {
+    let mut replayed = HashMap::new();
+    replay_wal_directory_stream(wal_dir, |chunk| {
+        for state in chunk.states.into_values() {
+            merge_replayed_state(&mut replayed, state);
+        }
+        Ok(())
+    })?;
+    Ok(replayed)
+}
+
+/// Replay the WAL directory incrementally and emit bounded state chunks.
+///
+/// The callback runs on the WAL I/O lane. It must apply backpressure rather
+/// than retain chunks: the production caller sends through a bounded channel
+/// and publishes each chunk before the reader advances. The deduplication set
+/// remains live for the scan so a retry split across chunks is still emitted
+/// exactly once.
+pub fn replay_wal_directory_stream(
+    wal_dir: impl AsRef<Path>,
+    emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
+) -> Result<(), ScribeError> {
+    replay_wal_directory_stream_accounted(wal_dir, None, emit)
+}
+
+/// Replay the WAL directory with a bounded decode reservation on each emitted
+/// batch. The production WAL lane supplies the governor; unit tests may omit
+/// it when they are exercising parser ordering or deduplication in isolation.
+pub(crate) fn replay_wal_directory_stream_accounted(
+    wal_dir: impl AsRef<Path>,
+    governor: Option<&BifrostMemoryGovernor>,
+    mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
+) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
+    let sealed_lsn_map = sealed_lsn_map(wal_dir)?;
+    let reader = WalReader::open_directory_unfiltered(wal_dir)?;
+    let mut accumulator = ReplayAccumulator::new(&sealed_lsn_map, governor)?;
 
-    let manifest_path = wal_dir.join("manifest");
-    let manifest = read_manifest(&manifest_path)?;
+    reader.for_each_record(|segment_path, record| {
+        if accumulator.append(segment_path, &record)?
+            && let Some(chunk) = accumulator.take_chunk()?
+        {
+            emit(chunk)?;
+        }
+        Ok(())
+    })?;
 
-    let sealed_lsn_map: HashMap<String, WalLsn> = manifest
+    if let Some(chunk) = accumulator.take_chunk()? {
+        emit(chunk)?;
+    }
+
+    Ok(())
+}
+
+fn sealed_lsn_map(wal_dir: &Path) -> Result<HashMap<String, WalLsn>, ScribeError> {
+    let manifest = read_manifest(wal_dir.join("manifest"))?;
+    Ok(manifest
         .as_ref()
-        .map(|m| {
-            m.sealed_lsn
+        .map(|manifest| {
+            manifest
+                .sealed_lsn
                 .iter()
-                .map(|(k, &v)| (k.clone(), WalLsn::new(v)))
+                .map(|(key, &lsn)| (key.clone(), WalLsn::new(lsn)))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
 
-    let reader = WalReader::open_directory_unfiltered(wal_dir)?;
-    let records = reader.read_all_records_with_paths()?;
+/// Owns the dedupe index and one bounded replay batch while the WAL reader
+/// advances. The index survives batch boundaries; decoded state does not.
+struct ReplayAccumulator<'a> {
+    sealed_lsn_map: &'a HashMap<String, WalLsn>,
+    seen_slices: HashSet<AppendSliceId>,
+    states: HashMap<String, ReplayedSealKey>,
+    governor: Option<&'a BifrostMemoryGovernor>,
+    memory: Option<MemoryReservation>,
+    memory_bytes: usize,
+}
 
-    // Truncate torn tails — already handled by WalRecord::decode_from returning Err on CRC mismatch
+impl<'a> ReplayAccumulator<'a> {
+    /// Create an empty bounded replay batch with a zero-sized reservation.
+    fn new(
+        sealed_lsn_map: &'a HashMap<String, WalLsn>,
+        governor: Option<&'a BifrostMemoryGovernor>,
+    ) -> Result<Self, ScribeError> {
+        let memory = governor
+            .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
+            .transpose()?;
+        Ok(Self {
+            sealed_lsn_map,
+            seen_slices: HashSet::new(),
+            states: HashMap::new(),
+            governor,
+            memory,
+            memory_bytes: 0,
+        })
+    }
 
-    // Deduplicate by (batch_id, seal_key), not by batch_id alone. A client
-    // retry may legitimately route the same batch id to a different day/key.
-    let mut seen_slices = HashSet::<AppendSliceId>::new();
-    let mut deduplicated = Vec::new();
-
-    for (_segment_path, record) in records {
+    /// Decode and append one record, returning whether the batch reached its
+    /// accounted memory bound.
+    fn append(
+        &mut self,
+        segment_path: std::path::PathBuf,
+        record: &crate::scribe::wal::WalRecord,
+    ) -> Result<bool, ScribeError> {
+        let record_memory_bytes = record
+            .payload
+            .len()
+            .saturating_mul(2)
+            .saturating_add(REPLAY_RECORD_OVERHEAD_BYTES);
+        let previous_memory = self.memory_bytes;
+        if let Some(memory) = self.memory.as_mut() {
+            memory.resize(previous_memory.saturating_add(record_memory_bytes))?;
+        }
         if record.record_kind != 2 {
             return Err(ScribeError::Internal {
                 detail: "WAL v3 contains a non-slice record".to_owned(),
@@ -98,63 +206,108 @@ pub fn replay_wal_directory(
         }
         let decoded = decode_slice_payload(&record.payload)?;
         let seal_key = decoded.seal_key.clone();
-        let batch_id = record.batch_id;
-        let seal_key_str = seal_key.as_path_components();
         let append_slice_id = AppendSliceId {
-            batch_id: uuid::Uuid::from_bytes(batch_id),
+            batch_id: uuid::Uuid::from_bytes(record.batch_id),
             seal_key: seal_key.clone(),
         };
-        if !seen_slices.insert(append_slice_id) {
-            continue;
+        let seal_key_path = seal_key.as_path_components();
+        if !self.seen_slices.insert(append_slice_id.clone()) {
+            self.resize_memory(previous_memory)?;
+            return Ok(false);
         }
-        if let Some(&sealed_lsn) = sealed_lsn_map.get(&seal_key_str)
-            && record.lsn <= sealed_lsn
+        if self
+            .sealed_lsn_map
+            .get(&seal_key_path)
+            .is_some_and(|sealed_lsn| record.lsn <= *sealed_lsn)
         {
-            continue;
+            self.resize_memory(previous_memory)?;
+            return Ok(false);
         }
-        deduplicated.push((record, decoded, batch_id, seal_key));
-    }
-
-    // Group by seal-key
-    let mut replayed_state: HashMap<String, ReplayedSealKey> = HashMap::new();
-
-    for (record, decoded, batch_id, seal_key) in deduplicated {
         let audit_event = decode_audit_event(&decoded.audit)?;
-        let seal_key_str = seal_key.as_path_components();
-
-        let state = replayed_state
-            .entry(seal_key_str.clone())
+        let state = self
+            .states
+            .entry(seal_key_path)
             .or_insert_with(|| ReplayedSealKey {
                 seal_key: seal_key.clone(),
                 audit_events: Vec::new(),
                 data_records: Vec::new(),
                 append_metas: Vec::new(),
+                wal_segments: Vec::new(),
             });
-
+        let segment = WalSegmentRef { path: segment_path };
+        if !state.wal_segments.contains(&segment) {
+            state.wal_segments.push(segment);
+        }
         state.audit_events.push(audit_event);
-        let rows_accepted =
-            arrow::ipc::reader::StreamReader::try_new(Cursor::new(&decoded.data), None)
-                .ok()
-                .map_or(0, |reader| {
-                    reader
-                        .filter_map(Result::ok)
-                        .map(|batch| batch.num_rows())
-                        .sum()
-                });
+        let rows_accepted = count_rows(&decoded.data);
         state.data_records.push(decoded.data);
         state.append_metas.push(ReplayedAppendMeta {
-            batch_id,
+            batch_id: record.batch_id,
             wal_lsn: record.lsn,
             rows_accepted,
-            append_slice_id: AppendSliceId {
-                batch_id: uuid::Uuid::from_bytes(batch_id),
-                seal_key: seal_key.clone(),
-            },
+            append_slice_id,
             schema_fingerprint: decoded.schema_fingerprint,
         });
+        self.memory_bytes = self.memory_bytes.saturating_add(record_memory_bytes);
+        Ok(self.memory_bytes >= REPLAY_BATCH_MEMORY_BYTES)
     }
 
-    Ok(replayed_state)
+    /// Move the current batch into a handoff and start a fresh reservation.
+    fn take_chunk(&mut self) -> Result<Option<ReplayChunk>, ScribeError> {
+        if self.states.is_empty() {
+            return Ok(None);
+        }
+        let next_memory = self
+            .governor
+            .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
+            .transpose()?;
+        let chunk = ReplayChunk {
+            states: std::mem::take(&mut self.states),
+            memory: self.memory.take(),
+        };
+        self.memory = next_memory;
+        self.memory_bytes = 0;
+        Ok(Some(chunk))
+    }
+
+    /// Resize the current batch after a record is rejected by deduplication or
+    /// the manifest watermark.
+    fn resize_memory(&mut self, bytes: usize) -> Result<(), ScribeError> {
+        if let Some(memory) = self.memory.as_mut() {
+            memory.resize(bytes)?;
+        }
+        Ok(())
+    }
+}
+
+fn count_rows(data: &[u8]) -> usize {
+    arrow::ipc::reader::StreamReader::try_new(Cursor::new(data), None)
+        .ok()
+        .map_or(0, |reader| {
+            reader
+                .filter_map(Result::ok)
+                .map(|batch| batch.num_rows())
+                .sum()
+        })
+}
+
+fn merge_replayed_state(
+    replayed: &mut HashMap<String, ReplayedSealKey>,
+    incoming: ReplayedSealKey,
+) {
+    let key = incoming.seal_key.as_path_components();
+    let Some(existing) = replayed.get_mut(&key) else {
+        replayed.insert(key, incoming);
+        return;
+    };
+    existing.audit_events.extend(incoming.audit_events);
+    existing.data_records.extend(incoming.data_records);
+    existing.append_metas.extend(incoming.append_metas);
+    for segment in incoming.wal_segments {
+        if !existing.wal_segments.contains(&segment) {
+            existing.wal_segments.push(segment);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -189,11 +342,10 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             1,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
-        let writer = wal.handle_for_seal_key(replay_key(tenant_id));
+        let seal_key = replay_key(tenant_id);
 
         // Write 2 appends
         for i in 0u8..2 {
@@ -218,8 +370,7 @@ mod tests {
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            writer
-                .append_and_fsync(batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -239,7 +390,6 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             1,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
@@ -249,8 +399,6 @@ mod tests {
             TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("date")),
         );
-        let first = wal.handle_for_seal_key(first_key.clone());
-        let second = wal.handle_for_seal_key(second_key.clone());
         let event = |resource: &str| AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -270,11 +418,9 @@ mod tests {
             .expect("first audit");
         let second_audit = crate::scribe::audit_envelope::encode_audit_event(&event("second"))
             .expect("second audit");
-        first
-            .append_and_fsync([1; 16], &first_audit, b"first")
+        wal.append_and_fsync_for_test(&first_key, [1; 16], &first_audit, b"first")
             .expect("first append");
-        second
-            .append_and_fsync([2; 16], &second_audit, b"second")
+        wal.append_and_fsync_for_test(&second_key, [2; 16], &second_audit, b"second")
             .expect("second append");
         let mut manifest = crate::scribe::manifest::Manifest::new(
             crate::scribe::stream_identity::StreamIdentity::new(
@@ -300,6 +446,133 @@ mod tests {
     }
 
     #[test]
+    fn replay_orders_numeric_segment_sequences_before_grouping() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant_id = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::new(256).expect("small segment config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant_id);
+        let audit_event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "test".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_owned(),
+            detail: None,
+        };
+        let audit_bytes =
+            crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode audit");
+
+        for value in 0_u8..12 {
+            wal.append_and_fsync_for_test(&seal_key, [value; 16], &audit_bytes, &[value])
+                .expect("append");
+        }
+
+        let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+        let state = &replayed[&seal_key.as_path_components()];
+        assert_eq!(state.append_metas.len(), 12);
+        assert!(
+            state
+                .append_metas
+                .windows(2)
+                .all(|window| window[0].wal_lsn < window[1].wal_lsn)
+        );
+    }
+
+    #[test]
+    fn streamed_replay_chunks_bound_state_and_dedupe_across_chunks() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let node_id = NodeId::generate();
+        let tenant_id = crate::test_support::tenant();
+        let wal = WalWriter::new(
+            temp_dir.path(),
+            *node_id.as_bytes(),
+            1,
+            WalConfig::new(16 * 1024 * 1024).expect("segment config"),
+        )
+        .expect("writer");
+        let seal_key = replay_key(tenant_id);
+        let audit_event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: "append".to_owned(),
+            resource: "test".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::new_v4()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "test".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "1 rows".to_owned(),
+            detail: None,
+        };
+        let audit_bytes =
+            crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("audit");
+
+        let payload = vec![7_u8; 2 * 1024 * 1024];
+        for value in 0_u16..5 {
+            let batch_id = value.to_le_bytes();
+            let mut id = [0_u8; 16];
+            id[..2].copy_from_slice(&batch_id);
+            let frame =
+                crate::scribe::wal::encode_append_frame(id, &audit_bytes, &payload).expect("frame");
+            wal.append_frame_for_test(&frame, &seal_key)
+                .expect("append");
+        }
+        let mut duplicate_id = [0_u8; 16];
+        duplicate_id[..2].copy_from_slice(&2_u16.to_le_bytes());
+        let duplicate =
+            crate::scribe::wal::encode_append_frame(duplicate_id, &audit_bytes, &payload)
+                .expect("duplicate frame");
+        wal.append_frame_for_test(&duplicate, &seal_key)
+            .expect("duplicate append");
+        wal.sync_data_for_test(&seal_key).expect("sync");
+
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+        let mut chunks = Vec::new();
+        replay_wal_directory_stream_accounted(temp_dir.path(), Some(&governor), |chunk| {
+            chunks.push(chunk);
+            Ok(())
+        })
+        .expect("streamed replay");
+
+        assert!(chunks.len() > 1);
+        assert!(
+            governor.snapshot().categories[MemoryCategory::Decode as usize] > 0,
+            "queued replay state must carry decode ownership"
+        );
+        let mut metas = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.states.into_values())
+            .flat_map(|state| state.append_metas)
+            .collect::<Vec<_>>();
+        assert_eq!(governor.snapshot().total_bytes(), 0);
+        metas.sort_by_key(|meta| meta.wal_lsn);
+        assert_eq!(metas.len(), 5);
+        assert!(metas.windows(2).all(|window| {
+            window[0].wal_lsn < window[1].wal_lsn
+                && window[0].append_slice_id != window[1].append_slice_id
+        }));
+
+        let merged = replay_wal_directory(temp_dir.path()).expect("merged replay");
+        assert_eq!(merged[&seal_key.as_path_components()].append_metas.len(), 5);
+    }
+
+    #[test]
     fn wal_torn_tail_is_truncated_on_replay() {
         let temp_dir = TempDir::new().expect("temp dir");
         let node_id = NodeId::generate();
@@ -309,11 +582,10 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             1,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
-        let writer = wal.handle_for_seal_key(replay_key(tenant_id));
+        let seal_key = replay_key(tenant_id);
 
         // Write 5 records
         for i in 0u8..5 {
@@ -338,8 +610,7 @@ mod tests {
             let data_bytes = format!("data-{i}").into_bytes();
             let batch_id = [i; 16];
 
-            writer
-                .append_and_fsync(batch_id, &audit_bytes, &data_bytes)
+            wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, &data_bytes)
                 .expect("append");
         }
 
@@ -365,11 +636,10 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             1,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
-        let writer = wal.handle_for_seal_key(replay_key(tenant_id));
+        let seal_key = replay_key(tenant_id);
 
         let shared_batch_id = [42u8; 16];
 
@@ -392,8 +662,7 @@ mod tests {
 
         let audit_bytes1 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event1).expect("encode");
-        writer
-            .append_and_fsync(shared_batch_id, &audit_bytes1, b"data-1")
+        wal.append_and_fsync_for_test(&seal_key, shared_batch_id, &audit_bytes1, b"data-1")
             .expect("append 1");
 
         // Write second append with same batch_id=42 (duplicate)
@@ -415,8 +684,7 @@ mod tests {
 
         let audit_bytes2 =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event2).expect("encode");
-        writer
-            .append_and_fsync(shared_batch_id, &audit_bytes2, b"data-2")
+        wal.append_and_fsync_for_test(&seal_key, shared_batch_id, &audit_bytes2, b"data-2")
             .expect("append 2");
 
         // Replay should deduplicate by batch_id
@@ -442,12 +710,10 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             1,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
         let seal_key = replay_key(tenant_id);
-        let writer = wal.handle_for_seal_key(seal_key.clone());
         let batch_id = [42u8; 16];
 
         for sequence in 0..2 {
@@ -473,9 +739,10 @@ mod tests {
                 format!("data-{sequence}").as_bytes(),
             )
             .expect("frame");
-            writer.append_frame(&frame).expect("append");
+            wal.append_frame_for_test(&frame, &seal_key)
+                .expect("append");
         }
-        writer.sync_data().expect("sync");
+        wal.sync_data_for_test(&seal_key).expect("sync");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
         let state = replayed
@@ -506,11 +773,10 @@ mod tests {
             temp_dir.path(),
             *node_id.as_bytes(),
             3,
-            tenant_id,
             WalConfig::default(),
         )
         .expect("writer");
-        let writer = wal.handle_for_seal_key(replay_key(tenant_id));
+        let seal_key = replay_key(tenant_id);
 
         let audit_event = AuditEvent {
             request_id: RequestId::now_v7(),
@@ -531,8 +797,7 @@ mod tests {
         let audit_bytes =
             crate::scribe::audit_envelope::encode_audit_event(&audit_event).expect("encode");
         let batch_id = [1u8; 16];
-        writer
-            .append_and_fsync(batch_id, &audit_bytes, b"data")
+        wal.append_and_fsync_for_test(&seal_key, batch_id, &audit_bytes, b"data")
             .expect("append");
 
         // Replay doesn't directly expose writer_epoch in ReplayedAppendMeta yet,
@@ -557,9 +822,8 @@ mod tests {
         let table = TableRef::new(crate::namespaces::BifrostNamespace::Bifrost, "events");
         let day = EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date"));
         let seal_key = SealKey::new(tenant, table, day);
-        let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, tenant, WalConfig::default())
+        let writer = WalWriter::new(temp_dir.path(), [9_u8; 16], 1, WalConfig::default())
             .expect("wal writer");
-        let handle = writer.handle_for_seal_key(seal_key.clone());
         let event = AuditEvent {
             request_id: RequestId::now_v7(),
             trace_id: None,
@@ -578,8 +842,10 @@ mod tests {
         let audit = crate::scribe::audit_envelope::encode_audit_event(&event).expect("audit");
         let frame =
             crate::scribe::wal::encode_append_frame([4_u8; 16], &audit, b"data").expect("frame");
-        handle.append_frame(&frame).expect("append");
-        handle.sync_data().expect("sync");
+        writer
+            .append_frame_for_test(&frame, &seal_key)
+            .expect("append");
+        writer.sync_data_for_test(&seal_key).expect("sync");
 
         let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
         assert!(replayed.contains_key(&seal_key.as_path_components()));

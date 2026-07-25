@@ -34,6 +34,8 @@ pub enum ForgeError {
     Shutdown,
     #[error("Forge {operation} timed out")]
     Timeout { operation: &'static str },
+    #[error("Forge memory workspace admission failed: {detail}")]
+    MemoryBudget { detail: String },
     #[error("Forge invariant failed: {detail}")]
     Invariant { detail: String },
 }

@@ -18,7 +18,7 @@
 //! tests in `wyrd-server/src/http/otlp.rs` — `writer_busy_maps_to_503` for the
 //! HTTP path and `writer_busy_table_name_is_per_signal` for per-signal table
 //! naming — plus the gRPC mapping in `vala-bifrost-redux/src/gate/error.rs`
-//! (`IngestError::WriterBusy → Code::ResourceExhausted` with
+//! (`IngestError::IngestBusy → Code::ResourceExhausted` with
 //! `WYRD_VALA_429_INGEST_BUSY`).
 //!
 //! Both tests boot a `start_bound` server (PgFixture), so the fast family lane

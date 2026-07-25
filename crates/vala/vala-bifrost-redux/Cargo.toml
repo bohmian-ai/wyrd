@@ -6,6 +6,11 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [features]
 default = []
@@ -32,6 +37,7 @@ serde_json = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 iceberg = { workspace = true }
+iceberg-datafusion = { workspace = true }
 iceberg-catalog-sql = { workspace = true }
 iceberg-storage-opendal = { workspace = true }
 datafusion = { workspace = true }

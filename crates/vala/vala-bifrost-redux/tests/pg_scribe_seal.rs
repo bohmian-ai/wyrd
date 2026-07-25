@@ -55,7 +55,6 @@ mod pg_tests {
                 temp_dir.path(),
                 node_id_bytes,
                 1,
-                tenant,
                 vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),
@@ -437,15 +436,56 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires fault injection infrastructure"]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
-        // This test would verify that if the seal transaction fails between
-        // file_list INSERT and audit_outbox fan-out, the transaction rolls back
-        // atomically and leaves no partial state.
-        //
-        // Implementation requires fault injection seams in SealDriver or
-        // a test-only hook in insert_and_audit that can fail after file_list
-        // but before audit. Deferred to follow-up with crash-injection harness.
-        // Skip for ; implement in follow-up with crash-injection harness.
+        let (fixture, tenant, scribe) = setup().await;
+        let batch = make_batch(
+            2,
+            DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                .expect("time")
+                .timestamp_micros(),
+        );
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
+                rows: batch,
+            })
+            .await
+            .expect("append");
+
+        let pool = fixture.app_pool();
+        let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .expect("tenant connection");
+        let post_commit = scribe.force_seal(&mut conn).await.expect("force seal");
+        drop(conn);
+        scribe.abort_post_commit(post_commit).expect("abort seal");
+
+        let mut verify = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .expect("verification connection");
+        let tx = verify.transaction();
+        let file_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind("events")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("file count");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource LIKE $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind("%events%")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("audit count");
+        assert_eq!(file_count, 0);
+        assert_eq!(audit_count, 0);
     }
 }

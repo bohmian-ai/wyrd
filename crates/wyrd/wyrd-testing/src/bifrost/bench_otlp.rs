@@ -1,26 +1,26 @@
 //! Real OTLP span-ingest capacity benchmark.
 //!
 //! This lane drives the public OTLP/gRPC `TraceService::Export` surface through
-//! Gate and Scribe. It intentionally reports the admission ACK separately from
-//! the post-run flush and query checks: an export response is not, by itself, a
-//! proof that the span is durable or queryable.
+//! Gate and Scribe. The export response is measured at the same durable Scribe
+//! ACK boundary as the unary lane; post-run publication/query checks are
+//! recorded separately and never relabeled as ACK throughput.
 
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::Bootstrap;
+use crate::bifrost::{BifrostTopology, WyrdTestCluster};
+use crate::otlp::RandomTraceGenerator;
 use serde::Serialize;
 use sqlx::Row;
 use tokio::task::JoinSet;
-use wyrd_bench::LatencyPercentiles;
+use wyrd_bench::{BenchmarkReadiness, BifrostReportEnvelope, BifrostScenario, LatencyPercentiles};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
-use wyrd_testing::Bootstrap;
-use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
-use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_tonic::otlp::trace_service::ExportTraceServiceRequest;
 use wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient;
 use wyrd_tonic::prost::Message;
@@ -29,29 +29,9 @@ use wyrd_tonic::tonic::transport::Channel;
 use wyrd_tonic::wyrd::v1::GetTraceRequest;
 use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 
-type BenchError = Box<dyn Error + Send + Sync>;
+pub type BenchError = Box<dyn Error + Send + Sync>;
 
-const DEFAULT_PODS: usize = 3;
-const DEFAULT_TENANTS: usize = 10;
-const DEFAULT_TARGET_SPANS_PER_SECOND: u64 = 10_000;
-const DEFAULT_SPANS_PER_REQUEST: usize = 100;
-const DEFAULT_WARMUP_SECONDS: u64 = 5;
-const DEFAULT_MEASURED_SECONDS: u64 = 60;
-const DEFAULT_MAX_IN_FLIGHT: usize = 256;
-const DEFAULT_VERIFY_SAMPLES: usize = 3;
 const MAX_RETAINED_SAMPLE_TRACES: usize = 16;
-
-#[derive(Debug, Clone)]
-struct Config {
-    pods: usize,
-    tenants: usize,
-    target_spans_per_second: u64,
-    spans_per_request: usize,
-    warmup_seconds: u64,
-    measured_seconds: u64,
-    max_in_flight: usize,
-    verify_samples: usize,
-}
 
 #[derive(Clone)]
 struct Endpoint {
@@ -126,17 +106,14 @@ impl PhaseStats {
 
 #[derive(Debug, Serialize)]
 struct Report {
-    schema_version: u32,
-    lane: &'static str,
+    envelope: BifrostReportEnvelope,
     ack_boundary: &'static str,
-    durability_boundary: &'static str,
     queryability_boundary: &'static str,
     config: ReportConfig,
     prewarm_accepted_spans: u64,
     warmup: PhaseReport,
     measurement: PhaseReport,
     verification: VerificationReport,
-    readiness: &'static str,
     notes: Vec<&'static str>,
 }
 
@@ -144,19 +121,19 @@ struct Report {
 struct ReportConfig {
     pods: usize,
     tenants: usize,
-    target_spans_per_second: u64,
-    spans_per_request: usize,
+    target_items_per_second: u64,
+    items_per_request: u32,
     warmup_seconds: u64,
     measured_seconds: u64,
     max_in_flight: usize,
-    verify_samples_per_tenant: usize,
+    verify_samples_per_tenant: u32,
     span_shape: &'static str,
 }
 
 #[derive(Debug, Serialize)]
 struct PhaseReport {
     elapsed_ms: u64,
-    target_spans_per_second: u64,
+    target_items_per_second: u64,
     scheduled_requests: u64,
     completed_requests: u64,
     offered_spans: u64,
@@ -189,88 +166,28 @@ struct VerificationReport {
     passed: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), BenchError> {
-    let config = Config::from_args()?;
-    let report = run(config).await?;
+pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
+    let report = execute(scenario).await?;
     emit_report(&report)?;
     Ok(())
 }
-
-impl Config {
-    fn from_args() -> Result<Self, BenchError> {
-        let config = Self {
-            pods: value("pods", "WYRD_OTLP_PODS", DEFAULT_PODS)?,
-            tenants: value("tenants", "WYRD_OTLP_TENANTS", DEFAULT_TENANTS)?,
-            target_spans_per_second: value(
-                "target-spans-per-second",
-                "WYRD_OTLP_TARGET_SPANS_PER_SECOND",
-                DEFAULT_TARGET_SPANS_PER_SECOND,
-            )?,
-            spans_per_request: value(
-                "spans-per-request",
-                "WYRD_OTLP_SPANS_PER_REQUEST",
-                DEFAULT_SPANS_PER_REQUEST,
-            )?,
-            warmup_seconds: value(
-                "warmup-seconds",
-                "WYRD_OTLP_WARMUP_SECONDS",
-                DEFAULT_WARMUP_SECONDS,
-            )?,
-            measured_seconds: value(
-                "measured-seconds",
-                "WYRD_OTLP_MEASURED_SECONDS",
-                DEFAULT_MEASURED_SECONDS,
-            )?,
-            max_in_flight: value(
-                "max-in-flight",
-                "WYRD_OTLP_MAX_IN_FLIGHT",
-                DEFAULT_MAX_IN_FLIGHT,
-            )?,
-            verify_samples: value(
-                "verify-samples",
-                "WYRD_OTLP_VERIFY_SAMPLES",
-                DEFAULT_VERIFY_SAMPLES,
-            )?,
-        };
-        if !matches!(config.pods, 1 | 3) {
-            return Err("OTLP benchmark supports one or three pods".into());
-        }
-        if config.tenants == 0
-            || config.target_spans_per_second == 0
-            || config.spans_per_request == 0
-            || config.measured_seconds == 0
-            || config.max_in_flight == 0
-        {
-            return Err("tenants, target rate, batch size, measured duration, and max in-flight must be positive".into());
-        }
-        Ok(config)
-    }
-}
-
-fn value<T>(argument_name: &str, env_name: &str, default: T) -> Result<T, BenchError>
-where
-    T: std::str::FromStr,
-    T::Err: Error + Send + Sync + 'static,
-{
-    let argument_prefix = format!("--{argument_name}=");
-    let raw = std::env::args()
-        .find_map(|argument| argument.strip_prefix(&argument_prefix).map(str::to_owned))
-        .or_else(|| std::env::var(env_name).ok());
-    raw.map_or(Ok(default), |raw| {
-        raw.parse::<T>()
-            .map_err(|error| format!("invalid {argument_name}={raw}: {error}").into())
-    })
-}
-
-async fn run(config: Config) -> Result<Report, BenchError> {
-    let topology = if config.pods == 1 {
+async fn execute(scenario: BifrostScenario) -> Result<Report, BenchError> {
+    let topology = if scenario.pods == 1 {
         BifrostTopology::OnePod
     } else {
         BifrostTopology::ThreePod
     };
-    let cluster = WyrdTestCluster::start(config.pods, topology).await?;
-    let result = run_on_cluster(&cluster, &config).await;
+    let cluster = if scenario.fsync_delay_ms > 0 {
+        WyrdTestCluster::start_with_wal_sync_delay(
+            usize::try_from(scenario.pods)?,
+            topology,
+            Duration::from_millis(u64::from(scenario.fsync_delay_ms)),
+        )
+        .await?
+    } else {
+        WyrdTestCluster::start(usize::try_from(scenario.pods)?, topology).await?
+    };
+    let result = run_on_cluster(&cluster, &scenario).await;
     let shutdown_result = cluster.shutdown().await;
     match (result, shutdown_result) {
         (Ok(report), Ok(())) => Ok(report),
@@ -283,16 +200,19 @@ async fn run(config: Config) -> Result<Report, BenchError> {
     }
 }
 
-async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Report, BenchError> {
-    let endpoints = provision_endpoints(cluster, config).await?;
+async fn run_on_cluster(
+    cluster: &WyrdTestCluster,
+    scenario: &BifrostScenario,
+) -> Result<Report, BenchError> {
+    let endpoints = provision_endpoints(cluster, scenario).await?;
     let prewarm_accepted_spans = prewarm_endpoints(&endpoints).await?;
     flush_tenants(cluster, &endpoints).await?;
     let mut warmup = PhaseStats::default();
-    if config.warmup_seconds > 0 {
+    if scenario.warmup_seconds > 0 {
         warmup = run_phase(
             &endpoints,
-            config,
-            Duration::from_secs(config.warmup_seconds),
+            scenario,
+            Duration::from_secs(u64::from(scenario.warmup_seconds)),
             0,
             false,
         )
@@ -300,8 +220,8 @@ async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Re
     }
     let measurement = run_phase(
         &endpoints,
-        config,
-        Duration::from_secs(config.measured_seconds),
+        scenario,
+        Duration::from_secs(u64::from(scenario.measured_seconds)),
         1_000_000_000,
         true,
     )
@@ -312,7 +232,7 @@ async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Re
         &warmup,
         &measurement,
         prewarm_accepted_spans,
-        config,
+        scenario,
     )
     .await?;
 
@@ -320,57 +240,60 @@ async fn run_on_cluster(cluster: &WyrdTestCluster, config: &Config) -> Result<Re
         && measurement.rejected_spans == 0
         && verification.passed
     {
-        "ready"
+        BenchmarkReadiness::Ready
     } else {
-        "not_ready"
+        BenchmarkReadiness::NotReady
     };
-    let queryability_boundary = if config.verify_samples == 0 {
+    let queryability_boundary = if scenario.verify_samples == 0 {
         "not run (verify-samples=0)"
     } else {
         "sampled ValaQueryService.GetTrace after flushing every pod"
     };
-    let mut notes = vec![
+    let notes = vec![
         "This is an open-loop bounded load test; the target is offered spans per second, not a server limit.",
         "Accepted spans per second is measured from successful OTLP responses and excludes rejected or failed requests.",
         "Forge and Oracle are not required for this Gate-to-Scribe ingest lane; their end-to-end stages need separate read/compaction benchmarks.",
     ];
-    if config.verify_samples == 0 {
-        notes.push(
-            "Query verification was disabled; the current ValaQuery route still targets the legacy shared catalog while Redux writes tenant-qualified tables.",
-        );
+    let mut envelope = BifrostReportEnvelope::new(scenario.clone(), readiness);
+    if !verification.passed {
+        envelope
+            .failures
+            .push("post-run verification failed".to_owned());
+    }
+    if measurement.failed_requests > 0 {
+        envelope
+            .failures
+            .push("one or more OTLP export requests failed".to_owned());
     }
     Ok(Report {
-        schema_version: 1,
-        lane: "otlp-span-ingest",
+        envelope,
         ack_boundary: "Gate accepted the OTLP export and Scribe admitted the projected frame",
-        durability_boundary: "post-run Scribe flush committed file-list rows; WAL fsync timing is not the client ACK",
         queryability_boundary,
         config: ReportConfig {
-            pods: config.pods,
-            tenants: config.tenants,
-            target_spans_per_second: config.target_spans_per_second,
-            spans_per_request: config.spans_per_request,
-            warmup_seconds: config.warmup_seconds,
-            measured_seconds: config.measured_seconds,
-            max_in_flight: config.max_in_flight,
-            verify_samples_per_tenant: config.verify_samples,
+            pods: usize::try_from(scenario.pods)?,
+            tenants: usize::try_from(scenario.tenants)?,
+            target_items_per_second: scenario.target_items_per_second,
+            items_per_request: scenario.items_per_request,
+            warmup_seconds: u64::from(scenario.warmup_seconds),
+            measured_seconds: u64::from(scenario.measured_seconds),
+            max_in_flight: usize::try_from(scenario.max_in_flight)?,
+            verify_samples_per_tenant: scenario.verify_samples,
             span_shape: "OTLP ResourceSpans with scope, parent/child spans, attributes, events, links, and status",
         },
         prewarm_accepted_spans,
-        warmup: phase_report(&warmup, config),
-        measurement: phase_report(&measurement, config),
+        warmup: phase_report(&warmup, scenario),
+        measurement: phase_report(&measurement, scenario),
         verification,
-        readiness,
         notes,
     })
 }
 
 async fn provision_endpoints(
     cluster: &WyrdTestCluster,
-    config: &Config,
+    scenario: &BifrostScenario,
 ) -> Result<Vec<Endpoint>, BenchError> {
     let bootstrap_server = cluster.server(0).ok_or("missing bootstrap pod")?;
-    let mut channels = Vec::with_capacity(config.pods);
+    let mut channels = Vec::with_capacity(usize::try_from(scenario.pods)?);
     for server in cluster.servers() {
         let url = server.grpc_url().ok_or("missing gRPC endpoint")?;
         let channel = Channel::from_shared(url)
@@ -380,8 +303,10 @@ async fn provision_endpoints(
         channels.push(Arc::new(channel));
     }
 
-    let mut endpoints = Vec::with_capacity(config.tenants.saturating_mul(config.pods));
-    for tenant_index in 0..config.tenants {
+    let mut endpoints = Vec::with_capacity(
+        usize::try_from(scenario.tenants)?.saturating_mul(usize::try_from(scenario.pods)?),
+    );
+    for tenant_index in 0..usize::try_from(scenario.tenants)? {
         let tenant = if tenant_index == 0 {
             cluster.data_tenant_id()
         } else {
@@ -434,19 +359,25 @@ async fn provision_endpoints(
 
 async fn run_phase(
     endpoints: &[Endpoint],
-    config: &Config,
+    scenario: &BifrostScenario,
     duration: Duration,
     sequence_base: u64,
     retain_samples: bool,
 ) -> Result<PhaseStats, BenchError> {
-    let request_period = request_period(config.target_spans_per_second, config.spans_per_request);
+    let request_period = request_period(
+        scenario.target_items_per_second,
+        usize::try_from(scenario.items_per_request)?,
+    );
     let mut interval = tokio::time::interval(request_period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let started = Instant::now();
     let deadline = started + duration;
     let mut sequence = sequence_base;
     let mut next_endpoint = 0usize;
-    let mut generator = RandomTraceGenerator::from_seed(sequence_base ^ 0x9e37_79b9_7f4a_7c15);
+    let mut generator = RandomTraceGenerator::from_seed_at(
+        sequence_base ^ 0x9e37_79b9_7f4a_7c15,
+        trace_start_time_nanos(sequence_base),
+    );
     let mut tasks = JoinSet::new();
     let mut stats = PhaseStats::default();
 
@@ -458,7 +389,7 @@ async fn run_phase(
         while let Some(result) = tasks.try_join_next() {
             stats.record(result??, retain_samples);
         }
-        if tasks.len() >= config.max_in_flight {
+        if tasks.len() >= usize::try_from(scenario.max_in_flight)? {
             stats.schedule_misses = stats.schedule_misses.saturating_add(1);
             if let Some(result) = tasks.join_next().await {
                 stats.record(result??, retain_samples);
@@ -469,10 +400,13 @@ async fn run_phase(
             .ok_or("endpoint scheduler selected an invalid endpoint")?
             .clone();
         next_endpoint = next_endpoint.wrapping_add(1);
-        let request =
-            generator.export_request(endpoint.tenant_index, sequence, config.spans_per_request);
+        let request = generator.export_request(
+            endpoint.tenant_index,
+            sequence,
+            usize::try_from(scenario.items_per_request)?,
+        );
         let trace_id = first_trace_id(&request).ok_or("generated OTLP request had no trace")?;
-        let offered_spans = u64::try_from(config.spans_per_request)?;
+        let offered_spans = u64::from(scenario.items_per_request);
         let offered_bytes = u64::try_from(request.encoded_len())?;
         stats.scheduled_requests = stats.scheduled_requests.saturating_add(1);
         stats.offered_spans = stats.offered_spans.saturating_add(offered_spans);
@@ -581,7 +515,7 @@ async fn verify_run(
     warmup: &PhaseStats,
     measurement: &PhaseStats,
     prewarm_accepted_spans: u64,
-    config: &Config,
+    scenario: &BifrostScenario,
 ) -> Result<VerificationReport, BenchError> {
     let started = Instant::now();
     let mut tenant_ids = BTreeMap::new();
@@ -604,7 +538,10 @@ async fn verify_run(
             .find(|endpoint| endpoint.tenant_index == *tenant_index && endpoint.pod_index == 0)
             .ok_or("missing query endpoint")?;
         let mut query = ValaQueryServiceClient::new(endpoint.channel.as_ref().clone());
-        for trace_id in trace_ids.iter().take(config.verify_samples) {
+        for trace_id in trace_ids
+            .iter()
+            .take(usize::try_from(scenario.verify_samples)?)
+        {
             verification.query_samples_requested =
                 verification.query_samples_requested.saturating_add(1);
             let query_started = Instant::now();
@@ -656,14 +593,19 @@ async fn verify_run(
     verification.file_list_rows = file_list_rows;
     verification.query_latency_us = LatencyPercentiles::from_samples(&query_latencies);
     verification.file_list_rows_match = file_list_rows == verification.expected_accepted_spans;
-    verification.passed = verification.query_errors.is_empty()
-        && verification.file_list_rows_match
-        && (verification.query_samples_requested == 0
-            || verification.query_samples_found == verification.query_samples_requested);
+    verification.passed = verification_passed(&verification);
     Ok(verification)
 }
 
-fn phase_report(stats: &PhaseStats, config: &Config) -> PhaseReport {
+fn verification_passed(verification: &VerificationReport) -> bool {
+    verification.query_errors.is_empty()
+        && verification.file_list_rows_match
+        && (verification.query_samples_requested == 0
+            || (verification.query_samples_found == verification.query_samples_requested
+                && verification.query_spans_found >= verification.query_samples_requested))
+}
+
+fn phase_report(stats: &PhaseStats, scenario: &BifrostScenario) -> PhaseReport {
     let elapsed_seconds = (stats.elapsed_ms as f64 / 1_000.0).max(f64::EPSILON);
     let tenant_accepted_spans = stats
         .tenant_accepted
@@ -677,7 +619,7 @@ fn phase_report(stats: &PhaseStats, config: &Config) -> PhaseReport {
         .collect();
     PhaseReport {
         elapsed_ms: stats.elapsed_ms,
-        target_spans_per_second: config.target_spans_per_second,
+        target_items_per_second: scenario.target_items_per_second,
         scheduled_requests: stats.scheduled_requests,
         completed_requests: stats.completed_requests,
         offered_spans: stats.offered_spans,
@@ -705,6 +647,15 @@ fn request_period(target_spans_per_second: u64, spans_per_request: usize) -> Dur
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
+fn trace_start_time_nanos(sequence_base: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let now = u64::try_from(now).unwrap_or(u64::MAX);
+    now.saturating_sub(sequence_base.saturating_mul(1_000_000_000))
+}
+
 fn first_trace_id(request: &ExportTraceServiceRequest) -> Option<[u8; 16]> {
     request
         .resource_spans
@@ -728,7 +679,7 @@ fn emit_report(report: &Report) -> Result<(), BenchError> {
         || {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../..")
-                .join("target/bifrost-benchmarks/post-throughput/reports/otlp-span-ingest.json")
+                .join("target/bifrost-benchmarks/task16/otlp.json")
         },
         std::path::PathBuf::from,
     );
@@ -741,4 +692,35 @@ fn emit_report(report: &Report) -> Result<(), BenchError> {
     )?;
     println!("OTLP span benchmark report: {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{VerificationReport, verification_passed};
+
+    #[test]
+    fn sampled_trace_verification_requires_returned_spans() {
+        let verification = VerificationReport {
+            file_list_rows_match: true,
+            query_samples_requested: 3,
+            query_samples_found: 3,
+            query_spans_found: 0,
+            ..VerificationReport::default()
+        };
+
+        assert!(!verification_passed(&verification));
+    }
+
+    #[test]
+    fn sampled_trace_verification_accepts_nonempty_traces() {
+        let verification = VerificationReport {
+            file_list_rows_match: true,
+            query_samples_requested: 3,
+            query_samples_found: 3,
+            query_spans_found: 3,
+            ..VerificationReport::default()
+        };
+
+        assert!(verification_passed(&verification));
+    }
 }

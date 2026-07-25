@@ -13,17 +13,23 @@ if [[ -e "$target" ]]; then
 fi
 mkdir -p "$target/reports"
 
-mise run bench:bifrost:preflight
+WYRD_BIFROST_REPORT="$target/reports/preflight.json" mise run bench:bifrost:preflight
 
 for lane in scribe forge oracle capacity; do
   output="$target/reports/$lane.json"
-  task="bench:bifrost:${lane}:slo"
-  if [[ "$lane" == "capacity" ]]; then
-    task="bench:bifrost:capacity"
-  fi
-  WYRD_BIFROST_OUTPUT="$output" WYRD_BIFROST_STAGE="$stage" mise run "$task" \
+  case "$lane" in
+    scribe) task="bench:bifrost:scribe:slo" ;;
+    forge) task="bench:bifrost:forge:slo" ;;
+    oracle) task="bench:bifrost:oracle:slo" ;;
+    capacity) task="bench:bifrost:capacity" ;;
+  esac
+  WYRD_BIFROST_REPORT="$output" WYRD_BIFROST_STAGE="$stage" mise run "$task" \
     || { echo "Bifrost lane failed: $lane" >&2; exit 1; }
-  if ! jq -e '.complete == true and .errors == 0 and .verification.passed == true' "$output" >/dev/null; then
+  if ! jq -e 'if .ack then
+      .ack.envelope.readiness == "ready" and .ack.verified == true and .exact_rows_verified == true
+    else
+      .envelope.readiness == "ready" and .verified == true
+    end' "$output" >/dev/null; then
     echo "Bifrost lane produced an incomplete or failed report: $lane" >&2
     exit 1
   fi
@@ -49,14 +55,19 @@ jq -n \
   '{stage: $stage, git_sha: $git_sha, dirty_worktree: $dirty_worktree,
     configuration: {pods: $pods, tenants: $tenants,
       run_deadline_seconds: $run_deadline_seconds,
-      runner: "bench_real_bifrost_workload"},
+      runner: "typed-bifrost-lanes"},
     reports: [$scribe[0], $forge[0], $oracle[0], $capacity[0]]}' \
   > "$target/stage.json"
 
 jq -r --arg stage "$stage" '
   "# Bifrost benchmark stage: \($stage)\n\n" +
-  ("| Lane | Complete | Errors |\n|---|---:|---:|\n" +
-    ([.reports[] | "| \(.lane) | \(.complete) | \(.errors) |"] | join("\n")) + "\n")
+  ("| Lane | Readiness | Verified |\n|---|---|---:|\n" +
+    ([.reports[] |
+      if .ack then
+        "| \(.ack.envelope.lane) | \(.ack.envelope.readiness) | \(.ack.verified) |"
+      else
+        "| \(.envelope.lane) | \(.envelope.readiness) | \(.verified) |"
+      end] | join("\n")) + "\n")
 ' "$target/stage.json" > "$target/stage.md"
 
 if [[ -n "$before_manifest" ]]; then

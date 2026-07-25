@@ -19,7 +19,7 @@
 //! `Export*ServiceResponse`, including `partial_success` when spans were
 //! rejected.
 //!
-//! Backpressure: [`vala_bifrost_redux::gate::IngestError::WriterBusy`] maps to HTTP `503`
+//! Backpressure: [`vala_bifrost_redux::gate::IngestError::IngestBusy`] maps to HTTP `503`
 //! (retryable), never to `partial_success` — no rows from a busy request are
 //! written. The gRPC edge maps the same condition to gRPC
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
@@ -60,7 +60,7 @@ use crate::state::AppState;
 /// The OTLP signal type handled by a specific export endpoint.
 ///
 /// Used to derive the physical Bifrost table name for per-signal error messages
-/// so that `WriterBusy` / `WriterClosed` responses name the correct table
+/// so that `IngestBusy` / `IngressClosed` responses name the correct table
 /// (`vala.traces.spans`, `vala.metrics.points`, `vala.logs.records`) rather
 /// than always reporting the traces table.
 #[derive(Clone, Copy, Debug)]
@@ -329,14 +329,14 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
 
 /// Map an [`IngestError`] onto its HTTP response for the given OTLP signal.
 ///
-/// Backpressure ([`IngestError::WriterBusy`]) becomes a retryable `503`, matching
+/// Backpressure ([`IngestError::IngestBusy`]) becomes a retryable `503`, matching
 /// the OTLP/HTTP throttling contract (the gRPC edge maps the same condition to
 /// retryable `RESOURCE_EXHAUSTED` per [`IngestError::grpc_code`]). The `signal` parameter provides the per-endpoint
 /// physical table name so error messages name the correct target table rather
 /// than always reporting the traces table. Every other ingest error renders its
 /// stable `WYRD_VALA_*` [`WyrdError`] problem+json.
 fn ingest_error_to_response(error: IngestError, signal: OtlpSignal) -> WyrdErrorResponse {
-    if matches!(error, IngestError::WriterBusy) {
+    if matches!(error, IngestError::IngestBusy) {
         return WyrdErrorResponse::from(WyrdError::from(BifrostError::WriterUnavailable {
             table: signal.table().to_owned(),
         }));
@@ -381,21 +381,21 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
                 bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
             })
         }
-        IngestError::WriterClosed => WyrdError::from(BifrostError::WriterUnavailable {
+        IngestError::IngressClosed => WyrdError::from(BifrostError::WriterUnavailable {
             table: signal.table().to_owned(),
         }),
         // A malformed OTLP request body (bad protobuf or invalid JSON) is a
         // permanent client-side error. Map to the dedicated OTLP-request-validation
         // code (HTTP 400) — NOT to QueryInvalidSql, which is reserved for SQL query
         // validation failures and would give the client a nonsense remediation.
-        IngestError::StreamProtocolViolation(detail) | IngestError::Decode(detail) => {
+        IngestError::RequestValidation(detail) | IngestError::Decode(detail) => {
             WyrdError::from(BifrostError::OtlpRequestMalformed {
                 table: signal.table().to_owned(),
                 detail,
             })
         }
         // Backpressure is handled by ingest_error_to_response before this point.
-        IngestError::WriterBusy => WyrdError::from(BifrostError::WriterUnavailable {
+        IngestError::IngestBusy => WyrdError::from(BifrostError::WriterUnavailable {
             table: signal.table().to_owned(),
         }),
         other => WyrdError::from(BifrostError::Internal {
@@ -461,11 +461,11 @@ mod tests {
     // Backpressure is a coordinator-local, cross-boundary-state-free condition
     // (channel-full). Forcing genuine channel saturation end-to-end is flaky and
     // materially harder than asserting the load-bearing mapping directly, so the
-    // OTLP/HTTP `WriterBusy → 503` contract is pinned here (mirroring the gRPC
-    // collector's unit test for `WriterBusy → UNAVAILABLE`).
+    // OTLP/HTTP `IngestBusy → 503` contract is pinned here (mirroring the gRPC
+    // collector's unit test for `IngestBusy → UNAVAILABLE`).
     #[test]
     fn writer_busy_maps_to_503() {
-        let response = ingest_error_to_response(IngestError::WriterBusy, OtlpSignal::Traces);
+        let response = ingest_error_to_response(IngestError::IngestBusy, OtlpSignal::Traces);
         let status = axum::response::IntoResponse::into_response(response).status();
         assert_eq!(
             status,
@@ -476,13 +476,13 @@ mod tests {
 
     #[test]
     fn writer_busy_table_name_is_per_signal() {
-        // WriterClosed must report the correct physical table for each OTLP signal.
+        // IngressClosed must report the correct physical table for each OTLP signal.
         for (signal, expected_table) in [
             (OtlpSignal::Traces, "vala.traces.spans"),
             (OtlpSignal::Metrics, "vala.metrics.points"),
             (OtlpSignal::Logs, "vala.logs.records"),
         ] {
-            let wyrd_err = ingest_error_to_wyrd(IngestError::WriterClosed, signal);
+            let wyrd_err = ingest_error_to_wyrd(IngestError::IngressClosed, signal);
             match wyrd_err {
                 wyrd_spec::error::WyrdError::Vala {
                     error: BifrostError::WriterUnavailable { table },
@@ -520,8 +520,8 @@ mod tests {
                 "Decode",
             ),
             (
-                IngestError::StreamProtocolViolation("mismatched batch_id".to_owned()),
-                "StreamProtocolViolation",
+                IngestError::RequestValidation("mismatched batch_id".to_owned()),
+                "RequestValidation",
             ),
         ] {
             let wyrd_err = ingest_error_to_wyrd(variant, OtlpSignal::Traces);

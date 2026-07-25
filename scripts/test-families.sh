@@ -34,6 +34,7 @@ FAMILY_SKALD=(
 
 FAMILY_VALA=(
   vala-bifrost
+  vala-bifrost-redux
   vala-core
   vala-drift
   vala-eval
@@ -54,6 +55,7 @@ FAMILY_SHARED=(
   wyrd-queue
   wyrd-runtime
   wyrd-semver
+  wyrd-storage-client
   wyrd-telemetry
   wyrd-test-contract-macros
   wyrd-bench

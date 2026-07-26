@@ -3,12 +3,18 @@
 use std::sync::Arc;
 
 use thiserror::Error;
-use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::execution_lanes::{
+    ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
+};
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
+use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::seal::PostCommitBatch;
 use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use vala_bifrost_redux::scribe::{
+    ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribePersistenceConfig,
+};
 use vala_sql::TenantConn;
 use wyrd_spec::DataTenantId;
 
@@ -41,6 +47,31 @@ pub struct BifrostHarness {
 impl BifrostHarness {
     /// Start a one- or three-pod real Scribe harness with seeded tenants.
     pub async fn start(pods: usize, tenant_count: usize) -> Result<Self, HarnessError> {
+        Self::start_with_wal_sync_delay(pods, tenant_count, std::time::Duration::ZERO).await
+    }
+
+    /// Start a Scribe harness with an explicit test-only WAL sync delay.
+    pub async fn start_with_wal_sync_delay(
+        pods: usize,
+        tenant_count: usize,
+        wal_sync_delay: std::time::Duration,
+    ) -> Result<Self, HarnessError> {
+        Self::start_with_faults(
+            pods,
+            tenant_count,
+            wal_sync_delay,
+            PersistenceFaults::default(),
+        )
+        .await
+    }
+
+    /// Start a Scribe harness with concrete persistence fault controls.
+    pub async fn start_with_faults(
+        pods: usize,
+        tenant_count: usize,
+        wal_sync_delay: std::time::Duration,
+        persistence_faults: PersistenceFaults,
+    ) -> Result<Self, HarnessError> {
         if tenant_count == 0 {
             return Err(HarnessError::Configuration(
                 "at least one tenant is required".to_owned(),
@@ -55,8 +86,11 @@ impl BifrostHarness {
                 )));
             }
         };
-        let cluster = WyrdTestCluster::start(pods, topology).await?;
-        match Self::start_with_cluster(&cluster, tenant_count).await {
+        let cluster =
+            WyrdTestCluster::start_with_wal_sync_delay(pods, topology, wal_sync_delay).await?;
+        match Self::start_with_cluster(&cluster, tenant_count, wal_sync_delay, persistence_faults)
+            .await
+        {
             Ok((scribes, tenants)) => Ok(Self {
                 cluster,
                 scribes,
@@ -72,6 +106,8 @@ impl BifrostHarness {
     async fn start_with_cluster(
         cluster: &WyrdTestCluster,
         tenant_count: usize,
+        wal_sync_delay: std::time::Duration,
+        persistence_faults: PersistenceFaults,
     ) -> Result<(Vec<Arc<ScribeImpl>>, Vec<DataTenantId>), HarnessError> {
         let mut tenants = Vec::with_capacity(tenant_count);
         tenants.push(cluster.data_tenant_id());
@@ -101,17 +137,33 @@ impl BifrostHarness {
                         "Bifrost test server did not provision shared memory".to_owned(),
                     )
                 })?;
-            let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+            let server = cluster.server(index).ok_or_else(|| {
+                HarnessError::Configuration("missing Bifrost test server".to_owned())
+            })?;
+            let scribe = ScribeImpl::new_with_execution_pools(
                 Arc::clone(&operator),
                 wal,
                 node_id.to_string(),
                 i64::try_from(index + 1)
                     .map_err(|error| HarnessError::Configuration(error.to_string()))?,
-                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
-                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                ScribeBuildConfig {
                     admission: AdmissionConfig::default(),
                     coordination_runtime: tokio::runtime::Handle::current(),
-                    memory_governor: Some(memory_governor),
+                    execution_pools: ScribeExecutionPools::new(
+                        ScribeIngressCpuPool::new_with_capacity(2, 256),
+                        ScribePersistenceCpuPool::new_with_capacity(2, 64),
+                        ScribeWalIoPool::try_new_with_capacity_and_delay(2, 256, wal_sync_delay)
+                            .map_err(|error| HarnessError::Configuration(error.to_string()))?,
+                    ),
+                    persistence: Some(
+                        ScribePersistenceConfig::new(
+                            Arc::new(server.state().postgres.vala().clone()),
+                            64,
+                            2,
+                        )
+                        .with_test_faults(persistence_faults.clone()),
+                    ),
+                    memory_budget: Some(memory_governor.scribe_budget()),
                 },
             );
             scribes.push(Arc::new(scribe));

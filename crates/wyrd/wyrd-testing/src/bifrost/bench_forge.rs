@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
 use vala_bifrost_redux::forge::run_maintenance_tick;
-use wyrd_bench::{BifrostLane, BifrostScenario};
+use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -27,12 +27,22 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
     let outcome = run_maintenance_tick(&fixture.context).await?;
-    let verified = outcome.tables_succeeded > 0 || outcome.tables_skipped > 0;
+    let negative_flows = if scenario.require_negative_flows {
+        let retry = run_maintenance_tick(&fixture.context).await?;
+        NegativeFlowReport::executed(
+            ["completed_forge_tick_is_idempotent"],
+            retry.bins_committed == 0 && retry.tables_failed == 0,
+        )
+    } else {
+        NegativeFlowReport::skipped()
+    };
+    let verified =
+        (outcome.tables_succeeded > 0 || outcome.tables_skipped > 0) && negative_flows.passed;
+    let mut envelope =
+        wyrd_bench::BifrostReportEnvelope::new(scenario, super::bench_report::readiness(verified));
+    envelope.negative_flows = negative_flows;
     let report = super::bench_report::LaneExecutionReport {
-        envelope: wyrd_bench::BifrostReportEnvelope::new(
-            scenario,
-            super::bench_report::readiness(verified),
-        ),
+        envelope,
         elapsed_us: u64::try_from(started.elapsed().as_micros())?,
         verified,
         rows: 1,

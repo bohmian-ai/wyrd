@@ -20,7 +20,7 @@ use crate::scribe::execution_lanes::{
     ScribeWalIoPool, ScribeWalIoResult,
 };
 use crate::scribe::file_list_writer::{self, FileListCommitKey};
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
+use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget};
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
@@ -280,7 +280,7 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) node_id: String,
     pub(crate) writer_epoch: i64,
-    pub(crate) memory: BifrostMemoryGovernor,
+    pub(crate) memory: ScribeMemoryBudget,
     pub(crate) faults: PersistenceFaults,
 }
 
@@ -476,7 +476,7 @@ struct PersistenceDependencies {
     wal_io: ScribeWalIoPool,
     node_id: String,
     writer_epoch: i64,
-    memory: BifrostMemoryGovernor,
+    memory: ScribeMemoryBudget,
     faults: PersistenceFaults,
     manifest_guard: tokio::sync::Mutex<()>,
 }

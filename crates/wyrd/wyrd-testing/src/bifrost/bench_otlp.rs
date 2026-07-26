@@ -16,7 +16,7 @@ use crate::otlp::RandomTraceGenerator;
 use serde::Serialize;
 use sqlx::Row;
 use tokio::task::JoinSet;
-use wyrd_bench::{BenchmarkReadiness, BifrostReportEnvelope, BifrostScenario, LatencyPercentiles};
+use wyrd_bench::{BenchmarkReadiness, BifrostReportEnvelope, BifrostScenario, NegativeFlowReport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
@@ -32,6 +32,37 @@ use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 pub type BenchError = Box<dyn Error + Send + Sync>;
 
 const MAX_RETAINED_SAMPLE_TRACES: usize = 16;
+
+/// OTLP lane latency percentiles in microseconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+struct LatencyPercentiles {
+    p50_us: u64,
+    p95_us: u64,
+    p99_us: u64,
+    p999_us: u64,
+}
+
+impl LatencyPercentiles {
+    fn from_samples(samples: &[u64]) -> Self {
+        if samples.is_empty() {
+            return Self::default();
+        }
+        let mut sorted = samples.to_vec();
+        sorted.sort_unstable();
+        let rank = |numerator: usize, denominator: usize| {
+            sorted[(sorted.len() * numerator)
+                .div_ceil(denominator)
+                .saturating_sub(1)
+                .min(sorted.len() - 1)]
+        };
+        Self {
+            p50_us: rank(1, 2),
+            p95_us: rank(19, 20),
+            p99_us: rank(99, 100),
+            p999_us: rank(999, 1_000),
+        }
+    }
+}
 
 #[derive(Clone)]
 struct Endpoint {
@@ -226,6 +257,7 @@ async fn run_on_cluster(
         true,
     )
     .await?;
+    let negative_flows = run_negative_flow(&endpoints, scenario).await?;
     let verification = verify_run(
         cluster,
         &endpoints,
@@ -238,6 +270,7 @@ async fn run_on_cluster(
 
     let readiness = if measurement.failed_requests == 0
         && measurement.rejected_spans == 0
+        && negative_flows.passed
         && verification.passed
     {
         BenchmarkReadiness::Ready
@@ -255,6 +288,7 @@ async fn run_on_cluster(
         "Forge and Oracle are not required for this Gate-to-Scribe ingest lane; their end-to-end stages need separate read/compaction benchmarks.",
     ];
     let mut envelope = BifrostReportEnvelope::new(scenario.clone(), readiness);
+    envelope.negative_flows = negative_flows;
     if !verification.passed {
         envelope
             .failures
@@ -264,6 +298,11 @@ async fn run_on_cluster(
         envelope
             .failures
             .push("one or more OTLP export requests failed".to_owned());
+    }
+    if !envelope.negative_flows.passed {
+        envelope
+            .failures
+            .push("required negative-flow checks failed".to_owned());
     }
     Ok(Report {
         envelope,
@@ -286,6 +325,27 @@ async fn run_on_cluster(
         verification,
         notes,
     })
+}
+
+async fn run_negative_flow(
+    endpoints: &[Endpoint],
+    scenario: &BifrostScenario,
+) -> Result<NegativeFlowReport, BenchError> {
+    if !scenario.require_negative_flows {
+        return Ok(NegativeFlowReport::skipped());
+    }
+    let endpoint = endpoints.first().cloned().ok_or("missing OTLP endpoint")?;
+    let invalid_endpoint = Endpoint {
+        jwt: Arc::from("invalid-benchmark-token"),
+        ..endpoint.clone()
+    };
+    let request = RandomTraceGenerator::from_seed(0x00B1_F057).export_request(0, 0, 1);
+    let trace_id = first_trace_id(&request).ok_or("negative OTLP request had no trace")?;
+    let result = export(invalid_endpoint, request, trace_id, 1).await?;
+    Ok(NegativeFlowReport::executed(
+        ["unauthenticated_export_is_rejected"],
+        result.error.is_some() && result.accepted_spans == 0,
+    ))
 }
 
 async fn provision_endpoints(

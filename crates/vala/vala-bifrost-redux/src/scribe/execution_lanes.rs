@@ -18,7 +18,7 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::memory::BifrostMemoryGovernor;
+use crate::scribe::memory::ScribeMemoryBudget;
 use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
@@ -777,7 +777,7 @@ pub(crate) enum ScribeWalIoOp {
     ReplayDirectoryStream {
         path: PathBuf,
         shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
-        memory: BifrostMemoryGovernor,
+        memory: ScribeMemoryBudget,
     },
     RetireWal {
         wal: WalHandle,

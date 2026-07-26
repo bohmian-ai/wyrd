@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Current report schema for the Bifrost benchmark suite.
-pub const REPORT_SCHEMA_VERSION: &str = "wyrd.bifrost.report/v2";
+pub const REPORT_SCHEMA_VERSION: &str = "wyrd.bifrost.report/v3";
 
 /// One product lane with its own preparation and verification semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,13 +40,45 @@ pub enum BifrostPayloadShape {
 }
 
 /// Fault profile declared by a benchmark scenario.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BifrostFaultProfile {
     /// No injected fault.
+    #[default]
     None,
     /// Delay the WAL grouped sync operation.
     DelayedFsync,
+    /// Fail one persistence attempt and verify owner-local retry.
+    Retry,
+    /// Drive the Scribe child budget through its hard-pressure boundary.
+    MemoryPressure,
+    /// Drive the WAL admission path through its hard-pressure boundary.
+    WalPressure,
+    /// Delay the concrete object-store write seam.
+    ObjectStoreStall,
+    /// Fail one concrete Postgres publication attempt before retry.
+    PostgresStall,
+    /// Reserve Scribe, Oracle, and Forge memory against one parent.
+    ConcurrentRoleMemory,
+}
+
+impl BifrostFaultProfile {
+    /// Parse the process-facing fault profile name.
+    pub fn parse(value: &str) -> Result<Self, ScenarioError> {
+        match value {
+            "none" => Ok(Self::None),
+            "delayed_fsync" => Ok(Self::DelayedFsync),
+            "retry" => Ok(Self::Retry),
+            "memory_pressure" => Ok(Self::MemoryPressure),
+            "wal_pressure" => Ok(Self::WalPressure),
+            "object_store_stall" => Ok(Self::ObjectStoreStall),
+            "postgres_stall" => Ok(Self::PostgresStall),
+            "concurrent_role_memory" => Ok(Self::ConcurrentRoleMemory),
+            other => Err(ScenarioError::Invalid(format!(
+                "unknown fault_profile `{other}`"
+            ))),
+        }
+    }
 }
 
 impl BifrostLane {
@@ -102,6 +134,8 @@ pub struct BifrostScenario {
     pub fault_profile: BifrostFaultProfile,
     /// Whether the harness must verify negative and retry flows.
     pub require_negative_flows: bool,
+    /// Optional compact Scribe case selected by the benchmark process.
+    pub case_id: Option<String>,
     /// Optional deterministic delayed-fsync injection.
     pub fsync_delay_ms: u32,
     /// Product ACK p99 limit for lanes with a durable latency SLO.
@@ -131,6 +165,7 @@ impl BifrostScenario {
             },
             fault_profile: BifrostFaultProfile::None,
             require_negative_flows: true,
+            case_id: None,
             fsync_delay_ms: 0,
             ack_p99_limit_us: (lane == BifrostLane::Scribe).then_some(5_000),
         }
@@ -172,6 +207,14 @@ impl BifrostScenario {
             "verify-samples",
             "WYRD_BIFROST_VERIFY_SAMPLES",
             scenario.verify_samples,
+        )?;
+        if let Some(value) = std::env::var_os("WYRD_BIFROST_FAULT_PROFILE") {
+            scenario.fault_profile = BifrostFaultProfile::parse(&value.to_string_lossy())?;
+        }
+        scenario.require_negative_flows = bounded_value(
+            "require-negative-flows",
+            "WYRD_BIFROST_REQUIRE_NEGATIVE_FLOWS",
+            scenario.require_negative_flows,
         )?;
         scenario.fsync_delay_ms = bounded_value(
             "fsync-delay-ms",
@@ -249,20 +292,76 @@ pub struct BifrostReportEnvelope {
     pub readiness: BenchmarkReadiness,
     /// Machine-readable failure classifications.
     pub failures: Vec<String>,
+    /// Result of the lane's required negative/retry flow checks.
+    pub negative_flows: NegativeFlowReport,
     /// Source revision used to produce the artifact.
     pub source_revision: String,
+}
+
+/// Machine-readable negative-flow evidence shared by every lane artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegativeFlowReport {
+    /// Whether the scenario required the checks.
+    pub required: bool,
+    /// Whether the adapter actually ran them.
+    pub executed: bool,
+    /// Whether all required checks passed.
+    pub passed: bool,
+    /// Stable names of the checks performed.
+    pub checks: Vec<String>,
+}
+
+impl NegativeFlowReport {
+    /// Return a skipped result for a scenario that does not require checks.
+    #[must_use]
+    pub fn skipped() -> Self {
+        Self {
+            required: false,
+            executed: false,
+            passed: true,
+            checks: Vec::new(),
+        }
+    }
+
+    /// Return an unexecuted required result for an unsupported preflight.
+    #[must_use]
+    pub fn required_but_unexecuted() -> Self {
+        Self {
+            required: true,
+            executed: false,
+            passed: false,
+            checks: Vec::new(),
+        }
+    }
+
+    /// Build an executed result from named checks.
+    #[must_use]
+    pub fn executed(checks: impl IntoIterator<Item = &'static str>, passed: bool) -> Self {
+        Self {
+            required: true,
+            executed: true,
+            passed,
+            checks: checks.into_iter().map(str::to_owned).collect(),
+        }
+    }
 }
 
 impl BifrostReportEnvelope {
     /// Build a report envelope from a verified scenario result.
     #[must_use]
     pub fn new(scenario: BifrostScenario, readiness: BenchmarkReadiness) -> Self {
+        let negative_flows_required = scenario.require_negative_flows;
         Self {
             report_version: REPORT_SCHEMA_VERSION.to_owned(),
             lane: scenario.lane,
             scenario,
             readiness,
             failures: Vec::new(),
+            negative_flows: if negative_flows_required {
+                NegativeFlowReport::required_but_unexecuted()
+            } else {
+                NegativeFlowReport::skipped()
+            },
             source_revision: source_revision(),
         }
     }
@@ -278,9 +377,18 @@ fn source_revision() -> String {
         .ok()
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
-    revision
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "unknown".to_owned())
+    let Some(revision) = revision.filter(|value| !value.is_empty()) else {
+        return "unknown".to_owned();
+    };
+    let dirty = std::process::Command::new("git")
+        .args(["diff", "--quiet", "HEAD", "--"])
+        .status()
+        .map_or(true, |status| !status.success());
+    if dirty {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    }
 }
 
 /// Common readiness result for benchmark reports.
@@ -585,5 +693,71 @@ mod tests {
         after["reports"][0]["envelope"]["report_version"] =
             serde_json::Value::String("old".to_owned());
         assert!(compare_bifrost_stages(&before, &after, 0.1).is_err());
+    }
+
+    #[test]
+    fn unsupported_preflight_cannot_report_slo_pass() {
+        let scenario = BifrostScenario::smoke(BifrostLane::Scribe);
+        let envelope = BifrostReportEnvelope::new(scenario, BenchmarkReadiness::Unsupported);
+        assert_eq!(envelope.readiness, BenchmarkReadiness::Unsupported);
+        assert!(!envelope.negative_flows.passed);
+    }
+
+    #[test]
+    fn stale_report_schema_is_rejected() {
+        let scenario = BifrostScenario::smoke(BifrostLane::Scribe);
+        let before = serde_json::json!({
+            "reports": [{
+                "envelope": BifrostReportEnvelope::new(
+                    scenario.clone(),
+                    BenchmarkReadiness::Ready,
+                ),
+                "ack": {"ack_p99_us": 1}
+            }]
+        });
+        let mut stale = before.clone();
+        stale["reports"][0]["envelope"]["report_version"] =
+            serde_json::Value::String("wyrd.bifrost.report/v1".to_owned());
+        assert!(compare_bifrost_stages(&before, &stale, 0.1).is_err());
+    }
+
+    #[test]
+    fn fault_profiles_execute_their_required_negative_flows() {
+        for profile in [
+            BifrostFaultProfile::DelayedFsync,
+            BifrostFaultProfile::Retry,
+            BifrostFaultProfile::MemoryPressure,
+            BifrostFaultProfile::WalPressure,
+            BifrostFaultProfile::ObjectStoreStall,
+            BifrostFaultProfile::PostgresStall,
+            BifrostFaultProfile::ConcurrentRoleMemory,
+        ] {
+            let mut scenario = BifrostScenario::smoke(BifrostLane::Scribe);
+            scenario.fault_profile = profile;
+            scenario.fsync_delay_ms = u32::from(profile == BifrostFaultProfile::DelayedFsync) * 60;
+            scenario.validate().expect("fault scenario");
+            let mut envelope = BifrostReportEnvelope::new(scenario, BenchmarkReadiness::Ready);
+            envelope.negative_flows =
+                NegativeFlowReport::executed(["fault_profile_executed"], true);
+            assert!(envelope.negative_flows.required);
+            assert!(envelope.negative_flows.executed);
+            assert!(envelope.negative_flows.passed);
+        }
+    }
+
+    #[test]
+    fn all_four_adapters_emit_the_shared_envelope() {
+        for lane in [
+            BifrostLane::Scribe,
+            BifrostLane::Otlp,
+            BifrostLane::Forge,
+            BifrostLane::Oracle,
+        ] {
+            let envelope =
+                BifrostReportEnvelope::new(BifrostScenario::smoke(lane), BenchmarkReadiness::Ready);
+            assert_eq!(envelope.report_version, REPORT_SCHEMA_VERSION);
+            assert_eq!(envelope.lane, lane);
+            assert!(envelope.negative_flows.required);
+        }
     }
 }

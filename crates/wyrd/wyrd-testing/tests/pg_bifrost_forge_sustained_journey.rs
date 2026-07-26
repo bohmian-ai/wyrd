@@ -14,17 +14,19 @@ use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group, seed_forge_group_for
 ///
 /// Steps:
 /// 1. Start one bound Wyrd server, which starts its production Forge scheduler,
-///    and seed three physical tables through the shared Postgres/SQL-Iceberg/
+///    and seed four physical tables through the shared Postgres/SQL-Iceberg/
 ///    OpenDAL fixture.
 /// 2. Run three concurrent producer tasks. Each appends aged Scribe-shaped
 ///    Parquet files and matching `vala.file_list` rows to one table for several
 ///    cycles, while the server scheduler runs every 10 ms.
 /// 3. Drain with public one-shot ticks, then query durable `file_list` counts,
-///    committed snapshots, audit pairs, and maintenance leases.
+///    committed snapshots, terminal audit transitions, and maintenance leases.
 ///
 /// The assertions verify exact durable row-count conservation, a readable
-/// committed snapshot per table, matched prepared/committed audit pairs,
-/// and no lease residue.
+/// committed snapshot per table, and no lease residue. A prepared operation
+/// may finish as committed, be recovered after an uncertain catalog response,
+/// or be reset after a definite failure; every prepared operation must have
+/// exactly one such terminal event.
 /// This catches loss, duplicate bookkeeping, table starvation, and shutdown
 /// cleanup failures that a health endpoint or in-memory load callback cannot see.
 async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak() {
@@ -103,10 +105,10 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
                 .await
                 .expect("durable Forge drain tick");
         }
-        if pending_file_count(&fixtures[0]).await == 0
-            && pending_file_count(&fixtures[1]).await == 0
-            && pending_file_count(&fixtures[2]).await == 0
-            && pending_file_count(&fixtures[3]).await == 0
+        if maintenance_settled(&fixtures[0]).await
+            && maintenance_settled(&fixtures[1]).await
+            && maintenance_settled(&fixtures[2]).await
+            && maintenance_settled(&fixtures[3]).await
         {
             break;
         }
@@ -129,9 +131,13 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         let committed = fixture
             .operation_count("forge.file_compact.committed")
             .await;
-        assert!(committed >= 1);
+        let recovered = fixture
+            .operation_count("forge.file_compact.recovered")
+            .await;
+        let reset = fixture.operation_count("forge.file_compact.reset").await;
+        assert!(committed + recovered >= 1);
         let prepared = fixture.operation_count("forge.file_compact.prepared").await;
-        assert_eq!(prepared, committed);
+        assert_eq!(prepared, committed + recovered + reset);
         assert!(
             fixture
                 .context
@@ -157,6 +163,18 @@ async fn pending_file_count(fixture: &ForgeFixture) -> i64 {
     .fetch_one(fixture.context.operator_pool.pool())
     .await
     .expect("pending file count")
+}
+
+async fn maintenance_settled(fixture: &ForgeFixture) -> bool {
+    let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+    let terminal = fixture
+        .operation_count("forge.file_compact.committed")
+        .await
+        + fixture
+            .operation_count("forge.file_compact.recovered")
+            .await
+        + fixture.operation_count("forge.file_compact.reset").await;
+    pending_file_count(fixture).await == 0 && prepared == terminal
 }
 
 async fn read_staged_parquet_rows(fixture: &ForgeFixture) -> usize {

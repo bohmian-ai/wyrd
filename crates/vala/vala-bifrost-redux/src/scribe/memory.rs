@@ -100,6 +100,15 @@ pub struct BifrostMemoryGovernor {
     inner: Arc<MemoryGovernorInner>,
 }
 
+/// Scribe-only capability over the process-wide Bifrost memory parent.
+///
+/// This child exposes category and shard accounting without exposing
+/// parent-only reservations used by Oracle and Forge.
+#[derive(Debug, Clone)]
+pub struct ScribeMemoryBudget {
+    parent: BifrostMemoryGovernor,
+}
+
 #[derive(Debug)]
 struct MemoryGovernorInner {
     pod_limit_bytes: usize,
@@ -200,37 +209,12 @@ impl BifrostMemoryGovernor {
         self.inner.bifrost_limit_bytes
     }
 
-    /// Target size for one active bucket (`S / 4`) within the fixed bounds.
+    /// Derive the Scribe-only child capability from this parent.
     #[must_use]
-    pub fn active_bucket_target_bytes(&self) -> usize {
-        (self.scribe_limit_bytes() / 4).clamp(MIN_BUCKET_BYTES, MAX_BUCKET_BYTES)
-    }
-
-    /// Reserve category bytes without waiting.
-    pub fn try_reserve(
-        &self,
-        category: MemoryCategory,
-        bytes: usize,
-    ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.scribe_limit_bytes())
-    }
-
-    /// Reserve ingress bytes below the 90% Scribe breaker.
-    pub fn try_reserve_ingress(
-        &self,
-        category: MemoryCategory,
-        bytes: usize,
-    ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.scribe_limit_bytes() * 90 / 100)
-    }
-
-    /// Reserve bounded maintenance bytes up to the full parent and child caps.
-    pub fn try_reserve_maintenance(
-        &self,
-        category: MemoryCategory,
-        bytes: usize,
-    ) -> Result<MemoryReservation, ScribeError> {
-        self.try_reserve_with_limit(category, bytes, self.scribe_limit_bytes())
+    pub fn scribe_budget(&self) -> ScribeMemoryBudget {
+        ScribeMemoryBudget {
+            parent: self.clone(),
+        }
     }
 
     /// Reserve bytes from the process-wide parent without charging Scribe.
@@ -262,49 +246,7 @@ impl BifrostMemoryGovernor {
         )
     }
 
-    fn try_reserve_with_limit(
-        &self,
-        category: MemoryCategory,
-        bytes: usize,
-        scribe_limit: usize,
-    ) -> Result<MemoryReservation, ScribeError> {
-        if bytes > 0
-            && let Some((current, limit)) = cgroup_pressure()
-            && current.saturating_mul(100) >= limit.saturating_mul(90)
-        {
-            return Err(ScribeError::IngestBusy {
-                table: "memory".to_owned(),
-            });
-        }
-        reserve_with_limit(&self.inner.scribe_total_bytes, scribe_limit, bytes)?;
-        if let Err(error) = reserve_with_limit(
-            &self.inner.bifrost_total_bytes,
-            self.bifrost_limit_bytes(),
-            bytes,
-        ) {
-            self.inner
-                .scribe_total_bytes
-                .fetch_sub(bytes, Ordering::AcqRel);
-            return Err(error);
-        }
-        self.inner.categories[category as usize].fetch_add(bytes, Ordering::AcqRel);
-        Ok(MemoryReservation {
-            governor: self.clone(),
-            category,
-            bytes,
-            shard: None,
-        })
-    }
-
-    pub(crate) fn shard_accounting(&self) -> Arc<Vec<AtomicUsize>> {
-        Arc::clone(&self.inner.shard_bytes)
-    }
-
-    pub(crate) fn shard_snapshot(&self) -> [usize; SHARD_ACCOUNTING_COUNT] {
-        std::array::from_fn(|index| self.inner.shard_bytes[index].load(Ordering::Acquire))
-    }
-
-    /// Read category totals.
+    /// Read parent and child totals.
     #[must_use]
     pub fn snapshot(&self) -> MemorySnapshot {
         MemorySnapshot {
@@ -320,36 +262,132 @@ impl BifrostMemoryGovernor {
             cgroup_limit_bytes: self.inner.cgroup_limit_bytes,
         }
     }
+}
+
+impl ScribeMemoryBudget {
+    /// Return the Scribe child reservation limit.
+    #[must_use]
+    pub fn limit_bytes(&self) -> usize {
+        self.parent.scribe_limit_bytes()
+    }
+
+    /// Target size for one active bucket (`S / 4`) within the fixed bounds.
+    #[must_use]
+    pub fn active_bucket_target_bytes(&self) -> usize {
+        (self.limit_bytes() / 4).clamp(MIN_BUCKET_BYTES, MAX_BUCKET_BYTES)
+    }
+
+    /// Reserve category bytes without waiting.
+    pub fn try_reserve(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> Result<MemoryReservation, ScribeError> {
+        self.try_reserve_with_limit(category, bytes, self.limit_bytes())
+    }
+
+    /// Reserve ingress bytes below the 90% Scribe breaker.
+    pub fn try_reserve_ingress(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> Result<MemoryReservation, ScribeError> {
+        self.try_reserve_with_limit(category, bytes, self.limit_bytes() * 90 / 100)
+    }
+
+    /// Reserve bounded maintenance bytes up to the full parent and child caps.
+    pub fn try_reserve_maintenance(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+    ) -> Result<MemoryReservation, ScribeError> {
+        self.try_reserve_with_limit(category, bytes, self.limit_bytes())
+    }
+
+    fn try_reserve_with_limit(
+        &self,
+        category: MemoryCategory,
+        bytes: usize,
+        scribe_limit: usize,
+    ) -> Result<MemoryReservation, ScribeError> {
+        if bytes > 0
+            && let Some((current, limit)) = cgroup_pressure()
+            && current.saturating_mul(100) >= limit.saturating_mul(90)
+        {
+            return Err(ScribeError::IngestBusy {
+                table: "memory".to_owned(),
+            });
+        }
+        reserve_with_limit(&self.parent.inner.scribe_total_bytes, scribe_limit, bytes)?;
+        if let Err(error) = reserve_with_limit(
+            &self.parent.inner.bifrost_total_bytes,
+            self.parent.bifrost_limit_bytes(),
+            bytes,
+        ) {
+            self.parent
+                .inner
+                .scribe_total_bytes
+                .fetch_sub(bytes, Ordering::AcqRel);
+            return Err(error);
+        }
+        self.parent.inner.categories[category as usize].fetch_add(bytes, Ordering::AcqRel);
+        Ok(MemoryReservation {
+            governor: self.clone(),
+            category,
+            bytes,
+            shard: None,
+        })
+    }
+
+    pub(crate) fn shard_accounting(&self) -> Arc<Vec<AtomicUsize>> {
+        Arc::clone(&self.parent.inner.shard_bytes)
+    }
+
+    pub(crate) fn shard_snapshot(&self) -> [usize; SHARD_ACCOUNTING_COUNT] {
+        std::array::from_fn(|index| self.parent.inner.shard_bytes[index].load(Ordering::Acquire))
+    }
+
+    /// Read category totals.
+    #[must_use]
+    pub fn snapshot(&self) -> MemorySnapshot {
+        self.parent.snapshot()
+    }
 
     fn release(&self, category: MemoryCategory, bytes: usize) {
-        self.inner.categories[category as usize].fetch_sub(bytes, Ordering::AcqRel);
-        self.inner
+        self.parent.inner.categories[category as usize].fetch_sub(bytes, Ordering::AcqRel);
+        self.parent
+            .inner
             .scribe_total_bytes
             .fetch_sub(bytes, Ordering::AcqRel);
-        self.inner
+        self.parent
+            .inner
             .bifrost_total_bytes
             .fetch_sub(bytes, Ordering::AcqRel);
     }
 
     /// Reconcile one category with an authoritative owner snapshot.
     pub fn reconcile_category(&self, category: MemoryCategory, target: usize) {
-        let current = self.inner.categories[category as usize].load(Ordering::Acquire);
+        let current = self.parent.inner.categories[category as usize].load(Ordering::Acquire);
         if target > current {
             let delta = target - current;
-            self.inner.categories[category as usize].fetch_add(delta, Ordering::AcqRel);
-            self.inner
+            self.parent.inner.categories[category as usize].fetch_add(delta, Ordering::AcqRel);
+            self.parent
+                .inner
                 .scribe_total_bytes
                 .fetch_add(delta, Ordering::AcqRel);
-            self.inner
+            self.parent
+                .inner
                 .bifrost_total_bytes
                 .fetch_add(delta, Ordering::AcqRel);
         } else {
             let delta = current - target;
-            self.inner.categories[category as usize].fetch_sub(delta, Ordering::AcqRel);
-            self.inner
+            self.parent.inner.categories[category as usize].fetch_sub(delta, Ordering::AcqRel);
+            self.parent
+                .inner
                 .scribe_total_bytes
                 .fetch_sub(delta, Ordering::AcqRel);
-            self.inner
+            self.parent
+                .inner
                 .bifrost_total_bytes
                 .fetch_sub(delta, Ordering::AcqRel);
         }
@@ -454,7 +492,7 @@ pub struct MemoryLedger {
 
 impl MemoryLedger {
     /// Create zero-sized active and immutable reservations on one governor.
-    pub fn new(governor: &BifrostMemoryGovernor) -> Result<Self, ScribeError> {
+    pub fn new(governor: &ScribeMemoryBudget) -> Result<Self, ScribeError> {
         Ok(Self {
             active: Arc::new(Mutex::new(governor.try_reserve(MemoryCategory::Active, 0)?)),
             immutable: Arc::new(Mutex::new(
@@ -560,7 +598,7 @@ impl MemoryLedger {
 /// RAII category reservation.
 #[derive(Debug)]
 pub struct MemoryReservation {
-    governor: BifrostMemoryGovernor,
+    governor: ScribeMemoryBudget,
     category: MemoryCategory,
     bytes: usize,
     shard: Option<(Arc<Vec<AtomicUsize>>, usize)>,
@@ -575,12 +613,12 @@ impl MemoryReservation {
 
     /// Resize this reservation while preserving category ownership.
     pub fn resize(&mut self, bytes: usize) -> Result<(), ScribeError> {
-        self.resize_with_limit(bytes, self.governor.scribe_limit_bytes())
+        self.resize_with_limit(bytes, self.governor.limit_bytes())
     }
 
     /// Resize an ingress reservation without crossing the 90% hard breaker.
     pub fn resize_ingress(&mut self, bytes: usize) -> Result<(), ScribeError> {
-        self.resize_with_limit(bytes, self.governor.scribe_limit_bytes() * 90 / 100)
+        self.resize_with_limit(bytes, self.governor.limit_bytes() * 90 / 100)
     }
 
     fn resize_with_limit(&mut self, bytes: usize, limit: usize) -> Result<(), ScribeError> {
@@ -664,9 +702,9 @@ impl MemoryReservation {
     /// Move accounting to another lifecycle category without changing totals.
     pub fn transfer_category(&mut self, category: MemoryCategory) {
         if self.category != category {
-            self.governor.inner.categories[self.category as usize]
+            self.governor.parent.inner.categories[self.category as usize]
                 .fetch_sub(self.bytes, Ordering::AcqRel);
-            self.governor.inner.categories[category as usize]
+            self.governor.parent.inner.categories[category as usize]
                 .fetch_add(self.bytes, Ordering::AcqRel);
         }
         self.category = category;
@@ -761,7 +799,10 @@ mod tests {
             governor.bifrost_limit_bytes(),
             1024 * 1024 * 1024 * 70 / 100
         );
-        assert_eq!(governor.active_bucket_target_bytes(), 64 * 1024 * 1024);
+        assert_eq!(
+            governor.scribe_budget().active_bucket_target_bytes(),
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -785,6 +826,7 @@ mod tests {
     fn reservations_are_categorized_and_released() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let reservation = governor
+            .scribe_budget()
             .try_reserve(MemoryCategory::Active, 512)
             .expect("reserve");
         assert_eq!(governor.snapshot().total_bytes(), 512);
@@ -801,6 +843,7 @@ mod tests {
     fn transfers_reservations_between_lifecycle_categories() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let mut reservation = governor
+            .scribe_budget()
             .try_reserve(MemoryCategory::Decode, 512)
             .expect("reserve");
         reservation.transfer_category(MemoryCategory::Prepared);
@@ -814,6 +857,7 @@ mod tests {
     fn split_and_merge_preserve_exact_totals() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let mut reservation = governor
+            .scribe_budget()
             .try_reserve(MemoryCategory::Prepared, 512)
             .expect("reserve");
         let part = reservation.split(128).expect("split");
@@ -827,18 +871,19 @@ mod tests {
     #[test]
     fn shard_ownership_tracks_transient_bytes_until_active_absorption() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
-        let mut reservation = governor
+        let budget = governor.scribe_budget();
+        let mut reservation = budget
             .try_reserve(MemoryCategory::Queued, 512)
             .expect("reserve");
-        reservation.attach_shard(governor.shard_accounting(), 3);
+        reservation.attach_shard(budget.shard_accounting(), 3);
         let part = reservation.split(128).expect("split");
         drop(part);
-        assert_eq!(governor.shard_snapshot()[3], 384);
+        assert_eq!(budget.shard_snapshot()[3], 384);
 
-        let ledger = MemoryLedger::new(&governor).expect("ledger");
+        let ledger = MemoryLedger::new(&budget).expect("ledger");
         reservation.transfer_category(MemoryCategory::Active);
         ledger.absorb_active(reservation).expect("absorb");
-        assert_eq!(governor.shard_snapshot()[3], 0);
+        assert_eq!(budget.shard_snapshot()[3], 0);
         ledger.release_active(384).expect("release");
         assert_eq!(governor.snapshot().total_bytes(), 0);
     }
@@ -846,8 +891,9 @@ mod tests {
     #[test]
     fn ledger_absorbs_an_already_accounted_active_lease_once() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
-        let ledger = MemoryLedger::new(&governor).expect("ledger");
-        let mut prepared = governor
+        let budget = governor.scribe_budget();
+        let ledger = MemoryLedger::new(&budget).expect("ledger");
+        let mut prepared = budget
             .try_reserve(MemoryCategory::Prepared, 512)
             .expect("prepared reservation");
         let mut active = prepared.split(256).expect("active split");
@@ -868,32 +914,21 @@ mod tests {
     fn parent_limit_rejects_even_when_scribe_budget_has_room() {
         let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("valid memory");
         let first = governor
-            .try_reserve_with_limit(
-                MemoryCategory::Raw,
-                governor.bifrost_limit_bytes(),
-                usize::MAX,
-            )
+            .try_reserve_parent(governor.bifrost_limit_bytes())
             .expect("parent budget");
-        assert!(
-            governor
-                .try_reserve_with_limit(MemoryCategory::Raw, 1, usize::MAX)
-                .is_err()
-        );
+        assert!(governor.try_reserve_parent(1).is_err());
         drop(first);
     }
 
     #[test]
     fn ninety_percent_pressure_rejects_before_wal_append() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let budget = governor.scribe_budget();
         let limit = governor.scribe_limit_bytes() * 90 / 100;
-        let reservation = governor
+        let reservation = budget
             .try_reserve_ingress(MemoryCategory::Raw, limit)
             .expect("90% ingress reservation");
-        assert!(
-            governor
-                .try_reserve_ingress(MemoryCategory::Raw, 1)
-                .is_err()
-        );
+        assert!(budget.try_reserve_ingress(MemoryCategory::Raw, 1).is_err());
         drop(reservation);
     }
 
@@ -912,6 +947,7 @@ mod tests {
     fn scribe_forge_oracle_share_one_parent_limit() {
         let governor = BifrostMemoryGovernor::new(MIN_MEMORY_BYTES).expect("valid memory");
         let scribe = governor
+            .scribe_budget()
             .try_reserve(MemoryCategory::Active, 200 * 1024 * 1024)
             .expect("Scribe reserve");
         let forge = governor
@@ -947,6 +983,7 @@ mod tests {
             .map(|_| {
                 let governor = governor.clone();
                 std::thread::spawn(move || {
+                    let budget = governor.scribe_budget();
                     for _ in 0..32 {
                         if let Ok(reservation) = governor.try_reserve_parent(4 * 1024 * 1024) {
                             assert!(
@@ -955,7 +992,7 @@ mod tests {
                             );
                             drop(reservation);
                         }
-                        if let Ok(reservation) = governor.try_reserve(MemoryCategory::Queued, 1) {
+                        if let Ok(reservation) = budget.try_reserve(MemoryCategory::Queued, 1) {
                             drop(reservation);
                         }
                     }
@@ -973,6 +1010,7 @@ mod tests {
     fn inspection_reconciles_parent_child_and_role_reservations() {
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let scribe = governor
+            .scribe_budget()
             .try_reserve(MemoryCategory::Active, 1024)
             .expect("Scribe reserve");
         let oracle = governor.try_reserve_parent(2048).expect("Oracle reserve");

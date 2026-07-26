@@ -6,7 +6,7 @@ use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuOp, ScribePersistenceCpuPool,
     ScribePersistenceCpuResult,
 };
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory};
+use crate::scribe::memory::{MemoryCategory, ScribeMemoryBudget};
 use crate::scribe::preprocess::AdmittedAppend;
 use crate::scribe::shards::ScribeShardRuntime;
 use std::time::Instant;
@@ -20,7 +20,7 @@ use std::time::Instant;
 pub(super) async fn process_ingress_frame(
     frame: ScribeIngressFrame,
     admission: &AdmissionController,
-    memory_governor: &BifrostMemoryGovernor,
+    memory_budget: &ScribeMemoryBudget,
     ingress_cpu: &ScribeIngressCpuPool,
     persistence_cpu: &ScribePersistenceCpuPool,
     shards: &ScribeShardRuntime,
@@ -43,12 +43,12 @@ pub(super) async fn process_ingress_frame(
         .measured_wire_bytes
         .saturating_add(REQUEST_OVERHEAD_BYTES);
     let mut reservation = admission.try_reserve(table.clone(), initial_bytes)?;
-    let mut memory = memory_governor
+    let mut memory = memory_budget
         .try_reserve_ingress(MemoryCategory::Raw, initial_bytes)
         .map_err(|_| ScribeError::IngestBusy {
             table: table.clone(),
         })?;
-    memory.attach_shard(memory_governor.shard_accounting(), shard);
+    memory.attach_shard(memory_budget.shard_accounting(), shard);
 
     let rows = ingress_cpu
         .decode(

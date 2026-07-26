@@ -240,10 +240,11 @@ fn parent_scribe_and_wal_hard_limits_reject_before_append() {
     assert!(governor.try_reserve_parent(1).is_err());
     drop(parent);
 
-    let scribe = governor
+    let budget = governor.scribe_budget();
+    let scribe = budget
         .try_reserve(MemoryCategory::Raw, governor.scribe_limit_bytes())
         .expect("Scribe limit reservation");
-    assert!(governor.try_reserve(MemoryCategory::Raw, 1).is_err());
+    assert!(budget.try_reserve(MemoryCategory::Raw, 1).is_err());
     drop(scribe);
 
     let wal_root = tempfile::tempdir().expect("WAL directory");

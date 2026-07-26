@@ -14,7 +14,7 @@ use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::seal_key::EventDay;
 use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
 use vala_bifrost_redux::scribe::wal::WalLsn;
-use wyrd_bench::{BifrostLane, BifrostScenario};
+use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
@@ -61,7 +61,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let binding = TenantTableBinding::resolve((tenant, table.clone()))?;
     let hot = tail
         .fetch_hot_batches(FetchLiveTailRequest {
-            binding,
+            binding: binding.clone(),
             target_stream: tail.stream(),
             start_day: EventDay::new(day),
             end_day: EventDay::new(day),
@@ -70,15 +70,31 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         })
         .await?;
     let returned_rows = hot.iter().map(|batch| batch.rows.num_rows()).sum::<usize>();
+    let negative_flows = if scenario.require_negative_flows {
+        let invalid = tail
+            .fetch_hot_batches(FetchLiveTailRequest {
+                binding: binding.clone(),
+                target_stream: tail.stream(),
+                start_day: EventDay::new(day),
+                end_day: EventDay::new(day),
+                after_lsn: WalLsn::ZERO,
+                required_columns: vec!["missing_benchmark_column".to_owned()],
+            })
+            .await;
+        NegativeFlowReport::executed(["invalid_oracle_projection_is_rejected"], invalid.is_err())
+    } else {
+        NegativeFlowReport::skipped()
+    };
     let verified = admission.batch_id == batch_id
         && admission.rows_accepted == u64::try_from(row_count)?
         && !hot.is_empty()
-        && returned_rows == row_count;
+        && returned_rows == row_count
+        && negative_flows.passed;
+    let mut envelope =
+        wyrd_bench::BifrostReportEnvelope::new(scenario, super::bench_report::readiness(verified));
+    envelope.negative_flows = negative_flows;
     let report = super::bench_report::LaneExecutionReport {
-        envelope: wyrd_bench::BifrostReportEnvelope::new(
-            scenario,
-            super::bench_report::readiness(verified),
-        ),
+        envelope,
         elapsed_us: u64::try_from(started.elapsed().as_micros())?,
         verified,
         rows: u64::try_from(returned_rows)?,

@@ -302,7 +302,7 @@ pub async fn build_app_state_from_boot_with_config(
                 64,
                 scribe_config.wal_io_threads,
             )),
-            memory_governor: Some(bifrost_memory.clone()),
+            memory_budget: Some(bifrost_memory.scribe_budget()),
         },
     ));
     match scribe.replay_wal_async().await {

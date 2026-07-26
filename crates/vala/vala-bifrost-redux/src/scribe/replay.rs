@@ -14,7 +14,7 @@ use wyrd_spec::vala::api::AuditEvent;
 use crate::contracts::ScribeError;
 use crate::scribe::audit_envelope::decode_audit_event;
 use crate::scribe::manifest::read_manifest;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryCategory, MemoryReservation};
+use crate::scribe::memory::{MemoryCategory, MemoryReservation, ScribeMemoryBudget};
 use crate::scribe::preprocess::AppendSliceId;
 use crate::scribe::seal_key::SealKey;
 #[cfg(test)]
@@ -115,7 +115,7 @@ pub fn replay_wal_directory_stream(
 /// it when they are exercising parser ordering or deduplication in isolation.
 pub(crate) fn replay_wal_directory_stream_accounted(
     wal_dir: impl AsRef<Path>,
-    governor: Option<&BifrostMemoryGovernor>,
+    governor: Option<&ScribeMemoryBudget>,
     mut emit: impl FnMut(ReplayChunk) -> Result<(), ScribeError>,
 ) -> Result<(), ScribeError> {
     let wal_dir = wal_dir.as_ref();
@@ -159,7 +159,7 @@ struct ReplayAccumulator<'a> {
     sealed_lsn_map: &'a HashMap<String, WalLsn>,
     seen_slices: HashSet<AppendSliceId>,
     states: HashMap<String, ReplayedSealKey>,
-    governor: Option<&'a BifrostMemoryGovernor>,
+    governor: Option<&'a ScribeMemoryBudget>,
     memory: Option<MemoryReservation>,
     memory_bytes: usize,
 }
@@ -168,7 +168,7 @@ impl<'a> ReplayAccumulator<'a> {
     /// Create an empty bounded replay batch with a zero-sized reservation.
     fn new(
         sealed_lsn_map: &'a HashMap<String, WalLsn>,
-        governor: Option<&'a BifrostMemoryGovernor>,
+        governor: Option<&'a ScribeMemoryBudget>,
     ) -> Result<Self, ScribeError> {
         let memory = governor
             .map(|governor| governor.try_reserve_maintenance(MemoryCategory::Decode, 0))
@@ -314,6 +314,7 @@ fn merge_replayed_state(
 mod tests {
     use super::*;
     use crate::catalog::TableRef;
+    use crate::scribe::memory::BifrostMemoryGovernor;
     use crate::scribe::seal_key::EventDay;
     use crate::scribe::stream_identity::NodeId;
     use crate::scribe::wal::WalWriter;
@@ -543,8 +544,9 @@ mod tests {
         wal.sync_data_for_test(&seal_key).expect("sync");
 
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+        let budget = governor.scribe_budget();
         let mut chunks = Vec::new();
-        replay_wal_directory_stream_accounted(temp_dir.path(), Some(&governor), |chunk| {
+        replay_wal_directory_stream_accounted(temp_dir.path(), Some(&budget), |chunk| {
             chunks.push(chunk);
             Ok(())
         })

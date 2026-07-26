@@ -1330,7 +1330,7 @@ impl WyrdTestServerBuilder {
                     lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
                     admission: scribe_admission,
                     coordination_runtime: tokio::runtime::Handle::current(),
-                    memory_governor: Some(bifrost_memory.clone()),
+                    memory_budget: Some(bifrost_memory.scribe_budget()),
                 },
             )
         } else {
@@ -1344,7 +1344,7 @@ impl WyrdTestServerBuilder {
                     lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
                     admission: scribe_admission,
                     coordination_runtime: tokio::runtime::Handle::current(),
-                    memory_governor: Some(bifrost_memory.clone()),
+                    memory_budget: Some(bifrost_memory.scribe_budget()),
                 },
             )
             .map_err(WyrdTestServerError::Start)?

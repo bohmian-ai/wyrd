@@ -127,8 +127,8 @@ pub struct ScribeImpl {
     writer_epoch: i64,
     /// Pod-global request and shard admission counters.
     admission: AdmissionController,
-    /// Pod-global Bifrost/Scribe memory governor.
-    memory: memory::BifrostMemoryGovernor,
+    /// Scribe-only child capability over the pod-global Bifrost governor.
+    memory: memory::ScribeMemoryBudget,
     /// Shared active/immutable Arrow ownership ledger.
     memory_ledger: memory::MemoryLedger,
     /// Bounded persistence CPU lane retained for replay and seal preparation.
@@ -156,9 +156,8 @@ pub struct ScribeBuildConfig {
     pub execution_pools: ScribeExecutionPools,
     /// Optional server-provisioned immutable persistence dependencies.
     pub persistence: Option<ScribePersistenceConfig>,
-    /// Shared parent governor provisioned by server boot for Scribe, Forge,
-    /// and Oracle allocations.
-    pub memory_governor: Option<memory::BifrostMemoryGovernor>,
+    /// Scribe child budget provisioned by server boot.
+    pub memory_budget: Option<memory::ScribeMemoryBudget>,
 }
 
 /// Runtime, admission, and memory inputs for an embedded Scribe.
@@ -169,8 +168,8 @@ pub struct ScribeEmbeddedConfig {
     pub admission: AdmissionConfig,
     /// Runtime used for Scribe coordination tasks.
     pub coordination_runtime: Handle,
-    /// Optional server-provisioned parent memory governor.
-    pub memory_governor: Option<memory::BifrostMemoryGovernor>,
+    /// Optional server-provisioned Scribe child budget.
+    pub memory_budget: Option<memory::ScribeMemoryBudget>,
 }
 
 impl ScribeImpl {
@@ -226,7 +225,7 @@ impl ScribeImpl {
                 lane_config: ScribeLaneConfig::resolved(),
                 admission,
                 coordination_runtime: Handle::current(),
-                memory_governor: None,
+                memory_budget: None,
             },
         )
     }
@@ -269,7 +268,7 @@ impl ScribeImpl {
                 coordination_runtime: config.coordination_runtime,
                 execution_pools,
                 persistence: None,
-                memory_governor: config.memory_governor,
+                memory_budget: config.memory_budget,
             },
         ))
     }
@@ -334,7 +333,7 @@ impl ScribeImpl {
                 lane_config,
                 admission,
                 coordination_runtime,
-                memory_governor: None,
+                memory_budget: None,
             },
         )
     }
@@ -368,7 +367,7 @@ impl ScribeImpl {
                     ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
                 ),
                 persistence: None,
-                memory_governor: config.memory_governor,
+                memory_budget: config.memory_budget,
             },
         )
     }
@@ -391,7 +390,7 @@ impl ScribeImpl {
         writer_epoch: i64,
         config: ScribeBuildConfig,
     ) -> Self {
-        let memory = config.memory_governor.clone().unwrap_or_else(|| {
+        let memory = config.memory_budget.clone().unwrap_or_else(|| {
             memory::BifrostMemoryGovernor::new_with_scribe_limit(
                 config.admission.memory_limit_bytes,
                 config.admission.scribe_memory_limit_bytes,
@@ -401,6 +400,7 @@ impl ScribeImpl {
                 memory::BifrostMemoryGovernor::new(1024 * 1024 * 1024)
                     .expect("one-gibibyte fallback memory budget is valid")
             })
+            .scribe_budget()
         });
         let memory_ledger = memory::MemoryLedger::new(&memory)
             .expect("zero-sized memory ledger reservations must be valid");
@@ -410,7 +410,7 @@ impl ScribeImpl {
             execution_pools,
             persistence: persistence_config,
             admission: _,
-            memory_governor: _,
+            memory_budget: _,
         } = config;
         let ScribeExecutionPools {
             ingress_cpu,
@@ -529,7 +529,7 @@ impl ScribeImpl {
                     wal_io,
                 ),
                 persistence: None,
-                memory_governor: None,
+                memory_budget: None,
             },
         )
     }

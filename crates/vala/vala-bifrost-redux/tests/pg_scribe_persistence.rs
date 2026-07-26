@@ -79,7 +79,7 @@ impl PersistenceFixture {
                 coordination_runtime: tokio::runtime::Handle::current(),
                 execution_pools: pools,
                 persistence: Some(persistence),
-                memory_governor: Some(memory),
+                memory_budget: Some(memory.scribe_budget()),
             },
         ));
         scribe.replay_wal_async().await.expect("empty WAL replay");

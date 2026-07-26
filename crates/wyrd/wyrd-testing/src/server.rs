@@ -1208,6 +1208,10 @@ impl WyrdTestServerBuilder {
             .grpc_addr()
             .ok_or_else(|| WyrdTestServerError::Bind("no gRPC address bound".to_owned()))?;
         let base_url = format!("http://{addr}");
+        srv.inner
+            .state
+            .storage
+            .set_public_base_url(base_url.clone());
 
         let serve_handle = wyrd_runtime::runtime().spawn(async move {
             let _ = bound.run().await;

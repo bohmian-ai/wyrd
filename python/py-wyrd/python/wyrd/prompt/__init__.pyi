@@ -1561,6 +1561,10 @@ class PromptCard:
         """
         ...
 
+    def _to_card_envelope_json(self) -> str:
+        """Return the registry adapter's single envelope conversion."""
+        ...
+
     def as_card_ref(self) -> CardRef:
         """Return a CardRef pointing at this PromptCard.
 

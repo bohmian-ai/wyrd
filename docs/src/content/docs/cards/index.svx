@@ -42,10 +42,31 @@ A card object is a **local holder** first. In Python, `DataCard.save(path)` writ
 local files and `card.json`; `DataCard.load(path)` hydrates them back. That local
 workflow does **not** register anything.
 
-Durable registration is a separate, server-owned step: you upload the card, the
-registry versions it, validates the spec, stores any bytes, and derives the
-relationship graph from the card's `CardRef`s. See
-[Declare a card](/how-to/declare/).
+Use `Cards` for the server-backed lifecycle. Registration saves the card's
+envelope and artifacts, uploads them, waits for server completion, and stamps
+the server-assigned identity back onto the caller-owned card. The server is the
+source of truth for the persisted envelope.
+
+```python
+from wyrd import Cards, Prompt, PromptCard
+
+cards = Cards()
+prompt_card = PromptCard(
+    Prompt.openai_chat("gpt-4o", messages="Hello {{name}}"),
+    space="ml",
+    name="welcome",
+    version="0.1.0",
+)
+receipt = cards.prompt.register(prompt_card)
+
+# `get` validates the persisted envelope.
+prompt = cards.prompt.get(uid=receipt.root.uid)
+```
+
+Use `cards.data`, `cards.model`, and `cards.prompt` for kind-specific typing.
+`list` returns metadata-only summaries, `resolve_latest` returns an exact
+reference, `get` returns a typed card holder, and `load` hydrates DataCard or
+ModelCard artifacts. See [Declare a card](/how-to/declare/).
 
 ## Catalog
 

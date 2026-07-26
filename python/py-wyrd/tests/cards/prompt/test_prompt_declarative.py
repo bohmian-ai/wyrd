@@ -21,6 +21,7 @@ metadata:
   name: lead-scoring
   version: 0.1.0
   space: growth
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
 spec:
   provider: openai
   model: gpt-4o

@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
 from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError
-from ..cards import CardRef
+from ..cards import CardRef, JsonValue, ModelLoadArgs
 from ..data import FieldSpec
 
 #### end of imports ####
@@ -663,8 +663,16 @@ class ModelCardMetadata:
 class ModelCard:
     """Local ModelCard holder and spec builder.
 
-    `save` and `load` only touch the local filesystem. Registration belongs to
-    registry/client APIs, not the card object.
+    Registration belongs to registry/client APIs, not the card object:
+
+    ```python
+    cards = Cards()
+    card = cards.model.get(space="ml", name="fraud-model", interface=MyModelInterface)
+    card.load()
+    ```
+
+    `get` validates the server-stored Card envelope. `load` is the separate
+    operation that downloads and hydrates registered model artifacts.
     """
 
     space: str
@@ -718,46 +726,7 @@ class ModelCard:
     @overload
     def __init__(
         self,
-        model_or_interface: PathLike,
-        space: str | None = ...,
-        name: str | None = ...,
-        version: str | None = ...,
-        uid: str | None = ...,
-        labels: StringMap | None = ...,
-        annotations: StringMap | None = ...,
-        metadata: ModelCardMetadata | None = ...,
-    ) -> None:
-        """Create a ModelCard from a local model artifact path.
-
-        Args:
-            model_or_interface (PathLike): Wyrd model materialization root or a
-                convention artifact path such as `model.joblib`, `model.pt`,
-                `model.keras`, `savedmodel`, or `model/`.
-            space (str | None): Optional card space. Defaults to `default`.
-            name (str | None): Optional card name. Defaults to `model`.
-            version (str | None): Optional semantic version. Defaults to
-                `0.1.0`.
-            uid (str | None): Optional card UID. Defaults to a generated
-                UUIDv7.
-            labels (StringMap | None): Queryable user labels copied into the
-                card metadata.
-            annotations (StringMap | None): Free-form user annotations copied
-                into the card metadata.
-            metadata (ModelCardMetadata | None): Existing holder metadata to
-                seed before interface inference. A valid signature is required.
-                Joblib artifacts require `metadata.interface` because the file
-                layout is shared by Sklearn, XGBoost, LightGBM, and CatBoost.
-
-        Raises:
-            WyrdError: If Wyrd cannot infer a supported model interface or the
-                supplied metadata violates the ModelCard contract.
-        """
-        ...
-
-    @overload
-    def __init__(
-        self,
-        model_or_interface: Any,
+        model_or_interface: object,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -769,7 +738,7 @@ class ModelCard:
         """Create a ModelCard by inferring the interface from a runtime model.
 
         Args:
-            model_or_interface (Any): Runtime model object such as a
+            model_or_interface (object): Runtime model object such as a
                 scikit-learn estimator, XGBoost model, LightGBM model, CatBoost
                 model, PyTorch module, Lightning module, TensorFlow/Keras
                 model, or Hugging Face pretrained model.
@@ -793,7 +762,7 @@ class ModelCard:
         """
         ...
 
-    def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
+    def save(self, path: PathLike, save_kwargs: Mapping[str, JsonValue] | None = ...) -> None:
         """Materialize local model artifacts and write `card.json`.
 
         The held interface writes model bytes. Wyrd updates interface metadata
@@ -803,25 +772,48 @@ class ModelCard:
         Args:
             path (PathLike): Local directory where Wyrd writes model bytes and
                 `card.json`.
-            save_kwargs (dict[str, Any] | None): Optional interface-specific
+            save_kwargs (Mapping[str, JsonValue] | None): Optional
+                interface-specific
                 save options.
         """
         ...
 
-    def load(self, path: PathLike | None = ..., load_kwargs: dict[str, Any] | None = ...) -> None:
-        """Hydrate local model artifacts through the held interface.
+    def load(
+        self,
+        path: PathLike | None = ...,
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> None:
+        """Hydrate model artifacts through the held interface.
+
+        Pass `path` to load a saved local directory. Without a path, call this
+        on a card returned by `Cards.model.get`; Wyrd obtains the server artifact
+        inventory, downloads and verifies the artifacts into a temporary
+        directory, and then invokes the interface. `get` does not download
+        model bytes.
 
         Args:
-            path (PathLike | None): Local materialization directory. Pass
-                `None` only when another surface has already provided local
-                model bytes for the interface.
-            load_kwargs (dict[str, Any] | None): Optional interface-specific
-                load options.
+            path (PathLike | None): Optional local materialization directory.
+            load_kwargs (ModelLoadArgs | Mapping[str, JsonValue] | None):
+                Optional interface-specific load options.
+
+        Raises:
+            WyrdError: If no path is supplied to a card that was not returned
+                by `Cards.model.get`, the Card has no server UID, artifact
+                download or verification fails, no interface is attached, or
+                interface loading fails.
         """
         ...
 
     def model_dump_json(self) -> str:
         """Return this ModelCard envelope as JSON without filesystem IO."""
+        ...
+
+    def model_dump(self) -> JsonDict:
+        """Return this ModelCard envelope as a JSON-compatible dictionary."""
+        ...
+
+    def _to_card_envelope_json(self) -> str:
+        """Return the registry adapter's single envelope conversion."""
         ...
 
     def as_card_ref(self) -> CardRef:
@@ -836,18 +828,30 @@ class ModelCard:
         ...
 
     @staticmethod
-    def model_validate_json(json_string: str, interface: Any | None = ...) -> ModelCard:
+    def model_validate_json(
+        json_string: str,
+        interface: ModelInterface | type[ModelInterface] | None = ...,
+    ) -> ModelCard:
         """Build a ModelCard from serialized Wyrd card JSON.
 
-        Pass `interface=YourInterface` when the JSON describes a custom Python
-        `ModelInterface`; Wyrd cannot rebuild custom subclasses from metadata
-        alone.
+        The JSON must contain a complete `Model` Card envelope, including its
+        resolved version. This method rebuilds the holder and its interface;
+        it does not download model artifacts. Pass `interface=YourInterface`
+        when the JSON describes a custom Python `ModelInterface`; Wyrd cannot
+        rebuild custom subclasses from metadata alone.
 
         Args:
             json_string (str): Serialized ModelCard envelope.
-            interface (Any | None): Optional built-in interface, Python
-                subclass instance, or Python subclass type reconstructed
-                through `from_metadata`.
+            interface (ModelInterface | type[ModelInterface] | None): Optional
+                built-in interface, Python subclass instance, or Python
+                subclass type reconstructed through `from_metadata`.
+
+        Returns:
+            A ModelCard holder populated from the serialized envelope.
+
+        Raises:
+            WyrdError: If JSON parsing, envelope validation, or custom
+                interface reconstruction fails.
         """
         ...
 

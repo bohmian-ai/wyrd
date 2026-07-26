@@ -6642,7 +6642,10 @@ dependencies = [
  "skald-workflow",
  "vala-sdk",
  "wyrd-cards",
+ "wyrd-cli",
  "wyrd-config",
+ "wyrd-runtime",
+ "wyrd-sdk",
  "wyrd-testing",
  "wyrd-utils",
 ]
@@ -10648,11 +10651,15 @@ dependencies = [
  "pyo3",
  "serde",
  "serde_json",
+ "serde_yaml",
  "skald-prompt",
  "skald-spec",
+ "tempfile",
  "tokio",
  "wyrd-config",
  "wyrd-interfaces",
+ "wyrd-registry",
+ "wyrd-runtime",
  "wyrd-semver",
  "wyrd-spec",
  "wyrd-test-contract-macros",
@@ -10800,10 +10807,12 @@ dependencies = [
 name = "wyrd-loader"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "schemars 0.8.22",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "wyrd-config",
@@ -10916,6 +10925,29 @@ dependencies = [
  "wyrd",
  "wyrd-client",
  "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-sdk"
+version = "0.0.1"
+dependencies = [
+ "base64 0.22.1",
+ "pyo3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "wyrd-cards",
+ "wyrd-interfaces",
+ "wyrd-loader",
+ "wyrd-registry",
+ "wyrd-runtime",
+ "wyrd-semver",
+ "wyrd-spec",
+ "wyrd-utils",
 ]
 
 [[package]]
@@ -11175,6 +11207,7 @@ dependencies = [
  "wyrd-auth-verify",
  "wyrd-crypt",
  "wyrd-dev-fixtures",
+ "wyrd-interfaces",
  "wyrd-runtime",
  "wyrd-semver",
  "wyrd-server",

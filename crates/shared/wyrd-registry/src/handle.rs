@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use reqwest::Method;
 use secrecy::SecretString;
 use tempfile::TempDir;
@@ -168,6 +169,60 @@ impl Cards {
         }
     }
 
+    /// Download and verify every server-declared artifact for one Card.
+    ///
+    /// The caller owns the destination and its lifetime. This method owns only
+    /// registry selection, server download-plan creation, bounded transfer, and
+    /// integrity verification; no Card receives a registry or storage handle.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when inventory lookup, destination preparation,
+    /// transfer, or integrity verification fails.
+    pub async fn download_artifacts_to(
+        &self,
+        card_uid: &CardUid,
+        destination: &Path,
+    ) -> Result<(), WyrdError> {
+        tokio::fs::create_dir_all(destination)
+            .await
+            .map_err(RegistryEngineError::from)
+            .map_err(WyrdError::from)?;
+
+        let inventory = reads::list_artifacts(&self.engine.client, card_uid)
+            .await
+            .map_err(WyrdError::from)?;
+        let downloads =
+            futures_util::stream::iter(inventory.artifacts.into_iter().map(|artifact| {
+                let engine = Arc::clone(&self.engine);
+                let card_uid = card_uid.clone();
+                let destination = destination.to_path_buf();
+                async move {
+                    let path = destination.join(artifact.relative_path.as_str());
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(RegistryEngineError::from)?;
+                    }
+                    download::download_artifact(
+                        &engine.client,
+                        &engine.storage,
+                        &card_uid,
+                        &artifact.relative_path,
+                        &path,
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in downloads {
+            result.map_err(WyrdError::from)?;
+        }
+        Ok(())
+    }
+
     /// Register a loader-produced composite input and drive its private
     /// artifact transfer and server-owned completion lifecycle.
     ///
@@ -310,52 +365,29 @@ impl Cards {
                     message: "server response did not contain a card uid".to_owned(),
                     details: serde_json::json!({}),
                 })?;
-        let inventory = reads::list_artifacts(&self.engine.client, &card_uid)
-            .await
-            .map_err(WyrdError::from)?;
-
-        let (root, temporary_artifact_directory, artifact_directory) = match destination {
-            Some(path) => {
-                tokio::fs::create_dir_all(path)
-                    .await
-                    .map_err(RegistryEngineError::from)
-                    .map_err(WyrdError::from)?;
-                (path.to_path_buf(), None, Some(path.to_path_buf()))
-            }
-            None => {
-                let temporary = tempfile::Builder::new()
+        let temporary_directory = if destination.is_none() {
+            Some(
+                tempfile::Builder::new()
                     .prefix("wyrd-card-")
                     .tempdir()
                     .map_err(RegistryEngineError::from)
-                    .map_err(WyrdError::from)?;
-                let root = temporary.path().to_path_buf();
-                (root, Some(temporary), None)
-            }
-        };
-
-        for artifact in inventory.artifacts {
-            let path = root.join(artifact.relative_path.as_str());
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent)
-                    .await
-                    .map_err(RegistryEngineError::from)
-                    .map_err(WyrdError::from)?;
-            }
-            download::download_artifact(
-                &self.engine.client,
-                &self.engine.storage,
-                &card_uid,
-                &artifact.relative_path,
-                &path,
+                    .map_err(WyrdError::from)?,
             )
-            .await
-            .map_err(WyrdError::from)?;
-        }
+        } else {
+            None
+        };
+        let artifact_path = destination
+            .or_else(|| temporary_directory.as_ref().map(TempDir::path))
+            .ok_or_else(|| WyrdError::RegistryInvalidCardSpec {
+                message: "artifact load did not produce a destination".to_owned(),
+                details: serde_json::json!({}),
+            })?;
+        self.download_artifacts_to(&card_uid, artifact_path).await?;
 
         Ok(LoadedCard {
             card,
-            temporary_artifact_directory,
-            artifact_directory,
+            temporary_artifact_directory: temporary_directory,
+            artifact_directory: destination.map(Path::to_path_buf),
         })
     }
 }

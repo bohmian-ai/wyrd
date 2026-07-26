@@ -10,7 +10,7 @@ order: 11
 
 Describe a dataset, feature table, document set, or other data dependency.
 
-<CardSummary kind={"data"} title={"Data"} purpose={"Describe a dataset, feature table, document set, or other data dependency."} required={["interface", "schema", "stats"]} optionalCount={4} />
+<CardSummary kind={"data"} title={"Data"} purpose={"Describe a dataset, feature table, document set, or other data dependency."} required={["interface", "schema", "stats"]} optionalCount={5} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -24,6 +24,7 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | --- | --- | --- |
 | `card_refs` | `array` | no |
 | `interface` | `object` | yes |
+| `publishes_to` | `array` | no |
 | `schema` | `object` | yes |
 | `splits` | `object` | no |
 | `sql` | `object` | no |

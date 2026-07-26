@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use secrecy::ExposeSecret;
+use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
 use wyrd_utils::py::wyrd_error_to_py_err;
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -197,6 +198,48 @@ impl WyrdTestServer {
                     "expected Machine bootstrap from bootstrap_service",
                 ))
             }
+        }
+    }
+
+    /// Provision a second tenant for cross-tenant journey tests.
+    #[pyo3(signature = (slug))]
+    fn seed_tenant(&self, slug: &str) -> CardPyResult<String> {
+        let srv = self
+            .server
+            .as_ref()
+            .ok_or_else(|| WyrdPyError::internal("WyrdTestServer not started"))?;
+        let tenant_id = wyrd_runtime::runtime()
+            .block_on(srv.seed_tenant(slug))
+            .map_err(|error| WyrdPyError::from(wyrd_spec::error::WyrdError::from(error)))?;
+        Ok(tenant_id.to_string())
+    }
+
+    /// Bootstrap a service principal under an explicit tenant.
+    #[pyo3(signature = (tenant_id, roles, name = "svc"))]
+    fn bootstrap_service_in_tenant(
+        &self,
+        tenant_id: &str,
+        roles: Vec<String>,
+        name: &str,
+    ) -> CardPyResult<String> {
+        let srv = self
+            .server
+            .as_ref()
+            .ok_or_else(|| WyrdPyError::internal("WyrdTestServer not started"))?;
+        let tenant_id = tenant_id
+            .parse::<wyrd_spec::DataTenantId>()
+            .map_err(|error| WyrdPyError::validation(format!("invalid tenant id: {error}")))?;
+        let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+        let bootstrap = wyrd_runtime::runtime()
+            .block_on(srv.bootstrap_service_in_tenant(tenant_id, name, &roles))
+            .map_err(|error| WyrdPyError::from(wyrd_spec::error::WyrdError::from(error)))?;
+        match bootstrap {
+            crate::server::Bootstrap::Machine { api_key, .. } => {
+                Ok(api_key.expose_secret().to_owned())
+            }
+            crate::server::Bootstrap::User { .. } => Err(WyrdPyError::internal(
+                "expected Machine bootstrap from bootstrap_service_in_tenant",
+            )),
         }
     }
 }

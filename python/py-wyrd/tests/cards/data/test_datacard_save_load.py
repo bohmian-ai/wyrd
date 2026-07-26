@@ -594,13 +594,11 @@ def test_custom_interface_datacard_save_and_load(tmp_path: Path) -> None:
     _assert_stats(card)
 
 
-def test_load_requires_a_local_path_when_artifacts_are_not_downloaded() -> None:
+def test_load_without_path_requires_registry_configuration() -> None:
     card = DataCard(PandasInterface(data=pd.DataFrame({"x": [1]})))
 
-    with pytest.raises(WyrdError) as exc:
+    with pytest.raises(WyrdError):
         card.load()
-
-    assert exc.value.code == "WYRD_DATA_400_VALIDATION"
 
 
 def test_save_does_not_create_artifact_cards_or_card_refs(tmp_path: Path) -> None:

@@ -53,18 +53,36 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
+    std::process::ExitCode::from(run_cli_code(args).await)
+}
+
+/// Parse and run the CLI, returning its numeric process exit code for language
+/// bindings and other embedding surfaces.
+pub async fn run_cli_code<I, T>(args: I) -> u8
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
             let _ = error.print();
-            return std::process::ExitCode::from(64);
+            return 64;
         }
     };
     match dispatch(cli).await {
-        Ok(code) => code,
+        Ok(code) => code_to_u8(code),
         Err(error) => {
             eval::output::print_cli_error(&error);
-            std::process::ExitCode::from(error.exit_code())
+            error.exit_code()
         }
+    }
+}
+
+fn code_to_u8(code: std::process::ExitCode) -> u8 {
+    if code == std::process::ExitCode::SUCCESS {
+        0
+    } else {
+        1
     }
 }

@@ -229,12 +229,21 @@ impl PromptCard {
             ));
         };
 
+        let space = card.metadata.space.as_ref().ok_or_else(|| {
+            validation_error(
+                "PromptCard envelope missing space in metadata",
+                serde_json::Value::Null,
+            )
+        })?;
+        let uid = card.metadata.uid.as_ref().ok_or_else(|| {
+            validation_error(
+                "PromptCard envelope missing uid in metadata",
+                serde_json::Value::Null,
+            )
+        })?;
+
         Ok(Self {
-            space: card
-                .metadata
-                .space
-                .as_ref()
-                .map_or_else(|| "default".to_owned(), ToString::to_string),
+            space: space.to_string(),
             name: card.metadata.name.to_string(),
             version: card
                 .metadata
@@ -246,12 +255,7 @@ impl PromptCard {
                         serde_json::Value::Null,
                     )
                 })?,
-            uid: card
-                .metadata
-                .uid
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
+            uid: uid.to_string(),
             labels: card.metadata.labels,
             annotations: card.metadata.annotations,
             metadata: PromptCardMetadata {
@@ -262,6 +266,13 @@ impl PromptCard {
             #[cfg(feature = "python")]
             prompt: None,
         })
+    }
+
+    /// Hydrate the Python prompt projection from the native prompt spec.
+    #[cfg(feature = "python")]
+    pub fn hydrate_prompt(&mut self, py: Python<'_>) -> CardPyResult<()> {
+        self.prompt = Some(skald_prompt::prompt_py(self.metadata.prompt.clone(), py)?);
+        Ok(())
     }
 
     fn to_envelope_metadata(&self, spec_hash: SpecHash) -> Result<EnvelopeMetadata, WyrdError> {
@@ -642,6 +653,16 @@ impl PromptCard {
         Ok(io::write_card_file(&self.to_card()?, &path)?)
     }
 
+    /// Return this `PromptCard` as a Python dictionary.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when the envelope cannot be validated or converted
+    /// to Python values.
+    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        wyrd_utils::py::json_to_pyobject(py, &serde_json::to_value(&self.to_card()?)?)
+            .map_err(Into::into)
+    }
+
     /// Load a local `PromptCard` envelope from a JSON or YAML file.
     ///
     /// Accepts both the stored native format and the declarative authoring
@@ -655,9 +676,7 @@ impl PromptCard {
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
-        let mut card = Self::from_card(io::read_card_file(&path)?)?;
-        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
-        Ok(card)
+        Self::from_path_py(py, path)
     }
 
     /// Load a local `PromptCard` envelope from a JSON or YAML file.
@@ -675,8 +694,8 @@ impl PromptCard {
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn from_path_py(py: Python<'_>, path: PathBuf) -> CardPyResult<Self> {
-        let mut card = Self::from_card(io::read_card_file(&path)?)?;
-        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
+        let mut card = Self::from_card(io::read_local_card_file(&path)?)?;
+        card.hydrate_prompt(py)?;
         Ok(card)
     }
 
@@ -690,6 +709,13 @@ impl PromptCard {
         self.model_dump_json()
     }
 
+    /// Return the single card-envelope JSON conversion used by registry
+    /// adapters.
+    #[pyo3(name = "_to_card_envelope_json")]
+    pub fn to_card_envelope_json_py(&self) -> CardPyResult<String> {
+        self.model_dump_json()
+    }
+
     /// Build a `PromptCard` from serialized Wyrd card-envelope JSON.
     ///
     /// # Errors
@@ -699,7 +725,7 @@ impl PromptCard {
     #[pyo3(name = "model_validate_json")]
     pub fn model_validate_json_py(py: Python<'_>, json_string: &str) -> CardPyResult<Self> {
         let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
-        card.prompt = Some(skald_prompt::prompt_py(card.metadata.prompt.clone(), py)?);
+        card.hydrate_prompt(py)?;
         Ok(card)
     }
 

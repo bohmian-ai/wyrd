@@ -19,6 +19,7 @@ PUBLIC_MODULE_STUBS = {
     "observe.pyi": PACKAGE_DIR / "observe" / "__init__.pyi",
     "observer.pyi": PACKAGE_DIR / "observer.pyi",
     "prompt.pyi": PACKAGE_DIR / "prompt" / "__init__.pyi",
+    "runtime.pyi": PACKAGE_DIR / "runtime" / "__init__.pyi",
     "testing.pyi": PACKAGE_DIR / "testing" / "__init__.pyi",
 }
 
@@ -90,6 +91,13 @@ def rewrite_public_imports(filename: str, content: str) -> str:
         "config.pyi": {
             "from .cards import CardKind": "from ..cards import CardKind",
         },
+        "cards.pyi": {
+            "from .data import DataCard, DataInterface\nfrom .model import ModelCard, ModelInterface\nfrom .prompt import PromptCard, PromptReference": (
+                "from ..data import DataCard, DataInterface\n"
+                "from ..model import ModelCard, ModelInterface\n"
+                "from ..prompt import PromptCard, PromptReference"
+            ),
+        },
         "agent.pyi": {
             "from collections.abc import Callable, Mapping, Sequence": (
                 "from collections.abc import Callable, Mapping, Sequence"
@@ -109,12 +117,30 @@ def rewrite_public_imports(filename: str, content: str) -> str:
             ),
         },
         "data.pyi": {
+            "from .cards import CardRef, DataLoadArgs, JsonValue\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError"
+                "\nfrom ..cards import CardRef, DataLoadArgs, JsonValue"
+            ),
+            "from .cards import CardRef, DataLoadArgs\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError"
+                "\nfrom ..cards import CardRef, DataLoadArgs"
+            ),
             "from .cards import CardRef\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
                 "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError"
                 "\nfrom ..cards import CardRef"
             ),
         },
         "model.pyi": {
+            "from .cards import CardRef, JsonValue, ModelLoadArgs\nfrom .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError\n"
+                "from ..cards import CardRef, JsonValue, ModelLoadArgs\n"
+                "from ..data import FieldSpec"
+            ),
+            "from .cards import CardRef, ModelLoadArgs\nfrom .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
+                "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError\n"
+                "from ..cards import CardRef, ModelLoadArgs\n"
+                "from ..data import FieldSpec"
+            ),
             "from .cards import CardRef\nfrom .data import FieldSpec\nfrom .error import WyrdError\nfrom .header import CardRefLike, JsonDict, PathLike, StringMap": (
                 "from .._wyrd import CardRefLike, JsonDict, PathLike, StringMap, WyrdError\n"
                 "from ..cards import CardRef\n"

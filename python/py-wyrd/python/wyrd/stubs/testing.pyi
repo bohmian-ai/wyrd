@@ -42,4 +42,14 @@ class WyrdTestServer:
         """
         ...
 
+    def seed_tenant(self, slug: str) -> str:
+        """Provision a second tenant for isolation journeys."""
+        ...
+
+    def bootstrap_service_in_tenant(
+        self, tenant_id: str, roles: list[str], name: str = "svc"
+    ) -> str:
+        """Mint a service principal under an explicit tenant."""
+        ...
+
 __all__ = ["WyrdTestServer"]

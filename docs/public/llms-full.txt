@@ -110,6 +110,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "AgentRunConfigSpec": {
       "description": "Pure-serde mirror of the Skald agent run configuration.",
@@ -1136,7 +1137,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -1155,12 +1156,15 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -1185,7 +1189,6 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -1796,6 +1799,23 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "allOf": [
             {
               "$ref": "#/definitions/Prompt"
@@ -1808,7 +1828,7 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
           "type": "string"
         }
       ],
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "OpenAiAllowedTools": {
       "additionalProperties": false,
@@ -4180,6 +4200,40 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "description": "One native LLM request."
     },
+    "Ref": {
+      "anyOf": [
+        {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CardRef"
+            }
+          ],
+          "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A local authored path awaiting loader resolution.",
+          "type": "string"
+        }
+      ],
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
+    },
     "ResponseType": {
       "description": "Expected response shape for a rendered prompt.",
       "oneOf": [
@@ -4305,6 +4359,13 @@ Schema source: crates/wyrd-spec/schemas/agent_spec.json
       ],
       "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this agent.",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      },
+      "type": "array"
+    },
     "run_config": {
       "allOf": [
         {
@@ -4368,7 +4429,7 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -4387,12 +4448,15 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -4417,7 +4481,6 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -4569,11 +4632,28 @@ Schema source: crates/wyrd-spec/schemas/artifact_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -4704,7 +4784,7 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -4723,12 +4803,15 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -4753,7 +4836,6 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -4880,11 +4962,28 @@ Schema source: crates/wyrd-spec/schemas/audit_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -4948,6 +5047,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "ArrowFormat": {
       "description": "Arrow serialization formats accepted by DataCard.",
@@ -5018,7 +5118,7 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -5037,12 +5137,15 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -5067,7 +5170,6 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -5946,11 +6048,28 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -6225,6 +6344,13 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       ],
       "description": "Declared interface family and interface-specific metadata."
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this data card.",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      },
+      "type": "array"
+    },
     "schema": {
       "allOf": [
         {
@@ -6287,6 +6413,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "description": "Wyrd Card kind.",
@@ -6316,7 +6443,7 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -6335,12 +6462,15 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -6365,7 +6495,6 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -6957,11 +7086,28 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -7068,21 +7214,12 @@ Schema source: crates/wyrd-spec/schemas/drift_spec.json
         }
       ],
       "description": "How the measurement enters the monitor."
-    },
-    "subject_ref": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/Ref"
-        }
-      ],
-      "description": "Singular subject of the monitor: the entity drift is observed against. Allowed `subject_ref.kind`: `Model | Agent | Service | Data`."
     }
   },
   "required": [
     "condition",
     "method",
-    "signal",
-    "subject_ref"
+    "signal"
   ],
   "title": "DriftSpec",
   "type": "object"
@@ -7144,6 +7281,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "type": "object"
     },
     "AgentSpec": {
+      "additionalProperties": false,
       "description": "Agent authoring body inside a Wyrd Agent Card envelope.",
       "properties": {
         "prompt": {
@@ -7153,6 +7291,13 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
             }
           ],
           "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
+        },
+        "publishes_to": {
+          "description": "Eval and Drift cards that receive observations from this agent.",
+          "items": {
+            "$ref": "#/definitions/Ref"
+          },
+          "type": "array"
         },
         "run_config": {
           "allOf": [
@@ -8158,7 +8303,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -8177,12 +8322,15 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -8207,7 +8355,6 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -9402,6 +9549,23 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "allOf": [
             {
               "$ref": "#/definitions/AgentSpec"
@@ -9414,7 +9578,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "type": "string"
         }
       ],
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "InlineableRef_for_Prompt": {
       "anyOf": [
@@ -9425,6 +9589,23 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
             }
           ],
           "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
         },
         {
           "allOf": [
@@ -9439,7 +9620,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "type": "string"
         }
       ],
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "JsonPath": {
       "maxLength": 1024,
@@ -12302,11 +12483,28 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "ResponseType": {
       "description": "Expected response shape for a rendered prompt.",
@@ -12500,7 +12698,7 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
       ]
     }
   },
-  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `subject_ref` \u2014 canonical card this rubric judges per doctrine #3 and the `ObservationCriteria.subject_refs` precedent. - `dataset` \u2014 source data, typically a `Data` card with eval scenarios. - `tasks` \u2014 the rubric DAG. - `workflow` \u2014 optional declared workflow shape. - `sampling` \u2014 optional production sampling policy. - `pass_gate` \u2014 optional workflow-level pass criterion. - `context_capture` \u2014 durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
+  "description": "The typed spec body for an `Eval` card.\n\nThis struct does not carry a discriminator; the outer `CardBody` enum carries the envelope-level `kind: Eval` and `spec: { ... }` wire shape.\n\nAuthors declare: - `dataset` \u2014 source data, typically a `Data` card with eval scenarios. - `tasks` \u2014 the rubric DAG. - `workflow` \u2014 optional declared workflow shape. - `sampling` \u2014 optional production sampling policy. - `pass_gate` \u2014 optional workflow-level pass criterion. - `context_capture` \u2014 durable storage policy for `AssertionResult::actual`.\n\nThis struct does not carry envelope identity, tenant partitioning, triggers, or alert dispatch. Alert wiring is deferred until the drift primitives and secret reference model are locked.",
   "properties": {
     "context_capture": {
       "anyOf": [
@@ -12545,17 +12743,6 @@ Schema source: crates/wyrd-spec/schemas/eval_spec.json
         }
       ],
       "description": "Optional sampling policy applied at the record-ingest boundary."
-    },
-    "subject_ref": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/Ref"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Declarative subject \u2014 the card whose runs this rubric judges.\n\nWhen `Some`, registration can derive an `evaluates` relationship. Runtime records may still supply the subject when this is `None`.\n\n**Presence rule (D8).** The struct keeps `Option<CardRef>`, but registry validation at `wyrd apply` rejects an Eval card with `subject_ref = None` whenever the card receives online observations (`run.observe.eval(...)` needs the identity chain). It may be `None` only for pure-offline rubric cards driven entirely by datasets and scenarios. The validator itself ships with the registry surface; this field documents the rule the validator enforces, consistent with the kind-restriction note on `validate()` below."
     },
     "tasks": {
       "additionalProperties": {
@@ -12623,7 +12810,7 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -12642,12 +12829,15 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -12672,7 +12862,6 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -12951,11 +13140,28 @@ Schema source: crates/wyrd-spec/schemas/experiment_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "RunKind": {
       "description": "Execution kind recorded as a Run.",
@@ -13249,7 +13455,7 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -13268,12 +13474,15 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -13298,7 +13507,6 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -13425,11 +13633,28 @@ Schema source: crates/wyrd-spec/schemas/mcp_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -13500,6 +13725,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "description": "Wyrd Card kind.",
@@ -13529,7 +13755,7 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -13548,12 +13774,15 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -13578,7 +13807,6 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -14245,11 +14473,28 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SampleInput": {
       "description": "Sample input description for loader-side rehydration.",
@@ -14574,6 +14819,13 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       ],
       "description": "Framework interface tag and per-interface config metadata."
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this model card.",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      },
+      "type": "array"
+    },
     "sample_input": {
       "anyOf": [
         {
@@ -14622,6 +14874,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "description": "Wyrd Card kind.",
@@ -14651,7 +14904,7 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -14670,12 +14923,15 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -14700,7 +14956,6 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -14709,150 +14964,322 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "description": "Resolved immutable Card UID.",
       "type": "string"
     },
-    "FrameworkAdapterRef": {
-      "description": "Framework adapter reference for loading or invoking artifacts.",
-      "properties": {
-        "config": {
-          "additionalProperties": {
-            "$ref": "#/definitions/NonSecretValue"
-          },
-          "description": "Non-secret adapter configuration.",
-          "type": "object"
-        },
-        "name": {
-          "description": "Adapter name.",
-          "type": "string"
-        },
-        "version": {
-          "description": "Adapter version or version range.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "version"
-      ],
-      "type": "object"
-    },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
+    "HttpAuth": {
+      "description": "Server-side authentication sources for an HTTP action.",
       "oneOf": [
         {
-          "description": "String value.",
+          "additionalProperties": false,
+          "description": "No authentication.",
           "properties": {
-            "type": {
+            "scheme": {
               "enum": [
-                "str"
+                "none"
               ],
-              "type": "string"
-            },
-            "value": {
               "type": "string"
             }
           },
           "required": [
-            "type",
-            "value"
+            "scheme"
           ],
           "type": "object"
         },
         {
-          "description": "Numeric value.",
+          "additionalProperties": false,
+          "description": "Bearer token loaded from an environment variable.",
           "properties": {
-            "type": {
-              "enum": [
-                "number"
-              ],
+            "env": {
+              "description": "Environment variable name.",
               "type": "string"
             },
-            "value": {
-              "format": "double",
-              "type": "number"
+            "scheme": {
+              "enum": [
+                "bearer"
+              ],
+              "type": "string"
             }
           },
           "required": [
-            "type",
-            "value"
+            "env",
+            "scheme"
           ],
           "type": "object"
         },
         {
-          "description": "Boolean value.",
+          "additionalProperties": false,
+          "description": "`user:password` loaded from an environment variable.",
           "properties": {
-            "type": {
-              "enum": [
-                "bool"
-              ],
+            "env": {
+              "description": "Environment variable name.",
               "type": "string"
             },
-            "value": {
-              "type": "boolean"
+            "scheme": {
+              "enum": [
+                "basic"
+              ],
+              "type": "string"
             }
           },
           "required": [
-            "type",
-            "value"
+            "env",
+            "scheme"
           ],
           "type": "object"
         },
         {
-          "description": "List of non-secret values.",
+          "additionalProperties": false,
+          "description": "Custom header value loaded from an environment variable.",
           "properties": {
-            "type": {
-              "enum": [
-                "list"
-              ],
+            "env": {
+              "description": "Environment variable name.",
               "type": "string"
             },
-            "value": {
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "array"
+            "name": {
+              "description": "Header name.",
+              "type": "string"
+            },
+            "scheme": {
+              "enum": [
+                "header"
+              ],
+              "type": "string"
             }
           },
           "required": [
-            "type",
-            "value"
+            "env",
+            "name",
+            "scheme"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "HttpMethod": {
+      "description": "HTTP methods supported by an HTTP Operator action.",
+      "oneOf": [
+        {
+          "description": "GET.",
+          "enum": [
+            "get"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "POST.",
+          "enum": [
+            "post"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "PUT.",
+          "enum": [
+            "put"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "PATCH.",
+          "enum": [
+            "patch"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "DELETE.",
+          "enum": [
+            "delete"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "NotifyChannel": {
+      "description": "Typed notification destinations.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "PagerDuty event payload.",
+          "properties": {
+            "dedup_key": {
+              "description": "Optional de-duplication key.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "enum": [
+                "pager_duty"
+              ],
+              "type": "string"
+            },
+            "severity": {
+              "description": "PagerDuty severity.",
+              "type": "string"
+            },
+            "summary": {
+              "description": "Human-readable event summary.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "severity",
+            "summary"
           ],
           "type": "object"
         },
         {
-          "description": "Object of non-secret values.",
+          "additionalProperties": false,
+          "description": "Slack message payload.",
           "properties": {
-            "type": {
+            "kind": {
               "enum": [
-                "object"
+                "slack"
               ],
               "type": "string"
             },
-            "value": {
+            "text": {
+              "description": "Message text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "OperatorAction": {
+      "description": "The closed set of actions an Operator can perform.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Dispatch a registered Workflow.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "workflow"
+              ],
+              "type": "string"
+            },
+            "workflow_ref": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                }
+              ],
+              "description": "Workflow to dispatch with the trigger context."
+            }
+          },
+          "required": [
+            "kind",
+            "workflow_ref"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Send a typed notification.",
+          "properties": {
+            "channel": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/NotifyChannel"
+                }
+              ],
+              "description": "Notification destination and payload."
+            },
+            "kind": {
+              "enum": [
+                "notify"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "channel",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Perform an HTTP request.",
+          "properties": {
+            "auth": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/HttpAuth"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional server-side authentication binding."
+            },
+            "body": {
+              "description": "Optional structured JSON body."
+            },
+            "expect_status": {
+              "description": "Optional expected response status.",
+              "format": "uint16",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "headers": {
               "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
+                "type": "string"
               },
+              "description": "Optional request headers.",
               "type": "object"
+            },
+            "kind": {
+              "enum": [
+                "http"
+              ],
+              "type": "string"
+            },
+            "method": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/HttpMethod"
+                }
+              ],
+              "description": "HTTP method."
+            },
+            "timeout_seconds": {
+              "description": "Optional request timeout.",
+              "format": "uint32",
+              "minimum": 0.0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "url": {
+              "description": "URL template.",
+              "type": "string"
             }
           },
           "required": [
-            "type",
-            "value"
+            "kind",
+            "method",
+            "url"
           ],
           "type": "object"
         }
       ]
     },
     "OperatorBudget": {
-      "description": "Operator execution budget.",
+      "additionalProperties": false,
+      "description": "Operator execution limits.",
       "properties": {
-        "max_memory_mb": {
-          "description": "Maximum memory in MiB.",
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        },
         "max_tool_calls": {
           "description": "Maximum tool calls allowed during invocation.",
           "format": "uint32",
@@ -14874,24 +15301,6 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       },
       "type": "object"
     },
-    "OperatorInput": {
-      "description": "Operator input declaration.",
-      "properties": {
-        "name": {
-          "description": "Input name.",
-          "type": "string"
-        },
-        "schema_ref": {
-          "description": "Schema reference URI or symbolic schema identifier.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "name",
-        "schema_ref"
-      ],
-      "type": "object"
-    },
     "Ref": {
       "anyOf": [
         {
@@ -14903,11 +15312,28 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
@@ -14918,15 +15344,15 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
       "type": "string"
     }
   },
-  "description": "Server-side, policy-gated Operator declaration.",
+  "description": "A server-owned side-effect template.",
   "properties": {
-    "adapter": {
+    "action": {
       "allOf": [
         {
-          "$ref": "#/definitions/FrameworkAdapterRef"
+          "$ref": "#/definitions/OperatorAction"
         }
       ],
-      "description": "Framework adapter used to execute this Operator."
+      "description": "The single action performed when this operator fires."
     },
     "budget": {
       "anyOf": [
@@ -14937,32 +15363,18 @@ Schema source: crates/wyrd-spec/schemas/operator_spec.json
           "type": "null"
         }
       ],
-      "description": "Optional runtime budget."
+      "description": "Optional execution limits."
     },
-    "inputs": {
-      "description": "Declared runtime inputs.",
-      "items": {
-        "$ref": "#/definitions/OperatorInput"
-      },
-      "type": "array"
-    },
-    "post_invoke": {
-      "description": "Policy Cards evaluated after invocation.",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      },
-      "type": "array"
-    },
-    "pre_invoke": {
-      "description": "Policy Cards evaluated before invocation.",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      },
-      "type": "array"
+    "description": {
+      "description": "Optional human-readable purpose.",
+      "type": [
+        "string",
+        "null"
+      ]
     }
   },
   "required": [
-    "adapter"
+    "action"
   ],
   "title": "OperatorSpec",
   "type": "object"
@@ -19200,6 +19612,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "description": "Wyrd Card kind.",
@@ -19229,7 +19642,7 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -19248,12 +19661,15 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -19278,7 +19694,6 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -19441,11 +19856,28 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "ServiceComponent": {
       "description": "Alias-bound service component.",
@@ -19677,6 +20109,13 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
       "description": "Free-form metadata.",
       "type": "object"
     },
+    "publishes_to": {
+      "description": "Eval and Drift cards that receive observations from this service.",
+      "items": {
+        "$ref": "#/definitions/Ref"
+      },
+      "type": "array"
+    },
     "runtime": {
       "anyOf": [
         {
@@ -19718,6 +20157,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
 ```json
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
   "definitions": {
     "CardKind": {
       "description": "Wyrd Card kind.",
@@ -19747,7 +20187,7 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -19766,12 +20206,15 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -19796,7 +20239,6 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -19804,113 +20246,6 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
     "CardUid": {
       "description": "Resolved immutable Card UID.",
       "type": "string"
-    },
-    "NonSecretValue": {
-      "description": "Non-secret JSON-like configuration value.",
-      "oneOf": [
-        {
-          "description": "String value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "str"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Numeric value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "number"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "format": "double",
-              "type": "number"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Boolean value.",
-          "properties": {
-            "type": {
-              "enum": [
-                "bool"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "type": "boolean"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "List of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "list"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "items": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "array"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Object of non-secret values.",
-          "properties": {
-            "type": {
-              "enum": [
-                "object"
-              ],
-              "type": "string"
-            },
-            "value": {
-              "additionalProperties": {
-                "$ref": "#/definitions/NonSecretValue"
-              },
-              "type": "object"
-            }
-          },
-          "required": [
-            "type",
-            "value"
-          ],
-          "type": "object"
-        }
-      ]
     },
     "Ref": {
       "anyOf": [
@@ -19923,83 +20258,125 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "SpaceName": {
       "description": "Human-visible namespace for Cards and Runs.",
       "type": "string"
     },
+    "TriggerSchedule": {
+      "additionalProperties": false,
+      "description": "Cron schedule for Trigger evaluation.",
+      "properties": {
+        "cron": {
+          "description": "Cron expression.",
+          "type": "string"
+        },
+        "tz": {
+          "description": "Optional IANA timezone; absent means UTC.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "cron"
+      ],
+      "type": "object"
+    },
     "TriggerSource": {
-      "description": "Trigger source declaration.",
+      "description": "Observation source evaluated by a Trigger.",
       "oneOf": [
         {
-          "description": "Drift observation emitted by a Drift Card.",
+          "additionalProperties": false,
+          "description": "Drift observations, optionally limited to one publisher.",
           "properties": {
-            "card": {
+            "drift_ref": {
               "allOf": [
                 {
                   "$ref": "#/definitions/Ref"
                 }
               ],
-              "description": "Source Drift Card reference."
+              "description": "Drift card to evaluate."
             },
             "kind": {
               "enum": [
                 "drift_observation"
               ],
               "type": "string"
+            },
+            "subject_filter": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Optional publisher restriction."
             }
           },
           "required": [
-            "card",
+            "drift_ref",
             "kind"
           ],
           "type": "object"
         },
         {
-          "description": "Evaluation observation emitted by an Eval Card.",
+          "additionalProperties": false,
+          "description": "Eval observations, optionally limited to one publisher.",
           "properties": {
-            "card": {
+            "eval_ref": {
               "allOf": [
                 {
                   "$ref": "#/definitions/Ref"
                 }
               ],
-              "description": "Source Eval Card reference."
+              "description": "Eval card to evaluate."
             },
             "kind": {
               "enum": [
                 "eval_observation"
               ],
               "type": "string"
-            }
-          },
-          "required": [
-            "card",
-            "kind"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "Cron schedule.",
-          "properties": {
-            "cron": {
-              "description": "Cron expression.",
-              "type": "string"
             },
-            "kind": {
-              "enum": [
-                "schedule"
+            "subject_filter": {
+              "anyOf": [
+                {
+                  "$ref": "#/definitions/Ref"
+                },
+                {
+                  "type": "null"
+                }
               ],
-              "type": "string"
+              "description": "Optional publisher restriction."
             }
           },
           "required": [
-            "cron",
+            "eval_ref",
             "kind"
           ],
           "type": "object"
@@ -20011,44 +20388,46 @@ Schema source: crates/wyrd-spec/schemas/trigger_spec.json
       "type": "string"
     }
   },
-  "description": "Declarative trigger that invokes an Operator when its source condition fires.",
+  "description": "Declarative schedule and optional observation source for an Operator.",
   "properties": {
-    "config": {
-      "additionalProperties": {
-        "$ref": "#/definitions/NonSecretValue"
-      },
-      "description": "Non-secret trigger configuration.",
-      "type": "object"
-    },
-    "cooldown_seconds": {
-      "description": "Minimum cooldown between firings, in seconds.",
-      "format": "uint32",
-      "minimum": 0.0,
+    "description": {
+      "description": "Optional human-readable purpose.",
       "type": [
-        "integer",
+        "string",
         "null"
       ]
     },
-    "source": {
-      "allOf": [
-        {
-          "$ref": "#/definitions/TriggerSource"
-        }
-      ],
-      "description": "Trigger source."
-    },
-    "target": {
+    "operator_ref": {
       "allOf": [
         {
           "$ref": "#/definitions/Ref"
         }
       ],
-      "description": "Target Operator Card reference."
+      "description": "Operator fired when the source matches, or on every tick without a source."
+    },
+    "schedule": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/TriggerSchedule"
+        }
+      ],
+      "description": "Required evaluation schedule."
+    },
+    "source": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TriggerSource"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional observation stream to evaluate on each schedule tick."
     }
   },
   "required": [
-    "source",
-    "target"
+    "operator_ref",
+    "schedule"
   ],
   "title": "TriggerSpec",
   "type": "object"
@@ -20109,6 +20488,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "type": "object"
     },
     "AgentSpec": {
+      "additionalProperties": false,
       "description": "Agent authoring body inside a Wyrd Agent Card envelope.",
       "properties": {
         "prompt": {
@@ -20118,6 +20498,13 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             }
           ],
           "description": "Prompt reference preserved on disk and resolved by `skald-agent`."
+        },
+        "publishes_to": {
+          "description": "Eval and Drift cards that receive observations from this agent.",
+          "items": {
+            "$ref": "#/definitions/Ref"
+          },
+          "type": "array"
         },
         "run_config": {
           "allOf": [
@@ -21123,7 +21510,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "type": "string"
     },
     "CardRef": {
-      "description": "Reference to a registered Card by kind, name, version, space, and optional UID.",
+      "description": "Reference to a registered Card by kind, name, version, optional space, and optional UID.",
       "properties": {
         "kind": {
           "allOf": [
@@ -21142,12 +21529,15 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "Referenced Card name."
         },
         "space": {
-          "allOf": [
+          "anyOf": [
             {
               "$ref": "#/definitions/SpaceName"
+            },
+            {
+              "type": "null"
             }
           ],
-          "description": "Space pinning identity together with `name` and `version`."
+          "description": "Space pinning identity together with `name` and `version`.\n\nAuthors may omit it; the loader inherits the enclosing card's resolved metadata space before the reference crosses a wire boundary."
         },
         "uid": {
           "anyOf": [
@@ -21172,7 +21562,6 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
       "required": [
         "kind",
         "name",
-        "space",
         "version"
       ],
       "type": "object"
@@ -21821,6 +22210,23 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "allOf": [
             {
               "$ref": "#/definitions/AgentSpec"
@@ -21833,7 +22239,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "string"
         }
       ],
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "InlineableRef_for_Prompt": {
       "anyOf": [
@@ -21844,6 +22250,23 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
             }
           ],
           "description": "A direct reference to a registered Card."
+        },
+        {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
         },
         {
           "allOf": [
@@ -21858,7 +22281,7 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "type": "string"
         }
       ],
-      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
+      "description": "A reference position that may carry an embedded child spec.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. `Inline` bodies are authored, not synthesized by the loader."
     },
     "NonSecretValue": {
       "description": "Non-secret JSON-like configuration value.",
@@ -24468,11 +24891,28 @@ Schema source: crates/wyrd-spec/schemas/workflow_spec.json
           "description": "A direct reference to a registered Card."
         },
         {
+          "description": "A loader-projected reference to another submission in the same request.",
+          "properties": {
+            "sibling": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/CardRef"
+                }
+              ],
+              "description": "Exact identity of the sibling submission."
+            }
+          },
+          "required": [
+            "sibling"
+          ],
+          "type": "object"
+        },
+        {
           "description": "A local authored path awaiting loader resolution.",
           "type": "string"
         }
       ],
-      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Ref` values before submitting a request; the server rejects unresolved paths at the wire boundary."
+      "description": "A reference position that requires durable identity.\n\nLoaders rewrite `Path` values to `Sibling` values before submitting a request; the server rejects unresolved paths at the wire boundary. Authored `Ref` values remain external references even when they identify a submitted card."
     },
     "ResponseType": {
       "description": "Expected response shape for a rendered prompt.",

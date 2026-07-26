@@ -141,7 +141,7 @@ def test_raw_model_autodetection_for_framework_models(
     assert restored.interface.kind == expected_kind
 
 
-def test_sklearn_artifact_path_modelcard_save_and_load(tmp_path: Path) -> None:
+def test_sklearn_interface_loads_a_local_materialization(tmp_path: Path) -> None:
     source = tmp_path / "source-sklearn"
     ModelCard(
         _sklearn_model(),
@@ -149,16 +149,14 @@ def test_sklearn_artifact_path_modelcard_save_and_load(tmp_path: Path) -> None:
     ).save(source)
 
     card = ModelCard(
-        source / "model.joblib",
+        SklearnInterface(),
         metadata=model_metadata(
             "binary_classification",
-            interface=SklearnInterface(),
         ),
     )
+    card.load(source)
 
-    restored = _round_trip(card, tmp_path / "sklearn-from-path", "Sklearn")
-
-    assert restored.interface.has_model is True
+    assert card.interface.has_model is True
 
 
 def test_xgboost_interface_round_trips(tmp_path: Path) -> None:

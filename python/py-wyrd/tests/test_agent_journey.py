@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-import wyrd
-from wyrd import Agent, FinishReason, Prompt, RunConfig, tool
+from wyrd import Agent, AgentCard, FinishReason, Prompt, PromptReference, RunConfig, tool
 
 
 @tool(name="t", description="echoes text")
@@ -63,6 +61,21 @@ def test_journey_to_card_round_trip(tmp_path: Path) -> None:
     assert loaded_card["kind"] == card["kind"]
     assert loaded_card["metadata"] == card["metadata"]
     assert loaded_card["spec"] == card["spec"]
+
+
+def test_agent_card_json_round_trip() -> None:
+    prompt = PromptReference.inline(Prompt.openai_chat("gpt-4o-mini", messages=["hello"]))
+    card = AgentCard(prompt, space="research", name="planner", version="0.3.0")
+
+    payload = card.model_dump()
+    restored = AgentCard.model_validate_json(card.model_dump_json())
+
+    assert payload["apiVersion"] == "wyrd/v1"
+    assert payload["kind"] == "Agent"
+    assert payload["metadata"]["space"] == "research"
+    assert restored.uid == card.uid
+    assert restored.name == card.name
+    assert restored.prompt is not None
 
 
 def test_journey_delegate_via_agent_delegate_tool() -> None:
@@ -127,9 +140,4 @@ def test_journey_module_paths() -> None:
     assert Agent.__module__ == "wyrd.agent"
     assert type(agent).__module__ == "wyrd.agent"
     assert not hasattr(agent, "_inner")
-    assert not hasattr(wyrd, "AgentCard")
-
-    with pytest.raises(ImportError):
-        from wyrd import AgentCard  # noqa: F401
-
-    assert not hasattr(wyrd, "_wyrd") or "AgentCard" not in dir(getattr(wyrd, "_wyrd", object()))
+    assert AgentCard.__module__ == "wyrd.cards.agent"

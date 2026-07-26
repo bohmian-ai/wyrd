@@ -20,6 +20,64 @@ pub fn read_card_file(path: &Path) -> Result<Card, WyrdError> {
     parse_card_bytes(format, &bytes)
 }
 
+/// Read a local Prompt Card authoring file and fill local-only identity gaps.
+///
+/// This helper is intentionally separate from `read_card_file`: server hydration
+/// and `model_validate_json` require a complete persisted envelope, while local
+/// declarative files may omit API version, space, or UID.
+pub fn read_local_card_file(path: &Path) -> Result<Card, WyrdError> {
+    let format = format_from_path(path)?;
+    let bytes = std::fs::read(path).map_err(|error| loader_io(path, &error))?;
+    let mut value: serde_json::Value = match format {
+        CardLoadFormat::Json => {
+            serde_json::from_slice(&bytes).map_err(|error| WyrdError::Validation {
+                message: "failed to parse prompt card JSON".to_owned(),
+                details: serde_json::json!({ "source": error.to_string() }),
+            })?
+        }
+        CardLoadFormat::Yaml => {
+            serde_yaml::from_slice(&bytes).map_err(|error| WyrdError::Validation {
+                message: "failed to parse prompt card YAML".to_owned(),
+                details: serde_json::json!({ "source": error.to_string() }),
+            })?
+        }
+    };
+    let object = value.as_object_mut().ok_or_else(|| WyrdError::Validation {
+        message: "prompt card authoring file must be an object".to_owned(),
+        details: serde_json::Value::Null,
+    })?;
+    object
+        .entry("apiVersion")
+        .or_insert_with(|| serde_json::json!("wyrd/v1"));
+    object
+        .entry("kind")
+        .or_insert_with(|| serde_json::json!("Prompt"));
+    let metadata = object
+        .entry("metadata")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| WyrdError::Validation {
+            message: "prompt card metadata must be an object".to_owned(),
+            details: serde_json::Value::Null,
+        })?;
+    metadata
+        .entry("space")
+        .or_insert_with(|| serde_json::json!("default"));
+    metadata
+        .entry("name")
+        .or_insert_with(|| serde_json::json!("prompt"));
+    metadata
+        .entry("version")
+        .or_insert_with(|| serde_json::json!("0.1.0"));
+    metadata
+        .entry("uid")
+        .or_insert_with(|| serde_json::json!(wyrd_utils::uuid7()));
+    serde_json::from_value(value).map_err(|error| WyrdError::Validation {
+        message: "failed to parse local prompt card".to_owned(),
+        details: serde_json::json!({ "source": error.to_string() }),
+    })
+}
+
 /// Write a full Prompt Card envelope to a local JSON or YAML file.
 ///
 /// Parent directories are created when needed. The file format is selected from
@@ -166,8 +224,10 @@ mod prompt_io {
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
+  space: test
   name: yaml-prompt
   version: 0.1.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
 spec:
   provider: openai
   model: gpt-4o

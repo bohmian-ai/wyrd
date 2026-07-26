@@ -1,0 +1,42 @@
+[package]
+name = "wyrd-sdk"
+version = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+rust-version = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+description = "Rust-owned Wyrd client SDK projections."
+
+[features]
+default = []
+python = [
+    "dep:pyo3",
+    "wyrd-cards/python",
+    "wyrd-utils/python",
+]
+
+[dependencies]
+base64 = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+secrecy = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+wyrd-loader = { workspace = true }
+wyrd-semver = { workspace = true }
+wyrd-interfaces = { workspace = true }
+wyrd-cards = { workspace = true }
+wyrd-registry = { workspace = true }
+wyrd-runtime = { workspace = true }
+wyrd-spec = { workspace = true }
+wyrd-utils = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+wyrd-semver = { workspace = true }

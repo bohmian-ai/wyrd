@@ -22,7 +22,8 @@ if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/wyrd-spec; then
 fi
 
 if rg -n 'pyo3|pymodule|pyclass|pymethods' crates/shared \
-  --glob '!crates/shared/wyrd-utils/**'; then
+  --glob '!crates/shared/wyrd-utils/**' \
+  --glob '!crates/shared/wyrd-sdk/**'; then
   echo 'PyO3 scope violation detected in Python-free shared crates'
   exit 1
 fi
@@ -78,6 +79,17 @@ fi
 
 if ! rg -q '#\[cfg\(feature = "python"\)\]' crates/shared/wyrd-utils/src/lib.rs; then
   echo 'wyrd-utils Python helpers must remain cfg-gated'
+  exit 1
+fi
+
+if ! rg -q 'python = \[' crates/shared/wyrd-sdk/Cargo.toml || \
+   ! rg -q 'dep:pyo3' crates/shared/wyrd-sdk/Cargo.toml; then
+  echo 'wyrd-sdk must gate PyO3 behind its python feature'
+  exit 1
+fi
+
+if ! rg -q 'pyo3 = \{ workspace = true, optional = true \}' crates/shared/wyrd-sdk/Cargo.toml; then
+  echo 'wyrd-sdk PyO3 dependency must remain optional'
   exit 1
 fi
 

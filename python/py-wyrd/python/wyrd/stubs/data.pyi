@@ -3,7 +3,7 @@
 from collections.abc import Mapping, Sequence
 from typing import Any, overload
 
-from .cards import CardRef
+from .cards import CardRef, DataLoadArgs, JsonValue
 from .error import WyrdError
 from .header import CardRefLike, JsonDict, PathLike, StringMap
 
@@ -513,8 +513,17 @@ class DataCard:
     """Local DataCard holder and spec builder.
 
     A DataCard owns local identity, labels, annotations, schema metadata, and an
-    optional live data interface. `save` and `load` only operate on the local
-    filesystem. Registration belongs to registry/client APIs, not the card.
+    optional live data interface. Registration belongs to registry/client APIs,
+    not the card:
+
+    ```python
+    cards = Cards()
+    card = cards.data.get(space="ml", name="training-data", interface=MyDataInterface)
+    card.load()
+    ```
+
+    `get` validates the server-stored Card envelope. `load` is the separate
+    operation that downloads and hydrates registered data artifacts.
     """
 
     space: str
@@ -636,7 +645,7 @@ class DataCard:
     @overload
     def __init__(
         self,
-        data: Any,
+        data: object,
         space: str | None = ...,
         name: str | None = ...,
         version: str | None = ...,
@@ -648,7 +657,7 @@ class DataCard:
         """Create a DataCard by inferring the interface from runtime data.
 
         Args:
-            data (Any): Runtime object such as a pandas DataFrame, polars
+            data (object): Runtime object such as a pandas DataFrame, polars
                 DataFrame, PyArrow table, NumPy array, Torch tensor, SQL
                 mapping, or supported local path.
             space (str | None): Optional card space. Defaults to `default`.
@@ -670,7 +679,7 @@ class DataCard:
         ...
 
     @property
-    def data(self) -> Any:
+    def data(self) -> object:
         """Return live local data from the held interface.
 
         Raises:
@@ -679,7 +688,7 @@ class DataCard:
         """
         ...
 
-    def save(self, path: PathLike, save_kwargs: dict[str, Any] | None = ...) -> None:
+    def save(self, path: PathLike, save_kwargs: Mapping[str, JsonValue] | None = ...) -> None:
         """Materialize local data artifacts and write `card.json`.
 
         This is a local filesystem operation only. It updates interface
@@ -689,28 +698,48 @@ class DataCard:
         Args:
             path (PathLike): Local directory where Wyrd writes artifact bytes
                 and `card.json`.
-            save_kwargs (dict[str, Any] | None): Optional interface-specific
+            save_kwargs (Mapping[str, JsonValue] | None): Optional
+                interface-specific
                 save options.
         """
         ...
 
-    def load(self, path: PathLike | None = ..., load_kwargs: dict[str, Any] | None = ...) -> None:
-        """Hydrate local data through the held interface.
+    def load(
+        self,
+        path: PathLike | None = ...,
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
+    ) -> None:
+        """Hydrate data through the held interface.
 
-        Pass `path` when loading from a saved local directory. The interface
-        reconstructs its convention path under that directory.
+        Pass `path` to load a saved local directory. Without a path, call this
+        on a card returned by `Cards.data.get`; Wyrd obtains the server artifact
+        inventory, downloads and verifies the artifacts into a temporary
+        directory, and then invokes the interface. `get` does not download
+        data bytes.
 
         Args:
-            path (PathLike | None): Local materialization directory. Pass
-                `None` only when another surface has already provided local
-                data for the interface.
-            load_kwargs (dict[str, Any] | None): Optional interface-specific
-                load options.
+            path (PathLike | None): Optional local materialization directory.
+            load_kwargs (DataLoadArgs | Mapping[str, JsonValue] | None):
+                Optional interface-specific load options.
+
+        Raises:
+            WyrdError: If no path is supplied to a card that was not returned
+                by `Cards.data.get`, the Card has no server UID, artifact
+                download or verification fails, no interface is attached, or
+                interface loading fails.
         """
         ...
 
     def model_dump_json(self) -> str:
         """Return this DataCard envelope as JSON without filesystem IO."""
+        ...
+
+    def model_dump(self) -> JsonDict:
+        """Return this DataCard envelope as a JSON-compatible dictionary."""
+        ...
+
+    def _to_card_envelope_json(self) -> str:
+        """Return the registry adapter's single envelope conversion."""
         ...
 
     def as_card_ref(self) -> CardRef:
@@ -725,15 +754,29 @@ class DataCard:
         ...
 
     @staticmethod
-    def model_validate_json(json_string: str, interface: Any = ...) -> DataCard:
+    def model_validate_json(
+        json_string: str,
+        interface: DataInterface | type[DataInterface] | CardRefLike | None = ...,
+    ) -> DataCard:
         """Build a DataCard from serialized Wyrd card JSON.
+
+        The JSON must contain a complete `Data` Card envelope, including its
+        resolved version. This method rebuilds the holder and its interface;
+        it does not download data artifacts.
 
         Args:
             json_string (str): Serialized DataCard envelope.
-            interface (Any): Optional built-in interface, Python subclass
-                instance, Python subclass type reconstructed through
-                `from_metadata`, or CardRef with kind Artifact to attach after
-                parsing.
+            interface (DataInterface | type[DataInterface] | CardRefLike | None):
+                Optional built-in interface, Python subclass instance, Python
+                subclass type reconstructed through `from_metadata`, or an
+                Artifact CardRef to attach after parsing.
+
+        Returns:
+            A DataCard holder populated from the serialized envelope.
+
+        Raises:
+            WyrdError: If JSON parsing, envelope validation, or custom
+                interface reconstruction fails.
         """
         ...
 

@@ -988,6 +988,20 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A local WyrdState bundle contains metadata without required payloads.
+    #[error("[WYRD_SDK_400_UNHYDRATED_ARTIFACT] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_UNHYDRATED_ARTIFACT",
+        status = 400,
+        title = "Hydrated bundle is missing artifact payloads",
+        remediation = "Run wyrd get without --metadata-only and load the complete bundle."
+    )]
+    SdkUnhydratedArtifact {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The version block is invalid for this operation.
     #[error("[WYRD_REGISTRY_400_INVALID_VERSION_BLOCK] {message}")]
     #[wyrd_error(
@@ -2750,6 +2764,7 @@ impl WyrdError {
             | Self::CfgSchemaMismatch { message, details }
             | Self::CfgNameDefaultRejected { message, details }
             | Self::RegistryInvalidCardSpec { message, details }
+            | Self::SdkUnhydratedArtifact { message, details }
             | Self::RegistryInvalidVersionBlock { message, details }
             | Self::RegistrySpecTooLarge { message, details }
             | Self::RegistryVersionRequired { message, details }

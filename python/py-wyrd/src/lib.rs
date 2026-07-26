@@ -3,10 +3,13 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
+mod cli;
+
 /// Native extension entry point mounted as `wyrd._wyrd`.
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
+    cli::register(m)?;
 
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;
@@ -15,7 +18,13 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     register_submodule(py, "wyrd._wyrd.agent", &agent)?;
 
     wyrd_cards::register(py, m)?;
+    wyrd_sdk::python::register_cards(&m.getattr("cards")?.cast_into()?)?;
     register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
+
+    let runtime = PyModule::new(py, "runtime")?;
+    wyrd_sdk::python::register_runtime(&runtime)?;
+    m.add_submodule(&runtime)?;
+    register_submodule(py, "wyrd._wyrd.runtime", &runtime)?;
 
     wyrd_config::register(py, m)?;
     register_submodule(py, "wyrd._wyrd.config", &m.getattr("config")?.cast_into()?)?;
@@ -33,6 +42,11 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         py,
         "wyrd._wyrd.cards.prompt",
         &m.getattr("cards")?.getattr("prompt")?.cast_into()?,
+    )?;
+    register_submodule(
+        py,
+        "wyrd._wyrd.cards.agent",
+        &m.getattr("cards")?.getattr("agent")?.cast_into()?,
     )?;
 
     let tool = PyModule::new(py, "tool")?;

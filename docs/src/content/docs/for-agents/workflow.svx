@@ -91,8 +91,9 @@ if resp.status_code >= 400:
     # Preserve the full structure; never collapse it into prose.
 ```
 
-Preserve every field (`code`, `type`, `detail`, `remediation`, `context`). There
-is no Python registry client yet — the HTTP envelope is the registration surface.
+Preserve every field (`code`, `type`, `detail`, `remediation`, `context`). This
+page uses HTTP because it is language-agnostic; Python callers can use the
+typed `Cards` client for the same lifecycle.
 
 ## Error codes
 

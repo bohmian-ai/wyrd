@@ -70,27 +70,14 @@ def test_interface_class_passed_to_constructor_raises_model_error() -> None:
     assert "DataCard" not in str(exc.value)
 
 
-@pytest.mark.parametrize(
-    ("filename", "message"),
-    [
-        ("model.safetensors", "explicit TorchInterface"),
-        ("model.ckpt", "explicit LightningInterface"),
-        ("model.joblib", "requires metadata.interface"),
-    ],
-)
-def test_ambiguous_model_artifact_paths_require_explicit_interface(
-    tmp_path,
-    filename: str,
-    message: str,
-) -> None:
-    artifact = tmp_path / filename
+def test_modelcard_rejects_artifact_paths_as_denovo_inputs(tmp_path) -> None:
+    artifact = tmp_path / "model.joblib"
     artifact.write_bytes(b"placeholder")
 
     with pytest.raises(WyrdError) as exc:
         ModelCard(artifact, metadata=model_metadata("regression"))
 
-    assert exc.value.code == "WYRD_MODEL_400_VALIDATION"
-    assert message in str(exc.value)
+    assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
 
 
 def test_unknown_model_artifact_path_does_not_leak_absolute_path(tmp_path) -> None:
@@ -101,7 +88,7 @@ def test_unknown_model_artifact_path_does_not_leak_absolute_path(tmp_path) -> No
         ModelCard(artifact, metadata=model_metadata("regression"))
 
     assert exc.value.code == "WYRD_MODEL_400_UNKNOWN_MODEL_TYPE"
-    assert "private-model.bin" in str(exc.value)
+    assert "pathlib" in str(exc.value)
     assert str(tmp_path) not in str(exc.value)
 
 

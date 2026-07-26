@@ -31,12 +31,11 @@ use {
         JsonlInterface, NumpyInterface, PandasInterface, ParquetInterface, PolarsInterface,
         SqlInterface, TextInterface, TorchInterface,
     },
+    wyrd_interfaces::data::io::save_data,
     wyrd_interfaces::data::io::sql_logic_from_data,
-    wyrd_interfaces::data::io::{load_data, save_data},
     wyrd_interfaces::data::schema::PyDataSchema,
     wyrd_interfaces::data::stats::PyDataStats,
     wyrd_interfaces::error::WyrdPyError,
-    wyrd_spec::envelope::Metadata as EnvelopeMetadata,
     wyrd_spec::metadata::{AnnotationKey, AnnotationValue, LabelKey, LabelValue, MetadataError},
 };
 
@@ -92,8 +91,9 @@ impl Default for DataCardMetadata {
 /// Local Python-facing `DataCard` holder.
 ///
 /// A `DataCard` owns local identity, holder metadata, and an optional live Python
-/// data interface. It can save and load local filesystem materialization, but
-/// it never registers itself and never creates Artifact cards.
+/// data interface. It can save local materialization and load either a supplied
+/// local path or the server-owned artifacts associated with a retrieved Card.
+/// It never registers itself and never creates Artifact cards.
 #[cfg_attr(feature = "python", pyclass(module = "wyrd.data", skip_from_py_object))]
 // justification: pyo3 #[pyclass] generates unsafe impl for internal invariants; the Deserialize path constructs a plain Rust struct and does not exercise the unsafe boundary
 #[allow(clippy::unsafe_derive_deserialize)]
@@ -224,16 +224,6 @@ struct DataCardEnvelopeMetadata<'a> {
 }
 
 #[cfg(feature = "python")]
-#[derive(Deserialize)]
-struct SerializedDataCardEnvelope {
-    #[serde(rename = "apiVersion")]
-    api_version: ApiVersion,
-    kind: CardKind,
-    metadata: EnvelopeMetadata,
-    spec: DataSpec,
-}
-
-#[cfg(feature = "python")]
 #[pymethods]
 impl DataCardMetadata {
     /// Return this metadata as a Python-serializable dict for inspection.
@@ -243,6 +233,97 @@ impl DataCardMetadata {
             &serde_json::to_value(self).map_err(|e| WyrdPyError::Io(e.to_string()))?,
         )
         .map_err(Into::into)
+    }
+}
+
+#[cfg(feature = "python")]
+impl DataCard {
+    /// Build a native holder from a server-returned Data Card envelope.
+    ///
+    /// This path consumes the native envelope directly and does not re-enter
+    /// the Python package or deserialize through a Python model class.
+    pub fn from_card(card: wyrd_spec::envelope::Card) -> Result<Self, WyrdError> {
+        if card.api_version.as_str() != ApiVersion::V1 || card.kind != CardKind::Data {
+            return Err(WyrdError::DataValidation {
+                message: "DataCard envelope must use apiVersion wyrd/v1 and kind Data".to_owned(),
+                details: serde_json::Value::Null,
+            });
+        }
+        let metadata = card.metadata;
+        let Spec::Data(spec) = card.spec else {
+            return Err(WyrdError::DataValidation {
+                message: "DataCard envelope spec must be a Data spec".to_owned(),
+                details: serde_json::Value::Null,
+            });
+        };
+        spec.validate()?;
+        let version = metadata
+            .resolved_pin()
+            .map(ToString::to_string)
+            .ok_or_else(|| WyrdError::DataValidation {
+                message: "DataCard envelope missing resolved version pin".to_owned(),
+                details: serde_json::Value::Null,
+            })?;
+        let card_refs = spec
+            .card_refs
+            .into_iter()
+            .map(|reference| match reference {
+                Ref::Ref(card_ref) => Ok(card_ref),
+                Ref::Sibling { sibling } => Ok(sibling),
+                Ref::Path(path) => Err(WyrdError::DataValidation {
+                    message: format!(
+                        "DataCard contains unresolved card reference path: {}",
+                        path.display()
+                    ),
+                    details: serde_json::Value::Null,
+                }),
+            })
+            .collect::<Result<Vec<_>, WyrdError>>()?;
+        let space = metadata
+            .space
+            .as_ref()
+            .ok_or_else(|| WyrdError::DataValidation {
+                message: "DataCard envelope missing space in metadata".to_owned(),
+                details: serde_json::Value::Null,
+            })?;
+        let uid = metadata
+            .uid
+            .as_ref()
+            .ok_or_else(|| WyrdError::DataValidation {
+                message: "DataCard envelope missing uid in metadata".to_owned(),
+                details: serde_json::Value::Null,
+            })?;
+        Ok(Self {
+            space: space.to_string(),
+            name: metadata.name.to_string(),
+            version,
+            uid: uid.to_string(),
+            labels: metadata.labels,
+            annotations: metadata.annotations,
+            metadata: DataCardMetadata {
+                interface: spec.interface,
+                schema: spec.schema,
+                card_refs,
+                splits: spec.splits,
+                target_columns: spec.target_columns,
+                sql: spec.sql,
+                stats: spec.stats,
+            },
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+            is_card: true,
+            #[cfg(feature = "python")]
+            interface: None,
+        })
+    }
+
+    /// Hydrate the holder's built-in or caller-supplied Python interface.
+    #[cfg(feature = "python")]
+    pub fn hydrate_interface(
+        &mut self,
+        py: Python<'_>,
+        interface: Option<&Bound<'_, PyAny>>,
+    ) -> CardPyResult<()> {
+        self.attach_data(py, interface)
     }
 }
 
@@ -521,14 +602,28 @@ impl DataCard {
         self.write_card_json(&path)
     }
 
-    /// Load local data artifacts through the held interface.
+    /// Load data artifacts through the held interface.
     ///
-    /// The interface reconstructs its convention path from `path`; Wyrd does
-    /// not persist a local path in the card JSON.
+    /// Pass `path` to load an existing local materialization. Without a path,
+    /// call this on a `DataCard` returned by `Cards.data.get`; Wyrd uses the
+    /// configured Wyrd client to obtain the server's artifact inventory,
+    /// downloads and verifies the artifacts into an operation-local temporary
+    /// directory, and then invokes the interface.
+    ///
+    /// `get` itself only retrieves and validates the serialized Card envelope.
+    /// This method is the explicit boundary where data bytes enter memory.
+    /// The temporary directory remains alive until the interface load returns.
+    ///
+    /// # Arguments
+    /// * `path` - Optional local materialization directory. Omit it for a
+    ///   server-backed Card returned by `Cards.data.get`.
+    /// * `load_kwargs` - Optional `DataLoadArgs` or JSON-compatible mapping
+    ///   forwarded to the data interface.
     ///
     /// # Errors
-    /// Returns a Wyrd error when no interface is attached or interface load
-    /// fails.
+    /// Returns a Wyrd error when the configured client is unavailable, the
+    /// Card has no server UID, artifact download or verification fails, no
+    /// interface is attached, or interface load fails.
     #[wyrd_test_contract_macros::critical("python:DataCard.load")]
     #[pyo3(signature = (path=None, load_kwargs=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
@@ -537,12 +632,39 @@ impl DataCard {
         &mut self,
         py: Python<'_>,
         path: Option<PathBuf>,
-        load_kwargs: Option<&Bound<'_, PyDict>>,
+        load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
+        let load_kwargs = normalize_load_kwargs(load_kwargs)?;
+        let temporary_directory = if path.is_none() {
+            let uid = self.as_card_ref()?.uid.ok_or_else(|| {
+                WyrdPyError::validation("DataCard.load requires a server-assigned Card UID")
+            })?;
+            let cards = wyrd_registry::Cards::new(None, None).map_err(WyrdPyError::from)?;
+            let temporary = tempfile::Builder::new()
+                .prefix("wyrd-data-")
+                .tempdir()
+                .map_err(|error| WyrdPyError::Io(error.to_string()))?;
+            let destination = temporary.path().to_path_buf();
+            py.detach(move || {
+                wyrd_runtime::runtime().block_on(cards.download_artifacts_to(&uid, &destination))
+            })
+            .map_err(WyrdPyError::from)?;
+            Some(temporary)
+        } else {
+            None
+        };
+        let path = path.or_else(|| {
+            temporary_directory
+                .as_ref()
+                .map(|directory| directory.path().to_path_buf())
+        });
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::validation("DataCard interface is required for local load")
         })?;
-        load_data(interface.bind(py), path, load_kwargs)
+        interface
+            .bind(py)
+            .call_method1("load", (path, load_kwargs.as_ref()))?;
+        Ok(())
     }
 
     /// Return this `DataCard` as a JSON string.
@@ -552,6 +674,19 @@ impl DataCard {
     #[wyrd_test_contract_macros::critical("python:DataCard.model_dump_json")]
     #[pyo3(name = "model_dump_json")]
     pub fn model_dump_json_py(&self) -> CardPyResult<String> {
+        self.model_dump_json()
+    }
+
+    /// Return this `DataCard` as a Python dictionary.
+    pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        let value = serde_json::to_value(self.to_card_envelope())?;
+        wyrd_utils::py::json_to_pyobject(py, &value).map_err(Into::into)
+    }
+
+    /// Return the single card-envelope JSON conversion used by registry
+    /// adapters.
+    #[pyo3(name = "_to_card_envelope_json")]
+    pub fn to_card_envelope_json_py(&self) -> CardPyResult<String> {
         self.model_dump_json()
     }
 
@@ -569,8 +704,9 @@ impl DataCard {
     /// also accepted for lower-level tests and internal callers.
     ///
     /// # Errors
-    /// Returns a Wyrd error when JSON parsing fails or the serialized custom
-    /// interface cannot be rebuilt without an explicit Python object.
+    /// Returns a Wyrd error when JSON parsing or Card validation fails, or the
+    /// serialized custom interface cannot be rebuilt without an explicit
+    /// Python interface object.
     #[wyrd_test_contract_macros::critical("python:DataCard.model_validate_json")]
     #[staticmethod]
     #[pyo3(name = "model_validate_json", signature = (json_string, interface=None))]
@@ -579,8 +715,8 @@ impl DataCard {
         json_string: &str,
         interface: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<Self> {
-        let mut card = Self::from_card_json(json_string)?;
-        card.attach_data(py, interface)?;
+        let mut card = Self::from_card(serde_json::from_str(json_string)?)?;
+        card.hydrate_interface(py, interface)?;
         Ok(card)
     }
 
@@ -600,34 +736,6 @@ impl DataCard {
 
 #[cfg(feature = "python")]
 impl DataCard {
-    /// Convert this local holder into the Rust card spec body.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when interface conversion or `DataSpec` validation
-    /// fails.
-    pub fn to_rust_card_body(&self, py: Python<'_>) -> CardPyResult<Spec> {
-        Ok(Spec::Data(self.to_data_spec(py)?))
-    }
-
-    /// Convert this local holder into a pure Rust `DataSpec`.
-    ///
-    /// # Errors
-    /// Returns a Wyrd error when interface conversion or `DataSpec` validation
-    /// fails.
-    pub fn to_data_spec(&self, py: Python<'_>) -> CardPyResult<DataSpec> {
-        let interface = self
-            .interface
-            .as_ref()
-            .map(|interface| {
-                let handle = DataInterfaceHandle::from_interface(interface.bind(py))?;
-                handle.to_spec_interface(py)
-            })
-            .transpose()?
-            .unwrap_or_else(|| self.metadata.interface.clone());
-
-        Ok(data_spec_from_metadata(&self.metadata, interface))
-    }
-
     fn attach_data(&mut self, py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> CardPyResult<()> {
         if let Some(data) = data {
             let (interface, card_ref) =
@@ -646,68 +754,6 @@ impl DataCard {
 
         self.interface = Some(interface_from_spec(py, &self.metadata.interface)?);
         Ok(())
-    }
-
-    fn from_card_json(json_string: &str) -> CardPyResult<Self> {
-        if let Ok(envelope) = serde_json::from_str::<SerializedDataCardEnvelope>(json_string) {
-            if envelope.api_version.as_str() != ApiVersion::V1 || envelope.kind != CardKind::Data {
-                return Err(WyrdPyError::validation(
-                    "DataCard JSON must use apiVersion wyrd/v1 and kind Data",
-                ));
-            }
-            envelope.spec.validate()?;
-            return Ok(Self {
-                space: envelope
-                    .metadata
-                    .space
-                    .as_ref()
-                    .map_or_else(|| "default".to_string(), ToString::to_string),
-                name: envelope.metadata.name.to_string(),
-                version: envelope
-                    .metadata
-                    .resolved_pin()
-                    .map(ToString::to_string)
-                    .ok_or_else(|| {
-                        WyrdPyError::validation("DataCard envelope missing resolved version pin")
-                    })?,
-                uid: envelope
-                    .metadata
-                    .uid
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                labels: envelope.metadata.labels,
-                annotations: envelope.metadata.annotations,
-                metadata: DataCardMetadata {
-                    interface: envelope.spec.interface,
-                    schema: envelope.spec.schema,
-                    card_refs: envelope
-                        .spec
-                        .card_refs
-                        .into_iter()
-                        .map(|reference| match reference {
-                            Ref::Ref(card_ref) => Ok(card_ref),
-                            Ref::Sibling { sibling } => Ok(sibling),
-                            Ref::Path(path) => Err(WyrdPyError::validation(format!(
-                                "DataCard contains unresolved card reference path: {}",
-                                path.display()
-                            ))),
-                        })
-                        .collect::<CardPyResult<Vec<_>>>()?,
-                    splits: envelope.spec.splits,
-                    target_columns: envelope.spec.target_columns,
-                    sql: envelope.spec.sql,
-                    stats: envelope.spec.stats,
-                },
-                created_at: utc_now(),
-                is_card: true,
-                interface: None,
-            });
-        }
-
-        Err(WyrdPyError::validation(
-            "DataCard JSON must use the Wyrd envelope: apiVersion wyrd/v1, kind Data, metadata, spec",
-        ))
     }
 }
 
@@ -899,6 +945,22 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
 fn write_card_json_file(card: &DataCard, path: &std::path::Path) -> CardPyResult<()> {
     wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope())
         .map_err(|error| WyrdPyError::Io(error.to_string()))
+}
+
+#[cfg(feature = "python")]
+fn normalize_load_kwargs<'py>(
+    value: Option<&Bound<'py, PyAny>>,
+) -> CardPyResult<Option<Bound<'py, PyDict>>> {
+    value
+        .map(|value| {
+            if value.is_instance_of::<PyDict>() {
+                Ok(value.cast::<PyDict>()?.clone())
+            } else {
+                let converted = value.call_method0("to_dict")?;
+                Ok(converted.cast::<PyDict>()?.clone())
+            }
+        })
+        .transpose()
 }
 
 fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInterface) -> DataSpec {

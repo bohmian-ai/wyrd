@@ -9,7 +9,16 @@ authors = { workspace = true }
 
 [features]
 default = []
-python = ["dep:pyo3", "chrono/clock", "wyrd-interfaces/python", "wyrd-utils/python", "skald-prompt/python"]
+python = [
+    "dep:pyo3",
+    "dep:wyrd-registry",
+    "dep:wyrd-runtime",
+    "dep:tempfile",
+    "chrono/clock",
+    "wyrd-interfaces/python",
+    "wyrd-utils/python",
+    "skald-prompt/python",
+]
 
 [dependencies]
 skald-spec = { workspace = true }
@@ -18,12 +27,16 @@ wyrd-spec = { workspace = true }
 wyrd-config = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-interfaces = { workspace = true }
+wyrd-registry = { workspace = true, optional = true }
+wyrd-runtime = { workspace = true, optional = true }
 wyrd-utils = { workspace = true }
 wyrd-test-contract-macros = { workspace = true }
 serde = { workspace = true }
+serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

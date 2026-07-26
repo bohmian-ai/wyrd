@@ -189,8 +189,10 @@ def test_yaml_prompt_card_load_with_model_settings(tmp_path) -> None:
 apiVersion: wyrd/v1
 kind: Prompt
 metadata:
+  space: default
   name: yaml-prompt
   version: 0.1.0
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
 spec:
   provider: openai
   model: gpt-4o

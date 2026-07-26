@@ -11,12 +11,13 @@ order: 10
 Author a card in Python and write it to disk. Each card class owns its local
 `save`/`load`; the card envelope on disk is what you register.
 
-<Aside title="Registration is the HTTP API today" data-variant="not">
+<Aside title="Registration uses Cards" data-variant="wyrd">
 
-The Python package authors and saves cards locally. It does not ship a registry
-client yet — registration is the HTTP route `POST /api/v1/cards` (see
-[For agents](/for-agents/) for the stable paths). These recipes cover the shipped
-authoring surface; each notes where the server step picks up.
+The Python package exposes a tenant-scoped `Cards` client. Use
+`cards.data.register`, `cards.model.register`, or `cards.prompt.register` for
+Python-authored holders. Use the matching `get` method to retrieve the
+server-persisted envelope; call `DataCard.load` or `ModelCard.load` when you
+also need the registered artifacts.
 
 </Aside>
 

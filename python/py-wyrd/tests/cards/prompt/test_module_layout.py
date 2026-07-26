@@ -1,8 +1,6 @@
-import importlib
-
-import pytest
 import wyrd
 import wyrd.prompt
+import wyrd.runtime
 
 
 def test_wyrd_prompt_exposes_prompt_and_promptcard() -> None:
@@ -10,9 +8,8 @@ def test_wyrd_prompt_exposes_prompt_and_promptcard() -> None:
     assert wyrd.prompt.PromptCard is wyrd.PromptCard
 
 
-def test_importing_wyrd_runtime_fails() -> None:
-    with pytest.raises(ModuleNotFoundError):
-        importlib.import_module("wyrd" + ".runtime")
+def test_wyrd_runtime_exposes_local_state() -> None:
+    assert wyrd.runtime.WyrdState is wyrd.WyrdState
 
 
 def test_top_level_runtime_task_and_embedder_are_absent() -> None:

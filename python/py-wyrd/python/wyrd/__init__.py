@@ -1,6 +1,8 @@
 """Public Python package for Wyrd."""
 
-from . import cards, config, data, model, prompt
+from typing import Protocol
+
+from . import cards, config, data, model, prompt, runtime
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
@@ -19,7 +21,8 @@ from .agent import (
     local_registry,
     tool,
 )
-from .cards import CardKind, CardRef
+from .cards import AgentCard, CardKind, CardRef, Cards, RegistrationReceipt
+from .cli import run_wyrd_cli
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -39,16 +42,36 @@ from .prompt import (
     ProviderResponse,
     ResponseFormat,
 )
+from .runtime import StateCard, WyrdState
+
+
+class Card(Protocol):
+    """Shared authoring capability implemented by native Card holders."""
+
+    space: str
+    name: str
+    version: str
+    uid: str
+
+    def _to_card_envelope_json(self) -> str:
+        """Return the holder's single Wyrd envelope conversion."""
+        ...
+
+
+cards.Card = Card
 
 _init()
 
 __all__ = [
     "Agent",
+    "AgentCard",
     "AgentError",
     "AgentRun",
     "AnthropicSettings",
+    "Card",
     "CardKind",
     "CardRef",
+    "Cards",
     "DataCard",
     "FinishReason",
     "GeminiSettings",
@@ -67,6 +90,7 @@ __all__ = [
     "ProviderRequest",
     "ProviderResponse",
     "ResponseFormat",
+    "RegistrationReceipt",
     "Role",
     "RunConfig",
     "SampleInput",
@@ -81,12 +105,16 @@ __all__ = [
     "Workflow",
     "WorkflowRun",
     "WyrdError",
+    "WyrdState",
+    "StateCard",
     "cards",
     "config",
     "data",
     "local_registry",
     "model",
     "prompt",
+    "runtime",
+    "run_wyrd_cli",
     "tool",
     "WyrdConfig",
 ]

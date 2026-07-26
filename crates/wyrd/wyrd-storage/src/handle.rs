@@ -5,7 +5,7 @@ use crate::settings::{BackendConfig, StorageSettings};
 use crate::signer::BackendSigner;
 use crate::tenant_path::ValidatedPath;
 use opendal::{EntryMode, ErrorKind, Operator};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use wyrd_spec::storage::StorageBackendKind;
 
@@ -40,6 +40,7 @@ pub struct StorageHandle {
     default_part_size_bytes: u64,
     multipart_threshold_bytes: u64,
     public_base_url: Option<String>,
+    public_base_url_override: Arc<OnceLock<String>>,
 }
 
 impl std::fmt::Debug for StorageHandle {
@@ -96,6 +97,7 @@ impl StorageHandle {
             default_part_size_bytes: crate::settings::DEFAULT_PART_SIZE_BYTES,
             multipart_threshold_bytes: crate::plan::MULTIPART_THRESHOLD_BYTES,
             public_base_url: None,
+            public_base_url_override: Arc::new(OnceLock::new()),
         }
     }
 
@@ -173,6 +175,7 @@ impl StorageHandle {
             default_part_size_bytes: settings.part_size_bytes,
             multipart_threshold_bytes: settings.multipart_threshold_bytes,
             public_base_url: settings.public_base_url,
+            public_base_url_override: Arc::new(OnceLock::new()),
         }))
     }
 
@@ -227,7 +230,20 @@ impl StorageHandle {
     /// Public base URL configured for local-mode routes.
     #[must_use]
     pub fn public_base_url(&self) -> Option<&str> {
-        self.public_base_url.as_deref()
+        self.public_base_url_override
+            .get()
+            .map(String::as_str)
+            .or(self.public_base_url.as_deref())
+    }
+
+    /// Override the public base URL once the embedding server has bound its
+    /// concrete listener address.
+    ///
+    /// This is used by bound test servers whose ephemeral port is not known
+    /// when the storage handle is first assembled. Production callers should
+    /// configure `public_base_url` in [`StorageSettings`].
+    pub fn set_public_base_url(&self, base_url: String) {
+        let _ = self.public_base_url_override.set(base_url);
     }
 
     /// Probe the storage backend for liveness.

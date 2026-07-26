@@ -64,6 +64,7 @@ metadata:
   space: prod
   name: churn-model
   version: "1.0.0"
+  uid: 01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00
 spec:
   interface:
     kind: Sklearn

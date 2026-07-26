@@ -2,6 +2,8 @@
 
 #![deny(missing_docs)]
 
+/// AgentCard implementation module.
+pub mod agent;
 /// Compatibility re-exports for card holder types.
 pub mod card;
 /// Python-boundary card reference types: CardRef and CardKind.
@@ -21,12 +23,17 @@ use {pyo3::prelude::*, pyo3::types::PyModule};
 #[cfg(feature = "python")]
 pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     let cards = PyModule::new(py, "cards")?;
+    let agent = PyModule::new(py, "agent")?;
     let data = PyModule::new(py, "data")?;
     let model = PyModule::new(py, "model")?;
     let prompt = PyModule::new(py, "prompt")?;
 
     cards.add_class::<card_ref::CardRefPy>()?;
     cards.add_class::<card_ref::Kind>()?;
+
+    wyrd_interfaces::error::register_exceptions(&agent)?;
+    agent.add_class::<agent::AgentCard>()?;
+    cards.add_class::<agent::AgentCard>()?;
 
     wyrd_interfaces::error::register_exceptions(&data)?;
     wyrd_interfaces::data::register(&data)?;
@@ -47,11 +54,13 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     cards.add_submodule(&data)?;
     cards.add_submodule(&model)?;
     cards.add_submodule(&prompt)?;
+    cards.add_submodule(&agent)?;
     parent.add_submodule(&cards)?;
     register_submodule(py, "wyrd.cards", &cards)?;
     register_submodule(py, "wyrd.cards.data", &data)?;
     register_submodule(py, "wyrd.cards.model", &model)?;
     register_submodule(py, "wyrd.cards.prompt", &prompt)?;
+    register_submodule(py, "wyrd.cards.agent", &agent)?;
     Ok(())
 }
 

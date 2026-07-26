@@ -1,7 +1,7 @@
 # AUTO-GENERATED STUB FILE. DO NOT EDIT.
 # pylint: disable=redefined-builtin, invalid-name, dangerous-default-value
 #### begin imports ####
-from . import cards, config, data, model, prompt
+from . import cards, config, data, model, prompt, runtime
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError
 from .agent import (
     Agent,
@@ -20,7 +20,8 @@ from .agent import (
     local_registry,
     tool,
 )
-from .cards import CardKind, CardRef
+from .cards import AgentCard, Card, CardKind, CardRef, Cards, RegistrationReceipt
+from .cli import run_wyrd_cli
 from .config import WyrdConfig
 from .data import DataCard, Split
 from .model import ModelCard, ModelSignature, SampleInput
@@ -40,16 +41,20 @@ from .prompt import (
     ProviderResponse,
     ResponseFormat,
 )
+from .runtime import StateCard, WyrdState
 
 #### end of imports ####
 
 __all__ = [
     "Agent",
+    "AgentCard",
     "AgentError",
     "AgentRun",
     "AnthropicSettings",
+    "Card",
     "CardKind",
     "CardRef",
+    "Cards",
     "DataCard",
     "FinishReason",
     "GeminiSettings",
@@ -68,6 +73,7 @@ __all__ = [
     "ProviderRequest",
     "ProviderResponse",
     "ResponseFormat",
+    "RegistrationReceipt",
     "Role",
     "RunConfig",
     "SampleInput",
@@ -82,12 +88,16 @@ __all__ = [
     "Workflow",
     "WorkflowRun",
     "WyrdError",
+    "WyrdState",
+    "StateCard",
     "cards",
     "config",
     "data",
     "local_registry",
     "model",
     "prompt",
+    "runtime",
+    "run_wyrd_cli",
     "tool",
     "WyrdConfig",
 ]

@@ -10,7 +10,7 @@ order: 12
 
 Describe a model artifact, its interface, and the context needed to use it safely.
 
-<CardSummary kind={"model"} title={"Model"} purpose={"Describe a model artifact, its interface, and the context needed to use it safely."} required={["interface", "signature", "task_type"]} optionalCount={2} />
+<CardSummary kind={"model"} title={"Model"} purpose={"Describe a model artifact, its interface, and the context needed to use it safely."} required={["interface", "signature", "task_type"]} optionalCount={3} />
 
 This page is generated from the checked-in JSON Schema. Edit the Rust spec, run the schema generator, then run `mise run docs:generate` to refresh this page.
 
@@ -24,6 +24,7 @@ This page is generated from the checked-in JSON Schema. Edit the Rust spec, run 
 | --- | --- | --- |
 | `card_refs` | `array` | no |
 | `interface` | `object` | yes |
+| `publishes_to` | `array` | no |
 | `sample_input` | `object` | no |
 | `signature` | `object` | yes |
 | `task_type` | `object` | yes |

@@ -13,6 +13,13 @@ The repository OpenAPI document is `openapi.yaml`. Its current title is `Wyrd AP
 ## Routes
 
 - `/v1/cards`
+- `/v1/cards/by-ref`
+- `/v1/cards/by-uid/{kind}/{card_uid}`
+- `/v1/cards/download/init`
+- `/v1/cards/{card_uid}/artifacts`
+- `/v1/cards/{card_uid}/complete`
+- `/v1/cards/{kind}/{space}/{name}/latest`
+- `/v1/cards/{kind}/{space}/{name}/versions`
 
 ## Refresh
 

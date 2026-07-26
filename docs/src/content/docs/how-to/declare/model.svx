@@ -50,19 +50,26 @@ defaults to `default`.
 artifact under `path`. `save` requires a live model — an interface with no model
 attached raises `WYRD_MODEL_400_VALIDATION`.
 
-## Register
+## Register and load
 
-The saved `card.json` is the envelope you register over HTTP:
+`Cards.model.register` saves the card through its interface, uploads the envelope
+and model artifacts, and updates the caller-owned card with its server identity:
 
-```bash
-curl -X POST "$WYRD_SERVER_URL/api/v1/cards" \
-  -H "Authorization: Bearer $WYRD_ACCESS_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data @churn-model/card.json
+```python
+from wyrd import Cards
+
+cards = Cards()
+receipt = cards.model.register(card)
+
+# `get` retrieves the persisted envelope. `load` downloads the registered model.
+loaded = cards.model.get(uid=receipt.root.uid)
+loaded.load()
 ```
 
-There is no Python registry client yet. See [Declare a Data card](/how-to/declare/data/)
-for the request shape and idempotency rules.
+Pass `ModelSaveArgs(...)` as `save_args` when the model interface needs
+framework-specific save options. Pass a custom `ModelInterface` to `get` when
+the serialized card uses one and Wyrd cannot rebuild it from built-in metadata.
+The `Cards` client uses the configured Wyrd server and credentials.
 
 ## Notes
 

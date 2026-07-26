@@ -11,7 +11,7 @@
 
 mod pg_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use arrow::array::{Int64Array, StringArray};
@@ -20,6 +20,7 @@ mod pg_tests {
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use async_trait::async_trait;
     use secrecy::ExposeSecret;
+    use tokio::sync::Notify;
     use vala_bifrost::catalog::CreateTableRequest;
     use vala_bifrost::catalog::namespaces::BifrostNamespace;
     use vala_bifrost::types::TableScope;
@@ -78,10 +79,45 @@ mod pg_tests {
         }
     }
 
+    #[derive(Default)]
+    struct ReleasingSink {
+        started: AtomicBool,
+        released: AtomicBool,
+        sent_rows: AtomicUsize,
+        wake: Notify,
+    }
+
+    #[async_trait]
+    impl BatchSink for ReleasingSink {
+        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
+            self.started.store(true, Ordering::SeqCst);
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    let rows = usize::try_from(batch.rows).unwrap_or(usize::MAX);
+                    self.sent_rows.fetch_add(rows, Ordering::SeqCst);
+                    return Ok(batch.rows);
+                }
+                let notified = self.wake.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    continue;
+                }
+                notified.await;
+            }
+        }
+    }
+
     fn wait_until_started(sink: &StallSink) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !sink.started.load(Ordering::SeqCst) {
             assert!(Instant::now() < deadline, "stall sink never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_until_sent(sink: &ReleasingSink, rows: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sink.sent_rows.load(Ordering::SeqCst) < rows {
+            assert!(Instant::now() < deadline, "released sink did not drain");
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -338,6 +374,75 @@ mod pg_tests {
             "observe path: drops counted on saturation"
         );
 
+        srv.shutdown().await.expect("server shutdown");
+    }
+
+    #[tokio::test]
+    async fn downstream_stall_remains_bounded_and_recovers_after_drain() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let scope = ClientScope::from_config(&client_config(&srv)).expect("scope");
+        let sink = Arc::new(ReleasingSink::default());
+        let bifrost = Bifrost::new(scope, sink.clone(), saturating_config());
+        let schema = schema();
+        let target = card();
+
+        bifrost
+            .insert(
+                SinkKind::Record,
+                "test.downstream_stall",
+                &schema,
+                row(0),
+                target.clone(),
+                None,
+            )
+            .expect("first accepted");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sink.started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "releasing sink never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let mut accepted = 1_usize;
+        let mut rejected = 0_usize;
+        for i in 1..=100 {
+            match bifrost.insert(
+                SinkKind::Record,
+                "test.downstream_stall",
+                &schema,
+                row(i),
+                target.clone(),
+                None,
+            ) {
+                Ok(()) => accepted += 1,
+                Err(WyrdQueueError::QueueFull) => rejected += 1,
+                Err(error) => panic!("unexpected queue error: {error}"),
+            }
+        }
+        assert!(
+            rejected > 0,
+            "downstream stall must produce bounded rejection"
+        );
+
+        sink.released.store(true, Ordering::SeqCst);
+        sink.wake.notify_waiters();
+        wait_until_sent(&sink, accepted);
+
+        bifrost
+            .insert(
+                SinkKind::Record,
+                "test.downstream_stall",
+                &schema,
+                row(101),
+                target,
+                None,
+            )
+            .expect("post-drain write accepted");
+        wait_until_sent(&sink, accepted + 1);
+        assert_eq!(sink.sent_rows.load(Ordering::SeqCst), accepted + 1);
+
+        drop(bifrost);
         srv.shutdown().await.expect("server shutdown");
     }
 }

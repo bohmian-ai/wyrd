@@ -18,12 +18,11 @@ use tokio::sync::{Notify, Semaphore, mpsc, oneshot};
 use crate::catalog::TenantTableBinding;
 use crate::contracts::{IngressPayload, ScribeError};
 use crate::schema::fingerprint::SchemaFingerprint;
-use crate::scribe::memory::{BifrostMemoryGovernor, MemoryLedger};
+use crate::scribe::memory::BifrostMemoryGovernor;
 use crate::scribe::memtable::FrozenMemtable;
-use crate::scribe::memtable::Memtable;
 use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
 use crate::scribe::preprocess::{AdmittedAppend, PreparedAppend, prepare_append};
-use crate::scribe::replay::{ReplayChunk, ReplayedSealKey};
+use crate::scribe::replay::ReplayedSealKey;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{
@@ -308,8 +307,14 @@ fn decode(
         .first()
         .map(RecordBatch::schema)
         .ok_or(ScribeError::InvalidFrame)?;
-    let rows =
-        arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?;
+    let rows = if batches.len() == 1 {
+        batches
+            .into_iter()
+            .next()
+            .ok_or(ScribeError::InvalidFrame)?
+    } else {
+        arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
+    };
     for field in rows.schema().fields() {
         let reserved = match field.name().as_str() {
             CARD_UID | PRINCIPAL_ID | "run_id" | DATA_TENANT_ID | WYRD_BATCH_ID
@@ -548,8 +553,6 @@ pub(crate) enum ScribePersistenceCpuOp {
         tenant: wyrd_spec::ids::DataTenantId,
     },
     RestoreReplay {
-        memtable: Arc<Memtable>,
-        memory_ledger: MemoryLedger,
         replayed: Box<ReplayedSealKey>,
     },
 }
@@ -684,18 +687,8 @@ impl ScribePersistenceCpuPool {
                     tenant,
                 } => encode_batch(&frozen, &binding, tenant)
                     .map(ScribePersistenceCpuResult::ParquetEncoded),
-                ScribePersistenceCpuOp::RestoreReplay {
-                    memtable,
-                    memory_ledger,
-                    replayed,
-                } => {
-                    let frozen = memtable.restore_replayed(&replayed)?;
-                    let arrow_bytes = frozen.arrow_bytes;
-                    memory_ledger
-                        .reserve_immutable(arrow_bytes)
-                        .inspect_err(|_error| {
-                            let _ = memtable.discard_pending_generation(frozen.seal_id);
-                        })?;
+                ScribePersistenceCpuOp::RestoreReplay { replayed } => {
+                    let frozen = crate::scribe::memtable::Memtable::decode_replayed(&replayed)?;
                     Ok(ScribePersistenceCpuResult::ReplayRestored(Box::new(frozen)))
                 }
             }));
@@ -783,7 +776,7 @@ pub(crate) enum ScribeWalIoOp {
     },
     ReplayDirectoryStream {
         path: PathBuf,
-        sender: mpsc::Sender<ReplayChunk>,
+        shard_senders: Vec<mpsc::Sender<crate::scribe::shards::ShardCommand>>,
         memory: BifrostMemoryGovernor,
     },
     RetireWal {
@@ -798,7 +791,7 @@ pub(crate) enum ScribeWalIoResult {
     WalWritten { result: WalAppendResult },
     WalSynced,
     Completed,
-    ReplayStreamCompleted,
+    ReplayStreamCompleted { restored: usize },
 }
 
 /// Bounded filesystem lane for WAL append, sync, replay support, and retirement.
@@ -1009,21 +1002,41 @@ fn execute_wal_io(
         }
         ScribeWalIoOp::ReplayDirectoryStream {
             path,
-            sender,
+            shard_senders,
             memory,
         } => {
+            let mut restored = 0_usize;
             crate::scribe::replay::replay_wal_directory_stream_accounted(
                 path,
                 Some(&memory),
                 |chunk| {
-                    sender
-                        .blocking_send(chunk)
-                        .map_err(|_| ScribeError::Internal {
-                            detail: "replay consumer dropped the WAL chunk channel".to_owned(),
-                        })
+                    let crate::scribe::replay::ReplayChunk { states, memory } = chunk;
+                    drop(memory);
+                    for state in states.into_values() {
+                        let shard = crate::scribe::routing::shard_for(
+                            state.seal_key.tenant,
+                            &state.seal_key.table,
+                        );
+                        let (response, receiver) = tokio::sync::oneshot::channel();
+                        shard_senders[shard]
+                            .blocking_send(crate::scribe::shards::ShardCommand::Replay {
+                                state: Box::new(state),
+                                response,
+                            })
+                            .map_err(|_| ScribeError::Internal {
+                                detail: "replay owner dropped its command channel".to_owned(),
+                            })?;
+                        receiver
+                            .blocking_recv()
+                            .map_err(|_| ScribeError::Internal {
+                                detail: "replay owner dropped its completion response".to_owned(),
+                            })??;
+                        restored = restored.saturating_add(1);
+                    }
+                    Ok(())
                 },
             )?;
-            Ok(ScribeWalIoResult::ReplayStreamCompleted)
+            Ok(ScribeWalIoResult::ReplayStreamCompleted { restored })
         }
         ScribeWalIoOp::RetireWal { wal, segments } => {
             wal.retire_segments(&segments)?;

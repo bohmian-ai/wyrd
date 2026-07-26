@@ -98,7 +98,7 @@ impl Default for TailConfig {
 #[derive(Debug)]
 pub struct FetchLiveTailService {
     stream: StreamIdentity,
-    memtable: Arc<Memtable>,
+    memtable: Option<Arc<Memtable>>,
     shards: Option<Arc<ScribeShardRuntime>>,
     config: TailConfig,
 }
@@ -119,7 +119,7 @@ impl FetchLiveTailService {
     ) -> Self {
         Self {
             stream,
-            memtable,
+            memtable: Some(memtable),
             shards: None,
             config: TailConfig {
                 max_bytes: config.max_bytes.max(1),
@@ -132,13 +132,17 @@ impl FetchLiveTailService {
     #[must_use]
     pub(crate) fn with_runtime(
         stream: StreamIdentity,
-        memtable: Arc<Memtable>,
         shards: Arc<ScribeShardRuntime>,
         config: TailConfig,
     ) -> Self {
-        let mut service = Self::with_config(stream, memtable, config);
-        service.shards = Some(shards);
-        service
+        Self {
+            stream,
+            memtable: None,
+            shards: Some(shards),
+            config: TailConfig {
+                max_bytes: config.max_bytes.max(1),
+            },
+        }
     }
 
     /// Stream identity this service serves.
@@ -184,6 +188,10 @@ impl FetchLiveTailService {
             shards.snapshot(req.clone()).await?
         } else {
             self.memtable
+                .as_ref()
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: "direct tail memtable is not configured".to_owned(),
+                })?
                 .readable_batches_for_range(
                     req.binding.tenant,
                     &req.binding.table_ref,
@@ -224,6 +232,10 @@ impl FetchLiveTailService {
         }
         Ok(self
             .memtable
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "direct tail memtable is not configured".to_owned(),
+            })?
             .readable_batches_for_range(
                 request.binding.tenant,
                 &request.binding.table_ref,

@@ -107,6 +107,9 @@ pub enum ScribeError {
     #[error("WAL disk full")]
     WalDiskFull,
 
+    #[error("unsupported WAL version: {version}")]
+    UnsupportedWalVersion { version: u16 },
+
     #[error("ingest payload too large: {bytes} bytes")]
     PayloadTooLarge { bytes: usize },
 
@@ -151,6 +154,9 @@ impl ScribeError {
                 table: table.clone(),
             },
             Self::WalDiskFull => Self::WalDiskFull,
+            Self::UnsupportedWalVersion { version } => {
+                Self::UnsupportedWalVersion { version: *version }
+            }
             Self::PayloadTooLarge { bytes } => Self::PayloadTooLarge { bytes: *bytes },
             Self::FingerprintMismatch { table } => Self::FingerprintMismatch {
                 table: table.clone(),
@@ -184,6 +190,9 @@ impl ScribeError {
                 table: table.clone(),
             },
             Self::WalDiskFull => BifrostError::WalDiskFull,
+            Self::UnsupportedWalVersion { version } => BifrostError::Internal {
+                detail: format!("unsupported WAL version: {version}"),
+            },
             Self::PayloadTooLarge { bytes } => BifrostError::PayloadTooLarge { bytes: *bytes },
             Self::FingerprintMismatch { table } => BifrostError::FingerprintMismatch {
                 table: table.clone(),

@@ -20,6 +20,7 @@ mod pg_tests {
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::ScribeImpl;
+    use vala_bifrost_redux::scribe::seal::PostCommitBatch;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
@@ -74,6 +75,13 @@ mod pg_tests {
         (fixture, tenant, scribe)
     }
 
+    async fn complete_post_commit(scribe: &ScribeImpl, batch: PostCommitBatch) {
+        scribe
+            .complete_post_commit(batch)
+            .await
+            .expect("post_commit");
+    }
+
     fn make_batch(row_count: usize, base_time_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new(
@@ -122,7 +130,6 @@ mod pg_tests {
     async fn pg_scribe_append_seal_file_list() {
         let (fixture, tenant, scribe) = setup().await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
-
         // 1. Append 50k rows to trigger seal predicate
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
@@ -142,7 +149,6 @@ mod pg_tests {
         };
 
         scribe.append(req).await.expect("append");
-
         // 2. Force seal
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
@@ -150,9 +156,7 @@ mod pg_tests {
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
+        complete_post_commit(&scribe, post_commit).await;
 
         // 3. Verify file_list row and its organization-qualified object identity
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -261,9 +265,7 @@ mod pg_tests {
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
+        complete_post_commit(&scribe, post_commit).await;
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
@@ -297,7 +299,6 @@ mod pg_tests {
         .fetch_all(&mut **tx)
         .await
         .expect("audit query");
-
         assert_eq!(rows.len(), 3, "expected 3 audit rows (one per append)");
 
         for (i, row) in rows.iter().enumerate() {
@@ -407,9 +408,7 @@ mod pg_tests {
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
+        complete_post_commit(&scribe, post_commit).await;
 
         // Verify two file_list rows with distinct partition_day
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -463,7 +462,10 @@ mod pg_tests {
             .expect("tenant connection");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force seal");
         drop(conn);
-        scribe.abort_post_commit(post_commit).expect("abort seal");
+        scribe
+            .abort_post_commit(post_commit)
+            .await
+            .expect("abort seal");
 
         let mut verify = vala_sql::TenantConn::acquire(pool, tenant)
             .await

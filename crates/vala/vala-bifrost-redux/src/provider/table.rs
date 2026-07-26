@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use arrow::array::new_null_array;
 use arrow::compute::cast;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -170,12 +171,15 @@ fn project_hot_batch(batch: &RecordBatch, target: &SchemaRef) -> DfResult<Record
         .fields()
         .iter()
         .map(|field| {
-            let index = batch.schema().index_of(field.name()).map_err(|_| {
-                DataFusionError::Plan(format!(
+            let Some(index) = batch.schema().index_of(field.name()).ok() else {
+                if field.is_nullable() {
+                    return Ok(new_null_array(field.data_type(), batch.num_rows()));
+                }
+                return Err(DataFusionError::Plan(format!(
                     "Scribe hot batch is missing table column `{}`",
                     field.name()
-                ))
-            })?;
+                )));
+            };
             let column = batch.column(index);
             if column.data_type() == field.data_type() {
                 Ok(Arc::clone(column))

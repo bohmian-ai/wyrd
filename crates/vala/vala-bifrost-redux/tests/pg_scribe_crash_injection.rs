@@ -17,7 +17,7 @@ use vala_bifrost_redux::scribe::manifest::{Manifest, read_manifest, write_atomic
 use vala_bifrost_redux::scribe::replay::replay_wal_directory;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalRecord, WalWriter};
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -100,6 +100,44 @@ fn torn_wal_tail_is_truncated_and_prior_records_replay() {
     assert_eq!(
         std::fs::metadata(path).expect("WAL metadata").len(),
         valid_len
+    );
+}
+
+#[test]
+fn partial_frame_leaves_only_the_prior_acknowledged_prefix() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+        .expect("WAL writer");
+    let key = key();
+    writer
+        .append_and_fsync_for_test(&key, [1_u8; 16], &audit(), &data_bytes(1))
+        .expect("acknowledged prefix append");
+    let path = temp_dir
+        .path()
+        .join(node.as_uuid().simple().to_string())
+        .join("1")
+        .join(format!(
+            "shard-{:02}",
+            vala_bifrost_redux::scribe::routing::shard_for(key.tenant, &key.table)
+        ))
+        .join("0.wal");
+    let valid_len = std::fs::metadata(&path).expect("WAL metadata").len();
+    let partial = WalRecord::new(WalLsn::new(2), 2, [2_u8; 16], vec![1, 2, 3]).encode();
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("open WAL tail");
+    file.write_all(&partial[..partial.len() / 2])
+        .expect("partial WAL frame");
+    file.sync_all().expect("sync partial WAL frame");
+
+    let replayed = replay_wal_directory(temp_dir.path()).expect("replay partial frame");
+    assert_eq!(replayed[&key.as_path_components()].data_records.len(), 1);
+    assert_eq!(
+        std::fs::metadata(path).expect("WAL metadata").len(),
+        valid_len,
+        "unacknowledged partial frame must be truncated"
     );
 }
 

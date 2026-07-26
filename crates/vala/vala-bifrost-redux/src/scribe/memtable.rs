@@ -66,6 +66,8 @@ pub struct MemtableStats {
 pub(crate) struct BucketMemorySnapshot {
     /// Exact tenant/table/day identity of the bucket.
     pub seal_key: SealKey,
+    /// Rows currently retained for this seal-key.
+    pub row_count: usize,
     /// Bytes in the writable bucket.
     pub writable_bytes: usize,
     /// Bytes in immutable generations for the bucket.
@@ -186,6 +188,15 @@ impl Memtable {
         &self,
         replayed: &crate::scribe::replay::ReplayedSealKey,
     ) -> Result<FrozenMemtable, ScribeError> {
+        let mut frozen = Self::decode_replayed(replayed)?;
+        frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        self.insert_replayed_frozen(frozen)
+    }
+
+    /// Decode one replayed WAL state without mutating owner state.
+    pub(crate) fn decode_replayed(
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+    ) -> Result<FrozenMemtable, ScribeError> {
         if replayed.data_records.len() != replayed.append_metas.len() {
             return Err(ScribeError::Internal {
                 detail: format!(
@@ -249,9 +260,8 @@ impl Memtable {
                     detail: "replayed seal range contained no data".to_owned(),
                 })?;
         let arrow_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
-        let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-        let frozen = FrozenMemtable {
-            seal_id,
+        Ok(FrozenMemtable {
+            seal_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
             batches,
@@ -260,12 +270,22 @@ impl Memtable {
             opened_at: Instant::now(),
             closed_at: Instant::now(),
             arrow_bytes,
-        };
+        })
+    }
+
+    /// Insert a decoded replay generation into this owner-local memtable.
+    pub(crate) fn insert_replayed_frozen(
+        &self,
+        mut frozen: FrozenMemtable,
+    ) -> Result<FrozenMemtable, ScribeError> {
+        if frozen.seal_id == 0 {
+            frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        }
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         immutable
-            .entry(replayed.seal_key.clone())
+            .entry(frozen.seal_key.clone())
             .or_default()
             .push(ImmutableEntry::pending(frozen.clone()));
         Ok(frozen)
@@ -767,6 +787,7 @@ impl Memtable {
                 seal_key.clone(),
                 BucketMemorySnapshot {
                     seal_key: seal_key.clone(),
+                    row_count: bucket.row_count,
                     writable_bytes: bucket.bytes_accumulated,
                     immutable_bytes: 0,
                 },
@@ -777,9 +798,13 @@ impl Memtable {
                 .entry(seal_key.clone())
                 .or_insert_with(|| BucketMemorySnapshot {
                     seal_key: seal_key.clone(),
+                    row_count: 0,
                     writable_bytes: 0,
                     immutable_bytes: 0,
                 });
+            entry.row_count = entry
+                .row_count
+                .saturating_add(entries.iter().map(|entry| entry.frozen.row_count()).sum());
             entry.immutable_bytes = entries.iter().map(|entry| entry.frozen.arrow_bytes).sum();
         }
         Ok(by_key.into_values().collect())
@@ -1076,6 +1101,7 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::NaiveDate;
     use std::sync::Arc;
+    use std::sync::Barrier;
     use std::time::Duration;
 
     fn make_test_batch(num_rows: usize) -> RecordBatch {
@@ -1487,6 +1513,46 @@ mod tests {
             50,
             "new bucket has only the post-freeze append"
         );
+    }
+
+    #[test]
+    fn snapshot_detach_is_safe_during_concurrent_append_and_flush() {
+        let memtable = Arc::new(Memtable::new());
+        let seal_key = make_test_seal_key();
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("initial insert");
+        let barrier = Arc::new(Barrier::new(2));
+        let freezer_memtable = Arc::clone(&memtable);
+        let freezer_key = seal_key.clone();
+        let freezer_barrier = Arc::clone(&barrier);
+        let freezer = std::thread::spawn(move || {
+            freezer_barrier.wait();
+            freezer_memtable.freeze(&freezer_key)
+        });
+        let inserter_memtable = Arc::clone(&memtable);
+        let inserter_key = seal_key.clone();
+        let inserter_barrier = Arc::clone(&barrier);
+        let inserter = std::thread::spawn(move || {
+            inserter_barrier.wait();
+            inserter_memtable.insert(
+                &inserter_key,
+                make_test_event(),
+                make_test_meta(2),
+                make_test_batch(1),
+            )
+        });
+
+        freezer.join().expect("freeze thread").expect("freeze");
+        inserter.join().expect("append thread").expect("append");
+        let stats = memtable.stats().expect("stats");
+        assert_eq!(stats.writable_rows + stats.immutable_rows, 2);
+        assert_eq!(stats.immutable_generations, 1);
     }
 
     #[test]

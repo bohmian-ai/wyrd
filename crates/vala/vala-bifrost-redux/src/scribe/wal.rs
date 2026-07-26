@@ -169,9 +169,7 @@ impl SegmentHeader {
         }
 
         if version != WAL_VERSION {
-            return Err(ScribeError::Internal {
-                detail: format!("unsupported WAL version: {version}"),
-            });
+            return Err(ScribeError::UnsupportedWalVersion { version });
         }
 
         if reserved != 0 {
@@ -848,6 +846,8 @@ struct WalDiskState {
     configured_limit_bytes: Option<u64>,
     sample: Mutex<Option<DiskSample>>,
     hard_failed: AtomicBool,
+    sync_failure: AtomicBool,
+    post_sync_failure: AtomicBool,
 }
 
 impl WalDiskState {
@@ -857,6 +857,8 @@ impl WalDiskState {
             configured_limit_bytes,
             sample: Mutex::new(None),
             hard_failed: AtomicBool::new(false),
+            sync_failure: AtomicBool::new(false),
+            post_sync_failure: AtomicBool::new(false),
         }
     }
 
@@ -906,6 +908,22 @@ impl WalDiskState {
 
     fn mark_hard_failed(&self) {
         self.hard_failed.store(true, Ordering::Release);
+    }
+
+    fn trip_sync_failure(&self) {
+        self.sync_failure.store(true, Ordering::Release);
+    }
+
+    fn trip_post_sync_failure(&self) {
+        self.post_sync_failure.store(true, Ordering::Release);
+    }
+
+    fn take_sync_failure(&self) -> bool {
+        self.sync_failure.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_post_sync_failure(&self) -> bool {
+        self.post_sync_failure.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -1196,7 +1214,7 @@ impl WalHandle {
     }
 
     pub(crate) fn sync_segments(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
-        match WalWriter::sync_segments(segments) {
+        match self.writer.sync_segments_with_fault(segments) {
             Ok(()) => Ok(()),
             Err(error) => {
                 if matches!(error, ScribeError::WalDiskFull) {
@@ -1205,6 +1223,10 @@ impl WalHandle {
                 Err(error)
             }
         }
+    }
+
+    pub(crate) fn take_post_sync_failure_for_test(&self) -> bool {
+        self.writer.take_post_sync_failure_for_test()
     }
 
     pub(crate) fn retire_segments(&self, segments: &[WalSegmentRef]) -> Result<(), ScribeError> {
@@ -1317,6 +1339,17 @@ impl WalWriter {
         self.disk.mark_hard_failed();
     }
 
+    /// Inject one WAL `sync_data` failure after the record write and before
+    /// the durable acknowledgment boundary.
+    pub fn trip_sync_failure_for_test(&self) {
+        self.disk.trip_sync_failure();
+    }
+
+    /// Inject one failure after WAL sync and before memtable insertion.
+    pub fn trip_post_sync_failure_for_test(&self) {
+        self.disk.trip_post_sync_failure();
+    }
+
     /// Return the single WAL handle owned by one fixed shard task.
     pub(crate) fn handle_for_shard(&self, shard_id: usize) -> Result<WalHandle, ScribeError> {
         let shard_id = u8::try_from(shard_id).map_err(|_| ScribeError::Internal {
@@ -1427,6 +1460,15 @@ impl WalWriter {
         Ok(())
     }
 
+    fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        if self.disk.take_sync_failure() {
+            return Err(ScribeError::Internal {
+                detail: "injected WAL sync failure".to_owned(),
+            });
+        }
+        Self::sync_segments(segments)
+    }
+
     /// Return the configured segment size.
     #[must_use]
     pub fn segment_bytes(&self) -> u64 {
@@ -1499,8 +1541,12 @@ impl WalWriter {
             .expect("fixed shard count fits in u8"),
         );
         let result = self.append_prepared(prepared)?;
-        Self::sync_segments(&result.touched_segments)?;
+        self.sync_segments_with_fault(&result.touched_segments)?;
         Ok(result.lsn)
+    }
+
+    pub(crate) fn take_post_sync_failure_for_test(&self) -> bool {
+        self.disk.take_post_sync_failure()
     }
 
     #[cfg(feature = "bench-support")]
@@ -1883,6 +1929,21 @@ mod tests {
         assert_eq!(decoded.writer_epoch, 42);
         assert_eq!(decoded.seg_seq, 7);
         assert_eq!(decoded.shard_id, 3);
+    }
+
+    #[test]
+    fn wal_v2_header_is_rejected_with_typed_error() {
+        let mut header = SegmentHeader::new([1_u8; 16], 42, 7, 3);
+        header.version = 2;
+        let mut encoded = header.encode();
+        let crc = crc32c_hash(&encoded[..60]);
+        encoded[60..64].copy_from_slice(&crc.to_le_bytes());
+
+        let error = SegmentHeader::decode(&encoded).expect_err("v2 header must fail closed");
+        assert!(matches!(
+            error,
+            ScribeError::UnsupportedWalVersion { version: 2 }
+        ));
     }
 
     #[test]

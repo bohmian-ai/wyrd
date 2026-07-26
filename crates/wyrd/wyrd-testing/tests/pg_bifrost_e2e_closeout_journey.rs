@@ -5,6 +5,7 @@
 //! the fast family lanes do not claim coverage from this test.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -16,8 +17,9 @@ use vala_sdk::{BifrostFrame, BifrostGrpcTransport, IngestTransport};
 use wyrd_client::WyrdClient;
 use wyrd_client::config::ClientConfig;
 use wyrd_client::transport::{GrpcConfig, HttpConfig};
+use wyrd_spec::vala::api::SyncQueryRequest;
 use wyrd_testing::Bootstrap;
-use wyrd_testing::bifrost::{WyrdTestCluster, full_bifrost_topology};
+use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster, full_bifrost_topology};
 
 const TABLE_NAME: &str = "closeout_events";
 const TABLE_FQN: &str = "vala.bifrost.closeout_events";
@@ -32,6 +34,22 @@ async fn pg_bifrost_e2e_closeout_journey() {
     let shutdown = cluster.shutdown().await;
     shutdown.expect("three-pod cluster shutdown");
     result.expect("public Bifrost closeout journey");
+}
+
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn pg_bifrost_e2e_closeout_journey_delayed_fsync_drains_without_loss() {
+    let cluster = WyrdTestCluster::start_with_wal_sync_delay(
+        1,
+        BifrostTopology::OnePod,
+        Duration::from_millis(10),
+    )
+    .await
+    .expect("one-pod delayed-fsync WyrdTestCluster");
+    let result = run_delayed_fsync_journey(&cluster).await;
+    let shutdown = cluster.shutdown().await;
+    shutdown.expect("delayed-fsync cluster shutdown");
+    result.expect("delayed-fsync Bifrost closeout journey");
 }
 
 async fn run_closeout_journey(
@@ -92,7 +110,9 @@ async fn run_closeout_journey(
             retry_frame.arrow_ipc.to_vec(),
         )
         .await?;
-    first.flush_bifrost().await?;
+    for server in cluster.servers() {
+        server.flush_bifrost().await?;
+    }
 
     // Negative auth and resolution paths are exercised through the same public
     // SDK transport. Neither request is allowed to create durable file-list
@@ -124,8 +144,28 @@ async fn run_closeout_journey(
         .expect_err("schema conflict must be rejected before ACK");
     assert_eq!(conflict.status(), 409);
 
-    // Assert the durable file-list and audit boundary directly; the Oracle
-    // query journey separately covers the fused hot/published read path.
+    let mut oracle_rows = 0_u64;
+    for (pod, server) in cluster.servers().iter().enumerate() {
+        let query_client =
+            bootstrap_client(server, &format!("closeout-query-{pod}"), &["admin"]).await?;
+        let query = query_client
+            .request_arrow(
+                reqwest::Method::POST,
+                "/v1/query",
+                Some(&SyncQueryRequest {
+                    sql: format!("SELECT id, value FROM \"{TABLE_FQN}\" ORDER BY id"),
+                    params: Vec::new(),
+                }),
+            )
+            .await?;
+        oracle_rows = oracle_rows.saturating_add(query.row_count.unwrap_or_default());
+        assert!(!query.frames.is_empty(), "Oracle must return Arrow data");
+    }
+    assert_eq!(
+        oracle_rows, 8,
+        "distributed Oracle reads must cover every unique row"
+    );
+
     let rows: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(row_count), 0)::bigint
            FROM vala.file_list
@@ -153,11 +193,64 @@ async fn run_closeout_journey(
     Ok(())
 }
 
+async fn run_delayed_fsync_journey(
+    cluster: &WyrdTestCluster,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let tenant = cluster.data_tenant_id();
+    let server = cluster.server(0).ok_or("missing delayed-fsync pod")?;
+    server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .ok_or("missing Redux catalog")?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant,
+            audit: None,
+        })
+        .await?;
+
+    let transport = bootstrap_transport(server, "delayed-fsync-admin", &["admin"]).await?;
+    for id in 0..8_i64 {
+        transport
+            .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), ipc(&[id]))
+            .await?;
+    }
+    server.flush_bifrost().await?;
+
+    let query_client = bootstrap_client(server, "delayed-fsync-query", &["admin"]).await?;
+    let query = query_client
+        .request_arrow(
+            reqwest::Method::POST,
+            "/v1/query",
+            Some(&SyncQueryRequest {
+                sql: format!("SELECT id, value FROM \"{TABLE_FQN}\" ORDER BY id"),
+                params: Vec::new(),
+            }),
+        )
+        .await?;
+    assert_eq!(query.row_count, Some(8));
+    Ok(())
+}
+
 async fn bootstrap_transport(
     server: &wyrd_testing::WyrdTestServer,
     name: &str,
     roles: &[&str],
 ) -> Result<BifrostGrpcTransport, Box<dyn std::error::Error + Send + Sync>> {
+    let client = bootstrap_client(server, name, roles).await?;
+    Ok(BifrostGrpcTransport::connect(&client).await?)
+}
+
+async fn bootstrap_client(
+    server: &wyrd_testing::WyrdTestServer,
+    name: &str,
+    roles: &[&str],
+) -> Result<WyrdClient, Box<dyn std::error::Error + Send + Sync>> {
     let bootstrap = server.bootstrap_service(name, roles).await?;
     let key = match bootstrap {
         Bootstrap::Machine { api_key, .. } => api_key,
@@ -177,8 +270,7 @@ async fn bootstrap_transport(
         ..ClientConfig::default()
     };
     config.grpc.max_message_bytes = 32 * 1024 * 1024;
-    let client = WyrdClient::with_config(config)?;
-    Ok(BifrostGrpcTransport::connect(&client).await?)
+    Ok(WyrdClient::with_config(config)?)
 }
 
 fn frame(batch_id: [u8; 16], ids: &[i64]) -> BifrostFrame {

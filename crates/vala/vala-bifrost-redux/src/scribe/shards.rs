@@ -1,8 +1,8 @@
 //! Fixed pod-local Scribe shard mailboxes and tenant round-robin scheduling.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
@@ -12,9 +12,11 @@ use wyrd_spec::ids::DataTenantId;
 use crate::catalog::TableRef;
 use crate::contracts::ScribeError;
 use crate::scribe::admission::AdmissionController;
-use crate::scribe::execution_lanes::{ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult};
+use crate::scribe::execution_lanes::{
+    ScribePersistenceCpuPool, ScribeWalIoOp, ScribeWalIoPool, ScribeWalIoResult,
+};
 use crate::scribe::memory::{MemoryCategory, MemoryLedger};
-use crate::scribe::memtable::Memtable;
+use crate::scribe::memtable::{BucketMemorySnapshot, Memtable, MemtableStats, PressureCandidate};
 use crate::scribe::persistence::{
     ImmutableGeneration, PersistenceCompletion, PersistenceJob, PersistenceRuntime,
 };
@@ -257,6 +259,31 @@ pub(crate) enum ShardCommand {
         completion: Box<PersistenceCompletion>,
         waiter: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
+    Replay {
+        state: Box<crate::scribe::replay::ReplayedSealKey>,
+        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+    },
+    FreezeKey {
+        seal_key: crate::scribe::seal_key::SealKey,
+        response: tokio::sync::oneshot::Sender<
+            Result<crate::scribe::memtable::FrozenMemtable, ScribeError>,
+        >,
+    },
+    FreezeTenant {
+        tenant: DataTenantId,
+        response: tokio::sync::oneshot::Sender<
+            Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError>,
+        >,
+    },
+    CompletePostCommit {
+        seal_id: u64,
+        file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
+        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+    },
+    AbortPostCommit {
+        seal_id: u64,
+        response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
+    },
     FlushAll {
         response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
@@ -266,13 +293,23 @@ pub(crate) enum ShardCommand {
 #[derive(Debug)]
 struct ShardDependencies {
     admission: AdmissionController,
-    memtable: Arc<Memtable>,
+    memtable: Memtable,
+    persistence_cpu: ScribePersistenceCpuPool,
     wal_io: ScribeWalIoPool,
     persistence: Option<Arc<PersistenceRuntime>>,
     completion_tx: mpsc::Sender<ShardCommand>,
     stream: StreamIdentity,
     wal_handle: WalHandle,
     memory_ledger: MemoryLedger,
+    snapshot: Arc<Mutex<ShardMemtableSnapshot>>,
+}
+
+/// Last owner-published state used by synchronous inspection surfaces.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShardMemtableSnapshot {
+    pub(crate) stats: MemtableStats,
+    pub(crate) bucket_memory: Vec<BucketMemorySnapshot>,
+    pub(crate) pressure_candidates: Vec<PressureCandidate>,
 }
 
 /// The live fixed-shard Scribe runtime.
@@ -280,6 +317,7 @@ struct ShardDependencies {
 pub(crate) struct ScribeShardRuntime {
     senders: Vec<ScribeShard<ShardCommand>>,
     pressure_senders: Vec<watch::Sender<Option<PressureSignal>>>,
+    snapshots: Vec<Arc<Mutex<ShardMemtableSnapshot>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pending: Arc<AtomicUsize>,
     drained: Arc<Notify>,
@@ -288,8 +326,10 @@ pub(crate) struct ScribeShardRuntime {
 
 pub(crate) struct ScribeShardStartConfig {
     pub(crate) admission: AdmissionController,
-    pub(crate) memtable: Arc<Memtable>,
+    pub(crate) retention_grace: std::time::Duration,
+    pub(crate) rotation_bytes: usize,
     pub(crate) wal: Arc<WalWriter>,
+    pub(crate) persistence_cpu: ScribePersistenceCpuPool,
     pub(crate) wal_io: ScribeWalIoPool,
     pub(crate) persistence: Option<Arc<PersistenceRuntime>>,
     pub(crate) stream: StreamIdentity,
@@ -301,8 +341,10 @@ impl ScribeShardRuntime {
     pub(crate) fn start(config: ScribeShardStartConfig, runtime: &Handle) -> Arc<Self> {
         let ScribeShardStartConfig {
             admission,
-            memtable,
+            retention_grace,
+            rotation_bytes,
             wal,
+            persistence_cpu,
             wal_io,
             persistence,
             stream,
@@ -322,19 +364,24 @@ impl ScribeShardRuntime {
             .iter()
             .map(|(sender, _)| sender.clone())
             .collect::<Vec<_>>();
+        let snapshots = (0..SCRIBE_SHARD_COUNT)
+            .map(|_| Arc::new(Mutex::new(ShardMemtableSnapshot::default())))
+            .collect::<Vec<_>>();
         for (id, receiver) in receivers.into_iter().enumerate() {
             let wal_handle = wal.handle_for_shard(id).unwrap_or_else(|error| {
                 panic!("fixed shard WAL handle must be constructible: {error}")
             });
             let dependencies = ShardDependencies {
                 admission: admission.clone(),
-                memtable: Arc::clone(&memtable),
+                memtable: Memtable::new_with_limits(retention_grace, rotation_bytes),
+                persistence_cpu: persistence_cpu.clone(),
                 wal_io: wal_io.clone(),
                 persistence: persistence.clone(),
                 completion_tx: senders[id].sender.clone(),
                 stream,
                 wal_handle,
                 memory_ledger: memory_ledger.clone(),
+                snapshot: Arc::clone(&snapshots[id]),
             };
             let pending_count = Arc::clone(&pending);
             let drained_signal = Arc::clone(&drained);
@@ -351,6 +398,7 @@ impl ScribeShardRuntime {
         Arc::new(Self {
             senders,
             pressure_senders,
+            snapshots,
             tasks: tokio::sync::Mutex::new(tasks),
             pending,
             drained,
@@ -407,6 +455,84 @@ impl ScribeShardRuntime {
         .map_err(|_| ScribeError::IngressClosed)?;
         result.await.map_err(|_| ScribeError::Internal {
             detail: "shard dropped live-tail snapshot response".to_owned(),
+        })?
+    }
+
+    /// Freeze one key through its owning shard.
+    pub(crate) async fn freeze_key(
+        &self,
+        seal_key: crate::scribe::seal_key::SealKey,
+    ) -> Result<crate::scribe::memtable::FrozenMemtable, ScribeError> {
+        let shard = shard_for(seal_key.tenant, &seal_key.table);
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.senders[shard]
+            .sender
+            .send(ShardCommand::FreezeKey { seal_key, response })
+            .await
+            .map_err(|_| ScribeError::IngressClosed)?;
+        result.await.map_err(|_| ScribeError::Internal {
+            detail: "shard dropped freeze response".to_owned(),
+        })?
+    }
+
+    /// Freeze all keys for one tenant through their owning shard(s).
+    pub(crate) async fn freeze_tenant(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
+        let mut frozen = Vec::new();
+        for sender in &self.senders {
+            let (response, result) = tokio::sync::oneshot::channel();
+            sender
+                .sender
+                .send(ShardCommand::FreezeTenant { tenant, response })
+                .await
+                .map_err(|_| ScribeError::IngressClosed)?;
+            frozen.extend(result.await.map_err(|_| ScribeError::Internal {
+                detail: "shard dropped tenant freeze response".to_owned(),
+            })??);
+        }
+        Ok(frozen)
+    }
+
+    /// Mark an owner-local generation committed after its tenant transaction.
+    pub(crate) async fn complete_post_commit(
+        &self,
+        seal_id: u64,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
+    ) -> Result<(), ScribeError> {
+        let shard = shard_for(seal_key.tenant, &seal_key.table);
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.senders[shard]
+            .sender
+            .send(ShardCommand::CompletePostCommit {
+                seal_id,
+                file_list_key,
+                response,
+            })
+            .await
+            .map_err(|_| ScribeError::IngressClosed)?;
+        result.await.map_err(|_| ScribeError::Internal {
+            detail: "shard dropped post-commit response".to_owned(),
+        })?
+    }
+
+    /// Keep an owner-local generation pending after transaction rollback.
+    pub(crate) async fn abort_post_commit(
+        &self,
+        seal_id: u64,
+        seal_key: &crate::scribe::seal_key::SealKey,
+    ) -> Result<(), ScribeError> {
+        let shard = shard_for(seal_key.tenant, &seal_key.table);
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.senders[shard]
+            .sender
+            .send(ShardCommand::AbortPostCommit { seal_id, response })
+            .await
+            .map_err(|_| ScribeError::IngressClosed)?;
+        result.await.map_err(|_| ScribeError::Internal {
+            detail: "shard dropped abort response".to_owned(),
         })?
     }
 
@@ -478,14 +604,27 @@ impl ScribeShardRuntime {
         self.pending.load(Ordering::Acquire)
     }
 
-    /// Clone the owning shard command channel used by boot replay.
-    pub(crate) fn persistence_completion_sender(
-        &self,
-        seal_key: &crate::scribe::seal_key::SealKey,
-    ) -> mpsc::Sender<ShardCommand> {
-        self.senders[shard_for(seal_key.tenant, &seal_key.table)]
-            .sender
-            .clone()
+    /// Read owner-published state without touching any generation map.
+    pub(crate) fn memtable_snapshots(&self) -> Result<Vec<ShardMemtableSnapshot>, ScribeError> {
+        self.snapshots
+            .iter()
+            .map(|snapshot| {
+                snapshot
+                    .lock()
+                    .map(|snapshot| snapshot.clone())
+                    .map_err(|_| ScribeError::Internal {
+                        detail: "shard inspection snapshot lock poisoned".to_owned(),
+                    })
+            })
+            .collect()
+    }
+
+    /// Clone the fixed owner channels for synchronous WAL-lane replay routing.
+    pub(crate) fn replay_senders(&self) -> Vec<mpsc::Sender<ShardCommand>> {
+        self.senders
+            .iter()
+            .map(|sender| sender.sender.clone())
+            .collect()
     }
 
     /// Stop all owners after draining accepted work.
@@ -502,6 +641,20 @@ impl ScribeShardRuntime {
     }
 }
 
+fn publish_memtable_snapshot(dependencies: &ShardDependencies) {
+    let snapshot = ShardMemtableSnapshot {
+        stats: dependencies.memtable.stats().unwrap_or_default(),
+        bucket_memory: dependencies.memtable.bucket_memory().unwrap_or_default(),
+        pressure_candidates: dependencies
+            .memtable
+            .pressure_candidates()
+            .unwrap_or_default(),
+    };
+    if let Ok(mut published) = dependencies.snapshot.lock() {
+        *published = snapshot;
+    }
+}
+
 async fn run_shard(
     id: usize,
     mut receiver: mpsc::Receiver<ShardCommand>,
@@ -510,6 +663,7 @@ async fn run_shard(
     pending: Arc<AtomicUsize>,
     drained: Arc<Notify>,
 ) {
+    publish_memtable_snapshot(&dependencies);
     let mut scheduler = TenantRoundRobin::<PreparedAppend>::default();
     let mut shutting_down = false;
     let mut wal_segments = WalSegmentsByKey::new();
@@ -530,6 +684,7 @@ async fn run_shard(
                     &mut wal_segments,
                     &mut pending_generations,
                 );
+                publish_memtable_snapshot(&dependencies);
             }
         }
         while let Ok(command) = receiver.try_recv() {
@@ -546,6 +701,7 @@ async fn run_shard(
             {
                 shutting_down = true;
             }
+            publish_memtable_snapshot(&dependencies);
         }
         let group = scheduler.pop_group();
         if !group.is_empty() {
@@ -561,6 +717,7 @@ async fn run_shard(
             if let Err(error) = result {
                 tracing::error!(error = %error, shard = id, "Scribe shard group failed");
             }
+            publish_memtable_snapshot(&dependencies);
             pending.fetch_sub(group_len, Ordering::AcqRel);
             drained.notify_waiters();
             continue;
@@ -585,6 +742,7 @@ async fn run_shard(
                         {
                             shutting_down = true;
                         }
+                        publish_memtable_snapshot(&dependencies);
                     }
                     None => break,
                 }
@@ -657,6 +815,32 @@ async fn handle_shard_command(
                 wal_segments,
             );
         }
+        ShardCommand::Replay { state, response } => {
+            let result = replay_state_at_owner(dependencies, *state, pending_generations).await;
+            let _ = response.send(result);
+        }
+        ShardCommand::FreezeKey { seal_key, response } => {
+            let result = freeze_key_at_owner(dependencies, &seal_key);
+            let _ = response.send(result);
+        }
+        ShardCommand::FreezeTenant { tenant, response } => {
+            let result = freeze_tenant_at_owner(dependencies, tenant);
+            let _ = response.send(result);
+        }
+        ShardCommand::CompletePostCommit {
+            seal_id,
+            file_list_key,
+            response,
+        } => {
+            let result = dependencies
+                .memtable
+                .complete_post_commit(seal_id, file_list_key);
+            let _ = response.send(result);
+        }
+        ShardCommand::AbortPostCommit { seal_id, response } => {
+            let result = dependencies.memtable.abort_post_commit(seal_id);
+            let _ = response.send(result);
+        }
         ShardCommand::Shutdown => return true,
     }
     false
@@ -687,6 +871,110 @@ fn snapshot_at_owner(
             rows: batch.batch,
         })
         .collect())
+}
+
+async fn replay_state_at_owner(
+    dependencies: &ShardDependencies,
+    replayed_state: crate::scribe::replay::ReplayedSealKey,
+    pending_generations: &mut PendingGenerationsByKey,
+) -> Result<(), ScribeError> {
+    let seal_key = replayed_state.seal_key.clone();
+    let segment_refs = replayed_state.wal_segments.clone();
+    let result = dependencies
+        .persistence_cpu
+        .submit(
+            crate::scribe::execution_lanes::ScribePersistenceCpuOp::RestoreReplay {
+                replayed: Box::new(replayed_state),
+            },
+        )
+        .await?;
+    let crate::scribe::execution_lanes::ScribePersistenceCpuResult::ReplayRestored(frozen) = result
+    else {
+        return Err(ScribeError::Internal {
+            detail: "persistence CPU lane returned the wrong replay result".to_owned(),
+        });
+    };
+    let frozen = dependencies.memtable.insert_replayed_frozen(*frozen)?;
+    if let Err(error) = dependencies
+        .memory_ledger
+        .reserve_immutable(frozen.arrow_bytes)
+    {
+        let _ = dependencies
+            .memtable
+            .discard_pending_generation(frozen.seal_id);
+        return Err(error);
+    }
+    let owner_stats = dependencies.memtable.stats()?;
+    dependencies
+        .admission
+        .sync_memtable_bytes(owner_stats.writable_bytes, owner_stats.immutable_bytes);
+
+    let Some(persistence) = &dependencies.persistence else {
+        return Ok(());
+    };
+    let binding =
+        crate::catalog::TenantTableBinding::resolve((seal_key.tenant, seal_key.table.clone()))
+            .map_err(|error| ScribeError::Internal {
+                detail: error.to_string(),
+            })?;
+    let generation = Arc::new(ImmutableGeneration::from_frozen(
+        &frozen,
+        (seal_key.tenant, seal_key.table.clone()),
+        dependencies.stream,
+        segment_refs.clone(),
+        dependencies.wal_handle.clone(),
+    ));
+    pending_generations
+        .entry(seal_key.clone())
+        .or_default()
+        .push_back(PendingGeneration {
+            generation: Arc::clone(&generation),
+            binding: binding.clone(),
+            submitted: true,
+        });
+    dependencies.wal_handle.retain_segments(&segment_refs)?;
+    if let Err(error) = persistence
+        .submit(PersistenceJob {
+            generation,
+            binding,
+            completion_tx: dependencies.completion_tx.clone(),
+            completion_waiter: None,
+        })
+        .await
+    {
+        mark_front_retryable(pending_generations, &seal_key);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn freeze_key_at_owner(
+    dependencies: &ShardDependencies,
+    seal_key: &crate::scribe::seal_key::SealKey,
+) -> Result<crate::scribe::memtable::FrozenMemtable, ScribeError> {
+    let active_bytes = dependencies.memtable.row_count(seal_key)?;
+    let frozen = dependencies.memtable.freeze(seal_key)?;
+    if active_bytes > 0 {
+        dependencies
+            .memory_ledger
+            .move_active_to_immutable(frozen.arrow_bytes)?;
+        dependencies
+            .admission
+            .transfer_active_to_immutable(frozen.arrow_bytes);
+    }
+    Ok(frozen)
+}
+
+fn freeze_tenant_at_owner(
+    dependencies: &ShardDependencies,
+    tenant: DataTenantId,
+) -> Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError> {
+    dependencies
+        .memtable
+        .seal_keys_for_tenant(tenant)?
+        .into_iter()
+        .map(|seal_key| freeze_key_at_owner(dependencies, &seal_key))
+        .collect()
 }
 
 fn flush_expired_at_owner(
@@ -726,11 +1014,11 @@ fn flush_keys_at_owner(
         }
         let frozen = dependencies.memtable.freeze(&seal_key)?;
         dependencies
-            .admission
-            .transfer_active_to_immutable(frozen.arrow_bytes);
-        dependencies
             .memory_ledger
             .move_active_to_immutable(frozen.arrow_bytes)?;
+        dependencies
+            .admission
+            .transfer_active_to_immutable(frozen.arrow_bytes);
         let Some(persistence) = &dependencies.persistence else {
             continue;
         };
@@ -752,21 +1040,22 @@ fn flush_keys_at_owner(
             segment_refs.clone(),
             dependencies.wal_handle.clone(),
         ));
-        pending_generations
-            .entry(seal_key.clone())
-            .or_default()
-            .push_back(PendingGeneration {
-                generation,
-                binding,
-                submitted: false,
-            });
-        submit_front_at_owner(
-            dependencies,
-            &seal_key,
-            persistence,
-            pending_generations,
-            wal_segments,
-        );
+        let queue = pending_generations.entry(seal_key.clone()).or_default();
+        let should_submit = queue.is_empty();
+        queue.push_back(PendingGeneration {
+            generation,
+            binding,
+            submitted: false,
+        });
+        if should_submit {
+            submit_front_at_owner(
+                dependencies,
+                &seal_key,
+                persistence,
+                pending_generations,
+                wal_segments,
+            );
+        }
     }
     Ok(())
 }
@@ -1056,6 +1345,15 @@ async fn process_group(
             },
             WalSliceState { lsn: slice.lsn },
         );
+    }
+    if dependencies.wal_handle.take_post_sync_failure_for_test() {
+        let error = ScribeError::Internal {
+            detail: "injected post-sync WAL failure".to_owned(),
+        };
+        release_active_reservations(dependencies, &state.durable);
+        mark_wal_error(dependencies, &error);
+        notify_prepared_error(&mut state.prepared, &error);
+        return Err(error);
     }
     let touched_keys = match insert_group(
         dependencies,
@@ -1398,7 +1696,14 @@ mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
     use crate::scribe::seal_key::{EventDay, SealKey};
+    use crate::scribe::wal::{ScribeAppendMeta, WalLsn};
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use chrono::NaiveDate;
+    use std::sync::Arc;
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
     #[derive(Debug)]
     struct Item {
@@ -1429,6 +1734,121 @@ mod tests {
         let set = ScribeShardSet::<Item>::new();
         assert_eq!(set.len(), SCRIBE_SHARD_COUNT);
         assert_eq!(SHARD_COMMAND_CAPACITY, 256);
+    }
+
+    fn owner_key() -> SealKey {
+        SealKey::new(
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Bifrost, "owner-test"),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("valid date")),
+        )
+    }
+
+    fn owner_event() -> AuditEvent {
+        AuditEvent {
+            request_id: wyrd_spec::request_id::RequestId::now_v7(),
+            trace_id: None,
+            operation: "owner-test".to_owned(),
+            resource: "owner-test".to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::User,
+            auth_method: AuthMethod::Jwt,
+            permission: "bifrost:write".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: "owner-test".to_owned(),
+            detail: None,
+        }
+    }
+
+    fn owner_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        )
+        .expect("owner batch")
+    }
+
+    fn owner_meta(key: &SealKey) -> ScribeAppendMeta {
+        ScribeAppendMeta {
+            batch_id: *uuid::Uuid::now_v7().as_bytes(),
+            rows_accepted: 1,
+            wal_lsn_min: WalLsn::new(1),
+            wal_lsn_max: WalLsn::new(1),
+            seal_key: key.as_path_components(),
+        }
+    }
+
+    fn owner_file_list_key(key: &SealKey) -> crate::scribe::file_list_writer::FileListCommitKey {
+        crate::scribe::file_list_writer::FileListCommitKey {
+            data_tenant_id: key.tenant,
+            namespace: key.table.namespace.as_str().to_owned(),
+            table_name: key.table.name.clone(),
+            node_id: uuid::Uuid::nil(),
+            writer_epoch: 1,
+            wal_lsn_min: 1,
+            wal_lsn_max: 1,
+        }
+    }
+
+    #[test]
+    fn shard_owner_exclusively_mutates_generation_state() {
+        let key = owner_key();
+        let owner = Memtable::new();
+        let other_owner = Memtable::new();
+        owner
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        assert_eq!(owner.stats().expect("owner stats").writable_buckets, 1);
+        assert_eq!(
+            other_owner
+                .stats()
+                .expect("other owner stats")
+                .writable_buckets,
+            0
+        );
+    }
+
+    #[test]
+    fn persistence_completion_returns_to_owning_shard() {
+        let key = owner_key();
+        let owner = Memtable::new();
+        owner
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = owner.freeze(&key).expect("owner freeze");
+        owner
+            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .expect("owner completion");
+        let stats = owner.stats().expect("owner stats");
+        assert_eq!(stats.immutable_generations, 1);
+        assert_eq!(stats.pending_generations, 0);
+    }
+
+    #[test]
+    fn grace_expiry_does_not_add_generation_tasks() {
+        let key = owner_key();
+        let owner = Memtable::new_with_retention(std::time::Duration::from_secs(1));
+        owner
+            .insert(&key, owner_event(), owner_meta(&key), owner_batch())
+            .expect("owner insert");
+        let frozen = owner.freeze(&key).expect("owner freeze");
+        owner
+            .complete_post_commit(frozen.seal_id, owner_file_list_key(&key))
+            .expect("owner completion");
+        assert_eq!(
+            owner
+                .sweep_once_at(std::time::Instant::now() + std::time::Duration::from_secs(2))
+                .expect("grace sweep")
+                .len(),
+            1
+        );
+        assert_eq!(SCRIBE_SHARD_COUNT, 16);
     }
 
     #[test]

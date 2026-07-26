@@ -66,7 +66,7 @@ fn seal_key(tenant: DataTenantId, table: &str) -> SealKey {
 }
 
 #[tokio::test]
-async fn restart_replay_restores_interleaved_tenants_into_immutable_memory() {
+async fn replay_memory_is_bounded_by_owner_backpressure() {
     let temp_dir = TempDir::new().expect("WAL directory");
     let node = NodeId::new(Uuid::now_v7());
     let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
@@ -115,4 +115,36 @@ async fn restart_replay_restores_interleaved_tenants_into_immutable_memory() {
         stats.immutable_bytes
     );
     scribe.shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_failure_keeps_scribe_unready() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+        .expect("WAL writer");
+    let tenant = DataTenantId::new_v7();
+    let key = seal_key(tenant, "task16_replay_failure");
+    let audit = encode_audit_event(&audit_event("replay-failure", tenant)).expect("audit");
+    writer
+        .append_and_fsync_for_test(&key, *Uuid::now_v7().as_bytes(), &audit, &[1, 2, 3])
+        .expect("invalid replay fixture append");
+    drop(writer);
+
+    let operator = Arc::new(
+        opendal::Operator::new(Memory::default())
+            .expect("memory operator")
+            .finish(),
+    );
+    let wal = Arc::new(
+        WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
+            .expect("replay WAL writer"),
+    );
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, node.to_string(), 2);
+    let error = scribe
+        .replay_wal_async()
+        .await
+        .expect_err("invalid replay must fail");
+    assert!(error.to_string().contains("Arrow") || error.to_string().contains("replayed"));
+    assert!(!scribe.is_ready());
 }

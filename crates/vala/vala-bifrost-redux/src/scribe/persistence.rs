@@ -1,6 +1,6 @@
 //! Bounded immutable-generation persistence for Scribe.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,6 +25,93 @@ use crate::scribe::memtable::FrozenMemtable;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
+
+/// Test-tier one-shot failures for the concrete persistence seams.
+#[derive(Debug, Clone, Default)]
+pub struct PersistenceFaults {
+    object_write: Arc<std::sync::atomic::AtomicBool>,
+    sql_commit: Arc<std::sync::atomic::AtomicBool>,
+    manifest_publication: Arc<std::sync::atomic::AtomicBool>,
+    object_write_delay_ms: Arc<AtomicU64>,
+    object_write_active: Arc<AtomicUsize>,
+    max_object_write_active: Arc<AtomicUsize>,
+}
+
+impl PersistenceFaults {
+    /// Fail the next object-store write before it mutates storage.
+    pub fn fail_next_object_write(&self) {
+        self.object_write.store(true, Ordering::Release);
+    }
+
+    /// Fail the next SQL commit after the file-list/audit transaction is staged.
+    pub fn fail_next_sql_commit(&self) {
+        self.sql_commit.store(true, Ordering::Release);
+    }
+
+    /// Fail the next manifest publication after the SQL transaction commits.
+    pub fn fail_next_manifest_publication(&self) {
+        self.manifest_publication.store(true, Ordering::Release);
+    }
+
+    /// Delay object writes and expose their maximum overlap for concurrency tests.
+    pub fn set_object_write_delay_for_test(&self, delay: Duration) {
+        self.object_write_delay_ms.store(
+            delay.as_millis().try_into().unwrap_or(u64::MAX),
+            Ordering::Release,
+        );
+    }
+
+    /// Return the maximum number of object writes active at once.
+    #[must_use]
+    pub fn max_concurrent_object_writes_for_test(&self) -> usize {
+        self.max_object_write_active.load(Ordering::Acquire)
+    }
+
+    async fn begin_object_write(&self) -> ObjectWriteGuard {
+        let active = self.object_write_active.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut observed = self.max_object_write_active.load(Ordering::Acquire);
+        while active > observed {
+            match self.max_object_write_active.compare_exchange(
+                observed,
+                active,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => observed = current,
+            }
+        }
+        let delay_ms = self.object_write_delay_ms.load(Ordering::Acquire);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        ObjectWriteGuard {
+            active: Arc::clone(&self.object_write_active),
+        }
+    }
+
+    fn take_object_write(&self) -> bool {
+        self.object_write.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_sql_commit(&self) -> bool {
+        self.sql_commit.swap(false, Ordering::AcqRel)
+    }
+
+    fn take_manifest_publication(&self) -> bool {
+        self.manifest_publication.swap(false, Ordering::AcqRel)
+    }
+}
+
+struct ObjectWriteGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ObjectWriteGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Stable identity for one detached generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -152,6 +239,8 @@ pub struct ScribePersistenceConfig {
     pub queue_items: usize,
     /// Number of asynchronous persistence workers.
     pub workers: usize,
+    /// Concrete test-tier fault points; production uses the default no-fault value.
+    pub faults: PersistenceFaults,
 }
 
 impl std::fmt::Debug for ScribePersistenceConfig {
@@ -172,7 +261,15 @@ impl ScribePersistenceConfig {
             postgres,
             queue_items: queue_items.max(1),
             workers: workers.max(1),
+            faults: PersistenceFaults::default(),
         }
+    }
+
+    /// Install concrete test-tier fault points for this persistence runtime.
+    #[must_use]
+    pub fn with_test_faults(mut self, faults: PersistenceFaults) -> Self {
+        self.faults = faults;
+        self
     }
 }
 
@@ -184,6 +281,7 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) node_id: String,
     pub(crate) writer_epoch: i64,
     pub(crate) memory: BifrostMemoryGovernor,
+    pub(crate) faults: PersistenceFaults,
 }
 
 /// Bounded persistence queue and worker set.
@@ -230,6 +328,7 @@ impl PersistenceRuntime {
             node_id: context.node_id,
             writer_epoch: context.writer_epoch,
             memory: context.memory,
+            faults: context.faults,
             manifest_guard: tokio::sync::Mutex::new(()),
         });
         for _ in 0..config.workers {
@@ -342,21 +441,6 @@ impl PersistenceRuntime {
         Ok(())
     }
 
-    /// Enqueue one generation and wait until its object and SQL publication
-    /// have completed. Boot replay uses this to keep WAL scanning behind the
-    /// bounded downstream publication boundary.
-    pub(crate) async fn submit_and_wait(&self, mut job: PersistenceJob) -> Result<(), ScribeError> {
-        let (sender, receiver) = oneshot::channel();
-        job.completion_waiter = Some(sender);
-        self.submit(job).await?;
-        receiver
-            .await
-            .map_err(|_| ScribeError::Internal {
-                detail: "persistence completion waiter dropped".to_owned(),
-            })?
-            .map_err(|detail| ScribeError::Internal { detail })
-    }
-
     /// Stop accepting jobs and wait for queued jobs to finish.
     pub(crate) async fn close_and_drain(&self) {
         if let Ok(mut sender) = self.sender.lock() {
@@ -393,6 +477,7 @@ struct PersistenceDependencies {
     node_id: String,
     writer_epoch: i64,
     memory: BifrostMemoryGovernor,
+    faults: PersistenceFaults,
     manifest_guard: tokio::sync::Mutex<()>,
 }
 
@@ -421,12 +506,18 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
                     &generation.seal_key.table,
                 ),
             );
-            let result = persist_with_retries(&generation, &job.binding, dependencies).await;
+            let result = persist_once(&generation, &job.binding, dependencies).await;
             drop(reservation);
             result
         }
         Err(error) => Err(error),
     };
+    let status = if result.is_ok() {
+        "published"
+    } else {
+        "failed"
+    };
+    metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);
     let published_at = std::time::Instant::now();
     metrics::histogram!("bifrost_scribe_persistence_publication_seconds").record(
         published_at
@@ -464,34 +555,6 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
     }
 }
 
-async fn persist_with_retries(
-    generation: &ImmutableGeneration,
-    binding: &TenantTableBinding,
-    dependencies: &PersistenceDependencies,
-) -> Result<FileListCommitKey, ScribeError> {
-    let mut last_error = None;
-    for attempt in 0..5_u32 {
-        match persist_once(generation, binding, dependencies).await {
-            Ok(key) => {
-                metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => "published")
-                    .increment(1);
-                return Ok(key);
-            }
-            Err(error) => {
-                last_error = Some(error);
-                metrics::counter!("bifrost_scribe_persistence_retries_total").increment(1);
-                if attempt < 4 {
-                    tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(attempt))).await;
-                }
-            }
-        }
-    }
-    metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => "failed").increment(1);
-    Err(last_error.unwrap_or_else(|| ScribeError::Internal {
-        detail: "persistence failed without an error".to_owned(),
-    }))
-}
-
 async fn persist_once(
     generation: &ImmutableGeneration,
     binding: &TenantTableBinding,
@@ -515,6 +578,12 @@ async fn persist_once(
         }
     };
     let path = object_path(binding, &dependencies.node_id)?;
+    let _object_write_guard = dependencies.faults.begin_object_write().await;
+    if dependencies.faults.take_object_write() {
+        return Err(ScribeError::Internal {
+            detail: "test object-store write failure".to_owned(),
+        });
+    }
     let path = put_object(
         &dependencies.operator,
         &path,
@@ -537,10 +606,20 @@ async fn persist_once(
     let outcome = file_list_writer::insert_and_audit(&mut conn, &row, &encoded.audit_events)
         .await
         .map_err(ScribeError::from)?;
+    if dependencies.faults.take_sql_commit() {
+        return Err(ScribeError::Internal {
+            detail: "test SQL commit failure".to_owned(),
+        });
+    }
     conn.commit().await.map_err(ScribeError::from)?;
 
     let manifest_path = dependencies.wal.base_dir().join("manifest");
     let lsn = generation.wal_lsn_max;
+    if dependencies.faults.take_manifest_publication() {
+        return Err(ScribeError::Internal {
+            detail: "test manifest publication failure".to_owned(),
+        });
+    }
     let _manifest_guard = dependencies.manifest_guard.lock().await;
     let result = dependencies
         .wal_io

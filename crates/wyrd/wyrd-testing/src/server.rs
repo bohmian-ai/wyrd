@@ -22,6 +22,7 @@ use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
+use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use wyrd_auth::exchange_api_key::TokenExchangeSettings;
 use wyrd_auth::issue_api_key::WyrdApiKey;
@@ -1291,6 +1292,12 @@ impl WyrdTestServerBuilder {
                 "test server requires a platform-admin operator pool for Forge".to_owned(),
             )
         })?;
+        let scribe_admission = self.scribe_admission.unwrap_or_default();
+        let bifrost_memory = BifrostMemoryGovernor::new_with_scribe_limit(
+            scribe_admission.memory_limit_bytes,
+            scribe_admission.scribe_memory_limit_bytes,
+        )
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let forge_context = ForgeContext::new(
             postgres.vala().clone(),
             operator_pool,
@@ -1298,7 +1305,8 @@ impl WyrdTestServerBuilder {
             Arc::new(storage.operator().clone()),
             ForgeConfig::default(),
         )
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
+        .with_memory_governor(bifrost_memory.clone());
         let scribe_wal_root = Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
@@ -1313,32 +1321,31 @@ impl WyrdTestServerBuilder {
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let scribe = if self.wal_sync_delay.is_zero() {
-            if let Some(admission) = self.scribe_admission {
-                ScribeImpl::new_for_embedded_with_runtime_config_and_admission(
-                    Arc::new(storage.operator().clone()),
-                    wal,
-                    node_id.to_string(),
-                    1,
-                    vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
-                    admission,
-                    tokio::runtime::Handle::current(),
-                )
-            } else {
-                ScribeImpl::new_for_embedded_with_deps(
-                    Arc::new(storage.operator().clone()),
-                    wal,
-                    node_id.to_string(),
-                    1,
-                )
-            }
+            ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+                Arc::new(storage.operator().clone()),
+                wal,
+                node_id.to_string(),
+                1,
+                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                    admission: scribe_admission,
+                    coordination_runtime: tokio::runtime::Handle::current(),
+                    memory_governor: Some(bifrost_memory.clone()),
+                },
+            )
         } else {
-            ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission(
+            ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
                 Arc::new(storage.operator().clone()),
                 wal,
                 node_id.to_string(),
                 1,
                 self.wal_sync_delay,
-                self.scribe_admission.unwrap_or_default(),
+                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
+                    admission: scribe_admission,
+                    coordination_runtime: tokio::runtime::Handle::current(),
+                    memory_governor: Some(bifrost_memory.clone()),
+                },
             )
             .map_err(WyrdTestServerError::Start)?
         };
@@ -1354,6 +1361,7 @@ impl WyrdTestServerBuilder {
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(bifrost_redux)
+            .with_bifrost_memory(bifrost_memory)
             .with_forge_context(forge_context)
             .with_forge_interval(self.forge_interval)
             .with_scribe(scribe)

@@ -287,7 +287,7 @@ impl AppState {
                 detail: error.to_string(),
             }
         })?;
-        scribe.complete_post_commit(post_commit)
+        scribe.complete_post_commit(post_commit).await
     }
 
     /// Trip the Scribe WAL breaker for a deterministic test-tier probe.

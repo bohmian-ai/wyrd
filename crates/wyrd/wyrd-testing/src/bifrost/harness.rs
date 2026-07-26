@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
 use vala_bifrost_redux::scribe::seal::PostCommitBatch;
 use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
@@ -92,12 +93,26 @@ impl BifrostHarness {
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
             );
-            let scribe = ScribeImpl::new_for_embedded_with_deps(
+            let memory_governor = cluster
+                .server(index)
+                .and_then(|server| server.state().bifrost_memory.clone())
+                .ok_or_else(|| {
+                    HarnessError::Configuration(
+                        "Bifrost test server did not provision shared memory".to_owned(),
+                    )
+                })?;
+            let scribe = ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
                 Arc::clone(&operator),
                 wal,
                 node_id.to_string(),
                 i64::try_from(index + 1)
                     .map_err(|error| HarnessError::Configuration(error.to_string()))?,
+                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                    admission: AdmissionConfig::default(),
+                    coordination_runtime: tokio::runtime::Handle::current(),
+                    memory_governor: Some(memory_governor),
+                },
             );
             scribes.push(Arc::new(scribe));
         }
@@ -144,7 +159,7 @@ impl BifrostHarness {
                     Ok(batch) => commits.push((scribe.as_ref(), batch)),
                     Err(error) => {
                         for (completed_scribe, batch) in commits {
-                            let _ = completed_scribe.abort_post_commit(batch);
+                            let _ = completed_scribe.abort_post_commit(batch).await;
                         }
                         return Err(HarnessError::Scribe(error.to_string()));
                     }
@@ -156,6 +171,7 @@ impl BifrostHarness {
             for (scribe, batch) in commits {
                 scribe
                     .complete_post_commit(batch)
+                    .await
                     .map_err(|error| HarnessError::Scribe(error.to_string()))?;
             }
         }

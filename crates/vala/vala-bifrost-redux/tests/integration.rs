@@ -12,6 +12,8 @@ mod pg_forge_scheduler_closeout;
 mod pg_scribe_crash_injection;
 #[path = "pg_scribe_idempotent.rs"]
 mod pg_scribe_idempotent;
+#[path = "pg_scribe_persistence.rs"]
+mod pg_scribe_persistence;
 #[path = "pg_scribe_registry.rs"]
 mod pg_scribe_registry;
 #[path = "pg_scribe_restart.rs"]
@@ -26,3 +28,5 @@ mod tail_rpc_backpressure;
 mod tail_rpc_terminal_frames;
 #[path = "task15_scribe_path.rs"]
 mod task15_scribe_path;
+#[path = "task16_wal_closeout.rs"]
+mod task16_wal_closeout;

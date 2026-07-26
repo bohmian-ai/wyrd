@@ -105,6 +105,31 @@ impl SealDriver {
         node_id: &str,
         writer_epoch: i64,
     ) -> Result<SealCommit, ScribeError> {
+        info!("seal stage: Freeze");
+        let freeze_started = std::time::Instant::now();
+        let frozen = memtable.freeze(seal_key)?;
+        Self::record(
+            "freeze",
+            freeze_started.elapsed(),
+            frozen.row_count(),
+            frozen.arrow_bytes,
+        );
+        self.pre_commit_frozen(&frozen, seal_key, binding, conn, node_id, writer_epoch)
+            .await
+    }
+
+    /// Execute seal stages after the owning shard has detached the frozen
+    /// generation from its writable state.
+    #[tracing::instrument(skip(self, frozen, conn), fields(seal_key = %seal_key))]
+    pub async fn pre_commit_frozen(
+        &self,
+        frozen: &FrozenMemtable,
+        seal_key: &SealKey,
+        binding: &TenantTableBinding,
+        conn: &mut TenantConn<'_>,
+        node_id: &str,
+        writer_epoch: i64,
+    ) -> Result<SealCommit, ScribeError> {
         binding
             .validate_authenticated_tenant(conn.data_tenant_id())
             .map_err(|error| ScribeError::Internal {
@@ -119,22 +144,11 @@ impl SealDriver {
             });
         }
 
-        // 1. Freeze
-        info!("seal stage: Freeze");
-        let freeze_started = std::time::Instant::now();
-        let frozen = memtable.freeze(seal_key)?;
-        Self::record(
-            "freeze",
-            freeze_started.elapsed(),
-            frozen.row_count(),
-            frozen.arrow_bytes,
-        );
-
         // 2. WriteParquet on the boot-owned persistence CPU lane.
         info!("seal stage: WriteParquet");
         let parquet_started = std::time::Instant::now();
         let encoded = self
-            .encode_parquet(&frozen, binding, seal_key.tenant)
+            .encode_parquet(frozen, binding, seal_key.tenant)
             .await?;
         Self::record(
             "parquet_encode",
@@ -158,7 +172,7 @@ impl SealDriver {
         info!("seal stage: AtomicPgTx");
         let pg_started = std::time::Instant::now();
         let row = file_list_writer::build_insert(
-            &frozen,
+            frozen,
             &encoded,
             binding,
             node_id,

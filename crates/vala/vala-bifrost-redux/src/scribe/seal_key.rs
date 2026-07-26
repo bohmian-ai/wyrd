@@ -176,6 +176,10 @@ pub(crate) fn split_batch_by_event_day(
 mod tests {
     use super::*;
     use crate::namespaces::BifrostNamespace;
+    use arrow::array::{Int64Array, TimestampMicrosecondArray};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     #[test]
     fn event_day_from_timestamp() {
@@ -197,5 +201,71 @@ mod tests {
         assert!(path.contains("vala.bifrost"));
         assert!(path.contains("events"));
         assert!(path.contains("2026-07-14"));
+    }
+
+    #[test]
+    fn one_day_split_reuses_arrow_value_buffers() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let source = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_784_040_000_000_000,
+                    1_784_043_600_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("one-day batch");
+
+        let slices = split_batch_by_event_day(&source).expect("split");
+        assert_eq!(slices.len(), 1);
+        assert!(Arc::ptr_eq(source.column(0), slices[0].1.column(0)));
+        assert!(Arc::ptr_eq(source.column(1), slices[0].1.column(1)));
+    }
+
+    #[test]
+    fn cross_day_split_materializes_each_day_once() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "wyrd_event_time",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let source = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    1_783_929_600_000_000,
+                    1_783_933_200_000_000,
+                    1_784_016_000_000_000,
+                    1_784_019_600_000_000,
+                ])),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+            ],
+        )
+        .expect("cross-day batch");
+
+        let slices = split_batch_by_event_day(&source).expect("split");
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].1.num_rows(), 2);
+        assert_eq!(slices[1].1.num_rows(), 2);
+        assert_eq!(
+            slices
+                .iter()
+                .map(|(_, batch)| batch.num_rows())
+                .sum::<usize>(),
+            4
+        );
+        assert_ne!(slices[0].0, slices[1].0);
     }
 }

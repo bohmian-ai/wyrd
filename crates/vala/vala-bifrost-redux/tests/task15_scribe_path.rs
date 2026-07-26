@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow::array::{Int64Array, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Int64Array, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
@@ -146,6 +146,186 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     );
 
     scribe.shutdown().await;
+}
+
+#[tokio::test]
+async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
+    let tenant = DataTenantId::new_v7();
+    let pointer_table = TableRef::new(BifrostNamespace::Bifrost, "task16_pointer_identity");
+    let day_table = TableRef::new(BifrostNamespace::Bifrost, "task16_day_isolation");
+    let day_one = NaiveDate::from_ymd_opt(2026, 7, 24).expect("day one");
+    let day_two = NaiveDate::from_ymd_opt(2026, 7, 25).expect("day two");
+    let source = batch(day_one);
+    let source_value = source.column(1).clone();
+    let temp_dir = TempDir::new().expect("WAL temp dir");
+    let operator = Arc::new(
+        opendal::Operator::new(opendal::services::Memory::default())
+            .expect("memory operator")
+            .finish(),
+    );
+    let wal = Arc::new(
+        WalWriter::new(
+            temp_dir.path(),
+            *Uuid::nil().as_bytes(),
+            1,
+            WalConfig::default(),
+        )
+        .expect("WAL writer"),
+    );
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, Uuid::nil().to_string(), 1);
+    scribe
+        .append_durable(ScribeAppend {
+            principal: principal(tenant),
+            table: pointer_table.clone(),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(source.schema().as_ref()),
+            request_id: RequestId::now_v7(),
+            batch_id: Uuid::now_v7(),
+            measured_wire_bytes: 0,
+            rows: source.clone(),
+        })
+        .await
+        .expect("pointer identity append");
+    let stream = StreamIdentity::new(NodeId::new(Uuid::nil()), WriterEpoch::new(1));
+    assert_pointer_identity(
+        &scribe,
+        tenant,
+        &pointer_table,
+        day_one,
+        &source_value,
+        stream,
+    )
+    .await;
+
+    let cross_day = cross_day_batch(source.schema(), day_one, day_two);
+    scribe
+        .append_durable(ScribeAppend {
+            principal: principal(tenant),
+            table: day_table.clone(),
+            schema_fingerprint: SchemaFingerprint::from_arrow_schema(cross_day.schema().as_ref()),
+            request_id: RequestId::now_v7(),
+            batch_id: Uuid::now_v7(),
+            measured_wire_bytes: 0,
+            rows: cross_day,
+        })
+        .await
+        .expect("cross-day append");
+    assert_cross_day_materialization(&scribe, tenant, &day_table, day_one, day_two, stream).await;
+    assert_other_tenant_isolated(&scribe, &pointer_table, day_one, stream).await;
+    scribe.shutdown().await;
+}
+
+async fn assert_pointer_identity(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &TableRef,
+    day: NaiveDate,
+    source_value: &ArrayRef,
+    stream: StreamIdentity,
+) {
+    let hot = scribe
+        .tail_service()
+        .expect("tail service")
+        .fetch_hot_batches(FetchLiveTailRequest {
+            binding: TenantTableBinding::resolve((tenant, table.clone())).expect("pointer binding"),
+            target_stream: stream,
+            start_day: EventDay::new(day),
+            end_day: EventDay::new(day),
+            after_lsn: WalLsn::ZERO,
+            required_columns: vec!["value".to_owned()],
+        })
+        .await
+        .expect("pointer hot snapshot");
+    assert_eq!(hot.len(), 1);
+    assert!(Arc::ptr_eq(source_value, hot[0].rows.column(0)));
+}
+
+fn cross_day_batch(schema: Arc<Schema>, day_one: NaiveDate, day_two: NaiveDate) -> RecordBatch {
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                day_one
+                    .and_hms_opt(12, 0, 0)
+                    .expect("day one time")
+                    .and_utc()
+                    .timestamp_micros(),
+                day_two
+                    .and_hms_opt(12, 0, 0)
+                    .expect("day two time")
+                    .and_utc()
+                    .timestamp_micros(),
+            ])),
+            Arc::new(Int64Array::from(vec![101_i64, 202_i64])),
+        ],
+    )
+    .expect("cross-day batch")
+}
+
+async fn assert_cross_day_materialization(
+    scribe: &ScribeImpl,
+    tenant: DataTenantId,
+    table: &TableRef,
+    day_one: NaiveDate,
+    day_two: NaiveDate,
+    stream: StreamIdentity,
+) {
+    let read_day = |day: NaiveDate| FetchLiveTailRequest {
+        binding: TenantTableBinding::resolve((tenant, table.clone())).expect("day binding"),
+        target_stream: stream,
+        start_day: EventDay::new(day),
+        end_day: EventDay::new(day),
+        after_lsn: WalLsn::ZERO,
+        required_columns: vec!["value".to_owned()],
+    };
+    let day_one_hot = scribe
+        .tail_service()
+        .expect("tail service")
+        .fetch_hot_batches(read_day(day_one))
+        .await
+        .expect("day one snapshot");
+    let day_two_hot = scribe
+        .tail_service()
+        .expect("tail service")
+        .fetch_hot_batches(read_day(day_two))
+        .await
+        .expect("day two snapshot");
+    assert_eq!(day_one_hot.len(), 1);
+    assert_eq!(day_two_hot.len(), 1);
+    assert_eq!(day_one_hot[0].rows.num_rows(), 1);
+    assert_eq!(day_two_hot[0].rows.num_rows(), 1);
+    assert_eq!(hot_value(&day_one_hot[0].rows), 101);
+    assert_eq!(hot_value(&day_two_hot[0].rows), 202);
+}
+
+fn hot_value(rows: &RecordBatch) -> i64 {
+    rows.column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("hot values")
+        .value(0)
+}
+
+async fn assert_other_tenant_isolated(
+    scribe: &ScribeImpl,
+    table: &TableRef,
+    day: NaiveDate,
+    stream: StreamIdentity,
+) {
+    let other = scribe
+        .tail_service()
+        .expect("tail service")
+        .fetch_hot_batches(FetchLiveTailRequest {
+            binding: TenantTableBinding::resolve((DataTenantId::new_v7(), table.clone()))
+                .expect("other tenant binding"),
+            target_stream: stream,
+            start_day: EventDay::new(day),
+            end_day: EventDay::new(day),
+            after_lsn: WalLsn::ZERO,
+            required_columns: vec!["value".to_owned()],
+        })
+        .await
+        .expect("other tenant snapshot");
+    assert!(other.is_empty(), "hot snapshots must be tenant isolated");
 }
 
 #[test]

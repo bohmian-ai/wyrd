@@ -10879,6 +10879,7 @@ dependencies = [
  "clap",
  "datafusion",
  "futures-util",
+ "hex",
  "http-body-util",
  "insta",
  "jsonwebtoken 9.3.1",

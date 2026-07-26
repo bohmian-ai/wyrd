@@ -23,6 +23,7 @@ arc-swap = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+hex = { workspace = true }
 clap = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 shellexpand = { workspace = true }

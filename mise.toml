@@ -246,7 +246,7 @@ run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifro
 [tasks."bench:bifrost:scribe:sustained"]
 description = "Run the gated sustained multi-tenant Scribe characterization"
 depends = ["setup:postgres", "db:migrate"]
-env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_BIFROST_CLOSEOUT = "1" }
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_BIFROST_CLOSEOUT = "1", WYRD_BIFROST_REPORT = "../../../target/bifrost-benchmarks/task16/scribe-sustained.json" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_scribe -- --pods=3 --tenants=100 --measured-seconds=60 --target-items-per-second=10000 --items-per-request=100"
 
 [tasks."bench:bifrost:otlp:ingest"]

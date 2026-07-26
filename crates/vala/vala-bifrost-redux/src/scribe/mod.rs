@@ -923,7 +923,28 @@ impl ScribeImpl {
         );
         tokio::pin!(replay_future);
         let mut restored = 0;
+        let mut wal_result = None;
         let replay_result = loop {
+            if let Some(result) = wal_result.take() {
+                // The WAL lane sends its final chunk before completing the
+                // operation. Drain the bounded receiver after completion so
+                // a ready future cannot discard an already-enqueued chunk.
+                let Some(chunk) = receiver.recv().await else {
+                    break result;
+                };
+                let chunk_result = if self.persistence.is_some() {
+                    self.replay_and_publish_chunk(chunk).await
+                } else {
+                    self.restore_replay_chunk(chunk).await
+                };
+                match chunk_result {
+                    Ok(count) => restored += count,
+                    Err(error) => break Err(error),
+                }
+                wal_result = Some(result);
+                continue;
+            }
+
             tokio::select! {
                 chunk = receiver.recv() => {
                     let Some(chunk) = chunk else {
@@ -936,13 +957,11 @@ impl ScribeImpl {
                     };
                     match chunk_result {
                         Ok(count) => restored += count,
-                        Err(error) => {
-                            break Err(error);
-                        }
+                        Err(error) => break Err(error),
                     }
                 }
                 result = &mut replay_future => {
-                    break result;
+                    wal_result = Some(result);
                 }
             }
         };

@@ -490,7 +490,7 @@ async fn get_trace(
         .await
         .map_err(WyrdErrorResponse::from)?;
 
-    // trace_id binary pushdown deferred to Stage 5 — Rust post-filter applied.
+    // Keep the extraction filter as a defense-in-depth check for provider rows.
     let spans: Vec<SpanRow> = extract_span_rows_filtered(&batches, &trace_id);
 
     if spans.is_empty() {

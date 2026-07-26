@@ -13,8 +13,8 @@
 //! aggregation after collecting batches. Stage 5 will push aggregation into the plan.
 //!
 //! Physical→API schema mapping:
-//!   - Binary ID columns (trace_id FixedBin16, span_id FixedBin8) are NOT filtered
-//!     by string predicates in Stage 4 — binary comparison requires separate handling.
+//!   - Trace IDs are converted to fixed-binary literals for exact plan filtering;
+//!     span IDs remain extraction-only fields.
 //!   - String column name differences (start_time vs started_at, service_name vs service)
 //!     are resolved in the extraction layer in routes.rs.
 
@@ -296,9 +296,19 @@ pub async fn build_get_trace_plan(
         .await
         .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
-    // trace_id is FixedSizeBinary(16) in the physical schema; the string filter
-    // needs a binary literal — deferred to Stage 5 hex→binary conversion.
-    // For now the time-window filter scopes the scan; callers rely on filtering in Rust.
+    let trace_id = hex::decode(&req.trace_id).map_err(|error| WyrdError::Validation {
+        message: "trace_id must be a hexadecimal value".to_owned(),
+        details: serde_json::json!({ "trace_id": req.trace_id, "detail": error.to_string() }),
+    })?;
+    if trace_id.len() != 16 {
+        return Err(WyrdError::Validation {
+            message: "trace_id must contain exactly 16 bytes".to_owned(),
+            details: serde_json::json!({ "trace_id": req.trace_id, "bytes": trace_id.len() }),
+        });
+    }
+    let df = df
+        .filter(col("trace_id").eq(lit(ScalarValue::FixedSizeBinary(16, Some(trace_id)))))
+        .map_err(df_err)?;
     let df = if !has_perm(caller, Resource::BifrostTracePayload) {
         df.drop_columns(&["attributes"]).map_err(df_err)?
     } else {

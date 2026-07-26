@@ -12,10 +12,12 @@ use wyrd_spec::card::model::{
     CustomMeta as CustomModelMeta, ModelInterface as RustModelInterface,
     ModelSignature as RustModelSignature, ModelSpec, SampleInput as RustSampleInput, TaskType,
 };
-use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, Ref};
+
+use crate::identity::{card_name, optional_card_uid, space_name, version_block};
 
 #[cfg(feature = "python")]
 use {
@@ -137,7 +139,7 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.to_card_envelope())?)
+        Ok(serde_json::to_string(&self.to_card()?)?)
     }
 
     /// Convert serialized holder metadata into the Rust card spec body.
@@ -157,8 +159,6 @@ impl ModelCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{card_name, optional_card_uid, space_name, version_block};
-
         Ok(CardRef {
             kind: CardKind::Model,
             name: card_name("name", &self.name)?,
@@ -168,49 +168,34 @@ impl ModelCard {
         })
     }
 
-    fn to_card_envelope(&self) -> ModelCardEnvelope<'_> {
-        ModelCardEnvelope {
-            api_version: ApiVersion::V1,
-            kind: "Model",
-            metadata: ModelCardEnvelopeMetadata {
-                name: &self.name,
-                version: &self.version,
-                space: &self.space,
-                uid: &self.uid,
-                labels: &self.labels,
-                annotations: &self.annotations,
+    /// Convert this holder into the shared Wyrd Card envelope.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when identity or model specification validation
+    /// fails.
+    pub fn to_card(&self) -> Result<Card, WyrdError> {
+        let spec = self.to_model_spec_from_metadata();
+        spec.validate()?;
+        Ok(Card {
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Model,
+            metadata: EnvelopeMetadata {
+                name: card_name("name", &self.name)?,
+                version: Some(version_block(&self.version)?.into()),
+                bump: None,
+                space: Some(space_name(&self.space)?),
+                uid: optional_card_uid(&self.uid)?,
+                labels: self.labels.clone(),
+                annotations: self.annotations.clone(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
             },
-            spec: self.to_model_spec_from_metadata(),
-            relationships: Vec::new(),
+            spec: Spec::Model(spec),
+            relationships: Relationships::default(),
             status: None,
-        }
+        })
     }
-}
-
-#[derive(Serialize)]
-struct ModelCardEnvelope<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    kind: &'static str,
-    metadata: ModelCardEnvelopeMetadata<'a>,
-    spec: ModelSpec,
-    relationships: Vec<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct ModelCardEnvelopeMetadata<'a> {
-    name: &'a str,
-    version: &'a str,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    space: &'a str,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    uid: &'a str,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    labels: &'a Labels,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    annotations: &'a Annotations,
 }
 
 #[cfg(feature = "python")]
@@ -419,6 +404,51 @@ impl ModelCard {
         self.interface
             .as_ref()
             .map(|interface| interface.clone_ref(py))
+    }
+
+    /// Return the live framework model held by this card.
+    ///
+    /// Returns `None` before artifact loading or when a custom interface does
+    /// not expose a `model` attribute.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom interface attribute getter fails.
+    #[getter]
+    pub fn model(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        let Some(interface) = self.interface.as_ref() else {
+            return Ok(None);
+        };
+        ModelInterfaceHandle::from_interface(interface.bind(py))?.model_py(py)
+    }
+
+    /// Return the live preprocessing object held by this card.
+    ///
+    /// Returns `None` for interfaces without a preprocessor. Hugging Face
+    /// interfaces expose their analogous object through `processor`.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom interface attribute getter fails.
+    #[getter]
+    pub fn preprocessor(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        let Some(interface) = self.interface.as_ref() else {
+            return Ok(None);
+        };
+        ModelInterfaceHandle::from_interface(interface.bind(py))?.preprocessor_py(py)
+    }
+
+    /// Return the live Hugging Face processor held by this card.
+    ///
+    /// Returns `None` for non-Hugging Face interfaces and custom interfaces
+    /// without a `processor` attribute.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom interface attribute getter fails.
+    #[getter]
+    pub fn processor(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        let Some(interface) = self.interface.as_ref() else {
+            return Ok(None);
+        };
+        ModelInterfaceHandle::from_interface(interface.bind(py))?.processor_py(py)
     }
 
     /// Replace the held live model interface.
@@ -684,7 +714,7 @@ impl ModelCard {
 
     /// Return this `ModelCard` as a Python dictionary.
     pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        let value = serde_json::to_value(self.to_card_envelope())?;
+        let value = serde_json::to_value(self.to_card()?)?;
         wyrd_utils::py::json_to_pyobject(py, &value).map_err(Into::into)
     }
 
@@ -697,7 +727,10 @@ impl ModelCard {
 
     /// Return a pretty JSON representation for interactive inspection.
     pub fn __str__(&self) -> String {
-        wyrd_utils::json::pretty_json_string(&self.to_card_envelope())
+        match self.to_card() {
+            Ok(card) => wyrd_utils::json::pretty_json_string(&card),
+            Err(error) => format!("ModelCard(invalid={error})"),
+        }
     }
 
     /// Build a `ModelCard` from serialized JSON and an optional interface hook.
@@ -887,7 +920,7 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
 
 #[cfg(feature = "python")]
 fn write_model_card_json_file(card: &ModelCard, path: &std::path::Path) -> CardPyResult<()> {
-    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope())
+    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card()?)
         .map_err(|error| WyrdPyError::Io(error.to_string()))
 }
 
@@ -1036,7 +1069,16 @@ mod tests {
 
     #[test]
     fn model_card_envelope_serializes_kind_model() {
-        let serialized = match model_card().model_dump_json() {
+        let card = model_card();
+        let envelope = card.to_card().expect("ModelCard is valid");
+        assert!(envelope.metadata.spec_hash.is_none());
+        assert!(envelope.relationships.outbound.is_empty());
+        assert!(envelope.status.is_none());
+        let restored = ModelCard::from_card(envelope).expect("native ModelCard round trips");
+        assert_eq!(restored.name, card.name);
+        assert_eq!(restored.metadata.task_type, card.metadata.task_type);
+
+        let serialized = match card.model_dump_json() {
             Ok(value) => value,
             Err(error) => panic!("ModelCard holder should serialize: {error}"),
         };

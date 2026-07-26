@@ -66,6 +66,10 @@ class TextModelInterface(ModelInterface):
         self.loaded_kwargs = load_kwargs
         self.value = (path / "model.txt").read_text(encoding="utf-8")
 
+    @property
+    def model(self) -> str:
+        return self.value
+
 
 def _name(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex[:12]}"
@@ -104,6 +108,8 @@ def test_prompt_cards_register_get_list_resolve_latest_and_delete(wyrd_server) -
     envelope = cards.prompt.get(uid=card.uid)
     assert isinstance(envelope, PromptCard)
     assert envelope.uid == card.uid
+    assert isinstance(envelope.prompt, Prompt)
+    assert envelope.prompt.model == "gpt-4o"
     latest = cards.prompt.resolve_latest(space="python-e2e", name=name)
     assert latest.uid == card.uid
     exact = cards.prompt.get(space="python-e2e", name=name, version=latest.version)
@@ -168,6 +174,9 @@ def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
     loaded.load(load_kwargs=ModelLoadArgs({"strict": True}))
     assert loaded.interface.value == "model-bytes"
     assert loaded.interface.loaded_kwargs == {"strict": True}
+    assert loaded.model == "model-bytes"
+    assert loaded.preprocessor is None
+    assert loaded.processor is None
 
     cards.model.delete(uid=card.uid)
 

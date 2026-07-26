@@ -5,9 +5,9 @@
 from collections.abc import Mapping
 from typing import Protocol, TypeAlias
 
-from ..data import DataCard, DataInterface
-from ..model import ModelCard, ModelInterface
-from ..prompt import PromptCard, PromptReference
+from .data import DataCard, DataInterface
+from .model import ModelCard, ModelInterface
+from .prompt import Prompt, PromptCard, PromptReference
 
 #### end of imports ####
 
@@ -44,9 +44,12 @@ class AgentCard:
     name: str
     version: str
     uid: str
+    labels: dict[str, str]
+    annotations: dict[str, str]
     spec: dict[str, JsonValue]
     cascade_children: list[CardRef]
-    prompt: PromptReference
+    prompt_ref: PromptReference
+    prompt: Prompt | None
 
     def __init__(
         self,

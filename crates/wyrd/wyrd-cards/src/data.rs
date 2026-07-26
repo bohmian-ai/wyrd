@@ -12,11 +12,13 @@ use wyrd_spec::card::data::{
     CustomDataMeta, DataInterface as RustDataInterface, DataSchema, DataSpec, DataSplit, DataStats,
     SqlLogic,
 };
-use wyrd_spec::envelope::{CardKind, Spec};
+use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{ColumnName, SplitName};
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, Ref};
+
+use crate::identity::{card_name, optional_card_uid, space_name, version_block};
 
 #[cfg(feature = "python")]
 use {
@@ -139,7 +141,7 @@ impl DataCard {
     /// # Errors
     /// Returns a Wyrd error when serialization fails.
     pub fn model_dump_json(&self) -> CardPyResult<String> {
-        Ok(serde_json::to_string(&self.to_card_envelope())?)
+        Ok(serde_json::to_string(&self.to_card()?)?)
     }
 
     /// Convert serialized holder metadata into the Rust card spec body.
@@ -167,8 +169,6 @@ impl DataCard {
     /// # Errors
     /// Returns a Wyrd error when identity fields are invalid.
     pub fn as_card_ref(&self) -> Result<CardRef, WyrdError> {
-        use crate::identity::{card_name, optional_card_uid, space_name, version_block};
-
         Ok(CardRef {
             kind: CardKind::Data,
             name: card_name("name", &self.name)?,
@@ -178,49 +178,35 @@ impl DataCard {
         })
     }
 
-    fn to_card_envelope(&self) -> DataCardEnvelope<'_> {
-        DataCardEnvelope {
-            api_version: ApiVersion::V1,
-            kind: "Data",
-            metadata: DataCardEnvelopeMetadata {
-                name: &self.name,
-                version: &self.version,
-                space: &self.space,
-                uid: &self.uid,
-                labels: &self.labels,
-                annotations: &self.annotations,
+    /// Convert this holder into the shared Wyrd Card envelope.
+    ///
+    /// Draft Data Cards may contain placeholder statistics, so this conversion
+    /// validates identity but leaves durable `DataSpec` validation to
+    /// registration and deserialization boundaries.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when holder identity is invalid.
+    pub fn to_card(&self) -> Result<Card, WyrdError> {
+        Ok(Card {
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Data,
+            metadata: EnvelopeMetadata {
+                name: card_name("name", &self.name)?,
+                version: Some(version_block(&self.version)?.into()),
+                bump: None,
+                space: Some(space_name(&self.space)?),
+                uid: optional_card_uid(&self.uid)?,
+                labels: self.labels.clone(),
+                annotations: self.annotations.clone(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
             },
-            spec: self.to_data_spec_from_metadata(),
-            relationships: Vec::new(),
+            spec: Spec::Data(self.to_data_spec_from_metadata()),
+            relationships: Relationships::default(),
             status: None,
-        }
+        })
     }
-}
-
-#[derive(Serialize)]
-struct DataCardEnvelope<'a> {
-    #[serde(rename = "apiVersion")]
-    api_version: &'static str,
-    kind: &'static str,
-    metadata: DataCardEnvelopeMetadata<'a>,
-    spec: DataSpec,
-    relationships: Vec<serde_json::Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<serde_json::Value>,
-}
-
-#[derive(Serialize)]
-struct DataCardEnvelopeMetadata<'a> {
-    name: &'a str,
-    version: &'a str,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    space: &'a str,
-    #[serde(skip_serializing_if = "str::is_empty")]
-    uid: &'a str,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    labels: &'a Labels,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    annotations: &'a Annotations,
 }
 
 #[cfg(feature = "python")]
@@ -236,7 +222,6 @@ impl DataCardMetadata {
     }
 }
 
-#[cfg(feature = "python")]
 impl DataCard {
     /// Build a native holder from a server-returned Data Card envelope.
     ///
@@ -679,7 +664,7 @@ impl DataCard {
 
     /// Return this `DataCard` as a Python dictionary.
     pub fn model_dump(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
-        let value = serde_json::to_value(self.to_card_envelope())?;
+        let value = serde_json::to_value(self.to_card()?)?;
         wyrd_utils::py::json_to_pyobject(py, &value).map_err(Into::into)
     }
 
@@ -692,7 +677,10 @@ impl DataCard {
 
     /// Return a pretty JSON representation for interactive inspection.
     pub fn __str__(&self) -> String {
-        wyrd_utils::json::pretty_json_string(&self.to_card_envelope())
+        match self.to_card() {
+            Ok(card) => wyrd_utils::json::pretty_json_string(&card),
+            Err(error) => format!("DataCard(invalid={error})"),
+        }
     }
 
     /// Build a `DataCard` from serialized JSON and an optional interface hook.
@@ -943,7 +931,7 @@ fn metadata_error(error: MetadataError) -> WyrdPyError {
 
 #[cfg(feature = "python")]
 fn write_card_json_file(card: &DataCard, path: &std::path::Path) -> CardPyResult<()> {
-    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card_envelope())
+    wyrd_utils::json::write_json_sorted(path.join("card.json"), &card.to_card()?)
         .map_err(|error| WyrdPyError::Io(error.to_string()))
 }
 
@@ -1053,6 +1041,14 @@ mod tests {
 
         let body = card.to_rust_card_body_from_metadata();
         assert!(matches!(body, Spec::Data(_)));
+
+        let envelope = card.to_card().expect("DataCard identity is valid");
+        assert!(envelope.metadata.spec_hash.is_none());
+        assert!(envelope.relationships.outbound.is_empty());
+        assert!(envelope.status.is_none());
+        let restored = DataCard::from_card(envelope).expect("native DataCard round trips");
+        assert_eq!(restored.name, card.name);
+        assert_eq!(restored.metadata.stats, card.metadata.stats);
 
         let serialized = card
             .model_dump_json()

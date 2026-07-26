@@ -683,6 +683,9 @@ class ModelCard:
     annotations: dict[str, str]
     metadata: ModelCardMetadata
     interface: ModelInterface | None
+    model: Any | None
+    preprocessor: Any | None
+    processor: Any | None
     task_type: str
     signature: ModelSignature
     sample_input: SampleInput | None

@@ -145,7 +145,7 @@ def test_custom_json_without_explicit_interface_raises_stable_model_error_code()
             "signature": model_signature().to_dict(),
             "card_refs": [],
         },
-        "relationships": [],
+        "relationships": {},
     }
 
     with pytest.raises(WyrdError) as exc:

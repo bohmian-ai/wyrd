@@ -98,6 +98,7 @@ def _round_trip(card: ModelCard, path: Path, expected_kind: str, *, interface=No
 
     assert restored.interface.kind == expected_kind
     assert restored.interface.has_model is True
+    assert restored.model is not None
     assert_model_card_json(path, expected_kind)
     return restored
 
@@ -157,6 +158,22 @@ def test_sklearn_interface_loads_a_local_materialization(tmp_path: Path) -> None
     card.load(source)
 
     assert card.interface.has_model is True
+    assert card.model is not None
+
+
+def test_modelcard_projects_model_and_preprocessor_directly() -> None:
+    from sklearn.preprocessing import StandardScaler
+
+    model = _sklearn_model()
+    preprocessor = StandardScaler().fit(_matrix()[0])
+    card = ModelCard(
+        SklearnInterface(model=model, preprocessor=preprocessor),
+        metadata=model_metadata("binary_classification"),
+    )
+
+    assert card.model is model
+    assert card.preprocessor is preprocessor
+    assert card.processor is None
 
 
 def test_xgboost_interface_round_trips(tmp_path: Path) -> None:
@@ -297,6 +314,10 @@ def test_custom_python_model_interface_round_trips_with_explicit_loader(tmp_path
         def load(self, path, load_kwargs=None):
             self.value = (path / "custom.txt").read_text(encoding="utf-8")
 
+        @property
+        def model(self):
+            return self.value
+
     card = ModelCard(CustomMemoryInterface("saved"), metadata=model_metadata("other"))
     path = tmp_path / "custom"
     card.save(path)
@@ -309,6 +330,7 @@ def test_custom_python_model_interface_round_trips_with_explicit_loader(tmp_path
 
     assert restored.interface.kind == "Custom"
     assert restored.interface.value == "saved"
+    assert restored.model == "saved"
     assert_model_card_json(path, "Custom")
 
 

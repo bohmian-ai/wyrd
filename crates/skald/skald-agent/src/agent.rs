@@ -11,7 +11,7 @@ use skald_runtime::ProviderRegistry;
 use skald_spec::Prompt as PromptSpec;
 use skald_tool::{AgentTool, ToolError, ToolResolver};
 use wyrd_spec::{
-    AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec, CardMetadata,
+    AgentCard, AgentRunConfigSpec, AgentSpec, CardMetadata,
     envelope::CardKind,
     error::WyrdError,
     metadata::{Annotations, Labels},
@@ -21,6 +21,7 @@ use wyrd_spec::{
 use crate::callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, BeforeAgentFn, BeforeModelFn, BeforeToolFn,
 };
+use crate::card_error::AgentCardError;
 use crate::error::AgentResult;
 use crate::journal::{Journal, NoopJournal};
 use crate::run::{AgentRun, RunConfig};

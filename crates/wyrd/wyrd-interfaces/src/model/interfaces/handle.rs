@@ -206,6 +206,74 @@ impl ModelInterfaceHandle {
             Self::Subclass(_) => None,
         }
     }
+
+    /// Return the held live model as a Python object.
+    ///
+    /// Custom interfaces may expose an optional `model` attribute.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom attribute getter fails.
+    pub fn model_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        match self {
+            Self::Subclass(value) => optional_subclass_attribute(value.bind(py), "model"),
+            _ => Ok(self.model_ref().map(|model| model.clone_ref(py))),
+        }
+    }
+
+    /// Return the held preprocessing object as a Python object.
+    ///
+    /// Hugging Face interfaces use `processor` instead. Custom interfaces may
+    /// expose an optional `preprocessor` attribute.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom attribute getter fails.
+    pub fn preprocessor_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        let preprocessor = match self {
+            Self::Sklearn(value) => value.preprocessor.as_deref(),
+            Self::Xgboost(value) => value.preprocessor.as_deref(),
+            Self::Lightgbm(value) => value.preprocessor.as_deref(),
+            Self::Catboost(value) => value.preprocessor.as_deref(),
+            Self::Torch(value) => value.preprocessor.as_deref(),
+            Self::Lightning(value) => value.preprocessor.as_deref(),
+            Self::Tensorflow(value) => value.preprocessor.as_deref(),
+            Self::Huggingface(_) => None,
+            Self::Subclass(value) => {
+                return optional_subclass_attribute(value.bind(py), "preprocessor");
+            }
+        };
+        Ok(preprocessor.map(|value| value.clone_ref(py)))
+    }
+
+    /// Return the held Hugging Face processor as a Python object.
+    ///
+    /// Custom interfaces may expose an optional `processor` attribute.
+    ///
+    /// # Errors
+    /// Returns a Python error when a custom attribute getter fails.
+    pub fn processor_py(&self, py: Python<'_>) -> CardPyResult<Option<Py<PyAny>>> {
+        match self {
+            Self::Huggingface(value) => Ok(value
+                .processor
+                .as_deref()
+                .map(|processor| processor.clone_ref(py))),
+            Self::Subclass(value) => optional_subclass_attribute(value.bind(py), "processor"),
+            _ => Ok(None),
+        }
+    }
+}
+
+fn optional_subclass_attribute(
+    interface: &Bound<'_, PyAny>,
+    name: &str,
+) -> CardPyResult<Option<Py<PyAny>>> {
+    if !interface.hasattr(name)? {
+        return Ok(None);
+    }
+    let value = interface.getattr(name)?;
+    if value.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(value.unbind()))
 }
 
 fn package_version(py: Python<'_>, package: &str) -> String {

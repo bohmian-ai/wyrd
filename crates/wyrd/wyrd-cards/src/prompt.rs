@@ -9,9 +9,7 @@ use serde_json::json;
 use wyrd_interfaces::error::CardPyResult;
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::prompt::PromptSpec;
-use wyrd_spec::envelope::{
-    Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec, SpecHash,
-};
+use wyrd_spec::envelope::{Card, CardKind, Metadata as EnvelopeMetadata, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::metadata::{Annotations, Labels};
 use wyrd_spec::reference::{CardRef, InlineableRef};
@@ -114,7 +112,7 @@ pub struct PromptCard {
     /// Held live Python Prompt. This is skipped in serialized card JSON.
     #[cfg(feature = "python")]
     #[serde(skip)]
-    pub prompt: Option<Py<PyAny>>,
+    pub prompt: Option<Py<skald_prompt::Prompt>>,
 }
 
 impl PromptCard {
@@ -177,16 +175,10 @@ impl PromptCard {
     /// fails.
     pub fn to_card(&self) -> Result<Card, WyrdError> {
         let spec = Spec::Prompt(self.to_prompt_spec_from_metadata()?);
-        let spec_hash = spec.canonical_hash().map_err(|e| {
-            validation_error(
-                "PromptCard spec failed canonicalization",
-                json!({ "source": e.to_string() }),
-            )
-        })?;
         Ok(Card {
             api_version: ApiVersion::v1(),
             kind: CardKind::Prompt,
-            metadata: self.to_envelope_metadata(spec_hash)?,
+            metadata: self.to_envelope_metadata()?,
             spec,
             relationships: Relationships::default(),
             status: None,
@@ -275,7 +267,7 @@ impl PromptCard {
         Ok(())
     }
 
-    fn to_envelope_metadata(&self, spec_hash: SpecHash) -> Result<EnvelopeMetadata, WyrdError> {
+    fn to_envelope_metadata(&self) -> Result<EnvelopeMetadata, WyrdError> {
         Ok(EnvelopeMetadata {
             name: card_name("name", &self.name)?,
             version: Some(version_block(&self.version)?.into()),
@@ -284,7 +276,7 @@ impl PromptCard {
             uid: optional_card_uid(&self.uid)?,
             labels: self.labels.clone(),
             annotations: self.annotations.clone(),
-            spec_hash: Some(spec_hash),
+            spec_hash: None,
             artifact_hash: None,
             origin: None,
         })
@@ -330,6 +322,29 @@ impl PromptReference {
             InlineableRef::Sibling { .. } => "sibling",
             InlineableRef::Inline(_) => "inline",
             InlineableRef::Path(_) => "path",
+        }
+    }
+
+    /// Return the exact Card reference when this is a card-backed prompt.
+    #[getter]
+    pub fn card_ref(&self) -> Option<CardRefPy> {
+        self.inner.as_card_ref().cloned().map(CardRefPy)
+    }
+
+    /// Return the typed runtime Prompt when this reference is inline.
+    ///
+    /// # Errors
+    /// Returns a Python allocation error when the runtime wrapper cannot be
+    /// created.
+    #[getter]
+    pub fn prompt(&self, py: Python<'_>) -> CardPyResult<Option<Py<skald_prompt::Prompt>>> {
+        match &self.inner {
+            InlineableRef::Inline(prompt) => {
+                Ok(Some(skald_prompt::prompt_py((**prompt).clone(), py)?))
+            }
+            InlineableRef::Ref(_) | InlineableRef::Sibling { .. } | InlineableRef::Path(_) => {
+                Ok(None)
+            }
         }
     }
 
@@ -451,7 +466,7 @@ impl PromptCard {
         let prompt = if model_settings.is_some_and(|value| !value.is_none()) {
             Some(skald_prompt::prompt_py(metadata.prompt.clone(), py)?)
         } else {
-            Some(prompt.clone().unbind())
+            Some(runtime_prompt_from_py(prompt)?)
         };
 
         let mut resolved_space = space.map(str::to_owned);
@@ -480,7 +495,7 @@ impl PromptCard {
 
     /// Return the held live prompt, if one is attached.
     #[getter]
-    pub fn prompt(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+    pub fn prompt(&self, py: Python<'_>) -> CardPyResult<Py<skald_prompt::Prompt>> {
         if let Some(prompt) = self.prompt.as_ref() {
             return Ok(prompt.clone_ref(py));
         }
@@ -494,7 +509,7 @@ impl PromptCard {
     #[setter]
     pub fn set_prompt(&mut self, prompt: &Bound<'_, PyAny>) -> CardPyResult<()> {
         self.metadata.prompt = native_prompt_from_py(prompt)?;
-        self.prompt = Some(prompt.clone().unbind());
+        self.prompt = Some(runtime_prompt_from_py(prompt)?);
         Ok(())
     }
 
@@ -771,6 +786,14 @@ fn native_prompt_from_py(prompt: &Bound<'_, PyAny>) -> CardPyResult<skald_spec::
 }
 
 #[cfg(feature = "python")]
+fn runtime_prompt_from_py(prompt: &Bound<'_, PyAny>) -> CardPyResult<Py<skald_prompt::Prompt>> {
+    let prompt = prompt
+        .extract::<PyRef<'_, skald_prompt::Prompt>>()
+        .map_err(|_| WyrdPyError::validation("PromptCard requires a wyrd.prompt.Prompt"))?;
+    Ok(Py::new(prompt.py(), prompt.clone())?)
+}
+
+#[cfg(feature = "python")]
 fn labels_from_user(values: BTreeMap<String, String>) -> CardPyResult<Labels> {
     values
         .into_iter()
@@ -864,6 +887,14 @@ mod tests {
             .to_prompt_spec_from_metadata()
             .expect("valid prompt converts to PromptSpec");
         assert_eq!(spec.prompt, prompt);
+
+        let envelope = card.to_card().expect("PromptCard is valid");
+        assert!(envelope.metadata.spec_hash.is_none());
+        assert!(envelope.relationships.outbound.is_empty());
+        assert!(envelope.status.is_none());
+        let restored = PromptCard::from_card(envelope).expect("native PromptCard round trips");
+        assert_eq!(restored.name, card.name);
+        assert_eq!(restored.metadata.prompt, card.metadata.prompt);
     }
 
     #[test]

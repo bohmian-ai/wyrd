@@ -1361,11 +1361,11 @@ class PromptReference:
     """
 
     kind: str
+    card_ref: CardRef | None
+    prompt: Prompt | None
 
     @staticmethod
-    def card(
-        name: str, version: str, *, space: str | None = ..., uid: str | None = ...
-    ) -> PromptReference:
+    def card(name: str, version: str, *, space: str, uid: str | None = ...) -> PromptReference:
         """Create a reference to a registered Prompt Card."""
         ...
 

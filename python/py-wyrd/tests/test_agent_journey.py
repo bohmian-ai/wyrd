@@ -75,7 +75,28 @@ def test_agent_card_json_round_trip() -> None:
     assert payload["metadata"]["space"] == "research"
     assert restored.uid == card.uid
     assert restored.name == card.name
-    assert restored.prompt is not None
+    assert isinstance(restored.prompt, Prompt)
+    assert restored.prompt_ref.kind == "inline"
+    assert isinstance(restored.prompt_ref.prompt, Prompt)
+    assert restored.prompt_ref.card_ref is None
+
+
+def test_agent_card_preserves_unresolved_registered_prompt_reference() -> None:
+    prompt_ref = PromptReference.card(
+        "planner-prompt",
+        "0.3.0",
+        space="research",
+        uid="018f90f5-8e1b-7c4a-a834-4d2d4df6e9c2",
+    )
+    restored = AgentCard.model_validate_json(
+        AgentCard(prompt_ref, space="research", name="planner").model_dump_json()
+    )
+
+    assert restored.prompt is None
+    assert restored.prompt_ref.prompt is None
+    assert restored.prompt_ref.card_ref is not None
+    assert restored.prompt_ref.card_ref.name == "planner-prompt"
+    assert restored.prompt_ref.card_ref.version == "0.3.0"
 
 
 def test_journey_delegate_via_agent_delegate_tool() -> None:

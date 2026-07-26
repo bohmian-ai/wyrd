@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod callbacks;
+pub mod card_error;
 pub mod conversation;
 pub mod delegate;
 pub mod delegation;
@@ -39,6 +40,7 @@ pub use callbacks::{
     AfterAgentFn, AfterModelFn, AfterToolFn, AgentContext, BeforeAgentFn, BeforeModelFn,
     BeforeToolFn, CallbackOutcome,
 };
+pub use card_error::AgentCardError;
 pub use conversation::{Conversation, ConversationTurn};
 pub use delegate::AgentDelegateTool;
 pub use error::{AgentError, AgentResult};

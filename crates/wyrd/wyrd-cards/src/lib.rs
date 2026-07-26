@@ -32,8 +32,8 @@ pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
     cards.add_class::<card_ref::Kind>()?;
 
     wyrd_interfaces::error::register_exceptions(&agent)?;
-    agent.add_class::<agent::AgentCard>()?;
-    cards.add_class::<agent::AgentCard>()?;
+    agent.add_class::<agent::PyAgentCard>()?;
+    cards.add_class::<agent::PyAgentCard>()?;
 
     wyrd_interfaces::error::register_exceptions(&data)?;
     wyrd_interfaces::data::register(&data)?;

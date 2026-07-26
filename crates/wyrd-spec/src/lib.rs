@@ -33,7 +33,7 @@ pub mod storage;
 pub mod trace;
 pub mod vala;
 
-pub use card::agent::{AgentCard, AgentCardError, AgentRunConfigSpec, AgentSpec};
+pub use card::agent::{AgentCard, AgentRunConfigSpec, AgentSpec};
 pub use card::data::{
     ArrowFormat, ArrowMeta, ColValue, ColorMode, CustomDataMeta, DataInterface, DataSchema,
     DataSpec, DataSplit, DataStats, HuggingfaceMeta, ImageFormat, ImageMeta, Inequality,

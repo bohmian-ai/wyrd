@@ -53,15 +53,15 @@ mod pg_tests {
         operator_pool: OperatorPool,
         /// Real SQL Iceberg catalog used for snapshot assertions.
         catalog: Arc<dyn Catalog>,
-        /// Filesystem OpenDAL operator used to seed and inspect objects.
+        /// Filesystem `OpenDAL` operator used to seed and inspect objects.
         staging: Arc<opendal::Operator>,
         /// Baseline production limits used to compose alternate owners.
         config: ForgeConfig,
         /// Warehouse and Forge spill root retained for the fixture lifetime.
-        _root: TempDir,
+        root: TempDir,
     }
 
-    /// Object-store capability backed by the fixture's OpenDAL operator.
+    /// Object-store capability backed by the fixture's `OpenDAL` operator.
     #[derive(Debug)]
     struct TestObjectStore {
         /// Filesystem operator shared with fixture producers.
@@ -108,7 +108,56 @@ mod pg_tests {
     }
 
     impl Fixture {
+        /// Construct and seed a complete Postgres, catalog, and Forge fixture.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded services, catalog, or initial seed cannot
+        /// be created; these are fixture invariants rather than test inputs.
         async fn new() -> Self {
+            let (pg, vala, tenant, binding, root, staging) = Self::create_environment().await;
+            let arrow_schema = Self::arrow_schema();
+            let catalog = Self::create_catalog(&pg, &binding, &root, &arrow_schema).await;
+            let operator_pool = OperatorPool::from(pg.platform_admin_pool().clone());
+            let config = ForgeConfig::default();
+            let forge = Self::create_forge(
+                &vala,
+                &operator_pool,
+                &catalog,
+                &staging,
+                &root,
+                config.clone(),
+            );
+            let fixture = Self {
+                pg,
+                tenant,
+                binding,
+                forge,
+                vala,
+                operator_pool,
+                catalog,
+                staging,
+                config,
+                root,
+            };
+            fixture.seed_two_files(&arrow_schema).await;
+            fixture
+        }
+
+        /// Start the external services and allocate fixture-owned resources.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded Postgres fixture, temporary directory, or
+        /// local object-store operator cannot be initialized.
+        async fn create_environment() -> (
+            PgFixture,
+            vala_sql::ValaPostgres,
+            DataTenantId,
+            TenantTableBinding,
+            TempDir,
+            Arc<opendal::Operator>,
+        ) {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let vala = pg.vala_postgres().clone();
             let tenant = pg.data_tenant_id();
@@ -123,7 +172,33 @@ mod pg_tests {
                     .expect("filesystem operator")
                     .finish(),
             );
+            (pg, vala, tenant, binding, root, staging)
+        }
 
+        /// Return the Arrow schema shared by seeded staging files and Iceberg.
+        fn arrow_schema() -> ArrowSchema {
+            ArrowSchema::new(vec![
+                Field::new("value", DataType::Int64, false),
+                Field::new(
+                    "wyrd_event_time",
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                    false,
+                ),
+                Field::new("data_tenant_id", DataType::Utf8, false),
+            ])
+        }
+
+        /// Create the SQL Iceberg catalog and tenant table for the fixture.
+        ///
+        /// # Panics
+        ///
+        /// Panics when catalog loading or tenant table creation fails.
+        async fn create_catalog(
+            pg: &PgFixture,
+            binding: &TenantTableBinding,
+            root: &TempDir,
+            arrow_schema: &ArrowSchema,
+        ) -> Arc<dyn Catalog> {
             install_default_drivers();
             let storage_factory = Arc::new(OpenDalResolvingStorageFactory::new());
             let warehouse = format!("file://{}", root.path().display());
@@ -151,18 +226,8 @@ mod pg_tests {
                 .await
                 .expect("sql iceberg catalog");
             let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-
-            let arrow_schema = ArrowSchema::new(vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    false,
-                ),
-                Field::new("data_tenant_id", DataType::Utf8, false),
-            ]);
             let iceberg_schema =
-                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow_schema)
+                iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(arrow_schema)
                     .expect("iceberg schema");
             let partition_spec =
                 build_partition_spec(&iceberg_schema, &binding.partition_columns())
@@ -183,52 +248,61 @@ mod pg_tests {
                 )
                 .await
                 .expect("tenant table");
+            catalog
+        }
 
-            let operator_pool = OperatorPool::from(pg.platform_admin_pool().clone());
+        /// Build the public Forge owner used by the fixture's scheduler tests.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the staging channel, rewrite runtime, or Forge
+        /// constructor rejects the fixture configuration.
+        fn create_forge(
+            vala: &vala_sql::ValaPostgres,
+            operator_pool: &OperatorPool,
+            catalog: &Arc<dyn Catalog>,
+            staging: &Arc<opendal::Operator>,
+            root: &TempDir,
+            config: ForgeConfig,
+        ) -> Forge {
             let object_store: Arc<dyn ForgeObjectStore> = Arc::new(TestObjectStore {
-                operator: Arc::clone(&staging),
+                operator: Arc::clone(staging),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
-            let config = ForgeConfig::default();
             let rewrite_runtime = ForgeRewriteRuntime::new(
                 Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
                 &root.path().join("forge-spill"),
                 config.spill_limit_bytes,
             )
             .expect("rewrite runtime");
-            let forge = Forge::new(ForgeBuildConfig {
+            Forge::new(ForgeBuildConfig {
                 vala: vala.clone(),
                 operator_pool: operator_pool.clone(),
-                catalog: Arc::clone(&catalog),
-                staging: Arc::clone(&staging),
+                catalog: Arc::clone(catalog),
+                staging: Arc::clone(staging),
                 object_store,
                 rewrite_runtime,
                 hints,
                 config,
                 maintenance_interval: Duration::from_millis(10),
             })
-            .expect("forge");
-
-            let fixture = Self {
-                pg,
-                tenant,
-                binding,
-                forge,
-                vala,
-                operator_pool,
-                catalog,
-                staging,
-                config: ForgeConfig::default(),
-                _root: root,
-            };
-            fixture.seed_two_files(&arrow_schema).await;
-            fixture
+            .expect("forge")
         }
 
+        /// Seed the initial pair of aged Parquet files and file-list rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics if writing the fixture files or registering their rows fails.
         async fn seed_two_files(&self, schema: &ArrowSchema) {
             self.seed_pair(schema, 0).await;
         }
 
+        /// Seed a second pair of aged Parquet files for multi-bin scenarios.
+        ///
+        /// # Panics
+        ///
+        /// Panics if writing the fixture files or registering their rows fails.
         async fn seed_additional_two_files(&self) {
             let schema = ArrowSchema::new(vec![
                 Field::new("value", DataType::Int64, false),
@@ -242,6 +316,12 @@ mod pg_tests {
             self.seed_pair(&schema, 2).await;
         }
 
+        /// Write two Parquet files and register their durable file-list rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics when Parquet encoding, object writes, or SQL registration
+        /// fails; fixture setup treats each as an invariant.
         async fn seed_pair(&self, schema: &ArrowSchema, start: i64) {
             let base_micros = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
                 .expect("timestamp")
@@ -342,7 +422,7 @@ mod pg_tests {
             let rewrite_runtime = ForgeRewriteRuntime::new(
                 Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
                 &self
-                    ._root
+                    .root
                     .path()
                     .join(format!("forge-spill-{}", uuid::Uuid::now_v7())),
                 config.spill_limit_bytes,
@@ -455,7 +535,7 @@ mod pg_tests {
     /// Tests the directly awaitable scheduler lifecycle and lease cleanup.
     ///
     /// Steps:
-    /// 1. Build an isolated Postgres/SQL-Iceberg/OpenDAL fixture with two aged
+    /// 1. Build an isolated Postgres/SQL-Iceberg/`OpenDAL` fixture with two aged
     ///    Parquet inputs and corresponding `vala.file_list` rows.
     /// 2. Construct `Forge::new`, spawn its returned `run` future,
     ///    and wait for the real compaction to mark both inputs committed.

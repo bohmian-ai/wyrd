@@ -865,16 +865,10 @@ async fn test_catalog(
         fixture.catalog_dsn().expose_secret(),
         storage.backend_config(),
         Arc::new(fixture.app_pool().clone()),
-        None,
     )
     .await
     .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-    let catalog = Arc::new(catalog);
-    // Mirror server boot: provision the pre-declared OLAP domain tables.
-    vala_bifrost::tables::register_all(&catalog)
-        .await
-        .map_err(|error| WyrdTestError::Start(error.to_string()))?;
-    Ok(catalog)
+    Ok(Arc::new(catalog))
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {

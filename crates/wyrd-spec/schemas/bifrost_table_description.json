@@ -34,7 +34,6 @@
         "namespace",
         "partition_columns",
         "registered_at",
-        "scope",
         "status",
         "table_uid",
         "updated_at"
@@ -63,14 +62,6 @@
           "description": "Wall-clock registration time.",
           "type": "string",
           "format": "date-time"
-        },
-        "scope": {
-          "description": "Table scope (wire enum, not the engine type).",
-          "allOf": [
-            {
-              "$ref": "#/definitions/TableScopeWire"
-            }
-          ]
         },
         "status": {
           "description": "Lifecycle status.",
@@ -415,25 +406,6 @@
           "type": "boolean"
         }
       }
-    },
-    "TableScopeWire": {
-      "description": "Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so `wyrd-spec` carries no engine dependency; the engine maps between the two.",
-      "oneOf": [
-        {
-          "description": "Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.",
-          "type": "string",
-          "enum": [
-            "TenantOwned"
-          ]
-        },
-        {
-          "description": "Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.",
-          "type": "string",
-          "enum": [
-            "SystemShared"
-          ]
-        }
-      ]
     },
     "TableStatus": {
       "description": "Lifecycle status of a registered Bifrost table.",

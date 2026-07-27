@@ -1,6 +1,6 @@
 ---
 title: Data plane internals
-description: Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit chain sealing.
+description: Scribe WAL format, seal state machine, vala.file_list schema, Forge maintenance, and audit data.
 pillar: wyrd
 group: Bifrost
 order: 9
@@ -8,7 +8,7 @@ order: 9
 
 # Data plane internals
 
-This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, Forge's storage surfaces, and the audit sealing pipeline.
+This document covers the parts of Bifrost invisible to a normal caller but that matter for operational correctness, security review, and incident investigation: the Scribe WAL and seal state machine, the `vala.file_list` schema, Forge's storage surfaces, and audit data.
 
 The write surface is in [Writing data](/bifrost/writing-data); the overall system model is in [Architecture](/bifrost/architecture). This is the operator's view.
 
@@ -37,7 +37,7 @@ The seal itself is a pre-commit sequence followed by a single Postgres transacti
 
 1. **Freeze memtable.** Swap the mutable buffer for a fresh one; the frozen snapshot is immutable from here.
 2. **Encode Parquet.** Sort by `(data_tenant_id, wyrd_event_time)`. Build bloom filters on tenant + trace_id, write the page index.
-3. **PUT to object store.** Path: `s3://{namespace}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`. The `{pod_id}-{ulid}` suffix guarantees uniqueness across pods writing the same partition in the same second.
+3. **PUT to object store.** Path: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`. The tenant-qualified prefix and `{pod_id}-{ulid}` suffix guarantee uniqueness across tenants and pods.
 4. **Atomic Postgres tx.** `INSERT INTO vala.file_list (...)` plus append the sealed audit rows for the batch. Commit or rollback as one unit.
 5. **Retire WAL bytes.** Update the seal manifest with the new `sealed_lsn`, truncate the covered WAL segments.
 
@@ -61,7 +61,6 @@ Steps 4 and 5 are the durability boundary. Any Scribe crash before step 4 rolls 
 | `min_event_time` | `timestamptz` | Partition-pruning bound |
 | `max_event_time` | `timestamptz` | Partition-pruning bound |
 | `partition_day` | `date` | `Day(event_time)` partition |
-| `tenant_bucket` | `int` | `Bucket(tenant, 64)` partition |
 | `compacted` | `bool` | Flipped to `true` when Forge folds the file into a snapshot |
 | `committed_snapshot_id` | `bigint` | Iceberg snapshot ID after compaction; NULL until compacted |
 | `node_id` | `text` | Emitting Scribe pod |
@@ -83,61 +82,25 @@ The complete stage order, fencing rules, recovery behavior, and component
 boundaries are documented in [Forge system overview](/bifrost/forge). This page keeps the
 storage and audit context; the Forge page is the operational reference.
 
-## Audit sealing
+## Audit data
 
-Every write appends a row to the hash-chained audit outbox in Postgres. The audit relay ships those rows to the `vala.system.audit_log` Iceberg table. The seal worker then signs the shipped history so it cannot be modified retroactively without detection.
-
-```
-[vala.audit_outbox (Postgres)]
-        │ hash chain: entry_hash = SHA-256(prev_hash ‖ seq ‖ content_fields)
-        ▼
-[AuditRelay.tick()]
-        │ reads unshipped rows, appends to Iceberg audit_log table
-        │ marks rows shipped, records seq and entry_hash
-        ▼
-[seal_shipped_range() every 60 s]
-        │ latest_sealed_seq_hi()   → last checkpoint's seq_hi (0 if none)
-        │ shipped_outbox_refs_after(seq_hi)  → unsealed tail only
-        │ compute_range_hash(seq_lo, seq_hi, [entry_hash_0, …])
-        │   SHA-256( seq_lo ‖ seq_hi ‖ entry_hash_0 ‖ … ‖ entry_hash_n )
-        │ AuditSealKey.sign(range_hash)   → Ed25519 signature
-        │ UPSERT vala.audit_seal_checkpoints (seq_lo, seq_hi, hash, sig)
-        ▼
-[verify_checkpoint_walk()]
-        │ reads audit_seal_checkpoints ordered by seq_lo
-        │ for each checkpoint:
-        │   recompute every entry_hash from warehouse content columns
-        │     (NOT the stored entry_hash column; that column is untrusted)
-        │   recompute range_hash from recomputed hashes
-        │   AuditSealKey.verify(range_hash, signature)
-        │
-        ├─ all checkpoints verify, no shipped rows beyond last checkpoint
-        │       → VerifyOutcome::Clean
-        │
-        ├─ recomputed hash ≠ signed hash for a checkpoint
-        │       → VerifyOutcome::Tampered { seq_lo, seq_hi }
-        │
-        └─ shipped rows exist beyond the last checkpoint
-                → VerifyOutcome::Gap
-```
-
-The verifier deliberately ignores the `entry_hash` column stored in the Iceberg table. An attacker who can write to object storage could modify both a row's content and its stored `entry_hash` column simultaneously. Recomputing hashes from the content columns themselves makes that attack detectable: the recomputed hash will diverge from what the seal key signed.
-
-`VerifyOutcome::Gap` does not mean tampering. It means rows were shipped after the last seal pass ran. The seal worker runs every 60 seconds; a gap is normal between seal ticks.
+Every audited operation appends an immutable row to the tenant-scoped,
+hash-chained `vala.audit_outbox` in the operation's Postgres transaction.
+Redux defines the canonical `vala.system.audit_log` schema and a deterministic
+projection from ordered outbox rows; Scribe owns physical stamping when that
+projection is ingested.
 
 ## Database privilege model
 
-Bifrost uses three database pools, each connecting as a different Postgres role.
+Bifrost uses two control-plane database pools, each connecting as a different
+Postgres role.
 
 | Pool | Connecting role | RLS | Purpose |
 |---|---|---|---|
 | App pool | `wyrd_app` | Enforced via `wyrd.current_tenant()` | Tenant-scoped reads and writes from the server; Scribe audit inserts |
-| Recovery pool | `vala_recovery` | Not BYPASSRLS; SECURITY DEFINER only | Reserved for future maintenance routines that need cross-tenant access under audit |
 | Operator pool | `wyrd_platform_admin` | BYPASSRLS | Cross-tenant control-plane tables (`vala.maintenance_leases`, Forge lease coordination) |
 
 A few things worth being explicit about for audit purposes.
-
-`vala_recovery` is NOT BYPASSRLS. It executes only `SECURITY DEFINER` routines owned by `vala_recovery_owner` (which is BYPASSRLS). A direct `SELECT` or `UPDATE` from the recovery pool against a tenant-scoped table is rejected by RLS because no `app.current_tenant` is set on that connection.
 
 The operator pool is the sole path to tables that are intentionally cross-tenant by design. `vala.maintenance_leases` is the only such table today. All other `vala.*` tables are RLS-enforced. The `check:tenant-isolation` CI script fails any new query module that reads a non-RLS table without using the operator pool.
 
@@ -154,5 +117,3 @@ The app pool enforces tenant isolation via a Postgres RLS policy on every table.
 **Postgres unavailable during seal.** Same shape as above. Seal retries; the memtable stays in memory; the WAL keeps the acked data. New appends can proceed until the memtable fills.
 
 **Forge crash mid-tick.** Lease expires. Successor Forge pod picks up the same table, re-derives state from `vala.file_list` and Iceberg metadata, re-runs the tick. Idempotent by construction.
-
-**Seal worker not running.** Shipped audit rows accumulate as a gap. `verify_checkpoint_walk` returns `VerifyOutcome::Gap`. No data is lost or corrupted; only the signed coverage window is smaller than expected.

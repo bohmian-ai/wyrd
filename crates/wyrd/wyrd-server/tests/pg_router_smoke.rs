@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;
@@ -251,7 +251,8 @@ mod pg_tests {
         };
         let snapshot = Arc::new(ArcSwap::from_pointee(ReadinessSnapshot {
             postgres: ok_probe.clone(),
-            storage: ok_probe,
+            storage: ok_probe.clone(),
+            scribe: ok_probe,
         }));
         let state = test_state().await.with_readiness(snapshot);
 
@@ -406,7 +407,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -450,7 +451,7 @@ mod pg_tests {
         let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(pool, None),
+            vala_sql::ValaPostgres::from_pool(pool),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");

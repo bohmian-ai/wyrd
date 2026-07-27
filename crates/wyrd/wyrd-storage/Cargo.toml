@@ -26,6 +26,7 @@ emulator = ["cloud"]
 
 [dependencies]
 wyrd-sql = { path = "../wyrd-sql", version = "0.0.1" }
+vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 wyrd-spec = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync", "time"] }
 tokio-util = { workspace = true }

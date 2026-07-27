@@ -86,9 +86,11 @@ utoipa = { version = "5", features = ["chrono", "uuid"] }
 thiserror = "2.0"
 base64 = "0.22"
 bytes = "1"
+rayon = "1.12"
 futures-util = "0.3"
 criterion = { version = "0.5", features = ["async_tokio"] }
 hdrhistogram = "7.5"
+num-traits = "0.2"
 blake3 = "1"
 insta = { version = "1.43", features = ["json"] }
 wiremock = "0.6"
@@ -103,6 +105,7 @@ walkdir = "2.*"
 sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 crc32c = "0.6"
+rustix = { version = "1.1.4", features = ["fs"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }

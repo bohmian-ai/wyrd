@@ -5,7 +5,7 @@ use std::io::Cursor;
 use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 
-use crate::error::IngestError;
+use vala_bifrost_redux::gate::IngestError;
 
 /// Decode one Arrow IPC stream frame into its record batches.
 ///

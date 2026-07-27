@@ -7,7 +7,7 @@
 //! `ScribeAppendMeta` — not inside the `AuditEvent`.
 //!
 //! JSON was chosen over bincode for:
-//! - Cross-version compatibility (WAL is durable state)
+//! - A stable canonical encoding for durable WAL state
 //! - Self-describing format (debuggable WAL files)
 //! - `AuditEvent` already has JSON-compatible derives
 //! - Size difference negligible compared to Arrow IPC data records

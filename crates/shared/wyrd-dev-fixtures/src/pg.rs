@@ -142,26 +142,6 @@ impl PgFixture {
         &self.tenant_slug
     }
 
-    /// Open a pool connected as the `vala_recovery` role against the fixture database.
-    ///
-    /// Reads `VALA_RECOVERY_PASSWORD` from the environment. Callers that test
-    /// Bifrost crash-recovery paths need this pool to simulate the recovery role.
-    ///
-    /// # Errors
-    /// Returns [`FixtureError`] when `VALA_RECOVERY_PASSWORD` is unset or the
-    /// pool cannot connect.
-    pub async fn recovery_pool(&self) -> Result<PgPool, FixtureError> {
-        let password =
-            std::env::var(vala_sql::postgres::VALA_RECOVERY_PASSWORD_ENV).map_err(|_| {
-                SqlError::InvariantViolation {
-                    detail: "VALA_RECOVERY_PASSWORD must be set to connect recovery pool in tests"
-                        .to_owned(),
-                }
-            })?;
-        let dsns = self._test_db.resolved_dsns()?;
-        Ok(vala_sql::postgres::connect_recovery_pool(&dsns, SecretString::from(password)).await?)
-    }
-
     /// Build the iceberg catalog URI for this fixture's database.
     ///
     /// The iceberg-catalog-sql crate builds its own pool from this URI; it does
@@ -197,11 +177,9 @@ impl PgFixture {
     /// Open a pool connected as the `wyrd_migrator` (table-owner) role.
     ///
     /// Use this pool in test assertions that need to read across all tenants
-    /// without RLS — for example, inspecting `vala.olap_commits` or
-    /// `vala.olap_recovery_events` after a multi-tenant write. The
-    /// `wyrd_migrator` role is the table owner and bypasses all row-level
-    /// security, making it the lowest-friction read path for raw assertion
-    /// queries.
+    /// without RLS. The `wyrd_migrator` role is the table owner and bypasses
+    /// row-level security, making it the lowest-friction read path for raw
+    /// assertion queries.
     ///
     /// A new pool is created on each call; cache it in a local if you need
     /// it more than once per test.
@@ -327,7 +305,6 @@ impl TestDatabase {
                 .map(|dsn| database_dsn(dsn, &self.name))
                 .transpose()?,
             catalog_app: database_dsn(&base.catalog_app, &self.name)?,
-            recovery: database_dsn(&base.recovery, &self.name)?,
         })
     }
 }

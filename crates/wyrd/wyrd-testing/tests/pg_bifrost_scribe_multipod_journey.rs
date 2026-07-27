@@ -1,148 +1,135 @@
-//! journey tests for Scribe seal state machine.
-//!
-//! These tests verify the full seal flow across multiple pods with real database
-//! verification. They are the primary contract tests per AGENTS.md §11.
+use std::error::Error;
+use std::sync::Arc;
 
-mod journey_tests {
-    #[tokio::test]
-    #[ignore = "requires full DataFusion integration"]
-    async fn multi_scribe_three_pods_parallel_ingest_e2e() {
-        // This test would verify end-to-end seal correctness across 3 pods:
-        //
-        // 1. Start MultiScribeHarness with 3 pods, 1 tenant
-        // 2. Each pod appends 10k rows (30k total) to vala.events on 2026-07-14
-        // 3. Call wait_for_drain(30s timeout)
-        // 4. Verify:
-        //    - wal_pending_bytes() == 0 for all pods
-        //    - memtable_row_count(&key) == 0 for all seal-keys across all pods
-        //    - vala.file_list has ≥3 rows (one per pod, potentially more if day-split)
-        //    - SUM(row_count) FROM vala.file_list = 30,000
-        //    - Each file_list row has distinct (node_id, writer_epoch)
-        //    - vala.audit_outbox has ≥3 rows (one per append operation)
-        //    - DataFusion query over sealed Parquet paths returns exactly 30k rows
-        //
-        // Implementation requires:
-        // - MultiScribeHarness with proper Scribe::append calls
-        // - SQL queries against vala.file_list and vala.audit_outbox
-        // - DataFusion context that can read from sealed_parquet_paths
-        // - Object store integration (harness uses opendal-memory, so paths are in-memory)
-        //
-        // Deferred until DataFusion integration lands for reading sealed Parquet files.
+use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use uuid::Uuid;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
+use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
+use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::request_id::RequestId;
+use wyrd_testing::bifrost::BifrostHarness;
+
+const TABLE_NAME: &str = "scribe_journey_events";
+const ROWS_PER_APPEND: usize = 4;
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Bifrost journey environment"]
+async fn multi_scribe_three_pods_three_tenants_persists_and_isolates_rows() {
+    let harness = BifrostHarness::start(3, 3)
+        .await
+        .expect("real Bifrost harness");
+    let result = run_journey(&harness).await;
+    let shutdown = harness.shutdown().await;
+    shutdown.expect("Bifrost harness shutdown");
+    result.expect("Scribe journey");
+}
+
+async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let table = TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME);
+    let mut appends = Vec::new();
+    for (pod_index, scribe) in harness.scribes().iter().enumerate() {
+        for (tenant_index, tenant) in harness.tenants().iter().copied().enumerate() {
+            let scribe = Arc::clone(scribe);
+            let table = table.clone();
+            appends.push(tokio::spawn(async move {
+                let principal = Principal {
+                    id: PrincipalId::new(Uuid::now_v7()),
+                    kind: PrincipalKind::User,
+                    tenant_id: tenant,
+                    roles: Vec::new(),
+                    effective_permissions: PermissionSet::new(),
+                };
+                let rows = make_batch(pod_index, tenant_index);
+                let schema_fingerprint =
+                    SchemaFingerprint::from_arrow_schema(rows.schema().as_ref());
+                scribe
+                    .append(ScribeAppend {
+                        principal,
+                        table,
+                        rows,
+                        schema_fingerprint,
+                        request_id: RequestId::now_v7(),
+                        batch_id: Uuid::now_v7(),
+                        measured_wire_bytes: 0,
+                    })
+                    .await
+            }));
+        }
+    }
+    for append in appends {
+        append.await??;
     }
 
-    #[tokio::test]
-    #[ignore = "requires RLS verification infrastructure"]
-    async fn multi_scribe_multi_tenant_isolation_e2e() {
-        // This test would verify tenant isolation across pods:
-        //
-        // 1. Start MultiScribeHarness with 2 pods, 3 tenants
-        // 2. Each pod appends batches for all 3 tenants (mixed interleaved appends)
-        // 3. Force seal for all tenants via wait_for_drain
-        // 4. For each tenant T:
-        //    - Open TenantConn scoped to T
-        //    - Query vala.file_list → should only see T's rows (RLS enforced)
-        //    - Query vala.audit_outbox → each row's principal_tenant_id == T
-        //    - Verify principal_id matches the Principal used in that tenant's appends
-        // 5. Verify cross-tenant:
-        //    - SUM(row_count) across all tenants = total rows appended
-        //    - No tenant sees another tenant's rows
-        //
-        // Implementation requires:
-        // - MultiScribeHarness with multiple tenants
-        // - TenantConn acquisition per tenant from harness.pg()
-        // - RLS-aware queries (vala.file_list and vala.audit_outbox have RLS policies)
-        // - Principal tracking per append
-        //
-        // Deferred until full multi-tenant harness + RLS verification is ready.
+    harness.force_seal_all().await?;
+    assert!(harness.is_drained()?);
+
+    let pool = harness.cluster().pg_fixture().platform_admin_pool();
+    let (file_count, row_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*)::bigint, COALESCE(SUM(row_count), 0)::bigint
+           FROM vala.file_list
+          WHERE namespace = 'vala.bifrost' AND table_name = $1",
+    )
+    .bind(TABLE_NAME)
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(row_count, i64::try_from(3 * 3 * ROWS_PER_APPEND)?);
+    assert_eq!(file_count, 9);
+
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT file_path FROM vala.file_list
+          WHERE namespace = 'vala.bifrost' AND table_name = $1",
+    )
+    .bind(TABLE_NAME)
+    .fetch_all(pool)
+    .await?;
+    for path in paths {
+        harness.cluster().storage_operator().stat(&path).await?;
     }
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay + pod restart infrastructure"]
-    async fn multi_scribe_kill_mid_append_replay_no_dup() {
-        // This test would verify crash recovery with no data loss or duplicates:
-        //
-        // 1. Start MultiScribeHarness with 1 pod (writer_epoch=1), 1 tenant
-        // 2. Pod appends 5k rows from 4 distinct principals (4 append calls)
-        // 3. Simulate crash: drop pod without calling force_seal
-        // 4. Restart pod with new writer_epoch=2, same WAL directory + object store
-        // 5. Replay reconstructs memtable from WAL (4 append operations with their principals)
-        // 6. Force seal (replay-driven)
-        // 7. Verify:
-        //    - vala.file_list has exactly 1 row
-        //    - file_list.row_count = 5,000
-        //    - file_list.writer_epoch = 1 (original epoch from WAL, not restart epoch)
-        //    - vala.audit_outbox has exactly 4 rows (one per append)
-        //    - Each audit row has correct principal_id (matches original append)
-        //    - No duplicate rows in file_list or audit_outbox
-        //
-        // Implementation requires:
-        // - Full WAL replay (extract_seal_key_from_path, stream-identity preservation)
-        // - Test harness that can:
-        //   - Drop a pod mid-stream
-        //   - Restart with new writer_epoch but shared WAL/object-store state
-        //   - Verify writer_epoch in file_list matches original WAL epoch
-        //
-        // Deferred until WAL replay + manifest integration + pod restart harness are complete.
+    for tenant in harness.tenants().iter().copied() {
+        let mut conn = harness.tenant_conn(tenant).await?;
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(row_count), 0)::bigint
+               FROM vala.file_list
+              WHERE namespace = 'vala.bifrost' AND table_name = $1",
+        )
+        .bind(TABLE_NAME)
+        .fetch_one(&mut **conn.transaction())
+        .await?;
+        assert_eq!(visible, i64::try_from(3 * ROWS_PER_APPEND)?);
     }
+    Ok(())
+}
 
-    #[tokio::test]
-    #[ignore = "requires harness with controlled partition targeting"]
-    async fn multi_scribe_same_partition_no_collision() {
-        // This test would verify that multiple pods writing to the same partition
-        // (same tenant_bucket + partition_day) produce distinct, non-colliding file paths:
-        //
-        // 1. Start MultiScribeHarness with 3 pods, 1 tenant
-        // 2. Configure all pods to target the same partition:
-        //    - Same table (vala.events)
-        //    - Same partition_day (2026-07-14)
-        //    - Same tenant_bucket (force via controlled tenant ID hash)
-        // 3. Each pod appends 1k rows
-        // 4. Force seal all pods via wait_for_drain
-        // 5. Query vala.file_list WHERE partition_day = '2026-07-14'
-        // 6. Verify:
-        //    - Exactly 3 file_list rows (one per pod)
-        //    - All 3 file_path values are distinct (no collision)
-        //    - file_path format: bifrost/{tenant}/{namespace}/{table}/{pod_id}-{ulid}.parquet
-        //    - Each row has distinct (node_id, writer_epoch) tuple
-        //    - SUM(row_count) = 3,000
-        //
-        // Implementation requires:
-        // - Harness that can control tenant_bucket (either via tenant ID or explicit config)
-        // - SQL query to verify file_path uniqueness
-        // - Verification that seal_filename({pod_id}) produces unique paths per pod
-        //
-        // Deferred until harness supports controlled partition targeting.
-    }
-
-    #[tokio::test]
-    #[ignore = "requires per-stream watermark query implementation"]
-    async fn multi_scribe_unequal_lsn_per_stream_watermark() {
-        // This test would verify that per-stream watermark queries correctly
-        // maintain independent LSN watermarks per (node_id, writer_epoch) stream:
-        //
-        // 1. Start MultiScribeHarness with 2 pods, 1 tenant
-        // 2. Pod A appends many rows → seals to wal_lsn_max = 900
-        // 3. Pod B appends few rows → seals to wal_lsn_max = 40
-        // 4. Query per-stream watermarks:
-        //    SELECT node_id, writer_epoch, MAX(wal_lsn_max) as watermark
-        //    FROM vala.file_list
-        //    WHERE namespace = 'vala' AND table_name = 'events'
-        //    GROUP BY node_id, writer_epoch
-        // 5. Verify:
-        //    - Pod A's watermark = 900
-        //    - Pod B's watermark = 40
-        //    - A naive global MAX(wal_lsn_max) would return 900 for both streams,
-        //      incorrectly suggesting B's stream has caught up to 900
-        //    - This test ensures grouped query returns independent watermarks
-        //
-        // This is a regression test for a hypothetical C4 (correctness issue 4)
-        // where a global max would hide per-stream progress.
-        //
-        // Implementation requires:
-        // - Real WAL LSNs (not placeholder zeros) → already implemented in Phase 4
-        // - Harness that can produce unequal LSN ranges across pods
-        // - SQL query to verify per-stream watermarks
-        //
-        // Deferred until per-stream watermark query is formalized and tested.
-    }
+fn make_batch(pod_index: usize, tenant_index: usize) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+    ]));
+    let timestamp = chrono::Utc::now().timestamp_micros();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                (0..ROWS_PER_APPEND)
+                    .map(|row| {
+                        i64::try_from(pod_index * 100 + tenant_index * 10 + row).unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![timestamp; ROWS_PER_APPEND])
+                    .with_timezone("UTC"),
+            ),
+        ],
+    )
+    .expect("valid journey batch")
 }

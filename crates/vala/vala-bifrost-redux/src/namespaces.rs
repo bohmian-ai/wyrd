@@ -1,10 +1,10 @@
-//! Bifrost namespace enum — copied from vala-bifrost and extended with `Datasets`.
+//! Redux Bifrost namespace enum, including caller-owned datasets.
 
 use iceberg::NamespaceIdent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BifrostNamespace {
-    System,
+    Audit,
     Bifrost,
     Traces,
     Metrics,
@@ -20,7 +20,7 @@ impl BifrostNamespace {
     /// All known namespaces. Adding a variant here causes a compile error at every
     /// `match` that is missing a branch — the exhaustiveness guard.
     pub const ALL: [Self; 10] = [
-        Self::System,
+        Self::Audit,
         Self::Bifrost,
         Self::Traces,
         Self::Metrics,
@@ -34,7 +34,7 @@ impl BifrostNamespace {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::System => "vala.system",
+            Self::Audit => "vala.system",
             Self::Bifrost => "vala.bifrost",
             Self::Traces => "vala.traces",
             Self::Metrics => "vala.metrics",
@@ -57,7 +57,7 @@ impl BifrostNamespace {
     /// Returns `None` for unknown segments.
     pub fn from_domain_namespace(segment: &str) -> Option<Self> {
         match segment {
-            "system" => Some(Self::System),
+            "system" => Some(Self::Audit),
             "bifrost" => Some(Self::Bifrost),
             "traces" => Some(Self::Traces),
             "metrics" => Some(Self::Metrics),

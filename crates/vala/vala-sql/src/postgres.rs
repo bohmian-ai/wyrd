@@ -1,24 +1,16 @@
 //! Production-ready Postgres handle for Vala SQL.
 //!
-//! `ValaPostgres` intentionally owns its connection pools rather than borrowing
-//! Wyrd-owned pools by reference. The original vala-sql design consumed pools
-//! via `TenantConn` shared references; this module adds Vala-specific roles
-//! (`vala_recovery`) that require dedicated pool construction at the Vala tier.
+//! `ValaPostgres` owns its runtime connection pool rather than borrowing a
+//! Wyrd-owned pool by reference.
 
-use std::env;
 use std::time::Duration;
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::ExposeSecret;
 use sqlx::PgPool;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
 use wyrd_sql::{PoolConfig, SqlError, TenantConn};
-
-/// Optional password env var for the `vala_recovery` role.
-pub const VALA_RECOVERY_PASSWORD_ENV: &str = "VALA_RECOVERY_PASSWORD";
-/// Runtime role that executes Vala recovery SECURITY DEFINER routines.
-pub const VALA_RECOVERY_ROLE: &str = "vala_recovery";
 
 /// Runtime-ready Vala Postgres handle.
 ///
@@ -28,7 +20,6 @@ pub const VALA_RECOVERY_ROLE: &str = "vala_recovery";
 #[derive(Clone)]
 pub struct ValaPostgres {
     pool: PgPool,
-    recovery_pool: Option<PgPool>,
 }
 
 impl ValaPostgres {
@@ -79,11 +70,8 @@ impl ValaPostgres {
     /// use `connect_from_dsns` / `connect_after_wyrd`. Gated behind
     /// `testing` / `cfg(test)`.
     #[must_use]
-    pub fn from_pools(pool: PgPool, recovery_pool: Option<PgPool>) -> Self {
-        Self {
-            pool,
-            recovery_pool,
-        }
+    pub fn from_pool(pool: PgPool) -> Self {
+        Self { pool }
     }
 
     /// Borrow the Vala/Bifrost runtime pool.
@@ -105,12 +93,6 @@ impl ValaPostgres {
         data_tenant_id: DataTenantId,
     ) -> Result<TenantConn<'_>, SqlError> {
         TenantConn::acquire(&self.pool, data_tenant_id).await
-    }
-
-    /// Borrow the optional Vala recovery pool.
-    #[must_use]
-    pub fn recovery_pool(&self) -> Option<&PgPool> {
-        self.recovery_pool.as_ref()
     }
 }
 
@@ -135,37 +117,5 @@ async fn connect_runtime_pool(dsns: &ResolvedDsns) -> Result<ValaPostgres, SqlEr
     let pool = build_pool(dsns.app.expose_secret(), vala_pool_config())
         .await
         .map_err(SqlError::Connect)?;
-    let recovery_pool = match env::var(VALA_RECOVERY_PASSWORD_ENV).ok() {
-        Some(password) => Some(connect_recovery_pool(dsns, SecretString::from(password)).await?),
-        None => None,
-    };
-
-    Ok(ValaPostgres {
-        pool,
-        recovery_pool,
-    })
-}
-
-/// Build a Vala recovery pool from a supplied role password.
-///
-/// # Errors
-/// Returns [`SqlError`] when the DSN cannot be synthesized or the pool cannot
-/// connect.
-pub async fn connect_recovery_pool(
-    dsns: &ResolvedDsns,
-    password: SecretString,
-) -> Result<PgPool, SqlError> {
-    let recovery_dsn = wyrd_sql::dsn::role_dsn_from_base(&dsns.app, VALA_RECOVERY_ROLE, &password)
-        .map_err(|error| SqlError::InvariantViolation {
-            detail: format!("vala recovery DSN config error: {error}"),
-        })?;
-    build_pool(recovery_dsn.expose_secret(), vala_recovery_pool_config())
-        .await
-        .map_err(SqlError::Connect)
-}
-
-/// Default pool profile for Vala recovery SQL.
-#[must_use]
-pub fn vala_recovery_pool_config() -> PoolConfig {
-    PoolConfig::from_env_with_suffix(PoolConfig::platform_admin_defaults(), "_VALA_RECOVERY")
+    Ok(ValaPostgres { pool })
 }

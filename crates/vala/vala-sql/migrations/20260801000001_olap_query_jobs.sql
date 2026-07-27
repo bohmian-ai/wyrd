@@ -1,7 +1,7 @@
 -- Stage 3 async query-job storage.
 -- vala.olap_query_jobs: durable async-query submission ledger (one row per job).
 -- Tenant-scoped with RLS + per-tenant idempotency-key uniqueness. Mirrors the
--- landed vala.bifrost_tables / vala.olap_commits RLS idiom (ENABLE + FORCE RLS,
+-- landed vala.bifrost_tables RLS idiom (ENABLE + FORCE RLS,
 -- tenant_isolation policy on wyrd.current_tenant(), wyrd_app grant).
 --
 -- query_class / admission_mode are Stage-5 classifier outputs: nullable, never

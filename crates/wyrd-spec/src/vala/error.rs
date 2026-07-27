@@ -19,6 +19,32 @@ use crate::error::derive::WyrdError;
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
 pub enum BifrostError {
+    /// The ingest authentication credentials were missing or rejected.
+    #[error("ingest authentication failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_INGEST_AUTH",
+        status = 401,
+        title = "Ingest authentication failed",
+        remediation = "Provide a valid Wyrd access token with permission to write the target ingest surface."
+    )]
+    IngestAuthentication {
+        /// Human-readable authentication failure detail.
+        message: String,
+    },
+
+    /// The ingest request violated the native protocol contract.
+    #[error("ingest request validation failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_INGEST_PROTO",
+        status = 400,
+        title = "Invalid ingest request",
+        remediation = "Fix the ingest request fields and retry with a valid Wyrd ingest payload."
+    )]
+    IngestProtocol {
+        /// Human-readable protocol validation detail.
+        message: String,
+    },
+
     /// A user-supplied schema field uses a reserved system column name.
     #[error("reserved system column: {column}")]
     #[wyrd_error(
@@ -32,29 +58,29 @@ pub enum BifrostError {
         column: String,
     },
 
-    /// A `SystemShared` table schema is missing the required `data_tenant_id` column.
-    #[error("SystemShared table missing data_tenant_id column: {table}")]
+    /// A caller attempted to write a server-managed built-in table.
+    #[error("write to reserved built-in table denied: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_MISSING_TENANT_COLUMN",
-        status = 400,
-        title = "SystemShared table missing data_tenant_id column",
-        remediation = "Add a data_tenant_id Utf8 column to the schema for SystemShared tables."
+        code = "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+        status = 403,
+        title = "Reserved built-in write denied",
+        remediation = "Write through the supported observation or audit API instead of directly targeting a reserved built-in table."
     )]
-    MissingTenantColumn {
-        /// Fully-qualified table name that is missing the tenant column.
+    ReservedBuiltinWriteDenied {
+        /// Fully-qualified table name that was refused.
         table: String,
     },
 
-    /// A TenantOwned table schema includes the `data_tenant_id` column, which is not allowed.
-    #[error("TenantOwned table must not include data_tenant_id: {table}")]
+    /// A physical table schema is missing the required tenant isolation column.
+    #[error("table missing data_tenant_id managed column: {table}")]
     #[wyrd_error(
-        code = "WYRD_VALA_400_BIFROST_UNEXPECTED_TENANT_COLUMN",
+        code = "WYRD_VALA_400_BIFROST_TENANT_ISOLATION_COLUMN_MISSING",
         status = 400,
-        title = "TenantOwned table must not include data_tenant_id",
-        remediation = "Remove data_tenant_id from the schema — TenantOwned tables are isolated by catalog namespace."
+        title = "Tenant isolation column missing",
+        remediation = "Add the server-managed data_tenant_id Utf8 column to the physical table schema."
     )]
-    UnexpectedTenantColumn {
-        /// Fully-qualified table name that incorrectly includes the tenant column.
+    TenantIsolationColumnMissing {
+        /// Fully-qualified table name that is missing the tenant column.
         table: String,
     },
 
@@ -81,6 +107,29 @@ pub enum BifrostError {
         /// Canonical string form of the card reference that was refused.
         card_ref: String,
     },
+
+    /// A card reference could not be resolved to a tenant-local card UID.
+    #[error("card_ref cannot be resolved: {card_ref}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_CARD_UNRESOLVED",
+        status = 403,
+        title = "Card reference unresolved",
+        remediation = "Use a card_ref that resolves to a registered card in the current tenant."
+    )]
+    CardUnresolved {
+        /// Canonical card reference that could not be resolved.
+        card_ref: String,
+    },
+
+    /// The authenticated principal could not be stamped onto the ingest row.
+    #[error("principal_id cannot be stamped for authenticated write")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+        status = 401,
+        title = "Ingest principal unresolved",
+        remediation = "Authenticate with a token containing a valid principal identity and retry."
+    )]
+    PrincipalUnresolved,
 
     /// The requested Bifrost table does not exist in the catalog.
     #[error("bifrost table not found: {table}")]
@@ -234,6 +283,34 @@ pub enum BifrostError {
         remediation = "Add a LIMIT or narrower filters, or use the async query API for large result sets."
     )]
     QueryResultTooLarge,
+
+    /// The decompressed canonical ingest payload exceeded the Scribe limit.
+    #[error("ingest payload too large: {bytes} bytes")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+        status = 413,
+        title = "Ingest payload too large",
+        remediation = "Reduce the request to at most 32 MiB of canonical transport bytes and retry."
+    )]
+    PayloadTooLarge {
+        /// Server-measured canonical transport bytes.
+        bytes: usize,
+    },
+
+    /// The ingest request exceeded the aggregate row bound.
+    #[error("ingest request has too many rows ({rows} > {limit})")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_INGEST_OVERSIZED",
+        status = 413,
+        title = "Ingest request oversized",
+        remediation = "Reduce the number of rows in the request and retry."
+    )]
+    IngestOversized {
+        /// Number of rows observed in the request.
+        rows: u64,
+        /// Maximum rows allowed by the ingest contract.
+        limit: u64,
+    },
 
     /// An unexpected internal Bifrost failure occurred.
     #[error("internal bifrost failure: {detail}")]
@@ -398,8 +475,9 @@ pub enum BifrostError {
     /// partial success: no row from this request was written. Callers should
     /// back off and retry the full request.
     ///
-    /// The OTLP ingest path maps overload to a retryable `UNAVAILABLE`/`503`
-    /// response, never to `partial_success`.
+    /// The OTLP ingest path maps overload to HTTP `429` and gRPC
+    /// `RESOURCE_EXHAUSTED`, never to `partial_success`; no rows from the
+    /// request are written.
     #[error("ingest writer busy: {table}")]
     #[wyrd_error(
         code = "WYRD_VALA_429_INGEST_BUSY",

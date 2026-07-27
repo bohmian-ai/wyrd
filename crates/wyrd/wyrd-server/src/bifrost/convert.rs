@@ -10,7 +10,9 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit};
-use vala_bifrost::{BifrostNamespace, PartitionTransform, SchemaFingerprint};
+use vala_bifrost_redux::catalog::PartitionTransform;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::schema::SchemaFingerprint;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     DataTypeSpec, FieldSpec, PartitionColumnSpec, PartitionTransformWire, TimeUnit,

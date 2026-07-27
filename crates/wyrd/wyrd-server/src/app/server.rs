@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -15,11 +16,7 @@ use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
 use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
-use crate::boot::{
-    ServerBootError, check_recovery_pool, spawn_audit_reconciler, spawn_audit_relay,
-    spawn_audit_seal_worker, spawn_genai_derivation_worker, spawn_maintenance_scheduler,
-    spawn_storage_sweeper,
-};
+use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
 use crate::grpc::{
@@ -38,6 +35,7 @@ pub struct WyrdServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
 }
 
@@ -58,6 +56,15 @@ impl WyrdServer {
     /// Returns [`ServerBootError`] on gRPC router assembly (e.g. missing token
     /// verifier).
     pub fn new(config: WyrdServerConfig, state: AppState) -> Result<Self, ServerBootError> {
+        Self::new_with_metrics_handle(config, state, None)
+    }
+
+    /// Assemble a server when the process recorder was installed before boot.
+    pub fn new_with_metrics_handle(
+        config: WyrdServerConfig,
+        state: AppState,
+        metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    ) -> Result<Self, ServerBootError> {
         let (reporter, health_service) = wyrd_tonic::tonic_health::server::health_reporter();
         // Store this reporter in state so readiness drives THIS health service.
         let state = state.with_grpc_health(reporter.clone());
@@ -77,6 +84,7 @@ impl WyrdServer {
             http_router,
             grpc_router,
             reporter,
+            metrics_handle,
             extra_workers: Vec::new(),
         })
     }
@@ -239,6 +247,7 @@ impl WyrdServer {
             http_router: self.http_router,
             grpc_router: self.grpc_router,
             reporter: self.reporter,
+            metrics_handle: self.metrics_handle,
             extra_workers: self.extra_workers,
             http_listener,
             grpc_listener,
@@ -262,6 +271,7 @@ pub struct BoundServer {
     http_router: Router,
     grpc_router: TonicRouter,
     reporter: HealthReporter,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     extra_workers: Vec<(&'static str, BoxWorker)>,
     http_listener: Option<TcpListener>,
     grpc_listener: Option<TcpListener>,
@@ -303,10 +313,6 @@ impl BoundServer {
     /// Returns [`BootExit::Other`] on a terminal task error or if the process-
     /// global metrics recorder fails to install.
     pub async fn run(mut self) -> Result<(), BootExit> {
-        // Fail-fast (slice 01): a production deployment without the recovery pool
-        // cannot resolve stale precommits and would leak them indefinitely.
-        check_recovery_pool(&self.state).map_err(|e| BootExit::Other(Box::new(e)))?;
-
         let shutdown = self.state.shutdown_token.clone();
         let mut set: JoinSet<TaskExit> = JoinSet::new();
 
@@ -331,6 +337,26 @@ impl BoundServer {
                 shutdown.clone(),
             ),
         ));
+        if let Some(scribe) = self
+            .state
+            .bifrost_ingest
+            .as_ref()
+            .map(|runtime| Arc::clone(runtime.scribe()))
+        {
+            let shutdown = shutdown.clone();
+            set.spawn(worker_task(
+                TaskId::Worker("scribe_age_scanner"),
+                async move {
+                    let mut ticks = tokio::time::interval(Duration::from_secs(1));
+                    loop {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => break,
+                            _ = ticks.tick() => scribe.check_age(std::time::Instant::now()),
+                        }
+                    }
+                },
+            ));
+        }
         if let Some(handle) = spawn_storage_sweeper(&self.state, shutdown.clone())
             .map_err(|e| BootExit::Other(Box::new(e)))?
         {
@@ -342,34 +368,6 @@ impl BoundServer {
                 }
             }));
         }
-        if let Some(handle) = spawn_audit_relay(&self.state, shutdown.clone())
-            .await
-            .map_err(|e| BootExit::Other(Box::new(e)))?
-        {
-            set.spawn(worker_task(TaskId::Worker("audit_relay"), async move {
-                if let Err(join_error) = handle.await
-                    && join_error.is_panic()
-                {
-                    std::panic::resume_unwind(join_error.into_panic());
-                }
-            }));
-        }
-        if let Some(handle) = spawn_audit_reconciler(&self.state, shutdown.clone())
-            .await
-            .map_err(|e| BootExit::Other(Box::new(e)))?
-        {
-            set.spawn(worker_task(
-                TaskId::Worker("audit_reconciler"),
-                async move {
-                    if let Err(join_error) = handle.await
-                        && join_error.is_panic()
-                    {
-                        std::panic::resume_unwind(join_error.into_panic());
-                    }
-                },
-            ));
-        }
-
         // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
         // live-set rebuild, and orphan GC for this process.
         let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
@@ -378,37 +376,6 @@ impl BoundServer {
             TaskId::Worker("maintenance_scheduler"),
             scheduler,
         ));
-
-        // Audit-seal worker (slice 12): seals shipped audit ranges into signed
-        // checkpoints each tick. Spawns only when the audit-seal key and the
-        // platform-admin pool are both configured.
-        if let Some(handle) = spawn_audit_seal_worker(&self.state, shutdown.clone()) {
-            set.spawn(worker_task(
-                TaskId::Worker("audit_seal_worker"),
-                async move {
-                    if let Err(join_error) = handle.await
-                        && join_error.is_panic()
-                    {
-                        std::panic::resume_unwind(join_error.into_panic());
-                    }
-                },
-            ));
-        }
-
-        // Genai derivation worker (slice 05b): projects gen_ai.* spans into
-        // genai.* fact tables, watermarked in vala.olap_derivations.
-        if let Some(handle) = spawn_genai_derivation_worker(&self.state, shutdown.clone()) {
-            set.spawn(worker_task(
-                TaskId::Worker("genai_derivation_worker"),
-                async move {
-                    if let Err(join_error) = handle.await
-                        && join_error.is_panic()
-                    {
-                        std::panic::resume_unwind(join_error.into_panic());
-                    }
-                },
-            ));
-        }
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {
@@ -431,12 +398,11 @@ impl BoundServer {
                 serve_grpc_with_listener(router, listener, token).await
             }));
         }
-        // The recorder is a process-global singleton installed here (once, at
-        // run, only when the metrics listener was bound) rather than in `new` or
-        // `bind` — a constructed or bound but never-run server never touches the
-        // global recorder.
         if let Some(listener) = self.metrics_listener.take() {
-            let handle = install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?;
+            let handle = match self.metrics_handle.take() {
+                Some(handle) => handle,
+                None => install_recorder().map_err(|e| BootExit::Other(Box::new(e)))?,
+            };
             let router = metrics_router(handle);
             set.spawn(fallible_task(
                 TaskId::Metrics,
@@ -452,6 +418,10 @@ impl BoundServer {
 
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
         let terminal = supervise(set, shutdown, drain).await;
+
+        if let Some(runtime) = &self.state.bifrost_ingest {
+            runtime.shutdown().await;
+        }
 
         tracing::info!("wyrd-server shutdown complete");
         match terminal {
@@ -470,6 +440,11 @@ mod pg_tests {
 
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tempfile::tempdir;
+    use uuid::Uuid;
+    use vala_bifrost_redux::scribe::{
+        ScribeImpl,
+        wal::{WalConfig, WalWriter},
+    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{Kid, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem};
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -478,12 +453,13 @@ mod pg_tests {
     use crate::components::auth::ServerAuth;
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
+    use crate::state::BifrostIngestRuntime;
 
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
         ));
         let root = tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -508,16 +484,40 @@ mod pg_tests {
             ),
             WyrdAuthVerifySettings::default(),
         ));
-        AppState::new(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            crate::test_support::test_catalog().await,
-        )
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let catalog = crate::test_support::test_catalog().await;
+        let redux_catalog = crate::test_support::test_redux_catalog().await;
+        let wal_root = tempdir().expect("wal temp dir");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *Uuid::now_v7().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("wal initializes"),
+        );
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
+            Arc::new(storage.operator().clone()),
+            wal,
+            &Uuid::now_v7().to_string(),
+            1,
+        ));
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
+            Arc::clone(&redux_catalog),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
+        ));
+        AppState::new(postgres, storage, catalog)
+            .with_bifrost_redux(redux_catalog)
+            .with_bifrost_ingest(ingest)
+            .with_auth(ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..ServerAuth::default()
+            })
     }
 
     #[tokio::test]

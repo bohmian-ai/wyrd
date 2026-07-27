@@ -158,13 +158,9 @@ async fn journey_forge_scheduler_restart_preserves_reads_and_live_files() {
             .is_some()
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("restart audit count"),
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
         1
     );
     server.shutdown().await.expect("server shutdown");

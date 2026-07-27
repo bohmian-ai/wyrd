@@ -9,7 +9,7 @@
 //! * Commit the valid span durably (queryable by `trace_id`).
 //!
 //! This exercises the collector's per-span rejection path in
-//! `vala_ingest::collector::map_resource_spans`, which surfaces reject
+//! `vala_bifrost_redux::gate::collector::map_resource_spans`, which surfaces reject
 //! reasons into the OTLP `partial_success` envelope rather than failing the
 //! whole batch.
 

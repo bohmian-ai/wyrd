@@ -29,12 +29,10 @@ impl TableScope {
         }
     }
 
-    /// The control-plane RLS bind for `vala.bifrost_tables` / `vala.olap_commits`
-    /// rows. Derived from scope, never from the caller: `SystemShared`
-    /// tables register and commit under the privileged `SYSTEM_OWNER`; `TenantOwned`
-    /// tables under the authenticated data tenant. This is one of the two distinct
-    /// `DataTenantId` values a Bifrost path carries and must never collapse with
-    /// the data/stamp tenant below.
+    /// The control-plane RLS bind for `vala.bifrost_tables` rows. Derived from
+    /// scope, never from the caller: `SystemShared` tables register under the
+    /// privileged `SYSTEM_OWNER`; `TenantOwned` tables use the authenticated
+    /// data tenant.
     pub fn control_bind(self, data_tenant: DataTenantId) -> DataTenantId {
         match self {
             Self::SystemShared => DataTenantId::SYSTEM_OWNER,

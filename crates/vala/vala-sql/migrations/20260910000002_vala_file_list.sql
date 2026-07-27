@@ -22,7 +22,6 @@ CREATE TABLE vala.file_list (
     min_event_time        timestamptz NOT NULL,
     max_event_time        timestamptz NOT NULL,
     partition_day         date NOT NULL,
-    tenant_bucket         int  NOT NULL,
     compacted             bool NOT NULL DEFAULT false,
     committed_snapshot_id bigint,
     -- Writer stream identity: (node_id, writer_epoch) identifies the pod-local
@@ -37,7 +36,7 @@ CREATE TABLE vala.file_list (
 
 -- Forge compaction lookup: uncompacted files grouped by partition.
 CREATE INDEX file_list_group_idx
-    ON vala.file_list (namespace, table_name, partition_day, tenant_bucket)
+    ON vala.file_list (data_tenant_id, namespace, table_name, partition_day)
     WHERE NOT compacted;
 
 -- Tenant-scoped table queries (RLS enforced).
@@ -46,12 +45,13 @@ CREATE INDEX file_list_tenant_idx
 
 -- Per-stream watermark lookup for Oracle live-tail dedup.
 CREATE INDEX file_list_live_tail_watermark_idx
-    ON vala.file_list (namespace, table_name, tenant_bucket, node_id, writer_epoch, wal_lsn_max);
+    ON vala.file_list (data_tenant_id, namespace, table_name,
+                       node_id, writer_epoch, wal_lsn_max);
 
 -- Duplicate-range guard: prevents replay-driven re-seal from double-inserting
 -- the same sealed range (regression guard for restart idempotency).
 CREATE UNIQUE INDEX file_list_stream_range_uniq
-    ON vala.file_list (node_id, writer_epoch, wal_lsn_min, wal_lsn_max);
+    ON vala.file_list (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max);
 
 -- RLS: cross-tenant SELECT under a tenant-scoped role returns zero rows.
 ALTER TABLE vala.file_list ENABLE ROW LEVEL SECURITY;
@@ -62,7 +62,7 @@ CREATE POLICY tenant_isolation ON vala.file_list
 
 -- OperatorPool grants (wyrd_platform_admin BYPASSRLS). BYPASSRLS skips RLS
 -- policies but NOT privilege checks. Scribe INSERTs via TenantConn (RLS-bound);
--- Forge/Oracle system-owner work goes through OperatorPool (audited).
+-- Forge/Oracle maintenance work goes through OperatorPool (audited).
 DO $$ BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'wyrd_platform_admin') THEN
     RAISE EXCEPTION 'wyrd_platform_admin missing — run bootstrap/roles.sql / db:setup-roles';

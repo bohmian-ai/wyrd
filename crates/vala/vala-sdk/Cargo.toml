@@ -17,8 +17,10 @@ default = []
 python = ["dep:pyo3"]
 
 [dependencies]
+bytes = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-client = { workspace = true }
+wyrd-tonic = { workspace = true, features = ["client"] }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }
 arrow-schema = { workspace = true }
@@ -28,10 +30,17 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = "0.1"
+uuid = { workspace = true, features = ["v7"] }
 
 pyo3 = { workspace = true, optional = true }
 
 [dev-dependencies]
+arrow = { workspace = true }
+reqwest = { workspace = true }
+sqlx = { workspace = true, features = ["postgres"] }
+vala-bifrost = { workspace = true }
 wyrd-queue = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-testing = { workspace = true }

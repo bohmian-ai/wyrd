@@ -5,7 +5,7 @@
 //! panic→500 mapping, body-limit enforcement, and authenticated `Principal`.
 //! Also contrasts `merge_http` (unprotected) as a negative baseline.
 
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;
@@ -19,6 +19,10 @@ mod pg_tests {
     use chrono::Duration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tower::ServiceExt;
+    use vala_bifrost_redux::scribe::{
+        ScribeImpl,
+        wal::{WalConfig, WalWriter},
+    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -27,7 +31,7 @@ mod pg_tests {
     use wyrd_server::components::auth::ServerAuth;
     use wyrd_server::config::WyrdServerConfig;
     use wyrd_server::postgres::ServerPostgres;
-    use wyrd_server::state::LimitsConfig;
+    use wyrd_server::state::{BifrostIngestRuntime, LimitsConfig};
     use wyrd_server::{AppState, WyrdServer};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
@@ -37,7 +41,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -64,16 +68,40 @@ mod pg_tests {
             ),
             WyrdAuthVerifySettings::default(),
         ));
-        AppState::new(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            support::test_catalog().await,
-        )
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let catalog = support::test_catalog().await;
+        let redux_catalog = support::test_redux_catalog().await;
+        let wal_root = tempfile::tempdir().expect("wal temp dir");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("wal initializes"),
+        );
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
+            Arc::new(storage.operator().clone()),
+            wal,
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+        ));
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
+            Arc::clone(&redux_catalog),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
+        ));
+        AppState::new(postgres, storage, catalog)
+            .with_bifrost_redux(redux_catalog)
+            .with_bifrost_ingest(ingest)
+            .with_auth(ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..ServerAuth::default()
+            })
     }
 
     fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {

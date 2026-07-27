@@ -34,6 +34,7 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests replay convergence of compaction bookkeeping using real durable state.
 ///
 /// Steps:
@@ -72,18 +73,15 @@ async fn forge_compaction_pg_iceberg_bookkeeping_matrix_never_duplicates() {
             );
         }
     }
-    let committed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed'",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_one(fixture.context.operator_pool.pool())
-    .await
-    .expect("committed audit count");
+    let committed = fixture
+        .operation_count("forge.file_compact.committed")
+        .await;
     assert_eq!(committed, 1);
     server.shutdown().await.expect("server shutdown");
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests tenant, physical-table, partition, and schema isolation in one
 /// production discovery tick.
 ///
@@ -158,27 +156,11 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
             .await
             .expect("isolated catalog table");
         assert_eq!(table.metadata().snapshots().len(), expected_bins as usize);
-        let resource = format!(
-            "bifrost://{}/{}/{}",
-            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
-        );
-        let audit_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource = $2 AND operation = 'forge.file_compact.committed'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .bind(&resource)
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("isolated audit state");
+        let audit_count = fixture
+            .operation_count("forge.file_compact.committed")
+            .await;
         assert_eq!(audit_count, expected_bins);
-        let prepared_count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource = $2 AND operation = 'forge.file_compact.prepared'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .bind(&resource)
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("isolated prepared audit state");
+        let prepared_count = fixture.operation_count("forge.file_compact.prepared").await;
         assert_eq!(prepared_count, expected_bins);
         assert!(
             fixture
@@ -191,6 +173,7 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests public-tick behavior when a competing worker already owns the table.
 ///
 /// Steps:
@@ -242,6 +225,7 @@ async fn forge_compaction_lease_contention_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests reconciliation after Iceberg commits but the caller receives an
 /// injected retryable uncertainty response.
 ///
@@ -280,21 +264,14 @@ async fn forge_compaction_replay_after_commit_is_idempotent() {
         .await
         .expect("successor durable tick");
     assert_eq!(second.bins_committed, 0, "successor outcome: {second:?}");
-    let committed = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation IN ('forge.file_compact.committed', 'forge.file_compact.recovered')",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
+    let committed = fixture
+        .operation_count("forge.file_compact.committed")
         .await
-        .expect("committed audit count");
+        + fixture
+            .operation_count("forge.file_compact.recovered")
+            .await;
     assert_eq!(committed, 1, "successor outcome: {second:?}");
-    let prepared: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.prepared'",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_one(fixture.context.operator_pool.pool())
-    .await
-    .expect("prepared audit count");
+    let prepared = fixture.operation_count("forge.file_compact.prepared").await;
     assert_eq!(prepared, 1, "uncertain commit must reconcile one operation");
     let table = fixture
         .context
@@ -307,6 +284,7 @@ async fn forge_compaction_replay_after_commit_is_idempotent() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately after a real Iceberg commit and before SQL
 /// bookkeeping.
 ///
@@ -382,6 +360,7 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately before a real Iceberg commit.
 ///
 /// The catalog wrapper pauses at the existing `Catalog::update_table` seam,
@@ -441,6 +420,7 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests expiry fencing after the real snapshot-expiry commit and before its
 /// recovered terminal audit append.
 ///

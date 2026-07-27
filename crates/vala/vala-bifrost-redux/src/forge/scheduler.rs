@@ -165,10 +165,7 @@ async fn process_table(
 
     // Keep release outside the stage future so every post-acquisition path
     // converges through the same cleanup decision.
-    let table_result = tokio::select! {
-        result = run_table_stages(context, &mut lease, key, &binding, stopped, outcome) => result,
-        () = stopped.cancelled() => Err(ForgeError::Shutdown),
-    };
+    let table_result = run_table_stages(context, &mut lease, key, &binding, stopped, outcome).await;
     let release_result = release_lease(context, &lease).await;
     match (table_result, release_result) {
         (Ok(stop_after), Ok(())) => {

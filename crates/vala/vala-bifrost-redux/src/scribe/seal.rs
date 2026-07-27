@@ -10,11 +10,14 @@ use wyrd_spec::ids::PodId;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
+use crate::scribe::execution_lanes::{
+    ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult,
+};
 use crate::scribe::file_list_writer;
 use crate::scribe::file_list_writer::FileListCommitKey;
 use crate::scribe::filename::seal_filename;
-use crate::scribe::memtable::Memtable;
-use crate::scribe::parquet_writer::{ParquetEncoded, encode_batch};
+use crate::scribe::memtable::{FrozenMemtable, Memtable};
+use crate::scribe::parquet_writer::ParquetEncoded;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::WalLsn;
 
@@ -33,6 +36,8 @@ pub struct PostCommitToken {
     pub wal_lsn_min: WalLsn,
     /// Inclusive maximum WAL LSN in the generation.
     pub wal_lsn_max: WalLsn,
+    /// Arrow bytes transferred from the writable to immutable tier.
+    pub memtable_bytes: usize,
 }
 
 /// A set of post-commit capabilities produced by one force-seal call.
@@ -62,13 +67,26 @@ pub struct SealCommit {
 #[derive(Debug)]
 pub struct SealDriver {
     operator: Arc<Operator>,
+    persistence_cpu: ScribePersistenceCpuPool,
 }
 
 impl SealDriver {
     /// Construct a new `SealDriver` with the given opendal operator.
     #[must_use]
     pub fn new(operator: Arc<Operator>) -> Self {
-        Self { operator }
+        Self::new_with_lane(operator, ScribePersistenceCpuPool::new(1))
+    }
+
+    /// Construct a seal driver using the boot-owned persistence CPU lane.
+    #[must_use]
+    pub(crate) fn new_with_lane(
+        operator: Arc<Operator>,
+        persistence_cpu: ScribePersistenceCpuPool,
+    ) -> Self {
+        Self {
+            operator,
+            persistence_cpu,
+        }
     }
 
     /// Execute seal stages 1-4 (Freeze → Parquet → PUT → PG tx) and return a
@@ -81,6 +99,31 @@ impl SealDriver {
     pub async fn pre_commit(
         &self,
         memtable: &Memtable,
+        seal_key: &SealKey,
+        binding: &TenantTableBinding,
+        conn: &mut TenantConn<'_>,
+        node_id: &str,
+        writer_epoch: i64,
+    ) -> Result<SealCommit, ScribeError> {
+        info!("seal stage: Freeze");
+        let freeze_started = std::time::Instant::now();
+        let frozen = memtable.freeze(seal_key)?;
+        Self::record(
+            "freeze",
+            freeze_started.elapsed(),
+            frozen.row_count(),
+            frozen.arrow_bytes,
+        );
+        self.pre_commit_frozen(&frozen, seal_key, binding, conn, node_id, writer_epoch)
+            .await
+    }
+
+    /// Execute seal stages after the owning shard has detached the frozen
+    /// generation from its writable state.
+    #[tracing::instrument(skip(self, frozen, conn), fields(seal_key = %seal_key))]
+    pub async fn pre_commit_frozen(
+        &self,
+        frozen: &FrozenMemtable,
         seal_key: &SealKey,
         binding: &TenantTableBinding,
         conn: &mut TenantConn<'_>,
@@ -101,31 +144,37 @@ impl SealDriver {
             });
         }
 
-        // 1. Freeze
-        info!("seal stage: Freeze");
-        let frozen = memtable.freeze(seal_key)?;
-
-        // 2. WriteParquet (spawn_blocking to avoid blocking reactor)
+        // 2. WriteParquet on the boot-owned persistence CPU lane.
         info!("seal stage: WriteParquet");
-        let frozen_clone = frozen.clone();
-        let binding_clone = binding.clone();
-        let seal_tenant = seal_key.tenant;
-        let encoded = tokio::task::spawn_blocking(move || {
-            encode_batch(&frozen_clone, &binding_clone, seal_tenant)
-        })
-        .await
-        .map_err(|e| ScribeError::Internal {
-            detail: format!("Parquet encode task panic: {e}"),
-        })??;
+        let parquet_started = std::time::Instant::now();
+        let encoded = self
+            .encode_parquet(frozen, binding, seal_key.tenant)
+            .await?;
+        Self::record(
+            "parquet_encode",
+            parquet_started.elapsed(),
+            frozen.row_count(),
+            encoded.bytes.len(),
+        );
 
         // 3. PutObject
         info!("seal stage: PutObject");
-        let parquet_path = self.put_object(binding, &encoded, node_id).await?;
+        let put_started = std::time::Instant::now();
+        let parquet_path = self
+            .put_object(binding, seal_key, &encoded, node_id)
+            .await?;
+        Self::record(
+            "object_store_put",
+            put_started.elapsed(),
+            frozen.row_count(),
+            encoded.bytes.len(),
+        );
 
         // 4. AtomicPgTx
         info!("seal stage: AtomicPgTx");
+        let pg_started = std::time::Instant::now();
         let row = file_list_writer::build_insert(
-            &frozen,
+            frozen,
             &encoded,
             binding,
             node_id,
@@ -135,6 +184,12 @@ impl SealDriver {
         let insert_outcome = file_list_writer::insert_and_audit(conn, &row, &encoded.audit_events)
             .await
             .map_err(ScribeError::from)?;
+        Self::record(
+            "file_list_transaction",
+            pg_started.elapsed(),
+            frozen.row_count(),
+            encoded.bytes.len(),
+        );
 
         let wal_lsn_min = encoded
             .append_metas
@@ -157,10 +212,45 @@ impl SealDriver {
                 file_list_row_id: insert_outcome.id,
                 wal_lsn_min,
                 wal_lsn_max,
+                memtable_bytes: frozen.arrow_bytes,
             },
             binding: binding.clone(),
             parquet_path,
         })
+    }
+
+    async fn encode_parquet(
+        &self,
+        frozen: &FrozenMemtable,
+        binding: &TenantTableBinding,
+        tenant: wyrd_spec::ids::DataTenantId,
+    ) -> Result<ParquetEncoded, ScribeError> {
+        match self
+            .persistence_cpu
+            .submit(ScribePersistenceCpuOp::EncodeParquet {
+                frozen: Box::new(frozen.clone()),
+                binding: binding.clone(),
+                tenant,
+            })
+            .await?
+        {
+            ScribePersistenceCpuResult::ParquetEncoded(encoded) => Ok(encoded),
+            ScribePersistenceCpuResult::Prepared(_) => Err(ScribeError::Internal {
+                detail: "persistence lane returned the wrong seal result".to_owned(),
+            }),
+            ScribePersistenceCpuResult::ReplayRestored(_) => Err(ScribeError::Internal {
+                detail: "persistence lane returned replay output during seal".to_owned(),
+            }),
+        }
+    }
+
+    fn record(stage: &str, elapsed: std::time::Duration, rows: usize, bytes: usize) {
+        metrics::histogram!("bifrost_scribe_seal_stage_seconds", "stage" => stage.to_owned())
+            .record(elapsed.as_secs_f64());
+        metrics::counter!("bifrost_scribe_seal_rows_total", "stage" => stage.to_owned())
+            .increment(u64::try_from(rows).unwrap_or(u64::MAX));
+        metrics::counter!("bifrost_scribe_seal_bytes_total", "stage" => stage.to_owned())
+            .increment(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
     /// PUT the Parquet object to storage with retry on transient failures.
@@ -170,14 +260,23 @@ impl SealDriver {
     async fn put_object(
         &self,
         binding: &TenantTableBinding,
+        seal_key: &SealKey,
         encoded: &ParquetEncoded,
         node_id: &str,
     ) -> Result<String, ScribeError> {
-        let pod_id = PodId::new(node_id).map_err(|e| ScribeError::Internal {
-            detail: format!("node_id is not a valid PodId: {e}"),
+        let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
+            detail: format!("node_id is not a valid UUID: {error}"),
+        })?;
+        let pod_id = PodId::new(format!("pod-{}", node_uuid.simple())).map_err(|error| {
+            ScribeError::Internal {
+                detail: format!("derived node PodId is invalid: {error}"),
+            }
         })?;
         let filename = seal_filename(&pod_id);
-        let path = format!("{}/{}", binding.object_prefix, filename);
+        let path = format!(
+            "{}/day={}/{}",
+            binding.object_prefix, seal_key.day, filename
+        );
 
         // Retry policy: base 100 ms, cap 5 s, 5 attempts max, jitter enabled
         let mut attempt = 0;

@@ -2,11 +2,7 @@
 
 use sqlx::types::{Uuid, chrono};
 
-/// One unshipped audit row returned by `vala.claim_unshipped_audit`.
-///
-/// Carries the full audited-operation fields plus the hash-chain columns the
-/// relay needs to build the Iceberg batch. `data_tenant_id` and `seq` identify
-/// the row; the relay groups by tenant and ships a contiguous `seq` range.
+/// One immutable audit outbox row.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuditOutboxRow {
     /// Tenant isolation key.
@@ -45,8 +41,4 @@ pub struct AuditOutboxRow {
     pub detail: Option<String>,
     /// Wall-clock append time.
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Relay batch idempotency key stamped at claim time; `None` for rows not yet
-    /// claimed by the relay. On crash recovery the relay reuses this value instead
-    /// of recomputing from the live seq range.
-    pub ship_batch_id: Option<Vec<u8>>,
 }

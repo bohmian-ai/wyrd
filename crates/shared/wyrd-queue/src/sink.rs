@@ -21,8 +21,7 @@ pub struct SealedBatch {
     /// the sink forwards it to its typed service.
     pub table: String,
     /// Durable idempotency key. Minted **once at seal** (UUIDv7 bytes) and
-    /// **stable across transport retries** — a retry re-sends the same id so the
-    /// server `olap_commits` dedup holds. The producer never regenerates it.
+    /// **stable across transport retries**. The producer never regenerates it.
     pub batch_id: [u8; 16],
     /// Arrow IPC stream bytes for one logical `RecordBatch` — user columns plus
     /// the two per-row correlation columns `card_ref` and `run_id`. The server

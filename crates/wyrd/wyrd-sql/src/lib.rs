@@ -439,19 +439,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let historical_storage = fs::read_to_string(
-            crate_dir
-                .join("migrations")
-                .join("20260601000002_storage.sql"),
-        )
-        .expect("historical storage migration is readable");
-        let retirement = fs::read_to_string(
-            crate_dir
-                .join("migrations")
-                .join("20260601000014_storage_access_ledger_retirement.sql"),
-        )
-        .expect("storage retirement migration is readable");
-
         for table in [
             "wyrd.storage_multipart_uploads",
             "wyrd.storage_artifact_metadata",
@@ -462,26 +449,10 @@ mod tests {
                 "storage migration must create or configure {table}"
             );
         }
+        let removed_access_table = ["storage_access", "_ledger"].concat();
         assert!(
-            historical_storage.contains("CREATE TABLE wyrd.storage_access_ledger"),
-            "historical storage migration must preserve the legacy access ledger"
-        );
-        for statement in [
-            "DROP POLICY IF EXISTS admin_cross_tenant ON wyrd.storage_access_ledger;",
-            "DROP POLICY IF EXISTS tenant_isolation ON wyrd.storage_access_ledger;",
-            "DROP INDEX IF EXISTS wyrd.storage_access_ledger_tenant_created;",
-            "DROP INDEX IF EXISTS wyrd.storage_access_ledger_upload;",
-            "DROP TABLE IF EXISTS wyrd.storage_access_ledger;",
-            "DROP SEQUENCE IF EXISTS wyrd.storage_access_ledger_id_seq;",
-        ] {
-            assert!(
-                retirement.contains(statement),
-                "storage retirement migration must contain {statement}"
-            );
-        }
-        assert!(
-            migrations.contains("storage_access_ledger"),
-            "storage migration set must include the historical ledger and its retirement"
+            !migrations.contains(&removed_access_table),
+            "storage migration set must not contain the removed access ledger"
         );
 
         let forbidden_parts_table = ["storage_multipart_upload", "_parts"].concat();

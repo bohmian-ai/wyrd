@@ -9,9 +9,7 @@ use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailRequest, FetchLiveTailService, LiveTailShard, TailFrame,
-};
+use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
@@ -60,18 +58,28 @@ fn setup() -> (
     StreamIdentity,
     DataTenantId,
     TableRef,
-    LiveTailShard,
+    TenantTableBinding,
 ) {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "events");
     let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
     let stream = StreamIdentity::new(NodeId::new(Uuid::now_v7()), WriterEpoch::new(7));
-    let shard = LiveTailShard {
-        tenant_table: binding,
-        table: table.clone(),
-        tenant,
-    };
-    (Arc::new(Memtable::new()), stream, tenant, table, shard)
+    (Arc::new(Memtable::new()), stream, tenant, table, binding)
+}
+
+fn request(
+    binding: TenantTableBinding,
+    stream: StreamIdentity,
+    after_lsn: WalLsn,
+) -> FetchLiveTailRequest {
+    FetchLiveTailRequest {
+        binding,
+        target_stream: stream,
+        start_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        end_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+        after_lsn,
+        required_columns: Vec::new(),
+    }
 }
 
 fn append(memtable: &Memtable, tenant: DataTenantId, table: &TableRef, lsn: u64, value: i64) {
@@ -136,11 +144,7 @@ async fn tail_filters_strictly_after_lsn_and_emits_one_terminal() {
     let service = FetchLiveTailService::new(stream, memtable);
 
     let frames = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            shard,
-            target_stream: stream,
-            after_lsn: WalLsn::new(1),
-        })
+        .fetch_live_tail(request(shard, stream, WalLsn::new(1)))
         .await
         .expect("tail");
 
@@ -163,11 +167,7 @@ async fn stream_mismatch_rejects_before_memtable_read() {
     let service = FetchLiveTailService::new(stream, memtable);
 
     let error = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            shard,
-            target_stream: requested,
-            after_lsn: WalLsn::new(0),
-        })
+        .fetch_live_tail(request(shard, requested, WalLsn::new(0)))
         .await
         .expect_err("mismatch");
     assert!(matches!(
@@ -190,11 +190,7 @@ async fn tail_is_scoped_to_exact_tenant_and_table() {
     );
     let service = FetchLiveTailService::new(stream, memtable);
     let frames = service
-        .fetch_live_tail(FetchLiveTailRequest {
-            shard,
-            target_stream: stream,
-            after_lsn: WalLsn::new(0),
-        })
+        .fetch_live_tail(request(shard, stream, WalLsn::new(0)))
         .await
         .expect("tail");
     let lsns: Vec<_> = frames
@@ -211,11 +207,7 @@ async fn tail_is_scoped_to_exact_tenant_and_table() {
 async fn empty_tail_has_exactly_one_complete_frame() {
     let (memtable, stream, _tenant, _table, shard) = setup();
     let frames = FetchLiveTailService::new(stream, memtable)
-        .fetch_live_tail(FetchLiveTailRequest {
-            shard,
-            target_stream: stream,
-            after_lsn: WalLsn::new(0),
-        })
+        .fetch_live_tail(request(shard, stream, WalLsn::new(0)))
         .await
         .expect("empty tail");
     assert_eq!(frames, vec![TailFrame::Complete]);
@@ -226,11 +218,7 @@ async fn missing_data_tenant_column_is_internal_error() {
     let (memtable, stream, tenant, table, shard) = setup();
     append_without_tenant(&memtable, tenant, &table);
     let error = FetchLiveTailService::new(stream, memtable)
-        .fetch_live_tail(FetchLiveTailRequest {
-            shard,
-            target_stream: stream,
-            after_lsn: WalLsn::new(0),
-        })
+        .fetch_live_tail(request(shard, stream, WalLsn::new(0)))
         .await
         .expect_err("missing tenant column");
     assert!(matches!(

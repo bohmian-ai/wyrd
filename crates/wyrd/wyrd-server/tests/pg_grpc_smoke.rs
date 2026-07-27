@@ -1,4 +1,4 @@
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;
@@ -23,7 +23,7 @@ mod pg_tests {
         let pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(pool, None),
+            vala_sql::ValaPostgres::from_pool(pool),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");

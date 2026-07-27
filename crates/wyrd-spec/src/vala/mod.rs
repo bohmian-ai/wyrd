@@ -28,13 +28,13 @@ pub mod eval;
 pub mod ids;
 /// Log observation records (faithful OTel LogRecord).
 pub mod logs;
+/// Managed physical column names and the [`ManagedColumnSet`] descriptor.
+pub mod managed_columns;
 /// Metric observation records (full OTLP fidelity).
 pub mod metrics;
 /// Observation forward contract — envelope, closed kind taxonomy, and record
 /// descriptor for the Vala ingest surface.
 pub mod observation;
-/// Reserved system column names and the [`SystemColumnSet`] descriptor.
-pub mod system_columns;
 pub mod trace;
 
 pub use audit_detail::{
@@ -43,8 +43,8 @@ pub use audit_detail::{
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::BifrostError;
-pub use system_columns::{
-    CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RESERVED_CORRELATION_COLUMNS,
-    RESERVED_SYSTEM_COLUMNS, RUN_ID, SystemColumnSet, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, is_reserved_correlation_column, is_reserved_system_column,
+pub use managed_columns::{
+    CARD_REF, CARD_UID, DATA_TENANT_ID, ManagedColumnSet, PRINCIPAL_ID,
+    RESERVED_CORRELATION_COLUMNS, RESERVED_MANAGED_COLUMNS, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, is_reserved_correlation_column, is_reserved_managed_column,
 };

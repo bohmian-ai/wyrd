@@ -3,9 +3,11 @@ mod pg_tests {
 
     use chrono::{DateTime, NaiveDate, Utc};
     use opendal::services::Memory;
+    use secrecy::ExposeSecret;
     use sqlx::types::Uuid;
     use std::sync::Arc;
     use vala_bifrost_redux::catalog::tenant_table::TenantTableBindingError;
+    use vala_bifrost_redux::catalog::{BifrostCatalog, BifrostCatalogError, CreateTableRequest};
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::scribe::ScribeImpl;
@@ -19,6 +21,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+    use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
     fn logical_table() -> TableRef {
         TableRef::new(BifrostNamespace::Traces, "spans")
@@ -43,6 +46,45 @@ mod pg_tests {
             .await
             .expect("tenant B");
         (fixture, tenant_a, tenant_b)
+    }
+
+    async fn redux_catalog(
+        fixture: &PgFixture,
+    ) -> (tempfile::TempDir, Arc<StorageHandle>, BifrostCatalog) {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: warehouse.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: std::time::Duration::from_mins(10),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("storage");
+        let catalog = BifrostCatalog::new(
+            fixture.catalog_dsn().expose_secret(),
+            storage.backend_config(),
+            fixture.vala_postgres().clone(),
+        )
+        .await
+        .expect("Redux catalog");
+        (warehouse, storage, catalog)
+    }
+
+    fn catalog_request(table: TableRef, tenant: DataTenantId) -> CreateTableRequest {
+        CreateTableRequest {
+            table,
+            user_fields: vec![arrow::datatypes::Field::new(
+                "value",
+                arrow::datatypes::DataType::Int64,
+                false,
+            )],
+            tenant,
+            audit: None,
+        }
     }
 
     fn insert_row(
@@ -126,7 +168,6 @@ mod pg_tests {
         .fetch_all(&pool)
         .await
         .expect("file_list columns");
-        assert!(!columns.iter().any(|column| column == "tenant_bucket"));
         assert!(!columns.iter().any(|column| column == "scope"));
         let tenant_nullable: String = sqlx::query_scalar(
             "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'vala' AND table_name = 'file_list' AND column_name = 'data_tenant_id'",
@@ -189,6 +230,227 @@ mod pg_tests {
     }
 
     #[tokio::test]
+    async fn test_redux_catalog_registers_same_logical_name_per_tenant() {
+        let (fixture, tenant_a, tenant_b) = setup().await;
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let storage = StorageHandle::from_settings(StorageSettings {
+            backend: BackendConfig::Local {
+                root: warehouse.path().to_path_buf(),
+            },
+            require_encryption: false,
+            presign_ttl: std::time::Duration::from_mins(10),
+            part_size_bytes: 16 * 1024 * 1024,
+            multipart_threshold_bytes: 100 * 1024 * 1024,
+            public_base_url: Some("https://wyrd.test".to_owned()),
+        })
+        .await
+        .expect("storage");
+        let catalog = BifrostCatalog::new(
+            fixture.catalog_dsn().expose_secret(),
+            storage.backend_config(),
+            fixture.vala_postgres().clone(),
+        )
+        .await
+        .expect("Redux catalog");
+        let table = TableRef::new(BifrostNamespace::Bifrost, "shared_logical_name");
+        let user_fields = vec![arrow::datatypes::Field::new(
+            "value",
+            arrow::datatypes::DataType::Int64,
+            false,
+        )];
+
+        let uid_a = catalog
+            .create_table(CreateTableRequest {
+                table: table.clone(),
+                user_fields: user_fields.clone(),
+                tenant: tenant_a,
+                audit: None,
+            })
+            .await
+            .expect("tenant A table");
+        let uid_b = catalog
+            .create_table(CreateTableRequest {
+                table: table.clone(),
+                user_fields,
+                tenant: tenant_b,
+                audit: None,
+            })
+            .await
+            .expect("tenant B table");
+
+        assert_ne!(uid_a, uid_b);
+        assert_eq!(
+            catalog
+                .describe_table(&table, tenant_a)
+                .await
+                .expect("tenant A description")
+                .entry
+                .name,
+            "shared_logical_name"
+        );
+        assert_eq!(
+            catalog
+                .describe_table(&table, tenant_b)
+                .await
+                .expect("tenant B description")
+                .entry
+                .name,
+            "shared_logical_name"
+        );
+        let unregistered_tenant = DataTenantId::new_v7();
+        fixture
+            .seed_additional_tenant_with_uuid(
+                unregistered_tenant,
+                &format!("unregistered-{}", unregistered_tenant.as_uuid().simple()),
+            )
+            .await
+            .expect("unregistered tenant");
+        assert!(matches!(
+            catalog
+                .table_schema_fingerprint(&table, unregistered_tenant)
+                .await,
+            Err(BifrostCatalogError::TableNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_redux_catalog_reconciles_physical_only_state() {
+        let (fixture, tenant, _) = setup().await;
+        let (_warehouse, _storage, catalog) = redux_catalog(&fixture).await;
+        let table = TableRef::new(
+            BifrostNamespace::Bifrost,
+            format!("physical_only_{}", Uuid::now_v7().simple()),
+        );
+        let request = catalog_request(table.clone(), tenant);
+        let original_uid = catalog.create_table(request).await.expect("initial table");
+
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(tenant)
+            .await
+            .expect("tenant connection");
+        vala_sql::queries::olap_catalog::delete_table(&mut conn, &table.fqn())
+            .await
+            .expect("delete control row");
+        conn.commit().await.expect("commit control deletion");
+
+        let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
+        assert!(
+            catalog
+                .iceberg_catalog()
+                .table_exists(&binding.table_ident())
+                .await
+                .expect("physical table exists")
+        );
+        let repaired_uid = catalog
+            .create_table(catalog_request(table.clone(), tenant))
+            .await
+            .expect("repair control row");
+        assert_ne!(original_uid, repaired_uid);
+        catalog
+            .table_schema_fingerprint(&table, tenant)
+            .await
+            .expect("repaired control row");
+    }
+
+    #[tokio::test]
+    async fn test_redux_catalog_rejects_control_only_state_without_recreation() {
+        let (fixture, tenant, _) = setup().await;
+        let (_warehouse, _storage, catalog) = redux_catalog(&fixture).await;
+        let table = TableRef::new(
+            BifrostNamespace::Bifrost,
+            format!("control_only_{}", Uuid::now_v7().simple()),
+        );
+        catalog
+            .create_table(catalog_request(table.clone(), tenant))
+            .await
+            .expect("initial table");
+
+        let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
+        catalog
+            .iceberg_catalog()
+            .drop_table(&binding.table_ident())
+            .await
+            .expect("drop physical table");
+        assert!(
+            !catalog
+                .iceberg_catalog()
+                .table_exists(&binding.table_ident())
+                .await
+                .expect("physical table absence")
+        );
+
+        let error = catalog
+            .create_table(catalog_request(table, tenant))
+            .await
+            .expect_err("control-only state must fail closed");
+        assert!(
+            matches!(error, BifrostCatalogError::MetadataMismatch(message) if message.contains("without physical table"))
+        );
+        assert!(
+            !catalog
+                .iceberg_catalog()
+                .table_exists(&binding.table_ident())
+                .await
+                .expect("physical table remains absent")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redux_catalog_three_concurrent_first_creates_reconcile_once() {
+        let (fixture, tenant, _) = setup().await;
+        let (_warehouse, storage, catalog_a) = redux_catalog(&fixture).await;
+        let catalog_b = BifrostCatalog::new(
+            fixture.catalog_dsn().expose_secret(),
+            storage.backend_config(),
+            fixture.vala_postgres().clone(),
+        )
+        .await
+        .expect("second Redux catalog");
+        let catalog_c = BifrostCatalog::new(
+            fixture.catalog_dsn().expose_secret(),
+            storage.backend_config(),
+            fixture.vala_postgres().clone(),
+        )
+        .await
+        .expect("third Redux catalog");
+        let table = TableRef::new(
+            BifrostNamespace::Bifrost,
+            format!("concurrent_{}", Uuid::now_v7().simple()),
+        );
+
+        let (result_a, result_b, result_c) = tokio::join!(
+            catalog_a.create_table(catalog_request(table.clone(), tenant)),
+            catalog_b.create_table(catalog_request(table.clone(), tenant)),
+            catalog_c.create_table(catalog_request(table.clone(), tenant)),
+        );
+        let uid_a = result_a.expect("first concurrent registration");
+        let uid_b = result_b.expect("second concurrent registration");
+        let uid_c = result_c.expect("third concurrent registration");
+        assert_eq!(uid_a, uid_b);
+        assert_eq!(uid_b, uid_c);
+
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(tenant)
+            .await
+            .expect("tenant connection");
+        let rows = vala_sql::queries::olap_catalog::list_tables_for_tenant(&mut conn)
+            .await
+            .expect("catalog rows");
+        conn.commit().await.expect("commit catalog read");
+        assert_eq!(rows.iter().filter(|row| row.fqn == table.fqn()).count(), 1);
+        let binding = TenantTableBinding::resolve((tenant, table)).expect("binding");
+        assert!(
+            catalog_a
+                .iceberg_catalog()
+                .table_exists(&binding.table_ident())
+                .await
+                .expect("physical table exists")
+        );
+    }
+
+    #[tokio::test]
     async fn test_file_list_row_uses_exact_tenant_table_identity() {
         let (fixture, tenant_a, _) = setup().await;
         let binding = TenantTableBinding::resolve((tenant_a, logical_table())).expect("binding");
@@ -234,13 +496,13 @@ mod pg_tests {
                 temp_dir.path(),
                 *node_id.as_bytes(),
                 1,
-                tenant_a,
-                None,
+                vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),
         );
         std::mem::forget(temp_dir);
-        let scribe = ScribeImpl::new_with_deps(operator.clone(), wal, node_id.to_string(), 1);
+        let scribe =
+            ScribeImpl::new_for_embedded_with_deps(operator.clone(), wal, &node_id.to_string(), 1);
         let seal_key = SealKey::new(
             tenant_a,
             logical_table(),
@@ -296,10 +558,13 @@ mod pg_tests {
         let mut conn_b = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant_b)
             .await
             .expect("tenant B connection");
-        let error = insert_and_audit(&mut conn_b, &foreign, &[])
+        let foreign_outcome = insert_and_audit(&mut conn_b, &foreign, &[])
             .await
-            .expect_err("cross-tenant replay must fail closed");
-        assert!(error.to_string().contains("RLS-visible"));
+            .expect("tenant-qualified replay identity");
+        conn_b.commit().await.expect("tenant B commit");
+        assert_eq!(foreign_outcome.id, foreign.id);
+        assert!(!foreign_outcome.replayed);
+        assert_eq!(foreign_outcome.commit_key.data_tenant_id, tenant_b);
 
         let superuser = fixture.superuser_pool().await.expect("superuser pool");
         let audit_count: i64 = sqlx::query_scalar(

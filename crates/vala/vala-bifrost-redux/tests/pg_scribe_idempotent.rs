@@ -1,46 +1,94 @@
-mod pg_tests {
-    //! Idempotency tests for Scribe seal.
-    //!
-    //! Tests verify:
-    //! - Duplicate `batch_id` across appends is idempotent
-    //! - Replay-driven re-seal hits unique index, no duplicate rows
-    //!
-    //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
+//! Durable WAL idempotency and replay coverage for the Task-15 Scribe path.
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay deduplication infrastructure"]
-    async fn pg_scribe_duplicate_batch_id_is_idempotent() {
-        // This test would verify that if the same batch_id is sent in two append
-        // calls, the WAL deduplication logic (reading batch_id from the audit record
-        // header) skips the duplicate and the memtable + file_list contain only one
-        // set of rows.
-        //
-        // Implementation requires:
-        // 1. WAL replay deduplication by batch_id (currently stubbed)
-        // 2. Memtable restart-from-WAL integration
-        // 3. Test harness that can restart ScribeImpl and verify memtable state
-        //
-        // Deferred until WAL replay lands end-to-end.
-    }
+use arrow::array::Int64Array;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
+use chrono::NaiveDate;
+use std::sync::Arc;
+use tempfile::TempDir;
+use uuid::Uuid;
+use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
+use vala_bifrost_redux::scribe::replay::replay_wal_directory;
+use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::ids::DataTenantId;
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
 
-    #[tokio::test]
-    #[ignore = "requires WAL replay infrastructure"]
-    async fn pg_scribe_replay_reseal_hits_unique_index() {
-        // This test would verify idempotent seal behavior during replay:
-        //
-        // 1. Append + seal + commit successfully → file_list row written
-        // 2. Simulate restart without manifest advance (manifest.sealed_lsn still 0)
-        // 3. Replay reconstructs memtable from WAL
-        // 4. Force seal again on same data
-        // 5. Second seal's file_list INSERT hits unique index
-        //    (node_id, writer_epoch, wal_lsn_min, wal_lsn_max)
-        // 6. ON CONFLICT DO NOTHING succeeds, no duplicate audit rows
-        //
-        // Implementation requires:
-        // - Full WAL replay infrastructure (extract_seal_key_from_path, real segment reading)
-        // - Manifest read/write integration
-        // - Test harness that can simulate restarts with controlled manifest state
-        //
-        // Deferred until WAL replay + manifest integration are complete.
+fn batch_bytes(value: i64) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![value]))],
+    )
+    .expect("test batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC finish");
+    bytes
+}
+
+fn audit_event(operation: &str) -> AuditEvent {
+    AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: "vala.bifrost.task15".to_owned(),
+        card_ref: None,
+        principal_id: PrincipalId::new(Uuid::now_v7()),
+        principal_kind: PrincipalKindTag::User,
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:write".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "1 rows".to_owned(),
+        detail: None,
     }
+}
+
+fn seal_key(tenant: DataTenantId) -> SealKey {
+    SealKey::new(
+        tenant,
+        TableRef::new(BifrostNamespace::Bifrost, "task15_idempotent"),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 24).expect("test day")),
+    )
+}
+
+#[test]
+fn duplicate_batch_id_replays_once_and_preserves_the_first_audit() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let writer = WalWriter::new(
+        temp_dir.path(),
+        *Uuid::now_v7().as_bytes(),
+        1,
+        WalConfig::default(),
+    )
+    .expect("WAL writer");
+    let key = seal_key(DataTenantId::new_v7());
+    let batch_id = [9_u8; 16];
+    let first = encode_audit_event(&audit_event("first")).expect("audit");
+    let second = encode_audit_event(&audit_event("duplicate")).expect("audit");
+    let data = batch_bytes(42);
+
+    writer
+        .append_and_fsync_for_test(&key, batch_id, &first, &data)
+        .expect("first WAL append");
+    writer
+        .append_and_fsync_for_test(&key, batch_id, &second, &data)
+        .expect("duplicate WAL append");
+
+    let replayed = replay_wal_directory(temp_dir.path()).expect("replay");
+    let state = replayed.get(&key.as_path_components()).expect("state");
+    assert_eq!(state.data_records.len(), 1);
+    assert_eq!(state.audit_events.len(), 1);
+    assert_eq!(state.audit_events[0].operation, "first");
 }

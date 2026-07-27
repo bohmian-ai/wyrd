@@ -26,8 +26,8 @@ fn bloom_filter_ndv(row_count: usize) -> u64 {
 
 /// Parquet [`WriterProperties`] for every Bifrost data file.
 ///
-/// ZSTD level 3 (writes are once-per-batch via 2PC; reads are scan-bound, so the
-/// extra compression over SNAPPY is worth it). Row groups are capped at 131,072
+/// ZSTD level 3 (writes are once-per-frame after bounded admission; reads are
+/// scan-bound, so the extra compression over SNAPPY is worth it). Row groups are capped at 131,072
 /// rows because parquet-58 has no byte-based row-group flush.
 ///
 /// Bloom filters are enabled only for the identity and correlation columns used

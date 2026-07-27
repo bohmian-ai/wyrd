@@ -131,20 +131,4 @@ impl Registry {
 
         Ok(rows)
     }
-
-    /// Bump `vala.refresh_epochs` and evict the local cache entry.
-    ///
-    /// Called after a successful 2PC commit to invalidate stale metadata across
-    /// any in-process cache holders and signal other pods via the epoch counter.
-    pub(crate) async fn invalidate(&self, key: RegistryKey) -> Result<(), BifrostError> {
-        let mut conn = vala_sql::TenantConn::acquire(&self.pool, key.owner)
-            .await
-            .map_err(BifrostError::Sql)?;
-        vala_sql::queries::olap_catalog::bump_epoch(&mut conn, key.table_uid.as_bytes())
-            .await
-            .map_err(BifrostError::Sql)?;
-        conn.commit().await.map_err(BifrostError::Sql)?;
-        self.by_key.remove(&key);
-        Ok(())
-    }
 }

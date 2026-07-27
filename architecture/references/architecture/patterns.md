@@ -113,7 +113,7 @@ Do not assume these paths exist when writing code today.
 Twelve crates enable a `python` feature (enforced by
 `check:pyo3-scope`):
 
-`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `skald-observer`,
+`wyrd-cards`, `wyrd-config`, `wyrd-interfaces`, `wyrd-observe`,
 `wyrd-testing` (dev-only), `wyrd-utils`, `skald-agent`, `skald-prompt`,
 `skald-runtime`, `skald-tool`, `skald-workflow`, `vala-sdk`.
 
@@ -140,6 +140,52 @@ Python-visible wrappers around `wyrd-spec` contracts live in owner crates
 
 `wyrd-spec` is foundational but not a dumping ground for all contracts.
 If it is not spec-related, find another place for it.
+
+## Canonical Rust Composition Pattern
+
+Wyrd Rust code uses the required struct-centered hybrid style from
+`AGENTS.md` §5. Behavior is organized around three distinct roles:
+
+| Role | Owns | Shape |
+|---|---|---|
+| Domain value | Identity, invariants, validation, pure transformations | Struct, newtype, or closed enum with inherent methods |
+| Service or handle | Clients, stores, configuration, runtime state, IO workflows | Concrete struct with explicit fields, constructor, and inherent methods |
+| Pure helper | Stateless deterministic calculation or narrow conversion | Small module function |
+
+`crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical service
+pattern. `Cards` owns a shared `RegistryEngine`; callers discover registry
+workflows through methods such as `register`, `get`, `load`, and `delete`.
+Focused internal modules implement narrow stages, while the public handle owns
+the capability and workflow boundary.
+
+```text
+Cards
+└── RegistryEngine
+    ├── WyrdClient
+    └── storage client
+
+Cards methods             public and internal workflows
+Focused private methods   stateful workflow stages
+Module helper functions   pure validation and transformation only
+```
+
+When several functions repeatedly accept the same dependency bundle or
+context, replace that functional call graph with one cohesive owning struct.
+When a function is entirely determined by its inputs and has no natural owner,
+keep it free. Do not introduce zero-sized utility structs, broad manager
+objects, or traits around a single implementation.
+
+Synchronous methods are the default. Add async methods only for workflows that
+actually await IO, and keep their synchronous planning, validation, and
+transformation stages synchronous. Every item in either path requires rustdoc
+that explains intent, operation, workflow role, and errors in accordance with
+`AGENTS.md` §16.
+
+Card envelopes are the explicit exception to an active-record interpretation.
+They are declarative domain values and may own construction, validation, and
+pure transformations. They do not own registry, storage, policy, audit, or
+server lifecycle clients. Those operations stay on the corresponding service
+or handle.
 
 ## Server Pattern
 

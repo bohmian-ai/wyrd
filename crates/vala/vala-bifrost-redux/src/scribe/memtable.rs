@@ -1,8 +1,9 @@
 //! In-memory row buffer keyed by seal-key with seal predicate.
 //!
 //! The memtable holds Arrow buffers + paired `AuditEvent` lists per
-//! `SealKey = (DataTenantId, TableRef, EventDay)`. Seal predicate triggers
-//! freeze at first-of: 50k rows | 1s wall-time | 128 MiB | 5s inactivity.
+//! `SealKey = (DataTenantId, TableRef, EventDay)`. Rotation is driven by
+//! retained Arrow size, active-generation age, and global pressure. WAL
+//! segment rollover is deliberately independent from bucket rotation.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -17,14 +18,14 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::contracts::ScribeError;
 use crate::scribe::file_list_writer::FileListCommitKey;
+use crate::scribe::routing::shard_for;
 use crate::scribe::seal_key::SealKey;
 use crate::scribe::wal::ScribeAppendMeta;
 
-/// Seal predicate thresholds (hardcoded constants for ).
-const SEAL_ROWS_THRESHOLD: usize = 50_000;
-const SEAL_BYTES_THRESHOLD: usize = 128 * 1024 * 1024; // 128 MiB
-const SEAL_INTERVAL_SECS: u64 = 1;
-const SEAL_INACTIVITY_SECS: u64 = 5;
+/// Estimated Arrow bytes at which the active generation rotates.
+pub const MEMTABLE_ROTATION_BYTES: usize = 512 * 1024 * 1024;
+/// Maximum age of an active generation before the lifecycle scanner requests rotation.
+pub const ACTIVE_GENERATION_MAX_AGE: Duration = Duration::from_mins(10);
 
 /// Memtable — in-memory row buffer keyed by seal-key.
 ///
@@ -36,6 +37,54 @@ pub struct Memtable {
     pub(crate) immutable: Arc<Mutex<HashMap<SealKey, Vec<ImmutableEntry>>>>,
     next_seal_id: Arc<AtomicU64>,
     retention_grace: Duration,
+    rotation_bytes: usize,
+}
+
+/// Aggregate memory and generation state for a Scribe pod.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemtableStats {
+    /// Rows in writable buckets.
+    pub writable_rows: usize,
+    /// Estimated bytes in writable buckets.
+    pub writable_bytes: usize,
+    /// Rows retained in immutable generations.
+    pub immutable_rows: usize,
+    /// Estimated bytes retained in immutable generations.
+    pub immutable_bytes: usize,
+    /// Total immutable generations.
+    pub immutable_generations: usize,
+    /// Immutable generations still awaiting post-commit completion.
+    pub pending_generations: usize,
+    /// Writable seal-key buckets currently present.
+    pub writable_buckets: usize,
+    /// Seal-key buckets with immutable generations currently present.
+    pub immutable_buckets: usize,
+}
+
+/// Memory owned by one exact seal-key bucket, used by test-tier inspection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BucketMemorySnapshot {
+    /// Exact tenant/table/day identity of the bucket.
+    pub seal_key: SealKey,
+    /// Rows currently retained for this seal-key.
+    pub row_count: usize,
+    /// Bytes in the writable bucket.
+    pub writable_bytes: usize,
+    /// Bytes in immutable generations for the bucket.
+    pub immutable_bytes: usize,
+}
+
+/// Scanner-only pressure metadata for one writable seal-key bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PressureCandidate {
+    /// Exact tenant/table/day identity of the bucket.
+    pub seal_key: SealKey,
+    /// Arrow bytes eligible for a pressure rotation.
+    pub writable_bytes: usize,
+    /// Stable age tie-breaker.
+    pub first_insert_at: Instant,
+    /// Oldest WAL LSN currently retained by the bucket.
+    pub oldest_wal_lsn: Option<crate::scribe::wal::WalLsn>,
 }
 
 impl Memtable {
@@ -48,11 +97,18 @@ impl Memtable {
     /// Construct a memtable with an explicit immutable-generation grace period.
     #[must_use]
     pub fn new_with_retention(retention_grace: Duration) -> Self {
+        Self::new_with_limits(retention_grace, MEMTABLE_ROTATION_BYTES)
+    }
+
+    /// Construct a memtable with explicit retention and active-bucket limits.
+    #[must_use]
+    pub fn new_with_limits(retention_grace: Duration, rotation_bytes: usize) -> Self {
         Self {
             writable: Arc::new(Mutex::new(HashMap::new())),
             immutable: Arc::new(Mutex::new(HashMap::new())),
             next_seal_id: Arc::new(AtomicU64::new(1)),
             retention_grace,
+            rotation_bytes,
         }
     }
 
@@ -80,6 +136,48 @@ impl Memtable {
         Ok(())
     }
 
+    /// Return the row count for a batch that is still retained in the active
+    /// or immutable grace state for this exact seal key.
+    ///
+    /// The lookup is the runtime idempotency index. It is intentionally
+    /// derived from the bounded buckets instead of maintaining a process-wide
+    /// append-ID set whose memory would grow with the lifetime of a shard.
+    pub fn retained_batch_rows(
+        &self,
+        seal_key: &SealKey,
+        batch_id: [u8; 16],
+    ) -> Result<Option<u64>, ScribeError> {
+        let writable = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        if let Some(bucket) = writable.get(seal_key)
+            && let Some(meta) = bucket.metas.iter().find(|meta| meta.batch_id == batch_id)
+        {
+            return Ok(Some(u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX)));
+        }
+        drop(writable);
+
+        let immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        Ok(immutable.get(seal_key).and_then(|entries| {
+            entries.iter().find_map(|entry| {
+                entry
+                    .frozen
+                    .metas
+                    .iter()
+                    .find(|meta| meta.batch_id == batch_id)
+                    .map(|meta| u64::try_from(meta.rows_accepted).unwrap_or(u64::MAX))
+            })
+        }))
+    }
+
     /// Restore one unretired WAL range as a pending immutable generation.
     ///
     /// Replay is intentionally conservative: every data payload must decode
@@ -88,6 +186,15 @@ impl Memtable {
     /// `vala.file_list` commit key.
     pub fn restore_replayed(
         &self,
+        replayed: &crate::scribe::replay::ReplayedSealKey,
+    ) -> Result<FrozenMemtable, ScribeError> {
+        let mut frozen = Self::decode_replayed(replayed)?;
+        frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        self.insert_replayed_frozen(frozen)
+    }
+
+    /// Decode one replayed WAL state without mutating owner state.
+    pub(crate) fn decode_replayed(
         replayed: &crate::scribe::replay::ReplayedSealKey,
     ) -> Result<FrozenMemtable, ScribeError> {
         if replayed.data_records.len() != replayed.append_metas.len() {
@@ -152,26 +259,33 @@ impl Memtable {
                 .ok_or_else(|| ScribeError::Internal {
                     detail: "replayed seal range contained no data".to_owned(),
                 })?;
-        let batch = arrow::compute::concat_batches(&schema, &batches).map_err(|error| {
-            ScribeError::Internal {
-                detail: format!("replayed seal range merge failed: {error}"),
-            }
-        })?;
-        let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-        let frozen = FrozenMemtable {
-            seal_id,
+        let arrow_bytes = batches.iter().map(RecordBatch::get_array_memory_size).sum();
+        Ok(FrozenMemtable {
+            seal_id: 0,
             seal_key: replayed.seal_key.clone(),
             schema,
-            batch,
             batches,
             events: replayed.audit_events.clone(),
             metas,
-        };
+            opened_at: Instant::now(),
+            closed_at: Instant::now(),
+            arrow_bytes,
+        })
+    }
+
+    /// Insert a decoded replay generation into this owner-local memtable.
+    pub(crate) fn insert_replayed_frozen(
+        &self,
+        mut frozen: FrozenMemtable,
+    ) -> Result<FrozenMemtable, ScribeError> {
+        if frozen.seal_id == 0 {
+            frozen.seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
+        }
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
         })?;
         immutable
-            .entry(replayed.seal_key.clone())
+            .entry(frozen.seal_key.clone())
             .or_default()
             .push(ImmutableEntry::pending(frozen.clone()));
         Ok(frozen)
@@ -189,7 +303,7 @@ impl Memtable {
         })?;
 
         if let Some(bucket) = buckets.get(seal_key) {
-            Ok(bucket.should_seal())
+            Ok(bucket.should_seal_at(Instant::now(), self.rotation_bytes))
         } else {
             Ok(false)
         }
@@ -208,29 +322,26 @@ impl Memtable {
     /// Returns [`ScribeError::Internal`] if the bucket lock is poisoned or if
     /// the seal-key does not exist.
     pub fn freeze(&self, seal_key: &SealKey) -> Result<FrozenMemtable, ScribeError> {
-        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
-            detail: format!("memtable immutable lock poisoned: {e}"),
-        })?;
-        if let Some(entry) = immutable
-            .get(seal_key)
-            .and_then(|entries| entries.iter().find(|entry| entry.is_pending()))
-        {
-            return Ok(entry.frozen.clone());
-        }
-        drop(immutable);
-
         let mut buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
 
-        let bucket = buckets
-            .remove(seal_key)
-            .ok_or_else(|| ScribeError::Internal {
-                detail: format!("seal-key not found: {seal_key}"),
+        let Some(bucket) = buckets.remove(seal_key) else {
+            drop(buckets);
+            let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {e}"),
             })?;
+            return immutable
+                .get(seal_key)
+                .and_then(|entries| entries.iter().find(|entry| entry.is_pending()))
+                .map(|entry| entry.frozen.clone())
+                .ok_or_else(|| ScribeError::Internal {
+                    detail: format!("seal-key not found: {seal_key}"),
+                });
+        };
 
         let seal_id = self.next_seal_id.fetch_add(1, Ordering::Relaxed);
-        let frozen = bucket.freeze(seal_id)?;
+        let frozen = bucket.freeze(seal_id);
 
         let mut immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable immutable lock poisoned: {e}"),
@@ -274,6 +385,21 @@ impl Memtable {
             .collect())
     }
 
+    /// Snapshot active seal-keys owned by one fixed shard.
+    pub(crate) fn active_seal_keys_for_shard(
+        &self,
+        shard: usize,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self.writable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable bucket lock poisoned: {e}"),
+        })?;
+        Ok(buckets
+            .keys()
+            .filter(|key| shard_for(key.tenant, &key.table) == shard)
+            .cloned()
+            .collect())
+    }
+
     /// Snapshot writable and pending immutable seal keys for one tenant.
     pub fn seal_keys_for_tenant(&self, tenant: DataTenantId) -> Result<Vec<SealKey>, ScribeError> {
         let writable = self.active_seal_keys_for_tenant(tenant)?;
@@ -294,16 +420,117 @@ impl Memtable {
         Ok(keys)
     }
 
-    /// Return writable and immutable append batches for one tenant/table.
+    /// Snapshot age-expired buckets owned by one fixed shard.
+    pub(crate) fn expired_seal_keys_for_shard(
+        &self,
+        shard: usize,
+        now: Instant,
+    ) -> Result<Vec<SealKey>, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .iter()
+            .filter(|(seal_key, bucket)| {
+                shard_for(seal_key.tenant, &seal_key.table) == shard && bucket.is_age_expired(now)
+            })
+            .map(|(seal_key, _)| seal_key.clone())
+            .collect())
+    }
+
+    /// Scan writable pressure metadata without mutating any bucket state.
+    pub(crate) fn pressure_candidates(&self) -> Result<Vec<PressureCandidate>, ScribeError> {
+        let buckets = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        Ok(buckets
+            .iter()
+            .filter(|(_, bucket)| bucket.bytes_accumulated > 0)
+            .map(|(seal_key, bucket)| PressureCandidate {
+                seal_key: seal_key.clone(),
+                writable_bytes: bucket.bytes_accumulated,
+                first_insert_at: bucket.first_insert_at,
+                oldest_wal_lsn: bucket.metas.iter().map(|meta| meta.wal_lsn_min).min(),
+            })
+            .collect())
+    }
+
+    /// Select the globally deterministic largest writable victims.
+    pub(crate) fn select_pressure_victims(
+        mut candidates: Vec<PressureCandidate>,
+        bytes_to_release: usize,
+    ) -> Vec<SealKey> {
+        if bytes_to_release == 0 {
+            return Vec::new();
+        }
+        candidates.sort_by(|left, right| {
+            right
+                .writable_bytes
+                .cmp(&left.writable_bytes)
+                .then_with(|| left.first_insert_at.cmp(&right.first_insert_at))
+                .then_with(|| left.seal_key.to_string().cmp(&right.seal_key.to_string()))
+        });
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0_usize;
+        for candidate in candidates {
+            selected_bytes = selected_bytes.saturating_add(candidate.writable_bytes);
+            selected.push(candidate.seal_key);
+            if selected_bytes >= bytes_to_release {
+                break;
+            }
+        }
+        selected
+    }
+
+    /// Select exactly one globally oldest writable WAL victim.
+    pub(crate) fn select_oldest_wal_victim(candidates: &[PressureCandidate]) -> Option<SealKey> {
+        candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate.oldest_wal_lsn.map(|lsn| {
+                    (
+                        lsn,
+                        candidate.first_insert_at,
+                        candidate.seal_key.to_string(),
+                        candidate.seal_key.clone(),
+                    )
+                })
+            })
+            .min_by(|left, right| {
+                left.0
+                    .cmp(&right.0)
+                    .then_with(|| left.1.cmp(&right.1))
+                    .then_with(|| left.2.cmp(&right.2))
+            })
+            .map(|(_, _, _, seal_key)| seal_key)
+    }
+
+    /// Return writable and immutable append batches for one exact day range.
     ///
-    /// The returned snapshots are detached from the locks. Callers must still
-    /// verify the exact seal key before projecting a batch to an external
-    /// format.
-    pub fn readable_batches(
+    /// Structural pruning happens while the memtable locks are held: tenant,
+    /// table, and partition day are compared against the exact request. The
+    /// selected columns are then projected before the detached snapshot is
+    /// returned, so a snapshot never exposes an unrelated bucket or an
+    /// unrequested Arrow column.
+    pub fn readable_batches_for_range(
         &self,
         tenant: DataTenantId,
         table: &crate::catalog::TableRef,
+        start_day: crate::scribe::seal_key::EventDay,
+        end_day: crate::scribe::seal_key::EventDay,
+        required_columns: &[String],
     ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        if start_day > end_day {
+            return Err(ScribeError::Internal {
+                detail: "live-tail start day is after end day".to_owned(),
+            });
+        }
         let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
             detail: format!("memtable bucket lock poisoned: {e}"),
         })?;
@@ -313,18 +540,41 @@ impl Memtable {
         let mut batches = Vec::new();
 
         for (seal_key, bucket) in writable.iter() {
-            if seal_key.tenant == tenant && seal_key.table == *table {
-                batches.extend(bucket.readable_batches());
+            if seal_key.tenant == tenant
+                && seal_key.table == *table
+                && (start_day..=end_day).contains(&seal_key.day)
+            {
+                batches.extend(bucket.readable_batches(required_columns)?);
             }
         }
         for (seal_key, entries) in immutable.iter() {
-            if seal_key.tenant == tenant && seal_key.table == *table {
+            if seal_key.tenant == tenant
+                && seal_key.table == *table
+                && (start_day..=end_day).contains(&seal_key.day)
+            {
                 for entry in entries {
-                    batches.extend(entry.frozen.readable_batches());
+                    batches.extend(entry.frozen.readable_batches(required_columns)?);
                 }
             }
         }
         Ok(batches)
+    }
+
+    /// Return all readable batches for a table, preserving the old unit-test
+    /// convenience while applying the full table scope and schema.
+    #[cfg(test)]
+    pub fn readable_batches(
+        &self,
+        tenant: DataTenantId,
+        table: &crate::catalog::TableRef,
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        self.readable_batches_for_range(
+            tenant,
+            table,
+            crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MIN),
+            crate::scribe::seal_key::EventDay::new(chrono::NaiveDate::MAX),
+            &[],
+        )
     }
 
     /// Mark a prepared generation committed after the owning SQL transaction commits.
@@ -401,6 +651,36 @@ impl Memtable {
         Ok(retired)
     }
 
+    /// Retire one published generation after its grace period.
+    pub(crate) fn retire_generation_at(
+        &self,
+        seal_id: u64,
+        now: Instant,
+    ) -> Result<Option<WalRange>, ScribeError> {
+        let mut immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        for entries in immutable.values_mut() {
+            let Some(index) = entries.iter().position(|entry| {
+                entry.seal_id() == seal_id
+                    && matches!(
+                        &entry.state,
+                        ImmutableState::Committed { observed_at, .. }
+                            if now.saturating_duration_since(*observed_at) >= self.retention_grace
+                    )
+            }) else {
+                continue;
+            };
+            let entry = entries.remove(index);
+            return Ok(Some(entry.wal_range()));
+        }
+        immutable.retain(|_, entries| !entries.is_empty());
+        Ok(None)
+    }
+
     /// Number of immutable generations currently retained.
     pub fn immutable_generation_count(&self) -> Result<usize, ScribeError> {
         let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
@@ -419,6 +699,115 @@ impl Memtable {
             .flatten()
             .filter(|entry| entry.is_pending())
             .count())
+    }
+
+    /// Remove a replay generation when boot-time memory admission rejects it.
+    pub(crate) fn discard_pending_generation(&self, seal_id: u64) -> Result<(), ScribeError> {
+        let mut immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        for entries in immutable.values_mut() {
+            if let Some(index) = entries
+                .iter()
+                .position(|entry| entry.seal_id == seal_id && entry.is_pending())
+            {
+                entries.remove(index);
+                break;
+            }
+        }
+        immutable.retain(|_, entries| !entries.is_empty());
+        Ok(())
+    }
+
+    /// Return aggregate writable and immutable state without exposing buckets.
+    pub fn stats(&self) -> Result<MemtableStats, ScribeError> {
+        let writable = self.writable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable writable lock poisoned: {e}"),
+        })?;
+        let writable_rows = writable.values().map(|bucket| bucket.row_count).sum();
+        let writable_bytes = writable
+            .values()
+            .map(|bucket| bucket.bytes_accumulated)
+            .sum();
+        let writable_buckets = writable.len();
+        drop(writable);
+
+        let immutable = self.immutable.lock().map_err(|e| ScribeError::Internal {
+            detail: format!("memtable immutable lock poisoned: {e}"),
+        })?;
+        let immutable_rows = immutable
+            .values()
+            .flatten()
+            .map(|entry| entry.frozen.row_count())
+            .sum();
+        let immutable_bytes = immutable
+            .values()
+            .flatten()
+            .map(|entry| entry.frozen.arrow_bytes)
+            .sum();
+        let immutable_generations = immutable.values().map(Vec::len).sum();
+        let pending_generations = immutable
+            .values()
+            .flatten()
+            .filter(|entry| entry.is_pending())
+            .count();
+
+        Ok(MemtableStats {
+            writable_rows,
+            writable_bytes,
+            immutable_rows,
+            immutable_bytes,
+            immutable_generations,
+            pending_generations,
+            writable_buckets,
+            immutable_buckets: immutable.len(),
+        })
+    }
+
+    /// Return exact writable and immutable byte ownership by seal-key.
+    pub(crate) fn bucket_memory(&self) -> Result<Vec<BucketMemorySnapshot>, ScribeError> {
+        let writable = self
+            .writable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable writable lock poisoned: {error}"),
+            })?;
+        let immutable = self
+            .immutable
+            .lock()
+            .map_err(|error| ScribeError::Internal {
+                detail: format!("memtable immutable lock poisoned: {error}"),
+            })?;
+        let mut by_key = HashMap::<SealKey, BucketMemorySnapshot>::new();
+        for (seal_key, bucket) in writable.iter() {
+            by_key.insert(
+                seal_key.clone(),
+                BucketMemorySnapshot {
+                    seal_key: seal_key.clone(),
+                    row_count: bucket.row_count,
+                    writable_bytes: bucket.bytes_accumulated,
+                    immutable_bytes: 0,
+                },
+            );
+        }
+        for (seal_key, entries) in immutable.iter() {
+            let entry = by_key
+                .entry(seal_key.clone())
+                .or_insert_with(|| BucketMemorySnapshot {
+                    seal_key: seal_key.clone(),
+                    row_count: 0,
+                    writable_bytes: 0,
+                    immutable_bytes: 0,
+                });
+            entry.row_count = entry
+                .row_count
+                .saturating_add(entries.iter().map(|entry| entry.frozen.row_count()).sum());
+            entry.immutable_bytes = entries.iter().map(|entry| entry.frozen.arrow_bytes).sum();
+        }
+        Ok(by_key.into_values().collect())
     }
 }
 
@@ -467,53 +856,56 @@ impl MemtableBucket {
         self.last_insert_at = Instant::now();
     }
 
-    fn should_seal(&self) -> bool {
-        let now = Instant::now();
-        let elapsed_since_first = now.duration_since(self.first_insert_at).as_secs();
-        let elapsed_since_last = now.duration_since(self.last_insert_at).as_secs();
-
-        self.row_count >= SEAL_ROWS_THRESHOLD
-            || self.bytes_accumulated >= SEAL_BYTES_THRESHOLD
-            || elapsed_since_first >= SEAL_INTERVAL_SECS
-            || elapsed_since_last >= SEAL_INACTIVITY_SECS
+    fn should_seal_at(&self, now: Instant, rotation_bytes: usize) -> bool {
+        self.bytes_accumulated >= rotation_bytes
+            || now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
     }
 
-    fn freeze(self, seal_id: u64) -> Result<FrozenMemtable, ScribeError> {
-        use arrow::compute::concat_batches;
+    fn is_age_expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.first_insert_at) >= ACTIVE_GENERATION_MAX_AGE
+    }
 
+    fn freeze(self, seal_id: u64) -> FrozenMemtable {
         let batches = self.batches;
 
-        // Merge all batches into one
-        let batch = if batches.is_empty() {
-            // Empty bucket — return an empty RecordBatch with the schema
-            RecordBatch::new_empty(self.schema.clone())
-        } else if batches.len() == 1 {
-            // Single batch — no merge needed
-            batches[0].clone()
-        } else {
-            // Multiple batches — merge them
-            concat_batches(&self.schema, &batches).map_err(|error| ScribeError::Internal {
-                detail: format!("memtable batch schema mismatch: {error}"),
-            })?
-        };
+        let opened_at = self.first_insert_at;
+        let closed_at = Instant::now();
+        let arrow_bytes = self.bytes_accumulated;
 
-        Ok(FrozenMemtable {
+        FrozenMemtable {
             seal_id,
             seal_key: self.seal_key,
             schema: self.schema,
-            batch,
             batches,
             events: self.events,
             metas: self.metas,
-        })
+            opened_at,
+            closed_at,
+            arrow_bytes,
+        }
     }
 
-    fn readable_batches(&self) -> Vec<ReadableBatch> {
+    fn readable_batches(
+        &self,
+        required_columns: &[String],
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let projection = projection_indices(&self.schema, required_columns)?;
         self.batches
             .iter()
             .cloned()
             .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| ReadableBatch { meta, batch })
+            .map(|(batch, meta)| {
+                let batch = batch
+                    .project(&projection)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("live-tail Arrow projection failed: {error}"),
+                    })?;
+                Ok(ReadableBatch {
+                    partition_day: self.seal_key.day,
+                    meta,
+                    batch,
+                })
+            })
             .collect()
     }
 }
@@ -587,6 +979,8 @@ impl ImmutableEntry {
 /// An append batch that can be projected into a tail frame.
 #[derive(Debug, Clone)]
 pub struct ReadableBatch {
+    /// Exact partition day owning the batch.
+    pub partition_day: crate::scribe::seal_key::EventDay,
     /// WAL metadata for the append.
     pub meta: ScribeAppendMeta,
     /// Arrow rows for the append.
@@ -604,35 +998,87 @@ pub struct WalRange {
 
 /// Frozen memtable snapshot for one seal-key.
 ///
-/// Immutable snapshot detached from the writable bucket. Carries one merged Arrow
-/// batch, paired `AuditEvent` list, and `ScribeAppendMeta` list.
+/// Immutable snapshot detached from the writable bucket. It retains the original
+/// append batches so live tail reads preserve WAL/append granularity. A merged
+/// batch is materialized only inside the bounded persistence encoder; retaining
+/// both forms here would double the Arrow memory charged to Scribe.
 #[derive(Debug, Clone)]
 pub struct FrozenMemtable {
     /// Local immutable-generation identity.
     pub seal_id: u64,
     /// The seal-key this snapshot belongs to.
     pub seal_key: SealKey,
-    /// Arrow schema for the batch.
+    /// Arrow schema shared by all append batches.
     pub schema: SchemaRef,
-    /// Merged Arrow batch (all appends concatenated).
-    pub batch: RecordBatch,
     /// Original append batches, preserved for LSN-granular live tail reads.
     pub batches: Vec<RecordBatch>,
     /// Ordered list of `AuditEvent`s staged for the seal transaction.
     pub events: Vec<AuditEvent>,
     /// Per-append metadata derived from WAL record headers.
     pub metas: Vec<ScribeAppendMeta>,
+    /// Monotonic time at which the active generation first received a row.
+    pub opened_at: Instant,
+    /// Monotonic time at which the generation was detached.
+    pub closed_at: Instant,
+    /// Estimated Arrow memory retained by the generation.
+    pub arrow_bytes: usize,
 }
 
 impl FrozenMemtable {
-    fn readable_batches(&self) -> Vec<ReadableBatch> {
+    /// Return the rows retained by this immutable generation.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    fn readable_batches(
+        &self,
+        required_columns: &[String],
+    ) -> Result<Vec<ReadableBatch>, ScribeError> {
+        let projection = projection_indices(&self.schema, required_columns)?;
         self.batches
             .iter()
             .cloned()
             .zip(self.metas.iter().cloned())
-            .map(|(batch, meta)| ReadableBatch { meta, batch })
+            .map(|(batch, meta)| {
+                let batch = batch
+                    .project(&projection)
+                    .map_err(|error| ScribeError::Internal {
+                        detail: format!("live-tail Arrow projection failed: {error}"),
+                    })?;
+                Ok(ReadableBatch {
+                    partition_day: self.seal_key.day,
+                    meta,
+                    batch,
+                })
+            })
             .collect()
     }
+}
+
+/// Resolve and validate the bounded projection requested by Oracle.
+fn projection_indices(
+    schema: &SchemaRef,
+    required_columns: &[String],
+) -> Result<Vec<usize>, ScribeError> {
+    if required_columns.is_empty() {
+        return Ok((0..schema.fields().len()).collect());
+    }
+    let mut indices = Vec::with_capacity(required_columns.len());
+    for name in required_columns {
+        let Some(index) = schema.index_of(name).ok() else {
+            return Err(ScribeError::Internal {
+                detail: format!("live-tail required column is not in the table schema: {name}"),
+            });
+        };
+        if indices.contains(&index) {
+            return Err(ScribeError::Internal {
+                detail: format!("live-tail required column is duplicated: {name}"),
+            });
+        }
+        indices.push(index);
+    }
+    Ok(indices)
 }
 
 /// Estimate batch size in bytes (Arrow column sizes + overhead).
@@ -655,9 +1101,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use chrono::NaiveDate;
     use std::sync::Arc;
-    use std::thread;
+    use std::sync::Barrier;
     use std::time::Duration;
-    use wyrd_spec::ids::DataTenantId;
 
     fn make_test_batch(num_rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
@@ -695,7 +1140,7 @@ mod tests {
 
     fn make_test_seal_key() -> SealKey {
         SealKey::new(
-            DataTenantId::SYSTEM_OWNER,
+            crate::test_support::tenant(),
             TableRef::new(BifrostNamespace::Bifrost, "events"),
             EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("valid date")),
         )
@@ -703,7 +1148,7 @@ mod tests {
 
     fn make_file_list_key(min: u64, max: u64) -> FileListCommitKey {
         FileListCommitKey {
-            data_tenant_id: DataTenantId::SYSTEM_OWNER,
+            data_tenant_id: crate::test_support::tenant(),
             namespace: "vala.bifrost".to_owned(),
             table_name: "events".to_owned(),
             node_id: uuid::Uuid::nil(),
@@ -728,16 +1173,47 @@ mod tests {
 
         let frozen = memtable.freeze(&seal_key).expect("freeze");
 
-        assert_eq!(frozen.batch.num_rows(), 2);
+        assert_eq!(frozen.row_count(), 2);
         assert_eq!(memtable.row_count(&seal_key).expect("row count"), 0);
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 1);
         assert_eq!(memtable.pending_generation_count().expect("pending"), 1);
         assert_eq!(
             memtable
-                .readable_batches(DataTenantId::SYSTEM_OWNER, &seal_key.table)
+                .readable_batches(crate::test_support::tenant(), &seal_key.table)
                 .expect("readable")
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn retained_batch_lookup_covers_active_and_immutable_state() {
+        let memtable = Memtable::new();
+        let seal_key = make_test_seal_key();
+        let batch_id = [7u8; 16];
+        let mut meta = make_test_meta(10);
+        meta.batch_id = batch_id;
+        memtable
+            .insert(&seal_key, make_test_event(), meta, make_test_batch(2))
+            .expect("insert");
+        assert_eq!(
+            memtable
+                .retained_batch_rows(&seal_key, batch_id)
+                .expect("active lookup"),
+            Some(100)
+        );
+        memtable.freeze(&seal_key).expect("freeze");
+        assert_eq!(
+            memtable
+                .retained_batch_rows(&seal_key, batch_id)
+                .expect("immutable lookup"),
+            Some(100)
+        );
+        assert_eq!(
+            memtable
+                .retained_batch_rows(&seal_key, [8u8; 16])
+                .expect("missing lookup"),
+            None
         );
     }
 
@@ -771,7 +1247,7 @@ mod tests {
         assert_ne!(first.seal_id, second.seal_id);
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 2);
         let lsns: Vec<_> = memtable
-            .readable_batches(DataTenantId::SYSTEM_OWNER, &seal_key.table)
+            .readable_batches(crate::test_support::tenant(), &seal_key.table)
             .expect("readable")
             .into_iter()
             .map(|batch| batch.meta.wal_lsn_max)
@@ -831,7 +1307,7 @@ mod tests {
     }
 
     #[test]
-    fn memtable_seal_predicate_rows() {
+    fn row_count_does_not_trigger_generation_rotation() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
@@ -843,66 +1319,164 @@ mod tests {
                 .expect("insert");
         }
 
-        assert!(memtable.should_seal(&seal_key).expect("should_seal"));
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
         assert_eq!(memtable.row_count(&seal_key).expect("row_count"), 60_000);
     }
 
     #[test]
-    fn memtable_seal_predicate_interval() {
+    fn active_generation_age_is_the_only_time_predicate() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
-        // Insert 1 row, then wait >1s (30% margin for CI stability)
         let batch = make_test_batch(1);
         memtable
             .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
             .expect("insert");
 
-        thread::sleep(Duration::from_millis(1300));
+        let mut buckets = memtable.writable.lock().expect("writable lock");
+        buckets.get_mut(&seal_key).expect("bucket").first_insert_at = Instant::now()
+            .checked_sub(ACTIVE_GENERATION_MAX_AGE)
+            .expect("test clock supports age offset");
+        drop(buckets);
 
         assert!(
             memtable.should_seal(&seal_key).expect("should_seal"),
-            "1s interval triggers seal"
+            "600s active age triggers rotation"
         );
     }
 
     #[test]
-    fn memtable_seal_predicate_bytes() {
+    fn historical_128_mib_predicate_is_removed() {
         let memtable = Memtable::new();
         let seal_key = make_test_seal_key();
 
-        // Insert batches totaling >128 MiB
-        // Each Int64 array with 1M rows ≈ 8MB
-        for i in 0..20 {
-            let batch = make_test_batch(1_000_000);
-            memtable
-                .insert(&seal_key, make_test_event(), make_test_meta(i), batch)
-                .expect("insert");
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(0),
+                make_test_batch(1),
+            )
+            .expect("insert");
+
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
+    }
+
+    #[test]
+    fn inactivity_does_not_trigger_generation_rotation() {
+        let memtable = Memtable::new();
+        let seal_key = make_test_seal_key();
+
+        let batch = make_test_batch(1);
+        memtable
+            .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
+            .expect("insert");
+
+        assert!(!memtable.should_seal(&seal_key).expect("should_seal"));
+    }
+
+    #[test]
+    fn pressure_selection_prefers_largest_then_oldest_writable_buckets() {
+        let memtable = Memtable::new();
+        let first = make_test_seal_key();
+        let second = SealKey::new(
+            first.tenant,
+            first.table.clone(),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+        );
+        memtable
+            .insert(
+                &first,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("first insert");
+        memtable
+            .insert(
+                &second,
+                make_test_event(),
+                make_test_meta(2),
+                make_test_batch(1),
+            )
+            .expect("second insert");
+        {
+            let mut buckets = memtable.writable.lock().expect("writable lock");
+            buckets
+                .get_mut(&first)
+                .expect("first bucket")
+                .bytes_accumulated = 200;
+            buckets
+                .get_mut(&second)
+                .expect("second bucket")
+                .bytes_accumulated = 100;
         }
-
-        assert!(
-            memtable.should_seal(&seal_key).expect("should_seal"),
-            "128 MiB threshold triggers seal"
+        let selected = Memtable::select_pressure_victims(
+            memtable.pressure_candidates().expect("pressure candidates"),
+            150,
         );
+        assert_eq!(selected, vec![first]);
     }
 
     #[test]
-    fn memtable_seal_predicate_inactivity() {
-        let memtable = Memtable::new();
-        let seal_key = make_test_seal_key();
-
-        // Insert 1 row, then wait >5s (40% margin for CI stability)
-        let batch = make_test_batch(1);
-        memtable
-            .insert(&seal_key, make_test_event(), make_test_meta(0), batch)
-            .expect("insert");
-
-        thread::sleep(Duration::from_secs(7));
-
-        assert!(
-            memtable.should_seal(&seal_key).expect("should_seal"),
-            "5s inactivity triggers seal"
+    fn global_pressure_flushes_from_seventy_five_to_sixty_five_percent() {
+        let first = make_test_seal_key();
+        let second = SealKey::new(
+            first.tenant,
+            first.table.clone(),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
         );
+        let now = Instant::now();
+        let selected = Memtable::select_pressure_victims(
+            vec![
+                PressureCandidate {
+                    seal_key: first.clone(),
+                    writable_bytes: 200,
+                    first_insert_at: now,
+                    oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(10)),
+                },
+                PressureCandidate {
+                    seal_key: second.clone(),
+                    writable_bytes: 100,
+                    first_insert_at: now,
+                    oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(11)),
+                },
+            ],
+            250,
+        );
+        assert_eq!(selected, vec![first, second]);
+    }
+
+    #[test]
+    fn wal_pressure_flushes_exactly_one_global_oldest_bucket() {
+        let first = make_test_seal_key();
+        let second = SealKey::new(
+            first.tenant,
+            first.table.clone(),
+            EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 15).expect("valid date")),
+        );
+        let now = Instant::now();
+        let selected = Memtable::select_oldest_wal_victim(&[
+            PressureCandidate {
+                seal_key: first,
+                writable_bytes: 200,
+                first_insert_at: now,
+                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(11)),
+            },
+            PressureCandidate {
+                seal_key: second.clone(),
+                writable_bytes: 100,
+                first_insert_at: now,
+                oldest_wal_lsn: Some(crate::scribe::wal::WalLsn::new(10)),
+            },
+        ]);
+        assert_eq!(selected, Some(second));
+    }
+
+    #[test]
+    fn stale_pressure_key_is_a_noop() {
+        assert!(Memtable::select_pressure_victims(Vec::new(), 1).is_empty());
+        assert!(Memtable::select_oldest_wal_victim(&[]).is_none());
     }
 
     #[test]
@@ -922,7 +1496,8 @@ mod tests {
         // Freeze
         let frozen = memtable.freeze(&seal_key).expect("freeze");
 
-        assert_eq!(frozen.batch.num_rows(), 300, "3 batches × 100 rows merged");
+        assert_eq!(frozen.row_count(), 300, "3 batches × 100 rows retained");
+        assert_eq!(frozen.batches.len(), 3);
         assert_eq!(frozen.events.len(), 3);
         assert_eq!(frozen.metas.len(), 3);
         assert_eq!(frozen.seal_key, seal_key);
@@ -941,9 +1516,49 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_detach_is_safe_during_concurrent_append_and_flush() {
+        let memtable = Arc::new(Memtable::new());
+        let seal_key = make_test_seal_key();
+        memtable
+            .insert(
+                &seal_key,
+                make_test_event(),
+                make_test_meta(1),
+                make_test_batch(1),
+            )
+            .expect("initial insert");
+        let barrier = Arc::new(Barrier::new(2));
+        let freezer_memtable = Arc::clone(&memtable);
+        let freezer_key = seal_key.clone();
+        let freezer_barrier = Arc::clone(&barrier);
+        let freezer = std::thread::spawn(move || {
+            freezer_barrier.wait();
+            freezer_memtable.freeze(&freezer_key)
+        });
+        let inserter_memtable = Arc::clone(&memtable);
+        let inserter_key = seal_key.clone();
+        let inserter_barrier = Arc::clone(&barrier);
+        let inserter = std::thread::spawn(move || {
+            inserter_barrier.wait();
+            inserter_memtable.insert(
+                &inserter_key,
+                make_test_event(),
+                make_test_meta(2),
+                make_test_batch(1),
+            )
+        });
+
+        freezer.join().expect("freeze thread").expect("freeze");
+        inserter.join().expect("append thread").expect("append");
+        let stats = memtable.stats().expect("stats");
+        assert_eq!(stats.writable_rows + stats.immutable_rows, 2);
+        assert_eq!(stats.immutable_generations, 1);
+    }
+
+    #[test]
     fn memtable_per_seal_key_isolation() {
         let memtable = Memtable::new();
-        let tenant = DataTenantId::SYSTEM_OWNER;
+        let tenant = crate::test_support::tenant();
         let table = TableRef::new(BifrostNamespace::Bifrost, "events");
 
         let key1 = SealKey::new(
@@ -986,7 +1601,7 @@ mod tests {
 
         // Freeze key1
         let frozen1 = memtable.freeze(&key1).expect("freeze key1");
-        assert_eq!(frozen1.batch.num_rows(), 300, "3 batches × 100 rows merged");
+        assert_eq!(frozen1.row_count(), 300, "3 batches × 100 rows retained");
 
         // key2 untouched
         assert_eq!(

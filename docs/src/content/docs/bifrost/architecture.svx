@@ -56,7 +56,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
 6. **Seal state machine:**
    - Freeze memtable into an immutable Arrow snapshot.
    - Encode Parquet (sorted by `data_tenant_id`, `wyrd_event_time`; bloom filters, page index).
-   - PUT to object store: `s3://{ns}/{table}/day={YYYY-MM-DD}/tenant_bucket={N}/{pod_id}-{ulid}.parquet`.
+   - PUT to object store: `s3://tenants/{tenant_uuid}/{logical_namespace}/{table}/day={YYYY-MM-DD}/{pod_id}-{ulid}.parquet`.
    - Atomic Postgres transaction: INSERT `vala.file_list` row + append audit rows.
    - On commit, truncate WAL and retire manifest.
 7. **(Async) Forge** leases a tenant/table via `vala.maintenance_leases`, bin-packs small Parquet files into Iceberg data files, updates `vala.file_list`, and runs snapshot expiry plus orphan GC. See the [Forge system overview](/bifrost/forge) for the maintenance state machine.
@@ -86,7 +86,7 @@ orphan GC protect live data, and how leases fence concurrent workers.
 1. **Client** issues query via typed `ValaQueryService` method (e.g., `QueryTraces`, `QueryMetrics`) or generic SQL (`POST /v1/observations/query`).
 2. **Gate** authenticates, resolves tenant + permissions, routes to any Oracle.
 3. **Oracle** builds DataFusion session with fused scan:
-   - **IcebergTableScan** (compacted data, partition-pruned by `Day(event_time)` + `Bucket(tenant, 64)`)
+   - **IcebergTableScan** (compacted data, tenant-qualified and partition-pruned by `Day(event_time)`)
    - **FileListScan** (`SELECT vala.file_list WHERE NOT compacted`, un-compacted Parquet files)
    - **ScribeLiveTailScan** (gRPC to live Scribe pods for recent WAL data; Phase 2, partially implemented)
 4. Union, then `FilterExec(data_tenant_id = $tenant)` applied (non-removable via `TenantPredicateRule`).
@@ -123,7 +123,6 @@ Postgres table tracking all sealed Parquet files:
 | `min_event_time` | `TIMESTAMPTZ NOT NULL` | Earliest `wyrd_event_time` |
 | `max_event_time` | `TIMESTAMPTZ NOT NULL` | Latest `wyrd_event_time` |
 | `partition_day` | `DATE NOT NULL` | Exactly one Day per file |
-| `tenant_bucket` | `INT NOT NULL` | `Bucket(tenant, 64)` |
 | `compacted` | `BOOLEAN NOT NULL DEFAULT false` | `false` until Forge folds into snapshot |
 | `committed_snapshot_id` | `BIGINT` nullable | Iceberg snapshot ID (NULL until Forge commits) |
 | `node_id` | `TEXT NOT NULL` | Scribe pod ID |
@@ -132,7 +131,7 @@ Postgres table tracking all sealed Parquet files:
 | `wal_lsn_max` | `BIGINT NOT NULL` | WAL LSN range end |
 | `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT NOW()` | |
 
-**LSN streams:** LSN is append-position in one Scribe pod's local WAL. LSNs are meaningful ONLY within one `(node_id, writer_epoch)` stream. Cross-pod LSNs are unrelated integers. Oracle uses per-stream watermark `MAX(wal_lsn_max)` per `(ns, table, tenant_bucket, node_id, writer_epoch)` to dedupe live-tail data.
+**LSN streams:** LSN is append-position in one Scribe pod's local WAL. LSNs are meaningful ONLY within one `(node_id, writer_epoch)` stream. Cross-pod LSNs are unrelated integers. Oracle uses per-stream watermark `MAX(wal_lsn_max)` per `(data_tenant_id, namespace, table_name, node_id, writer_epoch)` to dedupe live-tail data.
 
 ## Concurrency model
 
@@ -219,17 +218,17 @@ All categories flow through unified Bifrost schema:
 
 | Category | Table | Partitioning | Isolation |
 |----------|-------|--------------|-----------|
-| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Traces (spans)** | `vala.traces.spans` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Traces (events, links)** | `vala.traces.events`, `vala.traces.links` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Metrics** | `vala.metrics.points` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Logs** | `vala.logs.records` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **GenAI signals** | `vala.genai.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Evaluations** | `vala.eval.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **Drift** | `vala.drift.*` | `Day(event_time) + Bucket(tenant, 64)` | `data_tenant_id` column + bucket + `FilterExec` |
-| **User datasets** | `vala.datasets.<tenant_uuid>.<name>` | `Day(event_time) + Bucket(tenant, 64)` (collapses to 1 slot) | Physical namespace + `data_tenant_id` + `FilterExec` |
+| **Agent traces** | `vala.dev.agent_traces` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Traces (spans)** | `vala.traces.spans` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Traces (events, links)** | `vala.traces.events`, `vala.traces.links` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Metrics** | `vala.metrics.points` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Logs** | `vala.logs.records` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **GenAI signals** | `vala.genai.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Evaluations** | `vala.eval.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **Drift** | `vala.drift.*` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
+| **User datasets** | `vala.datasets.<name>` | `Day(event_time)` | Tenant-qualified namespace + `data_tenant_id` |
 
-**Shared signal tables** use multi-tenant partitioning via `Bucket(tenant, 64)`. **Tenant-scoped dynamic datasets** collapse to 1 bucket (physical isolation + logical RLS).
+Every logical table has an independent tenant-qualified physical table. The logical namespace and FQN remain stable while the physical path is rooted at `tenants/<tenant_uuid>/`.
 
 ## DomainTable and boot registration
 
@@ -239,8 +238,8 @@ A `DomainTable` carries:
 
 - **FQN.** `vala.traces.spans`, `vala.genai.messages`, etc.
 - **Schema.** Arrow field list with types, nullability, and metadata.
-- **Scope.** `SystemShared`: all tenants write to the same physical Iceberg table; the `data_tenant_id` column enforces tenant isolation in the scan path.
-- **Partition spec.** Typically `Day(event_time) + Bucket(tenant, 64)`.
+- **Physical identity.** `(data_tenant_id, logical TableRef)`; built-ins and datasets use the same tenant-qualified storage model.
+- **Partition spec.** `Day(event_time)`.
 - **Sensitive payload columns.** The columns projected away by the payload permission gate.
 - **Correlation policy.** Which of `run_id`, `card_uid`, `principal_id` are stamped.
 
@@ -279,9 +278,11 @@ The `TenantPredicateRule` is a DataFusion `AnalyzerRule` registered on every `Se
 
 The predicate cannot be elided by a DataFusion optimizer pass because the rule is re-run after every optimization cycle.
 
-## Audit relay
+## Audit data
 
-Every Bifrost write operation appends audit rows atomically with the `vala.file_list` INSERT. Audit records are hash-chained and Ed25519-signed at seal boundaries. A separate audit relay worker tails the audit outbox and ships finalized records to long-term storage on a configurable schedule.
+Audited operations append immutable, hash-chained rows to
+`vala.audit_outbox` in their Postgres transaction. Redux owns the canonical
+`vala.system.audit_log` table definition and deterministic row projection.
 
 The audit log captures: operation name, principal ID, tenant, timestamp, decision (allow/deny), result, and detail field. Denials are written in a separate fail-closed transaction before the error is returned to the caller.
 

@@ -153,6 +153,91 @@ pub struct ServeConfig {
     pub mode: ServeMode,
 }
 
+/// Boot-time bounds and execution-lane sizing for Scribe.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScribeRuntimeConfig {
+    /// Tokio coordination worker count.
+    #[serde(default = "default_scribe_coordination_threads")]
+    pub coordination_threads: usize,
+    /// Ingress CPU worker count.
+    #[serde(default = "default_scribe_ingress_cpu_threads")]
+    pub ingress_cpu_threads: usize,
+    /// Persistence CPU worker count for Parquet preparation and bounded replay work.
+    #[serde(default = "default_scribe_persistence_cpu_threads")]
+    pub persistence_cpu_threads: usize,
+    /// WAL IO worker count.
+    #[serde(default = "default_scribe_wal_io_threads")]
+    pub wal_io_threads: usize,
+    /// Optional Scribe memory budget. When absent, cgroup detection is authoritative.
+    #[serde(default)]
+    pub memory_limit_bytes: Option<usize>,
+    /// Optional Scribe WAL disk budget. When absent, filesystem capacity is authoritative.
+    #[serde(default)]
+    pub wal_disk_limit_bytes: Option<u64>,
+}
+
+fn default_scribe_coordination_threads() -> usize {
+    2
+}
+
+fn default_scribe_ingress_cpu_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    (available.saturating_sub(2).max(2) / 3).max(1)
+}
+
+fn default_scribe_persistence_cpu_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let budget = available.saturating_sub(2).max(2);
+    budget
+        .saturating_sub(default_scribe_ingress_cpu_threads())
+        .max(1)
+}
+
+fn default_scribe_wal_io_threads() -> usize {
+    4
+}
+
+impl Default for ScribeRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            coordination_threads: default_scribe_coordination_threads(),
+            ingress_cpu_threads: default_scribe_ingress_cpu_threads(),
+            persistence_cpu_threads: default_scribe_persistence_cpu_threads(),
+            wal_io_threads: default_scribe_wal_io_threads(),
+            memory_limit_bytes: None,
+            wal_disk_limit_bytes: None,
+        }
+    }
+}
+
+impl ScribeRuntimeConfig {
+    /// Validate that every configured bound can provide bounded operation.
+    pub fn validate(&self) -> Result<(), String> {
+        let thread_values = [
+            ("coordination_threads", self.coordination_threads),
+            ("ingress_cpu_threads", self.ingress_cpu_threads),
+            ("persistence_cpu_threads", self.persistence_cpu_threads),
+            ("wal_io_threads", self.wal_io_threads),
+        ];
+        if let Some((name, _value)) = thread_values.into_iter().find(|(_, value)| *value == 0) {
+            return Err(format!("scribe.{name} must be at least 1"));
+        }
+        let min_bytes = 256 * 1024 * 1024;
+        if let Some(value) = self.memory_limit_bytes
+            && value < min_bytes
+        {
+            return Err("scribe.memory_limit_bytes must be at least 268435456 bytes".to_owned());
+        }
+        if let Some(value) = self.wal_disk_limit_bytes
+            && value == 0
+        {
+            return Err("scribe.wal_disk_limit_bytes must be at least 1".to_owned());
+        }
+        Ok(())
+    }
+}
+
 /// Prometheus metrics server configuration.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -241,6 +326,9 @@ pub struct WyrdServerConfig {
     /// Transport-selection configuration.
     #[serde(default)]
     pub serve: ServeConfig,
+    /// Bounded Scribe runtime and queue configuration.
+    #[serde(default)]
+    pub scribe: ScribeRuntimeConfig,
     /// Prometheus metrics server configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -383,15 +471,6 @@ pub struct AuthConfig {
     /// and are harmless. Tracked in issue #72.
     #[serde(skip)]
     pub sealing_key: Option<SecretString>,
-    /// Dedicated Ed25519 audit-seal key PEM (PKCS#8).
-    ///
-    /// Env-injected only — never read from the TOML file. Loaded at config time
-    /// from `WYRD_AUDIT_SEAL_KEY_FILE` (path to a mounted secret; primary) or
-    /// `WYRD_AUDIT_SEAL_KEY_PEM` (inline PEM; fallback). Not the JWT issuing key.
-    /// `None` when unset; `POST /v1/admin/audit/verify` returns a server error
-    /// when the key is absent.
-    #[serde(skip)]
-    pub audit_seal_key: Option<SecretString>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -880,11 +959,6 @@ impl WyrdServerConfig {
             self.auth.sealing_key = Some(key);
         }
 
-        // auth.audit_seal_key (WYRD_AUDIT_SEAL_KEY_FILE primary, WYRD_AUDIT_SEAL_KEY_PEM fallback)
-        if let Some(key) = load_audit_seal_key()? {
-            self.auth.audit_seal_key = Some(key);
-        }
-
         Ok(())
     }
 
@@ -893,6 +967,10 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
+        self.scribe
+            .validate()
+            .map_err(|message| ConfigError::Invalid { message })?;
+
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
             return Err(ConfigError::BindCollision {
@@ -1197,32 +1275,6 @@ fn load_sealing_key() -> Result<Option<SecretString>, ConfigError> {
     }
 }
 
-/// Load the Ed25519 audit-seal key PEM from the environment.
-///
-/// `WYRD_AUDIT_SEAL_KEY_FILE` (a path to a mounted secret) is the primary
-/// source; `WYRD_AUDIT_SEAL_KEY_PEM` (inline PEM) is the fallback. Setting
-/// both is a configuration error.
-fn load_audit_seal_key() -> Result<Option<SecretString>, ConfigError> {
-    let file = env_opt("WYRD_AUDIT_SEAL_KEY_FILE")?;
-    let inline = env_opt("WYRD_AUDIT_SEAL_KEY_PEM")?;
-    match (file, inline) {
-        (Some(_), Some(_)) => Err(ConfigError::ConflictingEnvVars {
-            keys: vec![
-                "WYRD_AUDIT_SEAL_KEY_FILE".to_string(),
-                "WYRD_AUDIT_SEAL_KEY_PEM".to_string(),
-            ],
-        }),
-        (Some(path), None) => {
-            let path = PathBuf::from(path);
-            let pem = std::fs::read_to_string(&path)
-                .map_err(|source| ConfigError::ReadSealingKey { path, source })?;
-            Ok(Some(SecretString::from(pem)))
-        }
-        (None, Some(pem)) => Ok(Some(SecretString::from(pem))),
-        (None, None) => Ok(None),
-    }
-}
-
 /// Parse a boolean flag from a `0`/`1` string.
 fn parse_flag(val: &str, key: &str) -> Result<bool, ConfigError> {
     match val {
@@ -1288,6 +1340,33 @@ mod tests {
     fn default_config_validates() {
         let cfg = WyrdServerConfig::default();
         cfg.validate().expect("default config must be valid");
+    }
+
+    #[test]
+    fn scribe_runtime_defaults_match_bounded_contract() {
+        let cfg = ScribeRuntimeConfig::default();
+        assert_eq!(cfg.coordination_threads, 2);
+        assert_eq!(cfg.memory_limit_bytes, None);
+        assert_eq!(cfg.wal_disk_limit_bytes, None);
+        cfg.validate().expect("resolved defaults must validate");
+    }
+
+    #[test]
+    fn scribe_runtime_rejects_zero_and_small_bounds() {
+        let cfg = ScribeRuntimeConfig {
+            persistence_cpu_threads: 0,
+            ..ScribeRuntimeConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = ScribeRuntimeConfig {
+            memory_limit_bytes: Some(1024),
+            ..ScribeRuntimeConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+        cfg.memory_limit_bytes = None;
+        cfg.wal_disk_limit_bytes = Some(0);
+        assert!(cfg.validate().is_err());
     }
 
     // ── 2. TOML with unknown legacy field fails with ParseToml ────────────────

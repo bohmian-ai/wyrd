@@ -22,6 +22,7 @@
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
 
+pub mod grpc;
 pub mod handle;
 pub mod observe;
 #[cfg(feature = "python")]
@@ -29,6 +30,10 @@ pub mod python;
 pub mod scope;
 pub mod sink;
 
+pub use grpc::{
+    BifrostFrame, BifrostGrpcTransport, BifrostTransportConfig, MAX_FRAME_BYTES, MAX_FRAME_RETRIES,
+    PROTO_FRAME_OVERHEAD_BYTES,
+};
 pub use handle::{Bifrost, schema_from_json_schema};
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
@@ -250,9 +255,9 @@ mod sdk {
             _table: &str,
             batch_id: [u8; 16],
             _frames: Vec<u8>,
-        ) -> Result<u64, WyrdError> {
+        ) -> Result<(), WyrdError> {
             self.seen.lock().expect("poisoned").push(batch_id);
-            Ok(0)
+            Ok(())
         }
     }
 

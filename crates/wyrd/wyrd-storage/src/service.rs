@@ -23,7 +23,7 @@ use wyrd_sql::queries::storage::multipart_uploads::{self, MultipartUploadRow, Up
 use wyrd_sql::{TenantConn, WyrdPostgres};
 
 use crate::StorageHandle;
-use crate::audit::{self, UploadAuditOperation, UploadAuditRow};
+use crate::audit::{self, UploadAuditOperation};
 use crate::error::StorageError;
 use crate::plan::{MAX_OBJECT_SIZE_BYTES, PlannedUpload, plan_upload};
 use crate::signer::{CompletePayload, HeadInfo, MultipartInit, UploadPlanReplayInput};
@@ -142,6 +142,7 @@ pub async fn upload_init(
         counts,
     )
     .await?;
+    write_session_created(&mut conn, caller, upload_uuid, &validated.full, backend).await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     if let Some(prior) = prior_abort {
@@ -192,6 +193,26 @@ pub async fn upload_init(
         plan: init.plan,
         storage_path: validated.full,
     })
+}
+
+async fn write_session_created(
+    conn: &mut TenantConn<'_>,
+    caller: &StorageCaller,
+    upload_uuid: Uuid,
+    storage_path: &str,
+    backend: StorageBackendKind,
+) -> Result<(), WyrdError> {
+    audit::write(
+        conn,
+        caller,
+        UploadAuditOperation::SessionCreated,
+        Some(upload_uuid),
+        storage_path,
+        backend,
+        201,
+        None,
+    )
+    .await
 }
 
 /// Return one S3 multipart part URL.
@@ -364,19 +385,19 @@ pub async fn upload_abort(
             Err(wyrd_sql::SqlError::Conflict { .. }) => false,
             Err(error) => return Err(map_sql_error(&error)),
         };
-    audit::write(
-        &mut conn,
-        caller,
-        UploadAuditRow {
-            operation: UploadAuditOperation::UploadAbort,
-            upload_id: Some(upload_uuid),
-            storage_path: &validated.full,
-            backend: row.backend,
-            status_code: 200,
-            error_code: None,
-        },
-    )
-    .await?;
+    if aborted {
+        audit::write(
+            &mut conn,
+            caller,
+            UploadAuditOperation::Abort,
+            Some(upload_uuid),
+            &validated.full,
+            row.backend,
+            200,
+            None,
+        )
+        .await?;
+    }
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
 
     Ok(AbortResponse { aborted })
@@ -439,14 +460,12 @@ pub async fn download_init(
     audit::write(
         &mut conn,
         caller,
-        UploadAuditRow {
-            operation: UploadAuditOperation::DownloadInit,
-            upload_id: None,
-            storage_path: &validated.full,
-            backend: metadata.backend,
-            status_code: 200,
-            error_code: None,
-        },
+        UploadAuditOperation::Download,
+        None,
+        &validated.full,
+        metadata.backend,
+        200,
+        None,
     )
     .await?;
     conn.commit().await.map_err(|error| map_sql_error(&error))?;
@@ -857,20 +876,20 @@ async fn drive_backend_init_or_mark_failed(
         Err(error) => {
             let error_code = error.code().to_owned();
             let status_code = i32::from(error.status());
-            mark_failed_best_effort(
+            mark_failed(
                 state,
                 caller,
                 upload_uuid,
                 validated,
                 state.storage.backend(),
                 FailureContext {
-                    operation: UploadAuditOperation::UploadInit,
+                    operation: UploadAuditOperation::BackendFailed,
                     reason: "backend init failed",
                     status_code,
                     error_code: Some(&error_code),
                 },
             )
-            .await;
+            .await?;
             Err(error)
         }
     }
@@ -908,14 +927,12 @@ async fn persist_s3_upload_id_and_audit(
     audit::write(
         conn,
         caller,
-        UploadAuditRow {
-            operation: UploadAuditOperation::UploadInit,
-            upload_id: Some(upload_uuid),
-            storage_path: &validated.full,
-            backend,
-            status_code: 200,
-            error_code: None,
-        },
+        UploadAuditOperation::BackendInitialized,
+        Some(upload_uuid),
+        &validated.full,
+        backend,
+        200,
+        None,
     )
     .await
 }
@@ -1045,20 +1062,20 @@ async fn complete_backend_upload(
         let error = map_storage_error(error);
         let error_code = error.code().to_owned();
         let status_code = i32::from(error.status());
-        mark_failed_best_effort(
+        mark_failed(
             state,
             caller,
             upload_uuid,
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
+                operation: UploadAuditOperation::BackendFailed,
                 reason: "backend_complete_failed",
                 status_code,
                 error_code: Some(&error_code),
             },
         )
-        .await;
+        .await?;
         return Err(error);
     }
     Ok(())
@@ -1082,20 +1099,20 @@ async fn verified_object_head(
             let error = map_storage_error(error);
             let error_code = error.code().to_owned();
             let status_code = i32::from(error.status());
-            mark_failed_best_effort(
+            mark_failed(
                 state,
                 caller,
                 upload_uuid,
                 validated,
                 row.backend,
                 FailureContext {
-                    operation: UploadAuditOperation::UploadComplete,
+                    operation: UploadAuditOperation::BackendFailed,
                     reason: "head_for_verification_failed",
                     status_code,
                     error_code: Some(&error_code),
                 },
             )
-            .await;
+            .await?;
             Err(error)
         }
     }
@@ -1134,14 +1151,12 @@ async fn persist_completed_upload(
     audit::write(
         conn,
         caller,
-        UploadAuditRow {
-            operation: UploadAuditOperation::UploadComplete,
-            upload_id: Some(upload_uuid),
-            storage_path: &validated.full,
-            backend: row.backend,
-            status_code: 200,
-            error_code: None,
-        },
+        UploadAuditOperation::Complete,
+        Some(upload_uuid),
+        &validated.full,
+        row.backend,
+        200,
+        None,
     )
     .await
 }
@@ -1167,79 +1182,73 @@ async fn verify_object_head(
         });
         let error_code = error.code().to_owned();
         let status_code = i32::from(error.status());
-        mark_failed_best_effort(
+        mark_failed(
             state,
             caller,
             upload_uuid,
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
+                operation: UploadAuditOperation::BackendFailed,
                 reason: "size_mismatch",
                 status_code,
                 error_code: Some(&error_code),
             },
         )
-        .await;
+        .await?;
         return Err(error);
     }
     if state.storage.require_encryption() && head.sse_marker.is_none() {
         let error = map_storage_error(StorageError::EncryptionMissing);
         let error_code = error.code().to_owned();
         let status_code = i32::from(error.status());
-        mark_failed_best_effort(
+        mark_failed(
             state,
             caller,
             upload_uuid,
             validated,
             row.backend,
             FailureContext {
-                operation: UploadAuditOperation::UploadComplete,
+                operation: UploadAuditOperation::BackendFailed,
                 reason: "encryption_missing",
                 status_code,
                 error_code: Some(&error_code),
             },
         )
-        .await;
+        .await?;
         return Err(error);
     }
     Ok(())
 }
 
-async fn mark_failed_best_effort(
+async fn mark_failed(
     state: &StorageServiceState<'_>,
     caller: &StorageCaller,
     upload_uuid: Uuid,
     validated: &ValidatedPath,
     backend: StorageBackendKind,
     ctx: FailureContext<'_>,
-) {
-    let Ok(mut conn) = state.postgres.tenant_conn(caller.data_tenant_id).await else {
-        tracing::warn!(upload_id = %upload_uuid, "failed to acquire tenant connection for failure mark");
-        return;
-    };
-    if let Err(error) = multipart_uploads::mark_failed(&mut conn, upload_uuid, ctx.reason).await {
-        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to mark upload failed");
-    }
-    if let Err(error) = audit::write(
+) -> Result<(), WyrdError> {
+    let mut conn = state
+        .postgres
+        .tenant_conn(caller.data_tenant_id)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    multipart_uploads::mark_failed(&mut conn, upload_uuid, ctx.reason)
+        .await
+        .map_err(|error| map_sql_error(&error))?;
+    audit::write(
         &mut conn,
         caller,
-        UploadAuditRow {
-            operation: ctx.operation,
-            upload_id: Some(upload_uuid),
-            storage_path: &validated.full,
-            backend,
-            status_code: ctx.status_code,
-            error_code: ctx.error_code,
-        },
+        ctx.operation,
+        Some(upload_uuid),
+        &validated.full,
+        backend,
+        ctx.status_code,
+        ctx.error_code,
     )
-    .await
-    {
-        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to append storage failure audit");
-    }
-    if let Err(error) = conn.commit().await {
-        tracing::warn!(error = %error, upload_id = %upload_uuid, "failed to commit failure mark");
-    }
+    .await?;
+    conn.commit().await.map_err(|error| map_sql_error(&error))
 }
 
 fn upload_id_uuid(upload_id: &UploadId) -> Result<Uuid, WyrdError> {
@@ -1339,7 +1348,7 @@ fn conflict_error(message: impl Into<String>, details: serde_json::Value) -> Wyr
     }
 }
 
-fn internal_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
+pub(crate) fn internal_error(message: impl Into<String>, details: serde_json::Value) -> WyrdError {
     WyrdError::Internal {
         message: message.into(),
         details,

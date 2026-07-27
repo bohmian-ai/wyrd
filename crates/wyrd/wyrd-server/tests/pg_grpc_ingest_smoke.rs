@@ -5,10 +5,11 @@
 //! token passes auth (the empty stream then terminates without an Unauthenticated
 //! error). Reuses the same key/verifier setup as `router_smoke.rs`.
 
-mod support;
+pub mod support;
 
 mod pg_tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -17,6 +18,10 @@ mod pg_tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio_util::sync::CancellationToken;
+    use vala_bifrost_redux::scribe::{
+        ScribeImpl,
+        wal::{WalConfig, WalWriter},
+    };
     use wyrd_auth_issue::IssuingKey;
     use wyrd_auth_verify::{
         Kid, TokenPrincipalRef, TokenVerifier, WyrdAuthVerifySettings, public_key_from_pem,
@@ -26,6 +31,7 @@ mod pg_tests {
     use wyrd_server::components::auth::ServerAuth;
     use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
     use wyrd_server::postgres::ServerPostgres;
+    use wyrd_server::state::BifrostIngestRuntime;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -42,7 +48,7 @@ mod pg_tests {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let postgres = Arc::new(ServerPostgres::from_parts(
             wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None),
-            vala_sql::ValaPostgres::from_pools(app_pool.clone(), None),
+            vala_sql::ValaPostgres::from_pool(app_pool.clone()),
         ));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
@@ -69,16 +75,40 @@ mod pg_tests {
             ),
             WyrdAuthVerifySettings::default(),
         ));
-        AppState::new(
-            postgres,
-            Arc::new(StorageHandle::new(BackendSigner::Local(signer))),
-            support::test_catalog().await,
-        )
-        .with_auth(ServerAuth {
-            issuing_key: Some(issuing_key),
-            token_verifier: Some(verifier),
-            ..ServerAuth::default()
-        })
+        let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
+        let catalog = support::test_catalog().await;
+        let redux_catalog = support::test_redux_catalog().await;
+        let wal_root = tempfile::tempdir().expect("wal temp dir");
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *uuid::Uuid::now_v7().as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("wal initializes"),
+        );
+        let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
+            Arc::new(storage.operator().clone()),
+            wal,
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+        ));
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
+            Arc::clone(&redux_catalog),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
+        ));
+        AppState::new(postgres, storage, catalog)
+            .with_bifrost_redux(redux_catalog)
+            .with_bifrost_ingest(ingest)
+            .with_auth(ServerAuth {
+                issuing_key: Some(issuing_key),
+                token_verifier: Some(verifier),
+                ..ServerAuth::default()
+            })
     }
 
     fn mint_user_jwt(state: &AppState, tenant: DataTenantId) -> String {
@@ -98,8 +128,12 @@ mod pg_tests {
             .expect("test jwt mints")
     }
 
-    fn empty_stream() -> tokio_stream::Iter<std::vec::IntoIter<InsertBatchRequest>> {
-        tokio_stream::iter(Vec::<InsertBatchRequest>::new())
+    fn empty_request() -> InsertBatchRequest {
+        InsertBatchRequest {
+            table: String::new(),
+            arrow_ipc: Default::default(),
+            wyrd_batch_id: uuid::Uuid::now_v7().as_bytes().to_vec().into(),
+        }
     }
 
     async fn bind_free_loopback() -> SocketAddr {
@@ -152,7 +186,7 @@ mod pg_tests {
 
         let mut client = connect_grpc(bind).await;
         let status = client
-            .insert_batch(Request::new(empty_stream()))
+            .insert_batch(Request::new(empty_request()))
             .await
             .expect_err("unauthenticated ingest must be rejected");
 
@@ -187,7 +221,7 @@ mod pg_tests {
         tokio::spawn(async move { serve_grpc(router, bind, token).await });
 
         let mut client = connect_grpc(bind).await;
-        let mut request = Request::new(empty_stream());
+        let mut request = Request::new(empty_request());
         request.metadata_mut().insert(
             "x-wyrd-access-token",
             format!("Bearer {jwt}").parse().expect("metadata value"),
@@ -206,5 +240,14 @@ mod pg_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_and_redux_managed_columns_are_exactly_equal() {
+        let user_fields = vec![Field::new("value", DataType::UInt64, false)];
+        assert_eq!(
+            vala_bifrost::schema::with_managed_columns(user_fields.clone()),
+            vala_bifrost_redux::schema::with_managed_columns(user_fields)
+        );
     }
 }

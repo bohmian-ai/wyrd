@@ -6,7 +6,7 @@
 //!    rejected with gRPC `PERMISSION_DENIED` / HTTP `403` and no row is written.
 //! 2. **Malformed request body** — a body that cannot be decoded as OTLP
 //!    protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
-//!    stable `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
+//!    stable `WYRD_VALA_400_INGEST_PROTO` code, and no row is written.
 //!
 //! Saturation (backpressure) journey note: driving the group-commit
 //! coordinator's mpsc channel to `try_send` failure end-to-end requires either
@@ -15,10 +15,10 @@
 //! `WYRD_VALA_500_INGEST_INTERNAL` before the coordinator's channel ever
 //! reports `BifrostError::IngestBusy`). Until the writer serialises catalog
 //! commits under bursty concurrency, the saturation mapping is pinned by unit
-//! tests in `wyrd-server/src/http/otlp.rs` — `writer_busy_maps_to_503` for the
+//! tests in `wyrd-server/src/http/otlp.rs` — `writer_busy_maps_to_429` for the
 //! HTTP path and `writer_busy_table_name_is_per_signal` for per-signal table
-//! naming — plus the gRPC mapping in `vala-ingest/src/error.rs`
-//! (`IngestError::WriterBusy → Code::ResourceExhausted` with
+//! naming — plus the gRPC mapping in `vala-bifrost-redux/src/gate/error.rs`
+//! (`IngestError::IngestBusy → Code::ResourceExhausted` with
 //! `WYRD_VALA_429_INGEST_BUSY`).
 //!
 //! Both tests boot a `start_bound` server (PgFixture), so the fast family lane
@@ -41,6 +41,7 @@ mod pg_tests {
     use wyrd_tonic::prost::Message;
     use wyrd_tonic::tonic::transport::Channel;
     use wyrd_tonic::tonic::{Code, Request};
+    use wyrd_tonic::tonic_types::StatusExt;
     use wyrd_tonic::wyrd::v1::GetTraceRequest;
     use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
 
@@ -347,7 +348,7 @@ mod pg_tests {
     }
 
     /// HTTP: a body that cannot be decoded as OTLP protobuf is rejected with
-    /// HTTP `400` and a `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code in the
+    /// HTTP `400` and a `WYRD_VALA_400_INGEST_PROTO` code in the
     /// problem+json body. No row is written.
     #[tokio::test]
     async fn http_malformed_protobuf_body_400_and_no_row_written() {
@@ -385,8 +386,8 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
-            "malformed body must carry WYRD_VALA_400_OTLP_REQUEST_MALFORMED, got {code:?}"
+            code, "WYRD_VALA_400_INGEST_PROTO",
+            "malformed body must carry WYRD_VALA_400_INGEST_PROTO, got {code:?}"
         );
         assert_ne!(
             code, "WYRD_VALA_400_QUERY_INVALID_SQL",
@@ -403,7 +404,7 @@ mod pg_tests {
     }
 
     /// HTTP: a malformed JSON body (invalid JSON syntax) at `/v1/traces` with
-    /// `application/json` encoding is rejected with `400 WYRD_VALA_400_OTLP_REQUEST_MALFORMED`.
+    /// `application/json` encoding is rejected with `400 WYRD_VALA_400_INGEST_PROTO`.
     #[tokio::test]
     async fn http_malformed_json_body_400_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
@@ -436,12 +437,40 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+            code, "WYRD_VALA_400_INGEST_PROTO",
             "malformed JSON body must carry the OTLP-specific 400 code, got {code:?}"
         );
 
         assert_no_span_written(connect(&grpc).await, &admin_jwt, TRACE_ID_MALFORMED_GRPC).await;
 
+        srv.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn wal_exhaustion_keeps_transport_contract_and_no_mutation() {
+        let srv = WyrdTestServer::start_bound().await.expect("bound server");
+        let admin_jwt = bootstrap_admin(&srv, "neg-capacity").await;
+        let grpc_url = srv.grpc_url().expect("grpc url");
+
+        srv.trip_bifrost_wal_disk_full_for_test()
+            .expect("trip gated WAL disk-full seam");
+        let mut traces = TraceServiceClient::new(connect(&grpc_url).await);
+        let wal_error = traces
+            .export(with_grpc_token(
+                Request::new(trace_export_request([9; 16], [8; 8])),
+                &admin_jwt,
+            ))
+            .await
+            .expect_err("WAL exhaustion must reject gRPC ingest");
+        assert_eq!(wal_error.code(), Code::ResourceExhausted);
+        assert_eq!(
+            wal_error
+                .get_details_error_info()
+                .expect("WAL error info")
+                .reason,
+            "WYRD_VALA_507_WAL_DISK_FULL"
+        );
+        assert_no_span_written(connect(&grpc_url).await, &admin_jwt, [9; 16]).await;
         srv.shutdown().await.expect("shutdown");
     }
 

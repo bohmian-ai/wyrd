@@ -13,6 +13,10 @@ pub type TenantTableKey = (DataTenantId, TableRef);
 /// The only errors produced while resolving or validating a physical table binding.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TenantTableBindingError {
+    /// The tenant identity is nil and cannot own physical data.
+    #[error("data tenant id must not be nil")]
+    InvalidTenant,
+
     /// The logical table name cannot safely be used as a catalog or path segment.
     #[error("invalid logical table name `{table_name}`")]
     InvalidTableName { table_name: String },
@@ -60,6 +64,9 @@ impl TenantTableBinding {
     /// [`TenantTableBindingError::InvalidPhysicalNamespace`] when the fixed
     /// namespace cannot be represented by Iceberg.
     pub fn resolve((tenant, table_ref): TenantTableKey) -> Result<Self, TenantTableBindingError> {
+        if tenant.as_uuid().is_nil() {
+            return Err(TenantTableBindingError::InvalidTenant);
+        }
         if !is_safe_name(&table_ref.name) {
             return Err(TenantTableBindingError::InvalidTableName {
                 table_name: table_ref.name,
@@ -232,6 +239,14 @@ mod tests {
                 binding_tenant,
                 authenticated_tenant,
             })
+        );
+    }
+
+    #[test]
+    fn tenant_table_binding_rejects_nil_tenant() {
+        assert_eq!(
+            TenantTableBinding::resolve((crate::test_support::nil_tenant(), table())),
+            Err(TenantTableBindingError::InvalidTenant)
         );
     }
 

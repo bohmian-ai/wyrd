@@ -8,10 +8,6 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
-use vala_ingest::{
-    BifrostIngestGrpc, OtlpLogsService, OtlpMetricsService, OtlpTraceService,
-    ingest_auth_interceptor,
-};
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
@@ -37,30 +33,30 @@ pub fn build_app_grpc<H>(
 where
     H: Health,
 {
-    let verifier = state
-        .auth
-        .token_verifier
-        .clone()
-        .ok_or(GrpcError::MissingTokenVerifier)?;
-    let ingest = BifrostIngestGrpc::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
+    if state.auth.token_verifier.is_none() {
+        return Err(GrpcError::MissingTokenVerifier);
+    }
+    let ingest = state
+        .bifrost_ingest
+        .as_ref()
+        .map(|runtime| runtime.gate())
+        .ok_or(GrpcError::MissingScribe)?;
+    let traces = wyrd_tonic::otlp::trace_service::trace_service_server::TraceServiceServer::new(
+        (*ingest).clone(),
     );
-    let traces = OtlpTraceService::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
+    let metrics =
+        wyrd_tonic::otlp::metrics_service::metrics_service_server::MetricsServiceServer::new(
+            (*ingest).clone(),
+        );
+    let logs = wyrd_tonic::otlp::logs_service::logs_service_server::LogsServiceServer::new(
+        (*ingest).clone(),
     );
-    let metrics = OtlpMetricsService::new(
-        state.bifrost.clone(),
-        ingest_auth_interceptor(verifier.clone()),
-    );
-    let logs = OtlpLogsService::new(state.bifrost.clone(), ingest_auth_interceptor(verifier));
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router
-        .add_service(ingest.into_server())
-        .add_service(traces.into_server())
-        .add_service(metrics.into_server())
-        .add_service(logs.into_server())
+        .add_service((*ingest).clone().into_server())
+        .add_service(traces)
+        .add_service(metrics)
+        .add_service(logs)
         .add_service(query.into_server()))
 }

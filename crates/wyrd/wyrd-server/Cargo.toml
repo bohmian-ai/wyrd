@@ -10,16 +10,20 @@ authors = { workspace = true }
 [features]
 cloud = ["wyrd-storage/cloud"]
 storage-emulator = ["cloud", "wyrd-storage/emulator"]
+test-support = ["vala-bifrost-redux/test-support"]
 
 [[bin]]
 name = "wyrd-server"
 path = "src/main.rs"
 
 [dependencies]
+async-stream = { workspace = true }
+futures-util = { workspace = true }
 arc-swap = { workspace = true }
 arrow = { workspace = true }
 async-trait = { workspace = true }
 datafusion = { workspace = true }
+hex = { workspace = true }
 clap = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server"] }
 shellexpand = { workspace = true }
@@ -50,7 +54,6 @@ reqwest = { workspace = true }
 vala-sql = { path = "../../vala/vala-sql", version = "0.0.1" }
 vala-bifrost = { workspace = true }
 vala-bifrost-redux = { workspace = true }
-vala-ingest = { workspace = true }
 wyrd-runtime = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }

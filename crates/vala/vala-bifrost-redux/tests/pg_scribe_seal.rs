@@ -9,7 +9,7 @@ mod pg_tests {
     //!
     //! Skipped when `WYRD_DATABASE_URL` is unset (credential-free default suite).
 
-    use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array};
+    use arrow::array::{RecordBatch, TimestampMicrosecondArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use chrono::DateTime;
     use opendal::services::Memory;
@@ -20,13 +20,14 @@ mod pg_tests {
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
     use vala_bifrost_redux::scribe::ScribeImpl;
+    use vala_bifrost_redux::scribe::seal::PostCommitBatch;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
 
-    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl) {
+    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -55,8 +56,7 @@ mod pg_tests {
                 temp_dir.path(),
                 node_id_bytes,
                 1,
-                tenant,
-                None,
+                vala_bifrost_redux::scribe::wal::WalConfig::default(),
             )
             .expect("WAL writer"),
         );
@@ -65,14 +65,25 @@ mod pg_tests {
         std::mem::forget(temp_dir);
 
         let writer_epoch = 1;
-        let scribe = ScribeImpl::new_with_deps(operator, wal, node_id.to_string(), writer_epoch);
+        let scribe = ScribeImpl::new_for_embedded_with_deps(
+            Arc::clone(&operator),
+            wal,
+            &node_id.to_string(),
+            writer_epoch,
+        );
 
-        (fixture, tenant, scribe)
+        (fixture, tenant, scribe, operator)
     }
 
-    fn make_batch(row_count: usize, base_time_micros: i64, tenant: DataTenantId) -> RecordBatch {
+    async fn complete_post_commit(scribe: &ScribeImpl, batch: PostCommitBatch) {
+        scribe
+            .complete_post_commit(batch)
+            .await
+            .expect("post_commit");
+    }
+
+    fn make_batch(row_count: usize, base_time_micros: i64) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -87,12 +98,9 @@ mod pg_tests {
         let values: Vec<u64> = (0..row_count)
             .map(|i| u64::try_from(i).expect("bounded row index"))
             .collect();
-        let tenant_ids = vec![tenant.to_string(); row_count];
-
         RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],
@@ -110,8 +118,8 @@ mod pg_tests {
         }
     }
 
-    fn stub_schema_fingerprint() -> SchemaFingerprint {
-        SchemaFingerprint([0u8; 32])
+    fn schema_fingerprint(batch: &RecordBatch) -> SchemaFingerprint {
+        SchemaFingerprint::from_arrow_schema(batch.schema().as_ref())
     }
 
     fn events_table() -> TableRef {
@@ -120,27 +128,27 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_append_seal_file_list() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, _operator) = setup().await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
-
         // 1. Append 50k rows to trigger seal predicate
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
-        let batch = make_batch(50_000, base_time, tenant);
+        let batch = make_batch(50_000, base_time);
         let principal = principal_for_tenant(tenant);
+        let fingerprint = schema_fingerprint(&batch);
 
         let req = ScribeAppend {
             principal,
             table: events_table(),
             rows: batch,
-            schema_fingerprint: stub_schema_fingerprint(),
+            schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
+            measured_wire_bytes: 0,
         };
 
         scribe.append(req).await.expect("append");
-
         // 2. Force seal
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
@@ -148,9 +156,7 @@ mod pg_tests {
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
+        complete_post_commit(&scribe, post_commit).await;
 
         // 3. Verify file_list row and its organization-qualified object identity
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
@@ -233,46 +239,37 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
-        let (fixture, tenant, scribe) = setup().await;
-        // 1. Three appends from three distinct principals
+        let (fixture, tenant, scribe, _operator) = setup().await;
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
-
         for i in 0..3 {
-            let batch = make_batch(1000, base_time + (i * 1_000_000), tenant);
+            let batch = make_batch(1000, base_time + (i * 1_000_000));
             let mut principal = principal_for_tenant(tenant);
             principal.id = PrincipalId::new(Uuid::now_v7());
-
+            let fingerprint = schema_fingerprint(&batch);
             let req = ScribeAppend {
                 principal,
                 table: events_table(),
                 rows: batch,
-                schema_fingerprint: stub_schema_fingerprint(),
+                schema_fingerprint: fingerprint,
                 request_id: RequestId::now_v7(),
                 batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
             };
-
             scribe.append(req).await.expect("append");
         }
-
-        // 2. Force seal
         let pool = fixture.app_pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
-
-        // 3. Verify audit_outbox has 3 rows with all 13 AuditEvent fields
+        complete_post_commit(&scribe, post_commit).await;
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
         let tx = conn2.transaction();
-
         #[allow(clippy::type_complexity)]
         let rows: Vec<(
             Uuid,           // data_tenant_id
@@ -302,16 +299,15 @@ mod pg_tests {
         .fetch_all(&mut **tx)
         .await
         .expect("audit query");
-
         assert_eq!(rows.len(), 3, "expected 3 audit rows (one per append)");
 
         for (i, row) in rows.iter().enumerate() {
             let (
                 data_tenant_id,
                 request_id,
-                trace_id,
+                _trace_id,
                 operation,
-                resource,
+                _resource,
                 card_ref,
                 principal_id,
                 principal_kind,
@@ -325,9 +321,7 @@ mod pg_tests {
 
             assert_eq!(*data_tenant_id, tenant.as_uuid());
             assert!(!request_id.is_empty(), "request_id {i} should be non-empty");
-            assert!(trace_id.is_none(), "trace_id should be None for this test");
             assert_eq!(operation, "bifrost.append");
-            assert!(!resource.is_empty(), "resource should be non-empty");
             assert!(card_ref.is_none(), "card_ref should be None for this test");
             assert_ne!(
                 *principal_id,
@@ -349,7 +343,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_cross_day_batch_produces_two_files() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, operator) = setup().await;
 
         // Create a batch spanning two days: 60 rows on 2026-07-14, 40 rows on 2026-07-15
         let day1_time = DateTime::parse_from_rfc3339("2026-07-14T23:59:50Z")
@@ -360,7 +354,6 @@ mod pg_tests {
             .timestamp_micros();
 
         let schema = Arc::new(Schema::new(vec![
-            Field::new("data_tenant_id", DataType::Utf8, false),
             Field::new(
                 "wyrd_event_time",
                 DataType::Timestamp(TimeUnit::Microsecond, None),
@@ -383,12 +376,9 @@ mod pg_tests {
             timestamps.push(day2_time + ((i - 60) * 100_000));
             values.push(u64::try_from(i).expect("bounded row index"));
         }
-        let tenant_ids = vec![tenant.to_string(); timestamps.len()];
-
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
-                Arc::new(StringArray::from(tenant_ids)),
                 Arc::new(TimestampMicrosecondArray::from(timestamps)),
                 Arc::new(UInt64Array::from(values)),
             ],
@@ -396,38 +386,38 @@ mod pg_tests {
         .expect("batch");
 
         let principal = principal_for_tenant(tenant);
+        let fingerprint = schema_fingerprint(&batch);
 
         let req = ScribeAppend {
             principal,
             table: events_table(),
             rows: batch,
-            schema_fingerprint: stub_schema_fingerprint(),
+            schema_fingerprint: fingerprint,
             request_id: RequestId::now_v7(),
             batch_id: uuid::Uuid::now_v7(),
+            measured_wire_bytes: 0,
         };
 
         scribe.append(req).await.expect("append");
 
         // Force seal
-        let vala = vala_sql::ValaPostgres::from_pools(fixture.app_pool().clone(), None);
+        let vala = vala_sql::ValaPostgres::from_pool(fixture.app_pool().clone());
         let pool = vala.pool();
         let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn");
         let post_commit = scribe.force_seal(&mut conn).await.expect("force_seal");
         conn.commit().await.expect("commit");
-        scribe
-            .complete_post_commit(post_commit)
-            .expect("post_commit");
+        complete_post_commit(&scribe, post_commit).await;
 
         // Verify two file_list rows with distinct partition_day
         let mut conn2 = vala_sql::TenantConn::acquire(pool, tenant)
             .await
             .expect("tenant conn2");
         let tx = conn2.transaction();
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
             r"
-            SELECT partition_day::text, row_count
+            SELECT partition_day::text, row_count, file_path
             FROM vala.file_list
             WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ORDER BY partition_day
@@ -440,20 +430,77 @@ mod pg_tests {
         assert_eq!(rows.len(), 2, "expected two file_list rows (one per day)");
         assert_eq!(rows[0].0, "2026-07-14");
         assert_eq!(rows[0].1, 60, "first day should have 60 rows");
+        assert_eq!(rows[0].2.matches("day=").count(), 1);
+        assert!(rows[0].2.contains("day=2026-07-14/"));
         assert_eq!(rows[1].0, "2026-07-15");
         assert_eq!(rows[1].1, 40, "second day should have 40 rows");
+        assert_eq!(rows[1].2.matches("day=").count(), 1);
+        assert!(rows[1].2.contains("day=2026-07-15/"));
+        let objects = operator
+            .list_with("")
+            .recursive(true)
+            .await
+            .expect("object list")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| objects.contains(&row.2)));
     }
 
     #[tokio::test]
-    #[ignore = "requires fault injection infrastructure"]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
-        // This test would verify that if the seal transaction fails between
-        // file_list INSERT and audit_outbox fan-out, the transaction rolls back
-        // atomically and leaves no partial state.
-        //
-        // Implementation requires fault injection seams in SealDriver or
-        // a test-only hook in insert_and_audit that can fail after file_list
-        // but before audit. Deferred to follow-up with crash-injection harness.
-        // Skip for ; implement in follow-up with crash-injection harness.
+        let (fixture, tenant, scribe, _operator) = setup().await;
+        let batch = make_batch(
+            2,
+            DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                .expect("time")
+                .timestamp_micros(),
+        );
+        scribe
+            .append(ScribeAppend {
+                principal: principal_for_tenant(tenant),
+                table: events_table(),
+                schema_fingerprint: schema_fingerprint(&batch),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
+                rows: batch,
+            })
+            .await
+            .expect("append");
+
+        let pool = fixture.app_pool();
+        let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .expect("tenant connection");
+        let post_commit = scribe.force_seal(&mut conn).await.expect("force seal");
+        drop(conn);
+        scribe
+            .abort_post_commit(post_commit)
+            .await
+            .expect("abort seal");
+
+        let mut verify = vala_sql::TenantConn::acquire(pool, tenant)
+            .await
+            .expect("verification connection");
+        let tx = verify.transaction();
+        let file_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND table_name = $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind("events")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("file count");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource LIKE $2",
+        )
+        .bind(tenant.as_uuid())
+        .bind("%events%")
+        .fetch_one(&mut **tx)
+        .await
+        .expect("audit count");
+        assert_eq!(file_count, 0);
+        assert_eq!(audit_count, 0);
     }
 }

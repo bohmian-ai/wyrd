@@ -28,39 +28,40 @@ The mode is chosen by presence. Set the database variables and you get external 
 | `WYRD_DATABASE_URL` | `wyrd_app` | yes | Canonical DSN. Runtime traffic runs as `wyrd_app` under RLS. |
 | `WYRD_DATABASE_MIGRATOR_PASSWORD` | `wyrd_migrator` | yes | Runs migrations at boot. The pool is closed once migrations finish. |
 | `WYRD_DATABASE_CATALOG_APP_PASSWORD` | `wyrd_catalog_app` | yes | The Bifrost Iceberg catalog connects with this role. |
-| `WYRD_DATABASE_RECOVERY_PASSWORD` | `vala_recovery` | yes | Vala startup recovery connects with this role. |
 | `WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD` | `wyrd_platform_admin` | no | Audited cross-tenant admin. Set it only if you use that capability. |
 
 ```bash
 export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
 export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
 export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
-export WYRD_DATABASE_RECOVERY_PASSWORD="recovery-pw"
 # Optional:
 export WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD="admin-pw"
 ```
 
 ### Roles
 
-The server splits privileges across five roles so that runtime request handling never holds more power than it needs. Row-level security is enforced for `wyrd_app`, which is the only role that serves request traffic. Two of the five belong to Vala, Wyrd's observability warehouse: `wyrd_catalog_app` connects its Bifrost Iceberg catalog, and `vala_recovery` runs its startup recovery. [Architecture](/self-hosting/architecture/) explains how those pieces fit.
+The server splits privileges across four roles so runtime request handling never
+holds more power than it needs. Row-level security is enforced for `wyrd_app`,
+which is the only role that serves request traffic. `wyrd_catalog_app` connects
+the Bifrost Iceberg catalog. [Architecture](/self-hosting/architecture/)
+explains how those pieces fit.
 
 | Role | Row-level security | What it does |
 | --- | --- | --- |
 | `wyrd_app` | enforced | All runtime request traffic. Sees only its tenant's rows. |
 | `wyrd_migrator` | not applicable | Applies migrations at boot. Boot-only, closed afterward. |
 | `wyrd_catalog_app` | not applicable | Bifrost Iceberg catalog access with a catalog search path. |
-| `vala_recovery` | not applicable | Vala warehouse startup recovery. |
 | `wyrd_platform_admin` | bypasses RLS | Optional audited cross-tenant administration. |
 
 These roles must exist in your cluster, with the privileges in the table above and the passwords you supply, before the server boots. The row-level security policies themselves are created by the migrations that run at boot, so you provision the roles and the server sets up the policies. In embedded mode the server provisions the roles for you; external mode expects them to already exist.
 
 ### Pool tuning
 
-Both modes share the same pool settings, covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). The ceiling applies across the app, catalog, and recovery pools, so size your cluster's `max_connections` above the sum you expect across replicas.
+Both modes share the same pool settings, covered in [Configuration](/self-hosting/configuration/): `WYRD_PG_POOL_MAX` (default 32) and `WYRD_PG_POOL_ACQUIRE_MS` (default 5000). The ceiling applies across the app, catalog, and optional platform-admin pools, so size your cluster's `max_connections` above the sum you expect across replicas.
 
 ## Embedded Postgres
 
-Leave every database variable unset and the server provisions its own PostgreSQL for you: it creates the cluster, bootstraps the five roles with generated passwords, persists those credentials under your local data directory, and runs migrations. This is the zero-setup path behind `mise run dev:backend`.
+Leave every database variable unset and the server provisions its own PostgreSQL for you: it creates the cluster, bootstraps the four roles with generated passwords, persists those credentials under your local data directory, and runs migrations. This is the zero-setup path behind `mise run dev:backend`.
 
 Embedded mode is for development. It is not a supported production deployment. When you move to staging or production, switch to external Postgres by setting the variables above.
 

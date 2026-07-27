@@ -27,10 +27,3 @@ CREATE ROLE wyrd_catalog_app
 
 GRANT wyrd_catalog TO wyrd_catalog_app;
 GRANT wyrd_catalog TO wyrd_migrator;
-
-CREATE ROLE vala_recovery_owner NOLOGIN BYPASSRLS;
-CREATE ROLE vala_recovery LOGIN PASSWORD 'REPLACE_WITH_VALA_RECOVERY_PASSWORD';
-GRANT vala_recovery_owner TO wyrd_migrator;
-
-CREATE ROLE vala_audit_relay NOLOGIN BYPASSRLS;
-GRANT vala_audit_relay TO wyrd_migrator;

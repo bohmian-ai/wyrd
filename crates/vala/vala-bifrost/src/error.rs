@@ -52,12 +52,6 @@ pub enum BifrostError {
     #[error("reserved system column: {0}")]
     ReservedColumn(String),
 
-    #[error("SystemShared table missing data_tenant_id column: {0}")]
-    MissingTenantColumn(String),
-
-    #[error("TenantOwned table must not include data_tenant_id: {0}")]
-    UnexpectedTenantColumn(String),
-
     #[error("no tenant binding for OLAP operation")]
     TenantBindingMissing,
 
@@ -98,8 +92,6 @@ impl BifrostError {
         use wyrd_spec::vala::BifrostError as Pub;
         match self {
             Self::ReservedColumn(column) => Pub::ReservedColumn { column },
-            Self::MissingTenantColumn(table) => Pub::MissingTenantColumn { table },
-            Self::UnexpectedTenantColumn(table) => Pub::UnexpectedTenantColumn { table },
             Self::TenantBindingMissing => Pub::TenantBindingMissing,
             Self::TableNotFound(table) => Pub::TableNotFound { table },
             Self::FingerprintMismatch(table) => Pub::FingerprintMismatch { table },

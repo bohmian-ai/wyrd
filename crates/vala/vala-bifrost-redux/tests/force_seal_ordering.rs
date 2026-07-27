@@ -31,6 +31,7 @@ fn force_seal_result_is_only_a_post_commit_capability_batch() {
         file_list_row_id: uuid::Uuid::nil(),
         wal_lsn_min: WalLsn::new(11),
         wal_lsn_max: WalLsn::new(11),
+        memtable_bytes: 0,
     };
     let batch: PostCommitBatch = token.clone().into();
     assert_eq!(batch.0.len(), 1);

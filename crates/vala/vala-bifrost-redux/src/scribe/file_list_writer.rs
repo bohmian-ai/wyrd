@@ -167,7 +167,7 @@ pub fn build_insert<'a>(
     // Row count and file size are usize; the Postgres columns are BIGINT (i64).
     // A single Parquet file cannot approach i64::MAX rows or bytes on any real
     // machine, so a failed conversion is an invariant violation.
-    let row_count = i64::try_from(frozen.batch.num_rows()).map_err(|_| ScribeError::Internal {
+    let row_count = i64::try_from(frozen.row_count()).map_err(|_| ScribeError::Internal {
         detail: "row_count exceeds i64::MAX (invariant violation)".to_string(),
     })?;
     let file_size = i64::try_from(encoded.bytes.len()).map_err(|_| ScribeError::Internal {
@@ -318,7 +318,7 @@ pub async fn insert_and_audit(
  $13,
  $14
  )
- ON CONFLICT (node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
+ ON CONFLICT (data_tenant_id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max) DO NOTHING
  ",
     )
     .bind(row.id)

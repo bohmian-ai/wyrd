@@ -145,17 +145,16 @@ tenant_slug = "acme"
 
 ## A complete production environment
 
-Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the five database roles and mount the signing key as a secret first.
+Each page above documents one slice. Here is the full set of variables a production deployment against external Postgres and an S3 bucket sets, in one place. Provision the four database roles and mount the signing key as a secret first.
 
 ```bash
 # Profile
 export APP_ENV=production
 
-# Database (external). The five roles must already exist in the cluster.
+# Database (external). The four roles must already exist in the cluster.
 export WYRD_DATABASE_URL="postgresql://wyrd_app:app-pw@db.internal:5432/wyrd"
 export WYRD_DATABASE_MIGRATOR_PASSWORD="migrator-pw"
 export WYRD_DATABASE_CATALOG_APP_PASSWORD="catalog-pw"
-export WYRD_DATABASE_RECOVERY_PASSWORD="recovery-pw"
 
 # Storage (S3). AWS credentials resolve via the default SDK chain.
 export WYRD_STORAGE_BACKEND=s3

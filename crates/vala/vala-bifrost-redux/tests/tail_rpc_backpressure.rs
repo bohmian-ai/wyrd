@@ -10,7 +10,7 @@ use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::tail_rpc::{
-    FetchLiveTailRequest, FetchLiveTailService, LiveTailShard, TailConfig, TailFrame,
+    FetchLiveTailRequest, FetchLiveTailService, TailConfig, TailFrame,
 };
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
@@ -79,11 +79,6 @@ async fn backpressure_emits_whole_batches_and_resume_token() {
     let tenant = DataTenantId::new_v7();
     let table = TableRef::new(BifrostNamespace::Bifrost, "events");
     let binding = TenantTableBinding::resolve((tenant, table.clone())).expect("binding");
-    let shard = LiveTailShard {
-        tenant_table: binding,
-        table: table.clone(),
-        tenant,
-    };
     let stream = StreamIdentity::new(NodeId::new(Uuid::now_v7()), WriterEpoch::new(1));
     let memtable = Arc::new(Memtable::new());
     append(&memtable, tenant, &table, 1);
@@ -97,9 +92,12 @@ async fn backpressure_emits_whole_batches_and_resume_token() {
     );
     let first = service
         .fetch_live_tail(FetchLiveTailRequest {
-            shard: shard.clone(),
+            binding: binding.clone(),
             target_stream: stream,
+            start_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+            end_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
             after_lsn: WalLsn::new(0),
+            required_columns: Vec::new(),
         })
         .await
         .expect("first page");
@@ -117,9 +115,12 @@ async fn backpressure_emits_whole_batches_and_resume_token() {
 
     let second = service
         .fetch_live_tail(FetchLiveTailRequest {
-            shard,
+            binding,
             target_stream: stream,
+            start_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+            end_day: EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
             after_lsn: WalLsn::new(1),
+            required_columns: Vec::new(),
         })
         .await
         .expect("second page");

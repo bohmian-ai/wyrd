@@ -8,19 +8,14 @@ use wyrd_queue::{BatchSink, SealedBatch};
 use wyrd_spec::error::WyrdError;
 
 /// The ingest RPC seam mirroring `wyrd.v1.BifrostIngestService::InsertBatch`.
-///
-/// One call ships one sealed batch: the destination `table`, the 16-byte
-/// idempotency `batch_id` (proto `wyrd_batch_id`), and the Arrow IPC `frames`
-/// (proto `arrow_ipc`, carrying the per-row `card_ref`/`run_id` correlation
-/// columns). Returns `rows_accepted`. The concrete gRPC client-streaming
-/// transport is wired in a later transport commit; this seam keeps
+/// One call ships one sealed batch and returns after the exact batch identity is
+/// acknowledged. This seam keeps
 /// [`BifrostIngestSink`] fully unit-testable server-free.
 #[async_trait]
 pub trait IngestTransport: Send + Sync + 'static {
-    /// Ship one sealed batch to the ingest service; return `rows_accepted`.
+    /// Ship one sealed batch to the ingest service.
     ///
-    /// Must be **idempotent on `batch_id`** — a retry re-sends the same id so
-    /// the server's `olap_commits` dedup holds.
+    /// Must be idempotent on `batch_id` during the server's retention window.
     ///
     /// # Errors
     /// Returns a [`WyrdError`] mapped from the transport/server failure.
@@ -28,8 +23,8 @@ pub trait IngestTransport: Send + Sync + 'static {
         &self,
         table: &str,
         batch_id: [u8; 16],
-        frames: Vec<u8>,
-    ) -> Result<u64, WyrdError>;
+        arrow_ipc: Vec<u8>,
+    ) -> Result<(), WyrdError>;
 }
 
 /// The Record-kind [`BatchSink`]: hands each sealed batch to the ingest RPC.
@@ -54,6 +49,7 @@ impl BatchSink for BifrostIngestSink {
     async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
         self.transport
             .insert_batch(&batch.table, batch.batch_id, batch.frames)
-            .await
+            .await?;
+        Ok(batch.rows)
     }
 }

@@ -114,8 +114,11 @@ mod pg_tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Proves one bound server uses its single Gate/Scribe runtime for an
+    /// authenticated OTLP write, explicit durable flush, query readback, and
+    /// ordered shutdown.
     #[tokio::test]
-    async fn otlp_trace_export_grpc_write_read() {
+    async fn bifrost_ingest_runtime_journey() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         // admin carries the wildcard permission, which covers bifrost_record:write.
         let jwt = match srv
@@ -146,7 +149,11 @@ mod pg_tests {
             "a well-formed span must not be rejected: {response:?}"
         );
 
-        // Read it back through the live query path by trace id.
+        // Force the same server-owned Scribe allocation behind Gate to seal its
+        // accepted work before the query projection reads the durable result.
+        srv.flush_bifrost().await.expect("Scribe flush succeeds");
+
+        // Read it back through the live query path by trace id after durability.
         let mut query = ValaQueryServiceClient::new(channel);
         let waterfall = query
             .get_trace(with_token(

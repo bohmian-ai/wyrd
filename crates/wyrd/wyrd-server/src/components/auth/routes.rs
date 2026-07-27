@@ -33,7 +33,7 @@ use crate::state::AppState;
 pub fn auth_router() -> Router<AppState> {
     let auth_governor = Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(10)
+            .per_millisecond(100)
             .burst_size(20)
             .finish()
             .expect("static auth governor config is valid"),
@@ -465,7 +465,7 @@ mod pg_tests {
 
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
         let wyrd = wyrd_sql::WyrdPostgres::from_pools(app_pool.clone(), None);
-        let vala = vala_sql::ValaPostgres::from_pools(app_pool, None);
+        let vala = vala_sql::ValaPostgres::from_pool(app_pool);
         let postgres = Arc::new(crate::postgres::ServerPostgres::from_parts(wyrd, vala));
         let root = tempfile::tempdir().expect("temp dir");
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");

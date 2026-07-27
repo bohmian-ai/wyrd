@@ -6,16 +6,23 @@ license = { workspace = true }
 rust-version = { workspace = true }
 repository = { workspace = true }
 authors = { workspace = true }
+autotests = false
 
 [features]
 default = []
+bench = ["dep:wyrd-bench"]
 python = ["dep:pyo3", "dep:wyrd-utils"]
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
 arrow = { workspace = true }
 base64 = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 futures-util = { workspace = true }
@@ -35,31 +42,49 @@ sqlx = { workspace = true, features = ["postgres"] }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
 tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
-vala-bifrost-redux = { workspace = true }
+vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
+vala-sdk = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }
 wyrd-auth-check = { workspace = true, features = ["test-helpers"] }
 wyrd-auth-issue = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-wyrd-bench = { workspace = true }
+wyrd-bench = { workspace = true, optional = true }
 wyrd-crypt = { path = "../../shared/wyrd-crypt", version = "0.0.1" }
+wyrd-client = { workspace = true }
 wyrd-dev-fixtures = { workspace = true, features = ["pg"] }
 wyrd-runtime = { workspace = true }
 wyrd-semver = { workspace = true }
-wyrd-server = { workspace = true }
+wyrd-server = { workspace = true, features = ["test-support"] }
 wyrd-spec = { workspace = true, features = ["test-utils"] }
 wyrd-sql = { workspace = true }
 wyrd-storage = { workspace = true }
 wyrd-utils = { workspace = true, features = ["python"], optional = true }
 
 [[bench]]
-name = "bench_forge_production"
+name = "bench_bifrost_scribe"
 harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bench_bifrost_otlp"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bench_bifrost_forge"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
+name = "bench_bifrost_oracle"
+harness = false
+required-features = ["bench"]

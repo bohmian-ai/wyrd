@@ -41,6 +41,7 @@ use wyrd_spec::vala::api::{
 
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::bifrost_writer_properties;
+use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
 
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, stable_pack};
 use super::error::ForgeError;
@@ -217,6 +218,8 @@ pub struct ForgeContext {
     /// Forge's read/list/stat/delete seam, backed by `staging` by default.
     pub object_store: Arc<dyn ForgeObjectStore>,
     pub config: ForgeConfig,
+    /// Optional process-global parent governor installed by production boot.
+    pub memory_governor: Option<BifrostMemoryGovernor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -250,6 +253,7 @@ impl ForgeContext {
             }),
             staging,
             config,
+            memory_governor: None,
         })
     }
 
@@ -258,6 +262,14 @@ impl ForgeContext {
     #[must_use]
     pub fn with_object_store(mut self, object_store: Arc<dyn ForgeObjectStore>) -> Self {
         self.object_store = object_store;
+        self
+    }
+
+    /// Attach the process-global Bifrost parent governor to Forge workspace
+    /// operations. Test fixtures may omit it when they do not model pressure.
+    #[must_use]
+    pub fn with_memory_governor(mut self, memory_governor: BifrostMemoryGovernor) -> Self {
+        self.memory_governor = Some(memory_governor);
         self
     }
 }
@@ -547,15 +559,11 @@ async fn load_reconciliation_keys(
         .collect()
 }
 
-/// Convert the database's system-owner UUID convention into a data-tenant ID.
+/// Convert a database UUID into a validated data-tenant ID.
 fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
-    if value.is_nil() {
-        Ok(DataTenantId::SYSTEM_OWNER)
-    } else {
-        DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })
-    }
+    DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
+        detail: error.to_string(),
+    })
 }
 
 /// Execute one fenced compaction operation from staged files to Iceberg.
@@ -570,6 +578,7 @@ async fn compact_bin(
     binding: &TenantTableBinding,
     bin: &RewriteBin,
 ) -> Result<(), ForgeError> {
+    let _workspace = reserve_forge_workspace(context, bin)?;
     let operation_id = operation_id(key, bin);
     let table = load_table(context, &binding.table_ident()).await?;
     let batch = read_and_project_staging(context, &table, key, binding, bin).await?;
@@ -644,6 +653,24 @@ async fn compact_bin(
             detail: "Iceberg replace committed without a current snapshot".to_owned(),
         })?;
     stamp_committed(context, lease, key, bin, &output, operation_id, snapshot_id).await
+}
+
+fn reserve_forge_workspace(
+    context: &ForgeContext,
+    bin: &RewriteBin,
+) -> Result<Option<ParentMemoryReservation>, ForgeError> {
+    let Some(governor) = &context.memory_governor else {
+        return Ok(None);
+    };
+    let requested = usize::try_from(bin.total_bytes).map_err(|error| ForgeError::MemoryBudget {
+        detail: format!("Forge input byte count does not fit memory accounting: {error}"),
+    })?;
+    governor
+        .try_reserve_parent(requested.max(1))
+        .map(Some)
+        .map_err(|error| ForgeError::MemoryBudget {
+            detail: error.to_string(),
+        })
 }
 
 /// Return whether Iceberg classified an error as safe to retry.

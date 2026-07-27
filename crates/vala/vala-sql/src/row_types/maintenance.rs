@@ -45,18 +45,17 @@ impl MaintenanceLeaseKey {
     }
 
     /// Build the lease key for one cross-table derivation:
-    /// `cross_table_derivation:{uid}:{control_bind}`.
+    /// `cross_table_derivation:{data_tenant_id}:{derivation_uid}`.
     ///
-    /// The `uid` identifies the derivation registration and `control_bind` is
-    /// the logical commit identity the derivation consumes (see
-    /// `vala.olap_derivations` / `olap_commits`), so two derivations that share
-    /// a `uid` across distinct control binds hold distinct leases. The
+    /// The tenant identifies the derivation registration's isolation boundary
+    /// and the UID identifies the derivation registration, so two tenants can
+    /// hold distinct leases for otherwise identical derivation IDs. The
     /// `cross_table_derivation` namespace is admitted by the
     /// `maintenance_leases_lease_key_namespace_check` CHECK.
     #[must_use]
-    pub fn cross_table_derivation(uid: &Uuid, control_bind: &Uuid) -> Self {
+    pub fn cross_table_derivation(data_tenant_id: &Uuid, derivation_uid: &Uuid) -> Self {
         Self(format!(
-            "{CROSS_TABLE_DERIVATION_PREFIX}:{uid}:{control_bind}"
+            "{CROSS_TABLE_DERIVATION_PREFIX}:{data_tenant_id}:{derivation_uid}"
         ))
     }
 
@@ -89,13 +88,13 @@ mod tests {
     #[test]
     fn cross_table_derivation_key() {
         let uid = Uuid::parse_str("018f3c1e-2a4b-7c8d-9e0f-1a2b3c4d5e6f").expect("valid uuid");
-        let control_bind =
+        let data_tenant_id =
             Uuid::parse_str("00000000-0000-0000-0000-000000000000").expect("valid uuid");
-        let key = MaintenanceLeaseKey::cross_table_derivation(&uid, &control_bind);
+        let key = MaintenanceLeaseKey::cross_table_derivation(&data_tenant_id, &uid);
 
         assert_eq!(
             key.as_str(),
-            format!("cross_table_derivation:{uid}:{control_bind}")
+            format!("cross_table_derivation:{data_tenant_id}:{uid}")
         );
         // The namespace (substring before the first ':') is what the
         // maintenance_leases CHECK whitelists.

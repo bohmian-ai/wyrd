@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use arrow::array::{Array, StringArray};
 use arrow::compute::SortColumn;
+use arrow::compute::concat_batches;
 use arrow::compute::lexsort_to_indices;
 use arrow::compute::take;
 use arrow::datatypes::{DataType, Schema};
@@ -18,7 +19,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::metadata::RowGroupMetaData;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::AuditEvent;
-use wyrd_spec::vala::system_columns::DATA_TENANT_ID;
+use wyrd_spec::vala::managed_columns::DATA_TENANT_ID;
 
 use crate::catalog::TenantTableBinding;
 use crate::contracts::ScribeError;
@@ -84,9 +85,15 @@ pub fn encode_batch(
         });
     }
 
-    // 1. Validate and stamp the server-owned tenant column, then sort by the
-    // same two keys for every physical table.
-    let stamped_batch = stamp_tenant(&frozen.batch, seal_tenant)?;
+    // 1. Materialize one temporary encoder batch in the bounded persistence
+    // worker, then stamp and sort by the same two keys for every physical
+    // table. FrozenMemtable retains only append batches so the merged form is
+    // not held alongside the originals.
+    let encoder_batch =
+        concat_batches(&frozen.schema, &frozen.batches).map_err(|error| ScribeError::Internal {
+            detail: format!("failed to materialize frozen memtable for encoding: {error}"),
+        })?;
+    let stamped_batch = stamp_tenant(&encoder_batch, seal_tenant)?;
     let sorted_batch = sort_batch(&stamped_batch)?;
 
     // 2. Write to Parquet in-memory using bifrost_writer_properties
@@ -356,10 +363,12 @@ mod tests {
             seal_id: 0,
             seal_key,
             schema,
-            batches: vec![batch.clone()],
-            batch,
+            batches: vec![batch],
             events: vec![],
             metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
         }
     }
 
@@ -602,10 +611,12 @@ mod tests {
                 EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).unwrap()),
             ),
             schema,
-            batches: vec![batch.clone()],
-            batch,
+            batches: vec![batch],
             events: vec![],
             metas: vec![],
+            opened_at: std::time::Instant::now(),
+            closed_at: std::time::Instant::now(),
+            arrow_bytes: 0,
         };
         let binding = TenantTableBinding::resolve((tenant, frozen.seal_key.table.clone())).unwrap();
 

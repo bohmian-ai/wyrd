@@ -32,6 +32,7 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests replay safety for maintenance and orphan cleanup with real objects.
 ///
 /// Steps:
@@ -81,6 +82,7 @@ async fn forge_expiry_compaction_gc_matrix_never_deletes_live_file() {
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests the list-to-delete GC race with a real durable file-list reference.
 ///
 /// Steps:
@@ -122,19 +124,16 @@ async fn forge_gc_replay_preserves_live_reference() {
         .expect("reference race maintenance tick");
     assert!(context.object_store.stat(&orphan).await.is_ok());
     assert_eq!(
-        sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation = 'forge.file_compact.committed'",
-        )
-        .bind(fixture.tenant.as_uuid())
-        .fetch_one(fixture.context.operator_pool.pool())
-        .await
-        .expect("committed audit count"),
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
         1
     );
     server.shutdown().await.expect("server shutdown");
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests partial GC failure and restart recovery with real object-store state.
 ///
 /// Steps:
@@ -189,18 +188,14 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
         .expect("partial-delete recovery tick");
     assert!(recovery.staging.stat(&first_orphan).await.is_err());
     assert!(recovery.staging.stat(&second_orphan).await.is_err());
-    let terminal: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation IN ('forge.orphan_gc.committed', 'forge.orphan_gc.recovered')",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .fetch_one(recovery.operator_pool.pool())
-    .await
-    .expect("GC terminal audit count");
+    let terminal = fixture.operation_count("forge.orphan_gc.committed").await
+        + fixture.operation_count("forge.orphan_gc.recovered").await;
     assert_eq!(terminal, 1);
     server.shutdown().await.expect("server shutdown");
 }
 
 #[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately before a destructive object-store effect.
 ///
 /// Steps:

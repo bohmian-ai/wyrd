@@ -31,15 +31,6 @@
       "items": {
         "$ref": "#/definitions/PartitionColumnSpec"
       }
-    },
-    "scope": {
-      "description": "Table scope; defaults to `TenantOwned`.",
-      "default": "TenantOwned",
-      "allOf": [
-        {
-          "$ref": "#/definitions/TableScopeWire"
-        }
-      ]
     }
   },
   "definitions": {
@@ -473,25 +464,6 @@
             }
           },
           "additionalProperties": false
-        }
-      ]
-    },
-    "TableScopeWire": {
-      "description": "Wire form of a Bifrost table scope. Distinct from the engine `TableScope` so `wyrd-spec` carries no engine dependency; the engine maps between the two.",
-      "oneOf": [
-        {
-          "description": "Tenant-isolated by catalog namespace; carries no `data_tenant_id` column.",
-          "type": "string",
-          "enum": [
-            "TenantOwned"
-          ]
-        },
-        {
-          "description": "Cross-tenant physical table; rows carry a server-stamped `data_tenant_id`.",
-          "type": "string",
-          "enum": [
-            "SystemShared"
-          ]
         }
       ]
     },

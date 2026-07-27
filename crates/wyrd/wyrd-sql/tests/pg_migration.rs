@@ -25,7 +25,6 @@ mod pg_tests {
     // already defines local helpers of the same name with different signatures.
     use wyrd_sql::queries::auth::insert_trusted_issuer as insert_trusted_issuer_query;
     use wyrd_sql::queries::auth::insert_workload_binding as insert_workload_binding_query;
-    use wyrd_sql::queries::platform::audit_log::{StorageAuditEvent, write_storage_event};
     use wyrd_sql::queries::storage;
     use wyrd_sql::{SqlError, SqlStore, TenantConn};
 
@@ -516,22 +515,6 @@ mod pg_tests {
             assert_eq!(metadata.backend, StorageBackendKind::S3);
             assert_eq!(metadata.sha256, sha);
 
-            write_storage_event(
-                &mut conn,
-                StorageAuditEvent {
-                    subject_id: "test-subject",
-                    operation: "upload_complete",
-                    storage_path: &storage_path,
-                    status_code: 200,
-                    error_code: None,
-                    request_id: "test-request",
-                    backend: StorageBackendKind::S3,
-                    upload_id: Some(upload_id),
-                },
-            )
-            .await
-            .expect("storage audit event writes");
-
             storage::idempotency::store(
                 &mut conn,
                 "idem-key",
@@ -683,13 +666,13 @@ mod pg_tests {
             "expired upload must be selected for sweeping"
         );
 
-        storage::admin::multipart_uploads::mark_aborted_admin(
-            store.pool(),
-            upload_id,
-            "test-sweeper",
-        )
-        .await
-        .expect("admin abort update succeeds");
+        let mut conn = TenantConn::acquire(store.pool(), tenant)
+            .await
+            .expect("tenant connection opens");
+        storage::admin::multipart_uploads::mark_aborted_admin(&mut conn, upload_id, "test-sweeper")
+            .await
+            .expect("admin abort update succeeds");
+        conn.commit().await.expect("admin abort commits");
 
         cleanup_storage_test_rows(store.pool(), &[tenant])
             .await
@@ -1678,10 +1661,6 @@ mod pg_tests {
             .map(|tenant| tenant.as_uuid())
             .collect::<Vec<_>>();
 
-        sqlx::query("DELETE FROM wyrd.storage_access_ledger WHERE data_tenant_id = ANY($1)")
-            .bind(&tenant_ids)
-            .execute(pool)
-            .await?;
         sqlx::query("DELETE FROM wyrd.storage_idempotency_keys WHERE data_tenant_id = ANY($1)")
             .bind(&tenant_ids)
             .execute(pool)

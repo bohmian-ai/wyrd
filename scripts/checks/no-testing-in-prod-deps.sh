@@ -21,6 +21,15 @@ for package in metadata["packages"]:
     for dependency in package["dependencies"]:
         if dependency["name"] not in {"wyrd-testing", "wyrd-bench"}:
             continue
+        # The test-tier crate owns the Task-15 benchmark adapters. Keep the
+        # benchmark crate optional and behind the explicit `bench` feature so
+        # its library/test consumers do not pull it into the default build.
+        if (
+            package["name"] == "wyrd-testing"
+            and dependency["name"] == "wyrd-bench"
+            and dependency.get("optional")
+        ):
+            continue
         if dependency.get("kind") not in (None, "normal"):
             continue
         if (

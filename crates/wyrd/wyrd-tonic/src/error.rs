@@ -68,6 +68,7 @@ fn http_status_to_grpc_code(status: u16) -> Code {
         501 => Code::Unimplemented,
         503 => Code::Unavailable,
         504 => Code::DeadlineExceeded,
+        507 => Code::ResourceExhausted,
         _ => Code::Unknown,
     }
 }
@@ -150,5 +151,12 @@ mod tests {
         };
         let status = wyrd_error_to_status(err, None);
         assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[test]
+    fn wal_disk_full_maps_to_resource_exhausted() {
+        let err = WyrdError::from(wyrd_spec::vala::error::BifrostError::WalDiskFull);
+        let status = wyrd_error_to_status(err, None);
+        assert_eq!(status.code(), tonic::Code::ResourceExhausted);
     }
 }

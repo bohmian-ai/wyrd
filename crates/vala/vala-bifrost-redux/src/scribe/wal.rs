@@ -913,11 +913,18 @@ struct WalDiskState {
     hard_failed: AtomicBool,
     accounted_bytes: AtomicU64,
     #[cfg(test)]
-    forced_sample: Mutex<Option<Option<(u64, u64)>>>,
+    forced_sample: Mutex<Option<ForcedSample>>,
     #[cfg(any(test, feature = "test-support"))]
     sync_failure: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     post_sync_failure: AtomicBool,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+enum ForcedSample {
+    Failure,
+    Value((u64, u64)),
 }
 
 impl WalDiskState {
@@ -952,8 +959,8 @@ impl WalDiskState {
             .and_then(|mut value| value.take());
         #[cfg(test)]
         let sampled = match forced {
-            Some(Some(value)) => Some(value),
-            Some(None) => Some((0, 0)),
+            Some(ForcedSample::Value(value)) => Some(value),
+            Some(ForcedSample::Failure) => Some((0, 0)),
             None => filesystem_space(&self.base_dir),
         };
         #[cfg(not(test))]
@@ -978,7 +985,10 @@ impl WalDiskState {
     #[cfg(test)]
     fn force_sample(&self, sample: Option<(u64, u64)>) {
         if let Ok(mut forced) = self.forced_sample.lock() {
-            *forced = Some(sample);
+            *forced = Some(match sample {
+                Some(value) => ForcedSample::Value(value),
+                None => ForcedSample::Failure,
+            });
         }
         if let Ok(mut cached) = self.sample.lock() {
             *cached = None;

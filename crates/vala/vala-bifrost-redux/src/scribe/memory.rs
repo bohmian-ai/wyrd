@@ -10,6 +10,9 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 
 use crate::contracts::ScribeError;
 
+#[cfg(test)]
+static CGROUP_CURRENT_READS: AtomicUsize = AtomicUsize::new(0);
+
 /// Minimum supported cgroup memory size.
 pub const MIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const MIN_SCRIBE_BYTES: usize = 256 * 1024 * 1024;
@@ -769,6 +772,8 @@ fn read_cgroup_limit() -> Option<usize> {
 }
 
 fn read_cgroup_current() -> Option<usize> {
+    #[cfg(test)]
+    CGROUP_CURRENT_READS.fetch_add(1, Ordering::Relaxed);
     [
         "/sys/fs/cgroup/memory.current",
         "/sys/fs/cgroup/memory/memory.usage_in_bytes",
@@ -1039,5 +1044,19 @@ mod tests {
             snapshot.scribe_total_bytes + oracle.bytes() + forge.bytes()
         );
         drop((scribe, oracle, forge));
+    }
+
+    #[test]
+    fn cgroup_current_is_cached_for_repeated_snapshots() {
+        CGROUP_CURRENT_READS.store(0, Ordering::Relaxed);
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let _ = governor.snapshot();
+        let first = CGROUP_CURRENT_READS.load(Ordering::Relaxed);
+        let _ = governor.snapshot();
+        let second = CGROUP_CURRENT_READS.load(Ordering::Relaxed);
+        assert!(
+            second <= first + 1,
+            "cached snapshot performed excessive reads"
+        );
     }
 }

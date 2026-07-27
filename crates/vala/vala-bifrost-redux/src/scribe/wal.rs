@@ -1026,7 +1026,11 @@ impl WalDiskState {
 
 fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
     let stats = statvfs(path).ok()?;
-    let block_size = stats.f_frsize.max(stats.f_bsize);
+    let block_size = if stats.f_frsize == 0 {
+        stats.f_bsize
+    } else {
+        stats.f_frsize
+    };
     Some((
         stats.f_blocks.saturating_mul(block_size),
         stats.f_bavail.saturating_mul(block_size),
@@ -2516,5 +2520,57 @@ mod tests {
 
         let error = wal_io_error("test WAL write", &io::Error::from_raw_os_error(28));
         assert!(matches!(error, ScribeError::WalDiskFull));
+    }
+
+    #[test]
+    fn statvfs_matches_direct_measurement_without_df() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let stats = rustix::fs::statvfs(temp_dir.path()).expect("statvfs");
+        let expected_capacity = stats.f_blocks.saturating_mul(stats.f_frsize);
+        let expected_available = stats.f_bavail.saturating_mul(stats.f_frsize);
+        let measured = filesystem_space(temp_dir.path()).expect("filesystem sample");
+        assert_eq!(measured, (expected_capacity, expected_available));
+    }
+
+    #[test]
+    fn prepared_encoded_len_matches_actual_for_payload_boundaries() {
+        let key = test_seal_key(crate::test_support::tenant());
+        for size in [0, 1, 255, 256, 4096] {
+            let prepared = PreparedWalAppend::new(
+                WalLsn::ZERO,
+                [7; 16],
+                Bytes::from(vec![1; size]),
+                Bytes::from(vec![2; size]),
+            )
+            .for_slice(key.clone(), [3; 32]);
+            let actual = prepared.record().expect("record").encode().len();
+            assert_eq!(prepared.encoded_len().expect("encoded len"), actual);
+        }
+    }
+
+    #[test]
+    fn wal_accounting_tracks_nested_state_and_retirement_actual_length() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let key = test_seal_key(crate::test_support::tenant());
+        let writer =
+            WalWriter::new(temp_dir.path(), [21; 16], 1, WalConfig::default()).expect("writer");
+        writer
+            .append_and_fsync_for_test(&key, [1; 16], b"audit", b"data")
+            .expect("append");
+        let actual = directory_bytes(temp_dir.path());
+        assert_eq!(writer.bytes_on_disk(), actual);
+        let segment = WalReader::open_directory_unfiltered(temp_dir.path())
+            .expect("reader")
+            .segments
+            .first()
+            .expect("segment")
+            .reference();
+        writer
+            .close_segments_if_unowned(std::slice::from_ref(&segment), &HashSet::new())
+            .expect("close");
+        writer
+            .retire_segments(std::slice::from_ref(&segment))
+            .expect("retire");
+        assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
     }
 }

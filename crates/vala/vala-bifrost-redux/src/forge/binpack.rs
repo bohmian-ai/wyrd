@@ -201,7 +201,14 @@ mod tests {
     #[test]
     fn binpack_is_stable_and_never_exceeds_target() {
         let files = vec![file(3, 4, 2, 3), file(1, 4, 0, 1), file(2, 4, 1, 2)];
-        let bins = plan_incremental_bins(files, 8, 10, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).rewrite_bins;
+        let bins = plan_incremental_bins(
+            files,
+            8,
+            10,
+            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        )
+        .rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -213,7 +220,14 @@ mod tests {
     #[test]
     fn binpack_skips_singletons_and_preserves_interval_order() {
         let files = vec![file(1, 9, 0, 1), file(2, 4, 2, 3), file(3, 4, 4, 5)];
-        let bins = plan_incremental_bins(files, 8, 2, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).rewrite_bins;
+        let bins = plan_incremental_bins(
+            files,
+            8,
+            2,
+            NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        )
+        .rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),

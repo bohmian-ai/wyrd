@@ -1,47 +1,68 @@
+//! Typed failures produced by Forge scheduling and maintenance workflows.
+
 use thiserror::Error;
 
+/// Failures that preserve the durable boundary where Forge stopped.
 #[derive(Debug, Error)]
 pub enum ForgeError {
+    /// A construction or runtime limit cannot safely execute Forge.
     #[error("invalid Forge configuration: {detail}")]
     InvalidConfig { detail: String },
+    /// A lease acquisition, renewal, fence, or release query failed.
     #[error("Forge lease query failed: {0}")]
     Lease(#[source] vala_sql::SqlError),
+    /// A non-lease Forge SQL transition failed.
     #[error("Forge SQL operation failed: {0}")]
     Sql(#[source] vala_sql::SqlError),
+    /// An Iceberg catalog, manifest, or transaction operation failed.
     #[error("Forge catalog operation failed: {0}")]
     Catalog(#[source] iceberg::Error),
+    /// A staging or rewritten object operation failed.
     #[error("Forge staging object read failed: {0}")]
     ObjectStore(#[source] opendal::Error),
+    /// Snapshot-expiry planning or reconciliation failed.
     #[error("Forge snapshot expiry failed: {detail}")]
     SnapshotExpiry { detail: String },
+    /// The retained Iceberg live set could not be constructed safely.
     #[error("Forge live-set construction failed: {detail}")]
     LiveSet { detail: String },
+    /// A table-owned object prefix could not be listed.
     #[error("Forge object listing failed: {0}")]
     ObjectList(#[source] opendal::Error),
+    /// A fenced orphan object could not be deleted.
     #[error("Forge object deletion failed: {0}")]
     ObjectDelete(#[source] opendal::Error),
+    /// Parquet decoding, encoding, or owned spill-path setup failed.
     #[error("Forge parquet operation failed: {detail}")]
     Parquet { detail: String },
+    /// A staging batch did not match the registered physical schema.
     #[error("Forge schema validation failed: {detail}")]
     Schema { detail: String },
+    /// Durable candidate identity or values were invalid.
     #[error("Forge candidate group is invalid: {detail}")]
     Group { detail: String },
+    /// Another owner acquired the table fence before this operation completed.
     #[error("Forge lost lease fence `{lease_key}`")]
     FenceLost { lease_key: String },
+    /// Prepared or terminal durable state could not be reconciled safely.
     #[error("Forge reconciliation failed: {detail}")]
     Reconciliation { detail: String },
+    /// Cancellation stopped work at a bounded stage or batch boundary.
     #[error("Forge scheduler was shut down")]
     Shutdown,
+    /// A configured external-operation timeout elapsed.
     #[error("Forge {operation} timed out")]
     Timeout { operation: &'static str },
-    #[error("Forge memory workspace admission failed: {detail}")]
-    MemoryBudget { detail: String },
+    /// An internal invariant failed before a durable transition could proceed.
     #[error("Forge invariant failed: {detail}")]
     Invariant { detail: String },
+    /// A second long-lived scheduler attempted to use the same owner.
     #[error("Forge scheduler is already running")]
     AlreadyRunning,
+    /// `DataFusion` failed while executing the spillable physical rewrite.
     #[error("Forge DataFusion execution failed: {0}")]
     DataFusion(#[source] datafusion::error::DataFusionError),
+    /// `DataFusion` exhausted the configured operation spill ceiling.
     #[error("Forge spill limit of {limit_bytes} bytes was exceeded")]
     SpillLimitExceeded { limit_bytes: u64 },
 }

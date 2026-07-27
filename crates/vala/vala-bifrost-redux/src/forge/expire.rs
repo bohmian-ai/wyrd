@@ -18,9 +18,10 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 
-use super::compact::{ForgeCore, ForgeTableKey, load_table};
+use super::compact::{ForgeTableKey, load_table};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::{Forge, ForgeCore};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -75,11 +76,36 @@ pub fn select_expirable_snapshots(
     selected
 }
 
+impl Forge {
+    /// Discover the ordered durable table set for one periodic tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns a SQL error when no complete discovery set can be formed.
+    pub(super) async fn discover_tables(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
+        discover_tables_inner(&self.core).await
+    }
+
+    /// Reconcile and expire snapshots while retaining the shared table fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, SQL, audit, or reconciliation failures.
+    pub(super) async fn run_snapshot_expiry_for_table(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        run_snapshot_expiry_for_table_inner(&self.core, lease, key, binding).await
+    }
+}
+
 /// Discover tenant/table pairs represented in the server-owned file list.
 ///
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
-pub(crate) async fn discover_tables(
+async fn discover_tables_inner(
     context: &ForgeCore,
 ) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
     let rows = sqlx::query(
@@ -140,7 +166,7 @@ pub(crate) async fn discover_tables(
 /// Current and reference heads, plus their retained ancestry, are protected by
 /// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
 /// commit so a stale prepared selection cannot delete a newly protected head.
-pub(crate) async fn run_snapshot_expiry_for_table(
+async fn run_snapshot_expiry_for_table_inner(
     context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,

@@ -224,8 +224,8 @@ pub enum AuditDetail {
         input_file_ids: Vec<uuid::Uuid>,
         /// Exact staging paths consumed by the operation.
         input_paths: Vec<StoragePath>,
-        /// Deterministic compacted output path.
-        output_path: StoragePath,
+        /// Deterministic compacted output paths in writer-rotation order.
+        output_paths: Vec<StoragePath>,
         /// Iceberg snapshot returned by a committed operation, when known.
         snapshot_id: Option<i64>,
         /// Writer recipe identifier used to create the output.

@@ -18,10 +18,11 @@ use wyrd_spec::vala::api::{
 
 use crate::catalog::TenantTableBinding;
 
-use super::compact::{ForgeCore, ForgeTableKey, load_table};
+use super::compact::{ForgeTableKey, load_table};
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
+use super::{Forge, ForgeCore};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -58,7 +59,38 @@ pub fn is_gc_candidate(
         && last_modified.is_some_and(|modified| modified < now - ttl)
 }
 
-pub(crate) async fn run_orphan_gc_for_table(
+impl Forge {
+    /// Run reconciled orphan deletion for one fenced physical table.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, catalog, object-store, SQL, audit, or live-set failures.
+    pub(super) async fn run_orphan_gc_for_table(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        live_set: &ProtectedLiveSet,
+    ) -> Result<OrphanGcOutcome, ForgeError> {
+        run_orphan_gc_for_table_inner(&self.core, lease, key, binding, live_set).await
+    }
+
+    /// Build the complete retained snapshot and pending-staging live set.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, SQL, path-validation, or live-set failures.
+    pub(super) async fn build_live_set(
+        &self,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+    ) -> Result<ProtectedLiveSet, ForgeError> {
+        build_live_set_inner(&self.core, key, binding, table).await
+    }
+}
+
+async fn run_orphan_gc_for_table_inner(
     context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
@@ -95,7 +127,7 @@ pub(crate) struct OrphanGcOutcome {
 
 /// Build the live set from every retained Iceberg snapshot and every pending
 /// server-side file-list row for this exact tenant/table predicate.
-pub(crate) async fn build_live_set(
+async fn build_live_set_inner(
     context: &ForgeCore,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,

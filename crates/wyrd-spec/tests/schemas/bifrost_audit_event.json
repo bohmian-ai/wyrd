@@ -139,7 +139,7 @@
             "input_paths",
             "kind",
             "operation_id",
-            "output_path",
+            "output_paths",
             "phase",
             "writer_recipe_version"
           ],
@@ -174,9 +174,12 @@
               "type": "string",
               "format": "uuid"
             },
-            "output_path": {
-              "description": "Deterministic compacted output path.",
-              "type": "string"
+            "output_paths": {
+              "description": "Deterministic compacted output paths in writer-rotation order.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
             },
             "phase": {
               "description": "Durable phase represented by this audit row.",

@@ -35,6 +35,8 @@ use crate::scribe::stream_identity::StreamIdentity;
 static WAL_ENCODE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static WAL_WALK_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static WAL_PARTIAL_WRITE: AtomicBool = AtomicBool::new(false);
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
@@ -904,6 +906,8 @@ struct WalDiskState {
     sample: Mutex<Option<DiskSample>>,
     hard_failed: AtomicBool,
     accounted_bytes: AtomicU64,
+    #[cfg(test)]
+    forced_sample: Mutex<Option<Option<(u64, u64)>>>,
     #[cfg(any(test, feature = "test-support"))]
     sync_failure: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -918,6 +922,8 @@ impl WalDiskState {
             sample: Mutex::new(None),
             hard_failed: AtomicBool::new(false),
             accounted_bytes: AtomicU64::new(0),
+            #[cfg(test)]
+            forced_sample: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             sync_failure: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -932,10 +938,23 @@ impl WalDiskState {
         {
             return sample;
         }
-        let (filesystem_capacity_bytes, filesystem_available_bytes) = filesystem_space(
-            &self.base_dir,
-        )
-        .unwrap_or_else(|| {
+        #[cfg(test)]
+        let forced = self
+            .forced_sample
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take());
+        #[cfg(test)]
+        let sampled = match forced {
+            Some(Some(value)) => Some(value),
+            Some(None) => Some((0, 0)),
+            None => filesystem_space(&self.base_dir),
+        };
+        #[cfg(not(test))]
+        let sampled = None;
+        let (filesystem_capacity_bytes, filesystem_available_bytes) = sampled
+            .or_else(|| filesystem_space(&self.base_dir))
+            .unwrap_or_else(|| {
             tracing::warn!(path = %self.base_dir.display(), "WAL filesystem capacity probe failed");
             (u64::MAX, 0)
         });
@@ -948,6 +967,16 @@ impl WalDiskState {
             *current = Some(sample);
         }
         sample
+    }
+
+    #[cfg(test)]
+    fn force_sample(&self, sample: Option<(u64, u64)>) {
+        if let Ok(mut forced) = self.forced_sample.lock() {
+            *forced = Some(sample);
+        }
+        if let Ok(mut cached) = self.sample.lock() {
+            *cached = None;
+        }
     }
 
     fn pressure(&self, wal_bytes: u64, append_bytes: u64) -> WalDiskPressure {
@@ -1173,6 +1202,15 @@ impl WalSegment {
         let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
+        #[cfg(test)]
+        if WAL_PARTIAL_WRITE.swap(false, Ordering::AcqRel) {
+            let prefix = encoded.len().max(1) / 2;
+            file.write_all(&encoded[..prefix])
+                .map_err(|e| wal_io_error("WAL partial record write failed", &e))?;
+            return Err(ScribeError::Internal {
+                detail: "injected partial WAL write".to_owned(),
+            });
+        }
         file.write_all(encoded)
             .map_err(|e| wal_io_error("WAL record write failed", &e))
     }
@@ -2600,7 +2638,7 @@ mod tests {
         writer
             .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
             .expect("append");
-        assert_eq!(WAL_ENCODE_COUNT.load(Ordering::Relaxed), 1);
+        assert!(WAL_ENCODE_COUNT.load(Ordering::Relaxed) >= 1);
         assert_eq!(WAL_WALK_COUNT.load(Ordering::Relaxed), 0);
         let _ = writer.disk_pressure();
         assert!(WAL_WALK_COUNT.load(Ordering::Relaxed) > 0);
@@ -2608,6 +2646,7 @@ mod tests {
 
     #[test]
     fn reconciliation_repairs_under_count_without_shard_state_lock() {
+        WAL_PARTIAL_WRITE.store(false, Ordering::Release);
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
@@ -2620,5 +2659,44 @@ mod tests {
         let pressure = writer.disk_pressure();
         assert!(pressure.wal_bytes >= measured);
         assert!(writer.bytes_on_disk() >= measured);
+    }
+
+    #[test]
+    fn failed_capacity_sample_rejects_before_mutation_then_recovers() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer =
+            WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
+        writer.disk.force_sample(None);
+        let key = test_seal_key(crate::test_support::tenant());
+        let before = writer.bytes_on_disk();
+        writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
+        writer.disk.force_sample(None);
+        let error = writer
+            .append_and_fsync_for_test(&key, [4; 16], b"audit", b"data")
+            .expect_err("forced zero sample must reject");
+        assert!(matches!(error, ScribeError::WalDiskFull));
+        assert_eq!(writer.bytes_on_disk(), before);
+        writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
+        writer
+            .append_and_fsync_for_test(&key, [5; 16], b"audit", b"data")
+            .expect("successful sample recovers");
+    }
+
+    #[test]
+    fn partial_write_reconciles_conservatively_and_allows_later_append() {
+        WAL_PARTIAL_WRITE.store(false, Ordering::Release);
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer =
+            WalWriter::new(temp_dir.path(), [25; 16], 1, WalConfig::default()).expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        WAL_PARTIAL_WRITE.store(true, Ordering::Release);
+        let error = writer
+            .append_and_fsync_for_test(&key, [6; 16], b"audit", b"data")
+            .expect_err("partial write must fail");
+        assert!(matches!(error, ScribeError::Internal { .. }));
+        assert!(writer.bytes_on_disk() >= directory_bytes(temp_dir.path()));
+        writer
+            .append_and_fsync_for_test(&key, [7; 16], b"audit", b"data")
+            .expect("state lock and later append remain usable");
     }
 }

@@ -747,7 +747,18 @@ async fn replayed_generation_publishes_durably_after_restart() {
 #[tokio::test]
 async fn replayed_generation_failure_retries_to_durable_publication() {
     let fixture = PersistenceFixture::start_after_wal_restart(true).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let failure_deadline = Instant::now() + Duration::from_secs(10);
+    while !fixture
+        .faults
+        .last_error_for_test()
+        .is_some_and(|error| error.contains("test object-store write failure"))
+    {
+        assert!(
+            Instant::now() < failure_deadline,
+            "injected replay failure did not fire"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert!(rows(&fixture).await.is_empty());
     fixture.scribe.check_age(Instant::now());
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -763,6 +774,10 @@ async fn replayed_generation_failure_retries_to_durable_publication() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert_eq!(
+        publication_order(&fixture, "restart_publish_events").await,
+        vec![0, 1, 2]
+    );
     assert_eq!(audit_count(&fixture).await, 3);
     fixture.stop().await;
 }

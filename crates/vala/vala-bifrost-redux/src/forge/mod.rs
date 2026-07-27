@@ -14,7 +14,7 @@ pub(crate) mod orphan_gc;
 pub(crate) mod rewrite;
 mod scheduler;
 
-pub use compact::{ForgeConfig, ForgeCore, ForgeObjectStore, ForgeTickOutcome};
+pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
 pub use rewrite::ForgeRewriteRuntime;
 pub use scheduler::{Forge, ForgeBuildConfig};

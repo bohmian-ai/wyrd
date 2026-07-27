@@ -46,8 +46,12 @@ use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_bins};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::rewrite::{ForgeRewritePipeline, ForgeRewriteRuntime};
 
 const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
+const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_OUTPUT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -85,14 +89,14 @@ pub struct ForgeConfig {
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
     pub max_gc_candidates_per_batch: usize,
+    /// Maximum concurrent staged-object reads during rewrite.
+    pub max_concurrent_reads: usize,
+    /// DataFusion spill ceiling for Forge rewrites.
+    pub spill_limit_bytes: u64,
+    /// Maximum encoded bytes per rewritten output file.
+    pub output_file_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
-    /// Maximum concurrent object reads during rewrite.
-    pub max_concurrent_reads: usize,
-    /// Maximum bytes DataFusion may spill for one operation.
-    pub spill_limit_bytes: u64,
-    /// Maximum encoded bytes written to one output file.
-    pub output_file_bytes: u64,
 }
 
 impl Default for ForgeConfig {
@@ -115,10 +119,10 @@ impl Default for ForgeConfig {
             retain_last: 1,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
+            max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
+            spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
+            output_file_bytes: DEFAULT_OUTPUT_FILE_BYTES,
             max_hints_per_wake: 256,
-            max_concurrent_reads: 4,
-            spill_limit_bytes: 4 * 1024 * 1024 * 1024,
-            output_file_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -143,6 +147,9 @@ impl ForgeConfig {
             || self.retain_last == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
+            || self.max_concurrent_reads == 0
+            || self.spill_limit_bytes == 0
+            || self.output_file_bytes == 0
             || self.max_hints_per_wake == 0
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
@@ -221,21 +228,22 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
     }
 }
 
-#[derive(Clone)]
-pub struct ForgeCore {
+pub(crate) struct ForgeCore {
     /// Vala-owned application SQL handle used to open tenant transactions.
-    pub vala: vala_sql::ValaPostgres,
+    pub(crate) vala: vala_sql::ValaPostgres,
     /// Operator pool used for cross-tenant lease and candidate discovery work.
-    pub operator_pool: vala_sql::OperatorPool,
+    pub(crate) operator_pool: vala_sql::OperatorPool,
     /// Iceberg catalog used to load tables and commit maintenance actions.
-    pub catalog: Arc<dyn Catalog>,
+    pub(crate) catalog: Arc<dyn Catalog>,
     /// Raw staging operator retained for producer fixtures and callers.
-    pub staging: Arc<Operator>,
+    pub(crate) staging: Arc<Operator>,
     /// Forge's read/list/stat/delete seam, backed by `staging` by default.
-    pub object_store: Arc<dyn ForgeObjectStore>,
-    pub config: ForgeConfig,
+    pub(crate) object_store: Arc<dyn ForgeObjectStore>,
+    pub(crate) config: ForgeConfig,
+    /// Shared bounded rewrite runtime owned by Forge.
+    pub(crate) rewrite: ForgeRewritePipeline,
     /// Optional process-global parent governor installed by production boot.
-    pub memory_governor: Option<BifrostMemoryGovernor>,
+    pub(crate) memory_governor: Option<BifrostMemoryGovernor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -258,17 +266,26 @@ impl ForgeCore {
         catalog: Arc<dyn Catalog>,
         staging: Arc<Operator>,
         config: ForgeConfig,
+        rewrite_runtime: ForgeRewriteRuntime,
     ) -> Result<Self, ForgeError> {
         config.validate()?;
+        let object_store: Arc<dyn ForgeObjectStore> = Arc::new(OpenDalForgeObjectStore {
+            operator: Arc::clone(&staging),
+        });
         Ok(Self {
             vala,
             operator_pool,
             catalog,
-            object_store: Arc::new(OpenDalForgeObjectStore {
-                operator: Arc::clone(&staging),
-            }),
-            staging,
-            config,
+            object_store: Arc::clone(&object_store),
+            staging: Arc::clone(&staging),
+            config: config.clone(),
+            rewrite: ForgeRewritePipeline::new(
+                rewrite_runtime,
+                Arc::clone(&staging),
+                Arc::clone(&object_store),
+                config.max_concurrent_reads,
+                config.output_file_bytes,
+            )?,
             memory_governor: None,
         })
     }

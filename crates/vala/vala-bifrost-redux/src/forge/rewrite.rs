@@ -7,6 +7,42 @@ use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 
 use super::error::ForgeError;
+use super::compact::ForgeObjectStore;
+
+/// Owned rewrite dependencies shared by every Forge compaction operation.
+pub(crate) struct ForgeRewritePipeline {
+    /// Process-wide DataFusion runtime and spill ceiling.
+    pub(crate) runtime: ForgeRewriteRuntime,
+    /// Staging operator used for bounded input reads.
+    pub(crate) staging: Arc<opendal::Operator>,
+    /// Testable object-store seam for staged data.
+    pub(crate) object_store: Arc<dyn ForgeObjectStore>,
+    /// Maximum concurrent readers.
+    pub(crate) max_concurrent_reads: usize,
+    /// Maximum encoded bytes per output object.
+    pub(crate) output_file_bytes: u64,
+}
+
+impl std::fmt::Debug for ForgeRewritePipeline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ForgeRewritePipeline").finish_non_exhaustive()
+    }
+}
+
+impl ForgeRewritePipeline {
+    pub(crate) fn new(
+        runtime: ForgeRewriteRuntime,
+        staging: Arc<opendal::Operator>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        max_concurrent_reads: usize,
+        output_file_bytes: u64,
+    ) -> Result<Self, ForgeError> {
+        if max_concurrent_reads == 0 || output_file_bytes == 0 {
+            return Err(ForgeError::InvalidConfig { detail: "rewrite limits must be positive".to_owned() });
+        }
+        Ok(Self { runtime, staging, object_store, max_concurrent_reads, output_file_bytes })
+    }
+}
 
 /// DataFusion runtime with an owned, bounded spill directory.
 pub struct ForgeRewriteRuntime {

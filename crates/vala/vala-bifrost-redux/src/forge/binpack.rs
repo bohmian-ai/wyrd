@@ -146,54 +146,6 @@ pub(crate) fn plan_incremental_bins(
     }
 }
 
-/// Pack candidate files into deterministic bins without exceeding either limit.
-///
-/// Files larger than `target_bytes` are skipped. A partial bin is emitted only
-/// when it contains at least two files, so the operation always reduces the
-/// number of staged objects it needs to manage.
-pub fn stable_pack(
-    mut files: Vec<CandidateFile>,
-    target_bytes: u64,
-    max_files: usize,
-) -> Vec<RewriteBin> {
-    files.sort_by_key(|file| (file.min_event_time, file.max_event_time, file.id));
-    if max_files == 0 || target_bytes == 0 {
-        return Vec::new();
-    }
-
-    let mut bins = Vec::new();
-    let mut current = Vec::new();
-    let mut current_bytes = 0_u64;
-    for file in files {
-        if file.size > target_bytes {
-            continue;
-        }
-        let would_exceed = !current.is_empty()
-            && (current.len() >= max_files
-                || current_bytes.saturating_add(file.size) > target_bytes);
-        if would_exceed {
-            if current.len() >= 2 {
-                bins.push(RewriteBin {
-                    files: std::mem::take(&mut current),
-                    total_bytes: current_bytes,
-                });
-            } else {
-                current.clear();
-            }
-            current_bytes = 0;
-        }
-        current_bytes = current_bytes.saturating_add(file.size);
-        current.push(file);
-    }
-    if current.len() >= 2 {
-        bins.push(RewriteBin {
-            files: current,
-            total_bytes: current_bytes,
-        });
-    }
-    bins
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +201,7 @@ mod tests {
     #[test]
     fn binpack_is_stable_and_never_exceeds_target() {
         let files = vec![file(3, 4, 2, 3), file(1, 4, 0, 1), file(2, 4, 1, 2)];
-        let bins = stable_pack(files, 8, 10);
+        let bins = plan_incremental_bins(files, 8, 10, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),
@@ -261,7 +213,7 @@ mod tests {
     #[test]
     fn binpack_skips_singletons_and_preserves_interval_order() {
         let files = vec![file(1, 9, 0, 1), file(2, 4, 2, 3), file(3, 4, 4, 5)];
-        let bins = stable_pack(files, 8, 2);
+        let bins = plan_incremental_bins(files, 8, 2, NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()).rewrite_bins;
         assert_eq!(bins.len(), 1);
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),

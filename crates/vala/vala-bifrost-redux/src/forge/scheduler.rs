@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::collections::HashSet;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,7 @@ use super::orphan_gc::{build_live_set, run_orphan_gc_for_table};
 use super::rewrite::ForgeRewriteRuntime;
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileInbox;
+use super::binpack::ForgeGroupKey;
 
 /// Construction-time dependency graph for one Forge handle.
 pub struct ForgeBuildConfig {
@@ -70,6 +72,7 @@ impl Forge {
             config.catalog,
             config.staging,
             config.config,
+            config.rewrite_runtime,
         )?
         .with_object_store(config.object_store);
         Ok(Self {
@@ -97,6 +100,15 @@ impl Forge {
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
+                first = async {
+                    let mut hints = self.hints.lock().await;
+                    hints.recv().await
+                } => {
+                    if let Some(first) = first {
+                        let outcome = self.run_hinted_batch(first, &shutdown).await?;
+                        tracing::debug!(groups_seen = outcome.groups_seen, bins_committed = outcome.bins_committed, "Forge hinted maintenance completed");
+                    }
+                },
                 _ = ticker.tick() => {
                     match self.run_tick(&shutdown).await {
                         Ok(outcome) => tracing::debug!(
@@ -131,6 +143,49 @@ impl Forge {
     async fn run_tick(&self, stop: &CancellationToken) -> Result<ForgeTickOutcome, ForgeError> {
         let _tick = self.tick.lock().await;
         run_maintenance_tick_with_stop(&self.context, stop).await
+    }
+
+    /// Drain one bounded hint batch and run deterministic keyed maintenance.
+    async fn run_hinted_batch(&self, first: crate::maintenance::StagingFileCommitted, stop: &CancellationToken) -> Result<ForgeTickOutcome, ForgeError> {
+        let _tick = self.tick.lock().await;
+        let keys = self.drain_hint_keys(first).await;
+        let mut outcome = ForgeTickOutcome::default();
+        for key in keys {
+            if stop.is_cancelled() { break; }
+            if let Err(error) = self.run_hinted_key(&key, stop, &mut outcome).await {
+                outcome.tables_failed += 1;
+                tracing::error!(error = %error, tenant = %key.tenant, table = %key.table_ref.fqn(), "Forge hinted key failed; continuing");
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Convert and deduplicate hints without holding the inbox during IO.
+    async fn drain_hint_keys(&self, first: crate::maintenance::StagingFileCommitted) -> Vec<ForgeGroupKey> {
+        let mut events = vec![first];
+        let mut hints = self.hints.lock().await;
+        for _ in 1..self.context.config.max_hints_per_wake {
+            match hints.try_recv() {
+                Ok(event) => events.push(event),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty | tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        drop(hints);
+        let mut keys = HashSet::new();
+        for event in events {
+            let (binding, day) = event.into_parts();
+            keys.insert(ForgeGroupKey { tenant: binding.tenant, table_ref: binding.table_ref, partition_day: day });
+        }
+        let mut keys: Vec<_> = keys.into_iter().collect();
+        keys.sort_by_key(|key| (key.tenant.to_string(), key.table_ref.namespace.as_str().to_owned(), key.table_ref.name.clone(), key.partition_day));
+        keys
+    }
+
+    /// Run the existing fenced table boundary for one exact hinted key.
+    async fn run_hinted_key(&self, key: &ForgeGroupKey, stop: &CancellationToken, outcome: &mut ForgeTickOutcome) -> Result<(), ForgeError> {
+        let table_key = ForgeTableKey { tenant: key.tenant, table_ref: key.table_ref.clone() };
+        process_table(&self.context, &table_key, Uuid::now_v7(), stop, outcome).await;
+        Ok(())
     }
 }
 

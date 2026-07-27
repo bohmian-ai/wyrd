@@ -31,6 +31,11 @@ use crate::contracts::ScribeError;
 use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::StreamIdentity;
 
+#[cfg(test)]
+static WAL_ENCODE_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static WAL_WALK_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
 /// LSNs are never comparable across different pods or different epochs of the
@@ -304,6 +309,8 @@ impl PreparedWalAppend {
     }
 
     fn record(&self) -> Result<WalRecord, ScribeError> {
+        #[cfg(test)]
+        WAL_ENCODE_COUNT.fetch_add(1, Ordering::Relaxed);
         let seal_key = self
             .seal_key
             .as_ref()
@@ -1038,6 +1045,8 @@ fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
 }
 
 fn directory_bytes(path: &Path) -> u64 {
+    #[cfg(test)]
+    WAL_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
@@ -2572,5 +2581,44 @@ mod tests {
             .retire_segments(std::slice::from_ref(&segment))
             .expect("retire");
         assert_eq!(writer.bytes_on_disk(), directory_bytes(temp_dir.path()));
+    }
+
+    #[test]
+    fn append_encodes_once_and_does_not_walk_unrelated_wal_files() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer =
+            WalWriter::new(temp_dir.path(), [22; 16], 1, WalConfig::default()).expect("writer");
+        let unrelated_dir = temp_dir.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated_dir).expect("fixture dir");
+        for index in 0..32 {
+            let path = unrelated_dir.join(format!("unrelated-{index}.wal"));
+            std::fs::write(path, [0_u8; 8]).expect("fixture");
+        }
+        let key = test_seal_key(crate::test_support::tenant());
+        WAL_ENCODE_COUNT.store(0, Ordering::Relaxed);
+        WAL_WALK_COUNT.store(0, Ordering::Relaxed);
+        writer
+            .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
+            .expect("append");
+        assert_eq!(WAL_ENCODE_COUNT.load(Ordering::Relaxed), 1);
+        assert_eq!(WAL_WALK_COUNT.load(Ordering::Relaxed), 0);
+        let _ = writer.disk_pressure();
+        assert!(WAL_WALK_COUNT.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn reconciliation_repairs_under_count_without_shard_state_lock() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let writer =
+            WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
+        let key = test_seal_key(crate::test_support::tenant());
+        writer
+            .append_and_fsync_for_test(&key, [3; 16], b"audit", b"data")
+            .expect("append");
+        let measured = directory_bytes(temp_dir.path());
+        writer.disk.accounted_bytes.store(0, Ordering::Release);
+        let pressure = writer.disk_pressure();
+        assert!(pressure.wal_bytes >= measured);
+        assert!(writer.bytes_on_disk() >= measured);
     }
 }

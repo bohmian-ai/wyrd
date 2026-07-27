@@ -816,7 +816,9 @@ async fn handle_shard_command(
             );
         }
         ShardCommand::Replay { state, response } => {
-            let result = replay_state_at_owner(dependencies, *state, pending_generations).await;
+            let result =
+                replay_state_at_owner(dependencies, *state, pending_generations, wal_segments)
+                    .await;
             let _ = response.send(result);
         }
         ShardCommand::FreezeKey { seal_key, response } => {
@@ -877,6 +879,7 @@ async fn replay_state_at_owner(
     dependencies: &ShardDependencies,
     replayed_state: crate::scribe::replay::ReplayedSealKey,
     pending_generations: &mut PendingGenerationsByKey,
+    wal_segments: &WalSegmentsByKey,
 ) -> Result<(), ScribeError> {
     let seal_key = replayed_state.seal_key.clone();
     let segment_refs = replayed_state.wal_segments.clone();
@@ -930,21 +933,16 @@ async fn replay_state_at_owner(
         .push_back(PendingGeneration {
             generation: Arc::clone(&generation),
             binding: binding.clone(),
-            submitted: true,
+            submitted: false,
         });
     dependencies.wal_handle.retain_segments(&segment_refs)?;
-    if let Err(error) = persistence
-        .submit(PersistenceJob {
-            generation,
-            binding,
-            completion_tx: dependencies.completion_tx.clone(),
-            completion_waiter: None,
-        })
-        .await
-    {
-        mark_front_retryable(pending_generations, &seal_key);
-        return Err(error);
-    }
+    submit_front_at_owner(
+        dependencies,
+        &seal_key,
+        persistence,
+        pending_generations,
+        wal_segments,
+    );
     Ok(())
 }
 

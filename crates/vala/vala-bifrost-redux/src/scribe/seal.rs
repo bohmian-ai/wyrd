@@ -160,7 +160,9 @@ impl SealDriver {
         // 3. PutObject
         info!("seal stage: PutObject");
         let put_started = std::time::Instant::now();
-        let parquet_path = self.put_object(binding, &encoded, node_id).await?;
+        let parquet_path = self
+            .put_object(binding, seal_key, &encoded, node_id)
+            .await?;
         Self::record(
             "object_store_put",
             put_started.elapsed(),
@@ -258,6 +260,7 @@ impl SealDriver {
     async fn put_object(
         &self,
         binding: &TenantTableBinding,
+        seal_key: &SealKey,
         encoded: &ParquetEncoded,
         node_id: &str,
     ) -> Result<String, ScribeError> {
@@ -270,7 +273,10 @@ impl SealDriver {
             }
         })?;
         let filename = seal_filename(&pod_id);
-        let path = format!("{}/{}", binding.object_prefix, filename);
+        let path = format!(
+            "{}/day={}/{}",
+            binding.object_prefix, seal_key.day, filename
+        );
 
         // Retry policy: base 100 ms, cap 5 s, 5 attempts max, jitter enabled
         let mut attempt = 0;

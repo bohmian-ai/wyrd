@@ -402,3 +402,34 @@ async fn file_list_and_audit_commit_atomically() {
     assert_eq!(audit_count(&fixture).await, 1);
     fixture.stop().await;
 }
+
+#[tokio::test]
+async fn three_generations_same_key_remain_fifo_and_file_paths_are_object_keys() {
+    let fixture = PersistenceFixture::start().await;
+    fixture
+        .faults
+        .set_object_write_delay_for_test(Duration::from_millis(50));
+    for value in 1..=3 {
+        append_one(&fixture, "three_generation_events", value).await;
+        fixture
+            .scribe
+            .flush_writable_for_test()
+            .await
+            .expect("generation flush");
+    }
+
+    wait_for_state(&fixture, 0).await;
+    let persisted = rows(&fixture).await;
+    let objects = object_paths(&fixture).await;
+    assert_eq!(persisted.len(), 3);
+    assert_eq!(objects.len(), 3);
+    assert!(persisted.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    for (_, _, path) in persisted {
+        assert_eq!(path.matches("day=").count(), 1);
+        assert!(
+            objects.contains(&path),
+            "file_list path must be an object key"
+        );
+    }
+    fixture.stop().await;
+}

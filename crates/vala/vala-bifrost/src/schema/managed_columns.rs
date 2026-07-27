@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
 };
 
 /// Extend the user fields with the physical Bifrost columns for a dynamically-created
@@ -21,6 +21,7 @@ pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
     user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+    user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
     user_fields.push(Field::new(
         WYRD_EVENT_TIME,
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
@@ -38,4 +39,33 @@ pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     ));
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
     user_fields
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_column_order_matches_redux_contract() {
+        let fields = with_managed_columns(vec![Field::new("value", DataType::UInt64, false)]);
+        let names = fields
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "value",
+                RUN_ID,
+                CARD_UID,
+                PRINCIPAL_ID,
+                WYRD_REQUEST_ID,
+                WYRD_EVENT_TIME,
+                WYRD_INGESTED_AT,
+                WYRD_BATCH_ID,
+                DATA_TENANT_ID,
+            ]
+        );
+        assert!(!fields[4].is_nullable());
+    }
 }

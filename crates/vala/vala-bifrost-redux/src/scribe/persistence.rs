@@ -412,46 +412,6 @@ impl PersistenceRuntime {
         }
     }
 
-    /// Enqueue a job while honoring the bounded persistence queue.
-    ///
-    /// Boot replay uses this path because replay must pause behind downstream
-    /// publication instead of accumulating an unbounded in-memory generation
-    /// list. Normal shard flushes remain non-blocking and use [`Self::try_submit`].
-    pub(crate) async fn submit(&self, job: PersistenceJob) -> Result<(), ScribeError> {
-        let sender = match self.sender.lock() {
-            Ok(sender) => sender.clone(),
-            Err(_) => {
-                return Err(ScribeError::Internal {
-                    detail: "persistence queue lock poisoned".to_owned(),
-                });
-            }
-        };
-        let Some(sender) = sender else {
-            return Err(ScribeError::IngressClosed);
-        };
-        let queued_bytes = job.generation.arrow_bytes;
-        self.queued.fetch_add(1, Ordering::AcqRel);
-        self.queued_bytes.fetch_add(queued_bytes, Ordering::AcqRel);
-        if sender.send(Box::new(job)).await.is_err() {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
-            self.queued_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
-            return Err(ScribeError::IngressClosed);
-        }
-        metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
-            self.queued
-                .load(Ordering::Acquire)
-                .to_f64()
-                .unwrap_or(f64::MAX),
-        );
-        metrics::gauge!("bifrost_scribe_persistence_queue_bytes").set(
-            self.queued_bytes
-                .load(Ordering::Acquire)
-                .to_f64()
-                .unwrap_or(f64::MAX),
-        );
-        Ok(())
-    }
-
     /// Stop accepting jobs and wait for queued jobs to finish.
     pub(crate) async fn close_and_drain(&self) {
         if let Ok(mut sender) = self.sender.lock() {
@@ -589,7 +549,7 @@ async fn persist_once(
             });
         }
     };
-    let path = object_path(binding, &dependencies.node_id)?;
+    let path = object_path(binding, &generation.seal_key, &dependencies.node_id)?;
     #[cfg(any(test, feature = "test-support"))]
     let _object_write_guard = dependencies.faults.begin_object_write().await;
     #[cfg(any(test, feature = "test-support"))]
@@ -654,7 +614,11 @@ async fn persist_once(
     Ok(outcome.commit_key)
 }
 
-fn object_path(binding: &TenantTableBinding, node_id: &str) -> Result<String, ScribeError> {
+fn object_path(
+    binding: &TenantTableBinding,
+    seal_key: &SealKey,
+    node_id: &str,
+) -> Result<String, ScribeError> {
     let node_uuid = Uuid::parse_str(node_id).map_err(|error| ScribeError::Internal {
         detail: format!("node_id is not a valid UUID: {error}"),
     })?;
@@ -665,8 +629,9 @@ fn object_path(binding: &TenantTableBinding, node_id: &str) -> Result<String, Sc
             }
         })?;
     Ok(format!(
-        "{}/{}",
+        "{}/day={}/{}",
         binding.object_prefix,
+        seal_key.day,
         crate::scribe::filename::seal_filename(&pod_id)
     ))
 }

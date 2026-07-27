@@ -5,9 +5,9 @@
 from collections.abc import Mapping
 from typing import Protocol, TypeAlias
 
-from .data import DataCard, DataInterface
-from .model import ModelCard, ModelInterface
-from .prompt import Prompt, PromptCard, PromptReference
+from ..data import DataCard, DataInterface
+from ..model import ModelCard, ModelInterface
+from ..prompt import Prompt, PromptCard, PromptReference
 
 #### end of imports ####
 

@@ -110,6 +110,55 @@ pub enum IngestError {
 }
 
 impl IngestError {
+    /// Project this transport-neutral failure onto the derive-backed catalog.
+    #[must_use]
+    pub fn to_bifrost_error(&self) -> wyrd_spec::vala::error::BifrostError {
+        use wyrd_spec::vala::error::BifrostError;
+
+        match self {
+            Self::Unauthenticated(message) => BifrostError::IngestAuthentication {
+                message: message.clone(),
+            },
+            Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved,
+            Self::RequestValidation(message) | Self::Decode(message) => {
+                BifrostError::IngestProtocol {
+                    message: message.clone(),
+                }
+            }
+            Self::ReservedBuiltinWriteDenied { table } => {
+                BifrostError::ReservedBuiltinWriteDenied {
+                    table: table.clone(),
+                }
+            }
+            Self::CardScopeDenied { card_ref } => BifrostError::CardScopeDenied {
+                card_ref: card_ref.clone(),
+            },
+            Self::CardUnresolved { card_ref } => BifrostError::CardUnresolved {
+                card_ref: card_ref.clone(),
+            },
+            Self::RbacDenied { detail } | Self::Internal(detail) => BifrostError::Internal {
+                detail: detail.clone(),
+            },
+            Self::TableNotFound { table } => BifrostError::TableNotFound {
+                table: table.clone(),
+            },
+            Self::SchemaMismatch { table } => BifrostError::FingerprintMismatch {
+                table: table.clone(),
+            },
+            Self::PayloadTooLarge { bytes, .. } => BifrostError::PayloadTooLarge {
+                bytes: usize::try_from(*bytes).unwrap_or(usize::MAX),
+            },
+            Self::TooManyRows { rows, limit } => BifrostError::IngestOversized {
+                rows: *rows,
+                limit: *limit,
+            },
+            Self::IngressClosed | Self::IngestBusy => BifrostError::WriterUnavailable {
+                table: "unknown".to_owned(),
+            },
+            Self::WalDiskFull => BifrostError::WalDiskFull,
+        }
+    }
+
     /// Map a queued Redux Scribe result onto the transport-neutral ingest
     /// taxonomy used by HTTP and gRPC adapters.
     pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
@@ -148,23 +197,9 @@ impl IngestError {
     #[must_use]
     pub fn wyrd_code(&self) -> &'static str {
         match self {
-            Self::Unauthenticated(_) => "WYRD_VALA_401_INGEST_AUTH",
-            Self::RequestValidation(_) | Self::Decode(_) => "WYRD_VALA_400_INGEST_PROTO",
-            Self::ReservedBuiltinWriteDenied { .. } => {
-                "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE"
-            }
-            Self::CardScopeDenied { .. } => "WYRD_VALA_403_BIFROST_CARD_SCOPE",
-            Self::CardUnresolved { .. } => "WYRD_VALA_403_CARD_UNRESOLVED",
-            Self::PrincipalUnresolved => "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
             Self::RbacDenied { .. } => "WYRD_PERMISSION_403_DENIED_RBAC",
-            Self::TableNotFound { .. } => "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
-            Self::SchemaMismatch { .. } => "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
-            Self::TooManyRows { .. } => "WYRD_VALA_413_INGEST_OVERSIZED",
-            Self::PayloadTooLarge { .. } => "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
-            Self::IngressClosed => "WYRD_VALA_409_INGEST_WRITER_CLOSED",
             Self::IngestBusy => "WYRD_VALA_429_INGEST_BUSY",
-            Self::WalDiskFull => "WYRD_VALA_507_INGEST_WAL_UNAVAILABLE",
-            Self::Internal(_) => "WYRD_VALA_500_INGEST_INTERNAL",
+            _ => self.to_bifrost_error().code(),
         }
     }
 
@@ -184,7 +219,7 @@ impl IngestError {
             | Self::PayloadTooLarge { .. }
             | Self::IngestBusy
             | Self::WalDiskFull => Code::ResourceExhausted,
-            Self::IngressClosed => Code::Aborted,
+            Self::IngressClosed => Code::Unavailable,
             Self::Internal(_) => Code::Internal,
         }
     }
@@ -226,5 +261,90 @@ impl IngestError {
 impl From<IngestError> for Status {
     fn from(error: IngestError) -> Self {
         error.into_status()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IngestError;
+
+    #[test]
+    fn every_ingest_error_has_the_expected_stable_identity() {
+        let cases = [
+            (
+                IngestError::Unauthenticated("bad token".to_owned()),
+                "WYRD_VALA_401_INGEST_AUTH",
+            ),
+            (
+                IngestError::RequestValidation("bad request".to_owned()),
+                "WYRD_VALA_400_INGEST_PROTO",
+            ),
+            (
+                IngestError::ReservedBuiltinWriteDenied {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+            ),
+            (
+                IngestError::CardScopeDenied {
+                    card_ref: "c".to_owned(),
+                },
+                "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+            ),
+            (
+                IngestError::CardUnresolved {
+                    card_ref: "c".to_owned(),
+                },
+                "WYRD_VALA_403_CARD_UNRESOLVED",
+            ),
+            (
+                IngestError::PrincipalUnresolved,
+                "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+            ),
+            (
+                IngestError::RbacDenied {
+                    detail: "denied".to_owned(),
+                },
+                "WYRD_PERMISSION_403_DENIED_RBAC",
+            ),
+            (
+                IngestError::TableNotFound {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+            ),
+            (
+                IngestError::SchemaMismatch {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+            ),
+            (
+                IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
+                "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+            ),
+            (
+                IngestError::TooManyRows { rows: 2, limit: 1 },
+                "WYRD_VALA_413_INGEST_OVERSIZED",
+            ),
+            (
+                IngestError::IngressClosed,
+                "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
+            ),
+            (IngestError::IngestBusy, "WYRD_VALA_429_INGEST_BUSY"),
+            (IngestError::WalDiskFull, "WYRD_VALA_507_WAL_DISK_FULL"),
+            (
+                IngestError::Decode("bad".to_owned()),
+                "WYRD_VALA_400_INGEST_PROTO",
+            ),
+            (
+                IngestError::Internal("broken".to_owned()),
+                "WYRD_VALA_500_BIFROST_INTERNAL",
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.wyrd_code(), expected, "identity drift for {error}");
+        }
     }
 }

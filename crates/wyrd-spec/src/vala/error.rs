@@ -19,6 +19,32 @@ use crate::error::derive::WyrdError;
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
 pub enum BifrostError {
+    /// The ingest authentication credentials were missing or rejected.
+    #[error("ingest authentication failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_INGEST_AUTH",
+        status = 401,
+        title = "Ingest authentication failed",
+        remediation = "Provide a valid Wyrd access token with permission to write the target ingest surface."
+    )]
+    IngestAuthentication {
+        /// Human-readable authentication failure detail.
+        message: String,
+    },
+
+    /// The ingest request violated the native protocol contract.
+    #[error("ingest request validation failed: {message}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_400_INGEST_PROTO",
+        status = 400,
+        title = "Invalid ingest request",
+        remediation = "Fix the ingest request fields and retry with a valid Wyrd ingest payload."
+    )]
+    IngestProtocol {
+        /// Human-readable protocol validation detail.
+        message: String,
+    },
+
     /// A user-supplied schema field uses a reserved system column name.
     #[error("reserved system column: {column}")]
     #[wyrd_error(
@@ -81,6 +107,29 @@ pub enum BifrostError {
         /// Canonical string form of the card reference that was refused.
         card_ref: String,
     },
+
+    /// A card reference could not be resolved to a tenant-local card UID.
+    #[error("card_ref cannot be resolved: {card_ref}")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_CARD_UNRESOLVED",
+        status = 403,
+        title = "Card reference unresolved",
+        remediation = "Use a card_ref that resolves to a registered card in the current tenant."
+    )]
+    CardUnresolved {
+        /// Canonical card reference that could not be resolved.
+        card_ref: String,
+    },
+
+    /// The authenticated principal could not be stamped onto the ingest row.
+    #[error("principal_id cannot be stamped for authenticated write")]
+    #[wyrd_error(
+        code = "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+        status = 401,
+        title = "Ingest principal unresolved",
+        remediation = "Authenticate with a token containing a valid principal identity and retry."
+    )]
+    PrincipalUnresolved,
 
     /// The requested Bifrost table does not exist in the catalog.
     #[error("bifrost table not found: {table}")]
@@ -246,6 +295,21 @@ pub enum BifrostError {
     PayloadTooLarge {
         /// Server-measured canonical transport bytes.
         bytes: usize,
+    },
+
+    /// The ingest request exceeded the aggregate row bound.
+    #[error("ingest request has too many rows ({rows} > {limit})")]
+    #[wyrd_error(
+        code = "WYRD_VALA_413_INGEST_OVERSIZED",
+        status = 413,
+        title = "Ingest request oversized",
+        remediation = "Reduce the number of rows in the request and retry."
+    )]
+    IngestOversized {
+        /// Number of rows observed in the request.
+        rows: u64,
+        /// Maximum rows allowed by the ingest contract.
+        limit: u64,
     },
 
     /// An unexpected internal Bifrost failure occurred.

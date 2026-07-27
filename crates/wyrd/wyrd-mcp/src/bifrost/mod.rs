@@ -276,6 +276,12 @@ pub fn bifrost_error_catalog() -> Vec<BifrostErrorDescriptor> {
 /// The catalog test below keeps this list aligned with the `BifrostError` enum.
 fn bifrost_error_variants() -> Vec<BifrostError> {
     let variants = vec![
+        BifrostError::IngestAuthentication {
+            message: String::new(),
+        },
+        BifrostError::IngestProtocol {
+            message: String::new(),
+        },
         BifrostError::ReservedColumn {
             column: String::new(),
         },
@@ -289,6 +295,10 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::CardScopeDenied {
             card_ref: String::new(),
         },
+        BifrostError::CardUnresolved {
+            card_ref: String::new(),
+        },
+        BifrostError::PrincipalUnresolved,
         BifrostError::TableNotFound {
             table: String::new(),
         },
@@ -319,6 +329,7 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
         BifrostError::QueryTimeout,
         BifrostError::QueryResultTooLarge,
         BifrostError::PayloadTooLarge { bytes: 0 },
+        BifrostError::IngestOversized { rows: 0, limit: 0 },
         BifrostError::Internal {
             detail: String::new(),
         },

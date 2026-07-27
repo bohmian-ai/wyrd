@@ -19,7 +19,7 @@
 //! `Export*ServiceResponse`, including `partial_success` when spans were
 //! rejected.
 //!
-//! Backpressure: [`vala_bifrost_redux::gate::IngestError::IngestBusy`] maps to HTTP `503`
+//! Backpressure: [`vala_bifrost_redux::gate::IngestError::IngestBusy`] maps to HTTP `429`
 //! (retryable), never to `partial_success` — no rows from a busy request are
 //! written. The gRPC edge maps the same condition to gRPC
 //! `RESOURCE_EXHAUSTED` (also retryable, per the OTLP spec's backpressure
@@ -329,15 +329,15 @@ fn caller_auth_context(caller: &Caller) -> AuthContext {
 
 /// Map an [`IngestError`] onto its HTTP response for the given OTLP signal.
 ///
-/// Backpressure ([`IngestError::IngestBusy`]) becomes a retryable `503`, matching
-/// the OTLP/HTTP throttling contract (the gRPC edge maps the same condition to
-/// retryable `RESOURCE_EXHAUSTED` per [`IngestError::grpc_code`]). The `signal` parameter provides the per-endpoint
+/// Backpressure ([`IngestError::IngestBusy`]) becomes a retryable `429`, matching
+/// the stable ingest catalog (the gRPC edge maps the same condition to retryable
+/// `RESOURCE_EXHAUSTED`). The `signal` parameter provides the per-endpoint
 /// physical table name so error messages name the correct target table rather
 /// than always reporting the traces table. Every other ingest error renders its
 /// stable `WYRD_VALA_*` [`WyrdError`] problem+json.
 fn ingest_error_to_response(error: IngestError, signal: OtlpSignal) -> WyrdErrorResponse {
     if matches!(error, IngestError::IngestBusy) {
-        return WyrdErrorResponse::from(WyrdError::from(BifrostError::WriterUnavailable {
+        return WyrdErrorResponse::from(WyrdError::from(BifrostError::IngestBusy {
             table: signal.table().to_owned(),
         }));
     }
@@ -351,15 +351,12 @@ fn ingest_error_to_response(error: IngestError, signal: OtlpSignal) -> WyrdError
 /// provides the per-endpoint physical table name for writer-availability and
 /// decode errors so each OTLP endpoint reports its own table in error messages.
 fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
+    let fallback_table = signal.table().to_owned();
     match error {
-        IngestError::Unauthenticated(message) => WyrdError::Unauthenticated {
-            message,
-            details: serde_json::Value::Null,
-        },
-        IngestError::PrincipalUnresolved => WyrdError::Unauthenticated {
-            message: "principal_id cannot be stamped for authenticated write".to_owned(),
-            details: serde_json::Value::Null,
-        },
+        IngestError::Unauthenticated(message) => {
+            WyrdError::from(BifrostError::IngestAuthentication { message })
+        }
+        IngestError::PrincipalUnresolved => WyrdError::from(BifrostError::PrincipalUnresolved),
         IngestError::RbacDenied { detail } => WyrdError::PermissionDeniedRbac {
             message: detail,
             details: serde_json::Value::Null,
@@ -367,8 +364,11 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
         IngestError::ReservedBuiltinWriteDenied { table } => {
             WyrdError::from(BifrostError::ReservedBuiltinWriteDenied { table })
         }
-        IngestError::CardScopeDenied { card_ref } | IngestError::CardUnresolved { card_ref } => {
+        IngestError::CardScopeDenied { card_ref } => {
             WyrdError::from(BifrostError::CardScopeDenied { card_ref })
+        }
+        IngestError::CardUnresolved { card_ref } => {
+            WyrdError::from(BifrostError::CardUnresolved { card_ref })
         }
         IngestError::TableNotFound { table } => {
             WyrdError::from(BifrostError::TableNotFound { table })
@@ -381,26 +381,25 @@ fn ingest_error_to_wyrd(error: IngestError, signal: OtlpSignal) -> WyrdError {
                 bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
             })
         }
+        IngestError::TooManyRows { rows, limit } => {
+            WyrdError::from(BifrostError::IngestOversized { rows, limit })
+        }
         IngestError::IngressClosed => WyrdError::from(BifrostError::WriterUnavailable {
-            table: signal.table().to_owned(),
+            table: fallback_table,
         }),
+        IngestError::WalDiskFull => WyrdError::from(BifrostError::WalDiskFull),
         // A malformed OTLP request body (bad protobuf or invalid JSON) is a
         // permanent client-side error. Map to the dedicated OTLP-request-validation
         // code (HTTP 400) — NOT to QueryInvalidSql, which is reserved for SQL query
         // validation failures and would give the client a nonsense remediation.
         IngestError::RequestValidation(detail) | IngestError::Decode(detail) => {
-            WyrdError::from(BifrostError::OtlpRequestMalformed {
-                table: signal.table().to_owned(),
-                detail,
-            })
+            WyrdError::from(BifrostError::IngestProtocol { message: detail })
         }
         // Backpressure is handled by ingest_error_to_response before this point.
-        IngestError::IngestBusy => WyrdError::from(BifrostError::WriterUnavailable {
-            table: signal.table().to_owned(),
+        IngestError::IngestBusy => WyrdError::from(BifrostError::IngestBusy {
+            table: fallback_table,
         }),
-        other => WyrdError::from(BifrostError::Internal {
-            detail: other.to_string(),
-        }),
+        IngestError::Internal(detail) => WyrdError::from(BifrostError::Internal { detail }),
     }
 }
 
@@ -458,19 +457,16 @@ mod tests {
         );
     }
 
-    // Backpressure is a coordinator-local, cross-boundary-state-free condition
-    // (channel-full). Forcing genuine channel saturation end-to-end is flaky and
-    // materially harder than asserting the load-bearing mapping directly, so the
-    // OTLP/HTTP `IngestBusy → 503` contract is pinned here (mirroring the gRPC
-    // collector's unit test for `IngestBusy → UNAVAILABLE`).
+    // Backpressure is a coordinator-local condition. The stable catalog identity
+    // is preserved on HTTP as 429, matching the gRPC resource-exhausted class.
     #[test]
-    fn writer_busy_maps_to_503() {
+    fn writer_busy_maps_to_429() {
         let response = ingest_error_to_response(IngestError::IngestBusy, OtlpSignal::Traces);
         let status = axum::response::IntoResponse::into_response(response).status();
         assert_eq!(
             status,
-            StatusCode::SERVICE_UNAVAILABLE,
-            "OTLP/HTTP backpressure must be a retryable 503"
+            StatusCode::TOO_MANY_REQUESTS,
+            "OTLP/HTTP backpressure must preserve the catalog's 429"
         );
     }
 
@@ -494,6 +490,101 @@ mod tests {
                 }
                 other => panic!("expected WriterUnavailable, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn every_ingest_error_preserves_catalog_code_and_http_status() {
+        let cases = vec![
+            (
+                IngestError::Unauthenticated("x".to_owned()),
+                "WYRD_VALA_401_INGEST_AUTH",
+                401,
+            ),
+            (
+                IngestError::RequestValidation("x".to_owned()),
+                "WYRD_VALA_400_INGEST_PROTO",
+                400,
+            ),
+            (
+                IngestError::ReservedBuiltinWriteDenied {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+                403,
+            ),
+            (
+                IngestError::CardScopeDenied {
+                    card_ref: "c".to_owned(),
+                },
+                "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+                403,
+            ),
+            (
+                IngestError::CardUnresolved {
+                    card_ref: "c".to_owned(),
+                },
+                "WYRD_VALA_403_CARD_UNRESOLVED",
+                403,
+            ),
+            (
+                IngestError::PrincipalUnresolved,
+                "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+                401,
+            ),
+            (
+                IngestError::RbacDenied {
+                    detail: "x".to_owned(),
+                },
+                "WYRD_PERMISSION_403_DENIED_RBAC",
+                403,
+            ),
+            (
+                IngestError::TableNotFound {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+                404,
+            ),
+            (
+                IngestError::SchemaMismatch {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+                409,
+            ),
+            (
+                IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
+                "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+                413,
+            ),
+            (
+                IngestError::TooManyRows { rows: 2, limit: 1 },
+                "WYRD_VALA_413_INGEST_OVERSIZED",
+                413,
+            ),
+            (
+                IngestError::IngressClosed,
+                "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
+                503,
+            ),
+            (IngestError::IngestBusy, "WYRD_VALA_429_INGEST_BUSY", 429),
+            (IngestError::WalDiskFull, "WYRD_VALA_507_WAL_DISK_FULL", 507),
+            (
+                IngestError::Decode("x".to_owned()),
+                "WYRD_VALA_400_INGEST_PROTO",
+                400,
+            ),
+            (
+                IngestError::Internal("x".to_owned()),
+                "WYRD_VALA_500_BIFROST_INTERNAL",
+                500,
+            ),
+        ];
+        for (error, code, status) in cases {
+            let catalog = ingest_error_to_wyrd(error, OtlpSignal::Traces);
+            assert_eq!(catalog.code(), code);
+            assert_eq!(catalog.status(), status);
         }
     }
 
@@ -527,14 +618,11 @@ mod tests {
             let wyrd_err = ingest_error_to_wyrd(variant, OtlpSignal::Traces);
             match &wyrd_err {
                 wyrd_spec::error::WyrdError::Vala {
-                    error: BifrostError::OtlpRequestMalformed { table, .. },
+                    error: BifrostError::IngestProtocol { .. },
                 } => {
-                    assert_eq!(
-                        table, "vala.traces.spans",
-                        "{label}: must name the traces table"
-                    );
+                    let _ = label;
                 }
-                other => panic!("{label}: expected OtlpRequestMalformed, got {other:?}"),
+                other => panic!("{label}: expected IngestProtocol, got {other:?}"),
             }
             // Confirm HTTP 400 via the WyrdError status accessor.
             assert_eq!(
@@ -548,11 +636,7 @@ mod tests {
                 "WYRD_VALA_400_QUERY_INVALID_SQL",
                 "{label}: must not return the SQL error code for an OTLP decode failure"
             );
-            assert_eq!(
-                wyrd_err.code(),
-                "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
-                "{label}: must return the OTLP-specific 400 code"
-            );
+            assert_eq!(wyrd_err.code(), "WYRD_VALA_400_INGEST_PROTO");
         }
     }
 
@@ -564,11 +648,9 @@ mod tests {
         );
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
-                error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => {
-                assert_eq!(table, "vala.metrics.points");
-            }
-            other => panic!("expected OtlpRequestMalformed, got {other:?}"),
+                error: BifrostError::IngestProtocol { .. },
+            } => {}
+            other => panic!("expected IngestProtocol, got {other:?}"),
         }
     }
 
@@ -580,11 +662,9 @@ mod tests {
         );
         match wyrd_err {
             wyrd_spec::error::WyrdError::Vala {
-                error: BifrostError::OtlpRequestMalformed { table, .. },
-            } => {
-                assert_eq!(table, "vala.logs.records");
-            }
-            other => panic!("expected OtlpRequestMalformed, got {other:?}"),
+                error: BifrostError::IngestProtocol { .. },
+            } => {}
+            other => panic!("expected IngestProtocol, got {other:?}"),
         }
     }
 }

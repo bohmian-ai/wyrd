@@ -24,7 +24,7 @@ pub enum CatalogError {
 }
 
 /// Failures raised while serving a Bifrost ingest request.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum IngestError {
     /// Bearer token missing, malformed, or rejected by the verifier.
     #[error("ingest authentication failed: {0}")]

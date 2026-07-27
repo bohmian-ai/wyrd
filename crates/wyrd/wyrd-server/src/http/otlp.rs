@@ -495,6 +495,7 @@ mod tests {
 
     #[test]
     fn every_ingest_error_preserves_catalog_code_and_http_status() {
+        use axum::response::IntoResponse;
         let cases = vec![
             (
                 IngestError::Unauthenticated("x".to_owned()),
@@ -582,9 +583,22 @@ mod tests {
             ),
         ];
         for (error, code, status) in cases {
-            let catalog = ingest_error_to_wyrd(error, OtlpSignal::Traces);
+            let grpc = error.clone().into_status();
+            use wyrd_tonic::tonic_types::StatusExt;
+            let info = grpc
+                .get_details_error_info()
+                .expect("gRPC status carries catalog ErrorInfo");
+            let catalog = ingest_error_to_wyrd(error.clone(), OtlpSignal::Traces);
             assert_eq!(catalog.code(), code);
             assert_eq!(catalog.status(), status);
+            assert_eq!(info.reason, code);
+            assert_eq!(
+                ingest_error_to_response(error, OtlpSignal::Traces)
+                    .into_response()
+                    .status()
+                    .as_u16(),
+                status
+            );
         }
     }
 

@@ -52,6 +52,52 @@ async fn pg_bifrost_e2e_closeout_journey_delayed_fsync_drains_without_loss() {
     result.expect("delayed-fsync Bifrost closeout journey");
 }
 
+#[tokio::test]
+#[ignore = "requires the real Postgres-backed Bifrost journey lane"]
+async fn fresh_boot_provisions_redux_before_first_write() {
+    let cluster = WyrdTestCluster::start(1, BifrostTopology::OnePod)
+        .await
+        .expect("fresh WyrdTestCluster boot");
+    let server = cluster.server(0).expect("booted Bifrost server");
+    let tenant = cluster.data_tenant_id();
+    let redux = server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("server boot provisions Redux catalog");
+    redux
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, TABLE_NAME),
+            user_fields: vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("value", DataType::Utf8, false),
+            ],
+            tenant,
+            audit: None,
+        })
+        .await
+        .expect("first Redux table resolution after boot");
+    let transport = bootstrap_transport(server, "fresh-boot-writer", &["admin"])
+        .await
+        .expect("first writer after boot");
+    transport
+        .insert_batch(TABLE_FQN, uuid::Uuid::now_v7().into_bytes(), ipc(&[1]))
+        .await
+        .expect("first Redux write after boot");
+    server.flush_bifrost().await.expect("first write flush");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(row_count), 0)::bigint FROM vala.file_list
+         WHERE data_tenant_id = $1 AND namespace = 'vala.bifrost' AND table_name = $2",
+    )
+    .bind(tenant.as_uuid())
+    .bind(TABLE_NAME)
+    .fetch_one(cluster.pg_fixture().platform_admin_pool())
+    .await
+    .expect("first Redux file-list read");
+    assert_eq!(rows, 1);
+    cluster.shutdown().await.expect("cluster shutdown");
+}
+
 async fn run_closeout_journey(
     cluster: &WyrdTestCluster,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

@@ -9828,6 +9828,7 @@ dependencies = [
  "parquet",
  "rand 0.8.7",
  "rayon",
+ "rustix",
  "secrecy",
  "serde",
  "serde_json",

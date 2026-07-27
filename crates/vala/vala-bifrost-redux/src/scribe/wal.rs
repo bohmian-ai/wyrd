@@ -13,6 +13,7 @@
 //! Version 3 is the only accepted format. Older paired formats are rejected.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as FmtWrite;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rustix::fs::statvfs;
 use uuid::Uuid;
 use wyrd_spec::ids::DataTenantId;
 
@@ -312,9 +314,60 @@ impl PreparedWalAppend {
             encode_slice_payload(seal_key, self.schema_fingerprint, &self.audit, &self.data)?;
         Ok(WalRecord::new(self.lsn, 2, self.batch_id, payload))
     }
+
+    pub(crate) fn encoded_len(&self) -> Result<usize, ScribeError> {
+        let seal_key = self
+            .seal_key
+            .as_ref()
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "prepared WAL append is missing its self-describing seal key".to_owned(),
+            })?;
+        let table_len =
+            u16::try_from(seal_key.table.namespace.as_str().len() + 1 + seal_key.table.name.len())
+                .map_err(|_| ScribeError::Internal {
+                    detail: "WAL table FQN exceeds v3 payload limits".to_owned(),
+                })?;
+        let mut day_len = 0;
+        write!(
+            CountWriter(&mut day_len),
+            "{}",
+            seal_key.day.as_date().format("%Y-%m-%d")
+        )
+        .map_err(|_| ScribeError::Internal {
+            detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+        })?;
+        let day_len = u8::try_from(day_len).map_err(|_| ScribeError::Internal {
+            detail: "WAL partition day exceeds v3 payload limits".to_owned(),
+        })?;
+        let audit_len = u32::try_from(self.audit.len()).map_err(|_| ScribeError::Internal {
+            detail: "WAL audit payload exceeds v3 payload limits".to_owned(),
+        })?;
+        let data_len = u32::try_from(self.data.len()).map_err(|_| ScribeError::Internal {
+            detail: "WAL Arrow payload exceeds v3 payload limits".to_owned(),
+        })?;
+        let payload_len = 63usize
+            .saturating_add(usize::from(table_len))
+            .saturating_add(usize::from(day_len))
+            .saturating_add(usize::try_from(audit_len).expect("invariant: u32 fits usize"))
+            .saturating_add(usize::try_from(data_len).expect("invariant: u32 fits usize"));
+        payload_len
+            .checked_add(36)
+            .ok_or_else(|| ScribeError::Internal {
+                detail: "encoded WAL record length overflow".to_owned(),
+            })
+    }
 }
 
 const SLICE_PAYLOAD_MAGIC: [u8; 4] = *b"S3SL";
+
+struct CountWriter<'a>(&'a mut usize);
+
+impl FmtWrite for CountWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        *self.0 = self.0.saturating_add(value.len());
+        Ok(())
+    }
+}
 
 fn encode_slice_payload(
     seal_key: &SealKey,
@@ -843,6 +896,7 @@ struct WalDiskState {
     configured_limit_bytes: Option<u64>,
     sample: Mutex<Option<DiskSample>>,
     hard_failed: AtomicBool,
+    accounted_bytes: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     sync_failure: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
@@ -856,6 +910,7 @@ impl WalDiskState {
             configured_limit_bytes,
             sample: Mutex::new(None),
             hard_failed: AtomicBool::new(false),
+            accounted_bytes: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             sync_failure: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-support"))]
@@ -870,8 +925,13 @@ impl WalDiskState {
         {
             return sample;
         }
-        let (filesystem_capacity_bytes, filesystem_available_bytes) =
-            filesystem_space(&self.base_dir).unwrap_or((u64::MAX, u64::MAX));
+        let (filesystem_capacity_bytes, filesystem_available_bytes) = filesystem_space(
+            &self.base_dir,
+        )
+        .unwrap_or_else(|| {
+            tracing::warn!(path = %self.base_dir.display(), "WAL filesystem capacity probe failed");
+            (u64::MAX, 0)
+        });
         let sample = DiskSample {
             sampled_at: Instant::now(),
             filesystem_capacity_bytes,
@@ -895,6 +955,38 @@ impl WalDiskState {
             wal_bytes.saturating_add(append_bytes),
             sample.filesystem_available_bytes,
         )
+    }
+
+    fn bytes(&self) -> u64 {
+        self.accounted_bytes.load(Ordering::Acquire)
+    }
+
+    fn add_bytes(&self, bytes: u64) {
+        self.accounted_bytes.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    fn subtract_bytes(&self, bytes: u64) {
+        let mut current = self.bytes();
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.accounted_bytes.compare_exchange(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    fn reconcile(&self) {
+        let measured = directory_bytes(&self.base_dir);
+        let current = self.bytes();
+        if measured > current {
+            self.accounted_bytes.store(measured, Ordering::Release);
+        }
     }
 
     fn reject_if_hard(&self, wal_bytes: u64, append_bytes: u64) -> Result<(), ScribeError> {
@@ -933,26 +1025,34 @@ impl WalDiskState {
 }
 
 fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
-    let output = std::process::Command::new("df")
-        .args(["-Pk", "--"])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout
-        .lines()
-        .skip(1)
-        .find(|line| !line.trim().is_empty())?;
-    let fields = line.split_whitespace().collect::<Vec<_>>();
-    let capacity_kib = fields.get(1)?.parse::<u64>().ok()?;
-    let available_kib = fields.get(3)?.parse::<u64>().ok()?;
+    let stats = statvfs(path).ok()?;
+    let block_size = stats.f_frsize.max(stats.f_bsize);
     Some((
-        capacity_kib.saturating_mul(1024),
-        available_kib.saturating_mul(1024),
+        stats.f_blocks.saturating_mul(block_size),
+        stats.f_bavail.saturating_mul(block_size),
     ))
+}
+
+fn directory_bytes(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let path = entry.path();
+            let Ok(metadata) = entry.metadata() else {
+                return 0;
+            };
+            if metadata.is_dir() {
+                directory_bytes(&path)
+            } else if metadata.is_file() {
+                metadata.len()
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 fn wal_io_error(context: &str, error: &io::Error) -> ScribeError {
@@ -1056,9 +1156,12 @@ impl WalSegment {
         Ok(())
     }
 
-    fn append_prepared(&self, prepared: &PreparedWalAppend) -> Result<(), ScribeError> {
-        let record = prepared.record()?;
-        self.append(&record)
+    fn append_encoded(&self, encoded: &[u8]) -> Result<(), ScribeError> {
+        let mut file = self.file.lock().map_err(|_| ScribeError::Internal {
+            detail: "WAL segment file lock poisoned (append)".to_string(),
+        })?;
+        file.write_all(encoded)
+            .map_err(|e| wal_io_error("WAL record write failed", &e))
     }
 
     /// Force all appended data for this segment to stable storage.
@@ -1311,6 +1414,9 @@ impl WalWriter {
         }
         let mut next_lsn = 0_u64;
         for path in paths {
+            if let Ok(metadata) = std::fs::metadata(&path) {
+                self.disk.add_bytes(metadata.len());
+            }
             let segment = WalSegment::open(&path)?;
             let header = segment.header();
             if header.node_id != self.node_id || header.writer_epoch != self.writer_epoch {
@@ -1406,10 +1512,10 @@ impl WalWriter {
         &self,
         mut prepared: PreparedWalAppend,
     ) -> Result<WalAppendResult, ScribeError> {
-        let encoded = prepared.record()?.encode();
-        let encoded_bytes = u64::try_from(encoded.len()).map_err(|_| ScribeError::Internal {
-            detail: "encoded WAL record length does not fit accounting".to_owned(),
-        })?;
+        let encoded_bytes =
+            u64::try_from(prepared.encoded_len()?).map_err(|_| ScribeError::Internal {
+                detail: "encoded WAL record length does not fit accounting".to_owned(),
+            })?;
         let shard_id = usize::from(prepared.shard_id.unwrap_or(0));
         let mut state = self.states[shard_id]
             .lock()
@@ -1430,6 +1536,11 @@ impl WalWriter {
         )?;
         let lsn = WalLsn::new(self.next_lsn.fetch_add(1, Ordering::SeqCst));
         prepared.assign_lsn(lsn);
+        let encoded = prepared.record()?.encode();
+        debug_assert_eq!(
+            usize::try_from(encoded_bytes).expect("invariant: encoded length fits usize"),
+            encoded.len()
+        );
         if rolls_segment {
             state.current_segment = None;
             state.current_segment_size = 0;
@@ -1441,12 +1552,15 @@ impl WalWriter {
                 detail: "invalid WAL shard index".to_owned(),
             })?,
         )?;
-        if let Err(error) = segment.append_prepared(&prepared) {
+        if let Err(error) = segment.append_encoded(&encoded) {
             if matches!(error, ScribeError::WalDiskFull) {
                 self.disk.mark_hard_failed();
             }
+            drop(state);
+            self.disk.reconcile();
             return Err(error);
         }
+        self.disk.add_bytes(encoded_bytes);
         state.current_segment_size = state.current_segment_size.saturating_add(encoded_bytes);
         state.current_segment_records = state.current_segment_records.saturating_add(1);
         Ok(WalAppendResult {
@@ -1679,9 +1793,11 @@ impl WalWriter {
                 continue;
             }
             if path.exists() {
+                let file_len = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
                 std::fs::remove_file(path).map_err(|error| ScribeError::Internal {
                     detail: format!("WAL segment retirement failed: {error}"),
                 })?;
+                self.disk.subtract_bytes(file_len);
                 if let Some(parent) = path.parent() {
                     let directory = File::open(parent).map_err(|error| ScribeError::Internal {
                         detail: format!("failed to open retired WAL directory: {error}"),
@@ -1700,28 +1816,7 @@ impl WalWriter {
     /// Return the current on-disk byte footprint of this WAL directory.
     #[must_use]
     pub fn bytes_on_disk(&self) -> u64 {
-        fn directory_bytes(path: &Path) -> u64 {
-            let Ok(entries) = std::fs::read_dir(path) else {
-                return 0;
-            };
-            entries
-                .filter_map(Result::ok)
-                .map(|entry| {
-                    let Ok(metadata) = entry.metadata() else {
-                        return 0;
-                    };
-                    if metadata.is_dir() {
-                        directory_bytes(&entry.path())
-                    } else if metadata.is_file() {
-                        metadata.len()
-                    } else {
-                        0
-                    }
-                })
-                .sum()
-        }
-
-        directory_bytes(&self.base_dir)
+        self.disk.bytes()
     }
 
     /// Return the current WAL disk-pressure state without reserving an append.
@@ -1731,6 +1826,7 @@ impl WalWriter {
     /// oldest unpublished bucket; a hard result rejects the next append.
     #[must_use]
     pub fn disk_pressure(&self) -> WalDiskPressure {
+        self.disk.reconcile();
         let bytes = self.bytes_on_disk();
         self.disk.pressure(bytes, 0)
     }
@@ -1758,6 +1854,7 @@ impl WalWriter {
         let header = SegmentHeader::new(self.node_id, self.writer_epoch, seq, shard_id);
 
         let segment = Arc::new(WalSegment::create(&path, header)?);
+        self.disk.add_bytes(SEGMENT_HEADER_SIZE as u64);
         state.current_segment = Some(Arc::clone(&segment));
 
         // Initialize segment size to header size

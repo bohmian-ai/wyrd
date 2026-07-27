@@ -105,6 +105,7 @@ walkdir = "2.*"
 sha2 = "0.10"
 uuid = { version = "1", default-features = false, features = ["serde"] }
 crc32c = "0.6"
+rustix = { version = "1.1.4", features = ["fs"] }
 semver = { version = "1", features = ["serde"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 metrics = { version = "0.24", default-features = false }

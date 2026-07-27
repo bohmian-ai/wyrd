@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use datafusion::error::DataFusionError;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
@@ -118,6 +119,7 @@ struct MemoryGovernorInner {
     bifrost_total_bytes: AtomicUsize,
     categories: [AtomicUsize; MEMORY_CATEGORY_COUNT],
     cgroup_limit_bytes: Option<usize>,
+    cgroup_current: Mutex<Option<(Instant, Option<usize>)>>,
     shard_bytes: Arc<Vec<AtomicUsize>>,
 }
 
@@ -168,6 +170,7 @@ impl BifrostMemoryGovernor {
                 scribe_total_bytes: AtomicUsize::new(0),
                 bifrost_total_bytes: AtomicUsize::new(0),
                 cgroup_limit_bytes: read_cgroup_limit(),
+                cgroup_current: Mutex::new(None),
                 shard_bytes: Arc::new(
                     (0..SHARD_ACCOUNTING_COUNT)
                         .map(|_| AtomicUsize::new(0))
@@ -232,7 +235,7 @@ impl BifrostMemoryGovernor {
 
     fn try_reserve_parent_bytes(&self, bytes: usize) -> Result<(), ScribeError> {
         if bytes > 0
-            && let Some((current, limit)) = cgroup_pressure()
+            && let Some((current, limit)) = self.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(100)
         {
             return Err(ScribeError::IngestBusy {
@@ -258,9 +261,27 @@ impl BifrostMemoryGovernor {
             categories: std::array::from_fn(|index| {
                 self.inner.categories[index].load(Ordering::Acquire)
             }),
-            cgroup_current_bytes: read_cgroup_current(),
+            cgroup_current_bytes: self.cgroup_current(),
             cgroup_limit_bytes: self.inner.cgroup_limit_bytes,
         }
+    }
+
+    fn cgroup_current(&self) -> Option<usize> {
+        if let Ok(cache) = self.inner.cgroup_current.lock()
+            && let Some((sampled_at, value)) = *cache
+            && sampled_at.elapsed() < Duration::from_secs(1)
+        {
+            return value;
+        }
+        let value = read_cgroup_current();
+        if let Ok(mut cache) = self.inner.cgroup_current.lock() {
+            *cache = Some((Instant::now(), value));
+        }
+        value
+    }
+
+    fn cgroup_pressure(&self) -> Option<(usize, usize)> {
+        Some((self.cgroup_current()?, self.inner.cgroup_limit_bytes?))
     }
 }
 
@@ -311,7 +332,7 @@ impl ScribeMemoryBudget {
         scribe_limit: usize,
     ) -> Result<MemoryReservation, ScribeError> {
         if bytes > 0
-            && let Some((current, limit)) = cgroup_pressure()
+            && let Some((current, limit)) = self.parent.cgroup_pressure()
             && current.saturating_mul(100) >= limit.saturating_mul(90)
         {
             return Err(ScribeError::IngestBusy {
@@ -760,10 +781,6 @@ fn read_cgroup_current() -> Option<usize> {
             .parse::<usize>()
             .ok()
     })
-}
-
-fn cgroup_pressure() -> Option<(usize, usize)> {
-    Some((read_cgroup_current()?, read_cgroup_limit()?))
 }
 
 fn read_memory_limit(path: &str) -> Option<usize> {

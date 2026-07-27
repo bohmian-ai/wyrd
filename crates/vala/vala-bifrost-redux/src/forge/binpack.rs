@@ -81,6 +81,71 @@ pub struct RewriteBin {
     pub total_bytes: u64,
 }
 
+/// Deterministic incremental compaction decision for one partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncrementalCompactionPlan {
+    /// Complete bins eligible for one fenced rewrite operation each.
+    pub(crate) rewrite_bins: Vec<RewriteBin>,
+    /// Files intentionally retained for a later tick.
+    pub(crate) retained_files: Vec<CandidateFile>,
+}
+
+/// Plan bounded incremental bins while preserving every input file.
+pub(crate) fn plan_incremental_bins(
+    mut files: Vec<CandidateFile>,
+    target_bytes: u64,
+    max_files: usize,
+    partition_day: NaiveDate,
+    current_utc_day: NaiveDate,
+) -> IncrementalCompactionPlan {
+    files.sort_by_key(|file| (file.min_event_time, file.max_event_time, file.id));
+    if target_bytes == 0 || max_files == 0 {
+        return IncrementalCompactionPlan {
+            rewrite_bins: Vec::new(),
+            retained_files: files,
+        };
+    }
+    let closed = partition_day < current_utc_day;
+    let mut rewrite_bins = Vec::new();
+    let mut retained_files = Vec::new();
+    let mut current = Vec::new();
+    let mut bytes = 0_u64;
+    for file in files {
+        if file.size > target_bytes {
+            retained_files.push(file);
+            continue;
+        }
+        let boundary = !current.is_empty()
+            && (current.len() >= max_files || bytes.saturating_add(file.size) > target_bytes);
+        if boundary {
+            if current.len() >= 2 {
+                rewrite_bins.push(RewriteBin {
+                    files: std::mem::take(&mut current),
+                    total_bytes: bytes,
+                });
+            } else {
+                retained_files.append(&mut current);
+            }
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(file.size);
+        current.push(file);
+    }
+    if current.len() >= 2 && (closed || bytes >= target_bytes || current.len() >= max_files) {
+        rewrite_bins.push(RewriteBin {
+            files: current,
+            total_bytes: bytes,
+        });
+    } else {
+        retained_files.extend(current);
+    }
+    retained_files.sort_by_key(|file| (file.min_event_time, file.max_event_time, file.id));
+    IncrementalCompactionPlan {
+        rewrite_bins,
+        retained_files,
+    }
+}
+
 /// Pack candidate files into deterministic bins without exceeding either limit.
 ///
 /// Files larger than `target_bytes` are skipped. A partial bin is emitted only
@@ -201,6 +266,52 @@ mod tests {
         assert_eq!(
             bins[0].files.iter().map(|f| f.id).collect::<Vec<_>>(),
             vec![Uuid::from_u128(2), Uuid::from_u128(3)]
+        );
+    }
+
+    #[test]
+    fn active_day_retains_incomplete_trailing_bin() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let plan =
+            plan_incremental_bins(vec![file(1, 3, 0, 1), file(2, 3, 2, 3)], 10, 10, day, day);
+        assert!(plan.rewrite_bins.is_empty());
+        assert_eq!(plan.retained_files.len(), 2);
+    }
+
+    #[test]
+    fn active_day_emits_exact_target_trailing_bin() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let plan =
+            plan_incremental_bins(vec![file(1, 5, 0, 1), file(2, 5, 2, 3)], 10, 10, day, day);
+        assert_eq!(plan.rewrite_bins.len(), 1);
+    }
+
+    #[test]
+    fn closed_day_emits_multi_file_remainder() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let now = day.succ_opt().expect("next");
+        let plan =
+            plan_incremental_bins(vec![file(1, 3, 0, 1), file(2, 3, 2, 3)], 10, 10, day, now);
+        assert_eq!(plan.rewrite_bins.len(), 1);
+    }
+
+    #[test]
+    fn planner_never_rewrites_singleton_or_drops_oversized_file() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let plan =
+            plan_incremental_bins(vec![file(1, 11, 0, 1), file(2, 3, 2, 3)], 10, 10, day, day);
+        assert!(plan.rewrite_bins.is_empty());
+        assert_eq!(plan.retained_files.len(), 2);
+    }
+
+    #[test]
+    fn planner_is_stable_across_input_order() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
+        let a = vec![file(2, 5, 2, 3), file(1, 5, 0, 1)];
+        let b = vec![a[1].clone(), a[0].clone()];
+        assert_eq!(
+            plan_incremental_bins(a, 10, 10, day, day),
+            plan_incremental_bins(b, 10, 10, day, day)
         );
     }
 }

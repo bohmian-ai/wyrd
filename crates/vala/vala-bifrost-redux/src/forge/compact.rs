@@ -85,6 +85,14 @@ pub struct ForgeConfig {
     pub orphan_gc_ttl: Duration,
     /// Maximum orphan candidates considered in one GC batch.
     pub max_gc_candidates_per_batch: usize,
+    /// Maximum staging hints drained by one wake-up.
+    pub max_hints_per_wake: usize,
+    /// Maximum concurrent object reads during rewrite.
+    pub max_concurrent_reads: usize,
+    /// Maximum bytes DataFusion may spill for one operation.
+    pub spill_limit_bytes: u64,
+    /// Maximum encoded bytes written to one output file.
+    pub output_file_bytes: u64,
 }
 
 impl Default for ForgeConfig {
@@ -107,6 +115,10 @@ impl Default for ForgeConfig {
             retain_last: 1,
             orphan_gc_ttl: Duration::from_hours(24),
             max_gc_candidates_per_batch: 256,
+            max_hints_per_wake: 256,
+            max_concurrent_reads: 4,
+            spill_limit_bytes: 4 * 1024 * 1024 * 1024,
+            output_file_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -131,6 +143,10 @@ impl ForgeConfig {
             || self.retain_last == 0
             || self.orphan_gc_ttl.is_zero()
             || self.max_gc_candidates_per_batch == 0
+            || self.max_hints_per_wake == 0
+            || self.max_concurrent_reads == 0
+            || self.spill_limit_bytes == 0
+            || self.output_file_bytes == 0
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
@@ -160,7 +176,7 @@ impl ForgeConfig {
 ///
 /// Keeping this capability narrow lets production use the real `OpenDAL`
 /// operator while integration tests wrap the same seam with deterministic
-/// barriers and failures. Fixture code still uses [`ForgeContext::staging`]
+/// barriers and failures. Fixture code still uses [`ForgeCore::staging`]
 /// directly for producer writes.
 #[async_trait]
 pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
@@ -206,7 +222,7 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
 }
 
 #[derive(Clone)]
-pub struct ForgeContext {
+pub struct ForgeCore {
     /// Vala-owned application SQL handle used to open tenant transactions.
     pub vala: vala_sql::ValaPostgres,
     /// Operator pool used for cross-tenant lease and candidate discovery work.
@@ -228,7 +244,7 @@ pub(crate) struct ForgeTableKey {
     pub(crate) table_ref: crate::catalog::TableRef,
 }
 
-impl ForgeContext {
+impl ForgeCore {
     /// Build a validated Forge context using the staging operator as its object
     /// store seam.
     ///
@@ -313,7 +329,7 @@ pub struct ForgeTickOutcome {
 
 /// Load one Iceberg table with the configured catalog request timeout.
 pub(crate) async fn load_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     ident: &iceberg::TableIdent,
 ) -> Result<iceberg::table::Table, ForgeError> {
     tokio::time::timeout(
@@ -332,7 +348,7 @@ pub(crate) async fn load_table(
 /// A prepared operation is marked committed when its output is still live in
 /// Iceberg, or reset when the output is absent after the uncertainty window.
 pub(crate) async fn run_compaction_reconciliation_for_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     table_key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -354,7 +370,7 @@ pub(crate) async fn run_compaction_reconciliation_for_table(
 /// byte, or bin budget stops the table without treating the skipped work as a
 /// failure.
 pub(crate) async fn run_compaction_bins_for_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     table_key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -518,9 +534,7 @@ pub(crate) async fn select_candidate_groups(
 }
 
 /// Load groups whose prepared SQL transition has no committed snapshot ID.
-async fn load_reconciliation_keys(
-    context: &ForgeContext,
-) -> Result<Vec<ForgeGroupKey>, ForgeError> {
+async fn load_reconciliation_keys(context: &ForgeCore) -> Result<Vec<ForgeGroupKey>, ForgeError> {
     let rows = sqlx::query(
         r"SELECT DISTINCT data_tenant_id, namespace, table_name, partition_day
              FROM vala.file_list
@@ -572,7 +586,7 @@ fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
 /// commit the Iceberg transaction, and stamp the committed snapshot. Every
 /// external boundary is fenced so a stale lease cannot finish the operation.
 async fn compact_bin(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     binding: &TenantTableBinding,
@@ -656,7 +670,7 @@ async fn compact_bin(
 }
 
 fn reserve_forge_workspace(
-    context: &ForgeContext,
+    context: &ForgeCore,
     bin: &RewriteBin,
 ) -> Result<Option<ParentMemoryReservation>, ForgeError> {
     let Some(governor) = &context.memory_governor else {
@@ -681,7 +695,7 @@ fn is_retryable(error: &iceberg::Error) -> bool {
 /// Read a rewrite bin, enforce tenant ownership, project by field name, and
 /// sort rows by tenant and event time for the Iceberg writer.
 async fn read_and_project_staging(
-    context: &ForgeContext,
+    context: &ForgeCore,
     table: &iceberg::table::Table,
     key: &ForgeGroupKey,
     binding: &TenantTableBinding,
@@ -962,7 +976,7 @@ fn path_is_under_prefix(path: &str, prefix: &str) -> bool {
 /// The SQL transition and audit append share one tenant transaction, which is
 /// fenced immediately before commit.
 async fn prepare_inputs(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     bin: &RewriteBin,
@@ -1006,7 +1020,7 @@ async fn prepare_inputs(
 
 /// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
 async fn stamp_committed(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     bin: &RewriteBin,
@@ -1059,7 +1073,7 @@ async fn stamp_committed(
 /// Restore prepared input rows to the uncompacted state after a definite
 /// Iceberg failure.
 async fn reset_inputs(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     bin: &RewriteBin,
@@ -1112,7 +1126,7 @@ async fn reset_inputs(
 /// A live output is stamped as recovered. An output absent after the
 /// uncertainty window resets the hidden inputs so a future tick can retry.
 async fn reconcile_group(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     binding: &TenantTableBinding,
@@ -1194,7 +1208,7 @@ async fn reconcile_group(
 
 /// Load the latest audit detail for each compaction operation in a group.
 async fn load_reconciliation_audits(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeGroupKey,
     resource: &str,
 ) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
@@ -1303,7 +1317,7 @@ async fn live_snapshot_for_path(
 
 /// Confirm that prepared audit inputs still match hidden `file_list` rows.
 async fn verify_hidden_inputs(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeGroupKey,
     input_file_ids: &[Uuid],
     detail: &AuditDetail,
@@ -1374,7 +1388,7 @@ async fn verify_hidden_inputs(
 /// Stamp a recovered compaction with the snapshot that already contains its
 /// output.
 async fn stamp_reconciled(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     input_file_ids: &[Uuid],
@@ -1421,7 +1435,7 @@ async fn stamp_reconciled(
 
 /// Reset a recovered compaction whose output was never committed.
 async fn reset_reconciled(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeGroupKey,
     input_file_ids: &[Uuid],

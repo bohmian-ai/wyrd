@@ -38,4 +38,10 @@ pub enum ForgeError {
     MemoryBudget { detail: String },
     #[error("Forge invariant failed: {detail}")]
     Invariant { detail: String },
+    #[error("Forge scheduler is already running")]
+    AlreadyRunning,
+    #[error("Forge DataFusion execution failed: {0}")]
+    DataFusion(#[source] datafusion::error::DataFusionError),
+    #[error("Forge spill limit of {limit_bytes} bytes was exceeded")]
+    SpillLimitExceeded { limit_bytes: u64 },
 }

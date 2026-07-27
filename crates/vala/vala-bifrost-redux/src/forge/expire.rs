@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 
-use super::compact::{ForgeContext, ForgeTableKey, load_table};
+use super::compact::{ForgeCore, ForgeTableKey, load_table};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 
@@ -80,7 +80,7 @@ pub fn select_expirable_snapshots(
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
 pub(crate) async fn discover_tables(
-    context: &ForgeContext,
+    context: &ForgeCore,
 ) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
     let rows = sqlx::query(
         r"SELECT DISTINCT data_tenant_id, namespace, table_name
@@ -141,7 +141,7 @@ pub(crate) async fn discover_tables(
 /// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
 /// commit so a stale prepared selection cannot delete a newly protected head.
 pub(crate) async fn run_snapshot_expiry_for_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -252,7 +252,7 @@ fn expiry_detail(
 /// `recovered` selects the terminal audit phase used when completing a
 /// prepared operation left by an earlier Forge process.
 async fn complete_expiry(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -373,7 +373,7 @@ fn selected_ids_are_eligible(
 /// selection still present is retried only after the uncertainty bound has
 /// elapsed.
 async fn reconcile_expiry(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -424,7 +424,7 @@ async fn reconcile_expiry(
 
 /// Read the latest prepared and terminal expiry audit state for one table.
 async fn load_expiry_audits(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeTableKey,
 ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
     let mut conn = context
@@ -492,7 +492,7 @@ async fn load_expiry_audits(
 
 /// Append a fenced snapshot-expiry audit event in the tenant transaction.
 async fn append_expiry_audit(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     tenant: DataTenantId,
     detail: &AuditDetail,

@@ -21,9 +21,7 @@ mod pg_tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
-    use vala_bifrost_redux::forge::{
-        ForgeConfig, ForgeContext, ForgeScheduler, run_maintenance_tick,
-    };
+    use vala_bifrost_redux::forge::{Forge, ForgeConfig, ForgeCore, run_maintenance_tick};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -39,7 +37,7 @@ mod pg_tests {
         pg: PgFixture,
         tenant: DataTenantId,
         binding: TenantTableBinding,
-        context: ForgeContext,
+        context: ForgeCore,
         _root: TempDir,
     }
 
@@ -119,7 +117,7 @@ mod pg_tests {
                 .await
                 .expect("tenant table");
 
-            let context = ForgeContext::new(
+            let context = ForgeCore::new(
                 pg.vala_postgres().clone(),
                 OperatorPool::from(pg.platform_admin_pool().clone()),
                 catalog,
@@ -234,8 +232,8 @@ mod pg_tests {
             .expect("age file list rows");
         }
 
-        fn context_with_config(&self, config: ForgeConfig) -> ForgeContext {
-            ForgeContext::new(
+        fn context_with_config(&self, config: ForgeConfig) -> ForgeCore {
+            ForgeCore::new(
                 self.pg.vala_postgres().clone(),
                 self.context.operator_pool.clone(),
                 self.context.catalog.clone(),
@@ -306,9 +304,7 @@ mod pg_tests {
     #[tokio::test]
     async fn forge_scheduler_run_maintenance_tick_compacts_exact_groups() {
         let fixture = Fixture::new().await;
-        let outcome = run_maintenance_tick(&fixture.context)
-            .await
-            .expect("maintenance tick");
+        let outcome = run_once(&fixture.context).await.expect("maintenance tick");
 
         assert_eq!(outcome.bins_committed, 1);
         let state = fixture.file_state().await;
@@ -344,7 +340,7 @@ mod pg_tests {
     /// Steps:
     /// 1. Build an isolated Postgres/SQL-Iceberg/OpenDAL fixture with two aged
     ///    Parquet inputs and corresponding `vala.file_list` rows.
-    /// 2. Construct `ForgeScheduler::new`, spawn its returned `run` future,
+    /// 2. Construct `Forge::new`, spawn its returned `run` future,
     ///    and wait for the real compaction to mark both inputs committed.
     /// 3. Cancel the supplied `CancellationToken`, await the scheduler future,
     ///    and query `vala.maintenance_leases`.
@@ -358,7 +354,7 @@ mod pg_tests {
         let fixture = Fixture::new().await;
         let shutdown = CancellationToken::new();
         let task = tokio::spawn(
-            ForgeScheduler::new(fixture.context.clone(), Duration::from_millis(10))
+            Forge::new(fixture.context.clone(), Duration::from_millis(10))
                 .expect("scheduler start")
                 .run(shutdown.clone()),
         );
@@ -403,7 +399,7 @@ mod pg_tests {
     /// after an uncertain catalog response.
     async fn forge_scheduler_reconciliation_precedes_new_compaction() {
         let fixture = Fixture::new().await;
-        let first = run_maintenance_tick(&fixture.context)
+        let first = run_once(&fixture.context)
             .await
             .expect("first maintenance tick");
         assert_eq!(first.bins_committed, 1);
@@ -417,7 +413,7 @@ mod pg_tests {
             .snapshots()
             .len();
 
-        let second = run_maintenance_tick(&fixture.context)
+        let second = run_once(&fixture.context)
             .await
             .expect("reconciliation maintenance tick");
         assert_eq!(second.bins_committed, 0);
@@ -464,7 +460,7 @@ mod pg_tests {
         .expect("competing lease acquisition")
         .expect("competing lease");
 
-        let outcome = run_maintenance_tick(&fixture.context)
+        let outcome = run_once(&fixture.context)
             .await
             .expect("fenced maintenance tick");
         assert_eq!(outcome.bins_committed, 0);
@@ -627,7 +623,7 @@ mod pg_tests {
     ///
     /// Steps:
     /// 1. Build the normal real fixture so the constructor receives a production
-    ///    `ForgeContext`.
+    ///    `ForgeCore`.
     /// 2. Pass `Duration::ZERO` to the only public scheduler constructor.
     /// 3. Assert construction returns the configuration error before any task is
     ///    spawned.
@@ -636,7 +632,7 @@ mod pg_tests {
     /// or require an out-of-band shutdown path.
     async fn forge_scheduler_rejects_zero_interval_without_spawning() {
         let fixture = Fixture::new().await;
-        let Err(error) = ForgeScheduler::new(fixture.context.clone(), Duration::ZERO) else {
+        let Err(error) = Forge::new(fixture.context.clone(), Duration::ZERO) else {
             panic!("zero interval must fail closed");
         };
         assert!(error.to_string().contains("interval must be positive"));
@@ -659,10 +655,7 @@ mod pg_tests {
         let fixture = Fixture::new().await;
         let first_context = fixture.context.clone();
         let second_context = fixture.context.clone();
-        let (first, second) = tokio::join!(
-            run_maintenance_tick(&first_context),
-            run_maintenance_tick(&second_context)
-        );
+        let (first, second) = tokio::join!(run_once(&first_context), run_once(&second_context));
         let first = first.expect("first competing scheduler");
         let second = second.expect("second competing scheduler");
         assert_eq!(first.bins_committed + second.bins_committed, 1);
@@ -714,7 +707,7 @@ mod pg_tests {
         .await
         .expect("invalid discovery row");
 
-        let outcome = run_maintenance_tick(&fixture.context)
+        let outcome = run_once(&fixture.context)
             .await
             .expect("maintenance continues after invalid table");
         assert!(outcome.tables_failed >= 1);
@@ -740,11 +733,11 @@ mod pg_tests {
     /// for uncertain catalog responses and idempotent reconciliation.
     async fn forge_compaction_uncertain_commit_reconciles_without_second_snapshot() {
         let fixture = Fixture::new().await;
-        let first = run_maintenance_tick(&fixture.context)
+        let first = run_once(&fixture.context)
             .await
             .expect("initial compaction");
         assert_eq!(first.bins_committed, 1);
-        let second = run_maintenance_tick(&fixture.context)
+        let second = run_once(&fixture.context)
             .await
             .expect("manifest-first reconciliation");
         assert_eq!(second.bins_committed, 0);
@@ -774,12 +767,10 @@ mod pg_tests {
         let mut config = fixture.context.config.clone();
         config.snapshot_retention = Duration::from_millis(1);
         let context = fixture.context_with_config(config);
-        run_maintenance_tick(&context)
-            .await
-            .expect("initial snapshot");
+        run_once(&context).await.expect("initial snapshot");
         tokio::time::sleep(Duration::from_millis(10)).await;
         fixture.seed_additional_two_files().await;
-        let outcome = run_maintenance_tick(&context).await.expect("expiry tick");
+        let outcome = run_once(&context).await.expect("expiry tick");
         assert_eq!(outcome.bins_committed, 1);
         let table = context
             .catalog
@@ -799,7 +790,7 @@ mod pg_tests {
     #[tokio::test]
     async fn forge_scheduler_live_set_protects_every_retained_iceberg_path() {
         let fixture = Fixture::new().await;
-        run_maintenance_tick(&fixture.context)
+        run_once(&fixture.context)
             .await
             .expect("live-set compaction");
         let table = fixture
@@ -810,9 +801,7 @@ mod pg_tests {
             .expect("live table");
         let snapshot = table.metadata().current_snapshot().expect("snapshot");
         let manifest_list = snapshot.manifest_list().to_owned();
-        run_maintenance_tick(&fixture.context)
-            .await
-            .expect("live-set rebuild");
+        run_once(&fixture.context).await.expect("live-set rebuild");
         assert!(table.metadata().current_snapshot_id().is_some());
         assert!(manifest_list.contains("metadata"));
         assert_eq!(
@@ -843,9 +832,7 @@ mod pg_tests {
             .write(&young, Buffer::from(vec![2_u8]))
             .await
             .expect("young orphan write");
-        run_maintenance_tick(&context)
-            .await
-            .expect("orphan GC tick");
+        run_once(&context).await.expect("orphan GC tick");
         assert!(!fixture.object_exists(&orphan).await);
         assert!(fixture.object_exists(&young).await);
         assert!(fixture.operation_count("forge.orphan_gc.prepared").await >= 1);
@@ -857,9 +844,7 @@ mod pg_tests {
     /// GC reference check does not delete it or create another compaction.
     async fn forge_scheduler_gc_rechecks_reference_before_delete() {
         let fixture = Fixture::new().await;
-        run_maintenance_tick(&fixture.context)
-            .await
-            .expect("reference rebuild");
+        run_once(&fixture.context).await.expect("reference rebuild");
         let table = fixture
             .context
             .catalog
@@ -868,7 +853,7 @@ mod pg_tests {
             .expect("table reference");
         let live = table.metadata().current_snapshot_id();
         assert!(live.is_some());
-        let second = run_maintenance_tick(&fixture.context)
+        let second = run_once(&fixture.context)
             .await
             .expect("final GC revalidation");
         assert_eq!(second.bins_committed, 0);
@@ -881,7 +866,7 @@ mod pg_tests {
         let mut config = fixture.context.config.clone();
         config.snapshot_retention = Duration::from_millis(1);
         let context = fixture.context_with_config(config);
-        run_maintenance_tick(&context).await.expect("seed snapshot");
+        run_once(&context).await.expect("seed snapshot");
         let first_table = context
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -893,9 +878,7 @@ mod pg_tests {
             .expect("first snapshot id");
         fixture.seed_additional_two_files().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
-        run_maintenance_tick(&context)
-            .await
-            .expect("external expiry effect");
+        run_once(&context).await.expect("external expiry effect");
         let expired_table = context
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -931,7 +914,7 @@ mod pg_tests {
         fixture
             .append_audit_detail("forge.snapshot_expire.prepared", resource, detail)
             .await;
-        let outcome = run_maintenance_tick(&context)
+        let outcome = run_once(&context)
             .await
             .expect("restart expiry reconciliation");
         assert!(outcome.reconciled >= 1);
@@ -958,11 +941,9 @@ mod pg_tests {
             .await
             .expect("restart orphan write");
         tokio::time::sleep(Duration::from_millis(10)).await;
-        run_maintenance_tick(&context).await.expect("first GC pass");
+        run_once(&context).await.expect("first GC pass");
         let committed = fixture.operation_count("forge.orphan_gc.committed").await;
-        run_maintenance_tick(&context)
-            .await
-            .expect("idempotent GC restart");
+        run_once(&context).await.expect("idempotent GC restart");
         assert!(!fixture.object_exists(&orphan).await);
         assert_eq!(
             fixture.operation_count("forge.orphan_gc.committed").await,
@@ -1009,7 +990,7 @@ mod pg_tests {
             .await
             .expect("release")
         );
-        let outcome = run_maintenance_tick(&fixture.context)
+        let outcome = run_once(&fixture.context)
             .await
             .expect("maintenance after release");
         assert_eq!(outcome.bins_committed, 1);

@@ -1,43 +1,104 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::compact::{
-    ForgeContext, ForgeTableKey, ForgeTickOutcome, run_compaction_bins_for_table,
+    ForgeCore, ForgeTableKey, ForgeTickOutcome, run_compaction_bins_for_table,
     run_compaction_reconciliation_for_table,
 };
 use super::error::ForgeError;
 use super::expire::{discover_tables, run_snapshot_expiry_for_table};
 use super::lease::{ForgeLease, forge_lease_key};
 use super::orphan_gc::{build_live_set, run_orphan_gc_for_table};
+use super::rewrite::ForgeRewriteRuntime;
 use crate::catalog::TenantTableBinding;
+use crate::maintenance::StagingFileInbox;
 
-pub struct ForgeScheduler {
-    context: ForgeContext,
-    interval: Duration,
+/// Construction-time dependency graph for one Forge handle.
+pub struct ForgeBuildConfig {
+    /// SQL handle used by Forge stages.
+    pub vala: vala_sql::ValaPostgres,
+    /// Cross-tenant operator pool.
+    pub operator_pool: vala_sql::OperatorPool,
+    /// Iceberg catalog.
+    pub catalog: Arc<dyn iceberg::Catalog>,
+    /// Raw staging operator.
+    pub staging: Arc<opendal::Operator>,
+    /// Object-store seam used by rewrites and GC.
+    pub object_store: Arc<dyn super::compact::ForgeObjectStore>,
+    /// DataFusion runtime owned by the Forge process.
+    pub rewrite_runtime: ForgeRewriteRuntime,
+    /// Bounded advisory Scribe wake-up inbox.
+    pub hints: StagingFileInbox,
+    /// Forge limits.
+    pub config: super::compact::ForgeConfig,
+    /// Delayed periodic maintenance interval.
+    pub maintenance_interval: Duration,
 }
 
-impl ForgeScheduler {
-    /// Construct the one production Forge scheduler surface.
-    pub fn new(context: ForgeContext, interval: Duration) -> Result<Self, ForgeError> {
-        if interval.is_zero() {
+/// The single stateful Forge maintenance handle.
+pub struct Forge {
+    context: Arc<ForgeCore>,
+    interval: Duration,
+    hints: tokio::sync::Mutex<StagingFileInbox>,
+    tick: tokio::sync::Mutex<()>,
+    running: AtomicBool,
+}
+
+impl Forge {
+    /// Construct Forge and validate its complete dependency graph.
+    pub fn new(config: ForgeBuildConfig) -> Result<Self, ForgeError> {
+        if config.maintenance_interval.is_zero() {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge scheduler interval must be positive".to_owned(),
             });
         }
-        Ok(Self { context, interval })
+        config.config.validate()?;
+        if config.rewrite_runtime.spill_limit_bytes() != config.config.spill_limit_bytes {
+            return Err(ForgeError::InvalidConfig {
+                detail: "rewrite runtime spill limit must match Forge config".to_owned(),
+            });
+        }
+        let core = ForgeCore::new(
+            config.vala,
+            config.operator_pool,
+            config.catalog,
+            config.staging,
+            config.config,
+        )?
+        .with_object_store(config.object_store);
+        Ok(Self {
+            context: Arc::new(core),
+            interval: config.maintenance_interval,
+            hints: tokio::sync::Mutex::new(config.hints),
+            tick: tokio::sync::Mutex::new(()),
+            running: AtomicBool::new(false),
+        })
     }
 
     /// Run until `shutdown` is cancelled.
-    pub async fn run(self, shutdown: CancellationToken) -> Result<(), ForgeError> {
-        let mut ticker = tokio::time::interval(self.interval);
+    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), ForgeError> {
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(ForgeError::AlreadyRunning);
+        }
+        let _guard = RunGuard(&self.running);
+        let mut ticker =
+            tokio::time::interval_at(tokio::time::Instant::now() + self.interval, self.interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 _ = ticker.tick() => {
-                    match run_maintenance_tick_with_stop(&self.context, &shutdown).await {
+                    match self.run_tick(&shutdown).await {
                         Ok(outcome) => tracing::debug!(
                             groups_seen = outcome.groups_seen,
                             bins_committed = outcome.bins_committed,
@@ -61,13 +122,26 @@ impl ForgeScheduler {
             }
         }
     }
+
+    /// Execute one serialized full maintenance tick.
+    pub async fn run_once(&self) -> Result<ForgeTickOutcome, ForgeError> {
+        self.run_tick(&CancellationToken::new()).await
+    }
+
+    async fn run_tick(&self, stop: &CancellationToken) -> Result<ForgeTickOutcome, ForgeError> {
+        let _tick = self.tick.lock().await;
+        run_maintenance_tick_with_stop(&self.context, stop).await
+    }
+}
+
+struct RunGuard<'a>(&'a AtomicBool);
+impl Drop for RunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// Run all Forge maintenance stages once.
-pub async fn run_maintenance_tick(context: &ForgeContext) -> Result<ForgeTickOutcome, ForgeError> {
-    run_maintenance_tick_with_stop(context, &CancellationToken::new()).await
-}
-
 /// Discover and process one complete maintenance tick.
 ///
 /// Discovery and deterministic ordering happen once per tick. Each discovered
@@ -76,7 +150,7 @@ pub async fn run_maintenance_tick(context: &ForgeContext) -> Result<ForgeTickOut
 /// A database failure while discovering the table set remains a tick-level
 /// error because no safe ordered work set exists in that case.
 async fn run_maintenance_tick_with_stop(
-    context: &ForgeContext,
+    context: &ForgeCore,
     stopped: &CancellationToken,
 ) -> Result<ForgeTickOutcome, ForgeError> {
     let owner = Uuid::now_v7();
@@ -120,7 +194,7 @@ enum TableRunStatus {
 /// failure; callers receive a small status instead of a partially updated
 /// outcome so the tick can continue with the next ordered table.
 async fn process_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeTableKey,
     owner: Uuid,
     stopped: &CancellationToken,
@@ -226,7 +300,7 @@ async fn process_table(
 /// release boundary so success, cancellation, stage failure, and release
 /// failure all converge through the same conditional cleanup path.
 async fn run_table_stages(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &super::compact::ForgeTableKey,
     binding: &TenantTableBinding,
@@ -273,7 +347,7 @@ async fn run_table_stages(
     Ok(false)
 }
 
-async fn release_lease(context: &ForgeContext, lease: &ForgeLease) -> Result<(), ForgeError> {
+async fn release_lease(context: &ForgeCore, lease: &ForgeLease) -> Result<(), ForgeError> {
     let released = tokio::time::timeout(
         context.config.catalog_request_timeout,
         lease.release(&context.operator_pool),

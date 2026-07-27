@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
 
 use crate::catalog::TenantTableBinding;
 
-use super::compact::{ForgeContext, ForgeTableKey, load_table};
+use super::compact::{ForgeCore, ForgeTableKey, load_table};
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
@@ -59,7 +59,7 @@ pub fn is_gc_candidate(
 }
 
 pub(crate) async fn run_orphan_gc_for_table(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -96,7 +96,7 @@ pub(crate) struct OrphanGcOutcome {
 /// Build the live set from every retained Iceberg snapshot and every pending
 /// server-side file-list row for this exact tenant/table predicate.
 pub(crate) async fn build_live_set(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
     table: &iceberg::table::Table,
@@ -175,7 +175,7 @@ pub(crate) async fn build_live_set(
 }
 
 async fn list_gc_candidates(
-    context: &ForgeContext,
+    context: &ForgeCore,
     binding: &TenantTableBinding,
     live_set: &ProtectedLiveSet,
 ) -> Result<Vec<String>, ForgeError> {
@@ -202,7 +202,7 @@ async fn list_gc_candidates(
 }
 
 async fn delete_gc_batch(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -309,7 +309,7 @@ async fn delete_gc_batch(
 /// object delete; it avoids rebuilding the complete set for every candidate
 /// while still protecting a reference that appeared after the initial list.
 async fn path_is_referenced(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
     table: &iceberg::table::Table,
@@ -388,7 +388,7 @@ async fn path_is_referenced(
 }
 
 async fn reconcile_gc(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     key: &ForgeTableKey,
     binding: &TenantTableBinding,
@@ -409,7 +409,7 @@ async fn reconcile_gc(
 }
 
 async fn load_gc_audits(
-    context: &ForgeContext,
+    context: &ForgeCore,
     key: &ForgeTableKey,
 ) -> Result<
     (
@@ -532,7 +532,7 @@ fn paths_to_storage(paths: Vec<String>) -> Vec<StoragePath> {
 }
 
 async fn append_gc_audit(
-    context: &ForgeContext,
+    context: &ForgeCore,
     lease: &mut ForgeLease,
     tenant: DataTenantId,
     detail: &AuditDetail,

@@ -38,6 +38,7 @@ pub struct PersistenceFaults {
     object_write_delay_ms: Arc<AtomicU64>,
     object_write_active: Arc<AtomicUsize>,
     max_object_write_active: Arc<AtomicUsize>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -69,6 +70,12 @@ impl PersistenceFaults {
     #[must_use]
     pub fn max_concurrent_object_writes_for_test(&self) -> usize {
         self.max_object_write_active.load(Ordering::Acquire)
+    }
+
+    /// Return the most recent persistence error observed by a test fixture.
+    #[must_use]
+    pub fn last_error_for_test(&self) -> Option<String> {
+        self.last_error.lock().ok().and_then(|value| value.clone())
     }
 
     async fn begin_object_write(&self) -> ObjectWriteGuard {
@@ -487,6 +494,12 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
     let status = if result.is_ok() {
         "published"
     } else {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Err(error) = &result {
+            if let Ok(mut last_error) = dependencies.faults.last_error.lock() {
+                *last_error = Some(error.to_string());
+            }
+        }
         "failed"
     };
     metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);

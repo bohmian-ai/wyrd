@@ -75,7 +75,11 @@ pub(crate) async fn fetch_hot_batches(
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> Result<Vec<arrow::record_batch::RecordBatch>, WyrdError> {
-    let Some(scribe) = state.scribe.as_deref() else {
+    let Some(scribe) = state
+        .bifrost_ingest
+        .as_ref()
+        .map(|runtime| runtime.scribe())
+    else {
         return Ok(Vec::new());
     };
     let now = Utc::now();

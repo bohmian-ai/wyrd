@@ -18,6 +18,7 @@ use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
+use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool, ScribeLaneConfig,
@@ -78,19 +79,16 @@ impl PersistenceFixture {
             ScribePersistenceCpuPool::new_with_capacity(lane_config.persistence_cpu_threads, 64),
             ScribeWalIoPool::new_with_capacity(lane_config.wal_io_threads, 256),
         );
-        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
-            Arc::clone(&operator),
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            operator: Arc::clone(&operator),
             wal,
-            node_id.to_string(),
-            1,
-            ScribeBuildConfig {
-                admission,
-                coordination_runtime: tokio::runtime::Handle::current(),
-                execution_pools: pools,
-                persistence: Some(persistence),
-                memory_budget: Some(memory.scribe_budget()),
-            },
-        ));
+            stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(1)),
+            admission,
+            coordination_runtime: tokio::runtime::Handle::current(),
+            execution_pools: pools,
+            persistence: Some(persistence),
+            memory_budget: Some(memory.scribe_budget()),
+        }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
         Self {
             database,
@@ -190,19 +188,16 @@ impl PersistenceFixture {
             ScribePersistenceCpuPool::new_with_capacity(2, 64),
             ScribeWalIoPool::new_with_capacity(2, 256),
         );
-        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
-            Arc::clone(&operator),
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+            operator: Arc::clone(&operator),
             wal,
-            node_id.to_string(),
-            2,
-            ScribeBuildConfig {
-                admission,
-                coordination_runtime: tokio::runtime::Handle::current(),
-                execution_pools: pools,
-                persistence: Some(persistence),
-                memory_budget: Some(memory.scribe_budget()),
-            },
-        ));
+            stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(2)),
+            admission,
+            coordination_runtime: tokio::runtime::Handle::current(),
+            execution_pools: pools,
+            persistence: Some(persistence),
+            memory_budget: Some(memory.scribe_budget()),
+        }));
         scribe.replay_wal_async().await.expect("replay");
         Self {
             database,
@@ -228,19 +223,16 @@ fn first_replay_scribe(
         ScribePersistenceCpuPool::new_with_capacity(2, 64),
         ScribeWalIoPool::new_with_capacity(2, 256),
     );
-    Arc::new(ScribeImpl::new_with_execution_pools(
+    Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
         operator,
         wal,
-        node_id.to_string(),
-        1,
-        ScribeBuildConfig {
-            admission,
-            coordination_runtime: tokio::runtime::Handle::current(),
-            execution_pools: pools,
-            persistence: None,
-            memory_budget: Some(memory.scribe_budget()),
-        },
-    ))
+        stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(1)),
+        admission,
+        coordination_runtime: tokio::runtime::Handle::current(),
+        execution_pools: pools,
+        persistence: None,
+        memory_budget: Some(memory.scribe_budget()),
+    }))
 }
 
 async fn register_replay_tables(

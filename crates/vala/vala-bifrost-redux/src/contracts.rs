@@ -181,45 +181,6 @@ impl ScribeError {
             },
         }
     }
-
-    /// Map to the corresponding `BifrostError` variant for HTTP/MCP/CLI surfaces.
-    pub fn to_bifrost_error(&self) -> wyrd_spec::vala::error::BifrostError {
-        use wyrd_spec::vala::error::BifrostError;
-        match self {
-            Self::IngestBusy { table } => BifrostError::IngestBusy {
-                table: table.clone(),
-            },
-            Self::WalDiskFull => BifrostError::WalDiskFull,
-            Self::UnsupportedWalVersion { version } => BifrostError::Internal {
-                detail: format!("unsupported WAL version: {version}"),
-            },
-            Self::PayloadTooLarge { bytes } => BifrostError::PayloadTooLarge { bytes: *bytes },
-            Self::FingerprintMismatch { table } => BifrostError::FingerprintMismatch {
-                table: table.clone(),
-            },
-            Self::TooManyRows { rows, limit } => BifrostError::Internal {
-                detail: format!("ingest request has too many rows: {rows} > {limit}"),
-            },
-            Self::InvalidFrame | Self::CardScopeDenied | Self::CardUnresolved => {
-                BifrostError::Internal {
-                    detail: "ingest frame validation failed".to_owned(),
-                }
-            }
-            Self::IngressClosed => BifrostError::Internal {
-                detail: "ingress dispatcher is closed".to_owned(),
-            },
-            Self::ObjectStorePutFailed(e) => BifrostError::Internal {
-                detail: format!("object store PUT failed: {e}"),
-            },
-            Self::StreamMismatch { requested, actual } => BifrostError::StreamMismatch {
-                requested: requested.to_string(),
-                actual: actual.to_string(),
-            },
-            Self::Internal { detail } => BifrostError::Internal {
-                detail: detail.clone(),
-            },
-        }
-    }
 }
 
 impl From<vala_sql::SqlError> for ScribeError {
@@ -307,44 +268,5 @@ pub trait Scribe: Send + Sync {
     /// Network transports use the unary wire response with the same identity.
     async fn append(&self, req: ScribeAppend) -> Result<(), ScribeError> {
         self.append_durable(req).await.map(|_| ())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scribe_error_maps_to_wyrd_error_variants() {
-        let busy = ScribeError::IngestBusy {
-            table: "test.table".to_string(),
-        };
-        let wal_full = ScribeError::WalDiskFull;
-        let mismatch = ScribeError::FingerprintMismatch {
-            table: "test.table".to_string(),
-        };
-
-        let busy_bifrost = busy.to_bifrost_error();
-        let wal_bifrost = wal_full.to_bifrost_error();
-        let mismatch_bifrost = mismatch.to_bifrost_error();
-
-        match busy_bifrost {
-            wyrd_spec::vala::error::BifrostError::IngestBusy { table } => {
-                assert_eq!(table, "test.table");
-            }
-            _ => panic!("expected IngestBusy"),
-        }
-
-        match wal_bifrost {
-            wyrd_spec::vala::error::BifrostError::WalDiskFull => {}
-            _ => panic!("expected WalDiskFull"),
-        }
-
-        match mismatch_bifrost {
-            wyrd_spec::vala::error::BifrostError::FingerprintMismatch { table } => {
-                assert_eq!(table, "test.table");
-            }
-            _ => panic!("expected FingerprintMismatch"),
-        }
     }
 }

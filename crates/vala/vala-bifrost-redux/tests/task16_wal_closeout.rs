@@ -106,7 +106,7 @@ fn scribe(
     let scribe = vala_bifrost_redux::scribe::ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),
-        node.to_string(),
+        &node.to_string(),
         1,
     );
     (wal, scribe)

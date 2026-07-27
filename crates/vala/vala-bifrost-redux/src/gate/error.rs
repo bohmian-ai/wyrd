@@ -6,6 +6,8 @@
 //! `Status` and an HTTP `problem+json` to the same taxonomy.
 
 use wyrd_runtime::PermissionDenyReason;
+use wyrd_spec::error::WyrdError;
+use wyrd_spec::vala::error::BifrostError;
 use wyrd_tonic::tonic::{Code, Status};
 use wyrd_tonic::tonic_types::{ErrorDetails, StatusExt};
 
@@ -95,9 +97,13 @@ pub enum IngestError {
     /// The bounded ingest coordinator's local buffer is full.
     ///
     /// Local backpressure only (Q5) — no rows from this request were written.
-    /// Callers must back off and retry the full request.
-    #[error("ingest coordinator busy — local buffer full")]
-    IngestBusy,
+    /// Callers must back off and retry the full request. The table is retained
+    /// when Scribe supplied it so every transport can report the same target.
+    #[error("ingest coordinator busy for table {table} — local buffer full")]
+    IngestBusy {
+        /// Fully-qualified table whose coordinator buffer is saturated.
+        table: String,
+    },
     /// The pod-wide WAL disk breaker is open.
     #[error("ingest WAL storage is unavailable")]
     WalDiskFull,
@@ -110,60 +116,96 @@ pub enum IngestError {
 }
 
 impl IngestError {
-    /// Project this transport-neutral failure onto the derive-backed catalog.
+    /// Project the Gate taxonomy into the derive-backed public Wyrd catalog.
+    ///
+    /// This is the sole ingest identity projection. HTTP supplies the endpoint
+    /// table as `table_hint`; gRPC uses `"unknown"` only where the Gate has no
+    /// table-bearing variant. Scribe-supplied table names win over the hint so
+    /// both transports retain the same physical target without a second match
+    /// table in a serving adapter.
     #[must_use]
-    pub fn to_bifrost_error(&self) -> wyrd_spec::vala::error::BifrostError {
-        use wyrd_spec::vala::error::BifrostError;
-
+    pub fn to_wyrd_error(&self, table_hint: &str) -> WyrdError {
+        let fallback_table = || table_hint.to_owned();
+        let table = |value: &str| {
+            if value.is_empty() {
+                fallback_table()
+            } else {
+                value.to_owned()
+            }
+        };
         match self {
             Self::Unauthenticated(message) => BifrostError::IngestAuthentication {
                 message: message.clone(),
-            },
-            Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved,
-            Self::RequestValidation(message) | Self::Decode(message) => {
-                BifrostError::IngestProtocol {
-                    message: message.clone(),
-                }
             }
+            .into(),
+            Self::PrincipalUnresolved => BifrostError::PrincipalUnresolved.into(),
+            Self::RequestValidation(detail) | Self::Decode(detail) => {
+                BifrostError::OtlpRequestMalformed {
+                    table: fallback_table(),
+                    detail: detail.clone(),
+                }
+                .into()
+            }
+            Self::RbacDenied { detail } => WyrdError::PermissionDeniedRbac {
+                message: detail.clone(),
+                details: serde_json::Value::Null,
+            },
             Self::ReservedBuiltinWriteDenied { table } => {
                 BifrostError::ReservedBuiltinWriteDenied {
                     table: table.clone(),
                 }
+                .into()
             }
             Self::CardScopeDenied { card_ref } => BifrostError::CardScopeDenied {
                 card_ref: card_ref.clone(),
-            },
+            }
+            .into(),
             Self::CardUnresolved { card_ref } => BifrostError::CardUnresolved {
                 card_ref: card_ref.clone(),
-            },
-            Self::RbacDenied { detail } | Self::Internal(detail) => BifrostError::Internal {
-                detail: detail.clone(),
-            },
+            }
+            .into(),
             Self::TableNotFound { table } => BifrostError::TableNotFound {
                 table: table.clone(),
-            },
+            }
+            .into(),
             Self::SchemaMismatch { table } => BifrostError::FingerprintMismatch {
                 table: table.clone(),
-            },
+            }
+            .into(),
             Self::PayloadTooLarge { bytes, .. } => BifrostError::PayloadTooLarge {
                 bytes: usize::try_from(*bytes).unwrap_or(usize::MAX),
-            },
+            }
+            .into(),
             Self::TooManyRows { rows, limit } => BifrostError::IngestOversized {
                 rows: *rows,
                 limit: *limit,
-            },
-            Self::IngressClosed | Self::IngestBusy => BifrostError::WriterUnavailable {
-                table: "unknown".to_owned(),
-            },
-            Self::WalDiskFull => BifrostError::WalDiskFull,
+            }
+            .into(),
+            Self::IngressClosed => BifrostError::WriterUnavailable {
+                table: fallback_table(),
+            }
+            .into(),
+            Self::IngestBusy { table: value } => BifrostError::IngestBusy {
+                table: table(value),
+            }
+            .into(),
+            Self::WalDiskFull => BifrostError::WalDiskFull.into(),
+            Self::Internal(detail) => BifrostError::Internal {
+                detail: detail.clone(),
+            }
+            .into(),
         }
     }
 
-    /// Map a queued Redux Scribe result onto the transport-neutral ingest
-    /// taxonomy used by HTTP and gRPC adapters.
+    /// Map a queued Redux Scribe result onto the Gate-owned ingest taxonomy.
+    ///
+    /// This conversion retains domain context but does not choose an HTTP or
+    /// gRPC identity; [`Self::to_wyrd_error`] performs that projection once at
+    /// the serving boundary.
+    #[must_use]
     pub fn from_scribe(error: crate::contracts::ScribeError) -> Self {
         match error {
-            crate::contracts::ScribeError::IngestBusy { .. } => Self::IngestBusy,
+            crate::contracts::ScribeError::IngestBusy { table } => Self::IngestBusy { table },
             crate::contracts::ScribeError::PayloadTooLarge { bytes } => Self::PayloadTooLarge {
                 bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
                 limit: u64::try_from(crate::scribe::admission::MAX_REQUEST_BYTES)
@@ -193,46 +235,26 @@ impl IngestError {
         }
     }
 
-    /// The stable `WYRD_VALA_*` (or reused `WYRD_PERMISSION_*`) code.
-    #[must_use]
-    pub fn wyrd_code(&self) -> &'static str {
-        match self {
-            Self::RbacDenied { .. } => "WYRD_PERMISSION_403_DENIED_RBAC",
-            Self::IngestBusy => "WYRD_VALA_429_INGEST_BUSY",
-            _ => self.to_bifrost_error().code(),
-        }
-    }
-
-    /// The gRPC status code this error maps to.
+    /// Return the gRPC status class derived from the canonical Wyrd status.
     #[must_use]
     pub fn grpc_code(&self) -> Code {
-        match self {
-            Self::Unauthenticated(_) | Self::PrincipalUnresolved => Code::Unauthenticated,
-            Self::RequestValidation(_) | Self::Decode(_) => Code::InvalidArgument,
-            Self::ReservedBuiltinWriteDenied { .. }
-            | Self::CardScopeDenied { .. }
-            | Self::CardUnresolved { .. }
-            | Self::RbacDenied { .. } => Code::PermissionDenied,
-            Self::TableNotFound { .. } => Code::NotFound,
-            Self::SchemaMismatch { .. } => Code::FailedPrecondition,
-            Self::TooManyRows { .. }
-            | Self::PayloadTooLarge { .. }
-            | Self::IngestBusy
-            | Self::WalDiskFull => Code::ResourceExhausted,
-            Self::IngressClosed => Code::Unavailable,
-            Self::Internal(_) => Code::Internal,
-        }
+        grpc_code_for_wyrd(&self.to_wyrd_error("unknown"))
     }
 
-    /// Render as a `tonic::Status` with the stable code in `ErrorInfo` details.
+    /// Render as a `tonic::Status` with the canonical code in `ErrorInfo`.
+    ///
+    /// The Gate's native gRPC adapter has no endpoint table argument, so only
+    /// errors carrying their own table retain one here; OTLP/HTTP supplies its
+    /// endpoint table to [`Self::to_wyrd_error`] before response rendering.
     #[must_use]
     pub fn into_status(self) -> Status {
-        let code = self.grpc_code();
-        let reason = self.wyrd_code();
-        let message = self.to_string();
-        let details =
-            ErrorDetails::with_error_info(reason, WYRD_ERROR_DOMAIN, [] as [(String, String); 0]);
-        Status::with_error_details(code, message, details)
+        let public = self.to_wyrd_error("unknown");
+        let details = ErrorDetails::with_error_info(
+            public.code(),
+            WYRD_ERROR_DOMAIN,
+            [] as [(String, String); 0],
+        );
+        Status::with_error_details(grpc_code_for_wyrd(&public), public.to_string(), details)
     }
 
     /// Map an RBAC verdict denial into the reused RBAC code.
@@ -258,6 +280,25 @@ impl IngestError {
     }
 }
 
+/// Convert a canonical Wyrd HTTP status into the ingest gRPC class.
+///
+/// Ingest treats a schema conflict (`409`) as a failed precondition rather than
+/// `AlreadyExists`; all other statuses use the standard Wyrd transport class.
+#[must_use]
+fn grpc_code_for_wyrd(error: &WyrdError) -> Code {
+    match error.status() {
+        400 => Code::InvalidArgument,
+        401 => Code::Unauthenticated,
+        403 => Code::PermissionDenied,
+        404 => Code::NotFound,
+        409 => Code::FailedPrecondition,
+        413 | 429 | 507 => Code::ResourceExhausted,
+        500 => Code::Internal,
+        503 => Code::Unavailable,
+        _ => Code::Unknown,
+    }
+}
+
 impl From<IngestError> for Status {
     fn from(error: IngestError) -> Self {
         error.into_status()
@@ -267,84 +308,249 @@ impl From<IngestError> for Status {
 #[cfg(test)]
 mod tests {
     use super::IngestError;
+    use crate::contracts::ScribeError;
+    use wyrd_tonic::tonic::Code;
+    use wyrd_tonic::tonic_types::StatusExt;
 
-    #[test]
-    fn every_ingest_error_has_the_expected_stable_identity() {
-        let cases = [
+    /// Build the complete Gate error matrix used by both transport tests.
+    fn ingest_cases() -> Vec<(IngestError, &'static str, u16, Code)> {
+        let mut cases = access_cases();
+        cases.extend(catalog_cases());
+        cases.extend(capacity_cases());
+        cases.extend(lifecycle_cases());
+        cases
+    }
+
+    /// Build authentication and authorization cases for the ingest matrix.
+    fn access_cases() -> Vec<(IngestError, &'static str, u16, Code)> {
+        vec![
             (
                 IngestError::Unauthenticated("bad token".to_owned()),
                 "WYRD_VALA_401_INGEST_AUTH",
+                401,
+                Code::Unauthenticated,
             ),
             (
                 IngestError::RequestValidation("bad request".to_owned()),
-                "WYRD_VALA_400_INGEST_PROTO",
+                "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+                400,
+                Code::InvalidArgument,
             ),
             (
                 IngestError::ReservedBuiltinWriteDenied {
                     table: "t".to_owned(),
                 },
                 "WYRD_VALA_403_BIFROST_RESERVED_BUILTIN_WRITE",
+                403,
+                Code::PermissionDenied,
             ),
             (
                 IngestError::CardScopeDenied {
                     card_ref: "c".to_owned(),
                 },
                 "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+                403,
+                Code::PermissionDenied,
             ),
             (
                 IngestError::CardUnresolved {
                     card_ref: "c".to_owned(),
                 },
                 "WYRD_VALA_403_CARD_UNRESOLVED",
+                403,
+                Code::PermissionDenied,
             ),
             (
                 IngestError::PrincipalUnresolved,
                 "WYRD_VALA_401_PRINCIPAL_UNRESOLVED",
+                401,
+                Code::Unauthenticated,
             ),
             (
                 IngestError::RbacDenied {
                     detail: "denied".to_owned(),
                 },
                 "WYRD_PERMISSION_403_DENIED_RBAC",
+                403,
+                Code::PermissionDenied,
             ),
+        ]
+    }
+
+    /// Build catalog lookup and schema-conflict cases for the ingest matrix.
+    fn catalog_cases() -> Vec<(IngestError, &'static str, u16, Code)> {
+        vec![
             (
                 IngestError::TableNotFound {
                     table: "t".to_owned(),
                 },
                 "WYRD_VALA_404_BIFROST_TABLE_NOT_FOUND",
+                404,
+                Code::NotFound,
             ),
             (
                 IngestError::SchemaMismatch {
                     table: "t".to_owned(),
                 },
                 "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+                409,
+                Code::FailedPrecondition,
             ),
+        ]
+    }
+
+    /// Build request-size and WAL-capacity cases for the ingest matrix.
+    fn capacity_cases() -> Vec<(IngestError, &'static str, u16, Code)> {
+        vec![
             (
                 IngestError::PayloadTooLarge { bytes: 2, limit: 1 },
                 "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+                413,
+                Code::ResourceExhausted,
             ),
             (
                 IngestError::TooManyRows { rows: 2, limit: 1 },
                 "WYRD_VALA_413_INGEST_OVERSIZED",
+                413,
+                Code::ResourceExhausted,
             ),
+            (
+                IngestError::WalDiskFull,
+                "WYRD_VALA_507_WAL_DISK_FULL",
+                507,
+                Code::ResourceExhausted,
+            ),
+        ]
+    }
+
+    /// Build writer-lifecycle and internal-failure cases for the ingest matrix.
+    fn lifecycle_cases() -> Vec<(IngestError, &'static str, u16, Code)> {
+        vec![
             (
                 IngestError::IngressClosed,
                 "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
+                503,
+                Code::Unavailable,
             ),
-            (IngestError::IngestBusy, "WYRD_VALA_429_INGEST_BUSY"),
-            (IngestError::WalDiskFull, "WYRD_VALA_507_WAL_DISK_FULL"),
+            (
+                IngestError::IngestBusy {
+                    table: "t".to_owned(),
+                },
+                "WYRD_VALA_429_INGEST_BUSY",
+                429,
+                Code::ResourceExhausted,
+            ),
             (
                 IngestError::Decode("bad".to_owned()),
-                "WYRD_VALA_400_INGEST_PROTO",
+                "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+                400,
+                Code::InvalidArgument,
             ),
             (
                 IngestError::Internal("broken".to_owned()),
                 "WYRD_VALA_500_BIFROST_INTERNAL",
+                500,
+                Code::Internal,
+            ),
+        ]
+    }
+
+    /// Assert that every ingest condition has one Wyrd identity and matching
+    /// gRPC status/ErrorInfo projection.
+    #[test]
+    fn every_ingest_error_has_one_transport_projection() {
+        for (error, expected_code, expected_status, expected_grpc) in ingest_cases() {
+            let public = error.to_wyrd_error("vala.traces.spans");
+            assert_eq!(public.code(), expected_code, "identity drift for {error}");
+            assert_eq!(public.status(), expected_status, "status drift for {error}");
+
+            let grpc = error.into_status();
+            assert_eq!(grpc.code(), expected_grpc, "gRPC drift for {public}");
+            let info = grpc
+                .get_details_error_info()
+                .expect("canonical ingest status carries ErrorInfo");
+            assert_eq!(info.reason, expected_code, "ErrorInfo drift for {public}");
+        }
+    }
+
+    /// Assert that Scribe remains domain-only while Gate supplies stable
+    /// transport identity and preserves the Scribe-provided table where present.
+    #[test]
+    fn scribe_errors_project_through_gate_without_fallback_identity() {
+        let cases = [
+            (
+                ScribeError::IngestBusy {
+                    table: "vala.metrics.points".to_owned(),
+                },
+                "WYRD_VALA_429_INGEST_BUSY",
+                "vala.metrics.points",
+            ),
+            (
+                ScribeError::PayloadTooLarge { bytes: 2 },
+                "WYRD_VALA_413_PAYLOAD_TOO_LARGE",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::FingerprintMismatch {
+                    table: "vala.logs.records".to_owned(),
+                },
+                "WYRD_VALA_409_BIFROST_FINGERPRINT_MISMATCH",
+                "vala.logs.records",
+            ),
+            (
+                ScribeError::TooManyRows { rows: 2, limit: 1 },
+                "WYRD_VALA_413_INGEST_OVERSIZED",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::InvalidFrame,
+                "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::CardScopeDenied,
+                "WYRD_VALA_403_BIFROST_CARD_SCOPE",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::CardUnresolved,
+                "WYRD_VALA_403_CARD_UNRESOLVED",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::IngressClosed,
+                "WYRD_VALA_503_BIFROST_WRITER_UNAVAILABLE",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::WalDiskFull,
+                "WYRD_VALA_507_WAL_DISK_FULL",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::UnsupportedWalVersion { version: 2 },
+                "WYRD_VALA_500_BIFROST_INTERNAL",
+                "vala.traces.spans",
+            ),
+            (
+                ScribeError::Internal {
+                    detail: "broken".to_owned(),
+                },
+                "WYRD_VALA_500_BIFROST_INTERNAL",
+                "vala.traces.spans",
             ),
         ];
 
-        for (error, expected) in cases {
-            assert_eq!(error.wyrd_code(), expected, "identity drift for {error}");
+        for (scribe_error, expected_code, table) in cases {
+            let ingest_error = IngestError::from_scribe(scribe_error);
+            let public = ingest_error.to_wyrd_error(table);
+            assert_eq!(public.code(), expected_code);
+            if expected_code == "WYRD_VALA_429_INGEST_BUSY" {
+                assert_eq!(
+                    public.to_string(),
+                    "ingest writer busy: vala.metrics.points"
+                );
+            }
         }
     }
 }

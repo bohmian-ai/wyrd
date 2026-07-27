@@ -37,7 +37,7 @@ use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
 use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
-use crate::state::{AppState, ProductionValidationError};
+use crate::state::{AppState, BifrostIngestRuntime, ProductionValidationError};
 
 /// Caller-supplied overrides applied to core `AppState` before
 /// `production_validate`. Enterprise uses this to inject a real ABAC policy
@@ -51,6 +51,20 @@ pub struct StateOverrides {
     pub authz: Option<ServerAuthz>,
     /// Replace the eval audit writer.
     pub eval_audit: Option<Arc<dyn EvalAuditWriter>>,
+}
+
+/// Holds unmounted Bifrost dependencies while boot creates authentication.
+///
+/// This private boot value never reaches request handling. Once authentication
+/// exists, [`build_state`] consumes it to create one complete
+/// [`BifrostIngestRuntime`].
+struct BifrostIngestParts {
+    /// State without an ingest subsystem.
+    state: AppState,
+    /// Recovered Scribe allocation that Gate must wrap.
+    scribe: Arc<ScribeImpl>,
+    /// Dedicated runtime that owns Scribe coordination tasks.
+    coordination_runtime: Arc<tokio::runtime::Runtime>,
 }
 
 /// Errors raised while assembling server state.
@@ -174,6 +188,21 @@ pub async fn build_app_state_from_boot_with_config(
     boot: &PostgresBoot,
     scribe_config: crate::config::ScribeRuntimeConfig,
 ) -> Result<AppState, ServerBootError> {
+    Ok(build_bifrost_parts_from_boot(boot, scribe_config)
+        .await?
+        .state)
+}
+
+/// Builds state plus unmounted Scribe dependencies for the authenticated boot path.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError`] when database, storage, catalog, WAL, execution
+/// pool, recovery, or Forge setup fails.
+async fn build_bifrost_parts_from_boot(
+    boot: &PostgresBoot,
+    scribe_config: crate::config::ScribeRuntimeConfig,
+) -> Result<BifrostIngestParts, ServerBootError> {
     scribe_config.validate().map_err(ServerBootError::Scribe)?;
     let dsns = boot.dsns()?;
     let postgres = Arc::new(ServerPostgres::connect_from_boot(boot).await?);
@@ -288,23 +317,20 @@ pub async fn build_app_state_from_boot_with_config(
         ScribeWalIoPool::try_new_with_capacity(scribe_config.wal_io_threads, 256)
             .map_err(|error| ServerBootError::Scribe(format!("WAL IO pool failed: {error}")))?,
     );
-    let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
-        Arc::new(storage.operator().clone()),
+    let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+        operator: Arc::new(storage.operator().clone()),
         wal,
-        stream.node_id.to_string(),
-        stream.writer_epoch.as_i64(),
-        ScribeBuildConfig {
-            admission,
-            coordination_runtime: coordination_runtime.handle().clone(),
-            execution_pools,
-            persistence: Some(ScribePersistenceConfig::new(
-                Arc::new(postgres.vala().clone()),
-                64,
-                scribe_config.wal_io_threads,
-            )),
-            memory_budget: Some(bifrost_memory.scribe_budget()),
-        },
-    ));
+        stream,
+        admission,
+        coordination_runtime: coordination_runtime.handle().clone(),
+        execution_pools,
+        persistence: Some(ScribePersistenceConfig::new(
+            Arc::new(postgres.vala().clone()),
+            64,
+            scribe_config.wal_io_threads,
+        )),
+        memory_budget: Some(bifrost_memory.scribe_budget()),
+    }));
     match scribe.replay_wal_async().await {
         Ok(replayed_generations) => {
             tracing::info!(replayed_generations, "Scribe WAL recovery complete");
@@ -326,12 +352,15 @@ pub async fn build_app_state_from_boot_with_config(
     )?
     .with_memory_governor(bifrost_memory.clone());
 
-    Ok(AppState::new(postgres, storage, bifrost)
+    let state = AppState::new(postgres, storage, bifrost)
         .with_bifrost_redux(bifrost_redux)
         .with_bifrost_memory(bifrost_memory)
-        .with_forge_context(forge_context)
-        .with_scribe(scribe)
-        .with_scribe_coordination_runtime(coordination_runtime))
+        .with_forge_context(forge_context);
+    Ok(BifrostIngestParts {
+        state,
+        scribe,
+        coordination_runtime,
+    })
 }
 
 /// Emit pre-telemetry warnings for relaxed config that is still safe to run.
@@ -372,7 +401,8 @@ pub async fn build_state(
     let shutdown = CancellationToken::new();
 
     let boot = PostgresBoot::from_env().await?;
-    let state = build_app_state_from_boot_with_config(&boot, config.scribe).await?;
+    let bifrost_parts = build_bifrost_parts_from_boot(&boot, config.scribe).await?;
+    let state = bifrost_parts.state;
     let sealing_key = build_sealing_key(config)?;
 
     let state = attach_config_fields(state, config, shutdown, telemetry)?;
@@ -382,24 +412,18 @@ pub async fn build_state(
         .token_verifier
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires a token verifier".to_owned()))?;
-    let scribe = state
-        .scribe
-        .clone()
-        .ok_or_else(|| ServerBootError::Scribe("Gate requires Scribe".to_owned()))?;
     let bifrost_redux = state
         .bifrost_redux
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
-    let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+    let ingest = Arc::new(BifrostIngestRuntime::new(
+        bifrost_parts.scribe,
         bifrost_redux,
-        scribe.clone(),
-        vala_bifrost_redux::gate::auth::ingest_auth_interceptor(verifier),
+        verifier,
         vala_bifrost_redux::gate::limits::IngestLimits::default(),
-        Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-            scribe.ingress_cpu_pool(),
-        )),
+        Some(bifrost_parts.coordination_runtime),
     ));
-    let state = state.with_gate(gate);
+    let state = state.with_bifrost_ingest(ingest);
     seed_federation(&state, config, sealing_key.as_deref()).await?;
 
     // Install the real authz audit writer as the OSS default. Callers can

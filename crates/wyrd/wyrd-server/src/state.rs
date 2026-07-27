@@ -8,7 +8,11 @@ use datafusion::execution::memory_pool::MemoryPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::ForgeContext;
+use vala_bifrost_redux::gate::IngressCpuProjection;
+use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
+use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use wyrd_auth_verify::TokenVerifier;
@@ -32,6 +36,86 @@ pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolv
 /// Production Gate specialization used by AppState.
 pub type ServerGate =
     vala_bifrost_redux::gate::Gate<BifrostCatalog, SqlPermissionResolver, PgIssuerResolver>;
+
+/// Owns one completely wired Bifrost ingest subsystem for a server process.
+///
+/// The runtime retains the exact Scribe allocation provided to Gate, its
+/// coordination runtime, and the resulting Gate. Keeping the three values
+/// together prevents a request path, a test seam, and shutdown from selecting
+/// different writers.
+#[derive(Clone)]
+pub struct BifrostIngestRuntime {
+    /// Durable Scribe implementation used by every Gate dispatch and lifecycle path.
+    scribe: Arc<ScribeImpl>,
+    /// Protocol and policy boundary built around [`Self::scribe`].
+    gate: Arc<ServerGate>,
+    /// Optional dedicated runtime that owns Scribe coordination tasks in production.
+    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+impl BifrostIngestRuntime {
+    /// Builds Gate around the exact Scribe allocation retained by this runtime.
+    ///
+    /// The projection shares Scribe's bounded ingress CPU lane, while an
+    /// optional runtime keeps server-created coordination consumers alive.
+    #[must_use]
+    pub fn new(
+        scribe: Arc<ScribeImpl>,
+        catalog: Arc<BifrostCatalog>,
+        verifier: Arc<WyrdTokenVerifier>,
+        limits: IngestLimits,
+        coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    ) -> Self {
+        let gate_scribe: Arc<dyn Scribe> = scribe.clone();
+        let gate = Arc::new(ServerGate::with_scribe_and_projection(
+            catalog,
+            gate_scribe,
+            ingest_auth_interceptor(verifier),
+            limits,
+            Arc::new(IngressCpuProjection::new(scribe.ingress_cpu_pool())),
+        ));
+        Self {
+            scribe,
+            gate,
+            coordination_runtime,
+        }
+    }
+
+    /// Returns the Gate mounted by gRPC and HTTP ingest routes.
+    #[must_use]
+    pub fn gate(&self) -> Arc<ServerGate> {
+        Arc::clone(&self.gate)
+    }
+
+    /// Borrows the Scribe used by the Gate and lifecycle paths.
+    #[must_use]
+    pub fn scribe(&self) -> &Arc<ScribeImpl> {
+        &self.scribe
+    }
+
+    /// Reports whether the ingest writer has completed recovery and can accept work.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.scribe.is_ready()
+    }
+
+    /// Closes Gate before draining the shared Scribe allocation.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation after Gate closes can leave accepted Scribe work draining;
+    /// callers should retry shutdown until the server lifecycle completes.
+    pub async fn shutdown(&self) {
+        self.gate.close();
+        self.scribe.shutdown().await;
+    }
+
+    /// Returns whether this runtime retains a dedicated coordination executor.
+    #[must_use]
+    pub fn has_dedicated_coordination_runtime(&self) -> bool {
+        self.coordination_runtime.is_some()
+    }
+}
 
 /// Runtime-ready limits derived from config.
 #[derive(Debug, Clone, Copy)]
@@ -74,14 +158,8 @@ pub struct AppState {
     pub bifrost_memory: Option<BifrostMemoryGovernor>,
     /// Shared DataFusion pool bounded by the Bifrost parent ceiling.
     pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
-    /// Private lifecycle handle for the booted Scribe runtime. Request handlers
-    /// use `gate`; this field exists only for startup recovery and shutdown.
-    pub(crate) scribe: Option<Arc<ScribeImpl>>,
-    /// Fully constructed native Bifrost Gate. Production boot installs this
-    /// before any listener can bind; test-only states may leave it absent.
-    pub gate: Option<Arc<ServerGate>>,
-    /// Dedicated Tokio runtime that owns Scribe coordination consumers.
-    pub(crate) scribe_coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
+    pub bifrost_ingest: Option<Arc<BifrostIngestRuntime>>,
     /// Shared Redux Forge context built from the process-wide catalog and storage.
     pub forge_context: Option<Arc<ForgeContext>>,
     /// Interval used by the supervised Forge worker.
@@ -124,9 +202,7 @@ impl AppState {
             bifrost_redux: None,
             bifrost_memory: None,
             bifrost_query_memory: None,
-            scribe: None,
-            gate: None,
-            scribe_coordination_runtime: None,
+            bifrost_ingest: None,
             forge_context: None,
             forge_interval: Duration::from_secs(60),
             auth: ServerAuth::default(),
@@ -231,28 +307,13 @@ impl AppState {
         self
     }
 
-    /// Attach the server-owned queued Scribe runtime.
+    /// Attach one complete, internally consistent Bifrost ingest subsystem.
+    ///
+    /// No separate Gate or Scribe setters exist, so callers cannot mount a Gate
+    /// around a writer that lifecycle and test controls do not also own.
     #[must_use]
-    pub fn with_scribe(mut self, scribe: Arc<ScribeImpl>) -> Self {
-        self.scribe = Some(scribe);
-        self
-    }
-
-    /// Attach the fully constructed server-owned Gate.
-    #[must_use]
-    pub fn with_gate(mut self, gate: Arc<ServerGate>) -> Self {
-        self.gate = Some(gate);
-        self
-    }
-
-    /// Keep the dedicated Scribe coordination runtime alive with application
-    /// state until the server performs its shutdown drain.
-    #[must_use]
-    pub fn with_scribe_coordination_runtime(
-        mut self,
-        runtime: Arc<tokio::runtime::Runtime>,
-    ) -> Self {
-        self.scribe_coordination_runtime = Some(runtime);
+    pub fn with_bifrost_ingest(mut self, runtime: Arc<BifrostIngestRuntime>) -> Self {
+        self.bifrost_ingest = Some(runtime);
         self
     }
 
@@ -276,27 +337,27 @@ impl AppState {
         &self,
         mut conn: vala_sql::TenantConn<'_>,
     ) -> Result<(), vala_bifrost_redux::contracts::ScribeError> {
-        let Some(scribe) = &self.scribe else {
+        let Some(runtime) = &self.bifrost_ingest else {
             return Err(vala_bifrost_redux::contracts::ScribeError::Internal {
                 detail: "Scribe is not configured".to_owned(),
             });
         };
-        let post_commit = scribe.force_seal(&mut conn).await?;
+        let post_commit = runtime.scribe().force_seal(&mut conn).await?;
         conn.commit().await.map_err(|error| {
             vala_bifrost_redux::contracts::ScribeError::Internal {
                 detail: error.to_string(),
             }
         })?;
-        scribe.complete_post_commit(post_commit).await
+        runtime.scribe().complete_post_commit(post_commit).await
     }
 
     /// Trip the Scribe WAL breaker for a deterministic test-tier probe.
     #[cfg(feature = "test-support")]
     pub fn trip_scribe_wal_disk_full_for_test(&self) -> Result<(), String> {
-        let Some(scribe) = &self.scribe else {
+        let Some(runtime) = &self.bifrost_ingest else {
             return Err("Scribe is not configured".to_owned());
         };
-        scribe.trip_wal_disk_full_for_test();
+        runtime.scribe().trip_wal_disk_full_for_test();
         Ok(())
     }
 
@@ -305,10 +366,11 @@ impl AppState {
     pub fn scribe_inspection_snapshot_for_test(
         &self,
     ) -> Result<vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot, String> {
-        let Some(scribe) = &self.scribe else {
+        let Some(runtime) = &self.bifrost_ingest else {
             return Err("Scribe is not configured".to_owned());
         };
-        scribe
+        runtime
+            .scribe()
             .inspection_snapshot()
             .map_err(|error| error.to_string())
     }

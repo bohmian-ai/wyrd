@@ -77,7 +77,7 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
         )
         .expect("WAL writer"),
     );
-    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, Uuid::nil().to_string(), 1);
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
 
     let admission = scribe
         .append_durable(ScribeAppend {
@@ -172,7 +172,7 @@ async fn oracle_hot_snapshot_preserves_pointer_identity_and_day_isolation() {
         )
         .expect("WAL writer"),
     );
-    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, Uuid::nil().to_string(), 1);
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &Uuid::nil().to_string(), 1);
     scribe
         .append_durable(ScribeAppend {
             principal: principal(tenant),
@@ -376,7 +376,7 @@ async fn shard_wal_failure_reaches_the_durable_completion() {
     let scribe = ScribeImpl::new_for_embedded_with_deps(
         operator,
         Arc::clone(&wal),
-        Uuid::nil().to_string(),
+        &Uuid::nil().to_string(),
         1,
     );
     let rows = batch(day);

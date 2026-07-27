@@ -155,6 +155,13 @@ cargo test --locked -p wyrd-testing --test integration -- task15_inspection --ig
 cargo test --locked -p wyrd-testing --test integration -- otlp_negative_journeys --test-threads=1
 """
 
+[tasks."test:bifrost:ingest-runtime"]
+hide = true
+description = "Run the focused Gate/Scribe server-owned ingest runtime journey"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw" }
+run = "cargo test --locked -p wyrd-testing --test integration -- bifrost_ingest_runtime_journey --test-threads=1"
+
 [tasks."test:bifrost:inspection"]
 description = "Run the fixed-shard and 1,000-key Task-15 inspection harness"
 depends = ["setup:postgres", "db:migrate"]

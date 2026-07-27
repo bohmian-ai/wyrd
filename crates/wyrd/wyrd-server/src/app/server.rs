@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -336,7 +337,12 @@ impl BoundServer {
                 shutdown.clone(),
             ),
         ));
-        if let Some(scribe) = self.state.scribe.clone() {
+        if let Some(scribe) = self
+            .state
+            .bifrost_ingest
+            .as_ref()
+            .map(|runtime| Arc::clone(runtime.scribe()))
+        {
             let shutdown = shutdown.clone();
             set.spawn(worker_task(
                 TaskId::Worker("scribe_age_scanner"),
@@ -413,11 +419,8 @@ impl BoundServer {
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
         let terminal = supervise(set, shutdown, drain).await;
 
-        if let Some(gate) = &self.state.gate {
-            gate.close();
-        }
-        if let Some(scribe) = &self.state.scribe {
-            scribe.shutdown().await;
+        if let Some(runtime) = &self.state.bifrost_ingest {
+            runtime.shutdown().await;
         }
 
         tracing::info!("wyrd-server shutdown complete");
@@ -438,8 +441,6 @@ mod pg_tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tempfile::tempdir;
     use uuid::Uuid;
-    use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
-    use vala_bifrost_redux::gate::limits::IngestLimits;
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         wal::{WalConfig, WalWriter},
@@ -452,6 +453,7 @@ mod pg_tests {
     use crate::components::auth::ServerAuth;
     use crate::config::WyrdServerConfig;
     use crate::postgres::ServerPostgres;
+    use crate::state::BifrostIngestRuntime;
 
     async fn test_state_with_auth() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());
@@ -498,22 +500,19 @@ mod pg_tests {
         let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
             wal,
-            Uuid::now_v7().to_string(),
+            &Uuid::now_v7().to_string(),
             1,
         ));
-        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
             Arc::clone(&redux_catalog),
-            scribe.clone(),
-            ingest_auth_interceptor(Arc::clone(&verifier)),
-            IngestLimits::default(),
-            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                scribe.ingress_cpu_pool(),
-            )),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
         ));
         AppState::new(postgres, storage, catalog)
             .with_bifrost_redux(redux_catalog)
-            .with_scribe(scribe)
-            .with_gate(gate)
+            .with_bifrost_ingest(ingest)
             .with_auth(ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(verifier),

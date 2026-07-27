@@ -247,20 +247,30 @@ impl ImmutableGeneration {
 /// Completion sent through the owning shard command queue.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistenceCompletion {
+    /// Generation identity reconciled by the owning shard.
     pub(crate) generation_id: GenerationId,
+    /// Durable file-list key when publication succeeded.
     pub(crate) file_list_key: Option<FileListCommitKey>,
+    /// WAL segments retained until shard retirement.
     pub(crate) wal_segments: Vec<WalSegmentRef>,
+    /// WAL handle required for grace-ordered retirement.
     pub(crate) wal: crate::scribe::wal::WalHandle,
+    /// Arrow bytes released after the generation becomes retireable.
     pub(crate) arrow_bytes: usize,
+    /// Persistence detail when one durable stage failed.
     pub(crate) error: Option<String>,
 }
 
 /// One immutable generation submitted to the bounded persistence queue.
 #[derive(Debug)]
 pub(crate) struct PersistenceJob {
+    /// Immutable generation sent to a persistence worker.
     pub(crate) generation: Arc<ImmutableGeneration>,
+    /// Tenant/table binding used for object and SQL publication.
     pub(crate) binding: TenantTableBinding,
+    /// Owning shard mailbox for completion reconciliation.
     pub(crate) completion_tx: mpsc::Sender<crate::scribe::shards::ShardCommand>,
+    /// Optional caller waiter for explicit post-commit completion.
     pub(crate) completion_waiter: Option<oneshot::Sender<Result<(), String>>>,
 }
 
@@ -310,13 +320,21 @@ impl ScribePersistenceConfig {
 }
 
 pub(crate) struct PersistenceRuntimeContext {
+    /// Object-store operator shared by persistence workers.
     pub(crate) operator: Arc<opendal::Operator>,
+    /// WAL writer used for manifest location and recovery identity.
     pub(crate) wal: Arc<WalWriter>,
+    /// Bounded CPU lane used to encode immutable generations.
     pub(crate) persistence_cpu: ScribePersistenceCpuPool,
+    /// Bounded WAL lane used to advance manifests.
     pub(crate) wal_io: ScribeWalIoPool,
+    /// Pod identity used in staged object and file-list keys.
     pub(crate) node_id: String,
+    /// Writer epoch used to distinguish concurrent pod writers.
     pub(crate) writer_epoch: i64,
+    /// Scribe child budget used for per-job workspace reservations.
     pub(crate) memory: ScribeMemoryBudget,
+    /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
 }
@@ -356,29 +374,17 @@ impl PersistenceRuntime {
             drained: Arc::new(Notify::new()),
         });
         let receiver = Arc::new(tokio::sync::Mutex::new(receiver));
-        let dependencies = Arc::new(PersistenceDependencies {
-            postgres: config.postgres,
-            operator: context.operator,
-            wal: context.wal,
-            persistence_cpu: context.persistence_cpu,
-            wal_io: context.wal_io,
-            node_id: context.node_id,
-            writer_epoch: context.writer_epoch,
-            memory: context.memory,
-            #[cfg(any(test, feature = "test-support"))]
-            faults: context.faults,
-            manifest_guard: tokio::sync::Mutex::new(()),
-        });
+        let worker = Arc::new(PersistenceWorker::new(config.postgres, context));
         for _ in 0..config.workers {
             let receiver = Arc::clone(&receiver);
-            let dependencies = Arc::clone(&dependencies);
+            let worker = Arc::clone(&worker);
             let state = Arc::clone(&runtime_state);
             runtime.spawn(async move {
                 loop {
                     let job = receiver.lock().await.recv().await;
                     let Some(job) = job else { break };
                     let queued_bytes = job.generation.arrow_bytes;
-                    process_job(*job, &dependencies).await;
+                    worker.process_job(*job).await;
                     state.queued.fetch_sub(1, Ordering::AcqRel);
                     state.queued_bytes.fetch_sub(queued_bytes, Ordering::AcqRel);
                     metrics::gauge!("bifrost_scribe_persistence_queue_depth").set(
@@ -466,187 +472,261 @@ impl PersistenceRuntime {
     }
 }
 
-struct PersistenceDependencies {
+/// Owns the dependencies and durable workflow for one persistence worker.
+///
+/// Workers share the bounded queue but keep all object-store, SQL, WAL, memory,
+/// retry-fault, and manifest-ordering state behind this concrete owner. The
+/// manifest mutex serializes publication while independent workers may encode
+/// and upload different generations.
+struct PersistenceWorker {
+    /// Vala Postgres handle used for tenant-scoped file-list transactions.
     postgres: Arc<ValaPostgres>,
+    /// Object-store operator used for staged Parquet writes.
     operator: Arc<opendal::Operator>,
+    /// WAL writer retained for manifest location and generation recovery.
     wal: Arc<WalWriter>,
+    /// Bounded CPU lane used for Parquet encoding.
     persistence_cpu: ScribePersistenceCpuPool,
+    /// Bounded filesystem lane used for manifest advancement.
     wal_io: ScribeWalIoPool,
+    /// Pod identity embedded in object paths and file-list rows.
     node_id: String,
+    /// Writer epoch embedded in file-list rows and manifests.
     writer_epoch: i64,
+    /// Scribe memory budget for persistence workspace reservations.
     memory: ScribeMemoryBudget,
+    /// Test-only fault points for deterministic persistence-path coverage.
     #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
+    /// Serializes manifest publication after SQL commit.
     manifest_guard: tokio::sync::Mutex<()>,
 }
 
-async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies) {
-    let generation = Arc::clone(&job.generation);
-    tracing::debug!(
-        generation_id = generation.generation_id.0,
-        seal_key = %generation.seal_key,
-        wal_lsn_min = generation.wal_lsn_min.as_u64(),
-        wal_lsn_max = generation.wal_lsn_max.as_u64(),
-        "persisting immutable Scribe generation"
-    );
-    let workspace_bytes = generation
-        .arrow_bytes
-        .saturating_mul(2)
-        .saturating_add(8 * 1024 * 1024);
-    let result = match dependencies
-        .memory
-        .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
-    {
-        Ok(mut reservation) => {
-            reservation.attach_shard(
-                dependencies.memory.shard_accounting(),
-                crate::scribe::routing::shard_for(
-                    generation.seal_key.tenant,
-                    &generation.seal_key.table,
-                ),
-            );
-            let result = persist_once(&generation, &job.binding, dependencies).await;
-            drop(reservation);
-            result
+impl PersistenceWorker {
+    /// Builds a persistence worker from its complete durable dependencies.
+    fn new(postgres: Arc<ValaPostgres>, context: PersistenceRuntimeContext) -> Self {
+        Self {
+            postgres,
+            operator: context.operator,
+            wal: context.wal,
+            persistence_cpu: context.persistence_cpu,
+            wal_io: context.wal_io,
+            node_id: context.node_id,
+            writer_epoch: context.writer_epoch,
+            memory: context.memory,
+            #[cfg(any(test, feature = "test-support"))]
+            faults: context.faults,
+            manifest_guard: tokio::sync::Mutex::new(()),
         }
-        Err(error) => Err(error),
-    };
-    let status = if result.is_ok() {
-        "published"
-    } else {
-        #[cfg(any(test, feature = "test-support"))]
-        if let Err(error) = &result
-            && let Ok(mut last_error) = dependencies.faults.last_error.lock()
-        {
-            *last_error = Some(error.to_string());
-        }
-        "failed"
-    };
-    metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);
-    let published_at = std::time::Instant::now();
-    metrics::histogram!("bifrost_scribe_persistence_publication_seconds").record(
-        published_at
-            .duration_since(generation.closed_at)
-            .as_secs_f64(),
-    );
-    let completion = match result {
-        Ok(file_list_key) => PersistenceCompletion {
-            generation_id: generation.generation_id,
-            file_list_key: Some(file_list_key),
-            wal_segments: generation.wal_segments.clone(),
-            wal: generation.wal.clone(),
-            arrow_bytes: generation.arrow_bytes,
-            error: None,
-        },
-        Err(error) => PersistenceCompletion {
-            generation_id: generation.generation_id,
-            file_list_key: None,
-            wal_segments: generation.wal_segments.clone(),
-            wal: generation.wal.clone(),
-            arrow_bytes: generation.arrow_bytes,
-            error: Some(error.to_string()),
-        },
-    };
-    if job
-        .completion_tx
-        .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
-            completion: Box::new(completion),
-            waiter: job.completion_waiter,
-        })
-        .await
-        .is_err()
-    {
-        metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
     }
-}
 
-async fn persist_once(
-    generation: &ImmutableGeneration,
-    binding: &TenantTableBinding,
-    dependencies: &PersistenceDependencies,
-) -> Result<FileListCommitKey, ScribeError> {
-    let frozen = generation.frozen_snapshot();
-    let mut encoded = match dependencies
-        .persistence_cpu
-        .submit(ScribePersistenceCpuOp::EncodeParquet {
-            frozen: Box::new(frozen.clone()),
-            binding: binding.clone(),
-            tenant: binding.tenant,
-        })
-        .await?
-    {
-        ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
-        ScribePersistenceCpuResult::Prepared(_) | ScribePersistenceCpuResult::ReplayRestored(_) => {
+    /// Processes one queued generation and reports completion to its shard.
+    ///
+    /// The method reserves bounded workspace, performs the ordered persistence
+    /// stages, and always sends a completion outcome back to the owning shard.
+    /// A failed stage leaves the immutable generation retained for retry; an
+    /// interrupted task may have already written an idempotent object or SQL
+    /// row and is reconciled by replay.
+    ///
+    /// # Errors
+    ///
+    /// Persistence errors are captured in the completion sent to the shard;
+    /// channel delivery failure is recorded as a dropped completion metric.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation can occur after object or SQL side effects. The shard keeps
+    /// the generation pending and WAL replay reconciles any partial progress.
+    async fn process_job(&self, job: PersistenceJob) {
+        let generation = Arc::clone(&job.generation);
+        tracing::debug!(
+            generation_id = generation.generation_id.0,
+            seal_key = %generation.seal_key,
+            wal_lsn_min = generation.wal_lsn_min.as_u64(),
+            wal_lsn_max = generation.wal_lsn_max.as_u64(),
+            "persisting immutable Scribe generation"
+        );
+        let workspace_bytes = generation
+            .arrow_bytes
+            .saturating_mul(2)
+            .saturating_add(8 * 1024 * 1024);
+        let result = match self
+            .memory
+            .try_reserve_maintenance(MemoryCategory::Persistence, workspace_bytes)
+        {
+            Ok(mut reservation) => {
+                reservation.attach_shard(
+                    self.memory.shard_accounting(),
+                    crate::scribe::routing::shard_for(
+                        generation.seal_key.tenant,
+                        &generation.seal_key.table,
+                    ),
+                );
+                let result = self.persist_once(&generation, &job.binding).await;
+                drop(reservation);
+                result
+            }
+            Err(error) => Err(error),
+        };
+        let status = if result.is_ok() {
+            "published"
+        } else {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Err(error) = &result
+                && let Ok(mut last_error) = self.faults.last_error.lock()
+            {
+                *last_error = Some(error.to_string());
+            }
+            "failed"
+        };
+        metrics::counter!("bifrost_scribe_persistence_jobs_total", "status" => status).increment(1);
+        let published_at = std::time::Instant::now();
+        metrics::histogram!("bifrost_scribe_persistence_publication_seconds").record(
+            published_at
+                .duration_since(generation.closed_at)
+                .as_secs_f64(),
+        );
+        let completion = match result {
+            Ok(file_list_key) => PersistenceCompletion {
+                generation_id: generation.generation_id,
+                file_list_key: Some(file_list_key),
+                wal_segments: generation.wal_segments.clone(),
+                wal: generation.wal.clone(),
+                arrow_bytes: generation.arrow_bytes,
+                error: None,
+            },
+            Err(error) => PersistenceCompletion {
+                generation_id: generation.generation_id,
+                file_list_key: None,
+                wal_segments: generation.wal_segments.clone(),
+                wal: generation.wal.clone(),
+                arrow_bytes: generation.arrow_bytes,
+                error: Some(error.to_string()),
+            },
+        };
+        if job
+            .completion_tx
+            .send(crate::scribe::shards::ShardCommand::PersistenceComplete {
+                completion: Box::new(completion),
+                waiter: job.completion_waiter,
+            })
+            .await
+            .is_err()
+        {
+            metrics::counter!("bifrost_scribe_persistence_completion_dropped_total").increment(1);
+        }
+    }
+
+    /// Persists one generation through encode, object store, SQL, and manifest stages.
+    ///
+    /// SQL commits the file-list and audit rows before the manifest advances. A
+    /// later manifest failure is intentionally recoverable through WAL replay;
+    /// object writes use the deterministic generation path and may already exist
+    /// when a retry begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when encoding, object storage, tenant SQL, SQL
+    /// commit, or manifest advancement fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation may leave an object or committed file-list row behind. The
+    /// immutable generation remains retained by its shard for reconciliation.
+    async fn persist_once(
+        &self,
+        generation: &ImmutableGeneration,
+        binding: &TenantTableBinding,
+    ) -> Result<FileListCommitKey, ScribeError> {
+        let frozen = generation.frozen_snapshot();
+        let mut encoded = match self
+            .persistence_cpu
+            .submit(ScribePersistenceCpuOp::EncodeParquet {
+                frozen: Box::new(frozen.clone()),
+                binding: binding.clone(),
+                tenant: binding.tenant,
+            })
+            .await?
+        {
+            ScribePersistenceCpuResult::ParquetEncoded(encoded) => encoded,
+            ScribePersistenceCpuResult::Prepared(_)
+            | ScribePersistenceCpuResult::ReplayRestored(_) => {
+                return Err(ScribeError::Internal {
+                    detail: "persistence lane returned the wrong persistence result".to_owned(),
+                });
+            }
+        };
+        let path = object_path(binding, &generation.seal_key, &self.node_id)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let _object_write_guard = self.faults.begin_object_write().await;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_object_write() {
             return Err(ScribeError::Internal {
-                detail: "persistence lane returned the wrong persistence result".to_owned(),
+                detail: "test object-store write failure".to_owned(),
             });
         }
-    };
-    let path = object_path(binding, &generation.seal_key, &dependencies.node_id)?;
-    #[cfg(any(test, feature = "test-support"))]
-    let _object_write_guard = dependencies.faults.begin_object_write().await;
-    #[cfg(any(test, feature = "test-support"))]
-    if dependencies.faults.take_object_write() {
-        return Err(ScribeError::Internal {
-            detail: "test object-store write failure".to_owned(),
-        });
-    }
-    let path = put_object(
-        &dependencies.operator,
-        &path,
-        std::mem::take(&mut encoded.bytes),
-    )
-    .await?;
-    let row = file_list_writer::build_insert(
-        &frozen,
-        &encoded,
-        binding,
-        &dependencies.node_id,
-        dependencies.writer_epoch,
-        &path,
-    )?;
-    let mut conn = dependencies
-        .postgres
-        .tenant_conn(binding.tenant)
-        .await
-        .map_err(ScribeError::from)?;
-    let outcome = file_list_writer::insert_and_audit(&mut conn, &row, &encoded.audit_events)
-        .await
-        .map_err(ScribeError::from)?;
-    #[cfg(any(test, feature = "test-support"))]
-    if dependencies.faults.take_sql_commit() {
-        return Err(ScribeError::Internal {
-            detail: "test SQL commit failure".to_owned(),
-        });
-    }
-    conn.commit().await.map_err(ScribeError::from)?;
+        let path = self
+            .put_object(&path, std::mem::take(&mut encoded.bytes))
+            .await?;
+        let row = file_list_writer::build_insert(
+            &frozen,
+            &encoded,
+            binding,
+            &self.node_id,
+            self.writer_epoch,
+            &path,
+        )?;
+        let mut conn = self
+            .postgres
+            .tenant_conn(binding.tenant)
+            .await
+            .map_err(ScribeError::from)?;
+        let outcome = file_list_writer::insert_and_audit(&mut conn, &row, &encoded.audit_events)
+            .await
+            .map_err(ScribeError::from)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_sql_commit() {
+            return Err(ScribeError::Internal {
+                detail: "test SQL commit failure".to_owned(),
+            });
+        }
+        conn.commit().await.map_err(ScribeError::from)?;
 
-    let manifest_path = dependencies.wal.base_dir().join("manifest");
-    let lsn = generation.wal_lsn_max;
-    #[cfg(any(test, feature = "test-support"))]
-    if dependencies.faults.take_manifest_publication() {
-        return Err(ScribeError::Internal {
-            detail: "test manifest publication failure".to_owned(),
-        });
+        let manifest_path = self.wal.base_dir().join("manifest");
+        let lsn = generation.wal_lsn_max;
+        #[cfg(any(test, feature = "test-support"))]
+        if self.faults.take_manifest_publication() {
+            return Err(ScribeError::Internal {
+                detail: "test manifest publication failure".to_owned(),
+            });
+        }
+        let _manifest_guard = self.manifest_guard.lock().await;
+        let result = self
+            .wal_io
+            .submit(ScribeWalIoOp::AdvanceManifest {
+                path: manifest_path,
+                stream: generation.stream,
+                seal_key: generation.seal_key.clone(),
+                sealed_lsn: lsn,
+            })
+            .await?;
+        if !matches!(result, ScribeWalIoResult::Completed) {
+            return Err(ScribeError::Internal {
+                detail: "WAL IO lane returned the wrong manifest result".to_owned(),
+            });
+        }
+        Ok(outcome.commit_key)
     }
-    let _manifest_guard = dependencies.manifest_guard.lock().await;
-    let result = dependencies
-        .wal_io
-        .submit(ScribeWalIoOp::AdvanceManifest {
-            path: manifest_path,
-            stream: generation.stream,
-            seal_key: generation.seal_key.clone(),
-            sealed_lsn: lsn,
-        })
-        .await?;
-    if !matches!(result, ScribeWalIoResult::Completed) {
-        return Err(ScribeError::Internal {
-            detail: "WAL IO lane returned the wrong manifest result".to_owned(),
-        });
-    }
-    Ok(outcome.commit_key)
 }
 
+/// Builds the deterministic staged object path for one generation.
+///
+/// This helper remains free because it only validates and formats its inputs;
+/// it owns no persistence state or external dependency.
+///
+/// # Errors
+///
+/// Returns [`ScribeError`] when the node identity or derived pod identifier is invalid.
 fn object_path(
     binding: &TenantTableBinding,
     seal_key: &SealKey,
@@ -669,39 +749,53 @@ fn object_path(
     ))
 }
 
-async fn put_object(
-    operator: &opendal::Operator,
-    path: &str,
-    bytes: Vec<u8>,
-) -> Result<String, ScribeError> {
-    let bytes = Bytes::from(bytes);
-    let mut last_error = None;
-    for attempt in 0..5_u32 {
-        match tokio::time::timeout(Duration::from_secs(30), operator.write(path, bytes.clone()))
+impl PersistenceWorker {
+    /// Writes one Parquet object with bounded timeout and retry backoff.
+    ///
+    /// The object-store operation is isolated from SQL and manifest publication
+    /// so partial writes remain recoverable by the generation's deterministic path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when all object-store attempts fail or time out.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops the current attempt; a later retry may safely reuse
+    /// the same object path.
+    async fn put_object(&self, path: &str, bytes: Vec<u8>) -> Result<String, ScribeError> {
+        let bytes = Bytes::from(bytes);
+        let mut last_error = None;
+        for attempt in 0..5_u32 {
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                self.operator.write(path, bytes.clone()),
+            )
             .await
-        {
-            Ok(Ok(_)) => return Ok(path.to_owned()),
-            Ok(Err(error)) => {
-                let retryable = matches!(error.kind(), opendal::ErrorKind::RateLimited)
-                    || (matches!(error.kind(), opendal::ErrorKind::Unexpected)
-                        && error.is_temporary());
-                last_error = Some(ScribeError::ObjectStorePutFailed(error));
-                if !retryable || attempt == 4 {
-                    break;
+            {
+                Ok(Ok(_)) => return Ok(path.to_owned()),
+                Ok(Err(error)) => {
+                    let retryable = matches!(error.kind(), opendal::ErrorKind::RateLimited)
+                        || (matches!(error.kind(), opendal::ErrorKind::Unexpected)
+                            && error.is_temporary());
+                    last_error = Some(ScribeError::ObjectStorePutFailed(error));
+                    if !retryable || attempt == 4 {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    last_error = Some(ScribeError::Internal {
+                        detail: "object-store PUT timed out".to_owned(),
+                    });
+                    if attempt == 4 {
+                        break;
+                    }
                 }
             }
-            Err(_) => {
-                last_error = Some(ScribeError::Internal {
-                    detail: "object-store PUT timed out".to_owned(),
-                });
-                if attempt == 4 {
-                    break;
-                }
-            }
+            tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(attempt))).await;
         }
-        tokio::time::sleep(Duration::from_millis(100 * 2_u64.pow(attempt))).await;
+        Err(last_error.unwrap_or_else(|| ScribeError::Internal {
+            detail: "object-store PUT failed without an error".to_owned(),
+        }))
     }
-    Err(last_error.unwrap_or_else(|| ScribeError::Internal {
-        detail: "object-store PUT failed without an error".to_owned(),
-    }))
 }

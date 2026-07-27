@@ -68,7 +68,7 @@ mod pg_tests {
         let scribe = ScribeImpl::new_for_embedded_with_deps(
             Arc::clone(&operator),
             wal,
-            node_id.to_string(),
+            &node_id.to_string(),
             writer_epoch,
         );
 

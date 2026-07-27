@@ -18,8 +18,6 @@ use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
-use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
-use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
@@ -46,6 +44,7 @@ use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAud
 use wyrd_server::config::ServeMode;
 use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
+use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalKindTag;
@@ -1324,7 +1323,7 @@ impl WyrdTestServerBuilder {
             ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
                 Arc::new(storage.operator().clone()),
                 wal,
-                node_id.to_string(),
+                &node_id.to_string(),
                 1,
                 vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
                     lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
@@ -1337,7 +1336,7 @@ impl WyrdTestServerBuilder {
             ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
                 Arc::new(storage.operator().clone()),
                 wal,
-                node_id.to_string(),
+                &node_id.to_string(),
                 1,
                 self.wal_sync_delay,
                 vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
@@ -1350,22 +1349,19 @@ impl WyrdTestServerBuilder {
             .map_err(WyrdTestServerError::Start)?
         };
         let scribe = Arc::new(scribe);
-        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
             Arc::clone(&bifrost_redux),
-            scribe.clone(),
-            ingest_auth_interceptor(Arc::clone(&verifier)),
-            IngestLimits::default(),
-            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                scribe.ingress_cpu_pool(),
-            )),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(bifrost_redux)
             .with_bifrost_memory(bifrost_memory)
             .with_forge_context(forge_context)
             .with_forge_interval(self.forge_interval)
-            .with_scribe(scribe)
-            .with_gate(gate)
+            .with_bifrost_ingest(ingest)
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),

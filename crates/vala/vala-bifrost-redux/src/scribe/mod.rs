@@ -147,7 +147,18 @@ pub struct ScribeImpl {
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
 }
 
+/// Complete server-provisioned dependencies used to construct one Scribe graph.
+///
+/// The execution lanes and coordination runtime are supplied by the embedding
+/// server so Scribe does not create an unbounded runtime or hide resource
+/// sizing inside a durable data-plane component.
 pub struct ScribeBuildConfig {
+    /// Object-store operator used by the persistence runtime.
+    pub operator: Arc<opendal::Operator>,
+    /// WAL writer used by every fixed shard and persistence worker.
+    pub wal: Arc<wal::WalWriter>,
+    /// Validated node/epoch identity shared by all child owners.
+    pub stream: stream_identity::StreamIdentity,
     /// Admission bounds for in-flight frames and active memory.
     pub admission: AdmissionConfig,
     /// Runtime used for Scribe coordination tasks.
@@ -177,7 +188,7 @@ impl ScribeImpl {
     pub fn new_for_embedded_with_deps(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
     ) -> Self {
         Self::new_for_embedded_with_runtime(operator, wal, node_id, writer_epoch, Handle::current())
@@ -188,10 +199,15 @@ impl ScribeImpl {
     /// This seam is used only by real benchmark and failure-injection
     /// harnesses. Production boot supplies its own explicit pools through
     /// [`ScribeBuildConfig`] and always uses a zero WAL delay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         sync_delay: std::time::Duration,
     ) -> Result<Self, String> {
@@ -207,10 +223,15 @@ impl ScribeImpl {
 
     /// Construct the embedded Scribe with deterministic sync delay and
     /// explicit test-tier admission limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         sync_delay: std::time::Duration,
         admission: AdmissionConfig,
@@ -232,10 +253,15 @@ impl ScribeImpl {
 
     /// Construct the embedded Scribe with deterministic sync delay, explicit
     /// admission limits, and an optional server-provisioned memory governor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a configured execution lane cannot be created or
+    /// `node_id` is not a UUID accepted by the WAL stream identity.
     pub fn try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         sync_delay: std::time::Duration,
         config: ScribeEmbeddedConfig,
@@ -258,29 +284,37 @@ impl ScribeImpl {
             )
             .map_err(|error| format!("WAL IO pool failed: {error}"))?,
         );
-        Ok(Self::new_with_execution_pools(
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(
+                uuid::Uuid::parse_str(node_id).map_err(|error| error.to_string())?,
+            ),
+            stream_identity::WriterEpoch::new(writer_epoch),
+        );
+        Ok(Self::new_with_execution_pools(ScribeBuildConfig {
             operator,
             wal,
-            node_id,
-            writer_epoch,
-            ScribeBuildConfig {
-                admission: config.admission,
-                coordination_runtime: config.coordination_runtime,
-                execution_pools,
-                persistence: None,
-                memory_budget: config.memory_budget,
-            },
-        ))
+            stream,
+            admission: config.admission,
+            coordination_runtime: config.coordination_runtime,
+            execution_pools,
+            persistence: None,
+            memory_budget: config.memory_budget,
+        }))
     }
 
     /// Construct a Scribe using an explicitly owned Tokio coordination runtime.
     ///
     /// Server deployments use [`Self::new_with_execution_pools`]. Tests and
     /// embedded callers may use this constructor on the current runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         coordination_runtime: Handle,
     ) -> Self {
@@ -295,10 +329,15 @@ impl ScribeImpl {
     }
 
     /// Construct Scribe with explicitly provisioned execution lanes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         lane_config: ScribeLaneConfig,
         coordination_runtime: Handle,
@@ -315,10 +354,15 @@ impl ScribeImpl {
     }
 
     /// Construct Scribe with explicit execution lanes and admission bounds.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         lane_config: ScribeLaneConfig,
         admission: AdmissionConfig,
@@ -340,56 +384,63 @@ impl ScribeImpl {
 
     /// Construct Scribe with explicit execution lanes, admission bounds, and
     /// an optional server-provisioned memory governor.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `node_id` is not a UUID accepted by the WAL stream identity
+    /// or the fixed Scribe ownership graph cannot be initialized.
     pub fn new_for_embedded_with_runtime_config_and_admission_and_memory(
         operator: Arc<opendal::Operator>,
         wal: Arc<wal::WalWriter>,
-        node_id: String,
+        node_id: &str,
         writer_epoch: i64,
         config: ScribeEmbeddedConfig,
     ) -> Self {
-        Self::new_with_components(
+        let stream = stream_identity::StreamIdentity::new(
+            stream_identity::NodeId::new(
+                uuid::Uuid::parse_str(node_id).expect("embedded Scribe node_id must be a UUID"),
+            ),
+            stream_identity::WriterEpoch::new(writer_epoch),
+        );
+        Self::build(ScribeBuildConfig {
             operator,
             wal,
-            node_id,
-            writer_epoch,
-            ScribeBuildConfig {
-                admission: config.admission,
-                coordination_runtime: config.coordination_runtime,
-                execution_pools: ScribeExecutionPools::new(
-                    ScribeIngressCpuPool::new_with_capacity(
-                        config.lane_config.ingress_cpu_threads,
-                        256,
-                    ),
-                    ScribePersistenceCpuPool::new_with_capacity(
-                        config.lane_config.persistence_cpu_threads,
-                        64,
-                    ),
-                    ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
+            stream,
+            admission: config.admission,
+            coordination_runtime: config.coordination_runtime,
+            execution_pools: ScribeExecutionPools::new(
+                ScribeIngressCpuPool::new_with_capacity(
+                    config.lane_config.ingress_cpu_threads,
+                    256,
                 ),
-                persistence: None,
-                memory_budget: config.memory_budget,
-            },
-        )
+                ScribePersistenceCpuPool::new_with_capacity(
+                    config.lane_config.persistence_cpu_threads,
+                    64,
+                ),
+                ScribeWalIoPool::new_with_capacity(config.lane_config.wal_io_threads, 256),
+            ),
+            persistence: None,
+            memory_budget: config.memory_budget,
+        })
     }
 
     /// Construct Scribe from execution lanes provisioned by server boot.
-    pub fn new_with_execution_pools(
-        operator: Arc<opendal::Operator>,
-        wal: Arc<wal::WalWriter>,
-        node_id: String,
-        writer_epoch: i64,
-        config: ScribeBuildConfig,
-    ) -> Self {
-        Self::new_with_components(operator, wal, node_id, writer_epoch, config)
+    pub fn new_with_execution_pools(config: ScribeBuildConfig) -> Self {
+        Self::build(config)
     }
 
-    fn new_with_components(
-        operator: Arc<opendal::Operator>,
-        wal: Arc<wal::WalWriter>,
-        node_id: String,
-        writer_epoch: i64,
-        config: ScribeBuildConfig,
-    ) -> Self {
+    /// Builds the complete Scribe ownership graph from server-provisioned dependencies.
+    ///
+    /// This is the single internal construction path used by production and
+    /// embedded factories. It creates persistence before the fixed shard
+    /// owners so every child receives the same lanes, WAL identity, memory
+    /// ledger, and coordination runtime.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the configured fallback memory governor cannot represent
+    /// the fixed one-gibibyte invariant or a shard WAL handle cannot be built.
+    fn build(config: ScribeBuildConfig) -> Self {
         let memory = config.memory_budget.clone().unwrap_or_else(|| {
             memory::BifrostMemoryGovernor::new_with_scribe_limit(
                 config.admission.memory_limit_bytes,
@@ -406,12 +457,17 @@ impl ScribeImpl {
             .expect("zero-sized memory ledger reservations must be valid");
         let admission = AdmissionController::with_config(config.admission);
         let ScribeBuildConfig {
+            operator,
+            wal,
+            stream,
             coordination_runtime,
             execution_pools,
             persistence: persistence_config,
             admission: _,
             memory_budget: _,
         } = config;
+        let node_id = stream.node_id.to_string();
+        let writer_epoch = stream.writer_epoch.as_i64();
         let ScribeExecutionPools {
             ingress_cpu,
             persistence_cpu,
@@ -436,12 +492,6 @@ impl ScribeImpl {
                 &coordination_runtime,
             )
         });
-        let stream = stream_identity::StreamIdentity::new(
-            stream_identity::NodeId::new(
-                uuid::Uuid::parse_str(&node_id).unwrap_or(uuid::Uuid::nil()),
-            ),
-            stream_identity::WriterEpoch::new(writer_epoch),
-        );
         let shards = shards::ScribeShardRuntime::start(
             shards::ScribeShardStartConfig {
                 admission: admission.clone(),
@@ -517,23 +567,26 @@ impl ScribeImpl {
         // Leak temp_dir to keep WAL files for the test lifetime
         std::mem::forget(temp_dir);
 
-        Self::new_with_components(
+        Self::build(ScribeBuildConfig {
             operator,
             wal,
-            "00000000-0000-0000-0000-000000000000".to_string(),
-            1,
-            ScribeBuildConfig {
-                admission: admission_config,
-                coordination_runtime: Handle::current(),
-                execution_pools: ScribeExecutionPools::new(
-                    ScribeIngressCpuPool::new(1),
-                    persistence_cpu,
-                    wal_io,
+            stream: stream_identity::StreamIdentity::new(
+                stream_identity::NodeId::new(
+                    uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000000")
+                        .expect("static test Scribe node_id is a UUID"),
                 ),
-                persistence: None,
-                memory_budget: None,
-            },
-        )
+                stream_identity::WriterEpoch::new(1),
+            ),
+            admission: admission_config,
+            coordination_runtime: Handle::current(),
+            execution_pools: ScribeExecutionPools::new(
+                ScribeIngressCpuPool::new(1),
+                persistence_cpu,
+                wal_io,
+            ),
+            persistence: None,
+            memory_budget: None,
+        })
     }
 
     /// Stop accepting new shard work and drain the bounded execution lanes.
@@ -712,15 +765,7 @@ impl Scribe for ScribeImpl {
         if !self.is_ready() {
             return Err(ScribeError::IngressClosed);
         }
-        ingress::process_ingress_frame(
-            frame,
-            &self.admission,
-            &self.memory,
-            &self.ingress_cpu,
-            &self.persistence_cpu,
-            &self.shards,
-        )
-        .await
+        self.prepare_and_dispatch(frame).await
     }
 }
 

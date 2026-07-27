@@ -10,6 +10,7 @@ use vala_bifrost_redux::scribe::execution_lanes::{
 use vala_bifrost_redux::scribe::memtable::MemtableStats;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::seal::PostCommitBatch;
+use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::telemetry::ScribeInspectionSnapshot;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -119,12 +120,13 @@ impl BifrostHarness {
         let mut scribes = Vec::with_capacity(pods_for(cluster));
         for (index, wal_dir) in cluster.wal_dirs().enumerate() {
             let node_id = uuid::Uuid::now_v7();
+            let writer_epoch = i64::try_from(index + 1)
+                .map_err(|error| HarnessError::Configuration(error.to_string()))?;
             let wal = Arc::new(
                 WalWriter::new(
                     wal_dir,
                     *node_id.as_bytes(),
-                    i64::try_from(index + 1)
-                        .map_err(|error| HarnessError::Configuration(error.to_string()))?,
+                    writer_epoch,
                     WalConfig::default(),
                 )
                 .map_err(|error| HarnessError::Scribe(error.to_string()))?,
@@ -140,32 +142,28 @@ impl BifrostHarness {
             let server = cluster.server(index).ok_or_else(|| {
                 HarnessError::Configuration("missing Bifrost test server".to_owned())
             })?;
-            let scribe = ScribeImpl::new_with_execution_pools(
-                Arc::clone(&operator),
+            let scribe = ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+                operator: Arc::clone(&operator),
                 wal,
-                node_id.to_string(),
-                i64::try_from(index + 1)
-                    .map_err(|error| HarnessError::Configuration(error.to_string()))?,
-                ScribeBuildConfig {
-                    admission: AdmissionConfig::default(),
-                    coordination_runtime: tokio::runtime::Handle::current(),
-                    execution_pools: ScribeExecutionPools::new(
-                        ScribeIngressCpuPool::new_with_capacity(2, 256),
-                        ScribePersistenceCpuPool::new_with_capacity(2, 64),
-                        ScribeWalIoPool::try_new_with_capacity_and_delay(2, 256, wal_sync_delay)
-                            .map_err(|error| HarnessError::Configuration(error.to_string()))?,
-                    ),
-                    persistence: Some(
-                        ScribePersistenceConfig::new(
-                            Arc::new(server.state().postgres.vala().clone()),
-                            64,
-                            2,
-                        )
-                        .with_test_faults(persistence_faults.clone()),
-                    ),
-                    memory_budget: Some(memory_governor.scribe_budget()),
-                },
-            );
+                stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(writer_epoch)),
+                admission: AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                execution_pools: ScribeExecutionPools::new(
+                    ScribeIngressCpuPool::new_with_capacity(2, 256),
+                    ScribePersistenceCpuPool::new_with_capacity(2, 64),
+                    ScribeWalIoPool::try_new_with_capacity_and_delay(2, 256, wal_sync_delay)
+                        .map_err(|error| HarnessError::Configuration(error.to_string()))?,
+                ),
+                persistence: Some(
+                    ScribePersistenceConfig::new(
+                        Arc::new(server.state().postgres.vala().clone()),
+                        64,
+                        2,
+                    )
+                    .with_test_faults(persistence_faults.clone()),
+                ),
+                memory_budget: Some(memory_governor.scribe_budget()),
+            });
             scribes.push(Arc::new(scribe));
         }
 

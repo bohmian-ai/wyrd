@@ -18,8 +18,6 @@ mod pg_tests {
     use chrono::Duration as ChronoDuration;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio_util::sync::CancellationToken;
-    use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
-    use vala_bifrost_redux::gate::limits::IngestLimits;
     use vala_bifrost_redux::scribe::{
         ScribeImpl,
         wal::{WalConfig, WalWriter},
@@ -33,6 +31,7 @@ mod pg_tests {
     use wyrd_server::components::auth::ServerAuth;
     use wyrd_server::grpc::{GrpcRouterConfig, build_app_grpc, serve_grpc};
     use wyrd_server::postgres::ServerPostgres;
+    use wyrd_server::state::BifrostIngestRuntime;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalKindTag;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
@@ -92,22 +91,19 @@ mod pg_tests {
         let scribe = Arc::new(ScribeImpl::new_for_embedded_with_deps(
             Arc::new(storage.operator().clone()),
             wal,
-            uuid::Uuid::now_v7().to_string(),
+            &uuid::Uuid::now_v7().to_string(),
             1,
         ));
-        let gate = Arc::new(vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+        let ingest = Arc::new(BifrostIngestRuntime::new(
+            scribe,
             Arc::clone(&redux_catalog),
-            scribe.clone(),
-            ingest_auth_interceptor(Arc::clone(&verifier)),
-            IngestLimits::default(),
-            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                scribe.ingress_cpu_pool(),
-            )),
+            Arc::clone(&verifier),
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            None,
         ));
         AppState::new(postgres, storage, catalog)
             .with_bifrost_redux(redux_catalog)
-            .with_scribe(scribe)
-            .with_gate(gate)
+            .with_bifrost_ingest(ingest)
             .with_auth(ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(verifier),

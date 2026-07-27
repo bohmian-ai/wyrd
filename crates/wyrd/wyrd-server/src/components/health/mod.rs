@@ -133,8 +133,8 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
 
 /// Read the Scribe recovery bit without touching its queues or storage.
 fn probe_scribe(state: &AppState) -> ProbeOutcome {
-    match &state.scribe {
-        Some(scribe) if scribe.is_ready() => ProbeOutcome {
+    match &state.bifrost_ingest {
+        Some(runtime) if runtime.is_ready() => ProbeOutcome {
             ok: true,
             reason: ProbeReason::Ok,
             elapsed_ms: 0,

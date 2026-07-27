@@ -121,7 +121,7 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
             .expect("restarted WAL writer"),
     );
     let scribe =
-        ScribeImpl::new_for_embedded_with_deps(operator, restarted_wal, node.to_string(), 2);
+        ScribeImpl::new_for_embedded_with_deps(operator, restarted_wal, &node.to_string(), 2);
 
     let restored = scribe.replay_wal_async().await.expect("replay");
     assert!(restored > 0, "streamed replay should restore generations");
@@ -161,7 +161,7 @@ async fn replay_splits_three_same_key_generations_in_wal_order() {
         WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
             .expect("restarted WAL writer"),
     );
-    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, node.to_string(), 2);
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &node.to_string(), 2);
     let restored = scribe.replay_wal_async().await.expect("replay");
     assert_eq!(
         restored, 3,
@@ -200,7 +200,7 @@ async fn replay_failure_keeps_scribe_unready() {
         WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
             .expect("replay WAL writer"),
     );
-    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, node.to_string(), 2);
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, &node.to_string(), 2);
     let error = scribe
         .replay_wal_async()
         .await

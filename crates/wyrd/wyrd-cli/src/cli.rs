@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 
 use crate::audit::AuditCommand;
 use crate::auth::AuthCommand;
+use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
 use crate::dev::DevCommand;
 use crate::eval::run::EvalCommand;
 use crate::principal::PrincipalCommand;
@@ -20,6 +21,22 @@ pub struct Cli {
 /// Top-level CLI verbs.
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Load and validate a local card tree without contacting a server.
+    Plan(PlanArgs),
+    /// Register a local card tree and run its artifact lifecycle.
+    Apply(ApplyArgs),
+    /// Hydrate a selected Card and its reachable graph into --output-dir;
+    /// complete artifact downloads are the default and --metadata-only writes
+    /// an inspectable, non-runnable bundle.
+    Get(GetArgs),
+    /// Resolve the latest active card version by name.
+    Latest(LatestArgs),
+    /// List card summaries with typed server-side filters.
+    List(ListArgs),
+    /// Load a card and materialize its artifacts.
+    Load(LoadArgs),
+    /// Soft-delete one exact card.
+    Delete(DeleteArgs),
     /// Audit log commands (verify seal checkpoints).
     #[command(subcommand)]
     Audit(AuditCommand),

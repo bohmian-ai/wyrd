@@ -98,7 +98,7 @@ pub async fn persist_outbound_relationships(
 pub async fn inbound_relationships(
     conn: &mut TenantConn<'_>,
     card_uid: &CardUid,
-) -> Result<Vec<String>, WyrdError> {
+) -> Result<Vec<CardRef>, WyrdError> {
     let rows = sqlx::query_as::<_, (String, String, String, String, uuid::Uuid)>(
         "SELECT source.kind, source.space, source.name, source.version, source.card_uid \
            FROM wyrd.card_relationships relationship \
@@ -136,7 +136,7 @@ pub async fn inbound_relationships(
                 ),
                 uid: Some(CardUid::from_uuid(uid).map_err(WyrdError::from_card_uid_error)?),
             };
-            Ok(card_ref.to_string())
+            Ok(card_ref)
         })
         .collect()
 }

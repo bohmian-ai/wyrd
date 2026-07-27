@@ -1,11 +1,9 @@
-mod eval_support;
-
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use serde_json::Value;
 use wyrd_spec::vala::eval::EvalPassGate;
 
-use eval_support::{
+use crate::eval_support::{
     assertion_task, judge_task, record, spec, subject_ref, write_eval_card, write_records,
 };
 

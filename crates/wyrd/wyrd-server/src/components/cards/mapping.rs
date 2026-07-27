@@ -1,6 +1,8 @@
 //! Projections from registry rows into composite registration responses.
 
-use wyrd_spec::envelope::{Relationships, Spec};
+use std::collections::BTreeMap;
+
+use wyrd_spec::envelope::{CardRelationship, Relationships, Spec};
 use wyrd_spec::reference::{CardRef, scope_child_card_refs};
 use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::RegisteredCardRow;
@@ -55,15 +57,56 @@ pub fn existing_row_to_response(
 
 /// Project the normalized outbound Card references from a resolved spec.
 pub(crate) fn relationships_from_spec(spec: &Spec) -> Relationships {
-    let mut outbound = scope_child_card_refs(spec)
-        .into_iter()
-        .map(|card_ref| card_ref.to_string())
+    let mut refs = scope_child_card_refs(spec);
+    refs.sort_by_key(ToString::to_string);
+    refs.dedup();
+    let aliases = match spec {
+        Spec::Service(service) => service
+            .components
+            .iter()
+            .filter_map(|component| {
+                component
+                    .card_ref
+                    .as_card_ref()
+                    .map(|card_ref| (card_ref.to_string(), component.alias.clone()))
+            })
+            .fold(
+                BTreeMap::<String, Vec<String>>::new(),
+                |mut aliases, (card_ref, alias)| {
+                    aliases.entry(card_ref).or_default().push(alias);
+                    aliases
+                },
+            ),
+        _ => BTreeMap::new(),
+    };
+    let outbound = refs.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let outbound_refs = refs
+        .iter()
+        .flat_map(|card_ref| {
+            aliases.get(&card_ref.to_string()).map_or_else(
+                || {
+                    vec![CardRelationship {
+                        card_ref: card_ref.clone(),
+                        alias: None,
+                    }]
+                },
+                |aliases| {
+                    aliases
+                        .iter()
+                        .map(|alias| CardRelationship {
+                            card_ref: card_ref.clone(),
+                            alias: Some(alias.clone()),
+                        })
+                        .collect()
+                },
+            )
+        })
         .collect::<Vec<_>>();
-    outbound.sort();
-    outbound.dedup();
     Relationships {
         outbound,
+        outbound_refs,
         inbound: Vec::new(),
+        inbound_refs: Vec::new(),
     }
 }
 
@@ -118,6 +161,11 @@ mod tests {
         assert_eq!(
             relationships.outbound,
             vec!["default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
+        );
+        assert_eq!(relationships.outbound_refs.len(), 1);
+        assert_eq!(
+            relationships.outbound_refs[0].card_ref.to_string(),
+            "default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
         );
         assert!(relationships.inbound.is_empty());
     }

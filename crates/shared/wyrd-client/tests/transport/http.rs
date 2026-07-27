@@ -83,6 +83,22 @@ fn http_validate_accepts_non_empty_base_url() {
 }
 
 #[test]
+fn http_validate_rejects_remote_cleartext() {
+    let h = HttpConfig {
+        base_url: "http://wyrd.example.com".to_string(),
+        timeout_ms: 5_000,
+        tls: None,
+        compression: false,
+    };
+    let err = h.validate().unwrap_err();
+    assert_config_error(
+        err,
+        "http_config.base_url",
+        "remote cleartext HTTP is not allowed; use https:// or a loopback host",
+    );
+}
+
+#[test]
 fn http_validate_rejects_zero_timeout() {
     let h = HttpConfig {
         base_url: "https://example.com".to_string(),

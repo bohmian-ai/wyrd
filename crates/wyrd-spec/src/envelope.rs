@@ -459,9 +459,27 @@ pub struct Relationships {
     /// Outbound references as normalized display strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outbound: Vec<String>,
+    /// Exact outbound references with optional user-facing aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound_refs: Vec<CardRelationship>,
     /// Inbound references as normalized display strings.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbound: Vec<String>,
+    /// Exact inbound references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbound_refs: Vec<CardRelationship>,
+}
+
+/// One server-derived relationship edge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct CardRelationship {
+    /// Exact related Card reference.
+    #[serde(rename = "ref")]
+    pub card_ref: crate::reference::CardRef,
+    /// Optional user-facing alias assigned by a parent composition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 /// Server-derived Card status.

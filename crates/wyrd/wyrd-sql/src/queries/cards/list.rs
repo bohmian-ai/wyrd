@@ -110,6 +110,7 @@ pub async fn query_cards(
 
     let mut qb: QueryBuilder<Postgres> =
         QueryBuilder::new(format!("SELECT {CARD_ROW_COLUMNS} FROM wyrd.cards"));
+    qb.push(" WHERE TRUE");
     push_card_filters(&mut qb, query)?;
     push_keyset_cursor(&mut qb, &cursor);
     qb.push(" ORDER BY created_at ASC, card_uid ASC LIMIT ");

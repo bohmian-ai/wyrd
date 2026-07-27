@@ -8,11 +8,17 @@ mod download;
 mod engine;
 mod error;
 mod handle;
+mod hydrate;
 mod progress;
 mod reads;
 mod saga;
 
+pub use engine::RegistryContext;
 pub use handle::{CardSelector, Cards, LoadedCard};
+pub use hydrate::{
+    CardGraphHydrator, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
+    HydrationMode, HydrationSummary,
+};
 pub use progress::{RegistrationPhase, RegistrationProgressEvent, RegistrationProgressSink};
 pub use wyrd_spec::registry::{
     CardSummary, ListCardsRequest, ListCardsResponse, RegistrationReceipt,

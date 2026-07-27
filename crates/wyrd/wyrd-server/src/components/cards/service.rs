@@ -226,7 +226,7 @@ async fn hydrate_card(
     state: &AppState,
     caller: &Caller,
     row: wyrd_sql::row_types::cards::ParsedCardRow,
-    inbound: Vec<String>,
+    inbound: Vec<CardRef>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
         WyrdError::registry_card_not_found(
@@ -260,7 +260,14 @@ async fn hydrate_card(
             "stored Card blob identity does not match its registry row",
         ));
     }
-    card.relationships.inbound = inbound;
+    card.relationships.inbound = inbound.iter().map(ToString::to_string).collect();
+    card.relationships.inbound_refs = inbound
+        .into_iter()
+        .map(|card_ref| wyrd_spec::envelope::CardRelationship {
+            card_ref,
+            alias: None,
+        })
+        .collect();
     card.status = Some(Status {
         phase: row.status.as_db_str().to_owned(),
         message: None,

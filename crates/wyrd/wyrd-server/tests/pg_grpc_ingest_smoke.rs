@@ -9,6 +9,7 @@ pub mod support;
 
 mod pg_tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field};
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
@@ -243,5 +244,14 @@ mod pg_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn legacy_and_redux_managed_columns_are_exactly_equal() {
+        let user_fields = vec![Field::new("value", DataType::UInt64, false)];
+        assert_eq!(
+            vala_bifrost::schema::with_managed_columns(user_fields.clone()),
+            vala_bifrost_redux::schema::with_managed_columns(user_fields)
+        );
     }
 }

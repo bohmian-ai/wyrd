@@ -27,7 +27,7 @@ mod pg_tests {
     use wyrd_spec::auth::PrincipalId;
     use wyrd_spec::request_id::RequestId;
 
-    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl) {
+    async fn setup() -> (PgFixture, DataTenantId, ScribeImpl, Arc<opendal::Operator>) {
         let fixture = PgFixture::start().await.expect("fixture");
         let tenant = DataTenantId::new_v7();
         fixture
@@ -66,13 +66,13 @@ mod pg_tests {
 
         let writer_epoch = 1;
         let scribe = ScribeImpl::new_for_embedded_with_deps(
-            operator,
+            Arc::clone(&operator),
             wal,
             node_id.to_string(),
             writer_epoch,
         );
 
-        (fixture, tenant, scribe)
+        (fixture, tenant, scribe, operator)
     }
 
     async fn complete_post_commit(scribe: &ScribeImpl, batch: PostCommitBatch) {
@@ -128,7 +128,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_append_seal_file_list() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, _operator) = setup().await;
         let binding = TenantTableBinding::resolve((tenant, events_table())).expect("binding");
         // 1. Append 50k rows to trigger seal predicate
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
@@ -239,7 +239,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_seal_emits_one_audit_row_per_append() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, _operator) = setup().await;
         let base_time = DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
             .unwrap()
             .timestamp_micros();
@@ -343,7 +343,7 @@ mod pg_tests {
 
     #[tokio::test]
     async fn pg_scribe_cross_day_batch_produces_two_files() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, operator) = setup().await;
 
         // Create a batch spanning two days: 60 rows on 2026-07-14, 40 rows on 2026-07-15
         let day1_time = DateTime::parse_from_rfc3339("2026-07-14T23:59:50Z")
@@ -415,9 +415,9 @@ mod pg_tests {
             .await
             .expect("tenant conn2");
         let tx = conn2.transaction();
-        let rows: Vec<(String, i64)> = sqlx::query_as(
+        let rows: Vec<(String, i64, String)> = sqlx::query_as(
             r"
-            SELECT partition_day::text, row_count
+            SELECT partition_day::text, row_count, file_path
             FROM vala.file_list
             WHERE namespace = 'vala.bifrost' AND table_name = 'events'
             ORDER BY partition_day
@@ -430,13 +430,26 @@ mod pg_tests {
         assert_eq!(rows.len(), 2, "expected two file_list rows (one per day)");
         assert_eq!(rows[0].0, "2026-07-14");
         assert_eq!(rows[0].1, 60, "first day should have 60 rows");
+        assert_eq!(rows[0].2.matches("day=").count(), 1);
+        assert!(rows[0].2.contains("day=2026-07-14/"));
         assert_eq!(rows[1].0, "2026-07-15");
         assert_eq!(rows[1].1, 40, "second day should have 40 rows");
+        assert_eq!(rows[1].2.matches("day=").count(), 1);
+        assert!(rows[1].2.contains("day=2026-07-15/"));
+        let objects = operator
+            .list_with("")
+            .recursive(true)
+            .await
+            .expect("object list")
+            .into_iter()
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().all(|row| objects.contains(&row.2)));
     }
 
     #[tokio::test]
     async fn pg_scribe_seal_tx_failure_leaves_no_file_list_or_audit() {
-        let (fixture, tenant, scribe) = setup().await;
+        let (fixture, tenant, scribe, _operator) = setup().await;
         let batch = make_batch(
             2,
             DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")

@@ -39,6 +39,24 @@ fn batch_bytes(value: i64) -> Vec<u8> {
     bytes
 }
 
+fn large_batch_bytes(value: i64) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![value; 700_000]))],
+    )
+    .expect("large test batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC finish");
+    bytes
+}
+
 fn audit_event(operation: &str, tenant: DataTenantId) -> AuditEvent {
     AuditEvent {
         request_id: RequestId::now_v7(),
@@ -113,6 +131,48 @@ async fn replay_memory_is_bounded_by_owner_backpressure() {
     assert_eq!(
         scribe.memory_snapshot().categories[5],
         stats.immutable_bytes
+    );
+    scribe.shutdown().await;
+}
+
+#[tokio::test]
+async fn replay_splits_three_same_key_generations_in_wal_order() {
+    let temp_dir = TempDir::new().expect("WAL directory");
+    let node = NodeId::new(Uuid::now_v7());
+    let writer = WalWriter::new(temp_dir.path(), *node.as_bytes(), 1, WalConfig::default())
+        .expect("WAL writer");
+    let tenant = DataTenantId::new_v7();
+    let key = seal_key(tenant, "replay_three_generations");
+    let audit = encode_audit_event(&audit_event("replay-three", tenant)).expect("audit");
+    let data = large_batch_bytes(7);
+    for index in 0_u8..3 {
+        writer
+            .append_and_fsync_for_test(&key, [index; 16], &audit, &data)
+            .expect("same-key replay append");
+    }
+    drop(writer);
+
+    let operator = Arc::new(
+        opendal::Operator::new(Memory::default())
+            .expect("memory operator")
+            .finish(),
+    );
+    let wal = Arc::new(
+        WalWriter::new(temp_dir.path(), *node.as_bytes(), 2, WalConfig::default())
+            .expect("restarted WAL writer"),
+    );
+    let scribe = ScribeImpl::new_for_embedded_with_deps(operator, wal, node.to_string(), 2);
+    let restored = scribe.replay_wal_async().await.expect("replay");
+    assert_eq!(
+        restored, 3,
+        "one owner generation per streamed replay chunk"
+    );
+    assert_eq!(
+        scribe
+            .memtable_stats()
+            .expect("stats")
+            .immutable_generations,
+        3
     );
     scribe.shutdown().await;
 }

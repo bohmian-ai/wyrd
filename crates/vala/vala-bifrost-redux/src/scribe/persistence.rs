@@ -36,6 +36,7 @@ pub struct PersistenceFaults {
     sql_commit: Arc<std::sync::atomic::AtomicBool>,
     manifest_publication: Arc<std::sync::atomic::AtomicBool>,
     object_write_delay_ms: Arc<AtomicU64>,
+    object_write_delays_ms: Arc<Mutex<Vec<u64>>>,
     object_write_active: Arc<AtomicUsize>,
     max_object_write_active: Arc<AtomicUsize>,
     last_error: Arc<Mutex<Option<String>>>,
@@ -66,6 +67,16 @@ impl PersistenceFaults {
         );
     }
 
+    /// Set deterministic per-write delays consumed in order by object writes.
+    pub fn set_object_write_delays_for_test(&self, delays: &[Duration]) {
+        if let Ok(mut configured) = self.object_write_delays_ms.lock() {
+            *configured = delays
+                .iter()
+                .map(|delay| delay.as_millis().try_into().unwrap_or(u64::MAX))
+                .collect();
+        }
+    }
+
     /// Return the maximum number of object writes active at once.
     #[must_use]
     pub fn max_concurrent_object_writes_for_test(&self) -> usize {
@@ -92,7 +103,17 @@ impl PersistenceFaults {
                 Err(current) => observed = current,
             }
         }
-        let delay_ms = self.object_write_delay_ms.load(Ordering::Acquire);
+        let delay_ms = self
+            .object_write_delays_ms
+            .lock()
+            .ok()
+            .and_then(|mut delays| {
+                delays.first().copied().map(|delay| {
+                    delays.remove(0);
+                    delay
+                })
+            })
+            .unwrap_or_else(|| self.object_write_delay_ms.load(Ordering::Acquire));
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }

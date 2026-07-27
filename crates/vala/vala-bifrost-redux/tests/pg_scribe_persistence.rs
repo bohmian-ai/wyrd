@@ -109,14 +109,24 @@ impl PersistenceFixture {
     }
 
     async fn start_after_wal_restart(fail_replay_write: bool) -> Self {
-        Self::start_after_wal_restart_with_keys(fail_replay_write, &["restart_publish_events"], 3)
-            .await
+        Self::start_after_wal_restart_with_keys(
+            fail_replay_write,
+            &["restart_publish_events"],
+            3,
+            &[
+                Duration::from_millis(300),
+                Duration::from_millis(1),
+                Duration::from_millis(1),
+            ],
+        )
+        .await
     }
 
     async fn start_after_wal_restart_with_keys(
         fail_replay_write: bool,
         table_names: &[&str],
         generations: i64,
+        object_write_delays: &[Duration],
     ) -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
@@ -208,6 +218,7 @@ impl PersistenceFixture {
         if fail_replay_write {
             faults.fail_next_object_write();
         }
+        faults.set_object_write_delays_for_test(object_write_delays);
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
                 .with_test_faults(faults.clone());
@@ -447,6 +458,23 @@ async fn rows_for_table(fixture: &PersistenceFixture, table_name: &str) -> Vec<(
     .fetch_all(&mut **conn.transaction())
     .await
     .expect("file-list rows")
+}
+
+async fn publication_order(fixture: &PersistenceFixture, table_name: &str) -> Vec<i64> {
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query_scalar(
+        "SELECT wal_lsn_min FROM vala.file_list
+          WHERE data_tenant_id = $1 AND table_name = $2 ORDER BY created_at",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(table_name)
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("publication order")
 }
 
 async fn audit_count(fixture: &PersistenceFixture) -> i64 {
@@ -707,6 +735,10 @@ async fn replayed_generation_publishes_durably_after_restart() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(rows(&fixture).await.len(), 3);
+    assert_eq!(
+        publication_order(&fixture, "restart_publish_events").await,
+        vec![1, 2, 3]
+    );
     assert_eq!(audit_count(&fixture).await, 3);
     assert_eq!(object_paths(&fixture).await.len(), 3);
     fixture.stop().await;
@@ -741,11 +773,9 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
         false,
         &["restart_key_a", "restart_key_b"],
         2,
+        &[Duration::from_millis(100)],
     )
     .await;
-    fixture
-        .faults
-        .set_object_write_delay_for_test(Duration::from_millis(100));
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if fixture.scribe.persistence_queue_depth_for_test() == 0
@@ -763,8 +793,9 @@ async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
     }
     assert!(fixture.faults.max_concurrent_object_writes_for_test() >= 2);
     for table_name in ["restart_key_a", "restart_key_b"] {
-        let persisted = rows_for_table(&fixture, table_name).await;
-        assert!(persisted.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert_eq!(publication_order(&fixture, table_name).await.len(), 2);
+        let persisted = publication_order(&fixture, table_name).await;
+        assert!(persisted.windows(2).all(|pair| pair[0] < pair[1]));
     }
     assert_eq!(audit_count(&fixture).await, 4);
     assert_eq!(object_paths(&fixture).await.len(), 4);

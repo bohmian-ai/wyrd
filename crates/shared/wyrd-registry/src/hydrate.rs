@@ -1,6 +1,7 @@
 //! Client-side graph hydration and bundle publication.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,6 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::ArtifactInventoryResponse;
 
 use crate::download::download_artifact;
-use crate::engine::RegistryEngine;
 use crate::error::RegistryEngineError;
 use crate::handle::{CardSelector, Cards};
 use crate::reads;
@@ -104,12 +104,134 @@ pub struct HydratedArtifactManifest {
     pub local_path: Option<String>,
 }
 
+/// A Card, its server-owned artifact inventory, and safe local aliases.
 #[derive(Debug)]
 struct ResolvedCard {
+    /// Exact server-resolved Card identity.
     card_ref: CardRef,
+    /// Server-returned Card envelope to serialize into the bundle.
     card: Card,
+    /// Server-owned artifact metadata used for manifest creation and downloads.
     inventory: ArtifactInventoryResponse,
+    /// All validated aliases that point at this Card in the relationship graph.
     aliases: BTreeSet<String>,
+}
+
+/// Owns the local paths and rollback invariant for one bundle publication.
+struct HydrationPublisher<'a> {
+    /// Temporary directory containing the fully materialized bundle.
+    staging: &'a Path,
+    /// Final directory that should expose the new bundle after promotion.
+    destination: &'a Path,
+}
+
+impl<'a> HydrationPublisher<'a> {
+    /// Create a publisher for one staged bundle and its final destination.
+    #[must_use]
+    fn new(staging: &'a Path, destination: &'a Path) -> Self {
+        Self {
+            staging,
+            destination,
+        }
+    }
+
+    /// Promote the staged bundle while restoring the previous bundle on failure.
+    ///
+    /// A new destination is renamed directly into place. When a destination
+    /// already exists, it is first moved to a uniquely named backup, the new
+    /// bundle is promoted, and the backup is removed only after promotion
+    /// succeeds. A failed promotion attempts restoration before returning.
+    ///
+    /// # Errors
+    /// Returns a registry error when promotion fails, restoration fails, or
+    /// the filesystem cannot inspect or rename the involved paths.
+    fn publish(&self) -> Result<(), WyrdError> {
+        if fs::metadata(self.destination).is_err() {
+            fs::rename(self.staging, self.destination)
+                .map_err(RegistryEngineError::from)
+                .map_err(WyrdError::from)?;
+            return Ok(());
+        }
+        let parent = self.destination.parent().unwrap_or_else(|| Path::new("."));
+        let backup = parent.join(format!(
+            ".{}.previous-{}",
+            self.destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("wyrd-state"),
+            uuid::Uuid::now_v7()
+        ));
+        fs::rename(self.destination, &backup)
+            .map_err(RegistryEngineError::from)
+            .map_err(WyrdError::from)?;
+        let promotion = {
+            #[cfg(test)]
+            if take_publish_fault(FAIL_PROMOTION) {
+                Err(std::io::Error::other(
+                    "injected hydration promotion failure",
+                ))
+            } else {
+                fs::rename(self.staging, self.destination)
+            }
+            #[cfg(not(test))]
+            fs::rename(self.staging, self.destination)
+        };
+        if let Err(error) = promotion {
+            let publication_error = WyrdError::from(RegistryEngineError::from(error));
+            let restoration = {
+                #[cfg(test)]
+                if take_publish_fault(FAIL_RESTORE) {
+                    Err(std::io::Error::other(
+                        "injected hydration restoration failure",
+                    ))
+                } else {
+                    fs::rename(&backup, self.destination)
+                }
+                #[cfg(not(test))]
+                fs::rename(&backup, self.destination)
+            };
+            if let Err(error) = restoration {
+                let restoration_error = RegistryEngineError::from(error);
+                tracing::error!(
+                    error = %restoration_error,
+                    destination = %self.destination.display(),
+                    backup = %backup.display(),
+                    "hydration publication failed and rollback failed"
+                );
+                return Err(WyrdError::Internal {
+                    message: "hydration publication and rollback failed".to_owned(),
+                    details: serde_json::json!({
+                        "publication_error": publication_error.to_string(),
+                        "rollback_error": restoration_error.to_string(),
+                        "destination": self.destination,
+                        "backup": backup,
+                    }),
+                });
+            }
+            return Err(publication_error);
+        }
+        let cleanup = {
+            #[cfg(test)]
+            if take_publish_fault(FAIL_CLEANUP) {
+                Err(std::io::Error::other(
+                    "injected hydration backup cleanup failure",
+                ))
+            } else {
+                fs::remove_dir_all(&backup)
+            }
+            #[cfg(not(test))]
+            fs::remove_dir_all(&backup)
+        };
+        if let Err(error) = cleanup {
+            tracing::warn!(
+                error = %error,
+                backup = %backup.display(),
+                destination = %self.destination.display(),
+                "published hydration bundle but could not remove the previous bundle"
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Cards {
@@ -146,13 +268,19 @@ impl Cards {
     /// Returns a structured error for graph inconsistencies, unauthorized or
     /// missing reads, unsafe aliases/paths, transfer verification failures,
     /// or publication failures.
+    ///
+    /// # Cancellation
+    /// Cancellation during a remote read or artifact transfer stops hydration
+    /// after the completed stage. Returned errors clean up staging, but a task
+    /// dropped while awaiting external IO may leave its staging directory for
+    /// later local cleanup.
     pub async fn hydrate(
         &self,
         selector: CardSelector,
         destination: &Path,
         mode: HydrationMode,
     ) -> Result<HydrationSummary, WyrdError> {
-        let resolved = resolve_graph(&self.engine, selector).await?;
+        let resolved = self.resolve_graph(selector).await?;
         let root = resolved
             .first()
             .map(|card| card.card_ref.clone())
@@ -161,11 +289,10 @@ impl Cards {
                 details: serde_json::json!({}),
             })?;
         let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent)
-            .await
+        fs::create_dir_all(parent)
             .map_err(RegistryEngineError::from)
             .map_err(WyrdError::from)?;
-        match tokio::fs::metadata(destination).await {
+        match fs::metadata(destination) {
             Ok(metadata) if !metadata.is_dir() => {
                 return Err(WyrdError::RegistryInvalidCardSpec {
                     message: "hydration destination is not a directory".to_owned(),
@@ -187,17 +314,16 @@ impl Cards {
                 .unwrap_or("wyrd-state"),
             uuid::Uuid::now_v7()
         ));
-        tokio::fs::create_dir(&staging)
-            .await
+        fs::create_dir(&staging)
             .map_err(RegistryEngineError::from)
             .map_err(WyrdError::from)?;
-        let result = write_bundle(&self.engine, &staging, &resolved, mode, &root).await;
+        let result = self.write_bundle(&staging, &resolved, mode, &root).await;
         if let Err(error) = result {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
+            let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
-        if let Err(error) = publish_staging(&staging, destination).await {
-            let _ = tokio::fs::remove_dir_all(&staging).await;
+        if let Err(error) = HydrationPublisher::new(&staging, destination).publish() {
+            let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
 
@@ -220,134 +346,154 @@ impl Cards {
     }
 }
 
-async fn resolve_graph(
-    engine: &RegistryEngine,
-    selector: CardSelector,
-) -> Result<Vec<ResolvedCard>, WyrdError> {
-    let root = match &selector {
-        CardSelector::Named { version: None, .. } => {
-            let response = reads::get_response(&engine.client, &selector)
-                .await
-                .map_err(WyrdError::from)?;
-            reads::card_ref_from_card(&response.card)
-                .map_err(WyrdError::from)
-                .map(CardSelector::exact)?
-        }
-        _ => selector,
-    };
-    let root_response = reads::get_response(&engine.client, &root)
-        .await
-        .map_err(WyrdError::from)?;
-    let root_ref = reads::card_ref_from_card(&root_response.card).map_err(WyrdError::from)?;
-    enum Visit {
-        Enter(CardRef, String, bool),
-        Exit(String),
-    }
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum VisitState {
-        Visiting,
-        Resolved,
-    }
-    let mut stack = vec![Visit::Enter(root_ref, String::from("root"), true)];
-    let mut states = BTreeMap::<String, VisitState>::new();
-    let mut aliases = BTreeMap::<String, String>::new();
-    let mut nodes = BTreeMap::<String, ResolvedCard>::new();
-    let mut root_response = Some(root_response);
-
-    while let Some(item) = stack.pop() {
-        let (card_ref, alias, is_root) = match item {
-            Visit::Exit(key) => {
-                states.insert(key, VisitState::Resolved);
-                continue;
+impl Cards {
+    /// Resolve the selected Card and every reachable relationship.
+    ///
+    /// A versionless named selector is resolved to an exact reference first.
+    /// The traversal then reads each exact Card and its artifact inventory,
+    /// rejects cycles and unsafe aliases, and returns cards in deterministic
+    /// reference order without touching the local destination.
+    ///
+    /// # Errors
+    /// Returns a registry error when a Card or inventory read fails, a response
+    /// does not match its requested reference, a relationship is cyclic or
+    /// untyped, or an alias/path invariant is violated.
+    ///
+    /// # Cancellation
+    /// Cancellation stops the current remote read. No local bundle is created
+    /// by this stage, so no local cleanup is required.
+    async fn resolve_graph(&self, selector: CardSelector) -> Result<Vec<ResolvedCard>, WyrdError> {
+        let root = match &selector {
+            CardSelector::Named { version: None, .. } => {
+                let response = reads::get_response(&self.engine.client, &selector)
+                    .await
+                    .map_err(WyrdError::from)?;
+                reads::card_ref_from_card(&response.card)
+                    .map_err(WyrdError::from)
+                    .map(CardSelector::exact)?
             }
-            Visit::Enter(card_ref, alias, is_root) => (card_ref, alias, is_root),
+            _ => selector,
         };
-        let key = card_ref.to_string();
-        register_alias(&mut aliases, &alias, &key)?;
-        match states.get(&key) {
-            Some(VisitState::Visiting) => {
-                return Err(graph_error(
-                    "card relationship graph contains a cycle",
-                    &card_ref,
-                ));
-            }
-            Some(VisitState::Resolved) => {
-                if let Some(node) = nodes.get_mut(&key) {
-                    node.aliases.insert(alias);
-                }
-                continue;
-            }
-            None => {
-                states.insert(key.clone(), VisitState::Visiting);
-            }
-        }
-        let response = if is_root {
-            root_response.take().ok_or_else(|| WyrdError::Internal {
-                message: "hydration root response was consumed more than once".to_owned(),
-                details: serde_json::json!({ "card_ref": card_ref }),
-            })?
-        } else {
-            reads::get_response(&engine.client, &CardSelector::exact(card_ref.clone()))
-                .await
-                .map_err(WyrdError::from)?
-        };
-        let resolved = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
-        if resolved != card_ref {
-            return Err(graph_error(
-                "related Card response did not match its exact reference",
-                &card_ref,
-            ));
-        }
-        let uid = card_ref.uid.clone().ok_or_else(|| {
-            graph_error(
-                "hydration requires UID-bearing relationship references",
-                &card_ref,
-            )
-        })?;
-        let inventory = crate::reads::list_artifacts(&engine.client, &uid)
+        let root_response = reads::get_response(&self.engine.client, &root)
             .await
             .map_err(WyrdError::from)?;
-        let relationships = response.card.relationships.outbound_refs.clone();
-        if !response.card.relationships.outbound.is_empty() && relationships.is_empty() {
-            return Err(graph_error(
-                "server returned untyped outbound relationships; graph closure is unsafe",
-                &card_ref,
-            ));
+        let root_ref = reads::card_ref_from_card(&root_response.card).map_err(WyrdError::from)?;
+        /// Depth-first traversal work item for one relationship edge.
+        enum Visit {
+            /// Read and enter a Card, retaining its alias and root marker.
+            Enter(CardRef, String, bool),
+            /// Mark a Card as fully traversed after its children complete.
+            Exit(String),
         }
-        let node = ResolvedCard {
-            card_ref: card_ref.clone(),
-            card: response.card,
-            inventory,
-            aliases: BTreeSet::from([alias]),
-        };
-        stack.push(Visit::Exit(key.clone()));
-        for relationship in relationships.iter().rev() {
-            let child = relationship.card_ref.clone();
-            let child_alias = relationship
-                .alias
-                .clone()
-                .unwrap_or_else(|| default_alias(&child));
-            validate_alias(&child_alias)?;
-            let child_key = child.to_string();
-            register_alias(&mut aliases, &child_alias, &child_key)?;
-            match states.get(&child_key) {
+        /// Resolution state used to detect cycles during graph traversal.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum VisitState {
+            /// The Card is on the active traversal stack.
+            Visiting,
+            /// The Card and all reachable children have been materialized.
+            Resolved,
+        }
+        let mut stack = vec![Visit::Enter(root_ref, String::from("root"), true)];
+        let mut states = BTreeMap::<String, VisitState>::new();
+        let mut aliases = BTreeMap::<String, String>::new();
+        let mut nodes = BTreeMap::<String, ResolvedCard>::new();
+        let mut root_response = Some(root_response);
+
+        while let Some(item) = stack.pop() {
+            let (card_ref, alias, is_root) = match item {
+                Visit::Exit(key) => {
+                    states.insert(key, VisitState::Resolved);
+                    continue;
+                }
+                Visit::Enter(card_ref, alias, is_root) => (card_ref, alias, is_root),
+            };
+            let key = card_ref.to_string();
+            register_alias(&mut aliases, &alias, &key)?;
+            match states.get(&key) {
                 Some(VisitState::Visiting) => {
                     return Err(graph_error(
                         "card relationship graph contains a cycle",
-                        &child,
+                        &card_ref,
                     ));
                 }
                 Some(VisitState::Resolved) => {
-                    if let Some(existing) = nodes.get_mut(&child_key) {
-                        existing.aliases.insert(child_alias);
+                    if let Some(node) = nodes.get_mut(&key) {
+                        node.aliases.insert(alias);
                     }
+                    continue;
                 }
-                None => stack.push(Visit::Enter(child, child_alias, false)),
+                None => {
+                    states.insert(key.clone(), VisitState::Visiting);
+                }
             }
+            let response = if is_root {
+                root_response.take().ok_or_else(|| WyrdError::Internal {
+                    message: "hydration root response was consumed more than once".to_owned(),
+                    details: serde_json::json!({ "card_ref": card_ref }),
+                })?
+            } else {
+                reads::get_response(&self.engine.client, &CardSelector::exact(card_ref.clone()))
+                    .await
+                    .map_err(WyrdError::from)?
+            };
+            let resolved = reads::card_ref_from_card(&response.card).map_err(WyrdError::from)?;
+            if resolved != card_ref {
+                return Err(graph_error(
+                    "related Card response did not match its exact reference",
+                    &card_ref,
+                ));
+            }
+            let uid = card_ref.uid.clone().ok_or_else(|| {
+                graph_error(
+                    "hydration requires UID-bearing relationship references",
+                    &card_ref,
+                )
+            })?;
+            let inventory = crate::reads::list_artifacts(&self.engine.client, &uid)
+                .await
+                .map_err(WyrdError::from)?;
+            let relationships = response.card.relationships.outbound_refs.clone();
+            if !response.card.relationships.outbound.is_empty() && relationships.is_empty() {
+                return Err(graph_error(
+                    "server returned untyped outbound relationships; graph closure is unsafe",
+                    &card_ref,
+                ));
+            }
+            let node = ResolvedCard {
+                card_ref: card_ref.clone(),
+                card: response.card,
+                inventory,
+                aliases: BTreeSet::from([alias]),
+            };
+            stack.push(Visit::Exit(key.clone()));
+            for relationship in relationships.iter().rev() {
+                let child = relationship.card_ref.clone();
+                let child_alias = relationship
+                    .alias
+                    .clone()
+                    .unwrap_or_else(|| default_alias(&child));
+                validate_alias(&child_alias)?;
+                let child_key = child.to_string();
+                register_alias(&mut aliases, &child_alias, &child_key)?;
+                match states.get(&child_key) {
+                    Some(VisitState::Visiting) => {
+                        return Err(graph_error(
+                            "card relationship graph contains a cycle",
+                            &child,
+                        ));
+                    }
+                    Some(VisitState::Resolved) => {
+                        if let Some(existing) = nodes.get_mut(&child_key) {
+                            existing.aliases.insert(child_alias);
+                        }
+                    }
+                    None => stack.push(Visit::Enter(child, child_alias, false)),
+                }
+            }
+            nodes.insert(key, node);
         }
-        nodes.insert(key, node);
+        Ok(nodes.into_values().collect())
     }
-    Ok(nodes.into_values().collect())
 }
 
 fn register_alias(
@@ -407,123 +553,146 @@ fn graph_error(message: &str, card_ref: &CardRef) -> WyrdError {
     }
 }
 
-async fn write_bundle(
-    engine: &RegistryEngine,
-    staging: &Path,
-    cards: &[ResolvedCard],
-    mode: HydrationMode,
-    root: &CardRef,
-) -> Result<(), WyrdError> {
-    let mut manifests = Vec::with_capacity(cards.len());
-    let mut downloaded = 0;
-    for card in cards {
-        let canonical_alias = card
-            .aliases
-            .iter()
-            .next()
-            .ok_or_else(|| graph_error("hydrated Card has no bundle alias", &card.card_ref))?;
-        validate_alias(canonical_alias)?;
-        let card_dir = staging.join("cards").join(canonical_alias);
-        tokio::fs::create_dir_all(&card_dir)
-            .await
-            .map_err(RegistryEngineError::from)
-            .map_err(WyrdError::from)?;
-        let card_path = card_dir.join("card.yaml");
-        let relationships_path = card_dir.join("relationships.yaml");
-        let inventory_path = card_dir.join("artifacts.yaml");
-        write_yaml(&card_path, &card.card).await?;
-        write_yaml(&relationships_path, &card.card.relationships).await?;
-        let mut artifacts = Vec::with_capacity(card.inventory.artifacts.len());
-        for entry in &card.inventory.artifacts {
-            validate_artifact_path(entry.relative_path.as_str(), &card.card_ref)?;
-            let local_path = if matches!(mode, HydrationMode::Complete) {
-                let path = card_dir
-                    .join("artifacts")
-                    .join(entry.relative_path.as_str());
-                if !path.starts_with(staging) {
-                    return Err(graph_error(
-                        "artifact path escaped hydration staging",
-                        &card.card_ref,
-                    ));
-                }
-                if let Some(parent) = path.parent() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(RegistryEngineError::from)
-                        .map_err(WyrdError::from)?;
-                }
-                download_artifact(
-                    &engine.client,
-                    &engine.storage,
-                    card.card_ref.uid.as_ref().ok_or_else(|| {
-                        graph_error("artifact-bearing Card is missing its UID", &card.card_ref)
-                    })?,
-                    &entry.relative_path,
-                    &path,
-                )
-                .await
+impl Cards {
+    /// Materialize resolved Cards, inventories, aliases, and optional artifacts.
+    ///
+    /// Local manifest and directory writes are synchronous and bounded to the
+    /// staged bundle. Complete hydration additionally awaits each authorized,
+    /// verified artifact transfer before recording its local path in the
+    /// manifest.
+    ///
+    /// # Errors
+    /// Returns a registry error when a path or alias is unsafe, local bundle
+    /// materialization fails, an artifact lacks a UID, serialization fails, or
+    /// a remote artifact transfer cannot be verified.
+    ///
+    /// # Cancellation
+    /// Cancellation during an artifact transfer can leave partial files in the
+    /// staging directory. The owning `hydrate` workflow removes staging when
+    /// an awaited operation returns an error; a dropped task may require later
+    /// local cleanup.
+    async fn write_bundle(
+        &self,
+        staging: &Path,
+        cards: &[ResolvedCard],
+        mode: HydrationMode,
+        root: &CardRef,
+    ) -> Result<(), WyrdError> {
+        let mut manifests = Vec::with_capacity(cards.len());
+        let mut downloaded = 0;
+        for card in cards {
+            let canonical_alias =
+                card.aliases.iter().next().ok_or_else(|| {
+                    graph_error("hydrated Card has no bundle alias", &card.card_ref)
+                })?;
+            validate_alias(canonical_alias)?;
+            let card_dir = staging.join("cards").join(canonical_alias);
+            fs::create_dir_all(&card_dir)
+                .map_err(RegistryEngineError::from)
                 .map_err(WyrdError::from)?;
-                downloaded += 1;
-                Some(relative_path(staging, &path)?)
-            } else {
-                None
-            };
-            artifacts.push(HydratedArtifactManifest {
-                relative_path: entry.relative_path.as_str().to_owned(),
-                sha256: entry.sha256.clone(),
-                size_bytes: entry.size_bytes,
-                content_type: entry.content_type.clone(),
-                local_path,
+            let card_path = card_dir.join("card.yaml");
+            let relationships_path = card_dir.join("relationships.yaml");
+            let inventory_path = card_dir.join("artifacts.yaml");
+            write_yaml(&card_path, &card.card)?;
+            write_yaml(&relationships_path, &card.card.relationships)?;
+            let mut artifacts = Vec::with_capacity(card.inventory.artifacts.len());
+            for entry in &card.inventory.artifacts {
+                validate_artifact_path(entry.relative_path.as_str(), &card.card_ref)?;
+                let local_path = if matches!(mode, HydrationMode::Complete) {
+                    let path = card_dir
+                        .join("artifacts")
+                        .join(entry.relative_path.as_str());
+                    if !path.starts_with(staging) {
+                        return Err(graph_error(
+                            "artifact path escaped hydration staging",
+                            &card.card_ref,
+                        ));
+                    }
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(RegistryEngineError::from)
+                            .map_err(WyrdError::from)?;
+                    }
+                    download_artifact(
+                        &self.engine.client,
+                        &self.engine.storage,
+                        card.card_ref.uid.as_ref().ok_or_else(|| {
+                            graph_error("artifact-bearing Card is missing its UID", &card.card_ref)
+                        })?,
+                        &entry.relative_path,
+                        &path,
+                    )
+                    .await
+                    .map_err(WyrdError::from)?;
+                    downloaded += 1;
+                    Some(relative_path(staging, &path)?)
+                } else {
+                    None
+                };
+                artifacts.push(HydratedArtifactManifest {
+                    relative_path: entry.relative_path.as_str().to_owned(),
+                    sha256: entry.sha256.clone(),
+                    size_bytes: entry.size_bytes,
+                    content_type: entry.content_type.clone(),
+                    local_path,
+                });
+            }
+            write_yaml(&inventory_path, &artifacts)?;
+            let aliases = card.aliases.iter().cloned().collect::<Vec<_>>();
+            for alias in &aliases {
+                let alias_path = staging.join("aliases").join(format!("{alias}.yaml"));
+                let alias_record = serde_json::json!({
+                    "alias": alias,
+                    "card_ref": card.card_ref,
+                    "card_path": relative_path(staging, &card_path)?,
+                });
+                write_yaml(&alias_path, &alias_record)?;
+            }
+            manifests.push(HydratedCardManifest {
+                aliases,
+                card_ref: card.card_ref.clone(),
+                card_path: relative_path(staging, &card_path)?,
+                relationships_path: relative_path(staging, &relationships_path)?,
+                artifact_inventory_path: relative_path(staging, &inventory_path)?,
+                artifacts,
             });
         }
-        write_yaml(&inventory_path, &artifacts).await?;
-        let aliases = card.aliases.iter().cloned().collect::<Vec<_>>();
-        for alias in &aliases {
-            let alias_path = staging.join("aliases").join(format!("{alias}.yaml"));
-            let alias_record = serde_json::json!({
-                "alias": alias,
-                "card_ref": card.card_ref,
-                "card_path": relative_path(staging, &card_path)?,
-            });
-            write_yaml(&alias_path, &alias_record).await?;
-        }
-        manifests.push(HydratedCardManifest {
-            aliases,
-            card_ref: card.card_ref.clone(),
-            card_path: relative_path(staging, &card_path)?,
-            relationships_path: relative_path(staging, &relationships_path)?,
-            artifact_inventory_path: relative_path(staging, &inventory_path)?,
-            artifacts,
-        });
+        let artifact_count = manifests.iter().map(|card| card.artifacts.len()).sum();
+        let manifest = HydratedBundleManifest {
+            api_version: "wyrd/hydrated-bundle/v1".to_owned(),
+            hydration: mode,
+            root: root.clone(),
+            card_count: manifests.len(),
+            artifact_count,
+            downloaded_artifact_count: downloaded,
+            cards: manifests,
+        };
+        write_yaml(&staging.join("metadata.yaml"), &manifest)
     }
-    let artifact_count = manifests.iter().map(|card| card.artifacts.len()).sum();
-    let manifest = HydratedBundleManifest {
-        api_version: "wyrd/hydrated-bundle/v1".to_owned(),
-        hydration: mode,
-        root: root.clone(),
-        card_count: manifests.len(),
-        artifact_count,
-        downloaded_artifact_count: downloaded,
-        cards: manifests,
-    };
-    write_yaml(&staging.join("metadata.yaml"), &manifest).await
 }
 
-async fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
+/// Serialize one bounded hydration manifest and write it below the staging tree.
+///
+/// This helper is synchronous because it only performs local YAML serialization
+/// and small manifest/file writes. Network and storage transfers remain in the
+/// async bundle workflow that calls it.
+///
+/// # Errors
+/// Returns a registry error when the path has no parent, YAML serialization
+/// fails, or the local directory/file operation fails.
+fn write_yaml<T: Serialize>(path: &Path, value: &T) -> Result<(), WyrdError> {
     let parent = path.parent().ok_or_else(|| WyrdError::Internal {
         message: "hydration output path has no parent".to_owned(),
         details: serde_json::json!({ "path": path }),
     })?;
-    tokio::fs::create_dir_all(parent)
-        .await
+    fs::create_dir_all(parent)
         .map_err(RegistryEngineError::from)
         .map_err(WyrdError::from)?;
     let yaml = serde_yaml::to_string(value).map_err(|error| WyrdError::Internal {
         message: "failed to serialize hydrated bundle YAML".to_owned(),
         details: serde_json::json!({ "path": path, "error": error.to_string() }),
     })?;
-    tokio::fs::write(path, yaml)
-        .await
+    fs::write(path, yaml)
         .map_err(RegistryEngineError::from)
         .map_err(WyrdError::from)
 }
@@ -553,96 +722,6 @@ fn take_publish_fault(fault: u8) -> bool {
     PUBLISH_FAULTS.fetch_and(!fault, Ordering::SeqCst) & fault != 0
 }
 
-async fn publish_staging(staging: &Path, destination: &Path) -> Result<(), WyrdError> {
-    if tokio::fs::metadata(destination).await.is_err() {
-        tokio::fs::rename(staging, destination)
-            .await
-            .map_err(RegistryEngineError::from)
-            .map_err(WyrdError::from)?;
-        return Ok(());
-    }
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
-    let backup = parent.join(format!(
-        ".{}.previous-{}",
-        destination
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("wyrd-state"),
-        uuid::Uuid::now_v7()
-    ));
-    tokio::fs::rename(destination, &backup)
-        .await
-        .map_err(RegistryEngineError::from)
-        .map_err(WyrdError::from)?;
-    let promotion = {
-        #[cfg(test)]
-        if take_publish_fault(FAIL_PROMOTION) {
-            Err(std::io::Error::other(
-                "injected hydration promotion failure",
-            ))
-        } else {
-            tokio::fs::rename(staging, destination).await
-        }
-        #[cfg(not(test))]
-        tokio::fs::rename(staging, destination).await
-    };
-    if let Err(error) = promotion {
-        let publication_error = WyrdError::from(RegistryEngineError::from(error));
-        let restoration = {
-            #[cfg(test)]
-            if take_publish_fault(FAIL_RESTORE) {
-                Err(std::io::Error::other(
-                    "injected hydration restoration failure",
-                ))
-            } else {
-                tokio::fs::rename(&backup, destination).await
-            }
-            #[cfg(not(test))]
-            tokio::fs::rename(&backup, destination).await
-        };
-        if let Err(error) = restoration {
-            let restoration_error = RegistryEngineError::from(error);
-            tracing::error!(
-                error = %restoration_error,
-                destination = %destination.display(),
-                backup = %backup.display(),
-                "hydration publication failed and rollback failed"
-            );
-            return Err(WyrdError::Internal {
-                message: "hydration publication and rollback failed".to_owned(),
-                details: serde_json::json!({
-                    "publication_error": publication_error.to_string(),
-                    "rollback_error": restoration_error.to_string(),
-                    "destination": destination,
-                    "backup": backup,
-                }),
-            });
-        }
-        return Err(publication_error);
-    }
-    let cleanup = {
-        #[cfg(test)]
-        if take_publish_fault(FAIL_CLEANUP) {
-            Err(std::io::Error::other(
-                "injected hydration backup cleanup failure",
-            ))
-        } else {
-            tokio::fs::remove_dir_all(&backup).await
-        }
-        #[cfg(not(test))]
-        tokio::fs::remove_dir_all(&backup).await
-    };
-    if let Err(error) = cleanup {
-        tracing::warn!(
-            error = %error,
-            backup = %backup.display(),
-            destination = %destination.display(),
-            "published hydration bundle but could not remove the previous bundle"
-        );
-    }
-    Ok(())
-}
-
 fn validate_artifact_path(path: &str, card_ref: &CardRef) -> Result<(), WyrdError> {
     if path.is_empty()
         || path.starts_with('/')
@@ -670,18 +749,20 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, HydrationMode, PUBLISH_FAULTS, default_alias,
-        publish_staging, register_alias, validate_alias, validate_artifact_path,
+        FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, HydrationMode, HydrationPublisher,
+        PUBLISH_FAULTS, default_alias, register_alias, validate_alias, validate_artifact_path,
     };
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, SpaceName};
     use wyrd_spec::reference::CardRef;
 
+    /// Configure one-shot publication faults for rollback tests.
     fn inject_publish_faults(faults: u8) {
         PUBLISH_FAULTS.store(faults, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Write a marker file used to distinguish old and newly published bundles.
     fn write_bundle_marker(directory: &std::path::Path, marker: &str) {
         std::fs::create_dir_all(directory).expect("bundle directory creates");
         std::fs::write(directory.join("marker"), marker).expect("bundle marker writes");
@@ -740,15 +821,16 @@ mod tests {
         register_alias(&mut aliases, "shared", "first").expect("same alias remains valid");
     }
 
-    #[tokio::test]
-    async fn failed_replacement_restores_the_previous_bundle() {
+    /// Replacing a bundle with missing staging returns an error and preserves the old bundle.
+    #[test]
+    fn failed_replacement_restores_the_previous_bundle() {
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("missing-staging");
         write_bundle_marker(&destination, "previous");
 
-        let error = publish_staging(&staging, &destination)
-            .await
+        let error = HydrationPublisher::new(&staging, &destination)
+            .publish()
             .expect_err("missing staging must fail replacement");
 
         assert!(
@@ -762,8 +844,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn rollback_failure_is_reported_as_unrecoverable() {
+    /// Promotion and restoration failures surface as an unrecoverable publication error.
+    #[test]
+    fn rollback_failure_is_reported_as_unrecoverable() {
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("staging");
@@ -771,8 +854,8 @@ mod tests {
         write_bundle_marker(&staging, "new");
         inject_publish_faults(FAIL_PROMOTION | FAIL_RESTORE);
 
-        let error = publish_staging(&staging, &destination)
-            .await
+        let error = HydrationPublisher::new(&staging, &destination)
+            .publish()
             .expect_err("injected promotion must fail");
 
         assert!(
@@ -790,8 +873,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cleanup_failure_does_not_hide_a_published_bundle() {
+    /// A cleanup failure does not hide a bundle that was already published.
+    #[test]
+    fn cleanup_failure_does_not_hide_a_published_bundle() {
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("staging");
@@ -799,8 +883,8 @@ mod tests {
         write_bundle_marker(&staging, "new");
         inject_publish_faults(FAIL_CLEANUP);
 
-        publish_staging(&staging, &destination)
-            .await
+        HydrationPublisher::new(&staging, &destination)
+            .publish()
             .expect("cleanup failure is best effort");
 
         assert_eq!(

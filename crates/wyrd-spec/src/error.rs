@@ -1002,6 +1002,36 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// Python-side runtime Card hydration failed while constructing a usable
+    /// local SDK state from a complete bundle.
+    ///
+    /// The boundary uses this variant when a custom interface, prompt,
+    /// artifact loader, or Python object allocation cannot produce the typed
+    /// runtime holder required by the SDK. Call sites may expose only safe
+    /// structured details in `details`: the authored alias, Card reference,
+    /// one of the documented hydration stages, and a concise sanitized
+    /// reason. Python traceback locals and object representations are excluded
+    /// because they can contain secrets, user data, unstable implementation
+    /// details, or non-serializable Python objects.
+    #[error("[WYRD_SDK_400_RUNTIME_HYDRATION_FAILED] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED",
+        status = 400,
+        title = "Runtime Card hydration failed",
+        remediation = "Provide the required custom interface/load arguments or regenerate a complete compatible bundle."
+    )]
+    SdkRuntimeHydrationFailed {
+        /// Concise human-readable explanation of the runtime hydration
+        /// failure, suitable for Python and other public boundaries without
+        /// embedding traceback text or object representations.
+        message: String,
+        /// Safe machine-readable hydration context. Callers may include only
+        /// `alias`, `card_ref`, `stage` (`interface`, `prompt`,
+        /// `artifact_load`, or `python_allocation`), and a sanitized `reason`;
+        /// traceback locals and Python object representations must not be
+        /// stored here.
+        details: serde_json::Value,
+    },
     /// A local WyrdState bundle is malformed or internally inconsistent.
     #[error("[WYRD_SDK_400_INVALID_STATE_BUNDLE] {message}")]
     #[wyrd_error(
@@ -2807,6 +2837,7 @@ impl WyrdError {
             | Self::CfgNameDefaultRejected { message, details }
             | Self::RegistryInvalidCardSpec { message, details }
             | Self::SdkUnhydratedArtifact { message, details }
+            | Self::SdkRuntimeHydrationFailed { message, details }
             | Self::SdkInvalidStateBundle { message, details }
             | Self::SdkUnknownAlias { message, details }
             | Self::SdkCardKindMismatch { message, details }

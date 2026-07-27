@@ -162,24 +162,7 @@ impl PersistenceFixture {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
         };
-        let pools = ScribeExecutionPools::new(
-            ScribeIngressCpuPool::new_with_capacity(1, 256),
-            ScribePersistenceCpuPool::new_with_capacity(2, 64),
-            ScribeWalIoPool::new_with_capacity(2, 256),
-        );
-        let first = Arc::new(ScribeImpl::new_with_execution_pools(
-            Arc::clone(&operator),
-            Arc::clone(&wal),
-            node_id.to_string(),
-            1,
-            ScribeBuildConfig {
-                admission,
-                coordination_runtime: tokio::runtime::Handle::current(),
-                execution_pools: pools,
-                persistence: None,
-                memory_budget: Some(memory.scribe_budget()),
-            },
-        ));
+        let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, memory);
         first.replay_wal_async().await.expect("empty WAL replay");
         write_replay_records(&wal, table_names, generations, tenant);
         first.shutdown().await;
@@ -231,6 +214,33 @@ impl PersistenceFixture {
             tenant,
         }
     }
+}
+
+fn first_replay_scribe(
+    operator: Arc<opendal::Operator>,
+    wal: Arc<WalWriter>,
+    node_id: uuid::Uuid,
+    admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
+    memory: BifrostMemoryGovernor,
+) -> Arc<ScribeImpl> {
+    let pools = ScribeExecutionPools::new(
+        ScribeIngressCpuPool::new_with_capacity(1, 256),
+        ScribePersistenceCpuPool::new_with_capacity(2, 64),
+        ScribeWalIoPool::new_with_capacity(2, 256),
+    );
+    Arc::new(ScribeImpl::new_with_execution_pools(
+        operator,
+        wal,
+        node_id.to_string(),
+        1,
+        ScribeBuildConfig {
+            admission,
+            coordination_runtime: tokio::runtime::Handle::current(),
+            execution_pools: pools,
+            persistence: None,
+            memory_budget: Some(memory.scribe_budget()),
+        },
+    ))
 }
 
 async fn register_replay_tables(

@@ -25,6 +25,7 @@ pub mod wal;
 use crate::catalog::TenantTableBinding;
 pub use crate::contracts::ScribeAppend;
 use crate::contracts::{FrameAdmission, Scribe, ScribeError, ScribeIngressFrame};
+use crate::maintenance::StagingFilePublisher;
 use crate::scribe::admission::{AdmissionConfig, AdmissionController};
 pub use crate::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
@@ -145,6 +146,8 @@ pub struct ScribeImpl {
     recovery_ready: AtomicBool,
     /// Optional server-provisioned immutable persistence runtime.
     persistence: Option<Arc<persistence::PersistenceRuntime>>,
+    /// Optional local wake-up publisher retained for caller-owned commits.
+    staging_file_publisher: Option<StagingFilePublisher>,
 }
 
 /// Complete server-provisioned dependencies used to construct one Scribe graph.
@@ -169,6 +172,8 @@ pub struct ScribeBuildConfig {
     pub persistence: Option<ScribePersistenceConfig>,
     /// Scribe child budget provisioned by server boot.
     pub memory_budget: Option<memory::ScribeMemoryBudget>,
+    /// Optional bounded local wake-up publisher for committed staging files.
+    pub staging_file_publisher: Option<StagingFilePublisher>,
 }
 
 /// Runtime, admission, and memory inputs for an embedded Scribe.
@@ -299,6 +304,7 @@ impl ScribeImpl {
             execution_pools,
             persistence: None,
             memory_budget: config.memory_budget,
+            staging_file_publisher: None,
         }))
     }
 
@@ -421,6 +427,7 @@ impl ScribeImpl {
             ),
             persistence: None,
             memory_budget: config.memory_budget,
+            staging_file_publisher: None,
         })
     }
 
@@ -465,6 +472,7 @@ impl ScribeImpl {
             persistence: persistence_config,
             admission: _,
             memory_budget: _,
+            staging_file_publisher,
         } = config;
         let node_id = stream.node_id.to_string();
         let writer_epoch = stream.writer_epoch.as_i64();
@@ -486,6 +494,7 @@ impl ScribeImpl {
                     node_id: node_id.clone(),
                     writer_epoch,
                     memory: memory.clone(),
+                    staging_file_publisher: staging_file_publisher.clone(),
                     #[cfg(any(test, feature = "test-support"))]
                     faults,
                 },
@@ -521,6 +530,7 @@ impl ScribeImpl {
             closed: AtomicBool::new(false),
             recovery_ready: AtomicBool::new(true),
             persistence,
+            staging_file_publisher,
         }
     }
 
@@ -586,6 +596,7 @@ impl ScribeImpl {
             ),
             persistence: None,
             memory_budget: None,
+            staging_file_publisher: None,
         })
     }
 
@@ -959,9 +970,20 @@ impl ScribeImpl {
         T: Into<seal::PostCommitBatch>,
     {
         for token in post_commit.into().0 {
+            let binding =
+                TenantTableBinding::resolve((token.seal_key.tenant, token.seal_key.table.clone()))
+                    .map_err(|error| ScribeError::Internal {
+                        detail: error.to_string(),
+                    })?;
             self.shards
                 .complete_post_commit(token.seal_id, &token.seal_key, token.file_list_key)
                 .await?;
+            if let Some(publisher) = &self.staging_file_publisher {
+                let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                    binding,
+                    token.seal_key.day.as_naive_date(),
+                ));
+            }
         }
         Ok(())
     }
@@ -1031,9 +1053,20 @@ impl ScribeImpl {
         })?;
 
         if row.is_some() {
+            let binding =
+                TenantTableBinding::resolve((token.seal_key.tenant, token.seal_key.table.clone()))
+                    .map_err(|error| ScribeError::Internal {
+                        detail: error.to_string(),
+                    })?;
             self.shards
                 .complete_post_commit(token.seal_id, &token.seal_key, key.clone())
                 .await?;
+            if let Some(publisher) = &self.staging_file_publisher {
+                let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
+                    binding,
+                    token.seal_key.day.as_naive_date(),
+                ));
+            }
             Ok(true)
         } else {
             self.shards

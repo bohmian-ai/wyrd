@@ -17,6 +17,7 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::catalog::{TenantTableBinding, TenantTableKey};
 use crate::contracts::ScribeError;
+use crate::maintenance::StagingFilePublisher;
 use crate::scribe::execution_lanes::{
     ScribePersistenceCpuOp, ScribePersistenceCpuPool, ScribePersistenceCpuResult, ScribeWalIoOp,
     ScribeWalIoPool, ScribeWalIoResult,
@@ -334,6 +335,8 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) writer_epoch: i64,
     /// Scribe child budget used for per-job workspace reservations.
     pub(crate) memory: ScribeMemoryBudget,
+    /// Optional local wake-up publisher used after confirmed file-list commits.
+    pub(crate) staging_file_publisher: Option<StagingFilePublisher>,
     /// Deterministic fault points used only by test-tier persistence paths.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
@@ -495,6 +498,8 @@ struct PersistenceWorker {
     writer_epoch: i64,
     /// Scribe memory budget for persistence workspace reservations.
     memory: ScribeMemoryBudget,
+    /// Optional local wake-up publisher used after confirmed file-list commits.
+    staging_file_publisher: Option<StagingFilePublisher>,
     /// Test-only fault points for deterministic persistence-path coverage.
     #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
@@ -514,6 +519,7 @@ impl PersistenceWorker {
             node_id: context.node_id,
             writer_epoch: context.writer_epoch,
             memory: context.memory,
+            staging_file_publisher: context.staging_file_publisher,
             #[cfg(any(test, feature = "test-support"))]
             faults: context.faults,
             manifest_guard: tokio::sync::Mutex::new(()),
@@ -691,6 +697,13 @@ impl PersistenceWorker {
             });
         }
         conn.commit().await.map_err(ScribeError::from)?;
+        if let Some(publisher) = &self.staging_file_publisher {
+            let event = crate::maintenance::StagingFileCommitted::new(
+                binding.clone(),
+                generation.seal_key.day.as_naive_date(),
+            );
+            let _ = publisher.try_publish(event);
+        }
 
         let manifest_path = self.wal.base_dir().join("manifest");
         let lsn = generation.wal_lsn_max;

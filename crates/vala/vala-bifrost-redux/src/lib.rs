@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod contracts;
 pub mod forge;
 pub mod gate;
+pub mod maintenance;
 pub mod namespaces;
 pub mod parquet;
 pub mod provider;

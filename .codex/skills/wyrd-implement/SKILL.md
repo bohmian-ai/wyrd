@@ -65,6 +65,29 @@ Do not call an editing tool until the ledger names every loaded reference and
 the decision it governs. If a required reference cannot be read, stop and
 report the blocker.
 
+### Mandatory Rust structure gate
+
+Before editing Rust, record this structural decision in the working update:
+
+- the concrete struct, enum, or newtype that owns the behavior;
+- the state, dependencies, identity, or invariants it owns;
+- the public methods and cohesive private workflow stages being added or
+  changed;
+- the private pure helpers that remain free functions;
+- why any other new or materially changed free function is genuinely
+  stateless and has no natural owner; and
+- which methods remain synchronous, which methods are async, and the concrete
+  awaited IO that earns each async boundary;
+- the rustdoc coverage for every new or materially modified Rust item,
+  including private items, fields, variants, helpers, and tests; and
+- the nearest struct-centered Wyrd precedent.
+
+Do not edit until this gate is complete. `AGENTS.md` §5 "Required
+Struct-Centered Rust Style" is a hard acceptance criterion. If a plan prescribes
+module-level orchestration, repeated dependency threading, an anemic struct, a
+god object, or a single-implementation trait contrary to that rule, stop and
+surface the conflict rather than implementing the wrong structure.
+
 ## CodeGraph Hydration (if available)
 
 `.dev/` is gitignored — the plan files described here exist only in the
@@ -215,6 +238,10 @@ Registered as handlers on `wyrd-server` — the only serving surface. See
 
 - Keep core behavior in Rust. Python and TypeScript should be typed and
   ergonomic, not duplicate implementations.
+- Use Wyrd's required struct-centered hybrid style. Stateful capabilities,
+  dependency-backed behavior, workflows, and invariant-bearing domain behavior
+  live on cohesive concrete structs with inherent methods. Keep free functions
+  only for genuinely stateless deterministic helpers with no natural owner.
 - Use domain types instead of raw strings for durable identifiers
   (`TenantId`, `RunId`, `CardUid`, etc.).
 - Prefer `&str`, `&Path`, `&[T]`, and typed references when ownership is
@@ -262,9 +289,12 @@ Concrete examples: `architecture/references/languages/rust-core.md`.
 
 ## Async And Runtime Rules
 
-- Use async at IO boundaries: HTTP, database, storage, queues, network
-  calls, server handlers.
-- Keep pure computation synchronous unless the caller requires async.
+- Synchronous Rust is the default. Every `async fn` must directly await IO or
+  intentionally compose operations that do.
+- Keep validation, parsing, planning, transformations, and other pure
+  computation synchronous even when called by async code.
+- Keep async boundaries narrow; do not propagate async for signature
+  uniformity or hypothetical future IO.
 - Use the shared `wyrd-runtime` bridge for Python async/sync bridging. Do
   not create ad hoc Tokio runtimes in library or PyO3 code.
 - Do not block inside async request paths without an explicit blocking
@@ -452,19 +482,30 @@ Full guidance:
 ### Documentation
 
 - Document all new code and all behavior changed by an edit, including private
-  and internal functions, types, modules, helpers, and control-flow stages.
+  and internal functions, types, modules, fields, enum variants, helpers,
+  constants, type aliases, tests, and control-flow stages.
   Use rustdoc comments for Rust, docstrings for Python, and the repository's
-  established documentation convention for TypeScript. Explain purpose,
-  inputs/outputs, errors, invariants, and non-obvious design choices where
-  applicable.
+  established documentation convention for TypeScript. Rustdoc explains
+  intent, how the item works and participates in its workflow, inputs/outputs,
+  invariants, side effects, and non-obvious design choices. Every fallible Rust
+  function includes `# Errors`; document panics, cancellation, partial
+  progress, and retries when applicable.
 - Do not skip documentation because an implementation is small or obvious;
   maintainers and agents should understand touched code without reconstructing
   its intent from callers.
+- Missing or placeholder documentation on any new or materially modified Rust
+  item is a hard blocker even when compilation and tests pass.
 - Do not add documentation churn to code outside the edit's scope.
 
 A change is not done until:
 
 - The implementation matches the owning Wyrd crate's local patterns.
+- Every new or materially changed Rust symbol satisfies `AGENTS.md` §5
+  "Required Struct-Centered Rust Style"; correct behavior does not compensate
+  for the wrong structural shape.
+- Every new or materially changed Rust item satisfies the rustdoc hard gate in
+  `AGENTS.md` §16, and every async function has evidence of the awaited IO that
+  earns it.
 - New core behavior has Rust tests when practical; new user/agent-facing
   capability ships a **user-journey** test.
 - Python-visible behavior has Python coverage or a documented reason.

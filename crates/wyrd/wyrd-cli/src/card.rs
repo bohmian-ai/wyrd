@@ -13,7 +13,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
-use wyrd_registry::{CardSelector, Cards, HydrationMode, HydrationSummary};
+use wyrd_registry::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -305,7 +305,7 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
 ///
 /// The command validates the selector and required output directory locally,
 /// then delegates graph reads, artifact verification, staging, and publication
-/// to the shared `Cards` handle. Complete hydration is the default; the
+/// to a graph-focused hydrator sharing the registry context. Complete hydration is the default; the
 /// metadata-only flag omits artifact payload downloads.
 ///
 /// # Errors
@@ -328,13 +328,14 @@ pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
         )
     })?;
     let cards = build_cards(&args.connection)?;
+    let hydrator = CardGraphHydrator::new(cards.registry_context());
     let mode = if args.metadata_only {
         HydrationMode::MetadataOnly
     } else {
         HydrationMode::Complete
     };
-    let output = cards
-        .hydrate(selector, output_dir, mode)
+    let output = hydrator
+        .hydrate(&selector, output_dir, mode)
         .await
         .map_err(|source| WyrdCliError::Registry { source })?;
     match args.format {

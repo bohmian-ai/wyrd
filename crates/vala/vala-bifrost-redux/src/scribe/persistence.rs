@@ -495,10 +495,10 @@ async fn process_job(job: PersistenceJob, dependencies: &PersistenceDependencies
         "published"
     } else {
         #[cfg(any(test, feature = "test-support"))]
-        if let Err(error) = &result {
-            if let Ok(mut last_error) = dependencies.faults.last_error.lock() {
-                *last_error = Some(error.to_string());
-            }
+        if let Err(error) = &result
+            && let Ok(mut last_error) = dependencies.faults.last_error.lock()
+        {
+            *last_error = Some(error.to_string());
         }
         "failed"
     };

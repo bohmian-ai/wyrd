@@ -97,6 +97,107 @@ impl PersistenceFixture {
         self.scribe.shutdown().await;
         drop(self.wal_root);
     }
+
+    async fn start_after_wal_restart(fail_replay_write: bool) -> Self {
+        let database = PgFixture::start().await.expect("Postgres fixture");
+        let tenant = database.data_tenant_id();
+        let operator = Arc::new(
+            opendal::Operator::new(Memory::default())
+                .expect("memory operator")
+                .finish(),
+        );
+        let wal_root = tempfile::tempdir().expect("WAL directory");
+        let node_id = uuid::Uuid::now_v7();
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node_id.as_bytes(),
+                1,
+                WalConfig::default(),
+            )
+            .expect("WAL writer"),
+        );
+        let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+        let pools = ScribeExecutionPools::new(
+            ScribeIngressCpuPool::new_with_capacity(1, 256),
+            ScribePersistenceCpuPool::new_with_capacity(2, 64),
+            ScribeWalIoPool::new_with_capacity(2, 256),
+        );
+        let first = Arc::new(ScribeImpl::new_with_execution_pools(
+            Arc::clone(&operator),
+            Arc::clone(&wal),
+            node_id.to_string(),
+            1,
+            ScribeBuildConfig {
+                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                execution_pools: pools,
+                persistence: None,
+                memory_budget: Some(memory.scribe_budget()),
+            },
+        ));
+        first.replay_wal_async().await.expect("empty WAL replay");
+        let rows = batch(99);
+        first
+            .append(ScribeAppend {
+                principal: principal(tenant),
+                table: table("restart_publish_events"),
+                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
+                request_id: RequestId::now_v7(),
+                batch_id: uuid::Uuid::now_v7(),
+                measured_wire_bytes: 0,
+                rows,
+            })
+            .await
+            .expect("append");
+        first.flush_writable_for_test().await.expect("WAL flush");
+        first.shutdown().await;
+        drop(wal);
+
+        let faults = PersistenceFaults::default();
+        if fail_replay_write {
+            faults.fail_next_object_write();
+        }
+        let persistence =
+            ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
+                .with_test_faults(faults.clone());
+        let wal = Arc::new(
+            WalWriter::new(
+                wal_root.path(),
+                *node_id.as_bytes(),
+                2,
+                WalConfig::default(),
+            )
+            .expect("restarted WAL writer"),
+        );
+        let pools = ScribeExecutionPools::new(
+            ScribeIngressCpuPool::new_with_capacity(1, 256),
+            ScribePersistenceCpuPool::new_with_capacity(2, 64),
+            ScribeWalIoPool::new_with_capacity(2, 256),
+        );
+        let scribe = Arc::new(ScribeImpl::new_with_execution_pools(
+            Arc::clone(&operator),
+            wal,
+            node_id.to_string(),
+            2,
+            ScribeBuildConfig {
+                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                execution_pools: pools,
+                persistence: Some(persistence),
+                memory_budget: Some(memory.scribe_budget()),
+            },
+        ));
+        scribe.replay_wal_async().await.expect("replay");
+        Self {
+            database,
+            operator,
+            scribe,
+            faults,
+            wal_root,
+            tenant,
+        }
+    }
 }
 
 fn table(name: &str) -> TableRef {
@@ -431,5 +532,51 @@ async fn three_generations_same_key_remain_fifo_and_file_paths_are_object_keys()
             "file_list path must be an object key"
         );
     }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn replayed_generation_publishes_durably_after_restart() {
+    let fixture = PersistenceFixture::start_after_wal_restart(false).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if fixture.scribe.persistence_queue_depth_for_test() == 0
+            && !rows(&fixture).await.is_empty()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay persistence stalled: {:?}",
+            fixture.faults.last_error_for_test()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(rows(&fixture).await.len(), 1);
+    assert_eq!(audit_count(&fixture).await, 1);
+    assert_eq!(object_paths(&fixture).await.len(), 1);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn replayed_generation_failure_retries_to_durable_publication() {
+    let fixture = PersistenceFixture::start_after_wal_restart(true).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(rows(&fixture).await.is_empty());
+    fixture.scribe.check_age(Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay retry stalled: {:?}",
+            fixture.faults.last_error_for_test()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(audit_count(&fixture).await, 1);
     fixture.stop().await;
 }

@@ -49,7 +49,7 @@ tower = { workspace = true, features = ["util"] }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
 uuid = { workspace = true, features = ["v4", "v7"] }
 vala-bifrost = { workspace = true }
-vala-bifrost-redux = { workspace = true, features = ["bench-support"] }
+vala-bifrost-redux = { workspace = true, features = ["bench-support", "test-support"] }
 vala-sdk = { workspace = true }
 vala-sql = { workspace = true }
 wyrd-auth = { workspace = true }

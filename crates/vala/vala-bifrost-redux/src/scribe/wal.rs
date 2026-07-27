@@ -474,9 +474,6 @@ fn decode_slice_tenant(bytes: &[u8]) -> Result<DataTenantId, ScribeError> {
         detail: "WAL tenant id decode failed".to_owned(),
     })?;
     let tenant_uuid = uuid::Uuid::from_bytes(tenant_bytes);
-    if tenant_uuid.is_nil() {
-        return Ok(DataTenantId::SYSTEM_OWNER);
-    }
     DataTenantId::try_from(tenant_uuid).map_err(|error| ScribeError::Internal {
         detail: format!("WAL v3 tenant id is invalid: {error}"),
     })
@@ -846,7 +843,9 @@ struct WalDiskState {
     configured_limit_bytes: Option<u64>,
     sample: Mutex<Option<DiskSample>>,
     hard_failed: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
     sync_failure: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
     post_sync_failure: AtomicBool,
 }
 
@@ -857,7 +856,9 @@ impl WalDiskState {
             configured_limit_bytes,
             sample: Mutex::new(None),
             hard_failed: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
             sync_failure: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-support"))]
             post_sync_failure: AtomicBool::new(false),
         }
     }
@@ -910,18 +911,22 @@ impl WalDiskState {
         self.hard_failed.store(true, Ordering::Release);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn trip_sync_failure(&self) {
         self.sync_failure.store(true, Ordering::Release);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn trip_post_sync_failure(&self) {
         self.post_sync_failure.store(true, Ordering::Release);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_sync_failure(&self) -> bool {
         self.sync_failure.swap(false, Ordering::AcqRel)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn take_post_sync_failure(&self) -> bool {
         self.post_sync_failure.swap(false, Ordering::AcqRel)
     }
@@ -1225,6 +1230,7 @@ impl WalHandle {
         }
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_post_sync_failure_for_test(&self) -> bool {
         self.writer.take_post_sync_failure_for_test()
     }
@@ -1335,17 +1341,20 @@ impl WalWriter {
     /// Trip the concrete WAL disk breaker for deterministic failure-path
     /// tests. This uses the same hard-state check as a real ENOSPC result and
     /// therefore exercises rejection before LSN allocation or file mutation.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn trip_disk_full_for_test(&self) {
         self.disk.mark_hard_failed();
     }
 
     /// Inject one WAL `sync_data` failure after the record write and before
     /// the durable acknowledgment boundary.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn trip_sync_failure_for_test(&self) {
         self.disk.trip_sync_failure();
     }
 
     /// Inject one failure after WAL sync and before memtable insertion.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn trip_post_sync_failure_for_test(&self) {
         self.disk.trip_post_sync_failure();
     }
@@ -1381,6 +1390,7 @@ impl WalWriter {
     }
 
     /// Append one self-describing v3 record for deterministic test-tier probes.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn append_and_fsync_for_test(
         &self,
         seal_key: &SealKey,
@@ -1461,6 +1471,7 @@ impl WalWriter {
     }
 
     fn sync_segments_with_fault(&self, segments: &[Arc<WalSegment>]) -> Result<(), ScribeError> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.disk.take_sync_failure() {
             return Err(ScribeError::Internal {
                 detail: "injected WAL sync failure".to_owned(),
@@ -1519,6 +1530,7 @@ impl WalWriter {
         self.sync_data_for_shard(shard_id)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     fn append_and_fsync_for_key(
         &self,
         seal_key: &SealKey,
@@ -1545,6 +1557,7 @@ impl WalWriter {
         Ok(result.lsn)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_post_sync_failure_for_test(&self) -> bool {
         self.disk.take_post_sync_failure()
     }
@@ -1914,6 +1927,19 @@ mod tests {
     fn wal_lsn_ordering() {
         assert!(WalLsn::new(1) > WalLsn::ZERO);
         assert!(WalLsn::new(100) > WalLsn::new(99));
+    }
+
+    #[test]
+    fn slice_tenant_decoder_rejects_nil_and_non_v7() {
+        assert!(decode_slice_tenant(&[0; 16]).is_err());
+        assert!(decode_slice_tenant(Uuid::new_v4().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn slice_tenant_decoder_round_trips_v7() {
+        let tenant = DataTenantId::new_v7();
+        let encoded = uuid::Uuid::from(tenant).into_bytes();
+        assert!(matches!(decode_slice_tenant(&encoded), Ok(decoded) if decoded == tenant));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 //! Bounded immutable-generation persistence for Scribe.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,6 +29,7 @@ use crate::scribe::stream_identity::StreamIdentity;
 use crate::scribe::wal::{ScribeAppendMeta, WalLsn, WalSegmentRef, WalWriter};
 
 /// Test-tier one-shot failures for the concrete persistence seams.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Default)]
 pub struct PersistenceFaults {
     object_write: Arc<std::sync::atomic::AtomicBool>,
@@ -37,6 +40,7 @@ pub struct PersistenceFaults {
     max_object_write_active: Arc<AtomicUsize>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PersistenceFaults {
     /// Fail the next object-store write before it mutates storage.
     pub fn fail_next_object_write(&self) {
@@ -103,10 +107,12 @@ impl PersistenceFaults {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct ObjectWriteGuard {
     active: Arc<AtomicUsize>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for ObjectWriteGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::AcqRel);
@@ -240,6 +246,7 @@ pub struct ScribePersistenceConfig {
     /// Number of asynchronous persistence workers.
     pub workers: usize,
     /// Concrete test-tier fault points; production uses the default no-fault value.
+    #[cfg(any(test, feature = "test-support"))]
     pub faults: PersistenceFaults,
 }
 
@@ -261,12 +268,14 @@ impl ScribePersistenceConfig {
             postgres,
             queue_items: queue_items.max(1),
             workers: workers.max(1),
+            #[cfg(any(test, feature = "test-support"))]
             faults: PersistenceFaults::default(),
         }
     }
 
     /// Install concrete test-tier fault points for this persistence runtime.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_test_faults(mut self, faults: PersistenceFaults) -> Self {
         self.faults = faults;
         self
@@ -281,6 +290,7 @@ pub(crate) struct PersistenceRuntimeContext {
     pub(crate) node_id: String,
     pub(crate) writer_epoch: i64,
     pub(crate) memory: ScribeMemoryBudget,
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) faults: PersistenceFaults,
 }
 
@@ -328,6 +338,7 @@ impl PersistenceRuntime {
             node_id: context.node_id,
             writer_epoch: context.writer_epoch,
             memory: context.memory,
+            #[cfg(any(test, feature = "test-support"))]
             faults: context.faults,
             manifest_guard: tokio::sync::Mutex::new(()),
         });
@@ -477,6 +488,7 @@ struct PersistenceDependencies {
     node_id: String,
     writer_epoch: i64,
     memory: ScribeMemoryBudget,
+    #[cfg(any(test, feature = "test-support"))]
     faults: PersistenceFaults,
     manifest_guard: tokio::sync::Mutex<()>,
 }
@@ -578,7 +590,9 @@ async fn persist_once(
         }
     };
     let path = object_path(binding, &dependencies.node_id)?;
+    #[cfg(any(test, feature = "test-support"))]
     let _object_write_guard = dependencies.faults.begin_object_write().await;
+    #[cfg(any(test, feature = "test-support"))]
     if dependencies.faults.take_object_write() {
         return Err(ScribeError::Internal {
             detail: "test object-store write failure".to_owned(),
@@ -606,6 +620,7 @@ async fn persist_once(
     let outcome = file_list_writer::insert_and_audit(&mut conn, &row, &encoded.audit_events)
         .await
         .map_err(ScribeError::from)?;
+    #[cfg(any(test, feature = "test-support"))]
     if dependencies.faults.take_sql_commit() {
         return Err(ScribeError::Internal {
             detail: "test SQL commit failure".to_owned(),
@@ -615,6 +630,7 @@ async fn persist_once(
 
     let manifest_path = dependencies.wal.base_dir().join("manifest");
     let lsn = generation.wal_lsn_max;
+    #[cfg(any(test, feature = "test-support"))]
     if dependencies.faults.take_manifest_publication() {
         return Err(ScribeError::Internal {
             detail: "test manifest publication failure".to_owned(),

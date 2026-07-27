@@ -418,6 +418,7 @@ impl ScribeImpl {
             wal_io,
         } = execution_pools;
         let persistence = persistence_config.map(|config| {
+            #[cfg(any(test, feature = "test-support"))]
             let faults = config.faults.clone();
             persistence::PersistenceRuntime::start(
                 config,
@@ -429,6 +430,7 @@ impl ScribeImpl {
                     node_id: node_id.clone(),
                     writer_epoch,
                     memory: memory.clone(),
+                    #[cfg(any(test, feature = "test-support"))]
                     faults,
                 },
                 &coordination_runtime,
@@ -567,12 +569,14 @@ impl ScribeImpl {
     ///
     /// This is a test-tier control seam for exercising owner FIFO and retry
     /// behavior without bypassing the shard command boundary.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_writable_for_test(&self) -> Result<(), ScribeError> {
         self.shards.flush_all().await
     }
 
     /// Return the bounded persistence queue depth for test-tier drain checks.
     #[must_use]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn persistence_queue_depth_for_test(&self) -> usize {
         self.persistence
             .as_ref()
@@ -827,6 +831,7 @@ impl ScribeImpl {
     }
 
     /// Trip the WAL availability breaker for deterministic test-tier probes.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn trip_wal_disk_full_for_test(&self) {
         self.admission.trip_wal_disk_full();
     }

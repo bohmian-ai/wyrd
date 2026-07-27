@@ -1346,6 +1346,7 @@ async fn process_group(
             WalSliceState { lsn: slice.lsn },
         );
     }
+    #[cfg(any(test, feature = "test-support"))]
     if dependencies.wal_handle.take_post_sync_failure_for_test() {
         let error = ScribeError::Internal {
             detail: "injected post-sync WAL failure".to_owned(),

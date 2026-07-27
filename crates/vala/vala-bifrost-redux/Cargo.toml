@@ -15,6 +15,7 @@ path = "tests/integration.rs"
 [features]
 default = []
 bench-support = []
+test-support = []
 
 [dependencies]
 metrics.workspace = true

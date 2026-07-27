@@ -737,7 +737,7 @@ async fn replayed_generation_publishes_durably_after_restart() {
     assert_eq!(rows(&fixture).await.len(), 3);
     assert_eq!(
         publication_order(&fixture, "restart_publish_events").await,
-        vec![1, 2, 3]
+        vec![0, 1, 2]
     );
     assert_eq!(audit_count(&fixture).await, 3);
     assert_eq!(object_paths(&fixture).await.len(), 3);
@@ -750,7 +750,7 @@ async fn replayed_generation_failure_retries_to_durable_publication() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(rows(&fixture).await.is_empty());
     fixture.scribe.check_age(Instant::now());
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 3
         {

@@ -11,7 +11,6 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
@@ -727,7 +726,7 @@ pub fn spawn_storage_sweeper(
 ///
 /// # Errors
 /// Returns [`ServerBootError::ForgeSchedulerRequired`] when the real server
-/// state was not assembled with a Forge context.
+/// state was not assembled with a Forge owner.
 pub fn spawn_maintenance_scheduler(
     state: &AppState,
     shutdown: CancellationToken,
@@ -737,15 +736,14 @@ pub fn spawn_maintenance_scheduler(
     + 'static,
     ServerBootError,
 > {
-    let context = state.forge_context.as_ref().cloned().ok_or_else(|| {
-        ServerBootError::ForgeSchedulerRequired {
-            detail: "AppState has no shared ForgeContext".to_owned(),
-        }
-    })?;
-
-    let scheduler =
-        vala_bifrost_redux::forge::ForgeScheduler::new((*context).clone(), state.forge_interval)?;
-    Ok(scheduler.run(shutdown))
+    let forge =
+        state
+            .forge_handle()
+            .cloned()
+            .ok_or_else(|| ServerBootError::ForgeSchedulerRequired {
+                detail: "AppState has no shared Forge".to_owned(),
+            })?;
+    Ok(async move { forge.run(shutdown).await })
 }
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
 //! Shared axum application state.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -9,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::contracts::Scribe;
-use vala_bifrost_redux::forge::ForgeContext;
+use vala_bifrost_redux::forge::Forge;
 use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
@@ -160,10 +159,8 @@ pub struct AppState {
     pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
     /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
     pub bifrost_ingest: Option<Arc<BifrostIngestRuntime>>,
-    /// Shared Redux Forge context built from the process-wide catalog and storage.
-    pub forge_context: Option<Arc<ForgeContext>>,
-    /// Interval used by the supervised Forge worker.
-    pub forge_interval: Duration,
+    /// Shared Redux Forge owner used by supervision and maintenance tests.
+    pub forge: Option<Arc<Forge>>,
     /// Authentication handles: token issuance + verification + issuer/binding resolution.
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
@@ -203,8 +200,7 @@ impl AppState {
             bifrost_memory: None,
             bifrost_query_memory: None,
             bifrost_ingest: None,
-            forge_context: None,
-            forge_interval: Duration::from_secs(60),
+            forge: None,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
             deployment_profile: DeploymentProfile::Development,
@@ -317,18 +313,24 @@ impl AppState {
         self
     }
 
-    /// Attach the single production Forge context used by the supervised worker.
+    /// Attach the single production Forge owner used by the supervised worker.
     #[must_use]
-    pub fn with_forge_context(mut self, context: ForgeContext) -> Self {
-        self.forge_context = Some(Arc::new(context));
+    pub fn with_forge(mut self, forge: Arc<Forge>) -> Self {
+        self.forge = Some(forge);
         self
     }
 
-    /// Set the supervised Forge worker interval.
+    /// Borrow the retained Forge handle for server-owned supervision.
     #[must_use]
-    pub fn with_forge_interval(mut self, interval: Duration) -> Self {
-        self.forge_interval = interval;
-        self
+    pub(crate) fn forge_handle(&self) -> Option<&Arc<Forge>> {
+        self.forge.as_ref()
+    }
+
+    /// Borrow the retained Forge owner from test-tier callers.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn forge(&self) -> Option<&Arc<Forge>> {
+        self.forge.as_ref()
     }
 
     /// Flush the private Scribe runtime for the test harness only.

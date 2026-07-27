@@ -3,8 +3,13 @@
 use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group, seed_forge_group_for_tenant};
+use wyrd_testing::bifrost::{
+    ForgeFixture, seed_forge_group, seed_forge_group_for_tenant,
+    seed_forge_group_for_tenant_with_schema_and_days,
+};
 
 #[tokio::test]
 #[ignore = "gated journey: bound Wyrd server plus durable multi-table workload"]
@@ -30,7 +35,7 @@ use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group, seed_forge_group_for
 /// cleanup failures that a health endpoint or in-memory load callback cannot see.
 async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak() {
     let server = WyrdTestServer::builder()
-        .with_forge_interval(Duration::from_millis(10))
+        .with_forge_interval(Duration::from_secs(3600))
         .start_bound()
         .await
         .expect("real test server");
@@ -150,6 +155,125 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
                 .is_some()
         );
     }
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "gated sustained journey: current-day publication and durable Forge drain"]
+/// Publishes a continuous stream of Scribe-shaped files while the production
+/// scheduler runs, then drains with the public one-shot API and checks exact
+/// row conservation and terminal bookkeeping.
+///
+/// # Errors
+///
+/// The journey fails when sustained staging, SQL bookkeeping, or Iceberg
+/// reads cannot converge through the production Forge handle.
+async fn pg_bifrost_forge_incremental_sustained() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real test server");
+    let fixture = seed_forge_group_for_tenant_with_schema_and_days(
+        &server,
+        server.data_tenant_id(),
+        "incremental_sustained_rows",
+        false,
+        &[chrono::Utc::now().date_naive()],
+    )
+    .await;
+    server.cancel_bound_workers();
+    sqlx::query(
+        "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .execute(fixture.operator_pool.pool())
+    .await
+    .expect("age sustained fixture rows");
+    let baseline_memory = fixture.memory_snapshot().bifrost_total_bytes;
+    let mut config = fixture.config.clone();
+    config.max_hints_per_wake = 1;
+    config.max_files_per_bin = 2;
+    let (forge, publisher) = fixture.context_with_config_and_publisher(config);
+    let drain_forge = forge.clone();
+    assert_eq!(
+        publisher.try_publish(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::Utc::now().date_naive(),
+        )),
+        StagingPublishOutcome::Published
+    );
+    assert_eq!(
+        publisher.try_publish(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::Utc::now().date_naive(),
+        )),
+        StagingPublishOutcome::DroppedFull
+    );
+    let shutdown = CancellationToken::new();
+    let scheduler = tokio::spawn({
+        let stop = shutdown.clone();
+        async move { forge.run(stop).await }
+    });
+    for sequence in 0..8_i64 {
+        fixture.append_forge_file(100 + sequence * 2).await;
+        fixture.append_forge_file(101 + sequence * 2).await;
+        let _ = publisher.try_publish(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::Utc::now().date_naive(),
+        ));
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+    server.cancel_bound_workers();
+    for _ in 0..20 {
+        drain_forge
+            .run_once()
+            .await
+            .expect("incremental drain tick");
+        if maintenance_settled(&fixture).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(pending_file_count(&fixture).await, 0);
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(row_count), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await
+    .expect("sustained row count");
+    assert_eq!(rows, 20);
+    assert!(
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await
+            >= 1
+    );
+    assert_eq!(
+        fixture.operation_count("forge.file_compact.prepared").await,
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await
+            + fixture
+                .operation_count("forge.file_compact.recovered")
+                .await
+            + fixture.operation_count("forge.file_compact.reset").await
+    );
+    shutdown.cancel();
+    scheduler
+        .await
+        .expect("sustained scheduler")
+        .expect("scheduler shutdown");
+    assert!(fixture.spill_root_is_empty());
+    assert!(
+        fixture.memory_snapshot().bifrost_total_bytes <= baseline_memory + 2,
+        "shared memory did not return near baseline"
+    );
     server.shutdown().await.expect("server shutdown");
 }
 

@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
     CommitUncertaintyCatalog, seed_forge_group, seed_forge_group_for_tenant_with_schema,
@@ -413,6 +415,111 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
         .await
         .expect("successor release")
     );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge incremental interleaving lane"]
+/// Replays competing hinted/periodic-shaped one-shot ticks against one real
+/// table and then verifies lease theft fails closed before a successor tick
+/// converges the durable state.
+///
+/// # Errors
+///
+/// The journey fails when durable lease, SQL, or Iceberg operations diverge
+/// from the production Forge contract.
+async fn forge_incremental_interleaving() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "incremental_interleaving_rows").await;
+    let forge = fixture.context_with_config(fixture.config.clone());
+    let (first, second) = tokio::join!(forge.run_once(), forge.run_once());
+    assert!(first.expect("first interleaving tick").bins_committed <= 1);
+    assert!(second.expect("second interleaving tick").bins_committed <= 1);
+    assert_eq!(
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
+        1
+    );
+
+    let (owner, token) = steal_forge_lease(&fixture).await;
+    let blocked = forge.run_once().await.expect("blocked tick");
+    assert_eq!(blocked.bins_committed, 0);
+    let lease_key = format!(
+        "forge:table:{}:{}:{}",
+        fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+    );
+    assert!(
+        vala_sql::queries::maintenance_leases::release_lease_fenced(
+            &fixture.operator_pool,
+            &lease_key,
+            owner,
+            token,
+        )
+        .await
+        .expect("release interleaving lease")
+    );
+    forge.run_once().await.expect("successor convergence");
+    assert_eq!(
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
+        1
+    );
+    let hinted = seed_forge_group(&server, "hint_periodic_rows").await;
+    let (hint_forge, hint_publisher) =
+        hinted.context_with_config_and_publisher(hinted.config.clone());
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
+    assert_eq!(
+        hint_publisher.try_publish(StagingFileCommitted::new(hinted.binding.clone(), day)),
+        StagingPublishOutcome::Published
+    );
+    let hint_outcome = hint_forge.run_once().await.expect("hint/periodic tick");
+    assert!(hint_outcome.bins_committed <= 1);
+    assert_eq!(
+        hinted.operation_count("forge.file_compact.committed").await,
+        1
+    );
+
+    let uncertain_fixture = seed_forge_group(&server, "multi_output_uncertain_rows").await;
+    let mut multi_config = uncertain_fixture.config.clone();
+    multi_config.output_file_bytes = 1;
+    let uncertain = CommitUncertaintyCatalog::new(Arc::clone(&uncertain_fixture.catalog));
+    uncertain.fail_after_next_commit();
+    let uncertain_forge = uncertain_fixture.context_with_catalog(multi_config.clone(), uncertain);
+    let _ = uncertain_forge.run_once().await;
+    let successor = uncertain_fixture.context_with_config(multi_config);
+    let _ = successor.run_once().await;
+    assert_eq!(
+        uncertain_fixture
+            .operation_count("forge.file_compact.prepared")
+            .await,
+        1
+    );
+    assert_eq!(
+        uncertain_fixture
+            .operation_count("forge.file_compact.committed")
+            .await
+            + uncertain_fixture
+                .operation_count("forge.file_compact.recovered")
+                .await,
+        1
+    );
+    let cancel_stop = CancellationToken::new();
+    let cancel_forge = hinted.context_with_config(hinted.config.clone());
+    let cancel_task = tokio::spawn({
+        let stop = cancel_stop.clone();
+        async move { cancel_forge.run(stop).await }
+    });
+    cancel_stop.cancel();
+    cancel_task
+        .await
+        .expect("cancelled Forge")
+        .expect("cancelled Forge shutdown");
     server.shutdown().await.expect("server shutdown");
 }
 

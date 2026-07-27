@@ -1,6 +1,7 @@
 //! Shared Postgres-backed Forge fixture for gated journeys and interleavings.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -18,6 +19,7 @@ use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
+use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::DataTenantId;
@@ -409,6 +411,32 @@ impl ForgeFixture {
         )
     }
 
+    /// Build a production-shaped Forge together with its paired local hint
+    /// publisher for scheduler journey tests.
+    #[must_use]
+    pub fn context_with_config_and_publisher(
+        &self,
+        config: ForgeConfig,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
+        self.build_forge_with_publisher(
+            config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+        )
+    }
+
+    /// Return a read-only snapshot of the shared Bifrost memory parent.
+    #[must_use]
+    pub fn memory_snapshot(&self) -> vala_bifrost_redux::scribe::memory::MemorySnapshot {
+        self.memory.snapshot()
+    }
+
+    /// Report whether the Forge-owned spill root has no retained children.
+    #[must_use]
+    pub fn spill_root_is_empty(&self) -> bool {
+        directory_tree_is_empty(self.spill_root.path())
+    }
+
     /// Clone the context with a scoped catalog wrapper for one test journey.
     pub fn context_with_catalog(
         &self,
@@ -437,20 +465,33 @@ impl ForgeFixture {
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
     ) -> Arc<Forge> {
+        self.build_forge_with_publisher(config, catalog, object_store)
+            .0
+    }
+
+    /// Construct one Forge graph and retain the publisher paired with its inbox.
+    fn build_forge_with_publisher(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
-        drop(publisher);
         let runtime = ForgeRewriteRuntime::new(
             Arc::new(
                 vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
                     self.memory.clone(),
                 ),
             ),
-            self.spill_root.path(),
+            &self
+                .spill_root
+                .path()
+                .join(format!("forge-pod-{}", uuid::Uuid::now_v7())),
             config.spill_limit_bytes,
         )
         .expect("validated Forge rewrite runtime");
-        Arc::new(
+        let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
                 vala: self.vala.clone(),
                 operator_pool: self.operator_pool.clone(),
@@ -463,11 +504,27 @@ impl ForgeFixture {
                 maintenance_interval: std::time::Duration::from_secs(60),
             })
             .expect("validated Forge fixture config"),
-        )
+        );
+        (forge, publisher)
     }
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.
     pub async fn append_forge_file(&self, sequence: i64) {
+        self.append_forge_file_for_day(
+            sequence,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
+            true,
+        )
+        .await;
+    }
+
+    /// Append one Scribe-shaped file for an explicit partition day.
+    pub async fn append_forge_file_for_day(
+        &self,
+        sequence: i64,
+        partition_day: chrono::NaiveDate,
+        aged: bool,
+    ) {
         let schema = ArrowSchema::new(vec![
             Field::new("value", DataType::Int64, false),
             Field::new(
@@ -477,8 +534,10 @@ impl ForgeFixture {
             ),
             Field::new("data_tenant_id", DataType::Utf8, false),
         ]);
-        let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+        let base = partition_day
+            .and_hms_opt(12, 0, 0)
             .expect("Forge fixture timestamp")
+            .and_utc()
             .timestamp_micros()
             + sequence * 1_000_000;
         let batch = RecordBatch::try_new(
@@ -515,9 +574,9 @@ impl ForgeFixture {
         .bind(&path)
         .bind(file_size)
         .bind(1_i64)
-        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z").expect("timestamp"))
-        .bind(chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:01Z").expect("timestamp"))
-        .bind(chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"))
+        .bind(chrono::DateTime::from_timestamp_micros(base).expect("timestamp"))
+        .bind(chrono::DateTime::from_timestamp_micros(base + 1_000_000).expect("timestamp"))
+        .bind(partition_day)
         .bind(uuid::Uuid::now_v7())
         .bind(1_i64)
         .bind(sequence * 2 + 1)
@@ -525,13 +584,15 @@ impl ForgeFixture {
         .execute(self.operator_pool.pool())
         .await
         .expect("Forge fixture file-list append");
-        sqlx::query(
-            "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE id = $1",
-        )
-        .bind(file_id)
-        .execute(self.operator_pool.pool())
-        .await
-        .expect("Forge fixture append aging");
+        if aged {
+            sqlx::query(
+                "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE id = $1",
+            )
+            .bind(file_id)
+            .execute(self.operator_pool.pool())
+            .await
+            .expect("Forge fixture append aging");
+        }
     }
 
     /// Add a pending `file_list` reference for an existing object.
@@ -581,6 +642,18 @@ impl ForgeFixture {
         .await
         .expect("Forge fixture audit count")
     }
+}
+
+/// Return whether a fixture-owned spill directory contains no files.
+fn directory_tree_is_empty(path: &Path) -> bool {
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries.flatten().all(|entry| {
+                let child = entry.path();
+                child.is_dir() && directory_tree_is_empty(&child)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Create an Iceberg table, staging Parquet files, and aged `vala.file_list`

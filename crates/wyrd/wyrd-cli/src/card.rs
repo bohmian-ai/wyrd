@@ -13,7 +13,7 @@ use wyrd_client::config::ClientConfig;
 use wyrd_client::error::WyrdClientError;
 use wyrd_client::transport::HttpTransport;
 use wyrd_loader::{Diagnostic, LoadError, RegistrationInput, build_registration_input, load};
-use wyrd_registry::{CardSelector, Cards, HydrationMode, HydrationSummary};
+use wyrd_registry::{CardGraphHydrator, CardSelector, Cards, HydrationMode, HydrationSummary};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
@@ -239,7 +239,15 @@ struct DeleteOutput {
     deleted: bool,
 }
 
-/// Dispatch one card lifecycle verb.
+/// Validate a local Card tree and print the deterministic registration plan.
+///
+/// The command loads authored files, resolves local registration inputs, and
+/// reports the Cards and loader diagnostics without constructing credentials or
+/// contacting a Wyrd server.
+///
+/// # Errors
+/// Returns `WyrdCliError::CardLoad` when loading or local registration-input
+/// construction fails, or an output error when JSON serialization fails.
 pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
     let tree = match load(&args.path) {
         Ok(tree) => tree,
@@ -262,7 +270,22 @@ pub async fn dispatch_plan(args: PlanArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dispatch `wyrd apply`.
+/// Load a local Card tree, register it through the shared registry handle, and
+/// print the registration receipt.
+///
+/// Local loading and validation complete before the command constructs the
+/// configured client. Registration then performs the remote artifact and Card
+/// lifecycle operations owned by `wyrd-registry`.
+///
+/// # Errors
+/// Returns a CLI load error for invalid local input, a client error when
+/// configuration or credentials cannot be prepared, a registry error when
+/// registration fails, or an output error when JSON serialization fails.
+///
+/// # Cancellation
+/// Cancellation may stop the command during artifact transfer or server
+/// completion. Retry behavior follows the registry operation's idempotency
+/// contract.
 pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
     let tree = load(&args.path).map_err(WyrdCliError::CardLoad)?;
     let input = build_registration_input(tree).map_err(WyrdCliError::CardLoad)?;
@@ -278,7 +301,23 @@ pub async fn dispatch_apply(args: ApplyArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dispatch `wyrd get`.
+/// Resolve a Card and hydrate its reachable graph into a local directory.
+///
+/// The command validates the selector and required output directory locally,
+/// then delegates graph reads, artifact verification, staging, and publication
+/// to a graph-focused hydrator sharing the registry context. Complete hydration is the default; the
+/// metadata-only flag omits artifact payload downloads.
+///
+/// # Errors
+/// Returns a CLI argument error for an invalid selector or missing output
+/// directory, a client error when configuration or credentials fail, a
+/// registry error when reads or hydration fail, or an output error when JSON
+/// serialization fails.
+///
+/// # Cancellation
+/// Cancellation may stop remote reads or artifact transfers after partial
+/// staging progress. The registry hydration workflow owns cleanup for returned
+/// errors; a dropped task may require later staging cleanup.
 pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
     let selector = selector_from_args(&args.selector, false)?;
     let output_dir = args.output_dir.as_deref().ok_or_else(|| {
@@ -289,13 +328,14 @@ pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
         )
     })?;
     let cards = build_cards(&args.connection)?;
+    let hydrator = CardGraphHydrator::new(cards.registry_context());
     let mode = if args.metadata_only {
         HydrationMode::MetadataOnly
     } else {
         HydrationMode::Complete
     };
-    let output = cards
-        .hydrate(selector, output_dir, mode)
+    let output = hydrator
+        .hydrate(&selector, output_dir, mode)
         .await
         .map_err(|source| WyrdCliError::Registry { source })?;
     match args.format {
@@ -305,7 +345,20 @@ pub async fn dispatch_get(args: GetArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dispatch `wyrd latest`.
+/// Resolve and print the latest Active Card version for a named identity.
+///
+/// The command parses the kind, space, and name before asking the shared
+/// registry handle for the exact server-resolved `CardRef`.
+///
+/// # Errors
+/// Returns a CLI argument error for an invalid kind or identity, a client error
+/// when configuration or credentials fail, a registry error when no matching
+/// Active Card exists or the server request fails, or an output error when JSON
+/// serialization fails.
+///
+/// # Cancellation
+/// Cancellation may stop the remote latest-version lookup before a result is
+/// printed; the read is non-durable and safe to retry.
 pub async fn dispatch_latest(args: LatestArgs) -> Result<ExitCode, WyrdCliError> {
     let kind = parse_kind(&args.kind)?;
     let space = parse_id("space", &args.space, "a valid Card space")?;
@@ -323,7 +376,20 @@ pub async fn dispatch_latest(args: LatestArgs) -> Result<ExitCode, WyrdCliError>
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dispatch `wyrd list`.
+/// List Card summaries through the typed registry query.
+///
+/// The command validates optional kind, identity, status, metadata-filter, and
+/// limit values locally, then delegates pagination and server-side filtering to
+/// the shared `Cards` handle.
+///
+/// # Errors
+/// Returns a CLI argument error for invalid filters or values, a client error
+/// when configuration or credentials fail, a registry error when the server
+/// query fails, or an output error when JSON serialization fails.
+///
+/// # Cancellation
+/// Cancellation may stop the remote list query before a response is printed;
+/// the read is non-durable and safe to retry.
 pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     if args.limit.is_some_and(|limit| limit < 1) {
         return Err(invalid_argument(
@@ -372,7 +438,23 @@ pub async fn dispatch_list(args: ListArgs) -> Result<ExitCode, WyrdCliError> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Dispatch `wyrd load`.
+/// Load one Card and materialize its server-owned artifacts locally.
+///
+/// The command parses the selector, delegates Card and artifact reads to the
+/// shared registry handle, and reports the exact resolved Card reference after
+/// materialization. A caller-provided path is used when present; otherwise the
+/// registry handle manages a temporary artifact directory.
+///
+/// # Errors
+/// Returns a CLI argument error for an invalid selector, a client error when
+/// configuration or credentials fail, a registry error when the Card,
+/// inventory, destination, or artifact transfer fails, or an output error when
+/// JSON serialization fails.
+///
+/// # Cancellation
+/// Cancellation may stop artifact materialization after partial local progress;
+/// the registry load operation owns the temporary-directory lifecycle, while a
+/// caller-provided destination may retain already downloaded files.
 pub async fn dispatch_load(args: LoadArgs) -> Result<ExitCode, WyrdCliError> {
     let selector = selector_from_args(&args.selector, false)?;
     let cards = build_cards(&args.connection)?;

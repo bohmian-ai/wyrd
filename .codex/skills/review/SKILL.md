@@ -38,6 +38,25 @@ and local precedents.
 - Check Wyrd's test taxonomy and canonical `mise` task for the changed
   surface. A user- or agent-facing capability needs a user-journey test; a
   unit test alone is not sufficient.
+- Enforce `AGENTS.md` §5 "Required Struct-Centered Rust Style" as a hard
+  acceptance criterion. Treat new or materially changed module-level
+  orchestration, repeated dependency/context threading, anemic structs whose
+  natural behavior is detached, zero-sized utility structs, broad god objects,
+  and traits around one implementation as confirmed findings. Do not force a
+  genuinely stateless deterministic helper onto an artificial owner, and do
+  not move registry, storage, policy, audit, or lifecycle IO onto declarative
+  Card envelopes.
+- Enforce the `AGENTS.md` §16 rustdoc requirement as a hard acceptance
+  criterion. Inspect every new or materially modified Rust module, type, field,
+  variant, trait item, constant, alias, function, method, helper, and test.
+  Missing, placeholder, or mechanically restated rustdoc is a confirmed
+  `BLOCK_BEFORE_MERGE` finding. Fallible functions require `# Errors`; document
+  panics and async cancellation, partial progress, or retry behavior when
+  applicable.
+- Enforce synchronous Rust as the default. Every changed `async fn` must
+  directly await IO or intentionally compose operations that do. Flag pure
+  validation, parsing, planning, or transformation made async for caller
+  uniformity or hypothetical future IO.
 - Treat violations of `architecture/agent-rules.md` or explicit `AGENTS.md`
   requirements as confirmed evidence. Apply the shared materiality gate rather
   than silently ignoring a non-blocking violation.

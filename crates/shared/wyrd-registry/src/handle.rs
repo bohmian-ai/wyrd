@@ -19,7 +19,7 @@ use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
 use crate::config;
 use crate::download;
-use crate::engine::RegistryEngine;
+use crate::engine::{RegistryContext, RegistryEngine};
 use crate::error::RegistryEngineError;
 use crate::progress::RegistrationProgressSink;
 use crate::reads;
@@ -221,6 +221,39 @@ impl Cards {
             result.map_err(WyrdError::from)?;
         }
         Ok(())
+    /// Clone the authenticated context for another focused registry capability.
+    ///
+    /// The returned context shares this handle's transport, authentication
+    /// cache, and storage client without exposing their implementation types.
+    #[must_use]
+    pub fn registry_context(&self) -> RegistryContext {
+        RegistryContext::new(Arc::clone(&self.engine))
+    }
+
+    /// Loads one Card document from disk and registers it through the authenticated registry.
+    ///
+    /// The loader resolves the document and its local source context before this method
+    /// delegates the durable write to [`Self::register`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document cannot be loaded or converted into a registration
+    /// request, or when the registry rejects the registration.
+    pub async fn register_from_path(
+        &self,
+        path: &Path,
+    ) -> Result<crate::RegistrationReceipt, WyrdError> {
+        let tree = wyrd_loader::load(path).map_err(|error| WyrdError::RegistryInvalidCardSpec {
+            message: format!("card tree failed to load: {error}"),
+            details: serde_json::json!({ "path": path, "error": error.to_string() }),
+        })?;
+        let input = wyrd_loader::build_registration_input(tree).map_err(|error| {
+            WyrdError::RegistryInvalidCardSpec {
+                message: format!("card tree failed validation: {error}"),
+                details: serde_json::json!({ "path": path, "error": error.to_string() }),
+            }
+        })?;
+        self.register(&input).await
     }
 
     /// Register a loader-produced composite input and drive its private

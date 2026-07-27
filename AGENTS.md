@@ -175,11 +175,60 @@ Python, and TypeScript client surfaces where appropriate.
 - Avoid `Arc<Mutex<T>>` by default; first check whether ownership, immutable
   state, a narrower lock, or message passing fits.
 
+### Required Struct-Centered Rust Style
+
+Wyrd uses a hybrid Rust style centered on cohesive, composable structs. This is
+a repository requirement, not a preference. Code that produces the correct
+behavior with the wrong structural shape is incomplete.
+
+- All new and materially modified Rust code MUST follow this style. Existing
+  functional code is implementation drift, not precedent. A localized edit
+  does not require an unrelated crate-wide rewrite, but every new or materially
+  changed symbol and its immediate module structure must comply.
+- Stateful capabilities, multi-step workflows, dependency-backed behavior,
+  configuration-backed behavior, and invariant-bearing domain behavior MUST
+  have one clear owning concrete struct.
+- Public operations and internal orchestration that use an owner's state or
+  dependencies MUST be inherent methods on that owner. Callers should discover
+  workflows through shapes such as `cards.register(...)`,
+  `registry.resolve(...)`, and `writer.flush(...)`.
+- Compose dependencies through explicit struct fields and constructors. When
+  multiple functions repeatedly accept the same clients, stores, configuration,
+  or context, consolidate that state into the owning struct instead of
+  threading it through a functional call graph.
+- Free functions are permitted only for genuinely stateless, deterministic
+  helpers, narrow conversions, and algorithms with no natural owner. A
+  workflow function is not made stateless merely because all of its
+  dependencies are parameters.
+- Do not create zero-sized utility structs solely to turn unrelated functions
+  into methods. The struct must own meaningful state, dependencies, identity,
+  or invariants.
+- Keep domain values and service handles distinct. Domain structs own
+  construction, validation, invariants, and pure transformations. Service or
+  handle structs own IO dependencies and orchestration.
+- Struct-centered design does not permit god objects. Split a struct when its
+  methods do not share a cohesive responsibility, dependencies, or invariants.
+- Traits remain reserved for multiple real implementations sharing stable
+  behavior. Do not create inheritance-shaped traits around a single struct.
+- Wyrd Card envelopes and specs remain declarative. They MUST NOT acquire
+  registry clients, storage clients, server behavior, or hidden IO merely to
+  satisfy this style. Put those workflows on the owning service or handle.
+- `crates/shared/wyrd-registry/src/handle.rs::Cards` is the canonical Wyrd
+  pattern: a public, dependency-owning handle with discoverable methods,
+  composed from a focused engine and narrow private helper modules.
+
 ## 6. Async And Runtime Rules
 
-- Use async at IO boundaries: HTTP, database, storage, queues, network calls,
-  server handlers.
-- Keep pure computation synchronous unless the caller requires async.
+- Synchronous Rust is the default. Every `async fn` MUST earn its state-machine,
+  lifetime, cancellation, and `Send` complexity by directly awaiting IO or
+  intentionally composing operations that do.
+- Use async only at real IO boundaries: HTTP, database, storage, queues,
+  network calls, and server handlers that await them.
+- Keep validation, parsing, planning, transformations, and other pure
+  computation synchronous. An async caller does not justify making a
+  synchronous callee async.
+- Keep the async boundary as narrow as practical. Do not propagate async
+  through a module merely for uniform signatures or possible future IO.
 - Use the shared Wyrd runtime boundary for Python async/sync bridging.
 - Do not create ad hoc Tokio runtimes in library or PyO3 code.
 - Do not block inside async request paths without an explicit blocking
@@ -437,6 +486,21 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 
 - Python tests: top-level `def test_*` only. Never `class TestFoo:`.
 - Do not add comments, docstrings, or type annotations to code you did not touch.
+- Every new or materially modified Rust item MUST have rustdoc. This includes
+  modules, structs, fields, enums, variants, traits, associated types,
+  constants, type aliases, functions, methods, test helpers, and test
+  functions, regardless of visibility.
+- Rustdoc MUST explain intent, how the item participates in the surrounding
+  workflow, and relevant invariants or side effects. Function and method docs
+  MUST describe how the operation works at the level a maintainer needs to
+  modify it safely.
+- Every fallible Rust function or method MUST include a `# Errors` section
+  naming the error conditions. Add `# Panics` whenever a panic remains
+  possible, and document cancellation, partial progress, or retry behavior for
+  async and durable operations when relevant.
+- Documentation is part of implementation correctness. Missing or placeholder
+  rustdoc on any touched Rust item is a hard blocker even when the code
+  compiles and tests pass.
 - All code must be directly testable.
 - Functions and classes follow the single responsibility principle. If a function does two things, split it.
 - Follow existing code style and patterns. Do not introduce new paradigms unless there is a compelling reason. Consistency over cleverness.

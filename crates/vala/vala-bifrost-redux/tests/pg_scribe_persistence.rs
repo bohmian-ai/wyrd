@@ -145,19 +145,7 @@ impl PersistenceFixture {
         )
         .await
         .expect("Redux catalog");
-        for table_name in table_names {
-            catalog
-                .create_table(CreateTableRequest {
-                    table: table(table_name),
-                    user_fields: (1..=6)
-                        .map(|index| Field::new(format!("value_{index}"), DataType::Int64, false))
-                        .collect(),
-                    tenant,
-                    audit: None,
-                })
-                .await
-                .expect("catalog table");
-        }
+        register_replay_tables(&catalog, table_names, tenant).await;
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node_id = uuid::Uuid::now_v7();
         let wal = Arc::new(
@@ -193,24 +181,7 @@ impl PersistenceFixture {
             },
         ));
         first.replay_wal_async().await.expect("empty WAL replay");
-        for table_name in table_names {
-            for value in 1_i64..=generations {
-                let batch_id = *uuid::Uuid::now_v7().as_bytes();
-                let request_id = RequestId::now_v7();
-                let data = managed_batch_bytes(value, tenant, batch_id, &request_id);
-                let audit = encode_audit_event(&audit_event("bifrost.append", request_id))
-                    .expect("audit encoding");
-                let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
-                    tenant,
-                    table(table_name),
-                    vala_bifrost_redux::scribe::seal_key::EventDay::new(
-                        chrono::NaiveDate::from_ymd_opt(2026, 7, 24).expect("date"),
-                    ),
-                );
-                wal.append_and_fsync_for_test(&key, batch_id, &audit, &data)
-                    .expect("raw WAL append");
-            }
-        }
+        write_replay_records(&wal, table_names, generations, tenant);
         first.shutdown().await;
         drop(wal);
 
@@ -258,6 +229,52 @@ impl PersistenceFixture {
             wal_root,
             _warehouse: Some(warehouse),
             tenant,
+        }
+    }
+}
+
+async fn register_replay_tables(
+    catalog: &BifrostCatalog,
+    table_names: &[&str],
+    tenant: DataTenantId,
+) {
+    for table_name in table_names {
+        catalog
+            .create_table(CreateTableRequest {
+                table: table(table_name),
+                user_fields: (1..=6)
+                    .map(|index| Field::new(format!("value_{index}"), DataType::Int64, false))
+                    .collect(),
+                tenant,
+                audit: None,
+            })
+            .await
+            .expect("catalog table");
+    }
+}
+
+fn write_replay_records(
+    wal: &WalWriter,
+    table_names: &[&str],
+    generations: i64,
+    tenant: DataTenantId,
+) {
+    for table_name in table_names {
+        for value in 1_i64..=generations {
+            let batch_id = *uuid::Uuid::now_v7().as_bytes();
+            let request_id = RequestId::now_v7();
+            let data = managed_batch_bytes(value, tenant, batch_id, &request_id);
+            let audit = encode_audit_event(&audit_event("bifrost.append", request_id))
+                .expect("audit encoding");
+            let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
+                tenant,
+                table(table_name),
+                vala_bifrost_redux::scribe::seal_key::EventDay::new(
+                    chrono::NaiveDate::from_ymd_opt(2026, 7, 24).expect("date"),
+                ),
+            );
+            wal.append_and_fsync_for_test(&key, batch_id, &audit, &data)
+                .expect("raw WAL append");
         }
     }
 }

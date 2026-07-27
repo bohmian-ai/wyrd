@@ -475,8 +475,9 @@ pub enum BifrostError {
     /// partial success: no row from this request was written. Callers should
     /// back off and retry the full request.
     ///
-    /// The OTLP ingest path maps overload to a retryable `UNAVAILABLE`/`503`
-    /// response, never to `partial_success`.
+    /// The OTLP ingest path maps overload to HTTP `429` and gRPC
+    /// `RESOURCE_EXHAUSTED`, never to `partial_success`; no rows from the
+    /// request are written.
     #[error("ingest writer busy: {table}")]
     #[wyrd_error(
         code = "WYRD_VALA_429_INGEST_BUSY",

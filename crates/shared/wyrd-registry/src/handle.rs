@@ -221,6 +221,7 @@ impl Cards {
             result.map_err(WyrdError::from)?;
         }
         Ok(())
+    }
     /// Clone the authenticated context for another focused registry capability.
     ///
     /// The returned context shares this handle's transport, authentication

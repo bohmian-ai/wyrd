@@ -108,10 +108,9 @@ impl PersistenceFaults {
             .lock()
             .ok()
             .and_then(|mut delays| {
-                delays.first().copied().map(|delay| {
-                    delays.remove(0);
-                    delay
-                })
+                let delay = delays.first().copied()?;
+                delays.remove(0);
+                Some(delay)
             })
             .unwrap_or_else(|| self.object_write_delay_ms.load(Ordering::Acquire));
         if delay_ms > 0 {

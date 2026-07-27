@@ -5,10 +5,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use chrono::Duration as ChronoDuration;
 use ed25519_dalek::VerifyingKey;
+use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -17,7 +19,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
-use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext};
+use vala_bifrost_redux::forge::{
+    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+};
+use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
@@ -47,6 +52,38 @@ use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
+
+/// Production-shaped object-store seam for the embedded Forge fixture.
+#[derive(Debug)]
+struct TestForgeObjectStore {
+    operator: Arc<Operator>,
+}
+
+impl TestForgeObjectStore {
+    /// Retain the server-owned staging operator without changing its behavior.
+    fn new(operator: Arc<Operator>) -> Self {
+        Self { operator }
+    }
+}
+
+#[async_trait]
+impl ForgeObjectStore for TestForgeObjectStore {
+    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+        self.operator.read(path).await
+    }
+
+    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+        self.operator.list_with(prefix).recursive(true).await
+    }
+
+    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+        self.operator.stat(path).await
+    }
+
+    async fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.operator.delete(path).await
+    }
+}
 use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::auth::{
     RequestedSubject, SecretBearer, SubjectTokenType, TokenRequest, TokenResponse,
@@ -1297,15 +1334,39 @@ impl WyrdTestServerBuilder {
             scribe_admission.scribe_memory_limit_bytes,
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge_context = ForgeContext::new(
-            postgres.vala().clone(),
-            operator_pool,
-            bifrost_redux.iceberg_catalog(),
-            Arc::new(storage.operator().clone()),
-            ForgeConfig::default(),
+        let forge_config = ForgeConfig::default();
+        let (_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let query_memory = Arc::new(
+            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
+                bifrost_memory.clone(),
+            ),
+        );
+        let spill_root =
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let forge_runtime = ForgeRewriteRuntime::new(
+            query_memory,
+            spill_root.path(),
+            forge_config.spill_limit_bytes,
         )
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?
-        .with_memory_governor(bifrost_memory.clone());
+        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let staging = Arc::new(storage.operator().clone());
+        let object_store: Arc<dyn ForgeObjectStore> =
+            Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
+        let forge = Arc::new(
+            Forge::new(ForgeBuildConfig {
+                vala: postgres.vala().clone(),
+                operator_pool,
+                catalog: bifrost_redux.iceberg_catalog(),
+                staging,
+                object_store,
+                rewrite_runtime: forge_runtime,
+                hints: forge_inbox,
+                config: forge_config,
+                maintenance_interval: self.forge_interval,
+            })
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let scribe_wal_root = Arc::new(
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
@@ -1359,8 +1420,7 @@ impl WyrdTestServerBuilder {
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(bifrost_redux)
             .with_bifrost_memory(bifrost_memory)
-            .with_forge_context(forge_context)
-            .with_forge_interval(self.forge_interval)
+            .with_forge(forge)
             .with_bifrost_ingest(ingest)
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,

@@ -15,7 +15,10 @@ use opendal::{
 };
 use parquet::arrow::ArrowWriter;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
-use vala_bifrost_redux::forge::{ForgeConfig, ForgeContext, ForgeObjectStore};
+use vala_bifrost_redux::forge::{
+    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+};
+use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use wyrd_spec::DataTenantId;
 
@@ -24,8 +27,24 @@ use super::super::WyrdTestServer;
 /// Durable objects and SQL identity used by a Forge integration test.
 #[derive(Clone)]
 pub struct ForgeFixture {
-    /// The server-owned Forge context.
-    pub context: Arc<ForgeContext>,
+    /// The server-shaped Forge handle used by the journey.
+    pub forge: Arc<Forge>,
+    /// SQL handle retained for fixture assertions and scoped rewrites.
+    pub vala: vala_sql::ValaPostgres,
+    /// Operator pool retained for durable fixture assertions.
+    pub operator_pool: vala_sql::OperatorPool,
+    /// Iceberg catalog retained for fault-injection wrappers.
+    pub catalog: Arc<dyn Catalog>,
+    /// Staging operator retained for fixture object writes.
+    pub staging: Arc<opendal::Operator>,
+    /// Forge object-store seam retained for scoped fault injection.
+    pub object_store: Arc<dyn ForgeObjectStore>,
+    /// Forge-owned spill root kept alive for the fixture lifetime.
+    spill_root: Arc<tempfile::TempDir>,
+    /// Validated configuration used to construct the production-shaped handle.
+    pub config: ForgeConfig,
+    /// Shared parent budget used to construct the DataFusion memory pool.
+    memory: vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor,
     /// The logical and physical identity of the seeded table.
     pub binding: TenantTableBinding,
     /// The tenant that owns the table and file-list rows.
@@ -382,16 +401,12 @@ impl ForgeObjectStore for ForgeObjectStoreControl {
 impl ForgeFixture {
     /// Clone the server-owned context with a test-specific validated config.
     #[must_use]
-    pub fn context_with_config(&self, config: ForgeConfig) -> ForgeContext {
-        ForgeContext::new(
-            self.context.vala.clone(),
-            self.context.operator_pool.clone(),
-            Arc::clone(&self.context.catalog),
-            Arc::clone(&self.context.staging),
+    pub fn context_with_config(&self, config: ForgeConfig) -> Arc<Forge> {
+        self.build_forge(
             config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
         )
-        .expect("validated Forge fixture config")
-        .with_object_store(Arc::clone(&self.context.object_store))
     }
 
     /// Clone the context with a scoped catalog wrapper for one test journey.
@@ -399,16 +414,8 @@ impl ForgeFixture {
         &self,
         config: ForgeConfig,
         catalog: Arc<dyn Catalog>,
-    ) -> ForgeContext {
-        ForgeContext::new(
-            self.context.vala.clone(),
-            self.context.operator_pool.clone(),
-            catalog,
-            Arc::clone(&self.context.staging),
-            config,
-        )
-        .expect("validated Forge fixture config")
-        .with_object_store(Arc::clone(&self.context.object_store))
+    ) -> Arc<Forge> {
+        self.build_forge(config, catalog, Arc::clone(&self.object_store))
     }
 
     /// Clone the context with a scoped OpenDAL wrapper for one test journey.
@@ -416,19 +423,47 @@ impl ForgeFixture {
         &self,
         config: ForgeConfig,
         object_store: Arc<S>,
-    ) -> ForgeContext
+    ) -> Arc<Forge>
     where
         S: ForgeObjectStore + 'static,
     {
-        ForgeContext::new(
-            self.context.vala.clone(),
-            self.context.operator_pool.clone(),
-            Arc::clone(&self.context.catalog),
-            Arc::clone(&self.context.staging),
-            config,
+        self.build_forge(config, Arc::clone(&self.catalog), object_store)
+    }
+
+    /// Build a Forge with the production dependency shape and scoped seams.
+    fn build_forge(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+    ) -> Arc<Forge> {
+        let (publisher, inbox) =
+            staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
+        drop(publisher);
+        let runtime = ForgeRewriteRuntime::new(
+            Arc::new(
+                vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
+                    self.memory.clone(),
+                ),
+            ),
+            self.spill_root.path(),
+            config.spill_limit_bytes,
         )
-        .expect("validated Forge fixture config")
-        .with_object_store(object_store)
+        .expect("validated Forge rewrite runtime");
+        Arc::new(
+            Forge::new(ForgeBuildConfig {
+                vala: self.vala.clone(),
+                operator_pool: self.operator_pool.clone(),
+                catalog,
+                staging: Arc::clone(&self.staging),
+                object_store,
+                rewrite_runtime: runtime,
+                hints: inbox,
+                config,
+                maintenance_interval: std::time::Duration::from_secs(60),
+            })
+            .expect("validated Forge fixture config"),
+        )
     }
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.
@@ -465,8 +500,7 @@ impl ForgeFixture {
             self.binding.object_prefix
         );
         let file_size = i64::try_from(bytes.len()).expect("Forge fixture file size");
-        self.context
-            .staging
+        self.staging
             .write(&path, Buffer::from(bytes))
             .await
             .expect("Forge fixture append object");
@@ -488,14 +522,14 @@ impl ForgeFixture {
         .bind(1_i64)
         .bind(sequence * 2 + 1)
         .bind(sequence * 2 + 2)
-        .execute(self.context.operator_pool.pool())
+        .execute(self.operator_pool.pool())
         .await
         .expect("Forge fixture file-list append");
         sqlx::query(
             "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE id = $1",
         )
         .bind(file_id)
-        .execute(self.context.operator_pool.pool())
+        .execute(self.operator_pool.pool())
         .await
         .expect("Forge fixture append aging");
     }
@@ -523,7 +557,7 @@ impl ForgeFixture {
         .bind(1_i64)
         .bind(1_i64)
         .bind(1_i64)
-        .execute(self.context.operator_pool.pool())
+        .execute(self.operator_pool.pool())
         .await
         .expect("Forge fixture live reference");
     }
@@ -531,7 +565,6 @@ impl ForgeFixture {
     /// Count one tenant/table-scoped Forge audit operation.
     pub async fn operation_count(&self, operation: &str) -> i64 {
         let mut conn = self
-            .context
             .vala
             .tenant_conn(self.tenant)
             .await
@@ -601,12 +634,18 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         !partition_days.is_empty(),
         "Forge fixture needs one partition day"
     );
-    let context = server
+    let forge = server
         .state()
-        .forge_context
-        .as_ref()
+        .forge()
         .cloned()
-        .expect("production server has Redux Forge context");
+        .expect("production server has Forge");
+    let catalog = server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Bifrost Redux")
+        .iceberg_catalog();
+    let staging = Arc::new(server.state().storage.operator().clone());
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("Forge fixture table binding");
@@ -629,16 +668,14 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         .expect("Forge fixture partition spec");
     let warehouse =
         vala_bifrost::catalog::storage::warehouse_uri(server.state().storage.backend_config());
-    if let Err(error) = context
-        .catalog
+    if let Err(error) = catalog
         .create_namespace(binding.physical_namespace(), HashMap::new())
         .await
         && error.kind() != iceberg::ErrorKind::NamespaceAlreadyExists
     {
         panic!("Forge fixture namespace: {error}");
     }
-    context
-        .catalog
+    catalog
         .create_table(
             binding.physical_namespace(),
             TableCreation::builder()
@@ -651,8 +688,10 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         .await
         .expect("Forge fixture table");
 
-    let mut conn = context
-        .vala
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
         .tenant_conn(tenant)
         .await
         .expect("Forge fixture tenant connection");
@@ -692,8 +731,7 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             writer.close().expect("Parquet close");
             let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
             let size = i64::try_from(bytes.len()).expect("Forge fixture file size");
-            context
-                .staging
+            staging
                 .write(&path, Buffer::from(bytes))
                 .await
                 .expect("Forge fixture object");
@@ -728,12 +766,28 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
     .bind(tenant.as_uuid())
     .bind(&binding.logical_namespace)
     .bind(&binding.table_name)
-    .execute(context.operator_pool.pool())
+    .execute(server.state().postgres.operator_pool().expect("operator pool").pool())
     .await
     .expect("Forge fixture aging");
 
     ForgeFixture {
-        context,
+        forge,
+        vala: server.state().postgres.vala().clone(),
+        operator_pool: server
+            .state()
+            .postgres
+            .operator_pool()
+            .expect("operator pool"),
+        catalog,
+        staging: Arc::clone(&staging),
+        object_store: ForgeObjectStoreControl::new(Arc::clone(&staging)),
+        spill_root: Arc::new(tempfile::tempdir().expect("Forge spill root")),
+        memory: server
+            .state()
+            .bifrost_memory
+            .clone()
+            .expect("Bifrost memory governor"),
+        config: ForgeConfig::default(),
         binding,
         tenant,
     }

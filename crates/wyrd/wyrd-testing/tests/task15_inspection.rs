@@ -55,13 +55,7 @@ async fn scribe_inspection_has_fixed_topology_and_reconciled_memory() {
         .expect("shared Bifrost parent governor")
         .snapshot();
     assert!(state.bifrost_query_memory.is_some());
-    assert!(
-        state
-            .forge_context
-            .as_ref()
-            .and_then(|context| context.memory_governor.as_ref())
-            .is_some()
-    );
+    assert!(state.forge().is_some());
     let scribe_snapshot = harness
         .scribes()
         .first()

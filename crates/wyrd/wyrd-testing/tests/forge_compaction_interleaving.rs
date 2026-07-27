@@ -3,7 +3,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vala_bifrost_redux::forge::run_maintenance_tick;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
     CommitUncertaintyCatalog, seed_forge_group, seed_forge_group_for_tenant_with_schema,
@@ -17,15 +16,15 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
     );
     sqlx::query("UPDATE vala.maintenance_leases SET expires_at = now() - interval '1 second' WHERE lease_key = $1")
         .bind(&lease_key)
-        .execute(fixture.context.operator_pool.pool())
+        .execute(fixture.operator_pool.pool())
         .await
         .expect("expire Forge lease for deterministic takeover");
     let owner = uuid::Uuid::now_v7();
     let token = vala_sql::queries::maintenance_leases::try_acquire_lease(
-        &fixture.context.operator_pool,
+        &fixture.operator_pool,
         &lease_key,
         owner,
-        i64::try_from(fixture.context.config.lease_ttl.as_secs()).expect("lease seconds"),
+        i64::try_from(fixture.config.lease_ttl.as_secs()).expect("lease seconds"),
     )
     .await
     .expect("successor lease acquisition")
@@ -57,15 +56,14 @@ async fn forge_compaction_pg_iceberg_bookkeeping_matrix_never_duplicates() {
     let fixture = seed_forge_group(&server, "compaction_matrix_rows").await;
     for schedule in 0..24 {
         if schedule % 3 == 0 {
-            let (left, right) = tokio::join!(
-                run_maintenance_tick(&fixture.context),
-                run_maintenance_tick(&fixture.context),
-            );
+            let (left, right) = tokio::join!(fixture.forge.run_once(), fixture.forge.run_once(),);
             assert!(left.expect("left durable Forge replay").bins_committed <= 1);
             assert!(right.expect("right durable Forge replay").bins_committed <= 1);
         } else {
             assert!(
-                run_maintenance_tick(&fixture.context)
+                fixture
+                    .forge
+                    .run_once()
                     .await
                     .expect("durable Forge replay")
                     .bins_committed
@@ -125,11 +123,13 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
         sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id IN ($1, $2)")
             .bind(first.tenant.as_uuid())
             .bind(second.tenant.as_uuid())
-            .fetch_one(first.context.operator_pool.pool())
+            .fetch_one(first.operator_pool.pool())
             .await
             .expect("isolated discovery rows");
     assert_eq!(discovered_rows, 6);
-    let outcome = run_maintenance_tick(&first.context)
+    let outcome = first
+        .forge
+        .run_once()
         .await
         .expect("isolated production tick");
     assert_eq!(outcome.bins_committed, 3, "tick outcome: {outcome:?}");
@@ -141,7 +141,7 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
         .bind(fixture.tenant.as_uuid())
         .bind(&fixture.binding.logical_namespace)
         .bind(&fixture.binding.table_name)
-        .fetch_one(fixture.context.operator_pool.pool())
+        .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("isolated file-list state");
         let expected_files = if fixture.tenant == first.tenant { 4 } else { 2 };
@@ -150,7 +150,6 @@ async fn forge_compaction_tick_isolates_tenants_tables_and_schemas() {
         assert_eq!(state.1, expected_files);
         assert!(state.2.is_some());
         let table = fixture
-            .context
             .catalog
             .load_table(&fixture.binding.table_ident())
             .await
@@ -198,22 +197,20 @@ async fn forge_compaction_lease_contention_fails_closed() {
     );
     let owner = uuid::Uuid::now_v7();
     let token = vala_sql::queries::maintenance_leases::try_acquire_lease(
-        &fixture.context.operator_pool,
+        &fixture.operator_pool,
         &lease_key,
         owner,
-        i64::try_from(fixture.context.config.lease_ttl.as_secs()).expect("lease seconds"),
+        i64::try_from(fixture.config.lease_ttl.as_secs()).expect("lease seconds"),
     )
     .await
     .expect("lease acquisition")
     .expect("lease token");
-    let outcome = run_maintenance_tick(&fixture.context)
-        .await
-        .expect("fenced tick");
+    let outcome = fixture.forge.run_once().await.expect("fenced tick");
     assert_eq!(outcome.bins_committed, 0);
     assert!(outcome.tables_skipped > 0);
     assert!(
         vala_sql::queries::maintenance_leases::release_lease_fenced(
-            &fixture.context.operator_pool,
+            &fixture.operator_pool,
             &lease_key,
             owner,
             token,
@@ -249,18 +246,18 @@ async fn forge_compaction_replay_after_commit_is_idempotent() {
         .await
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "compaction_retry_rows").await;
-    let uncertain_catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.context.catalog));
+    let uncertain_catalog = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
     uncertain_catalog.fail_after_next_commit();
-    let context = fixture.context_with_catalog(fixture.context.config.clone(), uncertain_catalog);
-    let first = run_maintenance_tick(&context)
-        .await
-        .expect("uncertain tick outcome");
+    let context = fixture.context_with_catalog(fixture.config.clone(), uncertain_catalog);
+    let first = context.run_once().await.expect("uncertain tick outcome");
     assert_eq!(
         first.tables_failed, 1,
         "uncertain commit must fail its table"
     );
     assert_eq!(first.bins_committed, 0);
-    let second = run_maintenance_tick(&fixture.context)
+    let second = fixture
+        .forge
+        .run_once()
         .await
         .expect("successor durable tick");
     assert_eq!(second.bins_committed, 0, "successor outcome: {second:?}");
@@ -274,7 +271,6 @@ async fn forge_compaction_replay_after_commit_is_idempotent() {
     let prepared = fixture.operation_count("forge.file_compact.prepared").await;
     assert_eq!(prepared, 1, "uncertain commit must reconcile one operation");
     let table = fixture
-        .context
         .catalog
         .load_table(&fixture.binding.table_ident())
         .await
@@ -303,10 +299,10 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
         .await
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "compaction_fence_rows").await;
-    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.context.catalog));
+    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
     control.pause_after_commit();
-    let context = fixture.context_with_catalog(fixture.context.config.clone(), control.clone());
-    let task = tokio::spawn(async move { run_maintenance_tick(&context).await });
+    let context = fixture.context_with_catalog(fixture.config.clone(), control.clone());
+    let task = tokio::spawn(async move { context.run_once().await });
     control.wait_for_commit().await;
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_commit();
@@ -328,7 +324,7 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
         .bind(fixture.tenant.as_uuid())
         .bind(&fixture.binding.logical_namespace)
         .bind(&fixture.binding.table_name)
-        .fetch_one(fixture.context.operator_pool.pool())
+        .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("uncommitted source rows")
         == 2
@@ -339,7 +335,7 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
     );
     assert!(
         vala_sql::queries::maintenance_leases::release_lease_fenced(
-            &fixture.context.operator_pool,
+            &fixture.operator_pool,
             &lease_key,
             successor_owner,
             successor_token,
@@ -347,7 +343,9 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
         .await
         .expect("successor release")
     );
-    run_maintenance_tick(&fixture.context)
+    fixture
+        .forge
+        .run_once()
         .await
         .expect("successor reconciliation");
     assert_eq!(
@@ -374,10 +372,10 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
         .await
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "compaction_precommit_fence_rows").await;
-    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.context.catalog));
+    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
     control.pause_before_commit();
-    let context = fixture.context_with_catalog(fixture.context.config.clone(), control.clone());
-    let task = tokio::spawn(async move { run_maintenance_tick(&context).await });
+    let context = fixture.context_with_catalog(fixture.config.clone(), control.clone());
+    let task = tokio::spawn(async move { context.run_once().await });
     control.wait_for_before_commit().await;
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_before_commit();
@@ -387,7 +385,6 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
         .expect("stale precommit tick reports failure");
     assert_eq!(outcome.tables_failed, 1);
     let snapshots = fixture
-        .context
         .catalog
         .load_table(&fixture.binding.table_ident())
         .await
@@ -408,7 +405,7 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
     );
     assert!(
         vala_sql::queries::maintenance_leases::release_lease_fenced(
-            &fixture.context.operator_pool,
+            &fixture.operator_pool,
             &lease_key,
             successor_owner,
             successor_token,
@@ -439,21 +436,17 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
         .await
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "expiry_fence_rows").await;
-    run_maintenance_tick(&fixture.context)
-        .await
-        .expect("first snapshot");
+    fixture.forge.run_once().await.expect("first snapshot");
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    run_maintenance_tick(&fixture.context)
-        .await
-        .expect("second snapshot");
+    fixture.forge.run_once().await.expect("second snapshot");
 
-    let mut config = fixture.context.config.clone();
+    let mut config = fixture.config.clone();
     config.snapshot_retention = Duration::from_millis(1);
-    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.context.catalog));
+    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
     control.pause_after_commit();
     let context = fixture.context_with_catalog(config, control.clone());
-    let task = tokio::spawn(async move { run_maintenance_tick(&context).await });
+    let task = tokio::spawn(async move { context.run_once().await });
     control.wait_for_commit().await;
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_commit();
@@ -475,7 +468,6 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
         0
     );
     let snapshots = fixture
-        .context
         .catalog
         .load_table(&fixture.binding.table_ident())
         .await
@@ -491,7 +483,7 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
     );
     assert!(
         vala_sql::queries::maintenance_leases::release_lease_fenced(
-            &fixture.context.operator_pool,
+            &fixture.operator_pool,
             &lease_key,
             successor_owner,
             successor_token,
@@ -499,7 +491,9 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
         .await
         .expect("successor release")
     );
-    run_maintenance_tick(&fixture.context)
+    fixture
+        .forge
+        .run_once()
         .await
         .expect("expiry recovery tick");
     assert_eq!(

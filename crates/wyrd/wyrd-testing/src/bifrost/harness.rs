@@ -163,6 +163,7 @@ impl BifrostHarness {
                     .with_test_faults(persistence_faults.clone()),
                 ),
                 memory_budget: Some(memory_governor.scribe_budget()),
+                staging_file_publisher: None,
             });
             scribes.push(Arc::new(scribe));
         }

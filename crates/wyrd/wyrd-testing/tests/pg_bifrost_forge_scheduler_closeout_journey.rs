@@ -15,14 +15,10 @@ use wyrd_testing::WyrdTestServer;
 
 async fn seed_forge_group(
     server: &WyrdTestServer,
-) -> (
-    Arc<vala_bifrost_redux::forge::ForgeContext>,
-    TenantTableBinding,
-) {
+) -> (Arc<vala_bifrost_redux::forge::Forge>, TenantTableBinding) {
     let context = server
         .state()
-        .forge_context
-        .as_ref()
+        .forge()
         .cloned()
         .expect("production server has Redux Forge context");
     let tenant = server.data_tenant_id();
@@ -46,13 +42,21 @@ async fn seed_forge_group(
         .expect("partition spec");
     let warehouse =
         vala_bifrost::catalog::storage::warehouse_uri(server.state().storage.backend_config());
-    context
-        .catalog
+    server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Bifrost Redux")
+        .iceberg_catalog()
         .create_namespace(binding.physical_namespace(), HashMap::new())
         .await
         .expect("tenant namespace");
-    context
-        .catalog
+    server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Bifrost Redux")
+        .iceberg_catalog()
         .create_table(
             binding.physical_namespace(),
             TableCreation::builder()
@@ -68,8 +72,10 @@ async fn seed_forge_group(
     let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
         .expect("timestamp")
         .timestamp_micros();
-    let mut conn = context
-        .vala
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
         .tenant_conn(tenant)
         .await
         .expect("tenant connection");
@@ -96,8 +102,10 @@ async fn seed_forge_group(
         writer.close().expect("Parquet close");
         let path = format!("{}/journey-{file_number}.parquet", binding.object_prefix);
         let size = i64::try_from(bytes.len()).expect("file size");
-        context
-            .staging
+        server
+            .state()
+            .storage
+            .operator()
             .write(&path, Buffer::from(bytes))
             .await
             .expect("staging object");
@@ -133,7 +141,7 @@ async fn seed_forge_group(
     .bind(tenant.as_uuid())
     .bind(&binding.logical_namespace)
     .bind(&binding.table_name)
-    .execute(context.operator_pool.pool())
+    .execute(server.state().postgres.operator_pool().expect("operator pool").pool())
     .await
     .expect("age file list rows");
     (context, binding)
@@ -147,7 +155,7 @@ async fn journey_forge_scheduler_single_pod_end_to_end() {
         .start_bound()
         .await
         .expect("real server");
-    let (context, binding) = seed_forge_group(&server).await;
+    let (_context, binding) = seed_forge_group(&server).await;
     let tenant = server.data_tenant_id();
 
     let mut compacted = false;
@@ -158,7 +166,7 @@ async fn journey_forge_scheduler_single_pod_end_to_end() {
         .bind(tenant.as_uuid())
         .bind(&binding.logical_namespace)
         .bind(&binding.table_name)
-        .fetch_one(context.operator_pool.pool())
+        .fetch_one(server.state().postgres.operator_pool().expect("operator pool").pool())
         .await
         .expect("compaction state")
             == 2;
@@ -171,14 +179,20 @@ async fn journey_forge_scheduler_single_pod_end_to_end() {
         compacted,
         "server scheduler did not commit the seeded group"
     );
-    let table = context
-        .catalog
+    let table = server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Bifrost Redux")
+        .iceberg_catalog()
         .load_table(&binding.table_ident())
         .await
         .expect("journey table");
     assert!(table.metadata().current_snapshot_id().is_some());
-    let mut conn = context
-        .vala
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
         .tenant_conn(tenant)
         .await
         .expect("audit tenant connection");
@@ -189,5 +203,6 @@ async fn journey_forge_scheduler_single_pod_end_to_end() {
     .await
     .expect("audit count");
     assert_eq!(audit_count, 2);
+    drop(conn);
     server.shutdown().await.expect("server shutdown");
 }

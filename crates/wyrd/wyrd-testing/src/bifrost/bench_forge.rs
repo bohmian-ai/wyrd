@@ -3,7 +3,6 @@
 use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
-use vala_bifrost_redux::forge::run_maintenance_tick;
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
@@ -26,9 +25,9 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .first()
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
-    let outcome = run_maintenance_tick(&fixture.context).await?;
+    let outcome = fixture.forge.run_once().await?;
     let negative_flows = if scenario.require_negative_flows {
-        let retry = run_maintenance_tick(&fixture.context).await?;
+        let retry = fixture.forge.run_once().await?;
         NegativeFlowReport::executed(
             ["completed_forge_tick_is_idempotent"],
             retry.bins_committed == 0 && retry.tables_failed == 0,

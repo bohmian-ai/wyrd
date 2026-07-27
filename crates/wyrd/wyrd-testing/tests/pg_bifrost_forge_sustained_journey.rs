@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use vala_bifrost_redux::forge::run_maintenance_tick;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{ForgeFixture, seed_forge_group, seed_forge_group_for_tenant};
 
@@ -83,7 +82,7 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
     }
 
     server.cancel_bound_workers();
-    let operator_pool = fixtures[0].context.operator_pool.clone();
+    let operator_pool = fixtures[0].operator_pool.clone();
     let mut leases = i64::MAX;
     for _ in 0..100 {
         leases = sqlx::query_scalar(
@@ -101,7 +100,9 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
 
     for _ in 0..20 {
         for fixture in &fixtures {
-            run_maintenance_tick(&fixture.context)
+            fixture
+                .forge
+                .run_once()
                 .await
                 .expect("durable Forge drain tick");
         }
@@ -123,7 +124,7 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         .bind(fixture.tenant.as_uuid())
         .bind(&fixture.binding.logical_namespace)
         .bind(&fixture.binding.table_name)
-        .fetch_one(fixture.context.operator_pool.pool())
+        .fetch_one(fixture.operator_pool.pool())
         .await
         .expect("durable row count");
         assert_eq!(rows, 24);
@@ -140,7 +141,6 @@ async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak
         assert_eq!(prepared, committed + recovered + reset);
         assert!(
             fixture
-                .context
                 .catalog
                 .load_table(&fixture.binding.table_ident())
                 .await
@@ -160,7 +160,7 @@ async fn pending_file_count(fixture: &ForgeFixture) -> i64 {
     .bind(fixture.tenant.as_uuid())
     .bind(&fixture.binding.logical_namespace)
     .bind(&fixture.binding.table_name)
-    .fetch_one(fixture.context.operator_pool.pool())
+    .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("pending file count")
 }
@@ -184,13 +184,12 @@ async fn read_staged_parquet_rows(fixture: &ForgeFixture) -> usize {
     .bind(fixture.tenant.as_uuid())
     .bind(&fixture.binding.logical_namespace)
     .bind(&fixture.binding.table_name)
-    .fetch_all(fixture.context.operator_pool.pool())
+    .fetch_all(fixture.operator_pool.pool())
     .await
     .expect("staged file paths");
     let mut rows = 0_usize;
     for path in paths {
         let bytes = fixture
-            .context
             .staging
             .read(&path)
             .await

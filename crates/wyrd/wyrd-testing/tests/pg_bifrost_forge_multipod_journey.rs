@@ -1,6 +1,5 @@
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
-use vala_bifrost_redux::forge::{ForgeScheduler, run_maintenance_tick};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::seed_forge_group;
 
@@ -15,12 +14,7 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         .start_bound()
         .await
         .expect("test server");
-    let context = server
-        .state()
-        .forge_context
-        .as_ref()
-        .cloned()
-        .expect("Forge context");
+    let forge = server.state().forge().expect("Forge").clone();
     let fixtures = vec![
         seed_forge_group(&server, "multipod_rows_a").await,
         seed_forge_group(&server, "multipod_rows_b").await,
@@ -28,24 +22,12 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         seed_forge_group(&server, "multipod_rows_d").await,
         seed_forge_group(&server, "multipod_rows_e").await,
     ];
-    let shutdown_a = CancellationToken::new();
-    let shutdown_b = CancellationToken::new();
-    let shutdown_c = CancellationToken::new();
-    let scheduler_a = tokio::spawn(
-        ForgeScheduler::new((*context).clone(), Duration::from_millis(10))
-            .expect("first shared scheduler")
-            .run(shutdown_a.clone()),
-    );
-    let scheduler_b = tokio::spawn(
-        ForgeScheduler::new((*context).clone(), Duration::from_millis(10))
-            .expect("second shared scheduler")
-            .run(shutdown_b.clone()),
-    );
-    let scheduler_c = tokio::spawn(
-        ForgeScheduler::new((*context).clone(), Duration::from_millis(10))
-            .expect("third shared scheduler")
-            .run(shutdown_c.clone()),
-    );
+    let shutdown = CancellationToken::new();
+    let scheduler = tokio::spawn({
+        let forge = forge.clone();
+        let stop = shutdown.clone();
+        async move { forge.run(stop).await }
+    });
     for fixture in &fixtures {
         for _ in 0..100 {
             let compacted: i64 = sqlx::query_scalar(
@@ -54,7 +36,7 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
             .bind(fixture.tenant.as_uuid())
             .bind(&fixture.binding.logical_namespace)
             .bind(&fixture.binding.table_name)
-            .fetch_one(fixture.context.operator_pool.pool())
+            .fetch_one(fixture.operator_pool.pool())
             .await
             .expect("compaction state");
             if compacted == 2 {
@@ -63,28 +45,16 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    shutdown_a.cancel();
-    scheduler_a
+    shutdown.cancel();
+    scheduler
         .await
-        .expect("first scheduler task")
-        .expect("first scheduler shutdown");
-    shutdown_b.cancel();
-    scheduler_b
-        .await
-        .expect("second scheduler task")
-        .expect("second scheduler shutdown");
-    shutdown_c.cancel();
-    scheduler_c
-        .await
-        .expect("third scheduler task")
+        .expect("scheduler task")
         .expect("third scheduler shutdown");
     let operator_pool = server
         .state()
-        .forge_context
-        .as_ref()
-        .expect("Forge context")
-        .operator_pool
-        .clone();
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
     let mut lease_count = i64::MAX;
     for _ in 0..100 {
         lease_count = sqlx::query_scalar(
@@ -113,23 +83,19 @@ async fn journey_forge_scheduler_restart_preserves_reads_and_live_files() {
         .start_bound()
         .await
         .expect("test server");
-    let context = server
-        .state()
-        .forge_context
-        .as_ref()
-        .cloned()
-        .expect("Forge context");
+    let forge = server.state().forge().expect("Forge").clone();
     let fixture = seed_forge_group(&server, "restart_rows").await;
-    let outcome = run_maintenance_tick(&context)
+    let outcome = forge
+        .run_once()
         .await
         .expect("one-shot production Forge tick");
     assert_eq!(outcome.bins_committed, 1);
     let shutdown = CancellationToken::new();
-    let restarted = tokio::spawn(
-        ForgeScheduler::new((*context).clone(), Duration::from_millis(10))
-            .expect("restarted scheduler")
-            .run(shutdown.clone()),
-    );
+    let restarted = tokio::spawn({
+        let forge = forge.clone();
+        let stop = shutdown.clone();
+        async move { forge.run(stop).await }
+    });
     tokio::time::sleep(Duration::from_millis(30)).await;
     shutdown.cancel();
     restarted
@@ -142,13 +108,12 @@ async fn journey_forge_scheduler_restart_preserves_reads_and_live_files() {
     .bind(fixture.tenant.as_uuid())
     .bind(&fixture.binding.logical_namespace)
     .bind(&fixture.binding.table_name)
-    .fetch_one(fixture.context.operator_pool.pool())
+    .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("restart file-list state");
     assert_eq!(compacted, 2);
     assert!(
         fixture
-            .context
             .catalog
             .load_table(&fixture.binding.table_ident())
             .await

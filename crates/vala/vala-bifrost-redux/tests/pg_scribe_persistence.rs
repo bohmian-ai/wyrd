@@ -88,6 +88,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             memory_budget: Some(memory.scribe_budget()),
+            staging_file_publisher: None,
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
         Self {
@@ -197,6 +198,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             memory_budget: Some(memory.scribe_budget()),
+            staging_file_publisher: None,
         }));
         scribe.replay_wal_async().await.expect("replay");
         Self {
@@ -232,6 +234,7 @@ fn first_replay_scribe(
         execution_pools: pools,
         persistence: None,
         memory_budget: Some(memory.scribe_budget()),
+        staging_file_publisher: None,
     }))
 }
 

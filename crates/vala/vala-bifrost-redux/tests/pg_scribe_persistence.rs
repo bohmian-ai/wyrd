@@ -162,13 +162,7 @@ impl PersistenceFixture {
             memory_limit_bytes: 4 * 1024 * 1024 * 1024,
             scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
         };
-        let first = first_replay_scribe(
-            operator.clone(),
-            wal.clone(),
-            node_id,
-            admission.clone(),
-            memory.clone(),
-        );
+        let first = first_replay_scribe(operator.clone(), wal.clone(), node_id, admission, &memory);
         first.replay_wal_async().await.expect("empty WAL replay");
         write_replay_records(&wal, table_names, generations, tenant);
         first.shutdown().await;
@@ -227,7 +221,7 @@ fn first_replay_scribe(
     wal: Arc<WalWriter>,
     node_id: uuid::Uuid,
     admission: vala_bifrost_redux::scribe::admission::AdmissionConfig,
-    memory: BifrostMemoryGovernor,
+    memory: &BifrostMemoryGovernor,
 ) -> Arc<ScribeImpl> {
     let pools = ScribeExecutionPools::new(
         ScribeIngressCpuPool::new_with_capacity(1, 256),

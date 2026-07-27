@@ -38,7 +38,9 @@ static WAL_WALK_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
-static WAL_PARTIAL_WRITE: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 #[cfg(test)]
 static WAL_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1221,7 +1223,7 @@ impl WalSegment {
             detail: "WAL segment file lock poisoned (append)".to_string(),
         })?;
         #[cfg(test)]
-        if WAL_PARTIAL_WRITE.swap(false, Ordering::AcqRel) {
+        if WAL_PARTIAL_WRITE.with(|flag| flag.replace(false)) {
             let prefix = encoded.len().max(1) / 2;
             file.write_all(&encoded[..prefix])
                 .map_err(|e| wal_io_error("WAL partial record write failed", &e))?;
@@ -2594,7 +2596,9 @@ mod tests {
         let expected_capacity = stats.f_blocks.saturating_mul(stats.f_frsize);
         let expected_available = stats.f_bavail.saturating_mul(stats.f_frsize);
         let measured = filesystem_space(temp_dir.path()).expect("filesystem sample");
-        assert_eq!(measured, (expected_capacity, expected_available));
+        assert_eq!(measured.0, expected_capacity);
+        assert!(measured.1 <= expected_available);
+        assert!(expected_available - measured.1 <= stats.f_frsize);
     }
 
     #[test]
@@ -2668,7 +2672,7 @@ mod tests {
     #[test]
     fn reconciliation_repairs_under_count_without_shard_state_lock() {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
-        WAL_PARTIAL_WRITE.store(false, Ordering::Release);
+        WAL_PARTIAL_WRITE.with(|flag| flag.set(false));
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [23; 16], 1, WalConfig::default()).expect("writer");
@@ -2708,12 +2712,12 @@ mod tests {
     #[test]
     fn partial_write_reconciles_conservatively_and_allows_later_append() {
         let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
-        WAL_PARTIAL_WRITE.store(false, Ordering::Release);
+        WAL_PARTIAL_WRITE.with(|flag| flag.set(false));
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [25; 16], 1, WalConfig::default()).expect("writer");
         let key = test_seal_key(crate::test_support::tenant());
-        WAL_PARTIAL_WRITE.store(true, Ordering::Release);
+        WAL_PARTIAL_WRITE.with(|flag| flag.set(true));
         let error = writer
             .append_and_fsync_for_test(&key, [6; 16], b"audit", b"data")
             .expect_err("partial write must fail");

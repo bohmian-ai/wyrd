@@ -592,6 +592,18 @@ mod tests {
             assert_eq!(catalog.code(), code);
             assert_eq!(catalog.status(), status);
             assert_eq!(info.reason, code);
+            let expected_grpc = match status {
+                401 => wyrd_tonic::tonic::Code::Unauthenticated,
+                400 => wyrd_tonic::tonic::Code::InvalidArgument,
+                403 => wyrd_tonic::tonic::Code::PermissionDenied,
+                404 => wyrd_tonic::tonic::Code::NotFound,
+                409 => wyrd_tonic::tonic::Code::FailedPrecondition,
+                413 | 429 | 507 => wyrd_tonic::tonic::Code::ResourceExhausted,
+                500 => wyrd_tonic::tonic::Code::Internal,
+                503 => wyrd_tonic::tonic::Code::Unavailable,
+                _ => wyrd_tonic::tonic::Code::Unknown,
+            };
+            assert_eq!(grpc.code(), expected_grpc);
             assert_eq!(
                 ingest_error_to_response(error, OtlpSignal::Traces)
                     .into_response()

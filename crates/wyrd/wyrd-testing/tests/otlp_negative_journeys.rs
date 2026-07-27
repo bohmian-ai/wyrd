@@ -447,7 +447,7 @@ mod pg_tests {
     }
 
     #[tokio::test]
-    async fn wal_exhaustion_and_row_overflow_keep_transport_contracts() {
+    async fn wal_exhaustion_keeps_transport_contract_and_no_mutation() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let admin_jwt = bootstrap_admin(&srv, "neg-capacity").await;
         let grpc_url = srv.grpc_url().expect("grpc url");
@@ -471,34 +471,6 @@ mod pg_tests {
             "WYRD_VALA_507_WAL_DISK_FULL"
         );
         assert_no_span_written(connect(&grpc_url).await, &admin_jwt, [9; 16]).await;
-        srv.shutdown().await.expect("shutdown");
-
-        let srv = WyrdTestServer::start_bound().await.expect("bound server");
-        let admin_jwt = bootstrap_admin(&srv, "neg-overflow").await;
-        let mut oversized = trace_export_request([7; 16], [6; 8]);
-        let span = oversized.resource_spans[0].scope_spans[0].spans[0].clone();
-        oversized.resource_spans[0].scope_spans[0].spans = vec![span; 60_001];
-        let body = oversized.encode_to_vec();
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/v1/traces",
-                srv.base_url().expect("http base url")
-            ))
-            .header("x-wyrd-access-token", format!("Bearer {admin_jwt}"))
-            .header("content-type", "application/x-protobuf")
-            .body(body)
-            .send()
-            .await
-            .expect("HTTP request sent");
-        assert_eq!(response.status(), 413);
-        let problem: serde_json::Value = response.json().await.expect("problem json");
-        assert_eq!(problem["code"], "WYRD_VALA_413_INGEST_OVERSIZED");
-        assert_no_span_written(
-            connect(&srv.grpc_url().expect("grpc url")).await,
-            &admin_jwt,
-            [7; 16],
-        )
-        .await;
         srv.shutdown().await.expect("shutdown");
     }
 

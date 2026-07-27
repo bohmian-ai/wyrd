@@ -11,7 +11,11 @@ use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool};
 use crate::contracts::ScribeError;
 
 #[cfg(test)]
-static CGROUP_CURRENT_READS: AtomicUsize = AtomicUsize::new(0);
+static CGROUP_CURRENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(test)]
+thread_local! {
+    static CGROUP_CURRENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Minimum supported cgroup memory size.
 pub const MIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
@@ -773,7 +777,7 @@ fn read_cgroup_limit() -> Option<usize> {
 
 fn read_cgroup_current() -> Option<usize> {
     #[cfg(test)]
-    CGROUP_CURRENT_READS.fetch_add(1, Ordering::Relaxed);
+    CGROUP_CURRENT_READS.with(|count| count.set(count.get() + 1));
     [
         "/sys/fs/cgroup/memory.current",
         "/sys/fs/cgroup/memory/memory.usage_in_bytes",
@@ -1048,15 +1052,40 @@ mod tests {
 
     #[test]
     fn cgroup_current_is_cached_for_repeated_snapshots() {
-        CGROUP_CURRENT_READS.store(0, Ordering::Relaxed);
+        let _guard = CGROUP_CURRENT_TEST_LOCK.lock().expect("cgroup test lock");
+        CGROUP_CURRENT_READS.with(|count| count.set(0));
         let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
         let _ = governor.snapshot();
-        let first = CGROUP_CURRENT_READS.load(Ordering::Relaxed);
+        let first = CGROUP_CURRENT_READS.with(std::cell::Cell::get);
+        assert_eq!(first, 1, "first snapshot must perform one current read");
         let _ = governor.snapshot();
-        let second = CGROUP_CURRENT_READS.load(Ordering::Relaxed);
-        assert!(
-            second <= first + 1,
-            "cached snapshot performed excessive reads"
+        let second = CGROUP_CURRENT_READS.with(std::cell::Cell::get);
+        assert_eq!(second, first, "cached snapshot performed an extra read");
+
+        let cached_limit = governor.inner.cgroup_limit_bytes;
+        let cached_value = governor
+            .inner
+            .cgroup_current
+            .lock()
+            .expect("cgroup cache lock")
+            .expect("snapshot cached current")
+            .1;
+        *governor
+            .inner
+            .cgroup_current
+            .lock()
+            .expect("cgroup cache lock") = Some((
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("invariant: test clock is after two seconds"),
+            cached_value,
+        ));
+        let _ = governor.snapshot();
+        assert_eq!(
+            CGROUP_CURRENT_READS.with(std::cell::Cell::get),
+            first + 1,
+            "expired cache must perform exactly one refresh read"
         );
+        assert_eq!(governor.inner.cgroup_limit_bytes, cached_limit);
     }
 }

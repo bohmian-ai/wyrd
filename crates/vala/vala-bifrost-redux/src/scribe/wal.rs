@@ -32,13 +32,11 @@ use crate::scribe::seal_key::{EventDay, SealKey};
 use crate::scribe::stream_identity::StreamIdentity;
 
 #[cfg(test)]
-static WAL_ENCODE_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
-static WAL_WALK_COUNT: AtomicU64 = AtomicU64::new(0);
-#[cfg(test)]
 static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 thread_local! {
+    static WAL_ENCODE_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WAL_WALK_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static WAL_PARTIAL_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 #[cfg(test)]
@@ -319,7 +317,7 @@ impl PreparedWalAppend {
     fn record(&self) -> Result<WalRecord, ScribeError> {
         #[cfg(test)]
         if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
-            WAL_ENCODE_COUNT.fetch_add(1, Ordering::Relaxed);
+            WAL_ENCODE_COUNT.with(|count| count.set(count.get() + 1));
         }
         let seal_key = self
             .seal_key
@@ -1094,7 +1092,7 @@ fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
 fn directory_bytes(path: &Path) -> u64 {
     #[cfg(test)]
     if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
-        WAL_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
+        WAL_WALK_COUNT.with(|count| count.set(count.get() + 1));
     }
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -2628,6 +2626,14 @@ mod tests {
             .expect("append");
         let actual = directory_bytes(temp_dir.path());
         assert_eq!(writer.bytes_on_disk(), actual);
+        drop(writer);
+        let writer =
+            WalWriter::new(temp_dir.path(), [21; 16], 1, WalConfig::default()).expect("reopen");
+        assert_eq!(
+            writer.bytes_on_disk(),
+            actual,
+            "startup accounting must include existing nested shard WAL bytes"
+        );
         let segment = WalReader::open_directory_unfiltered(temp_dir.path())
             .expect("reader")
             .segments
@@ -2656,16 +2662,16 @@ mod tests {
             std::fs::write(path, [0_u8; 8]).expect("fixture");
         }
         let key = test_seal_key(crate::test_support::tenant());
-        WAL_ENCODE_COUNT.store(0, Ordering::Relaxed);
-        WAL_WALK_COUNT.store(0, Ordering::Relaxed);
+        WAL_ENCODE_COUNT.with(|count| count.set(0));
+        WAL_WALK_COUNT.with(|count| count.set(0));
         WAL_COUNT_ACTIVE.store(true, Ordering::Relaxed);
         writer
             .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
             .expect("append");
-        assert!(WAL_ENCODE_COUNT.load(Ordering::Relaxed) >= 1);
-        assert_eq!(WAL_WALK_COUNT.load(Ordering::Relaxed), 0);
+        assert_eq!(WAL_ENCODE_COUNT.with(std::cell::Cell::get), 1);
+        assert_eq!(WAL_WALK_COUNT.with(std::cell::Cell::get), 0);
         let _ = writer.disk_pressure();
-        assert!(WAL_WALK_COUNT.load(Ordering::Relaxed) > 0);
+        assert!(WAL_WALK_COUNT.with(std::cell::Cell::get) > 0);
         WAL_COUNT_ACTIVE.store(false, Ordering::Relaxed);
     }
 
@@ -2693,17 +2699,33 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
-        writer.disk.force_sample(None);
         let key = test_seal_key(crate::test_support::tenant());
         let before = writer.bytes_on_disk();
-        writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
+        let files_before = std::fs::read_dir(temp_dir.path())
+            .expect("list WAL directory")
+            .map(|entry| entry.expect("WAL directory entry").path())
+            .collect::<Vec<_>>();
         writer.disk.force_sample(None);
         let error = writer
             .append_and_fsync_for_test(&key, [4; 16], b"audit", b"data")
             .expect_err("forced zero sample must reject");
         assert!(matches!(error, ScribeError::WalDiskFull));
         assert_eq!(writer.bytes_on_disk(), before);
+        assert_eq!(directory_bytes(temp_dir.path()), before);
+        let files_after = std::fs::read_dir(temp_dir.path())
+            .expect("list WAL directory")
+            .map(|entry| entry.expect("WAL directory entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(files_after, files_before);
+        let sample = writer
+            .disk
+            .sample
+            .lock()
+            .expect("disk sample lock")
+            .expect("failed probe is cached");
+        assert_eq!(sample.filesystem_available_bytes, 0);
         writer.disk.force_sample(Some((u64::MAX, u64::MAX)));
+        assert!(!writer.disk_pressure().hard);
         writer
             .append_and_fsync_for_test(&key, [5; 16], b"audit", b"data")
             .expect("successful sample recovers");

@@ -117,5 +117,3 @@ The app pool enforces tenant isolation via a Postgres RLS policy on every table.
 **Postgres unavailable during seal.** Same shape as above. Seal retries; the memtable stays in memory; the WAL keeps the acked data. New appends can proceed until the memtable fills.
 
 **Forge crash mid-tick.** Lease expires. Successor Forge pod picks up the same table, re-derives state from `vala.file_list` and Iceberg metadata, re-runs the tick. Idempotent by construction.
-
-**Seal worker not running.** Shipped audit rows accumulate as a gap. `verify_checkpoint_walk` returns `VerifyOutcome::Gap`. No data is lost or corrupted; only the signed coverage window is smaller than expected.

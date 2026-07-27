@@ -1127,6 +1127,9 @@ depends = [
   "check:from-pools-allowlist",
   "check:fixtures-no-server",
   "check:no-testing-in-prod-deps",
+  "check:redux-isolation",
+  "check:redux-single-table-model",
+  "check:bifrost-bench-registration",
   "check:test-coverage"]
 
 [tasks."setup:db-roles"]

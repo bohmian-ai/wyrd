@@ -1141,6 +1141,10 @@ approved Vala Python owner crate) behind its optional `python` feature.
 
 **Principle — wyrd-server is the only serving surface.** `vala-*` crates are
 engine and data-plane libraries; they are never HTTP or gRPC serving crates.
+The Redux Gate may implement approved tonic protocol adapters and bearer-token
+verification through `wyrd-auth-verify`, but it does not serve the network.
+Only `wyrd-server` binds sockets, owns listeners and top-level routing,
+terminates TLS, performs boot/readiness, and controls server lifecycle.
 `wyrd-server` is the single process that binds ports and owns all HTTP/gRPC
 serving. The eval consolidation (commits 01–05) is the first realization of
 this principle; Bifrost/ingest serving reconciliation follows in a separate

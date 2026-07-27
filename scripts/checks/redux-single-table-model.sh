@@ -4,6 +4,11 @@ set -euo pipefail
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+if ! command -v rg >/dev/null 2>&1; then
+  echo "Redux single-table model checker requires rg; refusing to run without it" >&2
+  exit 1
+fi
+
 active_paths=(
   crates/vala/vala-bifrost-redux/src
   crates/vala/vala-bifrost-redux/tests
@@ -32,8 +37,8 @@ forbidden=(
 )
 
 for token in "${forbidden[@]}"; do
-  if rg -n -F "$token" "${active_paths[@]}" >/dev/null; then
-    echo "Redux single-table model violation: $token" >&2
+  if match="$(rg -n -F "$token" "${active_paths[@]}" 2>/dev/null)"; then
+    printf 'Redux single-table model violation: %s\n%s\n' "$token" "$match" >&2
     exit 1
   fi
 done

@@ -377,6 +377,30 @@ pub fn unresolved_card_ref_paths(spec: &Spec) -> Vec<PathBuf> {
     paths
 }
 
+/// Return every registration-only sibling Card reference in declaration order.
+///
+/// Siblings express request-time registration intent rather than durable Card
+/// identity. The typed visitor includes nested inline Agent and Prompt bodies,
+/// so this helper lets persistence and read projections reject that intent
+/// without traversing serialized JSON.
+#[must_use]
+pub fn registration_only_sibling_refs(spec: &Spec) -> Vec<CardRef> {
+    let mut spec = spec.clone();
+    let mut siblings = Vec::new();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => {
+            siblings.extend(reference.as_sibling().cloned());
+        }
+        SlotValue::InlineablePrompt(reference) => {
+            siblings.extend(reference.as_sibling().cloned());
+        }
+        SlotValue::InlineableAgent(reference) => {
+            siblings.extend(reference.as_sibling().cloned());
+        }
+    });
+    siblings
+}
+
 /// Bind server-resolved UIDs to the card references discovered by
 /// [`scope_child_card_refs`]. The input pairs are authoritative; JSON values
 /// are used only as the serialization boundary for the already typed spec and
@@ -548,6 +572,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::card::agent::{AgentRunConfigSpec, AgentSpec};
     use crate::card::mcp::McpSpec;
     use crate::card::service::{ServiceComponent, ServiceSpec};
     use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
@@ -786,5 +811,124 @@ mod tests {
     #[test]
     fn unresolved_card_ref_paths_are_empty_for_a_resolved_spec() {
         assert!(unresolved_card_ref_paths(&Spec::Service(ServiceSpec::default())).is_empty());
+    }
+
+    /// Build a prompt fixture that can be embedded in an inline Agent.
+    fn nested_prompt() -> skald_spec::Prompt {
+        skald_spec::Prompt::new(
+            skald_spec::ProviderRequest::OpenAiChatCompletion(skald_spec::OpenAiChatRequest {
+                model: "gpt-test".to_owned(),
+                messages: vec![skald_spec::OpenAiChatMessage {
+                    role: "user".to_owned(),
+                    content: Some(skald_spec::wire::openai_chat::OpenAiMessageContent::Text(
+                        "hello".to_owned(),
+                    )),
+                    ..Default::default()
+                }],
+                response_format: None,
+                stream: None,
+                stream_options: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                settings: skald_spec::OpenAiChatSettings::default(),
+            }),
+            "gpt-test",
+            None,
+            skald_spec::ResponseType::Text,
+        )
+        .expect("fixture prompt is valid")
+    }
+
+    /// Build an inline Agent whose prompt reference is supplied by the test.
+    fn nested_agent(prompt: InlineableRef<skald_spec::Prompt>) -> AgentSpec {
+        AgentSpec {
+            prompt,
+            tool_names: Vec::new(),
+            run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
+        }
+    }
+
+    /// Return a complete Workflow spec containing one inline Agent step.
+    fn nested_workflow(prompt: InlineableRef<skald_spec::Prompt>) -> WorkflowSpec {
+        WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "agent".to_owned(),
+                action: WorkflowAction::Agent(InlineableRef::Inline(Box::new(nested_agent(
+                    prompt,
+                )))),
+                depends_on: Vec::new(),
+                inputs: BTreeMap::new(),
+                condition: None,
+                timeout_seconds: None,
+                retry: None,
+                display: BTreeMap::new(),
+            }],
+            ..WorkflowSpec::default()
+        }
+    }
+
+    /// Confirm sibling collection covers top-level and nested slots in visitor order.
+    #[test]
+    fn registration_only_sibling_refs_include_top_level_and_nested_slots() {
+        let top_level = sample_ref();
+        let nested = CardRef {
+            name: CardName::new("nested-prompt").expect("static name is valid"),
+            ..sample_ref()
+        };
+        let mut service = ServiceSpec::default();
+        service.components.push(ServiceComponent {
+            alias: "top-level".to_owned(),
+            card_ref: Ref::Sibling {
+                sibling: top_level.clone(),
+            },
+            source: None,
+            config: BTreeMap::new(),
+            credential_refs: Vec::new(),
+        });
+        let workflow = nested_workflow(InlineableRef::Inline(Box::new(nested_prompt())));
+        let mut spec = Spec::Workflow(workflow);
+        if let Spec::Workflow(workflow) = &mut spec {
+            workflow.steps[0].action = WorkflowAction::Agent(InlineableRef::Inline(Box::new(
+                nested_agent(InlineableRef::Sibling {
+                    sibling: nested.clone(),
+                }),
+            )));
+        }
+
+        assert_eq!(
+            registration_only_sibling_refs(&Spec::Service(service)),
+            vec![top_level]
+        );
+        assert_eq!(registration_only_sibling_refs(&spec), vec![nested]);
+    }
+
+    /// Confirm durable refs, paths, and inline bodies are not classified as siblings.
+    #[test]
+    fn registration_only_sibling_refs_ignore_other_reference_forms() {
+        let durable = sample_ref();
+        let path = PathBuf::from("nested/prompt.yaml");
+        let mut service = ServiceSpec::default();
+        service.components.extend([
+            ServiceComponent {
+                alias: "durable".to_owned(),
+                card_ref: Ref::Ref(durable),
+                source: None,
+                config: BTreeMap::new(),
+                credential_refs: Vec::new(),
+            },
+            ServiceComponent {
+                alias: "path".to_owned(),
+                card_ref: Ref::Path(path),
+                source: None,
+                config: BTreeMap::new(),
+                credential_refs: Vec::new(),
+            },
+        ]);
+        let workflow = nested_workflow(InlineableRef::Inline(Box::new(nested_prompt())));
+
+        assert!(registration_only_sibling_refs(&Spec::Service(service)).is_empty());
+        assert!(registration_only_sibling_refs(&Spec::Workflow(workflow)).is_empty());
     }
 }

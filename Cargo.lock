@@ -10704,6 +10704,7 @@ dependencies = [
  "wyrd-error-derive",
  "wyrd-loader",
  "wyrd-registry",
+ "wyrd-sdk",
  "wyrd-semver",
  "wyrd-server",
  "wyrd-spec",

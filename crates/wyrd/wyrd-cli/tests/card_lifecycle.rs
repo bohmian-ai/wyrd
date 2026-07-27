@@ -7,6 +7,7 @@ use sha2::Digest;
 use std::process::{Command, Output};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
+use wyrd_sdk::WyrdState;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::WyrdTestServer;
 
@@ -853,6 +854,7 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
+    /// Prove real registry output hydrates into runtime state and rejects metadata-only output.
     #[tokio::test]
     async fn multi_card_service_get_hydrates_complete_and_metadata_bundles() {
         if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
@@ -997,7 +999,7 @@ mod pg_tests {
                     "name": "shared-model",
                     "version": "1.0.0",
                     "space": "default",
-                    "uid": model_uid,
+                    "uid": model_uid.clone(),
                 },
                 "alias": "agent-one",
             }));
@@ -1120,6 +1122,56 @@ mod pg_tests {
                 .any(|alias| alias == "prompt")
         );
 
+        let state = WyrdState::from_path(&full_dir)
+            .expect("registry-produced complete bundle loads as WyrdState");
+        assert_eq!(state.root_ref(), &registration.root);
+        assert_eq!(state.service().kind, wyrd_spec::envelope::CardKind::Service);
+        assert_eq!(
+            state
+                .card_ref("model")
+                .expect("model alias resolves")
+                .uid
+                .as_ref()
+                .map(ToString::to_string),
+            Some(model_uid.clone()),
+        );
+        assert_eq!(
+            state.aliases().collect::<Vec<_>>(),
+            vec![
+                "agent-one",
+                "agent-two",
+                "default-Prompt-shared-prompt-1.0.0",
+                "model",
+                "prompt",
+                "root",
+            ],
+        );
+
+        let model_artifacts = state.artifacts("model").expect("model artifacts resolve");
+        let expected_model_digest = base64::engine::general_purpose::STANDARD
+            .encode(sha2::Sha256::digest(b"shared-model-artifact"));
+        assert_eq!(model_artifacts.len(), 1);
+        assert_eq!(model_artifacts[0].relative_path(), "model.bin");
+        assert_eq!(
+            model_artifacts[0].size_bytes(),
+            b"shared-model-artifact".len() as u64
+        );
+        assert_eq!(model_artifacts[0].sha256(), expected_model_digest);
+        assert_eq!(
+            model_artifacts[0].content_type(),
+            Some("application/octet-stream")
+        );
+        assert!(model_artifacts[0].local_path().is_absolute());
+        assert!(
+            model_artifacts[0]
+                .local_path()
+                .starts_with(std::fs::canonicalize(&full_dir).expect("bundle canonicalizes"))
+        );
+        assert_eq!(
+            std::fs::read(model_artifacts[0].local_path()).expect("verified model artifact reads"),
+            b"shared-model-artifact",
+        );
+
         let metadata_dir = temp.path().join("metadata-service");
         let metadata = run_cli_owned_with_token(
             vec![
@@ -1157,6 +1209,9 @@ mod pg_tests {
                 .exists()
         );
         assert!(metadata_dir.join("cards/model/artifacts.yaml").exists());
+        let error = WyrdState::from_path(&metadata_dir)
+            .expect_err("metadata-only producer output is not runtime state");
+        assert_eq!(error.code(), "WYRD_SDK_400_UNHYDRATED_ARTIFACT");
 
         sqlx::query(
             "UPDATE wyrd.cards SET status = 'deleted' \

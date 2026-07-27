@@ -43,7 +43,7 @@ use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::bifrost_writer_properties;
 use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
 
-use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, stable_pack};
+use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_bins};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 
@@ -382,12 +382,14 @@ pub(crate) async fn run_compaction_bins_for_table(
     let mut bin_budget = 0_usize;
     'groups: for row in rows {
         outcome.groups_seen += 1;
-        let bins = stable_pack(
+        let plan = plan_incremental_bins(
             row.files,
             context.config.target_bin_bytes,
             context.config.max_files_per_bin,
+            row.key.partition_day,
+            Utc::now().date_naive(),
         );
-        for bin in bins {
+        for bin in plan.rewrite_bins {
             if bin_budget >= context.config.max_bins_per_tick {
                 break;
             }

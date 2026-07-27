@@ -36,7 +36,11 @@ static WAL_ENCODE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
 static WAL_WALK_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
+static WAL_COUNT_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
 static WAL_PARTIAL_WRITE: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static WAL_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
 /// WAL log sequence number — monotonic per `(node_id, writer_epoch)` stream.
 ///
@@ -312,7 +316,9 @@ impl PreparedWalAppend {
 
     fn record(&self) -> Result<WalRecord, ScribeError> {
         #[cfg(test)]
-        WAL_ENCODE_COUNT.fetch_add(1, Ordering::Relaxed);
+        if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
+            WAL_ENCODE_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
         let seal_key = self
             .seal_key
             .as_ref()
@@ -1075,7 +1081,9 @@ fn filesystem_space(path: &Path) -> Option<(u64, u64)> {
 
 fn directory_bytes(path: &Path) -> u64 {
     #[cfg(test)]
-    WAL_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
+    if WAL_COUNT_ACTIVE.load(Ordering::Relaxed) {
+        WAL_WALK_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
     };
@@ -2623,6 +2631,7 @@ mod tests {
 
     #[test]
     fn append_encodes_once_and_does_not_walk_unrelated_wal_files() {
+        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [22; 16], 1, WalConfig::default()).expect("writer");
@@ -2635,6 +2644,7 @@ mod tests {
         let key = test_seal_key(crate::test_support::tenant());
         WAL_ENCODE_COUNT.store(0, Ordering::Relaxed);
         WAL_WALK_COUNT.store(0, Ordering::Relaxed);
+        WAL_COUNT_ACTIVE.store(true, Ordering::Relaxed);
         writer
             .append_and_fsync_for_test(&key, [2; 16], b"audit", b"data")
             .expect("append");
@@ -2642,10 +2652,12 @@ mod tests {
         assert_eq!(WAL_WALK_COUNT.load(Ordering::Relaxed), 0);
         let _ = writer.disk_pressure();
         assert!(WAL_WALK_COUNT.load(Ordering::Relaxed) > 0);
+        WAL_COUNT_ACTIVE.store(false, Ordering::Relaxed);
     }
 
     #[test]
     fn reconciliation_repairs_under_count_without_shard_state_lock() {
+        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         WAL_PARTIAL_WRITE.store(false, Ordering::Release);
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
@@ -2663,6 +2675,7 @@ mod tests {
 
     #[test]
     fn failed_capacity_sample_rejects_before_mutation_then_recovers() {
+        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =
             WalWriter::new(temp_dir.path(), [24; 16], 1, WalConfig::default()).expect("writer");
@@ -2684,6 +2697,7 @@ mod tests {
 
     #[test]
     fn partial_write_reconciles_conservatively_and_allows_later_append() {
+        let _guard = WAL_FAULT_LOCK.lock().expect("test hook lock");
         WAL_PARTIAL_WRITE.store(false, Ordering::Release);
         let temp_dir = TempDir::new().expect("temp dir");
         let writer =

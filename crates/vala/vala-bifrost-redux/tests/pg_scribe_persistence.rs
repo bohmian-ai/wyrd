@@ -3,14 +3,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow::array::{
+    FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ipc::writer::StreamWriter;
 use opendal::services::Memory;
+use secrecy::ExposeSecret;
 use tempfile::TempDir;
-use vala_bifrost_redux::catalog::TableRef;
+use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
+use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::persistence::PersistenceFaults;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
@@ -22,7 +27,10 @@ use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_runtime::{Principal, PrincipalKind, permission::PermissionSet};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::PrincipalId;
+use wyrd_spec::auth::PrincipalKindTag;
 use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_storage::BackendConfig;
 
 struct PersistenceFixture {
     database: PgFixture,
@@ -30,6 +38,7 @@ struct PersistenceFixture {
     scribe: Arc<ScribeImpl>,
     faults: PersistenceFaults,
     wal_root: TempDir,
+    _warehouse: Option<TempDir>,
     tenant: DataTenantId,
 }
 
@@ -57,7 +66,7 @@ impl PersistenceFixture {
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
                 .with_test_faults(faults.clone());
-        let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+        let memory = BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor");
         let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig::default();
         let lane_config = ScribeLaneConfig {
             ingress_cpu_threads: 1,
@@ -89,6 +98,7 @@ impl PersistenceFixture {
             scribe,
             faults,
             wal_root,
+            _warehouse: None,
             tenant,
         }
     }
@@ -99,6 +109,15 @@ impl PersistenceFixture {
     }
 
     async fn start_after_wal_restart(fail_replay_write: bool) -> Self {
+        Self::start_after_wal_restart_with_keys(fail_replay_write, &["restart_publish_events"], 3)
+            .await
+    }
+
+    async fn start_after_wal_restart_with_keys(
+        fail_replay_write: bool,
+        table_names: &[&str],
+        generations: i64,
+    ) -> Self {
         let database = PgFixture::start().await.expect("Postgres fixture");
         let tenant = database.data_tenant_id();
         let operator = Arc::new(
@@ -106,6 +125,29 @@ impl PersistenceFixture {
                 .expect("memory operator")
                 .finish(),
         );
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let catalog = BifrostCatalog::new(
+            database.catalog_dsn().expose_secret(),
+            &BackendConfig::Local {
+                root: warehouse.path().to_path_buf(),
+            },
+            database.vala_postgres().clone(),
+        )
+        .await
+        .expect("Redux catalog");
+        for table_name in table_names {
+            catalog
+                .create_table(CreateTableRequest {
+                    table: table(table_name),
+                    user_fields: (1..=6)
+                        .map(|index| Field::new(format!("value_{index}"), DataType::Int64, false))
+                        .collect(),
+                    tenant,
+                    audit: None,
+                })
+                .await
+                .expect("catalog table");
+        }
         let wal_root = tempfile::tempdir().expect("WAL directory");
         let node_id = uuid::Uuid::now_v7();
         let wal = Arc::new(
@@ -117,7 +159,11 @@ impl PersistenceFixture {
             )
             .expect("WAL writer"),
         );
-        let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+        let memory = BifrostMemoryGovernor::new(8 * 1024 * 1024 * 1024).expect("memory governor");
+        let admission = vala_bifrost_redux::scribe::admission::AdmissionConfig {
+            memory_limit_bytes: 4 * 1024 * 1024 * 1024,
+            scribe_memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
+        };
         let pools = ScribeExecutionPools::new(
             ScribeIngressCpuPool::new_with_capacity(1, 256),
             ScribePersistenceCpuPool::new_with_capacity(2, 64),
@@ -129,7 +175,7 @@ impl PersistenceFixture {
             node_id.to_string(),
             1,
             ScribeBuildConfig {
-                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                admission,
                 coordination_runtime: tokio::runtime::Handle::current(),
                 execution_pools: pools,
                 persistence: None,
@@ -137,20 +183,24 @@ impl PersistenceFixture {
             },
         ));
         first.replay_wal_async().await.expect("empty WAL replay");
-        let rows = batch(99);
-        first
-            .append(ScribeAppend {
-                principal: principal(tenant),
-                table: table("restart_publish_events"),
-                schema_fingerprint: SchemaFingerprint::from_arrow_schema(rows.schema().as_ref()),
-                request_id: RequestId::now_v7(),
-                batch_id: uuid::Uuid::now_v7(),
-                measured_wire_bytes: 0,
-                rows,
-            })
-            .await
-            .expect("append");
-        first.flush_writable_for_test().await.expect("WAL flush");
+        for table_name in table_names {
+            for value in 1_i64..=generations {
+                let batch_id = *uuid::Uuid::now_v7().as_bytes();
+                let request_id = RequestId::now_v7();
+                let data = managed_batch_bytes(value, tenant, batch_id, &request_id);
+                let audit = encode_audit_event(&audit_event("bifrost.append", request_id))
+                    .expect("audit encoding");
+                let key = vala_bifrost_redux::scribe::seal_key::SealKey::new(
+                    tenant,
+                    table(table_name),
+                    vala_bifrost_redux::scribe::seal_key::EventDay::new(
+                        chrono::NaiveDate::from_ymd_opt(2026, 7, 24).expect("date"),
+                    ),
+                );
+                wal.append_and_fsync_for_test(&key, batch_id, &audit, &data)
+                    .expect("raw WAL append");
+            }
+        }
         first.shutdown().await;
         drop(wal);
 
@@ -181,7 +231,7 @@ impl PersistenceFixture {
             node_id.to_string(),
             2,
             ScribeBuildConfig {
-                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                admission,
                 coordination_runtime: tokio::runtime::Handle::current(),
                 execution_pools: pools,
                 persistence: Some(persistence),
@@ -195,6 +245,7 @@ impl PersistenceFixture {
             scribe,
             faults,
             wal_root,
+            _warehouse: Some(warehouse),
             tenant,
         }
     }
@@ -233,6 +284,93 @@ fn batch(value: i64) -> RecordBatch {
         ],
     )
     .expect("persistence batch")
+}
+
+fn audit_event(operation: &str, request_id: RequestId) -> AuditEvent {
+    AuditEvent {
+        request_id,
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource: "vala.bifrost.replay".to_owned(),
+        card_ref: None,
+        principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+        principal_kind: PrincipalKindTag::User,
+        auth_method: AuthMethod::Jwt,
+        permission: "bifrost:write".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: "replay rows".to_owned(),
+        detail: None,
+    }
+}
+
+fn managed_batch_bytes(
+    value: i64,
+    tenant: DataTenantId,
+    batch_id: [u8; 16],
+    request_id: &RequestId,
+) -> Vec<u8> {
+    let row_count = 50_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value_1", DataType::Int64, false),
+        Field::new("value_2", DataType::Int64, false),
+        Field::new("value_3", DataType::Int64, false),
+        Field::new("value_4", DataType::Int64, false),
+        Field::new("value_5", DataType::Int64, false),
+        Field::new("value_6", DataType::Int64, false),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("card_uid", DataType::Utf8, true),
+        Field::new("principal_id", DataType::Utf8, false),
+        Field::new("wyrd_request_id", DataType::Utf8, false),
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new(
+            "wyrd_ingested_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
+        Field::new("data_tenant_id", DataType::Utf8, false),
+    ]));
+    let timestamp = chrono::Utc::now().timestamp_micros();
+    let mut batch_builder = FixedSizeBinaryBuilder::with_capacity(row_count, 16);
+    for _ in 0..row_count {
+        batch_builder
+            .append_value(batch_id)
+            .expect("fixed batch id");
+    }
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![value; row_count])),
+            Arc::new(Int64Array::from(vec![value + 1; row_count])),
+            Arc::new(Int64Array::from(vec![value + 2; row_count])),
+            Arc::new(Int64Array::from(vec![value + 3; row_count])),
+            Arc::new(Int64Array::from(vec![value + 4; row_count])),
+            Arc::new(Int64Array::from(vec![value + 5; row_count])),
+            Arc::new(StringArray::from(vec![None::<String>; row_count])),
+            Arc::new(StringArray::from(vec![None::<String>; row_count])),
+            Arc::new(StringArray::from(vec!["replay-principal"; row_count])),
+            Arc::new(StringArray::from(vec![request_id.as_str(); row_count])),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"),
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"),
+            ),
+            Arc::new(batch_builder.finish()),
+            Arc::new(StringArray::from(vec![tenant.to_string(); row_count])),
+        ],
+    )
+    .expect("managed persistence batch");
+    let mut bytes = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
+    writer.write(&batch).expect("IPC batch");
+    writer.finish().expect("IPC finish");
+    bytes
 }
 
 async fn append_one(fixture: &PersistenceFixture, table_name: &str, value: i64) {
@@ -289,6 +427,23 @@ async fn rows(fixture: &PersistenceFixture) -> Vec<(i64, i64, String)> {
           ORDER BY wal_lsn_min",
     )
     .bind(fixture.tenant.as_uuid())
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("file-list rows")
+}
+
+async fn rows_for_table(fixture: &PersistenceFixture, table_name: &str) -> Vec<(i64, i64, String)> {
+    let mut conn = fixture
+        .database
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    sqlx::query_as(
+        "SELECT wal_lsn_min, wal_lsn_max, file_path FROM vala.file_list
+          WHERE data_tenant_id = $1 AND table_name = $2 ORDER BY wal_lsn_min",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(table_name)
     .fetch_all(&mut **conn.transaction())
     .await
     .expect("file-list rows")
@@ -540,8 +695,7 @@ async fn replayed_generation_publishes_durably_after_restart() {
     let fixture = PersistenceFixture::start_after_wal_restart(false).await;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if fixture.scribe.persistence_queue_depth_for_test() == 0
-            && !rows(&fixture).await.is_empty()
+        if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 3
         {
             break;
         }
@@ -552,9 +706,9 @@ async fn replayed_generation_publishes_durably_after_restart() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(rows(&fixture).await.len(), 1);
-    assert_eq!(audit_count(&fixture).await, 1);
-    assert_eq!(object_paths(&fixture).await.len(), 1);
+    assert_eq!(rows(&fixture).await.len(), 3);
+    assert_eq!(audit_count(&fixture).await, 3);
+    assert_eq!(object_paths(&fixture).await.len(), 3);
     fixture.stop().await;
 }
 
@@ -566,7 +720,7 @@ async fn replayed_generation_failure_retries_to_durable_publication() {
     fixture.scribe.check_age(Instant::now());
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 1
+        if fixture.scribe.persistence_queue_depth_for_test() == 0 && rows(&fixture).await.len() == 3
         {
             break;
         }
@@ -577,6 +731,42 @@ async fn replayed_generation_failure_retries_to_durable_publication() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(audit_count(&fixture).await, 1);
+    assert_eq!(audit_count(&fixture).await, 3);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn replayed_distinct_keys_publish_concurrently_and_fifo() {
+    let fixture = PersistenceFixture::start_after_wal_restart_with_keys(
+        false,
+        &["restart_key_a", "restart_key_b"],
+        2,
+    )
+    .await;
+    fixture
+        .faults
+        .set_object_write_delay_for_test(Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if fixture.scribe.persistence_queue_depth_for_test() == 0
+            && rows_for_table(&fixture, "restart_key_a").await.len() == 2
+            && rows_for_table(&fixture, "restart_key_b").await.len() == 2
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cross-key replay stalled: {:?}",
+            fixture.faults.last_error_for_test()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(fixture.faults.max_concurrent_object_writes_for_test() >= 2);
+    for table_name in ["restart_key_a", "restart_key_b"] {
+        let persisted = rows_for_table(&fixture, table_name).await;
+        assert!(persisted.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+    assert_eq!(audit_count(&fixture).await, 4);
+    assert_eq!(object_paths(&fixture).await.len(), 4);
     fixture.stop().await;
 }

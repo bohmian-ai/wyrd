@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Model
+metadata:
+  name: primary
+  version: 1.0.0
+  space: default
+spec:
+  interface:
+    kind: Sklearn
+    meta:
+      framework_version: "1.4.0"
+      model_subtype: GradientBoostingClassifier
+  task_type: BinaryClassification
+  signature:
+    inputs:
+      - { name: feature, dtype: float64 }
+    outputs:
+      - { name: prediction, dtype: float64 }
+artifacts:
+  - relative_path: primary.bin
+    sha256: SSYBzqXrKT24Q4cUWMSLFTC+xG1mpiWYRfb0J6sV8jg=
+    size_bytes: 14
+    content_type: application/octet-stream

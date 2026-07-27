@@ -1,6 +1,7 @@
 //! Local loading and indexing of complete hydrated Card bundles.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -10,11 +11,16 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use wyrd_cards::data::DataCard;
+use wyrd_cards::model::ModelCard;
+use wyrd_cards::prompt::PromptCard;
 use wyrd_registry::{
     HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
 };
 use wyrd_spec::api_version::ApiVersion;
-use wyrd_spec::envelope::{Card, CardKind, Relationships};
+use wyrd_spec::card::drift::DriftSpec;
+use wyrd_spec::card::workflow::WorkflowCard;
+use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
@@ -33,6 +39,40 @@ pub struct HydratedArtifact {
     size_bytes: u64,
     /// Optional server-declared MIME type.
     content_type: Option<String>,
+}
+
+/// Native typed projections retained for the runtime-relevant Card kinds.
+///
+/// The maps use the same canonical exact `CardRef` keys as the complete Card
+/// graph. They deliberately retain no artifact bytes and no runtime clients;
+/// the projections are immutable local views over validated bundle envelopes.
+#[derive(Default)]
+struct TypedCards {
+    /// Agent Card holders keyed by exact `CardRef`.
+    agents: BTreeMap<String, wyrd_spec::card::agent::AgentCard>,
+    /// Prompt Card holders keyed by exact `CardRef`.
+    prompts: BTreeMap<String, PromptCard>,
+    /// Model Card holders keyed by exact `CardRef`.
+    models: BTreeMap<String, ModelCard>,
+    /// Data Card holders keyed by exact `CardRef`.
+    data: BTreeMap<String, DataCard>,
+    /// Workflow Card holders keyed by exact `CardRef`.
+    workflows: BTreeMap<String, WorkflowCard>,
+}
+
+impl fmt::Debug for TypedCards {
+    /// Format typed-card indexes without requiring Python-backed holder types
+    /// to implement `Debug`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TypedCards")
+            .field("agents", &self.agents.keys().collect::<Vec<_>>())
+            .field("prompts", &self.prompts.keys().collect::<Vec<_>>())
+            .field("models", &self.models.keys().collect::<Vec<_>>())
+            .field("data", &self.data.keys().collect::<Vec<_>>())
+            .field("workflows", &self.workflows.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl HydratedArtifact {
@@ -91,6 +131,8 @@ struct HydratedStateIndex {
     artifacts_by_ref: BTreeMap<String, Vec<HydratedArtifact>>,
     /// Confined artifact directories grouped by canonical exact-reference key.
     artifact_dirs_by_ref: BTreeMap<String, PathBuf>,
+    /// Native typed Card holders grouped by canonical exact-reference key.
+    typed: TypedCards,
 }
 
 impl HydratedStateIndex {
@@ -134,6 +176,7 @@ impl HydratedStateIndex {
                 json!({ "root": root_ref }),
             ));
         }
+        let typed = hydrate_typed_cards(&cards_by_ref)?;
         Ok(Self {
             root_key,
             root_ref,
@@ -143,6 +186,7 @@ impl HydratedStateIndex {
             aliases_by_ref,
             artifacts_by_ref,
             artifact_dirs_by_ref,
+            typed,
         })
     }
 
@@ -362,6 +406,195 @@ impl WyrdState {
     pub fn artifact_dir(&self, alias: &str) -> Result<Option<&Path>, WyrdError> {
         let key = self.index.resolve_key(alias)?;
         self.artifact_dir_by_key(key)
+    }
+
+    /// Resolve an alias to a native Agent Card holder.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
+    /// internally inconsistent.
+    pub fn agent(&self, alias: &str) -> Result<&wyrd_spec::card::agent::AgentCard, WyrdError> {
+        let key = self.typed_key(alias, &CardKind::Agent)?;
+        self.index
+            .typed
+            .agents
+            .get(key)
+            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Agent))
+    }
+
+    /// Resolve an alias to a native Prompt Card holder.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
+    /// internally inconsistent.
+    pub fn prompt(&self, alias: &str) -> Result<&PromptCard, WyrdError> {
+        let key = self.typed_key(alias, &CardKind::Prompt)?;
+        self.index
+            .typed
+            .prompts
+            .get(key)
+            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Prompt))
+    }
+
+    /// Resolve an alias to a native Model Card holder.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
+    /// internally inconsistent.
+    pub fn model(&self, alias: &str) -> Result<&ModelCard, WyrdError> {
+        let key = self.typed_key(alias, &CardKind::Model)?;
+        self.index
+            .typed
+            .models
+            .get(key)
+            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Model))
+    }
+
+    /// Resolve an alias to a native Data Card holder.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
+    /// internally inconsistent.
+    pub fn data(&self, alias: &str) -> Result<&DataCard, WyrdError> {
+        let key = self.typed_key(alias, &CardKind::Data)?;
+        self.index
+            .typed
+            .data
+            .get(key)
+            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Data))
+    }
+
+    /// Resolve an alias to a native Workflow Card holder.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated typed index is
+    /// internally inconsistent.
+    pub fn workflow(&self, alias: &str) -> Result<&WorkflowCard, WyrdError> {
+        let key = self.typed_key(alias, &CardKind::Workflow)?;
+        self.index
+            .typed
+            .workflows
+            .get(key)
+            .ok_or_else(|| typed_map_invariant(alias, key, &CardKind::Workflow))
+    }
+
+    /// Resolve an alias to the pure Eval spec borrowed from its envelope.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` for an inconsistent envelope.
+    pub fn eval(&self, alias: &str) -> Result<&wyrd_spec::vala::eval::EvalSpec, WyrdError> {
+        self.spec_of_kind(alias, &CardKind::Eval, |spec| match spec {
+            Spec::Eval(spec) => Some(spec),
+            _ => None,
+        })
+    }
+
+    /// Resolve an alias to the pure Drift spec borrowed from its envelope.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias names another kind,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` for an inconsistent envelope.
+    pub fn drift(&self, alias: &str) -> Result<&DriftSpec, WyrdError> {
+        self.spec_of_kind(alias, &CardKind::Drift, |spec| match spec {
+            Spec::Drift(spec) => Some(spec),
+            _ => None,
+        })
+    }
+
+    /// Resolve an Agent's inline or exact Prompt Card prompt without creating a
+    /// Skald runtime Agent or resolving runtime-local tools.
+    ///
+    /// # Errors
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` for an unknown alias,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the alias is not an Agent,
+    /// or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a prompt target is absent,
+    /// not a Prompt Card, or remains an authored path.
+    pub fn agent_prompt(&self, alias: &str) -> Result<&skald_spec::Prompt, WyrdError> {
+        let agent = self.agent(alias)?;
+        match &agent.spec.prompt {
+            wyrd_spec::reference::InlineableRef::Inline(prompt) => Ok(prompt.as_ref()),
+            wyrd_spec::reference::InlineableRef::Ref(card_ref)
+            | wyrd_spec::reference::InlineableRef::Sibling { sibling: card_ref } => {
+                let key = card_ref.to_string();
+                self.index
+                    .typed
+                    .prompts
+                    .get(&key)
+                    .map(|card| &card.metadata.prompt)
+                    .ok_or_else(|| invalid_agent_prompt_target(alias, card_ref, &self.index))
+            }
+            wyrd_spec::reference::InlineableRef::Path(path) => {
+                Err(unresolved_prompt_path(alias, path))
+            }
+        }
+    }
+
+    /// Resolve an alias to a typed-holder key and enforce its exact Card kind.
+    ///
+    /// # Errors
+    /// Returns the shared unknown-alias, kind-mismatch, or invalid-state-bundle
+    /// error when the lookup or immutable graph invariant fails.
+    fn typed_key(&self, alias: &str, expected: &CardKind) -> Result<&str, WyrdError> {
+        let key = self.index.resolve_key(alias)?;
+        let card_ref = self.index.card_ref_by_key(key)?;
+        if &card_ref.kind != expected {
+            return Err(WyrdError::SdkCardKindMismatch {
+                message: format!("alias `{alias}` is not a {} Card", expected.wire_name()),
+                details: json!({
+                    "alias": alias,
+                    "expected_kind": expected.wire_name(),
+                    "actual_kind": card_ref.kind.wire_name(),
+                    "card_ref": card_ref,
+                }),
+            });
+        }
+        Ok(key)
+    }
+
+    /// Borrow one pure spec after applying the same exact-kind check as holder
+    /// accessors.
+    ///
+    /// # Errors
+    ///
+    /// Returns `WYRD_SDK_404_UNKNOWN_ALIAS` when the alias is absent,
+    /// `WYRD_SDK_400_CARD_KIND_MISMATCH` when the exact `CardRef` names another
+    /// kind, or `WYRD_SDK_400_INVALID_STATE_BUNDLE` when the validated
+    /// envelope and its spec variant disagree.
+    fn spec_of_kind<T, F>(
+        &self,
+        alias: &str,
+        expected: &CardKind,
+        extract: F,
+    ) -> Result<&T, WyrdError>
+    where
+        F: FnOnce(&Spec) -> Option<&T>,
+    {
+        let key = self.typed_key(alias, expected)?;
+        let card = self.index.card_by_key(key)?;
+        extract(&card.spec).ok_or_else(|| {
+            state_bundle_error(
+                "Card envelope kind and spec variant disagree",
+                json!({
+                    "alias": alias,
+                    "expected_kind": expected.wire_name(),
+                    "actual_kind": card.kind.wire_name(),
+                    "card_ref": self.index.card_ref_by_key(key).ok(),
+                }),
+            )
+        })
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
@@ -672,14 +905,14 @@ impl WyrdState {
         if let Some(path) = unresolved_card_ref_paths(&card.spec).first() {
             return Err(state_bundle_error(
                 "hydrated Card contains an unresolved path reference",
-                json!({ "card_ref": card_ref_for_error(card), "path": path }),
+                json!({ "card_ref": exact_card_ref_for_error(card), "path": path }),
             ));
         }
         if let Some(sibling) = registration_only_sibling_refs(&card.spec).first() {
             return Err(state_bundle_error(
                 "hydrated Card contains a registration-only sibling reference",
                 json!({
-                    "owner": card_ref_for_error(card),
+                    "owner": exact_card_ref_for_error(card),
                     "card_ref": sibling,
                     "reference_form": "sibling",
                 }),
@@ -689,14 +922,14 @@ impl WyrdState {
             if card_ref.uid.is_none() {
                 return Err(state_bundle_error(
                     "hydrated Card reference is missing its required UID",
-                    json!({ "card_ref": card_ref, "owner": card_ref_for_error(card) }),
+                    json!({ "card_ref": card_ref, "owner": exact_card_ref_for_error(card) }),
                 ));
             }
             let key = card_ref.to_string();
             if !known.contains(&key) {
                 return Err(state_bundle_error(
                     "hydrated Card spec reference is absent from the graph",
-                    json!({ "card_ref": card_ref, "owner": card_ref_for_error(card) }),
+                    json!({ "card_ref": card_ref, "owner": exact_card_ref_for_error(card) }),
                 ));
             }
         }
@@ -719,14 +952,14 @@ impl WyrdState {
             if card_ref.uid.is_none() {
                 return Err(state_bundle_error(
                     "hydrated relationship is missing its required UID",
-                    json!({ "owner": card_ref_for_error(card), "card_ref": card_ref }),
+                    json!({ "owner": exact_card_ref_for_error(card), "card_ref": card_ref }),
                 ));
             }
             let key = card_ref.to_string();
             if !known.contains(&key) {
                 return Err(state_bundle_error(
                     "hydrated relationship target is absent from the graph",
-                    json!({ "owner": card_ref_for_error(card), "card_ref": card_ref }),
+                    json!({ "owner": exact_card_ref_for_error(card), "card_ref": card_ref }),
                 ));
             }
             if let Some(alias) = &relationship.alias
@@ -734,7 +967,7 @@ impl WyrdState {
             {
                 return Err(state_bundle_error(
                     "hydrated relationship alias does not resolve to its CardRef",
-                    json!({ "owner": card_ref_for_error(card), "alias": alias, "card_ref": card_ref }),
+                    json!({ "owner": exact_card_ref_for_error(card), "alias": alias, "card_ref": card_ref }),
                 ));
             }
         }
@@ -805,6 +1038,125 @@ fn state_bundle_error(message: impl Into<String>, details: Value) -> WyrdError {
         message: message.into(),
         details,
     }
+}
+
+/// Construct native typed holders from the already validated Card envelope map.
+///
+/// This is the third immutable-state construction pass. It consumes envelope
+/// clones because each native holder owns its declarative spec projection; it
+/// never reads or copies artifact payload bytes. Conversion failures are
+/// normalized here so callers receive the exact `CardRef` and kind that failed.
+///
+/// # Errors
+/// Returns `WYRD_SDK_400_INVALID_STATE_BUNDLE` when a validated envelope cannot
+/// be converted to its required native typed holder.
+fn hydrate_typed_cards(cards: &BTreeMap<String, Card>) -> Result<TypedCards, WyrdError> {
+    let mut typed = TypedCards::default();
+    for (key, envelope) in cards {
+        match envelope.kind {
+            CardKind::Agent => {
+                let holder = wyrd_spec::card::agent::AgentCard::from_envelope(envelope.clone())
+                    .map_err(|error| typed_hydration_error(envelope, &error))?;
+                typed.agents.insert(key.clone(), holder);
+            }
+            CardKind::Prompt => {
+                let holder = PromptCard::from_card(envelope.clone())
+                    .map_err(|error| typed_hydration_error(envelope, &error))?;
+                typed.prompts.insert(key.clone(), holder);
+            }
+            CardKind::Model => {
+                let holder = ModelCard::from_card(envelope.clone())
+                    .map_err(|error| typed_hydration_error(envelope, &error))?;
+                typed.models.insert(key.clone(), holder);
+            }
+            CardKind::Data => {
+                let holder = DataCard::from_card(envelope.clone())
+                    .map_err(|error| typed_hydration_error(envelope, &error))?;
+                typed.data.insert(key.clone(), holder);
+            }
+            CardKind::Workflow => {
+                let holder = WorkflowCard::from_envelope(envelope.clone())
+                    .map_err(|error| typed_hydration_error(envelope, &error))?;
+                typed.workflows.insert(key.clone(), holder);
+            }
+            _ => {}
+        }
+    }
+    Ok(typed)
+}
+
+/// Normalize one native holder conversion failure at the state boundary.
+///
+/// The bundle graph has already validated this envelope's identity, so the
+/// error detail uses that identity directly and never introduces a second
+/// fallible `CardRef` conversion path.
+#[must_use]
+fn typed_hydration_error(card: &Card, source: &WyrdError) -> WyrdError {
+    WyrdError::SdkInvalidStateBundle {
+        message: format!(
+            "failed to construct typed {} Card from validated bundle envelope",
+            card.kind.wire_name(),
+        ),
+        details: json!({
+            "card_ref": exact_card_ref_for_error(card),
+            "kind": card.kind.wire_name(),
+            "reason": source.to_string(),
+        }),
+    }
+}
+
+/// Report a missing or non-Prompt target in an Agent prompt slot.
+///
+/// The helper remains free because it only formats deterministic details from
+/// its arguments; the graph-owning lookup remains on `WyrdState`.
+#[must_use]
+fn invalid_agent_prompt_target(
+    alias: &str,
+    card_ref: &wyrd_spec::reference::CardRef,
+    graph: &HydratedStateIndex,
+) -> WyrdError {
+    let key = card_ref.to_string();
+    let actual_kind = graph
+        .cards_by_ref
+        .get(&key)
+        .map(|card| card.kind.wire_name());
+    state_bundle_error(
+        "Agent prompt target is missing or is not a Prompt Card",
+        json!({
+            "alias": alias,
+            "card_ref": card_ref,
+            "actual_kind": actual_kind,
+        }),
+    )
+}
+
+/// Report an authored prompt path that should have been resolved before state
+/// construction.
+///
+/// # Panics
+/// This helper never panics; paths are copied into structured error details.
+#[must_use]
+fn unresolved_prompt_path(alias: &str, path: &Path) -> WyrdError {
+    state_bundle_error(
+        "Agent prompt retains an unresolved path reference",
+        json!({ "alias": alias, "path": path }),
+    )
+}
+
+/// Report a typed map omission after graph validation and holder construction.
+///
+/// # Panics
+/// This helper never panics; it only constructs a stable invariant error.
+#[must_use]
+fn typed_map_invariant(alias: &str, key: &str, expected: &CardKind) -> WyrdError {
+    state_bundle_error(
+        "validated typed Card map is missing its exact CardRef entry",
+        json!({
+            "alias": alias,
+            "card_ref_key": key,
+            "expected_kind": expected.wire_name(),
+        }),
+    )
 }
 
 impl WyrdState {
@@ -1117,9 +1469,10 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, WyrdError> {
         })
 }
 
-/// Project Card identity into the structured details of a state error.
+/// Project the already validated envelope identity into exact `CardRef`
+/// details for a state error without introducing a second fallible conversion.
 #[must_use]
-fn card_ref_for_error(card: &Card) -> Value {
+fn exact_card_ref_for_error(card: &Card) -> Value {
     json!({ "kind": card.kind, "name": card.metadata.name, "version": card.metadata.version, "space": card.metadata.space, "uid": card.metadata.uid })
 }
 
@@ -1188,6 +1541,7 @@ mod tests {
     use serde::Serialize;
     use serde_json::Value;
     use sha2::{Digest, Sha256};
+    use skald_spec::{OpenAiChatRequest, Prompt, ProviderRequest, ResponseType};
     use tempfile::{TempDir, tempdir};
     use wyrd_registry::{
         HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
@@ -1195,8 +1549,11 @@ mod tests {
     use wyrd_semver::{VersionBlock, VersionSpec};
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec};
+    use wyrd_spec::card::data::{CustomDataMeta, DataInterface, DataSchema, DataSpec, DataStats};
+    use wyrd_spec::card::drift::{DriftCondition, DriftMethod, DriftSignal, DriftSpec};
     use wyrd_spec::card::field::FieldSpec;
     use wyrd_spec::card::model::{CustomMeta, ModelInterface, ModelSignature, ModelSpec, TaskType};
+    use wyrd_spec::card::prompt::PromptSpec;
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
@@ -1337,6 +1694,111 @@ mod tests {
             bundle.manifest.card_count = bundle.manifest.cards.len();
             bundle.manifest.artifact_count = 1;
             bundle.manifest.downloaded_artifact_count = 1;
+            bundle.write();
+            bundle
+        }
+
+        /// Build a graph containing every typed SDK projection and two prompt
+        /// forms while keeping artifact bytes outside the holder values.
+        fn with_typed_cards() -> Self {
+            let mut bundle = Self::complete_service();
+            let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
+            let inline_prompt_ref = test_ref(CardKind::Agent, "inline", 5);
+            let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+            let data_ref = test_ref(CardKind::Data, "training", 7);
+            let eval_ref = test_ref(CardKind::Eval, "quality", 8);
+            let drift_ref = test_ref(CardKind::Drift, "model-drift", 9);
+            let workflow_ref = test_ref(CardKind::Workflow, "runtime", 10);
+
+            bundle.add_card(
+                "triage_prompt",
+                card(
+                    &prompt_ref,
+                    CardKind::Prompt,
+                    Spec::Prompt(prompt_spec("triage")),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "agent_triage",
+                card(
+                    &agent_ref,
+                    CardKind::Agent,
+                    Spec::Agent(AgentSpec {
+                        prompt: InlineableRef::Ref(prompt_ref.clone()),
+                        tool_names: Vec::new(),
+                        run_config: AgentRunConfigSpec::default(),
+                        publishes_to: Vec::new(),
+                    }),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "agent_inline",
+                card(
+                    &inline_prompt_ref,
+                    CardKind::Agent,
+                    Spec::Agent(AgentSpec {
+                        prompt: InlineableRef::Inline(Box::new(prompt("inline"))),
+                        tool_names: Vec::new(),
+                        run_config: AgentRunConfigSpec::default(),
+                        publishes_to: Vec::new(),
+                    }),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "training_data",
+                card(
+                    &data_ref,
+                    CardKind::Data,
+                    Spec::Data(data_spec()),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "quality_eval",
+                card(
+                    &eval_ref,
+                    CardKind::Eval,
+                    Spec::Eval(eval_spec()),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "model_drift",
+                card(
+                    &drift_ref,
+                    CardKind::Drift,
+                    Spec::Drift(DriftSpec {
+                        description: Some("fixture drift".to_owned()),
+                        method: DriftMethod::External,
+                        signal: DriftSignal::Metric {
+                            name: "score".to_owned(),
+                        },
+                        condition: DriftCondition::Statistical,
+                        profile: None,
+                        details: BTreeMap::new(),
+                    }),
+                    Relationships::default(),
+                ),
+                &[],
+            );
+            bundle.add_card(
+                "runtime_workflow",
+                card(
+                    &workflow_ref,
+                    CardKind::Workflow,
+                    Spec::Workflow(WorkflowSpec::default()),
+                    Relationships::default(),
+                ),
+                &[],
+            );
             bundle.write();
             bundle
         }
@@ -1610,6 +2072,62 @@ mod tests {
         }
     }
 
+    /// Build a minimal valid native prompt for typed-state fixtures.
+    fn prompt(text: &str) -> skald_spec::Prompt {
+        let request: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
+            "model": "fixture-model",
+            "messages": [{ "role": "user", "content": text }]
+        }))
+        .expect("fixture chat request is valid");
+        Prompt::new(
+            ProviderRequest::OpenAiChatCompletion(request),
+            "fixture-model",
+            None,
+            ResponseType::Text,
+        )
+        .expect("fixture prompt is valid")
+    }
+
+    /// Build a valid Prompt Card spec for the typed-state fixture.
+    fn prompt_spec(text: &str) -> PromptSpec {
+        PromptSpec::new(prompt(text)).expect("fixture prompt spec is valid")
+    }
+
+    /// Build a valid custom Data Card spec without embedding artifact bytes.
+    fn data_spec() -> DataSpec {
+        DataSpec {
+            interface: DataInterface::Custom(CustomDataMeta {
+                loader_module: "fixture".to_owned(),
+                loader_class: "Data".to_owned(),
+                extra: BTreeMap::new(),
+            }),
+            schema: DataSchema::empty(),
+            card_refs: Vec::new(),
+            publishes_to: Vec::new(),
+            splits: std::collections::HashMap::new(),
+            target_columns: Vec::new(),
+            sql: None,
+            stats: DataStats {
+                row_count: None,
+                col_count: None,
+                byte_count: 0,
+                sha256: "0".repeat(64),
+            },
+        }
+    }
+
+    /// Build an empty Eval spec used to prove pure-spec borrowing.
+    fn eval_spec() -> wyrd_spec::vala::eval::EvalSpec {
+        wyrd_spec::vala::eval::EvalSpec {
+            dataset: None,
+            tasks: BTreeMap::new(),
+            workflow: None,
+            sampling: None,
+            pass_gate: None,
+            context_capture: None,
+        }
+    }
+
     fn test_ref(kind: CardKind, name: &str, uid_suffix: u8) -> CardRef {
         let uid = format!("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b{uid_suffix:02x}");
         CardRef {
@@ -1675,6 +2193,278 @@ mod tests {
         assert_eq!(
             state.card("model").expect("model alias resolves").kind,
             CardKind::Model
+        );
+    }
+
+    /// Prove every runtime-relevant typed accessor returns its native Rust
+    /// projection while Eval and Drift remain borrowed envelope specs.
+    #[test]
+    fn typed_accessors_return_native_rust_cards() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        assert_eq!(state.model("model").expect("model resolves").name, "model");
+        assert_eq!(
+            state.data("training_data").expect("data resolves").name,
+            "training"
+        );
+        assert_eq!(
+            state.agent("agent_triage").expect("agent resolves").name,
+            "triage"
+        );
+        assert_eq!(
+            state.prompt("triage_prompt").expect("prompt resolves").name,
+            "triage"
+        );
+        assert_eq!(
+            state
+                .workflow("runtime_workflow")
+                .expect("workflow resolves")
+                .name,
+            "runtime"
+        );
+        assert!(
+            state
+                .eval("quality_eval")
+                .expect("eval resolves")
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .drift("model_drift")
+                .expect("drift resolves")
+                .description
+                .as_deref(),
+            Some("fixture drift")
+        );
+    }
+
+    /// Prove two exact Model Card identities retain distinct native holders.
+    #[test]
+    fn two_model_aliases_return_distinct_holders() {
+        let bundle = TestBundle::complete_service();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        let primary = state.model("model").expect("primary model resolves");
+        let backup = state.model("backup").expect("backup model resolves");
+        assert!(!std::ptr::eq(primary, backup));
+        assert_eq!(primary.uid, "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b02");
+        assert_eq!(backup.uid, "01890f28-7c4a-7cc3-98e7-4f4a3c2d1b03");
+    }
+
+    /// Prove duplicate aliases for one Prompt Card share one stored holder.
+    #[test]
+    fn duplicate_prompt_aliases_return_same_holder_address() {
+        let mut bundle = TestBundle::with_typed_cards();
+        let target = test_ref(CardKind::Prompt, "triage", 4);
+        bundle.add_alias("triage_prompt_alt", &target);
+        bundle.write();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        assert!(std::ptr::eq(
+            state.prompt("triage_prompt").expect("prompt resolves"),
+            state
+                .prompt("triage_prompt_alt")
+                .expect("prompt alias resolves")
+        ));
+    }
+
+    /// Prove inline Agent prompts are borrowed directly from the Agent spec.
+    #[test]
+    fn agent_prompt_resolves_inline_prompt() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        assert_eq!(
+            state.agent_prompt("agent_inline").expect("inline prompt"),
+            &prompt("inline")
+        );
+    }
+
+    /// Prove an exact Prompt Card reference resolves through the graph key.
+    #[test]
+    fn agent_prompt_resolves_exact_prompt_card() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        assert_eq!(
+            state
+                .agent_prompt("agent_triage")
+                .expect("referenced prompt"),
+            &state
+                .prompt("triage_prompt")
+                .expect("prompt resolves")
+                .metadata
+                .prompt
+        );
+    }
+
+    /// Prove a loader-resolved sibling identity uses the full `CardRef` key when
+    /// the durable bundle has converted the request-time form to a reference.
+    #[test]
+    fn agent_prompt_resolves_sibling_prompt_card() {
+        let bundle = TestBundle::with_typed_cards();
+        let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
+        let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+        bundle.rewrite_card(&agent_ref, |card| {
+            if let Spec::Agent(spec) = &mut card.spec {
+                spec.prompt = InlineableRef::Ref(prompt_ref.clone());
+            }
+        });
+        bundle.write();
+        let state = WyrdState::from_path(bundle.path()).expect("resolved sibling loads");
+        assert_eq!(
+            state
+                .agent_prompt("agent_triage")
+                .expect("sibling prompt resolves"),
+            &state
+                .prompt("triage_prompt")
+                .expect("prompt resolves")
+                .metadata
+                .prompt
+        );
+    }
+
+    /// Prove an Agent prompt target absent from the validated graph fails as an
+    /// invalid bundle instead of becoming an unknown runtime alias.
+    #[test]
+    fn agent_prompt_rejects_missing_target() {
+        let bundle = TestBundle::with_typed_cards();
+        let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+        let missing = test_ref(CardKind::Prompt, "missing", 11);
+        bundle.rewrite_card(&agent_ref, |card| {
+            if let Spec::Agent(spec) = &mut card.spec {
+                spec.prompt = InlineableRef::Ref(missing);
+            }
+        });
+        bundle.write();
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "owner",
+        );
+    }
+
+    /// Prove an Agent prompt target with another kind fails closed at bundle
+    /// validation rather than being coerced into a Prompt holder.
+    #[test]
+    fn agent_prompt_rejects_non_prompt_target() {
+        let bundle = TestBundle::with_typed_cards();
+        let agent_ref = test_ref(CardKind::Agent, "triage", 6);
+        let model_ref = test_ref(CardKind::Model, "model", 2);
+        bundle.rewrite_card(&agent_ref, |card| {
+            if let Spec::Agent(spec) = &mut card.spec {
+                spec.prompt = InlineableRef::Ref(model_ref);
+            }
+        });
+        bundle.write();
+        let state = WyrdState::from_path(bundle.path()).expect("known non-Prompt target loads");
+        let error = state
+            .agent_prompt("agent_triage")
+            .expect_err("non-Prompt target must fail closed");
+        assert_eq!(error.code(), "WYRD_SDK_400_INVALID_STATE_BUNDLE");
+        assert!(!problem_details(&error)["card_ref"].is_null());
+    }
+
+    /// Prove native holders retain only declarative metadata while verified
+    /// model and data payloads remain available through state artifact paths.
+    #[test]
+    fn model_and_data_artifacts_remain_external_to_holders() {
+        let mut bundle = TestBundle::with_artifact();
+        let data_ref = test_ref(CardKind::Data, "training", 12);
+        let data_artifact = TestArtifact {
+            relative_path: "training.bin".to_owned(),
+            bytes: b"training".to_vec(),
+            content_type: Some("application/octet-stream".to_owned()),
+        };
+        bundle.add_card(
+            "training",
+            card(
+                &data_ref,
+                CardKind::Data,
+                Spec::Data(data_spec()),
+                Relationships::default(),
+            ),
+            &[data_artifact],
+        );
+        let root_ref = test_ref(CardKind::Service, "service", 1);
+        bundle.rewrite_card(&root_ref, |card| {
+            if let Spec::Service(spec) = &mut card.spec {
+                spec.components.push(ServiceComponent {
+                    alias: "training".to_owned(),
+                    card_ref: Ref::Ref(data_ref.clone()),
+                    source: None,
+                    config: BTreeMap::new(),
+                    credential_refs: Vec::new(),
+                });
+            }
+        });
+        bundle.write();
+        let state = WyrdState::from_path(bundle.path()).expect("artifact graph loads");
+        let model_artifact = &state.artifacts("model").expect("model artifacts resolve")[0];
+        let data_artifact = &state.artifacts("training").expect("data artifacts resolve")[0];
+        assert_eq!(
+            fs::read(model_artifact.local_path()).expect("model bytes read"),
+            b"weights"
+        );
+        assert_eq!(
+            fs::read(data_artifact.local_path()).expect("data bytes read"),
+            b"training"
+        );
+        assert_eq!(
+            state
+                .model("model")
+                .expect("model holder resolves")
+                .metadata
+                .card_refs
+                .len(),
+            0
+        );
+        assert_eq!(
+            state
+                .data("training")
+                .expect("data holder resolves")
+                .metadata
+                .stats
+                .byte_count,
+            0
+        );
+    }
+
+    /// Prove every typed accessor reports the requested and actual kinds.
+    #[test]
+    fn each_typed_accessor_reports_expected_and_actual_kind() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        macro_rules! assert_wrong_kind {
+            ($lookup:expr) => {{
+                let Err(error) = $lookup else {
+                    panic!("wrong-kind lookup must fail");
+                };
+                assert_eq!(error.code(), "WYRD_SDK_400_CARD_KIND_MISMATCH");
+                let details = problem_details(&error);
+                assert!(!details["expected_kind"].is_null());
+                assert!(!details["actual_kind"].is_null());
+                assert!(!details["card_ref"].is_null());
+            }};
+        }
+        assert_wrong_kind!(state.agent("model"));
+        assert_wrong_kind!(state.prompt("model"));
+        assert_wrong_kind!(state.model("agent_triage"));
+        assert_wrong_kind!(state.data("agent_triage"));
+        assert_wrong_kind!(state.workflow("agent_triage"));
+        assert_wrong_kind!(state.eval("agent_triage"));
+        assert_wrong_kind!(state.drift("agent_triage"));
+    }
+
+    /// Prove generic Card access remains available for unprojected kinds.
+    #[test]
+    fn generic_card_supports_unprojected_kinds() {
+        let bundle = TestBundle::with_typed_cards();
+        let state = WyrdState::from_path(bundle.path()).expect("typed graph loads");
+        assert_eq!(
+            state.card("quality_eval").expect("eval card").kind,
+            CardKind::Eval
+        );
+        assert_eq!(
+            state.card("model_drift").expect("drift card").kind,
+            CardKind::Drift
         );
     }
 

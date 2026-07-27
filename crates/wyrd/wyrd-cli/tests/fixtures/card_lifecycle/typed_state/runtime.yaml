@@ -1,0 +1,8 @@
+apiVersion: wyrd/v1
+kind: Workflow
+metadata:
+  name: runtime
+  version: 1.0.0
+  space: default
+spec:
+  steps: []

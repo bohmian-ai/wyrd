@@ -1,0 +1,63 @@
+apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: typed-service
+  version: 1.0.0
+  space: default
+spec:
+  service_type: agent
+  components:
+    - alias: model_primary
+      ref:
+        kind: Model
+        name: primary
+        version: 1.0.0
+        space: default
+    - alias: model_shadow
+      ref:
+        kind: Model
+        name: shadow
+        version: 1.0.0
+        space: default
+    - alias: training_data
+      ref:
+        kind: Data
+        name: training
+        version: 1.0.0
+        space: default
+    - alias: agent_triage
+      ref:
+        kind: Agent
+        name: triage
+        version: 1.0.0
+        space: default
+    - alias: agent_inline
+      ref:
+        kind: Agent
+        name: inline
+        version: 1.0.0
+        space: default
+    - alias: triage_prompt
+      ref:
+        kind: Prompt
+        name: triage-prompt
+        version: 1.0.0
+        space: default
+    - alias: quality_eval
+      ref:
+        kind: Eval
+        name: quality
+        version: 1.0.0
+        space: default
+    - alias: model_drift
+      ref:
+        kind: Drift
+        name: model-drift
+        version: 1.0.0
+        space: default
+    - alias: runtime_workflow
+      ref:
+        kind: Workflow
+        name: runtime
+        version: 1.0.0
+        space: default

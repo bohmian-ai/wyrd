@@ -1,0 +1,23 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  name: training
+  version: 1.0.0
+  space: default
+spec:
+  interface:
+    kind: Custom
+    meta:
+      loader_module: fixture
+      loader_class: Data
+      extra: {}
+  schema:
+    columns: []
+  stats:
+    byte_count: 14
+    sha256: db622818c69fb90f249d5d1b35b8a76a75555fc9114b4cb36d41a05fd0526aa8
+artifacts:
+  - relative_path: training.bin
+    sha256: 22IoGMafuQ8knV0bNbinanVVX8kRS0yzbUGgX9BSaqg=
+    size_bytes: 14
+    content_type: application/octet-stream

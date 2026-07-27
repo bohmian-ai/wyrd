@@ -4,10 +4,13 @@ use assert_cmd::prelude::*;
 use base64::Engine;
 use serde_json::{Value, json};
 use sha2::Digest;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wyrd_sdk::WyrdState;
+use wyrd_spec::reference::{CardRef, unresolved_card_ref_paths};
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 use wyrd_testing::WyrdTestServer;
 
@@ -155,6 +158,146 @@ spec:
     )
     .expect("service writes");
     service
+}
+
+/// Owns the committed typed-state Card tree and its temporary test workspace.
+///
+/// The fixture copies stable Card documents and artifact bytes into an isolated
+/// directory so public registration and CLI apply consume the same tree a
+/// maintainer can inspect under `tests/fixtures`, while each journey gets a
+/// fresh bundle destination.
+struct RuntimeServiceFixture {
+    /// Temporary workspace containing the copied committed Card tree.
+    workspace: TempDir,
+    /// Directory containing the copied fixture documents and payloads.
+    source_root: PathBuf,
+    /// Copied Service document consumed by the CLI apply dispatcher.
+    service_path: PathBuf,
+    /// Destination used by the complete CLI hydration command.
+    bundle_dir: PathBuf,
+}
+
+impl RuntimeServiceFixture {
+    /// Names of the committed documents and payloads that form this journey.
+    const FILES: &[&str] = &[
+        "primary.bin",
+        "shadow.bin",
+        "training.bin",
+        "triage-prompt.yaml",
+        "model-primary.yaml",
+        "model-shadow.yaml",
+        "training.yaml",
+        "agent-triage.yaml",
+        "agent-inline.yaml",
+        "quality.yaml",
+        "model-drift.yaml",
+        "runtime.yaml",
+        "typed-service.yaml",
+    ];
+
+    /// Exact alias projection expected from the committed Service graph.
+    const EXPECTED_ALIASES: &[&str] = &[
+        "agent_inline",
+        "agent_triage",
+        "default-Data-training-1.0.0",
+        "default-Prompt-triage-prompt-1.0.0",
+        "model_drift",
+        "model_primary",
+        "model_shadow",
+        "quality_eval",
+        "root",
+        "runtime_workflow",
+        "training_data",
+        "triage_prompt",
+    ];
+
+    /// Create an isolated copy of the committed fixture tree.
+    ///
+    /// # Errors
+    /// Returns an IO error when the temporary workspace cannot be created, a
+    /// committed fixture cannot be read, or a fixture copy cannot be written.
+    fn new() -> Result<Self, std::io::Error> {
+        let workspace = tempfile::tempdir()?;
+        let source_root = workspace.path().join("source");
+        let committed_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/card_lifecycle/typed_state");
+        for relative in Self::FILES {
+            let destination = source_root.join(relative);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(committed_root.join(relative), &destination)?;
+        }
+        let service_path = source_root.join("typed-service.yaml");
+        let bundle_dir = workspace.path().join("bundle");
+        Ok(Self {
+            workspace,
+            source_root,
+            service_path,
+            bundle_dir,
+        })
+    }
+
+    /// Return the copied path for one fixture document or artifact.
+    ///
+    /// # Panics
+    /// Panics only when called with a relative path that is not part of the
+    /// committed fixture tree; all journey call sites use [`Self::FILES`].
+    fn path(&self, relative: &str) -> PathBuf {
+        assert!(Self::FILES.contains(&relative));
+        let path = self.source_root.join(relative);
+        assert!(path.starts_with(&self.source_root));
+        path
+    }
+
+    /// Return the Service document consumed by the CLI apply dispatcher.
+    #[must_use]
+    fn service_path(&self) -> &Path {
+        &self.service_path
+    }
+
+    /// Return the complete-hydration destination used by the CLI get command.
+    #[must_use]
+    fn bundle_dir(&self) -> &Path {
+        debug_assert!(self.bundle_dir.starts_with(self.workspace.path()));
+        &self.bundle_dir
+    }
+
+    /// Register every dependency in the fixture through the public Cards API.
+    ///
+    /// Models and Data carry the three artifact payloads whose bytes the
+    /// offline state later verifies. The remaining Cards make the Service
+    /// graph complete before the public CLI apply call.
+    ///
+    /// # Errors
+    /// Returns the first registry or fixture-loading error encountered while
+    /// registering a dependency through [`wyrd_registry::Cards`].
+    async fn register_dependencies(
+        &self,
+        cards: &wyrd_registry::Cards,
+    ) -> Result<(), wyrd_spec::error::WyrdError> {
+        for relative in [
+            "triage-prompt.yaml",
+            "model-primary.yaml",
+            "model-shadow.yaml",
+            "training.yaml",
+            "agent-triage.yaml",
+            "agent-inline.yaml",
+            "quality.yaml",
+            "model-drift.yaml",
+            "runtime.yaml",
+        ] {
+            cards.register_from_path(&self.path(relative)).await?;
+        }
+        Ok(())
+    }
+
+    /// Return the exact aliases expected from the Service graph and generated
+    /// canonical aliases emitted by hydration.
+    #[must_use]
+    fn expected_aliases() -> &'static [&'static str] {
+        Self::EXPECTED_ALIASES
+    }
 }
 
 fn first_stderr_json(output: &Output) -> Value {
@@ -393,7 +536,16 @@ mod pg_tests {
         server.shutdown().await.expect("test server shuts down");
     }
 
-    fn registry_cards(base_url: &str, jwt: &str) -> Cards {
+    /// Build the public registry handle used by the CLI journey's dependency
+    /// registration calls.
+    ///
+    /// The handle exercises the same authenticated HTTP client boundary as a
+    /// caller; it does not access the registry engine or database directly.
+    ///
+    /// # Panics
+    /// Panics when the authenticated transport cannot be assembled from the
+    /// test server URL and bootstrapped bearer token.
+    fn public_cards_client(base_url: &str, jwt: &str) -> Cards {
         let mut config = ClientConfig::default();
         config.http.base_url = base_url.to_owned();
         let auth = AuthMiddleware::new(
@@ -404,6 +556,131 @@ mod pg_tests {
         let transport = HttpTransport::new(&config.http, Arc::clone(&auth))
             .expect("registry HTTP transport builds");
         Cards::with_client(WyrdClient::from_parts(auth, transport, config.grpc))
+    }
+
+    /// Run one CLI dispatcher invocation and decode its successful JSON body.
+    ///
+    /// # Errors
+    /// Returns a string error when the subprocess exits unsuccessfully or its
+    /// stdout is not a JSON value.
+    async fn run_cli_json(arguments: Vec<String>, token: &str) -> Result<Value, String> {
+        let output = run_cli_owned_with_token(arguments, Some(token.to_owned())).await;
+        if !output.status.success() {
+            return Err(format!(
+                "CLI exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("CLI stdout is not JSON: {error}"))
+    }
+
+    /// Decode the exact Service root reference from an apply receipt.
+    ///
+    /// # Errors
+    /// Returns a JSON decoding error when the receipt has no valid `root`
+    /// CardRef object.
+    fn exact_root_ref(receipt: &Value) -> Result<CardRef, serde_json::Error> {
+        serde_json::from_value(receipt["root"].clone())
+    }
+
+    /// Build the exact UID-based CLI get command for a Service root.
+    ///
+    /// # Errors
+    /// Returns an error when the root lacks its required UID or the output
+    /// directory cannot be represented as UTF-8 for command-line transport.
+    fn exact_get_args(root: &CardRef, bundle: &Path, server: &str) -> Result<Vec<String>, String> {
+        let uid = root
+            .uid
+            .as_ref()
+            .ok_or_else(|| "Service root receipt has no UID".to_owned())?;
+        let bundle = bundle
+            .to_str()
+            .ok_or_else(|| "bundle path is not UTF-8".to_owned())?;
+        Ok(vec![
+            "get".to_owned(),
+            "--kind".to_owned(),
+            root.kind.wire_name().to_owned(),
+            "--uid".to_owned(),
+            uid.to_string(),
+            "--output-dir".to_owned(),
+            bundle.to_owned(),
+            "--server".to_owned(),
+            server.to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+    }
+
+    /// Assert that every hydrated model and data artifact has the expected
+    /// bytes, digest, and verified local path.
+    ///
+    /// The assertions prove artifact payloads remain external to typed holder
+    /// values while the `WyrdState` artifact index still exposes verified files.
+    ///
+    /// # Panics
+    /// Panics when an expected artifact is absent, unreadable, or differs from
+    /// its committed fixture bytes or digest.
+    fn assert_verified_artifact_bytes(state: &WyrdState) {
+        for (alias, expected) in [
+            ("model_primary", b"primary-model\n".as_slice()),
+            ("model_shadow", b"shadow-model\n".as_slice()),
+            ("training_data", b"training-data\n".as_slice()),
+        ] {
+            let artifact = state.artifacts(alias).expect("artifact list resolves");
+            assert_eq!(artifact.len(), 1, "{alias} has one fixture artifact");
+            let artifact = &artifact[0];
+            assert_eq!(
+                std::fs::read(artifact.local_path()).expect("artifact bytes read"),
+                expected
+            );
+            assert_eq!(artifact.size_bytes(), expected.len() as u64);
+            let expected_digest =
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(expected));
+            assert_eq!(artifact.sha256(), expected_digest);
+            assert!(artifact.local_path().is_file());
+        }
+    }
+
+    /// Assert exact version and UID identity for every Card represented by an
+    /// alias in the hydrated graph.
+    ///
+    /// # Panics
+    /// Panics when an alias is unresolved, a CardRef is not versioned, a UID is
+    /// absent or empty, or aliases do not cover ten unique Cards.
+    fn assert_all_refs_are_uid_pinned(state: &WyrdState) {
+        let aliases = state.aliases().collect::<Vec<_>>();
+        let mut refs = BTreeSet::new();
+        for alias in aliases {
+            let card_ref = state.card_ref(alias).expect("alias CardRef resolves");
+            assert!(card_ref.version.as_str().contains('.'));
+            let uid = card_ref.uid.as_ref().expect("CardRef has UID");
+            assert!(!uid.to_string().is_empty());
+            refs.insert(card_ref.to_string());
+        }
+        assert_eq!(refs.len(), 10);
+    }
+
+    /// Assert no loaded Card retains an authored or unresolved path reference.
+    ///
+    /// # Panics
+    /// Panics when an alias or Card cannot be loaded or any unique envelope
+    /// still contains an unresolved reference path.
+    fn assert_no_unresolved_paths(state: &WyrdState) {
+        let aliases = state.aliases().collect::<Vec<_>>();
+        let mut refs = BTreeSet::new();
+        for alias in aliases {
+            let card_ref = state.card_ref(alias).expect("alias CardRef resolves");
+            if refs.insert(card_ref.to_string()) {
+                let card = state.card(alias).expect("Card envelope resolves");
+                assert!(
+                    unresolved_card_ref_paths(&card.spec).is_empty(),
+                    "{} contains unresolved paths",
+                    card_ref
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -854,6 +1131,170 @@ mod pg_tests {
         stop_cli_server(server, shutdown, serve_handle).await;
     }
 
+    /// Prove the public CLI apply/get path publishes a complete bundle that
+    /// remains usable through native typed WyrdState after server shutdown.
+    ///
+    /// The journey exercises public registration, CLI subprocesses, complete
+    /// artifact hydration, exact alias projection, and offline typed access
+    /// after the originating server and connection endpoint are gone.
+    ///
+    /// # Panics
+    /// Panics when fixture creation, public registration, CLI apply/get,
+    /// server shutdown, offline loading, or any typed-state invariant fails.
+    ///
+    /// # Cancellation
+    /// Cancellation may leave temporary fixture files or an embedded test
+    /// server awaiting cleanup; the published bundle is written atomically and
+    /// offline loading does not leave partial in-memory state.
+    #[tokio::test]
+    #[ignore = "requires embedded Postgres WyrdTestServer"]
+    async fn cli_bundle_loads_typed_wyrdstate_after_server_shutdown() {
+        let fixture = RuntimeServiceFixture::new().expect("typed fixture copies");
+        let server = WyrdTestServer::start_bound()
+            .await
+            .expect("bound WyrdTestServer starts");
+        let base_url = server
+            .base_url()
+            .expect("bound server exposes base URL")
+            .to_owned();
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("typed-state-journey", &["writer"])
+            .await
+            .expect("journey writer bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+
+        let cards = public_cards_client(&base_url, &jwt);
+        fixture
+            .register_dependencies(&cards)
+            .await
+            .expect("journey dependencies register through public Cards API");
+        let apply = run_cli_json(
+            vec![
+                "apply".to_owned(),
+                fixture
+                    .service_path()
+                    .to_str()
+                    .expect("service path is UTF-8")
+                    .to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await;
+        let receipt = apply.expect("CLI apply succeeds");
+        let service_ref = exact_root_ref(&receipt).expect("apply root is an exact CardRef");
+        assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
+        assert_eq!(service_ref.name.as_str(), "typed-service");
+        assert_eq!(service_ref.version.as_str(), "1.0.0");
+        assert!(service_ref.uid.is_some());
+
+        let summary = run_cli_json(
+            exact_get_args(&service_ref, fixture.bundle_dir(), &base_url)
+                .expect("exact get arguments build"),
+            &jwt,
+        )
+        .await
+        .expect("CLI get succeeds");
+        assert_eq!(summary["mode"], "complete");
+        assert_eq!(summary["card_count"], 10);
+        assert_eq!(summary["downloaded_artifact_count"], 3);
+
+        drop(cards);
+        server.shutdown().await.expect("bound server shuts down");
+
+        let state =
+            WyrdState::from_path(fixture.bundle_dir()).expect("complete bundle loads offline");
+        assert_eq!(state.root_ref(), &service_ref);
+        assert_eq!(state.service().metadata.name.as_str(), "typed-service");
+        assert_eq!(
+            state
+                .model("model_primary")
+                .expect("primary model resolves")
+                .name,
+            "primary"
+        );
+        assert_eq!(
+            state
+                .model("model_shadow")
+                .expect("shadow model resolves")
+                .name,
+            "shadow"
+        );
+        assert_eq!(
+            state.data("training_data").expect("data resolves").name,
+            "training"
+        );
+        assert_eq!(
+            state
+                .agent("agent_triage")
+                .expect("shared agent resolves")
+                .name,
+            "triage"
+        );
+        assert_eq!(
+            state
+                .agent("agent_inline")
+                .expect("inline agent resolves")
+                .name,
+            "inline"
+        );
+        assert_eq!(
+            state.prompt("triage_prompt").expect("prompt resolves").name,
+            "triage-prompt"
+        );
+        assert_eq!(
+            state
+                .agent_prompt("agent_triage")
+                .expect("shared prompt resolves"),
+            &state
+                .prompt("triage_prompt")
+                .expect("prompt resolves")
+                .metadata
+                .prompt
+        );
+        let inline_prompt = state
+            .agent_prompt("agent_inline")
+            .expect("inline prompt resolves");
+        assert_eq!(inline_prompt.model, "gpt-4o");
+        assert!(
+            serde_json::to_string(&inline_prompt.request)
+                .expect("inline prompt serializes")
+                .contains("Inline triage")
+        );
+        assert!(
+            state
+                .eval("quality_eval")
+                .expect("eval resolves")
+                .tasks
+                .is_empty()
+        );
+        assert_eq!(
+            state
+                .drift("model_drift")
+                .expect("drift resolves")
+                .description
+                .as_deref(),
+            Some("fixture drift")
+        );
+        assert_eq!(
+            state
+                .workflow("runtime_workflow")
+                .expect("workflow resolves")
+                .name,
+            "runtime"
+        );
+        assert_verified_artifact_bytes(&state);
+        assert_all_refs_are_uid_pinned(&state);
+        assert_no_unresolved_paths(&state);
+        let aliases = state.aliases().collect::<Vec<_>>();
+        assert_eq!(aliases, RuntimeServiceFixture::expected_aliases());
+    }
+
     /// Prove real registry output hydrates into runtime state and rejects metadata-only output.
     #[tokio::test]
     async fn multi_card_service_get_hydrates_complete_and_metadata_bundles() {
@@ -881,7 +1322,7 @@ mod pg_tests {
             panic!("denied bootstrap returned a non-user principal");
         };
 
-        let cards = registry_cards(&base_url, &jwt);
+        let cards = public_cards_client(&base_url, &jwt);
         for path in [
             temp.path().join("shared-prompt.yaml"),
             temp.path().join("model.yaml"),

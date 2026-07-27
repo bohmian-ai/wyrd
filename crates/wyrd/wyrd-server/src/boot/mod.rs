@@ -6,13 +6,18 @@ pub mod issuer;
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use base64::Engine;
 use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::forge::{
+    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+};
+use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
-use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
+use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
@@ -37,6 +42,59 @@ use crate::components::eval::EvalAuditWriter;
 use crate::config::WorkloadBindingEntry;
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, BifrostIngestRuntime, ProductionValidationError};
+
+const DEFAULT_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_HINT_CAPACITY: usize = 1_024;
+
+/// Production Forge object-store capability backed by the server's OpenDAL operator.
+#[derive(Debug, Clone)]
+struct OpenDalForgeObjectStore {
+    /// Shared OpenDAL operator used for Forge reads and lifecycle operations.
+    operator: Arc<opendal::Operator>,
+}
+
+impl OpenDalForgeObjectStore {
+    /// Create a Forge capability over the process-owned storage operator.
+    #[must_use]
+    fn new(operator: Arc<opendal::Operator>) -> Self {
+        Self { operator }
+    }
+}
+
+#[async_trait]
+impl ForgeObjectStore for OpenDalForgeObjectStore {
+    /// Read one staged or Iceberg-owned object through OpenDAL.
+    ///
+    /// # Errors
+    /// Returns the underlying OpenDAL error when the object cannot be read.
+    async fn read(&self, path: &str) -> opendal::Result<opendal::Buffer> {
+        self.operator.read(path).await
+    }
+
+    /// Recursively list objects below a Forge-owned prefix.
+    ///
+    /// # Errors
+    /// Returns the underlying OpenDAL error when listing cannot complete.
+    async fn list(&self, prefix: &str) -> opendal::Result<Vec<opendal::Entry>> {
+        self.operator.list_with(prefix).recursive(true).await
+    }
+
+    /// Read object metadata before Forge makes a destructive decision.
+    ///
+    /// # Errors
+    /// Returns the underlying OpenDAL error when metadata cannot be read.
+    async fn stat(&self, path: &str) -> opendal::Result<opendal::Metadata> {
+        self.operator.stat(path).await
+    }
+
+    /// Delete one object after Forge's live-set and fence checks complete.
+    ///
+    /// # Errors
+    /// Returns the underlying OpenDAL error when deletion cannot complete.
+    async fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.operator.delete(path).await
+    }
+}
 
 /// Caller-supplied overrides applied to core `AppState` before
 /// `production_validate`. Enterprise uses this to inject a real ABAC policy
@@ -300,6 +358,10 @@ async fn build_bifrost_parts_from_boot(
         scribe_config.memory_limit_bytes,
     )
     .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let bifrost_datafusion_memory_pool =
+        Arc::new(BifrostDataFusionMemoryPool::new(bifrost_memory.clone()));
+    let (staging_file_publisher, staging_file_inbox) = staging_file_channel(DEFAULT_HINT_CAPACITY)
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
     let admission = AdmissionConfig {
         memory_limit_bytes: pod_memory_limit,
         scribe_memory_limit_bytes: scribe_config.memory_limit_bytes,
@@ -329,6 +391,7 @@ async fn build_bifrost_parts_from_boot(
             scribe_config.wal_io_threads,
         )),
         memory_budget: Some(bifrost_memory.scribe_budget()),
+        staging_file_publisher: Some(staging_file_publisher),
     }));
     match scribe.replay_wal_async().await {
         Ok(replayed_generations) => {
@@ -342,19 +405,31 @@ async fn build_bifrost_parts_from_boot(
         }
     }
 
-    let forge_context = ForgeContext::new(
-        postgres.vala().clone(),
-        operator_pool,
-        bifrost_redux.iceberg_catalog(),
-        Arc::new(storage.operator().clone()),
-        ForgeConfig::default(),
-    )?
-    .with_memory_governor(bifrost_memory.clone());
+    let forge_config = ForgeConfig::default();
+    let rewrite_runtime = ForgeRewriteRuntime::new(
+        bifrost_datafusion_memory_pool.clone(),
+        &wal_dir.join("forge-spill"),
+        forge_config.spill_limit_bytes,
+    )?;
+    let staging = Arc::new(storage.operator().clone());
+    let object_store: Arc<dyn ForgeObjectStore> =
+        Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
+    let forge = Arc::new(Forge::new(ForgeBuildConfig {
+        vala: postgres.vala().clone(),
+        operator_pool: operator_pool.clone(),
+        catalog: bifrost_redux.iceberg_catalog(),
+        staging,
+        object_store,
+        rewrite_runtime,
+        hints: staging_file_inbox,
+        config: forge_config,
+        maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+    })?);
 
     let state = AppState::new(postgres, storage, bifrost)
         .with_bifrost_redux(bifrost_redux)
-        .with_bifrost_memory(bifrost_memory)
-        .with_forge_context(forge_context);
+        .with_bifrost_memory_pool(bifrost_memory, bifrost_datafusion_memory_pool)
+        .with_forge(forge);
     Ok(BifrostIngestParts {
         state,
         scribe,

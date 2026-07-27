@@ -10887,6 +10887,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "moka",
+ "opendal",
  "rand 0.9.5",
  "reqwest 0.12.28",
  "secrecy",

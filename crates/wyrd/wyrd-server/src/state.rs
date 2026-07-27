@@ -303,6 +303,18 @@ impl AppState {
         self
     }
 
+    /// Attach the process-wide Bifrost memory governor and its shared DataFusion pool.
+    #[must_use]
+    pub fn with_bifrost_memory_pool(
+        mut self,
+        memory: BifrostMemoryGovernor,
+        query_memory: Arc<dyn MemoryPool>,
+    ) -> Self {
+        self.bifrost_query_memory = Some(query_memory);
+        self.bifrost_memory = Some(memory);
+        self
+    }
+
     /// Attach one complete, internally consistent Bifrost ingest subsystem.
     ///
     /// No separate Gate or Scribe setters exist, so callers cannot mount a Gate

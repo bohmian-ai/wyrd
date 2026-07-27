@@ -152,6 +152,7 @@ cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_scribe_mult
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_forge_multipod_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_forge_scheduler_closeout_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- task15_inspection --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- otlp_negative_journeys --test-threads=1
 """
 
 [tasks."test:bifrost:inspection"]

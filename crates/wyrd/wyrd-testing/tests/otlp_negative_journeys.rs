@@ -477,7 +477,7 @@ mod pg_tests {
         let admin_jwt = bootstrap_admin(&srv, "neg-overflow").await;
         let mut oversized = trace_export_request([7; 16], [6; 8]);
         let span = oversized.resource_spans[0].scope_spans[0].spans[0].clone();
-        oversized.resource_spans[0].scope_spans[0].spans = vec![span; 100_001];
+        oversized.resource_spans[0].scope_spans[0].spans = vec![span; 60_001];
         let body = oversized.encode_to_vec();
         let response = reqwest::Client::new()
             .post(format!(

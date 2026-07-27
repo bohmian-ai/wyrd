@@ -5,7 +5,7 @@
 
 mod state;
 
-pub use state::{StateCard, WyrdState};
+pub use state::{HydratedArtifact, WyrdState};
 
 #[cfg(feature = "python")]
 pub mod python;

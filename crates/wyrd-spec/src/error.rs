@@ -1002,6 +1002,48 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A local WyrdState bundle is malformed or internally inconsistent.
+    #[error("[WYRD_SDK_400_INVALID_STATE_BUNDLE] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+        status = 400,
+        title = "Invalid WyrdState bundle",
+        remediation = "Regenerate the bundle with wyrd get and load the complete output."
+    )]
+    SdkInvalidStateBundle {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A local WyrdState alias does not identify a Card.
+    #[error("[WYRD_SDK_404_UNKNOWN_ALIAS] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_404_UNKNOWN_ALIAS",
+        status = 404,
+        title = "Unknown WyrdState alias",
+        remediation = "Use an alias returned by the loaded WyrdState bundle."
+    )]
+    SdkUnknownAlias {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A typed Card lookup found a Card of a different kind.
+    #[error("[WYRD_SDK_400_CARD_KIND_MISMATCH] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SDK_400_CARD_KIND_MISMATCH",
+        status = 400,
+        title = "WyrdState Card kind mismatch",
+        remediation = "Use an alias for a Card of the expected kind."
+    )]
+    SdkCardKindMismatch {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// The version block is invalid for this operation.
     #[error("[WYRD_REGISTRY_400_INVALID_VERSION_BLOCK] {message}")]
     #[wyrd_error(
@@ -2765,6 +2807,9 @@ impl WyrdError {
             | Self::CfgNameDefaultRejected { message, details }
             | Self::RegistryInvalidCardSpec { message, details }
             | Self::SdkUnhydratedArtifact { message, details }
+            | Self::SdkInvalidStateBundle { message, details }
+            | Self::SdkUnknownAlias { message, details }
+            | Self::SdkCardKindMismatch { message, details }
             | Self::RegistryInvalidVersionBlock { message, details }
             | Self::RegistrySpecTooLarge { message, details }
             | Self::RegistryVersionRequired { message, details }

@@ -21,7 +21,7 @@ use wyrd_spec::registry::{
     RegistrationOutcomeKind, RegistrationReceipt,
 };
 
-use crate::{StateCard, WyrdState};
+use crate::WyrdState;
 
 /// Python wrapper for a locally hydrated `WyrdState`.
 #[pyclass(module = "wyrd.runtime", name = "WyrdState")]
@@ -45,7 +45,7 @@ impl PyWyrdState {
     /// Exact root Card reference.
     #[getter]
     fn root(&self) -> CardRefPy {
-        CardRefPy(self.inner.root().clone())
+        CardRefPy(self.inner.root_ref().clone())
     }
 
     /// Persisted aliases in stable order.
@@ -56,7 +56,9 @@ impl PyWyrdState {
 
     /// Resolve one persisted alias.
     fn get(&self, alias: &str) -> Option<PyStateCard> {
-        self.inner.get(alias).cloned().map(PyStateCard::from)
+        let card_ref = self.inner.card_ref(alias).ok()?.clone();
+        let aliases = self.inner.aliases_for(&card_ref).ok()?.to_vec();
+        Some(PyStateCard { card_ref, aliases })
     }
 
     /// Resolve one persisted alias with subscription syntax.
@@ -69,13 +71,8 @@ impl PyWyrdState {
 /// One Card projection in a local `WyrdState`.
 #[pyclass(module = "wyrd.runtime", name = "StateCard")]
 pub struct PyStateCard {
-    inner: StateCard,
-}
-
-impl From<StateCard> for PyStateCard {
-    fn from(inner: StateCard) -> Self {
-        Self { inner }
-    }
+    card_ref: wyrd_spec::reference::CardRef,
+    aliases: Vec<String>,
 }
 
 #[pymethods]
@@ -83,13 +80,13 @@ impl PyStateCard {
     /// Exact Card reference.
     #[getter]
     fn card_ref(&self) -> CardRefPy {
-        CardRefPy(self.inner.card_ref.clone())
+        CardRefPy(self.card_ref.clone())
     }
 
     /// All aliases for this Card.
     #[getter]
     fn aliases(&self) -> Vec<String> {
-        self.inner.aliases.clone()
+        self.aliases.clone()
     }
 }
 

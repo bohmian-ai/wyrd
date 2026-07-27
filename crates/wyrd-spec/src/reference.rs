@@ -349,6 +349,34 @@ pub fn scope_child_card_refs(spec: &Spec) -> Vec<CardRef> {
     references
 }
 
+/// Return every unresolved local Card reference path in a spec.
+///
+/// Traversal follows the typed reference visitor, including nested inline
+/// Prompt and Agent bodies, and preserves declaration order.
+#[must_use]
+pub fn unresolved_card_ref_paths(spec: &Spec) -> Vec<PathBuf> {
+    let mut spec = spec.clone();
+    let mut paths = Vec::new();
+    ReferenceSlotVisitor::visit(&mut spec, |slot| match slot.value {
+        SlotValue::Durable(reference) => {
+            if let Ref::Path(path) = reference {
+                paths.push(path.clone());
+            }
+        }
+        SlotValue::InlineablePrompt(reference) => {
+            if let InlineableRef::Path(path) = reference {
+                paths.push(path.clone());
+            }
+        }
+        SlotValue::InlineableAgent(reference) => {
+            if let InlineableRef::Path(path) = reference {
+                paths.push(path.clone());
+            }
+        }
+    });
+    paths
+}
+
 /// Bind server-resolved UIDs to the card references discovered by
 /// [`scope_child_card_refs`]. The input pairs are authoritative; JSON values
 /// are used only as the serialization boundary for the already typed spec and
@@ -517,8 +545,12 @@ pub enum CardRefParseError {
 }
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::card::mcp::McpSpec;
+    use crate::card::service::{ServiceComponent, ServiceSpec};
+    use crate::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
 
     fn sample_ref() -> CardRef {
         CardRef {
@@ -705,5 +737,54 @@ mod tests {
             ..first
         };
         assert!(!with_uid.same_identity(&different_space));
+    }
+
+    #[test]
+    fn unresolved_card_ref_paths_include_top_level_slots() {
+        let mut spec = ServiceSpec::default();
+        spec.components.push(ServiceComponent {
+            alias: "model".to_owned(),
+            card_ref: Ref::Path(PathBuf::from("components/model.yaml")),
+            source: None,
+            config: BTreeMap::new(),
+            credential_refs: Vec::new(),
+        });
+        spec.publishes_to
+            .push(Ref::Path(PathBuf::from("publishes/eval.yaml")));
+
+        assert_eq!(
+            unresolved_card_ref_paths(&Spec::Service(spec)),
+            vec![
+                PathBuf::from("components/model.yaml"),
+                PathBuf::from("publishes/eval.yaml")
+            ]
+        );
+    }
+
+    #[test]
+    fn unresolved_card_ref_paths_include_nested_slots() {
+        let spec = Spec::Workflow(WorkflowSpec {
+            steps: vec![WorkflowStep {
+                id: "nested".to_owned(),
+                action: WorkflowAction::Mcp(Ref::Path(PathBuf::from("nested/mcp.yaml"))),
+                depends_on: Vec::new(),
+                inputs: BTreeMap::new(),
+                condition: None,
+                timeout_seconds: None,
+                retry: None,
+                display: BTreeMap::new(),
+            }],
+            ..WorkflowSpec::default()
+        });
+
+        assert_eq!(
+            unresolved_card_ref_paths(&spec),
+            vec![PathBuf::from("nested/mcp.yaml")]
+        );
+    }
+
+    #[test]
+    fn unresolved_card_ref_paths_are_empty_for_a_resolved_spec() {
+        assert!(unresolved_card_ref_paths(&Spec::Service(ServiceSpec::default())).is_empty());
     }
 }

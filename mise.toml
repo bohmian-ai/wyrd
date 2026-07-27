@@ -46,6 +46,11 @@ run = "cargo fmt --all"
 description = "Workspace clippy with -D warnings (all features, all targets)"
 run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
+[tasks."lint:py-wyrd"]
+hide = true
+description = "Run the default-feature py-wyrd library clippy check"
+run = "cargo clippy --locked -p py-wyrd --lib -- -D warnings"
+
 [tasks."build:postgres"]
 hide = true
 description = "Start a clean Postgres container via docker compose and wait for it to be healthy"
@@ -150,6 +155,11 @@ run = "bash scripts/run-family-tests.sh vala"
 hide = true
 description = "Run shared family tests (unit tests only — pg_tests skipped without docker); package list in scripts/test-families.sh"
 run = "bash scripts/run-family-tests.sh shared"
+
+[tasks."test:wyrd-sdk"]
+hide = true
+description = "Run the default-feature Rust SDK unit tests serially"
+run = "cargo test --locked -p wyrd-sdk -- --nocapture --test-threads=1"
 
 [tasks."test:bifrost"]
 description = """Run vala-bifrost integration tests against local Postgres.

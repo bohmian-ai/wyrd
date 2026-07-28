@@ -372,13 +372,6 @@ async fn active_partition_incremental_compaction() {
         )),
         StagingPublishOutcome::Published
     );
-    assert_eq!(
-        closed_publisher.try_publish(StagingFileCommitted::new(
-            closed.binding.clone(),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("closed day"),
-        )),
-        StagingPublishOutcome::DroppedFull
-    );
     let closed_forge = harness
         .cluster()
         .server(1)

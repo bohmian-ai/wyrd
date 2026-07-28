@@ -1,10 +1,12 @@
 """Offline holder hydration and loader-configuration contracts."""
 
 import gc
+from collections import UserDict
 from pathlib import Path
 
 import pytest
 import wyrd
+from wyrd.cards import DataLoadArgs, ModelLoadArgs
 from wyrd.model import ModelCard
 from wyrd.state import WyrdState
 
@@ -114,6 +116,36 @@ def test_model_and_data_load_kwargs_are_forwarded_by_alias(tmp_path: Path) -> No
     assert data.loaded_kwargs == {"split": "train"}
     assert model.loaded_path == bundle / "cards/model/artifacts"
     assert data.loaded_path == bundle / "cards/training/artifacts"
+
+
+def test_typed_load_args_are_forwarded_as_dicts(tmp_path: Path) -> None:
+    """Typed ModelLoadArgs and DataLoadArgs reach custom interfaces as dictionaries."""
+    model, data = TinyModelInterface(), TinyDataInterface()
+    WyrdState.from_path(
+        build_complete_bundle(tmp_path),
+        interfaces={"model": model, "backup": TinyModelInterface(), "training_data": data},
+        load_kwargs={
+            "model": ModelLoadArgs({"seed": 7}),
+            "training_data": DataLoadArgs({"split": "validation"}),
+        },
+    )
+    assert model.loaded_kwargs == {"seed": 7}
+    assert data.loaded_kwargs == {"split": "validation"}
+
+
+def test_mapping_load_kwargs_are_materialized_as_dicts(tmp_path: Path) -> None:
+    """Non-dict Mapping loader arguments are materialized before forwarding."""
+    model = TinyModelInterface()
+    WyrdState.from_path(
+        build_complete_bundle(tmp_path),
+        interfaces={
+            "model": model,
+            "backup": TinyModelInterface(),
+            "training_data": TinyDataInterface(),
+        },
+        load_kwargs={"model": UserDict({"seed": 11})},
+    )
+    assert model.loaded_kwargs == {"seed": 11}
 
 
 def test_hydrated_objects_survive_gc(tmp_path: Path) -> None:

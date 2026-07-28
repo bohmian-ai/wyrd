@@ -600,22 +600,85 @@ fn parse_load_config(
         for (alias, value) in mapping_items(mapping)? {
             let reference = state.card_ref(&alias)?;
             require_model_data(&alias, reference)?;
-            let normalized = wyrd_utils::py::pyobject_to_json(&value)?;
+            let normalized = normalize_load_kwargs_value(py, state, &alias, reference, &value)?;
+            let normalized_json = wyrd_utils::py::pyobject_to_json(normalized.bind(py))?;
             let key = reference.to_string();
             if let Some(existing) = config.kwargs_by_ref.get(&key) {
                 let existing_json = wyrd_utils::py::pyobject_to_json(existing.bind(py))?;
-                if existing_json != normalized {
+                if existing_json != normalized_json {
                     return Err(WyrdPyError::from(WyrdError::SdkRuntimeHydrationFailed {
                         message: "conflicting loader kwargs for one Card".to_owned(),
                         details: serde_json::json!({"alias": alias, "card_ref": reference, "stage": "interface", "reason": "aliases resolving to one Card must use equivalent loader kwargs"}),
                     }));
                 }
             }
-            let py_value = json_to_py(py, &normalized)?;
-            config.kwargs_by_ref.insert(key, py_value);
+            config.kwargs_by_ref.insert(key, normalized.into_any());
         }
     }
     Ok(config)
+}
+
+/// Normalize one loader argument value to a real Python dictionary.
+///
+/// Typed `ModelLoadArgs` and `DataLoadArgs` use their `to_dict` methods,
+/// ordinary mapping implementations are materialized through Python's
+/// `dict` constructor, and dictionaries are retained directly. Unsupported
+/// values are rejected with the stable runtime-hydration error before any
+/// holder loading begins.
+///
+/// # Errors
+///
+/// Returns a stable runtime-hydration error when the value is not a supported
+/// loader-argument shape or cannot be converted to a dictionary; Python
+/// conversion errors are intentionally not exposed as traceback text.
+fn normalize_load_kwargs_value<'py>(
+    py: Python<'py>,
+    state: &WyrdState,
+    alias: &str,
+    reference: &CardRef,
+    value: &Bound<'py, PyAny>,
+) -> CardPyResult<Py<PyDict>> {
+    let conversion_error = || {
+        runtime_hydration_error(
+            state,
+            &reference.to_string(),
+            "interface",
+            "loader kwargs conversion failed",
+        )
+    };
+    let converted = if value.is_instance_of::<PyDict>() {
+        value
+            .cast::<PyDict>()
+            .cloned()
+            .map(Bound::into_any)
+            .map_err(|_| conversion_error())?
+    } else if value.is_instance_of::<PyModelLoadArgs>() || value.is_instance_of::<PyDataLoadArgs>()
+    {
+        value
+            .call_method0("to_dict")
+            .map_err(|_| conversion_error())?
+    } else if value.is_instance_of::<PyMapping>() {
+        py.import("builtins")
+            .and_then(|builtins| builtins.getattr("dict"))
+            .and_then(|dict| dict.call1((value,)))
+            .map_err(|_| conversion_error())?
+    } else {
+        return Err(WyrdPyError::from(WyrdError::SdkRuntimeHydrationFailed {
+            message: "unsupported loader kwargs value".to_owned(),
+            details: serde_json::json!({
+                "alias": alias,
+                "card_ref": reference,
+                "stage": "interface",
+                "reason": "loader kwargs must be a dict, ModelLoadArgs, DataLoadArgs, or Mapping",
+            }),
+        }));
+    };
+
+    converted
+        .cast::<PyDict>()
+        .cloned()
+        .map(Bound::unbind)
+        .map_err(|_| conversion_error())
 }
 
 /// Require a loader override to target a Model or Data Card.

@@ -62,6 +62,19 @@ class RuntimeServiceFixture:
         self.source = root / "service"
         shutil.copytree(source, self.source)
         self.artifact_count = 3
+        self.expected_aliases = (
+            "agent_inline",
+            "agent_triage",
+            "model_drift",
+            "model_primary",
+            "model_shadow",
+            "quality_eval",
+            "root",
+            "runtime_workflow",
+            "training_data",
+            "triage_prompt",
+            "shared_prompt",
+        )
         self.primary_result = self.shadow_result = self.data_result = [2]
 
     def register_model(self, cards: Cards, alias: str) -> CardRef:
@@ -206,6 +219,7 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.agent("agent_triage").prompt is not None
     assert state.agent("agent_inline").prompt is not None
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
+    assert state.aliases == fixture.expected_aliases
     assert_all_refs_are_exact_and_uid_bearing(state)
     assert_all_artifacts_are_confined_and_match_fixture(state, fixture)
 

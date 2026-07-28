@@ -6,6 +6,16 @@ use pyo3::types::PyModule;
 mod cli;
 
 /// Native extension entry point mounted as `wyrd._wyrd`.
+///
+/// The aggregator creates each public submodule and delegates registration to
+/// its owning Rust crate; it contains no client behavior or duplicate Card
+/// logic. The state submodule is the native owner for offline bundle loading.
+///
+/// # Errors
+///
+/// Returns a Python error when a native submodule cannot be allocated,
+/// registered, or inserted into `sys.modules`, including failures reported by
+/// an owning crate's registration function.
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
@@ -21,10 +31,14 @@ fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_sdk::python::register_cards(&m.getattr("cards")?.cast_into()?)?;
     register_submodule(py, "wyrd._wyrd.cards", &m.getattr("cards")?.cast_into()?)?;
 
-    let runtime = PyModule::new(py, "runtime")?;
-    wyrd_sdk::python::register_runtime(&runtime)?;
-    m.add_submodule(&runtime)?;
-    register_submodule(py, "wyrd._wyrd.runtime", &runtime)?;
+    let state = PyModule::new(py, "state")?;
+    state.setattr(
+        "__doc__",
+        "Offline, fully hydrated Wyrd Card graph. Load a complete local Service bundle without a registry or network; typed holders are shared across aliases, and artifact descriptors expose confined local paths without reading payload bytes.",
+    )?;
+    wyrd_sdk::python::register_state(&state)?;
+    m.add_submodule(&state)?;
+    register_submodule(py, "wyrd._wyrd.state", &state)?;
 
     wyrd_config::register(py, m)?;
     register_submodule(py, "wyrd._wyrd.config", &m.getattr("config")?.cast_into()?)?;

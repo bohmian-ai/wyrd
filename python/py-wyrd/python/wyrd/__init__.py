@@ -2,7 +2,7 @@
 
 from typing import Protocol
 
-from . import cards, config, data, model, prompt, runtime
+from . import cards, config, data, model, prompt, state
 from ._wyrd import AgentError, SessionError, ToolError, WyrdError, _init
 from .agent import (
     Agent,
@@ -42,7 +42,7 @@ from .prompt import (
     ProviderResponse,
     ResponseFormat,
 )
-from .runtime import StateCard, WyrdState
+from .state import CardEnvelope, HydratedArtifact, WyrdState
 
 
 class Card(Protocol):
@@ -105,15 +105,16 @@ __all__ = [
     "Workflow",
     "WorkflowRun",
     "WyrdError",
+    "CardEnvelope",
+    "HydratedArtifact",
     "WyrdState",
-    "StateCard",
     "cards",
     "config",
     "data",
     "local_registry",
     "model",
     "prompt",
-    "runtime",
+    "state",
     "run_wyrd_cli",
     "tool",
     "WyrdConfig",

@@ -22,11 +22,11 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         .server(0)
         .expect("first bound Bifrost pod");
     let fixtures = vec![
-        seed_forge_group(&server, "multipod_rows_a").await,
-        seed_forge_group(&server, "multipod_rows_b").await,
-        seed_forge_group(&server, "multipod_rows_c").await,
-        seed_forge_group(&server, "multipod_rows_d").await,
-        seed_forge_group(&server, "multipod_rows_e").await,
+        seed_forge_group(server, "multipod_rows_a").await,
+        seed_forge_group(server, "multipod_rows_b").await,
+        seed_forge_group(server, "multipod_rows_c").await,
+        seed_forge_group(server, "multipod_rows_d").await,
+        seed_forge_group(server, "multipod_rows_e").await,
     ];
     for pod in harness.cluster().servers() {
         pod.state()

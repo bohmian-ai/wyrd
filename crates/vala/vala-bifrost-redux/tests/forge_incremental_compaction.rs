@@ -111,28 +111,19 @@ mod pg_tests {
     }
 
     impl Fixture {
-        /// Build a real catalog, staging store, and Forge owner.
+        /// Build the Iceberg catalog and registered table used by Forge tests.
         ///
         /// # Panics
         ///
-        /// Panics when the embedded database, catalog, or fixture storage
-        /// cannot be initialized; these are test-environment invariants.
-        async fn new() -> Self {
-            let pg = PgFixture::start().await.expect("postgres fixture");
-            let tenant = pg.data_tenant_id();
-            let binding = TenantTableBinding::resolve((
-                tenant,
-                TableRef::new(BifrostNamespace::Bifrost, "incremental_rows"),
-            ))
-            .expect("binding");
-            let root = tempfile::tempdir().expect("warehouse root");
-            let staging = Arc::new(
-                Operator::new(Fs::default().root(root.path().to_str().expect("root")))
-                    .expect("operator")
-                    .finish(),
-            );
+        /// Panics when catalog loading, namespace creation, schema conversion,
+        /// or table registration fails because those are fixture invariants.
+        async fn build_catalog(
+            pg: &PgFixture,
+            root: &TempDir,
+            binding: &TenantTableBinding,
+            schema: &Schema,
+        ) -> Arc<dyn Catalog> {
             install_default_drivers();
-            let schema = Self::schema();
             let factory = Arc::new(OpenDalResolvingStorageFactory::new());
             let warehouse = format!("file://{}", root.path().display());
             let catalog = SqlCatalogBuilder::default()
@@ -159,7 +150,7 @@ mod pg_tests {
                 .await
                 .expect("catalog");
             let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-            let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&schema)
+            let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema)
                 .expect("iceberg schema");
             catalog
                 .create_namespace(binding.physical_namespace(), HashMap::new())
@@ -180,6 +171,31 @@ mod pg_tests {
                 )
                 .await
                 .expect("table");
+            catalog
+        }
+
+        /// Build a real catalog, staging store, and Forge owner.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded database, catalog, or fixture storage
+        /// cannot be initialized; these are test-environment invariants.
+        async fn new() -> Self {
+            let pg = PgFixture::start().await.expect("postgres fixture");
+            let tenant = pg.data_tenant_id();
+            let binding = TenantTableBinding::resolve((
+                tenant,
+                TableRef::new(BifrostNamespace::Bifrost, "incremental_rows"),
+            ))
+            .expect("binding");
+            let root = tempfile::tempdir().expect("warehouse root");
+            let staging = Arc::new(
+                Operator::new(Fs::default().root(root.path().to_str().expect("root")))
+                    .expect("operator")
+                    .finish(),
+            );
+            let schema = Self::schema();
+            let catalog = Self::build_catalog(&pg, &root, &binding, &schema).await;
             let operator_pool = OperatorPool::from(pg.platform_admin_pool().clone());
             let whole_reads = Arc::new(AtomicUsize::new(0));
             let reads = Arc::new(InstrumentedStore {
@@ -259,26 +275,26 @@ mod pg_tests {
                 .timestamp_micros();
             let mut rows = Vec::new();
             for index in 0..count {
+                let index = i64::try_from(index).expect("file index fits i64");
                 let row_count = 100_000_i64;
+                let row_count_usize = usize::try_from(row_count).expect("row count fits usize");
                 let batch = RecordBatch::try_new(
                     Arc::new(schema.clone()),
                     vec![
                         Arc::new(Int64Array::from(
-                            (0..row_count)
-                                .map(|row| index as i64 + row)
-                                .collect::<Vec<_>>(),
+                            (0..row_count).map(|row| index + row).collect::<Vec<_>>(),
                         )),
                         Arc::new(
                             TimestampMicrosecondArray::from(
                                 (0..row_count)
-                                    .map(|row| base + index as i64 + row)
+                                    .map(|row| base + index + row)
                                     .collect::<Vec<_>>(),
                             )
                             .with_timezone("UTC"),
                         ),
                         Arc::new(StringArray::from(vec![
                             self.tenant.to_string();
-                            row_count as usize
+                            row_count_usize
                         ])),
                     ],
                 )
@@ -299,7 +315,7 @@ mod pg_tests {
                 .await
                 .expect("tenant conn");
             for (path, index, row_count) in rows {
-                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&self.binding.logical_namespace).bind(&self.binding.table_name).bind(path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index as i64).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index as i64 + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index as i64 * 2 + 1).bind(index as i64 * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
+                sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)").bind(uuid::Uuid::now_v7()).bind(self.tenant.as_uuid()).bind(&self.binding.logical_namespace).bind(&self.binding.table_name).bind(path).bind(100_i64).bind(row_count).bind(chrono::DateTime::from_timestamp_micros(base + index).expect("min")).bind(chrono::DateTime::from_timestamp_micros(base + index + row_count).expect("max")).bind(day).bind(uuid::Uuid::now_v7()).bind(1_i64).bind(index * 2 + 1).bind(index * 2 + 2).execute(&mut **conn.transaction()).await.expect("file list");
             }
             conn.commit().await.expect("commit");
             if aged {

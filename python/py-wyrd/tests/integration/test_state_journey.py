@@ -117,9 +117,18 @@ class RuntimeServiceFixture:
         service.write_text(yaml.safe_dump(document, sort_keys=False))
         return self.source
 
-    def run_cli(self, server: WyrdTestServer, *arguments: str) -> dict[str, Any]:
+    def run_cli(
+        self,
+        server: WyrdTestServer,
+        *arguments: str,
+        api_key: str | None = None,
+        check: bool = True,
+    ) -> dict[str, Any]:
         previous = {key: os.environ.get(key) for key in ("WYRD_SERVER_URL", "WYRD_API_KEY")}
-        os.environ["WYRD_SERVER_URL"], os.environ["WYRD_API_KEY"] = server.base_url, server.api_key
+        os.environ["WYRD_SERVER_URL"], os.environ["WYRD_API_KEY"] = (
+            server.base_url,
+            api_key or server.api_key,
+        )
         old, sys.argv = sys.argv, ["wyrd", *arguments]
         out, err = io.StringIO(), io.StringIO()
         try:
@@ -132,6 +141,8 @@ class RuntimeServiceFixture:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+        if not check:
+            return {"code": code, "stdout": out.getvalue(), "stderr": err.getvalue()}
         assert code == 0, err.getvalue() or out.getvalue()
         return json.loads(out.getvalue())
 
@@ -268,9 +279,40 @@ def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> Non
 @pytest.mark.integration
 def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> None:
     """An underprivileged caller cannot publish a runnable output directory."""
-    fixture, bundle, service_ref = download_fixture(tmp_path)
-    del fixture, service_ref
-    assert bundle.joinpath("metadata.yaml").is_file()
+    fixture, bundle = RuntimeServiceFixture(tmp_path), tmp_path / "denied"
+    with WyrdTestServer(mutate_env=False) as server:
+        cards = Cards(server_url=server.base_url, api_key=server.api_key)
+        primary = fixture.register_model(cards, "model_primary")
+        shadow = fixture.register_model(cards, "model_shadow")
+        data = fixture.register_data(cards, "training_data")
+        for name in (
+            "triage-prompt.yaml",
+            "agent-triage.yaml",
+            "agent-inline.yaml",
+            "quality.yaml",
+            "model-drift.yaml",
+            "runtime.yaml",
+        ):
+            cards.register_from_path(str(fixture.source / name))
+        applied = fixture.run_cli(
+            server,
+            "apply",
+            str(fixture.write_service_tree(primary, shadow, data)),
+            "--format",
+            "json",
+        )
+        service_ref = CardRef(**applied["root"])
+        denied = server.bootstrap_service([], name="underprivileged-get")
+        result = fixture.run_cli(
+            server, *exact_get_arguments(service_ref, bundle), api_key=denied, check=False
+        )
+        assert result["code"] != 0
+        assert (
+            "FORBIDDEN" in result["stderr"]
+            or "PERMISSION" in result["stderr"]
+            or "denied" in result["stderr"].lower()
+        )
+    assert not bundle.exists() or not (bundle / "metadata.yaml").exists()
 
 
 @pytest.mark.integration

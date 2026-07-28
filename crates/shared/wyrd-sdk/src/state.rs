@@ -598,7 +598,7 @@ impl WyrdState {
     }
 
     /// Iterate over every loaded Card keyed by its canonical exact `CardRef`.
-    #[expect(dead_code, reason = "crate-private iteration is consumed by the Python SDK surface")]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn cards(&self) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
@@ -607,7 +607,7 @@ impl WyrdState {
     }
 
     /// Iterate over loaded Cards of one kind keyed by exact `CardRef`.
-    #[expect(dead_code, reason = "crate-private iteration is consumed by the Python SDK surface")]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn cards_of_kind(&self, kind: CardKind) -> impl Iterator<Item = (&str, &Card)> {
         self.index
             .cards_by_ref
@@ -617,13 +617,13 @@ impl WyrdState {
     }
 
     /// Resolve a canonical exact `CardRef` key to its stored reference.
-    #[expect(dead_code, reason = "crate-private lookup is consumed by the Python SDK surface")]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn card_ref_by_key(&self, key: &str) -> Result<&CardRef, WyrdError> {
         self.index.card_ref_by_key(key)
     }
 
     /// Resolve a canonical exact `CardRef` key to its aliases.
-    #[expect(dead_code, reason = "crate-private lookup is consumed by the Python SDK surface")]
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn aliases_by_key(&self, key: &str) -> Result<&[String], WyrdError> {
         self.index.aliases_by_key(key)
     }

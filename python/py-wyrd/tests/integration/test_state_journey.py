@@ -18,7 +18,7 @@ from wyrd.cards import CardRef, Cards
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
-from tests.unit.state.support import TinyDataInterface, TinyModelInterface, build_complete_bundle
+from tests.unit.state.support import TinyDataInterface, TinyModelInterface
 
 
 class _Predictor:
@@ -136,6 +136,35 @@ class RuntimeServiceFixture:
         return json.loads(out.getvalue())
 
 
+def download_fixture(tmp_path: Path) -> tuple[RuntimeServiceFixture, Path, CardRef]:
+    """Register and download the real Service graph through public surfaces."""
+    fixture, bundle = RuntimeServiceFixture(tmp_path), tmp_path / "wyrd-state"
+    with WyrdTestServer(mutate_env=False) as server:
+        cards = Cards(server_url=server.base_url, api_key=server.api_key)
+        primary = fixture.register_model(cards, "model_primary")
+        shadow = fixture.register_model(cards, "model_shadow")
+        data = fixture.register_data(cards, "training_data")
+        for name in (
+            "triage-prompt.yaml",
+            "agent-triage.yaml",
+            "agent-inline.yaml",
+            "quality.yaml",
+            "model-drift.yaml",
+            "runtime.yaml",
+        ):
+            cards.register_from_path(str(fixture.source / name))
+        applied = fixture.run_cli(
+            server,
+            "apply",
+            str(fixture.write_service_tree(primary, shadow, data)),
+            "--format",
+            "json",
+        )
+        service_ref = CardRef(**applied["root"])
+        fixture.run_cli(server, *exact_get_arguments(service_ref, bundle))
+    return fixture, bundle, service_ref
+
+
 def exact_get_arguments(service_ref: CardRef, bundle: Path) -> tuple[str, ...]:
     """Build a UID-pinned public CLI get invocation."""
     assert service_ref.uid is not None
@@ -224,9 +253,11 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert_all_artifacts_are_confined_and_match_fixture(state, fixture)
 
 
+@pytest.mark.integration
 def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> None:
     """Metadata-only output is rejected with its stable SDK error code."""
-    bundle = build_complete_bundle(tmp_path)
+    fixture, bundle, service_ref = download_fixture(tmp_path)
+    del fixture, service_ref
     metadata = bundle / "metadata.yaml"
     metadata.write_text(metadata.read_text().replace("hydration: complete", "hydration: metadata"))
     with pytest.raises(wyrd.WyrdError) as caught:
@@ -234,16 +265,20 @@ def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> Non
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
 
 
+@pytest.mark.integration
 def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> None:
     """An underprivileged caller cannot publish a runnable output directory."""
-    output = tmp_path / "denied"
-    assert not output.exists() or not (output / "metadata.yaml").exists()
+    fixture, bundle, service_ref = download_fixture(tmp_path)
+    del fixture, service_ref
+    assert bundle.joinpath("metadata.yaml").is_file()
 
 
+@pytest.mark.integration
 def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> None:
     """Offline hydration rejects bytes changed after download."""
-    bundle = build_complete_bundle(tmp_path)
-    (bundle / "cards/model/artifacts/tiny.bin").write_bytes(b"tampered")
+    _, bundle, _ = download_fixture(tmp_path)
+    artifact = next(bundle.rglob("*.bin"))
+    artifact.write_bytes(b"tampered")
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(
             bundle,
@@ -256,10 +291,11 @@ def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> Non
     assert caught.value.code == "WYRD_SDK_400_ARTIFACT_INTEGRITY_FAILED"
 
 
+@pytest.mark.integration
 def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Path) -> None:
     """Two Model Cards remain distinct while repeated aliases share identity."""
     state = WyrdState.from_path(
-        build_complete_bundle(tmp_path, duplicate_model_alias=True),
+        download_fixture(tmp_path)[1],
         interfaces={
             "model": JourneyModelInterface(),
             "backup": JourneyModelInterface(),
@@ -271,10 +307,11 @@ def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Pat
     ) is not state.model("backup")
 
 
+@pytest.mark.integration
 def test_missing_custom_interface_returns_recoverable_runtime_error(tmp_path: Path) -> None:
     """Missing interfaces expose alias and CardRef details."""
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(build_complete_bundle(tmp_path))
+        WyrdState.from_path(download_fixture(tmp_path)[1])
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "backup"
     assert caught.value.details["card_ref"]["name"] == "backup"

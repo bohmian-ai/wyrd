@@ -2392,7 +2392,23 @@ impl From<ListCardsResponse> for PyCardList {
     }
 }
 
-/// Register offline runtime state types on `wyrd._wyrd.state`.
+/// Register the native offline-state classes on `wyrd._wyrd.state`.
+///
+/// The Python package exposes this native module through `wyrd.state`. During
+/// extension initialisation, registration adds the `WyrdState` runtime handle
+/// first, followed by its immutable `CardEnvelope` and `HydratedArtifact`
+/// projections. Keeping these classes together ensures that a hydrated local
+/// bundle can be projected without importing the server-facing card registry;
+/// the registration itself performs no bundle loading, filesystem access, or
+/// network work.
+///
+/// # Errors
+///
+/// Returns a [`CardPyResult`] error when `PyO3` cannot allocate or mutate the
+/// module while registering `PyWyrdState`, `PyCardEnvelope`, or
+/// `PyHydratedArtifact`. In particular, failures from each corresponding
+/// `add_class` call (such as Python allocation errors or a duplicate/incompatible
+/// class entry) are propagated unchanged to the extension initialiser.
 pub fn register_state(module: &Bound<'_, PyModule>) -> CardPyResult<()> {
     module.add_class::<PyWyrdState>()?;
     module.add_class::<PyCardEnvelope>()?;

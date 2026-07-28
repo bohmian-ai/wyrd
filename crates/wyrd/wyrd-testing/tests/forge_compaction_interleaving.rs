@@ -51,11 +51,6 @@ impl OutputPutBarrier {
     fn release(&self) {
         self.release.notify_waiters();
     }
-
-    /// Return how many output PUT boundaries the rewrite reached.
-    fn output_boundaries(&self) -> usize {
-        self.calls.load(Ordering::Acquire)
-    }
 }
 
 #[async_trait]

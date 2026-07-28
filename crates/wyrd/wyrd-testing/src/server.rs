@@ -1375,6 +1375,7 @@ impl WyrdTestServerBuilder {
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let forge_config = ForgeConfig {
             max_files_per_bin: self.forge_max_files_per_bin,
+            candidate_min_age: Duration::ZERO,
             ..ForgeConfig::default()
         };
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)

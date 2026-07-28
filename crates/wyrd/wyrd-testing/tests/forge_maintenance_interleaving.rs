@@ -6,9 +6,7 @@ use std::time::Duration;
 use opendal::Buffer;
 use vala_bifrost_redux::forge::ForgeObjectStore;
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{
-    CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group,
-};
+use wyrd_testing::bifrost::{CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group};
 
 /// Acquire a successor owner after expiring the fixture's table lease.
 ///
@@ -19,7 +17,6 @@ use wyrd_testing::bifrost::{
 ///
 /// Panics when the lease cannot be expired or acquired, because either result
 /// means the deterministic takeover precondition was not established.
-async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uuid::Uuid, i64) {
 async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uuid::Uuid, i64) {
     let lease_key = format!(
         "forge:table:{}:{}:{}",
@@ -293,7 +290,12 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
         .expect("stale expiry task")
         .expect("stale expiry tick reports failure");
     assert_eq!(outcome.tables_failed, 1);
-    assert_eq!(fixture.operation_count("forge.snapshot_expire.committed").await, 0);
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0
+    );
 
     let lease_key = format!(
         "forge:table:{}:{}:{}",
@@ -314,7 +316,12 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
         .run_once()
         .await
         .expect("expiry recovery tick");
-    assert_eq!(fixture.operation_count("forge.snapshot_expire.recovered").await, 1);
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.recovered")
+            .await,
+        1
+    );
     let after = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())

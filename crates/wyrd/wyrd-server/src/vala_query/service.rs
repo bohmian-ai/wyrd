@@ -68,6 +68,15 @@ pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
 }
 
 /// Fetch the bounded active/immutable Scribe tail for one query table.
+///
+/// Rows already published by Forge are removed using the exact WAL ranges
+/// recorded for this pod's writer stream. LSNs are never compared across
+/// streams, and unpublished gaps remain visible from the live tail.
+///
+/// # Errors
+///
+/// Returns an error when the tenant/table binding is invalid, the operator
+/// pool cannot load published WAL ranges, or Scribe cannot snapshot the tail.
 pub(crate) async fn fetch_hot_batches(
     state: &AppState,
     table: &ReduxTableRef,
@@ -98,9 +107,44 @@ pub(crate) async fn fetch_hot_batches(
         message: "Scribe hot-read service unavailable".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
     })?;
+    let stream = service.stream();
+    let operator_pool = state
+        .postgres
+        .operator_pool()
+        .ok_or_else(|| WyrdError::Internal {
+            message: "Bifrost live-tail deduplication requires the operator pool".to_owned(),
+            details: serde_json::Value::Null,
+        })?;
+    let published_ranges = sqlx::query_as::<_, (i64, i64)>(
+        r"
+        SELECT wal_lsn_min, wal_lsn_max
+          FROM vala.file_list
+         WHERE data_tenant_id = $1
+           AND namespace = $2
+           AND table_name = $3
+           AND node_id = $4
+           AND writer_epoch = $5
+           AND partition_day BETWEEN $6 AND $7
+           AND committed_snapshot_id IS NOT NULL
+         ORDER BY wal_lsn_min, wal_lsn_max
+        ",
+    )
+    .bind(tenant.as_uuid())
+    .bind(table.namespace.as_str())
+    .bind(&table.name)
+    .bind(stream.node_id.as_uuid())
+    .bind(stream.writer_epoch.as_i64())
+    .bind(start.date_naive())
+    .bind(end.date_naive())
+    .fetch_all(operator_pool.pool())
+    .await
+    .map_err(|error| WyrdError::Internal {
+        message: "failed to load published Scribe WAL ranges".to_owned(),
+        details: serde_json::json!({ "detail": error.to_string() }),
+    })?;
     let request = FetchLiveTailRequest {
         binding,
-        target_stream: service.stream(),
+        target_stream: stream,
         start_day: EventDay::from_timestamp(start),
         end_day: EventDay::from_timestamp(end),
         after_lsn: WalLsn::ZERO,
@@ -109,7 +153,21 @@ pub(crate) async fn fetch_hot_batches(
     service
         .fetch_hot_batches(request)
         .await
-        .map(|batches| batches.into_iter().map(|batch| batch.rows).collect())
+        .map(|batches| {
+            batches
+                .into_iter()
+                .filter(|batch| {
+                    let lsn = batch.wal_lsn.as_u64();
+                    !published_ranges.iter().any(|&(min, max)| {
+                        u64::try_from(min)
+                            .ok()
+                            .zip(u64::try_from(max).ok())
+                            .is_some_and(|(min, max)| (min..=max).contains(&lsn))
+                    })
+                })
+                .map(|batch| batch.rows)
+                .collect()
+        })
         .map_err(|error| WyrdError::Internal {
             message: "Scribe hot-read failed".to_owned(),
             details: serde_json::json!({ "detail": error.to_string() }),

@@ -58,6 +58,11 @@ pub struct ForgeConfig {
     pub max_bytes_per_tick: u64,
     /// Maximum bins committed by one tick.
     pub max_bins_per_tick: usize,
+    /// Minimum staging age before periodic discovery may compact a file.
+    ///
+    /// Advisory hints bypass this delay; the periodic path applies it to avoid
+    /// rewriting files that are still likely to receive adjacent arrivals.
+    pub candidate_min_age: Duration,
     /// Lease duration used to fence one table's maintenance work.
     pub lease_ttl: Duration,
     /// Total time reserved for a retried Iceberg commit.
@@ -98,6 +103,7 @@ impl Default for ForgeConfig {
             max_files_per_tick: 1_024,
             max_bytes_per_tick: 2 * DEFAULT_TARGET_BIN_BYTES,
             max_bins_per_tick: 64,
+            candidate_min_age: Duration::from_mins(2),
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
             catalog_request_timeout: Duration::from_secs(30),
@@ -512,14 +518,21 @@ impl Forge {
            AND namespace = $2
            AND table_name = $3
            AND NOT compacted
-           AND created_at < now() - interval '2 min'
+           AND created_at < now() - ($4 * interval '1 second')
          ORDER BY partition_day, min_event_time, max_event_time, id
-         LIMIT $4
+         LIMIT $5
         ",
         )
         .bind(table_key.tenant.as_uuid())
         .bind(table_key.table_ref.namespace.as_str())
         .bind(&table_key.table_ref.name)
+        .bind(
+            i64::try_from(self.core.config.candidate_min_age.as_secs()).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "candidate_min_age exceeds PostgreSQL bigint seconds".to_owned(),
+                }
+            })?,
+        )
         .bind(
             i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
                 ForgeError::InvalidConfig {

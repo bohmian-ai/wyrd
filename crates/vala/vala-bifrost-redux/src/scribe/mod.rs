@@ -45,7 +45,7 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
 
-/// Build a test-tier DataFusion pool with an explicit bounded ceiling.
+/// Build a test-tier `DataFusion` pool with an explicit bounded ceiling.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn constrained_datafusion_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {

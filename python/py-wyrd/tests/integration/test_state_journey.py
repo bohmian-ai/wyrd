@@ -139,11 +139,6 @@ class RuntimeServiceFixture:
         path.write_text(yaml.safe_dump(document, sort_keys=False))
         return self.source
 
-
-def writer_api_key(server: WyrdTestServer) -> str:
-    """Mint a valid writer key for the journey's real server boundary."""
-    return server.bootstrap_service(["writer"], name=f"state-journey-{uuid4().hex[:12]}")
-
     def run_cli(
         self,
         server: WyrdTestServer,
@@ -173,6 +168,11 @@ def writer_api_key(server: WyrdTestServer) -> str:
             return {"code": code, "stdout": out.getvalue(), "stderr": err.getvalue()}
         assert code == 0, err.getvalue() or out.getvalue()
         return json.loads(out.getvalue())
+
+
+def writer_api_key(server: WyrdTestServer) -> str:
+    """Mint a valid writer key for the journey's real server boundary."""
+    return server.bootstrap_service(["writer"], name=f"state-journey-{uuid4().hex[:12]}")
 
 
 def exact_get_arguments(

@@ -71,6 +71,20 @@ impl ForgeObjectStore for OpenDalForgeObjectStore {
         self.operator.read(path).await
     }
 
+    /// Read only the requested Parquet byte range through OpenDAL's ranged reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying OpenDAL error when the reader cannot be opened or
+    /// the requested range cannot be fetched.
+    async fn read_range(
+        &self,
+        path: &str,
+        range: std::ops::Range<u64>,
+    ) -> opendal::Result<opendal::Buffer> {
+        self.operator.reader(path).await?.read(range).await
+    }
+
     /// Recursively list objects below a Forge-owned prefix.
     ///
     /// # Errors

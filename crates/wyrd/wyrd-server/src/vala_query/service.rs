@@ -52,6 +52,54 @@ use crate::components::auth::Caller;
 /// Default time window for `GetTrace` and listing queries (F-08: no unbounded scans).
 pub(crate) const DEFAULT_WINDOW_DAYS: i64 = 7;
 
+/// Resolve the immutable WAL fence for one Scribe stream.
+///
+/// Forge stamps each sealed `file_list` row with the stream's `(node_id,
+/// writer_epoch)` identity and its maximum WAL position. Using that durable
+/// fence prevents Oracle's live-tail union from replaying rows already present
+/// in Iceberg after a seal. A stream with no sealed rows starts at LSN zero.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the operator pool is unavailable, the
+/// durable lookup fails, or a stored LSN cannot be represented as [`WalLsn`].
+async fn sealed_stream_lsn(
+    state: &AppState,
+    tenant: wyrd_spec::ids::DataTenantId,
+    binding: &TenantTableBinding,
+    stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity,
+) -> Result<WalLsn, WyrdError> {
+    let pool = state
+        .postgres
+        .operator_pool()
+        .ok_or_else(|| WyrdError::Internal {
+            message: "operator pool unavailable for Oracle WAL fence".to_owned(),
+            details: serde_json::Value::Null,
+        })?;
+    let max_lsn: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(wal_lsn_max) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND node_id = $4 AND writer_epoch = $5",
+    )
+    .bind(tenant.as_uuid())
+    .bind(&binding.logical_namespace)
+    .bind(&binding.table_name)
+    .bind(stream.node_id.as_uuid())
+    .bind(stream.writer_epoch.as_i64())
+    .fetch_one(pool.pool())
+    .await
+    .map_err(|error| WyrdError::Internal {
+        message: "Oracle WAL fence lookup failed".to_owned(),
+        details: serde_json::json!({ "detail": error.to_string() }),
+    })?;
+    let Some(max_lsn) = max_lsn else {
+        return Ok(WalLsn::ZERO);
+    };
+    let max_lsn = u64::try_from(max_lsn).map_err(|error| WyrdError::Internal {
+        message: "Oracle WAL fence is invalid".to_owned(),
+        details: serde_json::json!({ "wal_lsn_max": max_lsn, "detail": error.to_string() }),
+    })?;
+    Ok(WalLsn::new(max_lsn))
+}
+
 #[derive(Clone, Copy)]
 struct TableProviderScope<'a> {
     tenant: wyrd_spec::ids::DataTenantId,
@@ -98,12 +146,14 @@ pub(crate) async fn fetch_hot_batches(
         message: "Scribe hot-read service unavailable".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
     })?;
+    let stream = service.stream();
+    let after_lsn = sealed_stream_lsn(state, tenant, &binding, stream).await?;
     let request = FetchLiveTailRequest {
         binding,
-        target_stream: service.stream(),
+        target_stream: stream,
         start_day: EventDay::from_timestamp(start),
         end_day: EventDay::from_timestamp(end),
-        after_lsn: WalLsn::ZERO,
+        after_lsn,
         required_columns: Vec::new(),
     };
     service

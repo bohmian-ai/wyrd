@@ -327,7 +327,7 @@ async fn active_partition_incremental_compaction() {
     )
     .await;
     let closed = seed_forge_group_for_tenant_with_schema_and_days(
-        &server,
+        server,
         fixture.tenant,
         "closed_remainder_incremental",
         false,
@@ -361,7 +361,7 @@ async fn active_partition_incremental_compaction() {
         1
     );
     let tail = seed_forge_group_for_tenant_with_schema_and_days(
-        &server,
+        server,
         fixture.tenant,
         "open_tail_incremental",
         false,

@@ -188,6 +188,8 @@ async fn active_partition_incremental_compaction() {
         .exchange_api_key(&api_key)
         .await
         .expect("exchange API key for JWT");
+    let oracle_baseline = oracle_rows(server, &jwt).await;
+    let expected_oracle_rows = oracle_baseline + 36;
     let publishers = harness.server_forge_publishers();
     let mut generator = RandomTraceGenerator::from_seed_at(
         0xA11CE,
@@ -318,10 +320,11 @@ async fn active_partition_incremental_compaction() {
             .any(|(operation, _, _)| operation == "forge.file_compact.committed")
     );
     assert_eq!(leases_now, 0);
-    let oracle_before = wait_for_oracle_rows(server, &jwt, 36).await;
+    let oracle_before = wait_for_oracle_rows(server, &jwt, expected_oracle_rows).await;
     assert_eq!(
-        oracle_before, 36,
-        "Oracle sees all flushed Scribe rows before Forge"
+        oracle_before - oracle_baseline,
+        36,
+        "Oracle sees the exact 36-span ingest delta before Forge"
     );
     let mut compacted = 0_i64;
     for _ in 0..100 {

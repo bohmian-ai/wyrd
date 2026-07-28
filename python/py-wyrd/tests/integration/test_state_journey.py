@@ -77,6 +77,13 @@ class RuntimeServiceFixture:
 
     def write_service_tree(self, primary: CardRef, shadow: CardRef, data: CardRef) -> Path:
         del primary, shadow, data
+        service = self.source / "typed-service.yaml"
+        service.write_text(
+            service.read_text()
+            + "    - alias: shared_prompt\n"
+            + "      ref:\n        kind: Prompt\n        name: triage-prompt\n"
+            + "        version: 1.0.0\n        space: default\n"
+        )
         return self.source
 
     def run_cli(self, server: WyrdTestServer, *arguments: str) -> dict[str, Any]:
@@ -174,6 +181,7 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.data("training_data").data.transform([1]) == fixture.data_result
     assert state.agent("agent_triage").prompt is not None
     assert state.agent("agent_inline").prompt is not None
+    assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
     assert_all_refs_are_exact_and_uid_bearing(state)
     assert_all_artifacts_are_confined_and_match_fixture(state, fixture)
 

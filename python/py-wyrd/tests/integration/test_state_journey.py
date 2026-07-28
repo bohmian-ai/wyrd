@@ -98,7 +98,7 @@ class RuntimeServiceFixture:
             "runtime.yaml",
         ):
             ref = cards.register_from_path(str(self.source / name)).root
-            refs[(str(ref.kind), ref.name)] = ref
+            refs[(ref.kind.name, ref.name)] = ref
         return refs
 
     def write_service_tree(self, refs: dict[tuple[str, str], CardRef]) -> Path:
@@ -108,10 +108,10 @@ class RuntimeServiceFixture:
         def rewrite(value: Any) -> Any:
             if isinstance(value, dict):
                 if {"kind", "name", "version"} <= value.keys():
-                    ref = refs.get((str(value["kind"]), value["name"]))
+                    ref = refs.get((value["kind"], value["name"]))
                     if ref is not None:
                         return {
-                            "kind": str(ref.kind),
+                            "kind": ref.kind.name,
                             "name": ref.name,
                             "version": ref.version,
                             "space": ref.space,

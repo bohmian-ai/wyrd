@@ -381,6 +381,19 @@ impl ForgeObjectStoreControl {
 
 #[async_trait]
 impl ForgeObjectStore for ForgeObjectStoreControl {
+    /// Read exactly the requested byte range through OpenDAL's native reader.
+    ///
+    /// Forge uses bounded reads for Parquet metadata and row-group admission;
+    /// fetching the complete object here would bypass that memory guardrail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OpenDAL error when the reader cannot open or fetch the
+    /// requested range.
+    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
+        self.inner.reader(path).await?.read(range).await
+    }
+
     async fn read(&self, path: &str) -> opendal::Result<Buffer> {
         self.inner.read(path).await
     }

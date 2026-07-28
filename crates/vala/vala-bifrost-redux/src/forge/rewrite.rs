@@ -31,10 +31,9 @@ use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
 use iceberg::arrow::NanValueCountVisitor;
-use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal,
-    SchemaRef as IcebergSchemaRef, Struct,
-};
+#[cfg(test)]
+use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat};
+use iceberg::spec::{DataFile, Literal, SchemaRef as IcebergSchemaRef, Struct};
 use iceberg::writer::file_writer::ParquetWriter;
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
@@ -148,6 +147,7 @@ struct RewriteBatchState {
 impl RewriteBatchState {
     /// Create empty state for isolated batch-state tests and callers without
     /// a shared DataFusion reservation.
+    #[cfg(test)]
     fn new() -> Self {
         Self::with_reservation(None)
     }

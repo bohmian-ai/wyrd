@@ -235,6 +235,8 @@ mod tests {
         );
     }
 
+    /// An open partition retains a trailing bin that is below both planner
+    /// thresholds so the next hint can add more files before rewriting it.
     #[test]
     fn active_day_retains_incomplete_trailing_bin() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
@@ -244,6 +246,8 @@ mod tests {
         assert_eq!(plan.retained_files.len(), 2);
     }
 
+    /// An open partition rewrites a trailing bin as soon as it reaches the
+    /// byte target, even though the partition has not closed yet.
     #[test]
     fn active_day_emits_exact_target_trailing_bin() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
@@ -252,6 +256,8 @@ mod tests {
         assert_eq!(plan.rewrite_bins.len(), 1);
     }
 
+    /// A closed partition rewrites a multi-file trailing remainder even when
+    /// it remains below the byte and file-count targets.
     #[test]
     fn closed_day_emits_multi_file_remainder() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
@@ -261,6 +267,8 @@ mod tests {
         assert_eq!(plan.rewrite_bins.len(), 1);
     }
 
+    /// The planner retains oversized inputs and never emits a singleton bin,
+    /// preserving every file for a future eligible compaction.
     #[test]
     fn planner_never_rewrites_singleton_or_drops_oversized_file() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");
@@ -270,6 +278,8 @@ mod tests {
         assert_eq!(plan.retained_files.len(), 2);
     }
 
+    /// Sorting by event-time bounds and row identity makes planning independent
+    /// of the order in which candidates were discovered.
     #[test]
     fn planner_is_stable_across_input_order() {
         let day = NaiveDate::from_ymd_opt(2026, 1, 2).expect("day");

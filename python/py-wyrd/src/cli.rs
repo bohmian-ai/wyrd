@@ -21,9 +21,7 @@ fn run_wyrd_cli(py: Python<'_>) -> PyResult<u8> {
         .import("sys")?
         .getattr("argv")?
         .extract::<Vec<String>>()?;
-    Ok(py.detach(|| {
-        wyrd_runtime::runtime().block_on(wyrd_cli::run_cli_code(args))
-    }))
+    Ok(py.detach(|| wyrd_runtime::runtime().block_on(wyrd_cli::run_cli_code(args))))
 }
 
 /// Register the CLI function on the native extension root.

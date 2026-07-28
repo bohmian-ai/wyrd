@@ -507,14 +507,12 @@ impl ForgeRewritePipeline {
         );
         let schema = Arc::clone(&request.schema);
         let batch = batch.clone();
-        let permit = self
-            .blocking_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| ForgeError::Invariant {
+        let permit = tokio::select! {
+            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge blocking permit closed: {error}"),
-            })?;
+            })?,
+        };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let result = detached.write_batch(&schema, &batch);
@@ -772,14 +770,12 @@ impl ForgeRewritePipeline {
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
         let operation_id = request.operation_id;
-        let permit = self
-            .blocking_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| ForgeError::Invariant {
+        let permit = tokio::select! {
+            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+            permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge blocking permit closed: {error}"),
-            })?;
+            })?,
+        };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {

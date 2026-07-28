@@ -271,6 +271,14 @@ pub struct ForgeTickOutcome {
     pub fence_losses: usize,
     /// Stage-level failures that did not abort discovery of other tables.
     pub stage_failures: usize,
+    /// Peak spill bytes observed across successful rewrites in this tick.
+    pub spill_bytes: u64,
+    /// Rows accepted from staged inputs.
+    pub input_rows: u64,
+    /// Rows encoded into committed outputs.
+    pub output_rows: u64,
+    /// Number of rotated output files committed to Iceberg.
+    pub outputs_committed: usize,
 }
 
 impl ForgeTickOutcome {
@@ -292,6 +300,12 @@ impl ForgeTickOutcome {
         self.lease_contention += other.lease_contention;
         self.fence_losses += other.fence_losses;
         self.stage_failures += other.stage_failures;
+        self.spill_bytes = self.spill_bytes.saturating_add(other.spill_bytes);
+        self.input_rows = self.input_rows.saturating_add(other.input_rows);
+        self.output_rows = self.output_rows.saturating_add(other.output_rows);
+        self.outputs_committed = self
+            .outputs_committed
+            .saturating_add(other.outputs_committed);
     }
 }
 
@@ -435,7 +449,13 @@ async fn compact_candidate_rows(
                 outcome.budget_skips += 1;
                 break 'groups;
             }
-            compact_bin(context, lease, &row.key, binding, &bin, stop).await?;
+            let stats = compact_bin(context, lease, &row.key, binding, &bin, stop).await?;
+            outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
+            outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
+            outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
+            outcome.outputs_committed = outcome
+                .outputs_committed
+                .saturating_add(stats.outputs_committed);
             budget.files += bin.files.len();
             budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
             budget.bins += 1;
@@ -699,7 +719,7 @@ async fn compact_bin(
     binding: &TenantTableBinding,
     bin: &RewriteBin,
     stop: &CancellationToken,
-) -> Result<(), ForgeError> {
+) -> Result<CompactStats, ForgeError> {
     let operation_id = operation_id(key, bin);
     let table = load_table(context, &binding.table_ident()).await?;
     let schema = Arc::new(
@@ -739,7 +759,26 @@ async fn compact_bin(
         None,
     )?;
     prepare_inputs(context, lease, key, bin, prepared).await?;
-    commit_rewrite(context, lease, key, binding, bin, operation_id, &rewrite).await
+    commit_rewrite(context, lease, key, binding, bin, operation_id, &rewrite).await?;
+    Ok(CompactStats {
+        spill_bytes: rewrite.spill_bytes,
+        input_rows: rewrite.input_rows,
+        output_rows: rewrite.output_rows,
+        outputs_committed: rewrite.object_paths.len(),
+    })
+}
+
+/// Rewrite statistics returned only after the Iceberg commit succeeds.
+#[derive(Debug, Default, Clone, Copy)]
+struct CompactStats {
+    /// Peak spill bytes observed by the rewrite runtime.
+    spill_bytes: u64,
+    /// Rows accepted from source batches.
+    input_rows: u64,
+    /// Rows encoded into outputs.
+    output_rows: u64,
+    /// Number of non-empty output files committed.
+    outputs_committed: usize,
 }
 
 /// Commit one completed rewrite and stamp its shared terminal snapshot.

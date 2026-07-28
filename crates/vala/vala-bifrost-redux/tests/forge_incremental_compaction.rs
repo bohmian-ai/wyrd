@@ -65,7 +65,7 @@ mod pg_tests {
             self.ranged_reads.fetch_add(1, Ordering::Relaxed);
             let active = self.active_reads.fetch_add(1, Ordering::AcqRel) + 1;
             self.peak_reads.fetch_max(active, Ordering::AcqRel);
-            let result = self.operator.read_with(path).range(range).await;
+            let result = self.operator.reader(path).await?.read(range).await;
             self.active_reads.fetch_sub(1, Ordering::AcqRel);
             result
         }
@@ -196,7 +196,7 @@ mod pg_tests {
                 ..ForgeConfig::default()
             };
             let runtime = ForgeRewriteRuntime::new(
-                Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024)),
+                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
                 &root.path().join("spill"),
                 config.spill_limit_bytes,
             )
@@ -347,7 +347,15 @@ mod pg_tests {
         let fixture = Fixture::new().await;
         fixture.seed_files(0, true).await;
         let outcome = fixture.forge.run_once().await.expect("rewrite");
-        assert_eq!(outcome.bins_committed, 1);
+        assert_eq!(outcome.bins_committed, 1, "outcome: {outcome:?}");
+        assert!(
+            outcome.spill_bytes > 0,
+            "rewrite must spill under bounded memory"
+        );
+        assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
+        assert!(outcome.outputs_committed >= 2);
+        assert_eq!(outcome.input_rows, 12_000);
+        assert_eq!(outcome.output_rows, 12_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);

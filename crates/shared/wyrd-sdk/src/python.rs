@@ -15,6 +15,7 @@ use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::query::MetadataQuery;
+use wyrd_spec::reference::InlineableRef;
 use wyrd_spec::registry::{
     CardLifecycleStatus, CardRegistrationOutcome, CardSummary, ListCardsRequest, ListCardsResponse,
     RegistrationOutcomeKind, RegistrationReceipt,
@@ -123,14 +124,13 @@ impl PyWyrdState {
 
     /// Persisted aliases in stable order.
     #[getter]
-    fn aliases(&self, py: Python<'_>) -> Py<PyAny> {
-        PyTuple::new(
+    fn aliases(&self, py: Python<'_>) -> CardPyResult<Py<PyAny>> {
+        Ok(PyTuple::new(
             py,
             self.inner.aliases().map(str::to_owned).collect::<Vec<_>>(),
-        )
-        .expect("tuple allocation should succeed")
+        )?
         .unbind()
-        .into_any()
+        .into_any())
     }
 
     /// Return a complete envelope selected by alias.
@@ -304,8 +304,8 @@ impl PyCardEnvelope {
     }
     /// Return the retained Card kind.
     #[getter]
-    fn kind(&self) -> String {
-        self.card.kind.wire_name().to_owned()
+    fn kind(&self) -> Kind {
+        kind_from_card_kind(&self.card.kind)
     }
     /// Return JSON-compatible metadata.
     #[getter]
@@ -482,18 +482,20 @@ fn runtime_hydration_error(
     stage_name: &str,
     reason: impl std::fmt::Display,
 ) -> WyrdPyError {
-    let alias = state
-        .aliases()
-        .find(|alias| {
-            state
-                .card_ref(alias)
-                .is_ok_and(|reference| reference.to_string() == key)
-        })
-        .unwrap_or("unknown");
-    let card_ref = state
-        .card_ref(alias)
-        .cloned()
-        .unwrap_or_else(|_| state.root_ref().clone());
+    let card_ref = match state.card_ref_by_key(key) {
+        Ok(card_ref) => card_ref.clone(),
+        Err(error) => return WyrdPyError::from(error),
+    };
+    let Some(alias) = state
+        .aliases_by_key(key)
+        .ok()
+        .and_then(|aliases| aliases.first())
+    else {
+        return WyrdPyError::from(wyrd_spec::error::WyrdError::SdkInvalidStateBundle {
+            message: "Card has no stable primary alias".to_owned(),
+            details: serde_json::json!({"card_ref": card_ref}),
+        });
+    };
     WyrdPyError::from(wyrd_spec::error::WyrdError::SdkRuntimeHydrationFailed {
         message: format!("runtime hydration failed at {stage_name}"),
         details: serde_json::json!({"alias": alias, "card_ref": card_ref, "stage": stage_name, "reason": reason.to_string()}),
@@ -515,24 +517,28 @@ fn build_envelopes(
     state: &WyrdState,
 ) -> CardPyResult<std::collections::BTreeMap<String, Py<PyCardEnvelope>>> {
     let mut values = std::collections::BTreeMap::new();
-    for alias in state.aliases() {
-        let card_ref = state.card_ref(alias)?.clone();
-        let key = card_ref.to_string();
-        if values.contains_key(&key) {
-            continue;
+    for (key, card) in state.cards() {
+        let card_ref = state.card_ref_by_key(key)?.clone();
+        let aliases = state.aliases_by_key(key)?.to_vec();
+        if aliases.is_empty() {
+            return Err(WyrdPyError::from(
+                wyrd_spec::error::WyrdError::SdkInvalidStateBundle {
+                    message: "Card has no stable alias".to_owned(),
+                    details: serde_json::json!({"card_ref": card_ref}),
+                },
+            ));
         }
-        let card = state.card(alias)?.clone();
-        let aliases = state.aliases_for(&card_ref)?.to_vec();
         values.insert(
-            key,
+            key.to_owned(),
             Py::new(
                 py,
                 PyCardEnvelope {
-                    card,
+                    card: card.clone(),
                     card_ref,
                     aliases,
                 },
-            )?,
+            )
+            .map_err(|error| runtime_hydration_error(state, key, "python_allocation", error))?,
         );
     }
     Ok(values)
@@ -543,20 +549,15 @@ fn build_prompts(
     state: &WyrdState,
 ) -> CardPyResult<std::collections::BTreeMap<String, Py<PromptCard>>> {
     let mut values = std::collections::BTreeMap::new();
-    for alias in state.aliases() {
-        let reference = state.card_ref(alias)?;
-        if reference.kind != CardKind::Prompt {
-            continue;
-        }
-        let key = reference.to_string();
-        let mut card = PromptCard::from_card(state.card(alias)?.clone())
-            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+    for (key, envelope) in state.cards_of_kind(CardKind::Prompt) {
+        let mut card = PromptCard::from_card(envelope.clone())
+            .map_err(|e| runtime_hydration_error(state, key, "prompt", e))?;
         card.hydrate_prompt(py)
-            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+            .map_err(|e| runtime_hydration_error(state, key, "prompt", e))?;
         values.insert(
-            key.clone(),
+            key.to_owned(),
             Py::new(py, card)
-                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+                .map_err(|e| runtime_hydration_error(state, key, "python_allocation", e))?,
         );
     }
     Ok(values)
@@ -567,20 +568,23 @@ fn build_agents(
     state: &WyrdState,
 ) -> CardPyResult<std::collections::BTreeMap<String, Py<wyrd_cards::agent::PyAgentCard>>> {
     let mut values = std::collections::BTreeMap::new();
-    for alias in state.aliases() {
-        let reference = state.card_ref(alias)?;
-        if reference.kind != CardKind::Agent {
-            continue;
+    for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
+        let mut card = wyrd_cards::agent::PyAgentCard::from_card(py, envelope.clone())
+            .map_err(|e| runtime_hydration_error(state, key, "prompt", e))?;
+        let alias = state.aliases_by_key(key)?.first().ok_or_else(|| {
+            WyrdPyError::from(wyrd_spec::error::WyrdError::SdkInvalidStateBundle {
+                message: "Agent has no stable alias".to_owned(),
+                details: serde_json::json!({"card_ref": key}),
+            })
+        })?;
+        if !matches!(state.agent(alias)?.spec.prompt, InlineableRef::Inline(_)) {
+            card.hydrate_resolved_prompt(py, state.agent_prompt(alias)?.clone())
+                .map_err(|e| runtime_hydration_error(state, key, "prompt", e))?;
         }
-        let key = reference.to_string();
-        let mut card = wyrd_cards::agent::PyAgentCard::from_card(py, state.card(alias)?.clone())
-            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
-        card.hydrate_resolved_prompt(py, state.agent_prompt(alias)?.clone())
-            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
         values.insert(
-            key.clone(),
+            key.to_owned(),
             Py::new(py, card)
-                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+                .map_err(|e| runtime_hydration_error(state, key, "python_allocation", e))?,
         );
     }
     Ok(values)
@@ -592,34 +596,32 @@ fn build_models(
     config: &PythonLoadConfig,
 ) -> CardPyResult<std::collections::BTreeMap<String, Py<ModelCard>>> {
     let mut values = std::collections::BTreeMap::new();
-    for alias in state.aliases() {
-        let reference = state.card_ref(alias)?;
-        if reference.kind != CardKind::Model {
-            continue;
-        }
-        let key = reference.to_string();
-        let mut card = ModelCard::from_card(state.card(alias)?.clone())
-            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
-        let interface = config
-            .interface_by_ref
-            .get(&key)
-            .map(|value| value.bind(py));
+    for (key, envelope) in state.cards_of_kind(CardKind::Model) {
+        let alias = state.aliases_by_key(key)?.first().ok_or_else(|| {
+            WyrdPyError::from(wyrd_spec::error::WyrdError::SdkInvalidStateBundle {
+                message: "Model has no stable alias".to_owned(),
+                details: serde_json::json!({"card_ref": key}),
+            })
+        })?;
+        let mut card = ModelCard::from_card(envelope.clone())
+            .map_err(|e| runtime_hydration_error(state, key, "interface", e))?;
+        let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
         card.hydrate_interface(py, interface)
-            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
+            .map_err(|e| runtime_hydration_error(state, key, "interface", e))?;
         let artifact_dir = state
             .artifact_dir(alias)?
             .map(PathBuf::from)
-            .ok_or_else(|| missing_runtime_artifacts(state, &key))?;
+            .ok_or_else(|| missing_runtime_artifacts(state, key))?;
         card.load(
             py,
             Some(artifact_dir),
-            config.kwargs_by_ref.get(&key).map(|value| value.bind(py)),
+            config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
         )
-        .map_err(|e| runtime_hydration_error(state, &key, "artifact_load", e))?;
+        .map_err(|e| runtime_hydration_error(state, key, "artifact_load", e))?;
         values.insert(
-            key.clone(),
+            key.to_owned(),
             Py::new(py, card)
-                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+                .map_err(|e| runtime_hydration_error(state, key, "python_allocation", e))?,
         );
     }
     Ok(values)
@@ -631,34 +633,32 @@ fn build_data(
     config: &PythonLoadConfig,
 ) -> CardPyResult<std::collections::BTreeMap<String, Py<DataCard>>> {
     let mut values = std::collections::BTreeMap::new();
-    for alias in state.aliases() {
-        let reference = state.card_ref(alias)?;
-        if reference.kind != CardKind::Data {
-            continue;
-        }
-        let key = reference.to_string();
-        let mut card = DataCard::from_card(state.card(alias)?.clone())
-            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
-        let interface = config
-            .interface_by_ref
-            .get(&key)
-            .map(|value| value.bind(py));
+    for (key, envelope) in state.cards_of_kind(CardKind::Data) {
+        let alias = state.aliases_by_key(key)?.first().ok_or_else(|| {
+            WyrdPyError::from(wyrd_spec::error::WyrdError::SdkInvalidStateBundle {
+                message: "Data has no stable alias".to_owned(),
+                details: serde_json::json!({"card_ref": key}),
+            })
+        })?;
+        let mut card = DataCard::from_card(envelope.clone())
+            .map_err(|e| runtime_hydration_error(state, key, "interface", e))?;
+        let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
         card.hydrate_interface(py, interface)
-            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
+            .map_err(|e| runtime_hydration_error(state, key, "interface", e))?;
         let artifact_dir = state
             .artifact_dir(alias)?
             .map(PathBuf::from)
-            .ok_or_else(|| missing_runtime_artifacts(state, &key))?;
+            .ok_or_else(|| missing_runtime_artifacts(state, key))?;
         card.load(
             py,
             Some(artifact_dir),
-            config.kwargs_by_ref.get(&key).map(|value| value.bind(py)),
+            config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
         )
-        .map_err(|e| runtime_hydration_error(state, &key, "artifact_load", e))?;
+        .map_err(|e| runtime_hydration_error(state, key, "artifact_load", e))?;
         values.insert(
-            key.clone(),
+            key.to_owned(),
             Py::new(py, card)
-                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+                .map_err(|e| runtime_hydration_error(state, key, "python_allocation", e))?,
         );
     }
     Ok(values)

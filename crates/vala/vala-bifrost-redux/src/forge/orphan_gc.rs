@@ -72,7 +72,8 @@ impl Forge {
         binding: &TenantTableBinding,
         live_set: &ProtectedLiveSet,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        run_orphan_gc_for_table_inner(&self.core, lease, key, binding, live_set).await
+        self.run_orphan_gc_for_table_inner(&self.core, lease, key, binding, live_set)
+            .await
     }
 
     /// Build the complete retained snapshot and pending-staging live set.
@@ -86,36 +87,41 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &iceberg::table::Table,
     ) -> Result<ProtectedLiveSet, ForgeError> {
-        build_live_set_inner(&self.core, key, binding, table).await
+        self.build_live_set_inner(&self.core, key, binding, table)
+            .await
     }
 }
 
-async fn run_orphan_gc_for_table_inner(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeTableKey,
-    binding: &TenantTableBinding,
-    live_set: &ProtectedLiveSet,
-) -> Result<OrphanGcOutcome, ForgeError> {
-    let mut outcome = reconcile_gc(context, lease, key, binding).await?;
-    let candidates = list_gc_candidates(context, binding, live_set).await?;
-    if candidates.is_empty() {
-        return Ok(outcome);
+impl Forge {
+    async fn run_orphan_gc_for_table_inner(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        live_set: &ProtectedLiveSet,
+    ) -> Result<OrphanGcOutcome, ForgeError> {
+        let mut outcome = reconcile_gc(context, lease, key, binding).await?;
+        let candidates = list_gc_candidates(context, binding, live_set).await?;
+        if candidates.is_empty() {
+            return Ok(outcome);
+        }
+        let detail = gc_detail(key, candidates)?;
+        append_gc_audit(
+            context,
+            lease,
+            key.tenant,
+            &detail,
+            "forge.orphan_gc.prepared",
+        )
+        .await?;
+        let (deleted, skipped) =
+            delete_gc_batch(context, lease, key, binding, &detail, false).await?;
+        outcome.recovered += 1;
+        outcome.deleted += deleted;
+        outcome.skipped += skipped;
+        Ok(outcome)
     }
-    let detail = gc_detail(key, candidates)?;
-    append_gc_audit(
-        context,
-        lease,
-        key.tenant,
-        &detail,
-        "forge.orphan_gc.prepared",
-    )
-    .await?;
-    let (deleted, skipped) = delete_gc_batch(context, lease, key, binding, &detail, false).await?;
-    outcome.recovered += 1;
-    outcome.deleted += deleted;
-    outcome.skipped += skipped;
-    Ok(outcome)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -127,83 +133,86 @@ pub(crate) struct OrphanGcOutcome {
 
 /// Build the live set from every retained Iceberg snapshot and every pending
 /// server-side file-list row for this exact tenant/table predicate.
-async fn build_live_set_inner(
-    context: &ForgeCore,
-    key: &ForgeTableKey,
-    binding: &TenantTableBinding,
-    table: &iceberg::table::Table,
-) -> Result<ProtectedLiveSet, ForgeError> {
-    assert_table_location(table.metadata(), binding)?;
-    let mut live = ProtectedLiveSet::default();
-    let prefix = &binding.object_prefix;
-    add_path(
-        &mut live,
-        prefix,
-        table
-            .metadata_location_result()
-            .map_err(ForgeError::Catalog)?,
-    )?;
-    for metadata_log in table.metadata().metadata_log() {
-        add_path(&mut live, prefix, &metadata_log.metadata_file)?;
-    }
-    for snapshot in table.metadata().snapshots() {
-        add_path(&mut live, prefix, snapshot.manifest_list())?;
-        let manifest_list = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .map_err(ForgeError::Catalog)?;
-        for manifest_file in manifest_list.entries() {
-            add_path(&mut live, prefix, &manifest_file.manifest_path)?;
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
+impl Forge {
+    async fn build_live_set_inner(
+        &self,
+        context: &ForgeCore,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+    ) -> Result<ProtectedLiveSet, ForgeError> {
+        assert_table_location(table.metadata(), binding)?;
+        let mut live = ProtectedLiveSet::default();
+        let prefix = &binding.object_prefix;
+        add_path(
+            &mut live,
+            prefix,
+            table
+                .metadata_location_result()
+                .map_err(ForgeError::Catalog)?,
+        )?;
+        for metadata_log in table.metadata().metadata_log() {
+            add_path(&mut live, prefix, &metadata_log.metadata_file)?;
+        }
+        for snapshot in table.metadata().snapshots() {
+            add_path(&mut live, prefix, snapshot.manifest_list())?;
+            let manifest_list = table
+                .manifest_list_reader(snapshot)
+                .load()
                 .await
                 .map_err(ForgeError::Catalog)?;
-            for entry in manifest.entries() {
-                add_path(&mut live, prefix, entry.data_file().file_path())?;
+            for manifest_file in manifest_list.entries() {
+                add_path(&mut live, prefix, &manifest_file.manifest_path)?;
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .map_err(ForgeError::Catalog)?;
+                for entry in manifest.entries() {
+                    add_path(&mut live, prefix, entry.data_file().file_path())?;
+                }
+            }
+            if let Some(statistics) = table
+                .metadata()
+                .statistics_for_snapshot(snapshot.snapshot_id())
+            {
+                add_path(&mut live, prefix, &statistics.statistics_path)?;
+            }
+            if let Some(statistics) = table
+                .metadata()
+                .partition_statistics_for_snapshot(snapshot.snapshot_id())
+            {
+                add_path(&mut live, prefix, &statistics.statistics_path)?;
             }
         }
-        if let Some(statistics) = table
-            .metadata()
-            .statistics_for_snapshot(snapshot.snapshot_id())
-        {
-            add_path(&mut live, prefix, &statistics.statistics_path)?;
-        }
-        if let Some(statistics) = table
-            .metadata()
-            .partition_statistics_for_snapshot(snapshot.snapshot_id())
-        {
-            add_path(&mut live, prefix, &statistics.statistics_path)?;
-        }
-    }
 
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    let rows = sqlx::query(
-        r"SELECT file_path
+        let mut conn = context
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let rows = sqlx::query(
+            r"SELECT file_path
              FROM vala.file_list
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
             ORDER BY file_path",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    conn.commit().await.map_err(ForgeError::Sql)?;
-    for row in rows {
-        let path: String = row
-            .try_get("file_path")
-            .map_err(|error| ForgeError::LiveSet {
-                detail: error.to_string(),
-            })?;
-        add_path(&mut live, prefix, &path)?;
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        for row in rows {
+            let path: String = row
+                .try_get("file_path")
+                .map_err(|error| ForgeError::LiveSet {
+                    detail: error.to_string(),
+                })?;
+            add_path(&mut live, prefix, &path)?;
+        }
+        Ok(live)
     }
-    Ok(live)
 }
 
 async fn list_gc_candidates(

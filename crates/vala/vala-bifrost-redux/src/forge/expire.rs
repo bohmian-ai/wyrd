@@ -83,7 +83,7 @@ impl Forge {
     ///
     /// Returns a SQL error when no complete discovery set can be formed.
     pub(super) async fn discover_tables(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        discover_tables_inner(&self.core).await
+        self.discover_tables_inner(&self.core).await
     }
 
     /// Reconcile and expire snapshots while retaining the shared table fence.
@@ -97,7 +97,8 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
-        run_snapshot_expiry_for_table_inner(&self.core, lease, key, binding).await
+        self.run_snapshot_expiry_for_table_inner(&self.core, lease, key, binding)
+            .await
     }
 }
 
@@ -105,99 +106,103 @@ impl Forge {
 ///
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
-async fn discover_tables_inner(
-    context: &ForgeCore,
-) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-    let rows = sqlx::query(
-        r"SELECT DISTINCT data_tenant_id, namespace, table_name
+impl Forge {
+    async fn discover_tables_inner(
+        &self,
+        context: &ForgeCore,
+    ) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
+        let rows = sqlx::query(
+            r"SELECT DISTINCT data_tenant_id, namespace, table_name
              FROM vala.file_list
             ORDER BY data_tenant_id, namespace, table_name",
-    )
-    .fetch_all(context.operator_pool.pool())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    let mut failures = 0;
-    let mut tables = Vec::new();
-    for row in rows {
-        let table: Result<ForgeTableKey, ForgeError> = (|| {
-            let tenant_uuid: Uuid =
-                row.try_get("data_tenant_id")
-                    .map_err(|error| ForgeError::SnapshotExpiry {
+        )
+        .fetch_all(context.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        let mut failures = 0;
+        let mut tables = Vec::new();
+        for row in rows {
+            let table: Result<ForgeTableKey, ForgeError> = (|| {
+                let tenant_uuid: Uuid =
+                    row.try_get("data_tenant_id")
+                        .map_err(|error| ForgeError::SnapshotExpiry {
+                            detail: error.to_string(),
+                        })?;
+                let tenant = DataTenantId::try_from(tenant_uuid).map_err(|error| {
+                    ForgeError::SnapshotExpiry {
                         detail: error.to_string(),
-                    })?;
-            let tenant = DataTenantId::try_from(tenant_uuid).map_err(|error| {
-                ForgeError::SnapshotExpiry {
-                    detail: error.to_string(),
+                    }
+                })?;
+                let namespace: String =
+                    row.try_get("namespace")
+                        .map_err(|error| ForgeError::SnapshotExpiry {
+                            detail: error.to_string(),
+                        })?;
+                let table_name: String =
+                    row.try_get("table_name")
+                        .map_err(|error| ForgeError::SnapshotExpiry {
+                            detail: error.to_string(),
+                        })?;
+                let namespace = BifrostNamespace::from_wire(&namespace).ok_or_else(|| {
+                    ForgeError::SnapshotExpiry {
+                        detail: format!("unknown Bifrost namespace `{namespace}`"),
+                    }
+                })?;
+                Ok(ForgeTableKey {
+                    tenant,
+                    table_ref: TableRef::new(namespace, table_name),
+                })
+            })();
+            match table {
+                Ok(table) => tables.push(table),
+                Err(error) => {
+                    failures += 1;
+                    tracing::warn!(error = %error, "Forge table discovery skipped an invalid row");
                 }
-            })?;
-            let namespace: String =
-                row.try_get("namespace")
-                    .map_err(|error| ForgeError::SnapshotExpiry {
-                        detail: error.to_string(),
-                    })?;
-            let table_name: String =
-                row.try_get("table_name")
-                    .map_err(|error| ForgeError::SnapshotExpiry {
-                        detail: error.to_string(),
-                    })?;
-            let namespace = BifrostNamespace::from_wire(&namespace).ok_or_else(|| {
-                ForgeError::SnapshotExpiry {
-                    detail: format!("unknown Bifrost namespace `{namespace}`"),
-                }
-            })?;
-            Ok(ForgeTableKey {
-                tenant,
-                table_ref: TableRef::new(namespace, table_name),
-            })
-        })();
-        match table {
-            Ok(table) => tables.push(table),
-            Err(error) => {
-                failures += 1;
-                tracing::warn!(error = %error, "Forge table discovery skipped an invalid row");
             }
         }
+        Ok((tables, failures))
     }
-    Ok((tables, failures))
-}
 
-/// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
-///
-/// Current and reference heads, plus their retained ancestry, are protected by
-/// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
-/// commit so a stale prepared selection cannot delete a newly protected head.
-async fn run_snapshot_expiry_for_table_inner(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeTableKey,
-    binding: &TenantTableBinding,
-) -> Result<usize, ForgeError> {
-    let mut recovered = reconcile_expiry(context, lease, key, binding).await?;
-    let table = load_table(context, &binding.table_ident()).await?;
-    let cutoff_ms = expiry_cutoff_ms(context.config.snapshot_retention)?;
-    let (summaries, ref_heads) = snapshot_summaries(&table)?;
-    let selected = select_expirable_snapshots(
-        &summaries,
-        table.metadata().current_snapshot_id(),
-        &ref_heads,
-        cutoff_ms,
-        context.config.retain_last,
-    );
-    if selected.is_empty() {
-        return Ok(recovered);
+    /// Reconcile prepared snapshot-expiry audits, then expire eligible snapshots.
+    ///
+    /// Current and reference heads, plus their retained ancestry, are protected by
+    /// [`select_expirable_snapshots`]. Iceberg metadata is reloaded before the
+    /// commit so a stale prepared selection cannot delete a newly protected head.
+    async fn run_snapshot_expiry_for_table_inner(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let mut recovered = reconcile_expiry(context, lease, key, binding).await?;
+        let table = load_table(context, &binding.table_ident()).await?;
+        let cutoff_ms = expiry_cutoff_ms(context.config.snapshot_retention)?;
+        let (summaries, ref_heads) = snapshot_summaries(&table)?;
+        let selected = select_expirable_snapshots(
+            &summaries,
+            table.metadata().current_snapshot_id(),
+            &ref_heads,
+            cutoff_ms,
+            context.config.retain_last,
+        );
+        if selected.is_empty() {
+            return Ok(recovered);
+        }
+        let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
+        append_expiry_audit(
+            context,
+            lease,
+            key.tenant,
+            &detail,
+            "forge.snapshot_expire.prepared",
+        )
+        .await?;
+        complete_expiry(context, lease, key, binding, &detail, false).await?;
+        recovered += 1;
+        Ok(recovered)
     }
-    let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
-    append_expiry_audit(
-        context,
-        lease,
-        key.tenant,
-        &detail,
-        "forge.snapshot_expire.prepared",
-    )
-    .await?;
-    complete_expiry(context, lease, key, binding, &detail, false).await?;
-    recovered += 1;
-    Ok(recovered)
 }
 
 /// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.

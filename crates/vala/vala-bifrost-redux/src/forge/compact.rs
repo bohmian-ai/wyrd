@@ -362,7 +362,9 @@ impl Forge {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
-            reconciled += reconcile_group(&self.core, lease, &key, binding).await?;
+            reconciled += self
+                .reconcile_group(&self.core, lease, &key, binding)
+                .await?;
         }
         Ok(reconciled)
     }
@@ -1129,89 +1131,92 @@ async fn reset_inputs(
     conn.commit().await.map_err(ForgeError::Sql)
 }
 
-/// Reconcile the latest prepared audit transition for every group in a table.
-///
-/// A live output is stamped as recovered. An output absent after the
-/// uncertainty window resets the hidden inputs so a future tick can retry.
-async fn reconcile_group(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    binding: &TenantTableBinding,
-) -> Result<usize, ForgeError> {
-    let resource = key.audit_resource();
-    let latest = load_reconciliation_audits(context, key, &resource).await?;
-    let mut recovered = 0;
-    for (_operation_id, (detail, created_at)) in latest {
-        if !matches!(
-            &detail,
-            AuditDetail::ForgeCompaction {
-                phase: ForgeCompactionPhase::Prepared,
+impl Forge {
+    /// Reconcile the latest prepared audit transition for every group in a table.
+    ///
+    /// A live output is stamped as recovered. An output absent after the
+    /// uncertainty window resets the hidden inputs so a future tick can retry.
+    async fn reconcile_group(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let resource = key.audit_resource();
+        let latest = load_reconciliation_audits(context, key, &resource).await?;
+        let mut recovered = 0;
+        for (_operation_id, (detail, created_at)) in latest {
+            if !matches!(
+                &detail,
+                AuditDetail::ForgeCompaction {
+                    phase: ForgeCompactionPhase::Prepared,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let AuditDetail::ForgeCompaction {
+                input_file_ids,
+                output_paths,
                 ..
+            } = &detail
+            else {
+                continue;
+            };
+            if detail_group(&detail) != resource {
+                return Err(ForgeError::Reconciliation {
+                    detail: "audit detail group differs from its resource".to_owned(),
+                });
             }
-        ) {
-            continue;
-        }
-        let AuditDetail::ForgeCompaction {
-            input_file_ids,
-            output_paths,
-            ..
-        } = &detail
-        else {
-            continue;
-        };
-        if detail_group(&detail) != resource {
-            return Err(ForgeError::Reconciliation {
-                detail: "audit detail group differs from its resource".to_owned(),
-            });
-        }
-        verify_hidden_inputs(context, key, input_file_ids, &detail).await?;
-        if !lease.renew(&context.operator_pool).await? {
-            return Err(ForgeError::FenceLost {
-                lease_key: lease.lease_key.clone(),
-            });
-        }
-        let table = load_table(context, &binding.table_ident()).await?;
-        if let Some(snapshot_id) = live_snapshot_for_paths(&table, output_paths).await? {
+            verify_hidden_inputs(context, key, input_file_ids, &detail).await?;
             if !lease.renew(&context.operator_pool).await? {
                 return Err(ForgeError::FenceLost {
                     lease_key: lease.lease_key.clone(),
                 });
             }
-            stamp_reconciled(context, lease, key, input_file_ids, &detail, snapshot_id).await?;
-            recovered += 1;
-            continue;
-        }
-        if Utc::now()
-            .signed_duration_since(created_at)
-            .to_std()
-            .unwrap_or_default()
-            < context.config.uncertainty_bound
-        {
-            continue;
-        }
-        let first_reload = load_table(context, &binding.table_ident()).await?;
-        if live_snapshot_for_paths(&first_reload, output_paths)
-            .await?
-            .is_some()
-        {
-            continue;
-        }
-        let second_reload = load_table(context, &binding.table_ident()).await?;
-        if live_snapshot_for_paths(&second_reload, output_paths)
-            .await?
-            .is_none()
-        {
-            if !lease.renew(&context.operator_pool).await? {
-                return Err(ForgeError::FenceLost {
-                    lease_key: lease.lease_key.clone(),
-                });
+            let table = load_table(context, &binding.table_ident()).await?;
+            if let Some(snapshot_id) = live_snapshot_for_paths(&table, output_paths).await? {
+                if !lease.renew(&context.operator_pool).await? {
+                    return Err(ForgeError::FenceLost {
+                        lease_key: lease.lease_key.clone(),
+                    });
+                }
+                stamp_reconciled(context, lease, key, input_file_ids, &detail, snapshot_id).await?;
+                recovered += 1;
+                continue;
             }
-            reset_reconciled(context, lease, key, input_file_ids, &detail).await?;
-            recovered += 1;
+            if Utc::now()
+                .signed_duration_since(created_at)
+                .to_std()
+                .unwrap_or_default()
+                < context.config.uncertainty_bound
+            {
+                continue;
+            }
+            let first_reload = load_table(context, &binding.table_ident()).await?;
+            if live_snapshot_for_paths(&first_reload, output_paths)
+                .await?
+                .is_some()
+            {
+                continue;
+            }
+            let second_reload = load_table(context, &binding.table_ident()).await?;
+            if live_snapshot_for_paths(&second_reload, output_paths)
+                .await?
+                .is_none()
+            {
+                if !lease.renew(&context.operator_pool).await? {
+                    return Err(ForgeError::FenceLost {
+                        lease_key: lease.lease_key.clone(),
+                    });
+                }
+                reset_reconciled(context, lease, key, input_file_ids, &detail).await?;
+                recovered += 1;
+            }
         }
+        Ok(recovered)
     }
-    Ok(recovered)
 }
 
 /// Load the latest audit detail for each compaction operation in a group.

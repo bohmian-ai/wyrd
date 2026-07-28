@@ -234,7 +234,8 @@ async fn active_partition_incremental_compaction() {
         )
         .expect("positive time anchor"),
     );
-    for (pod_index, pod) in servers.iter().enumerate() {
+    for pod_index in [1_usize, 2, 0] {
+        let pod = &servers[pod_index];
         let endpoint = pod.grpc_url().expect("bound pod gRPC URL");
         let deadline = Instant::now() + Duration::from_secs(5);
         let channel = loop {
@@ -266,14 +267,51 @@ async fn active_partition_incremental_compaction() {
                 .into_inner();
             assert!(response.partial_success.is_none());
         }
-    }
-    for (index, pod) in servers.iter().enumerate() {
-        let before = publishers[index].capacity_for_test();
+        let before = publishers[pod_index].capacity_for_test();
         pod.flush_bifrost_for_tenant(tenant)
             .await
             .expect("server-owned Scribe flush");
-        let after_flush = publishers[index].capacity_for_test();
+        let after_flush = publishers[pod_index].capacity_for_test();
         assert!(after_flush <= before);
+        if pod_index == 2 {
+            let remote_rows: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_one(
+                server
+                    .state()
+                    .postgres
+                    .operator_pool()
+                    .expect("operator pool")
+                    .pool(),
+            )
+            .await
+            .expect("remote-pod staging rows");
+            assert_eq!(
+                remote_rows, 2,
+                "only pods B and C have durable uncompacted rows"
+            );
+            let (status, problem) = oracle_problem_for_sql(
+                server,
+                &jwt,
+                "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'",
+            )
+            .await;
+            assert_eq!(status, reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                problem.get("detail").and_then(serde_json::Value::as_str),
+                Some("Oracle snapshot is awaiting Forge publication"),
+                "remote-only staging rows must trigger the Oracle publication fence"
+            );
+            assert_eq!(
+                problem
+                    .pointer("/details/unresolved_publication")
+                    .and_then(serde_json::Value::as_bool),
+                Some(true),
+                "the fail-closed response identifies unresolved publication"
+            );
+        }
     }
     let total_files: i64 =
         sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1")
@@ -592,8 +630,21 @@ async fn oracle_status_for_sql(
     jwt: &str,
     sql: &str,
 ) -> reqwest::StatusCode {
+    oracle_problem_for_sql(server, jwt, sql).await.0
+}
+
+/// Query one Oracle SQL statement and return its status and problem payload.
+///
+/// # Panics
+///
+/// Panics when the HTTP request fails or its response is not JSON.
+async fn oracle_problem_for_sql(
+    server: &WyrdTestServer,
+    jwt: &str,
+    sql: &str,
+) -> (reqwest::StatusCode, serde_json::Value) {
     let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(url)
         .header("x-wyrd-access-token", format!("Bearer {jwt}"))
         .json(&SyncQueryRequest {
@@ -602,8 +653,10 @@ async fn oracle_status_for_sql(
         })
         .send()
         .await
-        .expect("Oracle request")
-        .status()
+        .expect("Oracle request");
+    let status = response.status();
+    let problem = response.json().await.expect("Oracle problem JSON");
+    (status, problem)
 }
 
 /// Append one real hash-chained Forge transition for Oracle fence classification.

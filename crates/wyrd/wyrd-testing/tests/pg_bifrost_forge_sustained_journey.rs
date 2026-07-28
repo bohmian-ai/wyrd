@@ -184,10 +184,12 @@ async fn pg_bifrost_forge_incremental_sustained() {
     .await;
     server.cancel_bound_workers();
     let baseline_memory = fixture.memory_snapshot().bifrost_total_bytes;
+    let mut peak_shared_memory = baseline_memory;
     let mut config = fixture.config.clone();
     config.max_hints_per_wake = 1;
     config.max_files_per_bin = 2;
     config.output_file_bytes = 1;
+    assert!(config.max_hints_per_wake <= 1);
     let (forge, publisher) =
         fixture.context_with_constrained_memory_and_publisher(config, 16 * 1024 * 1024);
     let drain_forge = forge.clone();
@@ -232,6 +234,7 @@ async fn pg_bifrost_forge_incremental_sustained() {
             .await
             .expect("incremental drain tick");
         spill_bytes = spill_bytes.max(outcome.spill_bytes);
+        peak_shared_memory = peak_shared_memory.max(fixture.memory_snapshot().bifrost_total_bytes);
         outputs_committed = outputs_committed.saturating_add(outcome.outputs_committed);
         if maintenance_settled(&fixture).await {
             break;
@@ -244,6 +247,7 @@ async fn pg_bifrost_forge_incremental_sustained() {
         "incremental rewrite must exercise DataFusion spill"
     );
     assert!(spill_bytes <= fixture.config.spill_limit_bytes);
+    assert!(peak_shared_memory >= baseline_memory);
     assert!(
         outputs_committed > 1,
         "small output ceiling must rotate outputs"

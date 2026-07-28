@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
+use wyrd_spec::vala::api::SyncQueryRequest;
 use wyrd_testing::bifrost::{
     BifrostHarness, seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days,
 };
@@ -13,11 +14,13 @@ use wyrd_testing::{Bootstrap, WyrdTestServer};
 /// Lease cleanup and convergence prove the server can supervise competing pods
 /// without leaving a stale ownership row.
 async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
-    let server = WyrdTestServer::builder()
-        .with_forge_interval(Duration::from_millis(10))
-        .start_bound()
+    let harness = BifrostHarness::start(3, 1)
         .await
-        .expect("test server");
+        .expect("three-pod Bifrost harness");
+    let server = harness
+        .cluster()
+        .server(0)
+        .expect("first bound Bifrost pod");
     let forge = server.state().forge().expect("Forge").clone();
     let fixtures = vec![
         seed_forge_group(&server, "multipod_rows_a").await,
@@ -48,6 +51,22 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+        let committed = fixture
+            .operation_count("forge.file_compact.committed")
+            .await;
+        let recovered = fixture
+            .operation_count("forge.file_compact.recovered")
+            .await;
+        let reset = fixture.operation_count("forge.file_compact.reset").await;
+        assert_eq!(prepared, committed + recovered + reset);
+        assert_eq!(committed + recovered, 1, "one unique snapshot terminal");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("Forge snapshot");
+        assert_eq!(table.metadata().snapshots().len(), 1);
     }
     shutdown.cancel();
     scheduler
@@ -73,7 +92,10 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(lease_count, 0, "server scheduler leaves no stale lease");
-    server.shutdown().await.expect("server shutdown");
+    harness
+        .shutdown()
+        .await
+        .expect("three-pod harness shutdown");
 }
 
 #[tokio::test]
@@ -300,6 +322,11 @@ async fn active_partition_incremental_compaction() {
             .any(|(operation, _, _)| operation == "forge.file_compact.committed")
     );
     assert_eq!(leases_now, 0);
+    let oracle_before = oracle_rows(server, &jwt).await;
+    assert_eq!(
+        oracle_before, 36,
+        "Oracle sees all flushed Scribe rows before Forge"
+    );
     let mut compacted = 0_i64;
     for _ in 0..100 {
         compacted = sqlx::query_scalar(
@@ -326,6 +353,10 @@ async fn active_partition_incremental_compaction() {
         &[today],
     )
     .await;
+    let oracle_during = tokio::time::timeout(Duration::from_secs(5), oracle_rows(server, &jwt))
+        .await
+        .expect("Oracle during Forge bound");
+    assert_eq!(oracle_during, oracle_before, "Oracle parity during Forge");
     let closed = seed_forge_group_for_tenant_with_schema_and_days(
         server,
         fixture.tenant,
@@ -412,5 +443,30 @@ async fn active_partition_incremental_compaction() {
         tail.operation_count("forge.file_compact.committed").await,
         1
     );
+    let oracle_after = oracle_rows(server, &jwt).await;
+    assert_eq!(oracle_after, oracle_before, "Oracle parity after Forge");
     harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Query the bound server's public Oracle endpoint and return its durable row count.
+async fn oracle_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
+    let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
+    let response = reqwest::Client::new()
+        .post(url)
+        .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+        .json(&SyncQueryRequest {
+            sql: "SELECT * FROM \"vala.traces.spans\"".to_owned(),
+            params: Vec::new(),
+        })
+        .send()
+        .await
+        .expect("Oracle request")
+        .error_for_status()
+        .expect("Oracle response");
+    response
+        .headers()
+        .get("x-wyrd-row-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("Oracle row-count header")
 }

@@ -4,10 +4,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures_util::TryStreamExt;
+use arrow::datatypes::{DataType, Field};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use wyrd_spec::vala::api::SyncQueryRequest;
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
     ForgeFixture, seed_forge_group, seed_forge_group_for_tenant,
@@ -36,6 +39,11 @@ use wyrd_testing::bifrost::{
 /// exactly one such terminal event.
 /// This catches loss, duplicate bookkeeping, table starvation, and shutdown
 /// cleanup failures that a health endpoint or in-memory load callback cannot see.
+///
+/// # Errors
+///
+/// The journey panics when the bound server, durable Forge state, or public
+/// Oracle query cannot complete the sustained workload.
 async fn forge_sustained_scheduler_with_ingest_and_queries_has_zero_loss_or_leak() {
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
@@ -185,6 +193,34 @@ async fn pg_bifrost_forge_incremental_sustained() {
         &[chrono::Utc::now().date_naive()],
     )
     .await;
+    server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("server-owned Redux catalog")
+        .create_table(CreateTableRequest {
+            table: TableRef::new(
+                BifrostNamespace::Bifrost,
+                fixture.binding.table_name.clone(),
+            ),
+            user_fields: vec![Field::new("value", DataType::Int64, false)],
+            tenant: fixture.tenant,
+            audit: None,
+        })
+        .await
+        .expect("register sustained physical table in Redux control plane");
+    let machine = server
+        .bootstrap_service("incremental-sustained-query", &["admin"])
+        .await
+        .expect("bootstrap sustained query principal");
+    let api_key = match machine {
+        wyrd_testing::Bootstrap::Machine { api_key, .. } => api_key,
+        other => panic!("expected machine bootstrap, got {other:?}"),
+    };
+    let jwt = server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("exchange sustained query API key");
     let mut config = fixture.config.clone();
     config.max_hints_per_wake = 1;
     config.max_files_per_bin = 2;
@@ -277,7 +313,7 @@ async fn pg_bifrost_forge_incremental_sustained() {
     // The seeded fixture contributes two rows in addition to 16×100,000 rows.
     assert_eq!(rows, 1_600_004);
     assert_eq!(
-        oracle_table_rows(&fixture).await,
+        oracle_table_rows(&server, &jwt, &fixture).await,
         1_600_004,
         "Oracle provider must read every compacted sustained row"
     );
@@ -346,34 +382,33 @@ async fn pg_bifrost_forge_incremental_sustained() {
     server.shutdown().await.expect("server shutdown");
 }
 
-/// Scan the committed Iceberg snapshot through its production table reader.
+/// Query the bound server's authenticated Oracle endpoint for one tenant table.
 ///
 /// # Panics
 ///
-/// Panics when the committed table cannot be loaded, registered, planned, or
-/// scanned.
-async fn oracle_table_rows(fixture: &ForgeFixture) -> u64 {
-    let table = fixture
-        .catalog
-        .load_table(&fixture.binding.table_ident())
+/// Panics when the public request fails or omits a valid row-count header.
+async fn oracle_table_rows(server: &WyrdTestServer, jwt: &str, fixture: &ForgeFixture) -> u64 {
+    let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
+    reqwest::Client::new()
+        .post(url)
+        .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+        .json(&SyncQueryRequest {
+            sql: format!(
+                "SELECT * FROM \"vala.bifrost.{}\"",
+                fixture.binding.table_name
+            ),
+            params: Vec::new(),
+        })
+        .send()
         .await
-        .expect("load committed Oracle table");
-    let scan = table
-        .scan()
-        .select_all()
-        .build()
-        .expect("build committed Oracle scan");
-    let batches = scan
-        .to_arrow()
-        .await
-        .expect("create committed Oracle stream")
-        .try_fold(
-            0_usize,
-            |rows, batch| async move { Ok(rows + batch.num_rows()) },
-        )
-        .await
-        .expect("scan committed Oracle table");
-    u64::try_from(batches).expect("Oracle row count fits u64")
+        .expect("Oracle request")
+        .error_for_status()
+        .expect("Oracle response")
+        .headers()
+        .get("x-wyrd-row-count")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("Oracle row-count header")
 }
 
 async fn pending_file_count(fixture: &ForgeFixture) -> i64 {

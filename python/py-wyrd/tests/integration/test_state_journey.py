@@ -115,7 +115,6 @@ class RuntimeServiceFixture:
                             "name": ref.name,
                             "version": ref.version,
                             "space": ref.space,
-                            "uid": ref.uid,
                         }
                 return {key: rewrite(item) for key, item in value.items()}
             if isinstance(value, list):

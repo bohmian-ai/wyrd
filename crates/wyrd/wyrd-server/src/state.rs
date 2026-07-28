@@ -345,6 +345,13 @@ impl AppState {
         self.forge.as_ref()
     }
 
+    /// Borrow the retained Bifrost Scribe for test-tier harness inspection.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn bifrost_scribe_for_test(&self) -> Option<&Arc<ScribeImpl>> {
+        self.bifrost_ingest.as_ref().map(|runtime| runtime.scribe())
+    }
+
     /// Flush the private Scribe runtime for the test harness only.
     #[cfg(feature = "test-support")]
     pub async fn flush_scribe_for_test(

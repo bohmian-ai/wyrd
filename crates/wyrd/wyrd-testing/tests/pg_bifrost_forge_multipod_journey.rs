@@ -2,7 +2,9 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use wyrd_testing::WyrdTestServer;
-use wyrd_testing::bifrost::{seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days};
+use wyrd_testing::bifrost::{
+    BifrostHarness, seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days,
+};
 
 #[tokio::test]
 #[ignore = "gated journey: bound Wyrd server plus shared Postgres and Iceberg"]
@@ -143,20 +145,29 @@ async fn journey_forge_scheduler_restart_preserves_reads_and_live_files() {
 /// The journey fails when the bound server, durable SQL state, or Iceberg
 /// catalog cannot complete the incremental compaction.
 async fn active_partition_incremental_compaction() {
-    let server = WyrdTestServer::builder()
-        .with_forge_interval(Duration::from_secs(3600))
-        .start_bound()
+    let harness = BifrostHarness::start(3, 1)
         .await
-        .expect("test server");
+        .expect("three-pod Bifrost harness");
+    let servers = harness.cluster().servers();
+    assert_eq!(
+        servers.len(),
+        3,
+        "BifrostHarness must expose three real pods"
+    );
+    for server in servers {
+        server.cancel_bound_workers();
+    }
+    let server = &servers[0];
     let today = chrono::Utc::now().date_naive();
     let fixture = seed_forge_group_for_tenant_with_schema_and_days(
-        &server,
+        server,
         server.data_tenant_id(),
         "active_incremental_rows",
         false,
         &[today],
     )
     .await;
+    let pod_fixtures = vec![fixture.clone(), fixture.clone(), fixture.clone()];
     let total_bytes: i64 = sqlx::query_scalar(
         "SELECT coalesce(sum(file_size), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
     )
@@ -166,46 +177,41 @@ async fn active_partition_incremental_compaction() {
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("active file sizes");
-    let mut config = fixture.config.clone();
-    config.target_bin_bytes = u64::try_from(total_bytes).expect("positive active bytes");
-    config.max_hints_per_wake = 1;
-    let (forge, publisher) = fixture.context_with_config_and_publisher(config.clone());
-    let (competing_forge_a, competing_publisher_a) =
-        fixture.context_with_config_and_publisher(config.clone());
-    let (competing_forge_b, competing_publisher_b) =
-        fixture.context_with_config_and_publisher(config);
-    assert_eq!(
-        publisher.try_publish(StagingFileCommitted::new(fixture.binding.clone(), today)),
-        StagingPublishOutcome::Published
-    );
-    assert_eq!(
-        publisher.try_publish(StagingFileCommitted::new(fixture.binding.clone(), today)),
-        StagingPublishOutcome::DroppedFull
-    );
-    assert_eq!(
-        competing_publisher_a
-            .try_publish(StagingFileCommitted::new(fixture.binding.clone(), today)),
-        StagingPublishOutcome::Published
-    );
-    assert_eq!(
-        competing_publisher_b
-            .try_publish(StagingFileCommitted::new(fixture.binding.clone(), today)),
-        StagingPublishOutcome::Published
-    );
+    let _ = total_bytes;
+    let pod_forges = harness.server_forges();
+    let pod_publishers = harness.server_forge_publishers();
+    assert_eq!(pod_forges.len(), 3);
+    assert_eq!(pod_publishers.len(), 3);
+    for (pod, (forge, publisher)) in pod_fixtures
+        .iter()
+        .zip(pod_forges.iter().zip(&pod_publishers))
+    {
+        assert_eq!(
+            publisher.try_publish(StagingFileCommitted::new(pod.binding.clone(), today)),
+            StagingPublishOutcome::Published
+        );
+        assert_eq!(
+            publisher.try_publish(StagingFileCommitted::new(pod.binding.clone(), today)),
+            StagingPublishOutcome::Published
+        );
+        assert!(
+            forge
+                .run_once()
+                .await
+                .expect("pod hinted tick")
+                .bins_committed
+                <= 1
+        );
+    }
     let shutdown = CancellationToken::new();
-    let scheduler = tokio::spawn({
-        let forge = forge.clone();
-        let stop = shutdown.clone();
-        async move { forge.run(stop).await }
-    });
-    let scheduler_a = tokio::spawn({
-        let stop = shutdown.clone();
-        async move { competing_forge_a.run(stop).await }
-    });
-    let scheduler_b = tokio::spawn({
-        let stop = shutdown.clone();
-        async move { competing_forge_b.run(stop).await }
-    });
+    let schedulers = pod_forges
+        .iter()
+        .map(|forge| {
+            let forge = forge.clone();
+            let stop = shutdown.clone();
+            tokio::spawn(async move { forge.run(stop).await })
+        })
+        .collect::<Vec<_>>();
     let mut compacted = 0_i64;
     for _ in 0..100 {
         compacted = sqlx::query_scalar(
@@ -223,18 +229,12 @@ async fn active_partition_incremental_compaction() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     shutdown.cancel();
-    scheduler
-        .await
-        .expect("active scheduler")
-        .expect("scheduler shutdown");
-    scheduler_a
-        .await
-        .expect("competing scheduler")
-        .expect("scheduler shutdown");
-    scheduler_b
-        .await
-        .expect("competing scheduler")
-        .expect("scheduler shutdown");
+    for scheduler in schedulers {
+        scheduler
+            .await
+            .expect("active scheduler")
+            .expect("scheduler shutdown");
+    }
     assert_eq!(compacted, 2);
     assert_eq!(
         fixture.operation_count("forge.file_compact.prepared").await,
@@ -342,5 +342,5 @@ async fn active_partition_incremental_compaction() {
         tail.operation_count("forge.file_compact.committed").await,
         1
     );
-    server.shutdown().await.expect("server shutdown");
+    harness.shutdown().await.expect("harness shutdown");
 }

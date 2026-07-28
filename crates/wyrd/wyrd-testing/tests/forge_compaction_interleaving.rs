@@ -471,15 +471,33 @@ async fn forge_incremental_interleaving() {
         1
     );
     let hinted = seed_forge_group(&server, "hint_periodic_rows").await;
+    let hint_control = CommitUncertaintyCatalog::new(Arc::clone(&hinted.catalog));
+    hint_control.pause_before_commit();
     let (hint_forge, hint_publisher) =
-        hinted.context_with_config_and_publisher(hinted.config.clone());
+        hinted.context_with_catalog_and_publisher(hinted.config.clone(), hint_control.clone());
     let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
     assert_eq!(
         hint_publisher.try_publish(StagingFileCommitted::new(hinted.binding.clone(), day)),
         StagingPublishOutcome::Published
     );
-    let hint_outcome = hint_forge.run_once().await.expect("hint/periodic tick");
-    assert!(hint_outcome.bins_committed <= 1);
+    let hint_stop = CancellationToken::new();
+    let hint_task = tokio::spawn({
+        let forge = hint_forge.clone();
+        let stop = hint_stop.clone();
+        async move { forge.run(stop).await }
+    });
+    hint_control.wait_for_before_commit().await;
+    hint_stop.cancel();
+    hint_control.reject_paused_before_commit();
+    hint_task
+        .await
+        .expect("hint scheduler task")
+        .expect("hint scheduler shutdown");
+    assert_eq!(
+        hinted.operation_count("forge.file_compact.committed").await,
+        0
+    );
+    hint_forge.run_once().await.expect("periodic recovery tick");
     assert_eq!(
         hinted.operation_count("forge.file_compact.committed").await,
         1

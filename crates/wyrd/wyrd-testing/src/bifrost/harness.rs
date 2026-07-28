@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use thiserror::Error;
+use vala_bifrost_redux::forge::Forge;
+use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::execution_lanes::{
     ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool,
@@ -20,6 +22,7 @@ use vala_sql::TenantConn;
 use wyrd_spec::DataTenantId;
 
 use super::{BifrostTopology, ClusterError, WyrdTestCluster};
+use crate::WyrdTestServer;
 
 /// Errors raised while constructing or draining the real harness.
 #[derive(Debug, Error)]
@@ -89,9 +92,26 @@ impl BifrostHarness {
         };
         let cluster =
             WyrdTestCluster::start_with_wal_sync_delay(pods, topology, wal_sync_delay).await?;
-        match Self::start_with_cluster(&cluster, tenant_count, wal_sync_delay, persistence_faults)
-            .await
-        {
+        let actual_scribes = wal_sync_delay.is_zero();
+        let setup = if actual_scribes {
+            let tenants = {
+                let mut tenants = vec![cluster.data_tenant_id()];
+                for index in 1..tenant_count {
+                    tenants.push(cluster.add_tenant(&format!("bench-tenant-{index}")).await?);
+                }
+                tenants
+            };
+            let scribes = cluster
+                .servers()
+                .iter()
+                .filter_map(WyrdTestServer::bifrost_scribe)
+                .collect();
+            Ok((scribes, tenants))
+        } else {
+            Self::start_with_cluster(&cluster, tenant_count, wal_sync_delay, persistence_faults)
+                .await
+        };
+        match setup {
             Ok((scribes, tenants)) => Ok(Self {
                 cluster,
                 scribes,
@@ -187,6 +207,26 @@ impl BifrostHarness {
     #[must_use]
     pub fn scribes(&self) -> &[Arc<ScribeImpl>] {
         &self.scribes
+    }
+
+    /// Return the Forge handles retained by each real bound server pod.
+    #[must_use]
+    pub fn server_forges(&self) -> Vec<Arc<Forge>> {
+        self.cluster
+            .servers()
+            .iter()
+            .filter_map(|server| server.state().forge().cloned())
+            .collect()
+    }
+
+    /// Return publishers paired with the real server-owned Forge inboxes.
+    #[must_use]
+    pub fn server_forge_publishers(&self) -> Vec<StagingFilePublisher> {
+        self.cluster
+            .servers()
+            .iter()
+            .map(WyrdTestServer::forge_publisher)
+            .collect()
     }
 
     /// Acquire a tenant-scoped connection from the shared fixture.

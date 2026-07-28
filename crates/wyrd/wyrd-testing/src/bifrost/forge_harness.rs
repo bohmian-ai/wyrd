@@ -425,6 +425,20 @@ impl ForgeFixture {
         )
     }
 
+    /// Build a Forge with a scoped catalog and its paired local hint publisher.
+    ///
+    /// The publisher remains connected to the exact inbox owned by the
+    /// returned Forge, allowing interleaving tests to drive the hinted
+    /// scheduler branch rather than a periodic fallback.
+    #[must_use]
+    pub fn context_with_catalog_and_publisher(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
+        self.build_forge_with_publisher(config, catalog, Arc::clone(&self.object_store))
+    }
+
     /// Return a read-only snapshot of the shared Bifrost memory parent.
     #[must_use]
     pub fn memory_snapshot(&self) -> vala_bifrost_redux::scribe::memory::MemorySnapshot {
@@ -518,6 +532,22 @@ impl ForgeFixture {
         .await;
     }
 
+    /// Append a large aged file for spill-focused sustained journeys.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the requested row count cannot be represented in the
+    /// durable fixture metadata or the test object cannot be encoded.
+    pub async fn append_forge_file_with_rows(&self, sequence: i64, rows: usize) {
+        self.append_forge_file_for_day_with_rows(
+            sequence,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day"),
+            true,
+            rows,
+        )
+        .await;
+    }
+
     /// Append one Scribe-shaped file for an explicit partition day.
     pub async fn append_forge_file_for_day(
         &self,
@@ -525,6 +555,23 @@ impl ForgeFixture {
         partition_day: chrono::NaiveDate,
         aged: bool,
     ) {
+        self.append_forge_file_for_day_with_rows(sequence, partition_day, aged, 1)
+            .await;
+    }
+
+    /// Append a Scribe-shaped file with an explicit row count and partition.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `rows` is zero or the test object cannot be encoded.
+    async fn append_forge_file_for_day_with_rows(
+        &self,
+        sequence: i64,
+        partition_day: chrono::NaiveDate,
+        aged: bool,
+        rows: usize,
+    ) {
+        assert!(rows > 0, "Forge fixture files must contain rows");
         let schema = ArrowSchema::new(vec![
             Field::new("value", DataType::Int64, false),
             Field::new(
@@ -540,12 +587,22 @@ impl ForgeFixture {
             .and_utc()
             .timestamp_micros()
             + sequence * 1_000_000;
+        let values = (0..rows)
+            .map(|offset| {
+                sequence.saturating_mul(1_000_000)
+                    + i64::try_from(offset).expect("Forge fixture row offset")
+            })
+            .collect::<Vec<_>>();
+        let times = (0..rows)
+            .map(|offset| base + i64::try_from(offset).expect("row offset") * 1_000)
+            .collect::<Vec<_>>();
+        let tenants = vec![self.tenant.to_string(); rows];
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
-                Arc::new(Int64Array::from(vec![sequence])),
-                Arc::new(TimestampMicrosecondArray::from(vec![base]).with_timezone("UTC")),
-                Arc::new(StringArray::from(vec![self.tenant.to_string()])),
+                Arc::new(Int64Array::from(values)),
+                Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                Arc::new(StringArray::from(tenants)),
             ],
         )
         .expect("Forge fixture append batch");
@@ -573,7 +630,7 @@ impl ForgeFixture {
         .bind(&self.binding.table_name)
         .bind(&path)
         .bind(file_size)
-        .bind(1_i64)
+        .bind(i64::try_from(rows).expect("Forge fixture row count"))
         .bind(chrono::DateTime::from_timestamp_micros(base).expect("timestamp"))
         .bind(chrono::DateTime::from_timestamp_micros(base + 1_000_000).expect("timestamp"))
         .bind(partition_day)

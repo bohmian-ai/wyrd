@@ -22,7 +22,7 @@ use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
-use vala_bifrost_redux::maintenance::staging_file_channel;
+use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
@@ -121,6 +121,7 @@ struct WyrdTestServerInner {
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
+    forge_publisher: StagingFilePublisher,
 }
 
 enum Mode {
@@ -376,6 +377,18 @@ impl WyrdTestServer {
     #[must_use]
     pub fn state(&self) -> &AppState {
         &self.inner.state
+    }
+
+    /// Return the publisher paired with this server's Forge inbox.
+    #[must_use]
+    pub fn forge_publisher(&self) -> StagingFilePublisher {
+        self.inner.forge_publisher.clone()
+    }
+
+    /// Return the Scribe retained by this server's production ingest runtime.
+    #[must_use]
+    pub fn bifrost_scribe(&self) -> Option<Arc<ScribeImpl>> {
+        self.inner.state.bifrost_scribe_for_test().cloned()
     }
 
     /// Return the fixture tenant id.
@@ -1335,7 +1348,7 @@ impl WyrdTestServerBuilder {
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let forge_config = ForgeConfig::default();
-        let (_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
+        let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(
             vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
@@ -1391,6 +1404,7 @@ impl WyrdTestServerBuilder {
                     admission: scribe_admission,
                     coordination_runtime: tokio::runtime::Handle::current(),
                     memory_budget: Some(bifrost_memory.scribe_budget()),
+                    staging_file_publisher: Some(forge_publisher.clone()),
                 },
             )
         } else {
@@ -1405,6 +1419,7 @@ impl WyrdTestServerBuilder {
                     admission: scribe_admission,
                     coordination_runtime: tokio::runtime::Handle::current(),
                     memory_budget: Some(bifrost_memory.scribe_budget()),
+                    staging_file_publisher: Some(forge_publisher.clone()),
                 },
             )
             .map_err(WyrdTestServerError::Start)?
@@ -1450,6 +1465,7 @@ impl WyrdTestServerBuilder {
                 verifier,
                 issuing_key,
                 api_key: SecretString::from(String::new()),
+                forge_publisher,
             },
             mode: Mode::InProcess,
             shutdown_token: None,

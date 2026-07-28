@@ -183,19 +183,11 @@ async fn pg_bifrost_forge_incremental_sustained() {
     )
     .await;
     server.cancel_bound_workers();
-    sqlx::query(
-        "UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .bind(&fixture.binding.logical_namespace)
-    .bind(&fixture.binding.table_name)
-    .execute(fixture.operator_pool.pool())
-    .await
-    .expect("age sustained fixture rows");
     let baseline_memory = fixture.memory_snapshot().bifrost_total_bytes;
     let mut config = fixture.config.clone();
     config.max_hints_per_wake = 1;
     config.max_files_per_bin = 2;
+    config.output_file_bytes = 1;
     let (forge, publisher) = fixture.context_with_config_and_publisher(config);
     let drain_forge = forge.clone();
     assert_eq!(
@@ -218,8 +210,12 @@ async fn pg_bifrost_forge_incremental_sustained() {
         async move { forge.run(stop).await }
     });
     for sequence in 0..8_i64 {
-        fixture.append_forge_file(100 + sequence * 2).await;
-        fixture.append_forge_file(101 + sequence * 2).await;
+        fixture
+            .append_forge_file_with_rows(100 + sequence * 2, 100_000)
+            .await;
+        fixture
+            .append_forge_file_with_rows(101 + sequence * 2, 100_000)
+            .await;
         let _ = publisher.try_publish(StagingFileCommitted::new(
             fixture.binding.clone(),
             chrono::Utc::now().date_naive(),
@@ -227,17 +223,30 @@ async fn pg_bifrost_forge_incremental_sustained() {
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
     server.cancel_bound_workers();
+    let mut spill_bytes = 0_u64;
+    let mut outputs_committed = 0_usize;
     for _ in 0..20 {
-        drain_forge
+        let outcome = drain_forge
             .run_once()
             .await
             .expect("incremental drain tick");
+        spill_bytes = spill_bytes.max(outcome.spill_bytes);
+        outputs_committed = outputs_committed.saturating_add(outcome.outputs_committed);
         if maintenance_settled(&fixture).await {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(pending_file_count(&fixture).await, 0);
+    assert!(
+        spill_bytes > 0,
+        "incremental rewrite must exercise DataFusion spill"
+    );
+    assert!(spill_bytes <= fixture.config.spill_limit_bytes);
+    assert!(
+        outputs_committed > 1,
+        "small output ceiling must rotate outputs"
+    );
     let rows: i64 = sqlx::query_scalar(
         "SELECT coalesce(sum(row_count), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
     )
@@ -247,7 +256,7 @@ async fn pg_bifrost_forge_incremental_sustained() {
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("sustained row count");
-    assert_eq!(rows, 20);
+    assert_eq!(rows, 1_600_002);
     assert!(
         fixture
             .operation_count("forge.file_compact.committed")

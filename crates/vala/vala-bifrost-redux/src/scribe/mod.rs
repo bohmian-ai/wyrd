@@ -186,6 +186,8 @@ pub struct ScribeEmbeddedConfig {
     pub coordination_runtime: Handle,
     /// Optional server-provisioned Scribe child budget.
     pub memory_budget: Option<memory::ScribeMemoryBudget>,
+    /// Optional bounded publisher for post-commit Forge wake-ups.
+    pub staging_file_publisher: Option<StagingFilePublisher>,
 }
 
 impl ScribeImpl {
@@ -252,6 +254,7 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime: Handle::current(),
                 memory_budget: None,
+                staging_file_publisher: None,
             },
         )
     }
@@ -384,6 +387,7 @@ impl ScribeImpl {
                 admission,
                 coordination_runtime,
                 memory_budget: None,
+                staging_file_publisher: None,
             },
         )
     }
@@ -427,7 +431,7 @@ impl ScribeImpl {
             ),
             persistence: None,
             memory_budget: config.memory_budget,
-            staging_file_publisher: None,
+            staging_file_publisher: config.staging_file_publisher,
         })
     }
 

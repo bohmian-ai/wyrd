@@ -15,10 +15,21 @@ from wyrd.model import ModelInterface
 
 
 class TinyModelInterface(ModelInterface):
-    """Test-only model loader that records its local path and load arguments."""
+    """Test-only Model interface for proving offline loader delegation.
+
+    The fixture writes deterministic bytes below a caller-owned bundle path,
+    records the artifact directory and kwargs passed by Rust, and exposes
+    identity callables as loaded model and preprocessor values. It performs no
+    network access; the ``model`` and ``preprocessor`` attributes are deliberate
+    test invariants rather than production inference implementations.
+    """
 
     def __init__(self) -> None:
-        """Initialize empty model and preprocessor slots for hydration assertions."""
+        """Initialize empty holder slots and loader telemetry for assertions.
+
+        The superclass is initialized first so the object remains a valid
+        ``ModelInterface``; all additional fields are test-only observations.
+        """
         super().__init__()
         self.model: Any = None
         self.preprocessor: Any = None
@@ -27,7 +38,16 @@ class TinyModelInterface(ModelInterface):
         self.loaded_kwargs: dict[str, Any] | None = None
 
     def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
-        """Write deterministic bytes below ``path`` and return their statistics."""
+        """Write deterministic fixture bytes below ``path`` and report them.
+
+        Args:
+            path: Artifact-root directory supplied by the hydration runtime.
+            save_kwargs: Ignored test-only save options.
+        Returns:
+            Byte count and SHA-256 digest for the created payload.
+        Side effects:
+            Creates ``path/model/tiny.bin`` on the local filesystem.
+        """
         del save_kwargs
         output = path / "model" / "tiny.bin"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -36,7 +56,15 @@ class TinyModelInterface(ModelInterface):
         return DataStats(byte_count=len(payload), sha256=hashlib.sha256(payload).hexdigest())
 
     def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
-        """Record the verified artifact directory and expose callable test objects."""
+        """Record local load inputs and expose deterministic callable values.
+
+        Args:
+            path: Verified bundle-local artifact directory.
+            load_kwargs: Alias-specific options forwarded by ``WyrdState``.
+        Side effects:
+            Reads no bytes and performs no network access; it only records the
+            path/options and sets the test holder attributes.
+        """
         self.loaded_path = path
         self.loaded_kwargs = dict(load_kwargs or {})
         self.model = lambda value: value
@@ -45,17 +73,36 @@ class TinyModelInterface(ModelInterface):
 
 
 class TinyDataInterface(DataInterface):
-    """Test-only data loader that records local loading and returns a tiny dataset."""
+    """Test-only Data interface for proving local dataset hydration.
+
+    Loading records the verified artifact directory and publishes a tiny
+    deterministic mapping. The mapping is intentionally a test-only invariant
+    used to prove the public DataCard holder remains alive after hydration.
+    """
 
     def __init__(self) -> None:
-        """Initialize an empty data value and loader telemetry fields."""
+        """Initialize empty data state and test-only loader telemetry.
+
+        The constructor performs no filesystem or network work. Its fields are
+        mutable observations used to verify that Rust hydration forwards the
+        confined artifact path and preserves the loaded DataCard holder.
+        """
         super().__init__()
         self.data: Any = None
         self.loaded_path: Path | None = None
         self.loaded_kwargs: dict[str, Any] | None = None
 
     def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
-        """Write deterministic bytes below ``path`` and return their statistics."""
+        """Write deterministic fixture bytes below ``path`` and report them.
+
+        Args:
+            path: Artifact-root directory supplied by the hydration runtime.
+            save_kwargs: Ignored test-only save options.
+        Returns:
+            Byte count and SHA-256 digest for the created payload.
+        Side effects:
+            Creates ``path/data/tiny.bin`` on the local filesystem.
+        """
         del save_kwargs
         output = path / "data" / "tiny.bin"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -64,19 +111,44 @@ class TinyDataInterface(DataInterface):
         return DataStats(byte_count=len(payload), sha256=hashlib.sha256(payload).hexdigest())
 
     def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
-        """Record the verified artifact directory and expose a deterministic data value."""
+        """Record local load inputs and expose a deterministic data mapping.
+
+        Args:
+            path: Verified bundle-local artifact directory.
+            load_kwargs: Alias-specific options forwarded by ``WyrdState``.
+        Side effects:
+            Performs no network access and does not read payload bytes; it only
+            records arguments and sets the test dataset invariant.
+        """
         self.loaded_path = path
         self.loaded_kwargs = dict(load_kwargs or {})
         self.data = {"rows": [{"value": 1}]}
 
 
 def _ref(kind: str, name: str, uid: str) -> dict[str, str]:
-    """Return one complete CardRef mapping with stable fixture identity fields."""
+    """Build one deterministic CardRef mapping for a fixture Card.
+
+    Args:
+        kind: Native Card kind string.
+        name: Friendly Card name.
+        uid: Stable fixture UID.
+    Returns:
+        A complete versioned and space-qualified mapping accepted by the
+        bundle loader. This helper is pure and has no filesystem side effects.
+    """
     return {"kind": kind, "name": name, "version": "1.0.0", "space": "default", "uid": uid}
 
 
 def _card(ref: dict[str, str], spec: dict[str, Any]) -> dict[str, Any]:
-    """Wrap a fixture spec in the complete v1 Card envelope expected by WyrdState."""
+    """Wrap a fixture spec in the complete ``wyrd/v1`` Card envelope.
+
+    Args:
+        ref: CardRef mapping produced by :func:`_ref`.
+        spec: Kind-specific declarative spec mapping.
+    Returns:
+        A JSON/YAML-compatible complete Card dictionary with empty relationship
+        lists. The conversion is pure and does not write files.
+    """
     return {
         "apiVersion": "wyrd/v1",
         "kind": ref["kind"],
@@ -96,8 +168,16 @@ def _card(ref: dict[str, str], spec: dict[str, Any]) -> dict[str, Any]:
 def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False) -> Path:
     """Create a complete offline service bundle with model, data, prompt, and agents.
 
-    The builder writes only local YAML, alias indexes, inventories, and tiny artifact
-    bytes. It never starts a server; tests intentionally exercise the real Rust loader.
+    Args:
+        tmp_path: Pytest-managed temporary filesystem root.
+        duplicate_model_alias: Add ``primary_model`` pointing at the same exact
+            Model Card to exercise persistent identity and config conflict rules.
+    Returns:
+        The complete ``bundle`` directory containing metadata, Card YAML,
+        relationships, aliases, inventories, and confined payloads.
+    Side effects:
+        Creates and writes the complete fixture tree below ``tmp_path``. It
+        never starts a server or contacts a registry.
     """
     root = tmp_path / "bundle"
     root.mkdir()
@@ -274,8 +354,14 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
 def build_builtin_model_bundle(tmp_path: Path) -> Path:
     """Create a complete bundle whose primary Model uses native Sklearn loading.
 
-    A fitted ``LogisticRegression`` is serialized as ``model.joblib`` beneath the
-    verified model artifact directory; no custom interface override is needed.
+    Args:
+        tmp_path: Pytest-managed temporary filesystem root.
+    Returns:
+        The complete bundle directory containing a fitted ``model.joblib``.
+    Side effects:
+        Rewrites the model Card and metadata, removes the tiny custom payload,
+        and writes joblib bytes below the exact model artifact root. The
+        test-only invariant is that no ``model`` interface override is needed.
     """
     root = build_complete_bundle(tmp_path)
     card_path = root / "cards/model/card.yaml"

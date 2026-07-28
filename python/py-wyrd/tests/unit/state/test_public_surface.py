@@ -60,9 +60,9 @@ def test_public_state_surfaces_have_runtime_docstrings() -> None:
     }
     for value, names in required.items():
         for name in names:
-            assert inspect.getdoc(getattr(value, name)), (
-                f"missing runtime docs for {value.__name__}.{name}"
-            )
+            member = getattr(value, name)
+            doc = inspect.getdoc(member)
+            assert doc and len(doc) > 20, f"missing runtime docs for {value.__name__}.{name}"
     doc = inspect.getdoc(WyrdState.from_path)
     assert doc and "offline" in doc.lower() and "stable" in doc.lower() and "error" in doc.lower()
 
@@ -73,11 +73,46 @@ def test_generated_state_stubs_retain_docstrings() -> None:
     text = stub.read_text(encoding="utf-8")
     assert "WyrdState.from_path" in text
     assert "offline" in text.lower()
+    assert "./service-bundle" in text
+    assert "WYRD_SDK_" in text
     assert "class CardEnvelope" in text and "class HydratedArtifact" in text
+    assert "class WyrdState" in text
     assert "path: str | Path" in text
     assert "interfaces" in text and "load_kwargs" in text
     assert "Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]" in text
-    assert "./service-bundle" in text
+    for class_name, members in {
+        "CardEnvelope": (
+            "card_ref",
+            "aliases",
+            "kind",
+            "metadata",
+            "spec",
+            "relationships",
+            "status",
+            "model_dump",
+            "model_dump_json",
+        ),
+        "HydratedArtifact": ("relative_path", "local_path", "sha256", "size_bytes", "content_type"),
+        "WyrdState": (
+            "from_path",
+            "service",
+            "aliases",
+            "card",
+            "card_ref",
+            "artifacts",
+            "model",
+            "data",
+            "agent",
+            "prompt",
+            "eval",
+            "drift",
+            "workflow",
+        ),
+    }.items():
+        assert f"class {class_name}" in text
+        for member in members:
+            assert member in text
+    assert "Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]]" in text
 
 
 def test_card_envelope_exposes_complete_registered_card(tmp_path: Path) -> None:
@@ -116,3 +151,8 @@ def test_wrong_kind_accessor_raises_stable_wyrd_error(tmp_path: Path) -> None:
     with pytest.raises(wyrd.WyrdError) as caught:
         state.model("root")
     assert caught.value.code == "WYRD_SDK_400_CARD_KIND_MISMATCH"
+    assert caught.value.details["alias"] == "root"
+    assert caught.value.details["expected_kind"] == "Model"
+    assert caught.value.details["actual_kind"] == "Service"
+    assert caught.value.details["card_ref"]["kind"] == "Service"
+    assert caught.value.details["card_ref"]["name"] == "service"

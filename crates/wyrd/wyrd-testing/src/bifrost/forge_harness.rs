@@ -425,6 +425,21 @@ impl ForgeFixture {
         )
     }
 
+    /// Build a Forge graph with a deterministic DataFusion memory ceiling.
+    #[must_use]
+    pub fn context_with_constrained_memory_and_publisher(
+        &self,
+        config: ForgeConfig,
+        memory_limit_bytes: usize,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
+        self.build_forge_with_publisher_and_memory(
+            config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+            Some(memory_limit_bytes),
+        )
+    }
+
     /// Build a Forge with a scoped catalog and its paired local hint publisher.
     ///
     /// The publisher remains connected to the exact inbox owned by the
@@ -490,14 +505,30 @@ impl ForgeFixture {
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
     ) -> (Arc<Forge>, StagingFilePublisher) {
+        self.build_forge_with_publisher_and_memory(config, catalog, object_store, None)
+    }
+
+    /// Construct a Forge graph with an optional isolated DataFusion pool.
+    fn build_forge_with_publisher_and_memory(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        memory_limit_bytes: Option<usize>,
+    ) -> (Arc<Forge>, StagingFilePublisher) {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
-        let runtime = ForgeRewriteRuntime::new(
+        let query_memory = if let Some(limit) = memory_limit_bytes {
+            vala_bifrost_redux::scribe::constrained_datafusion_memory_pool(limit)
+        } else {
             Arc::new(
                 vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
                     self.memory.clone(),
                 ),
-            ),
+            )
+        };
+        let runtime = ForgeRewriteRuntime::new(
+            query_memory,
             &self
                 .spill_root
                 .path()

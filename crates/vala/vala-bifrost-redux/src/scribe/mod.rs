@@ -37,12 +37,20 @@ use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
 };
 use async_trait::async_trait;
+use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
 use vala_sql::TenantConn;
+
+/// Build a test-tier DataFusion pool with an explicit bounded ceiling.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn constrained_datafusion_memory_pool(limit_bytes: usize) -> Arc<dyn MemoryPool> {
+    Arc::new(GreedyMemoryPool::new(limit_bytes.max(1)))
+}
 
 /// Memtable key for per-bucket row-count inspection.
 ///

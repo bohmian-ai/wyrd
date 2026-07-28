@@ -188,7 +188,8 @@ async fn pg_bifrost_forge_incremental_sustained() {
     config.max_hints_per_wake = 1;
     config.max_files_per_bin = 2;
     config.output_file_bytes = 1;
-    let (forge, publisher) = fixture.context_with_config_and_publisher(config);
+    let (forge, publisher) =
+        fixture.context_with_constrained_memory_and_publisher(config, 16 * 1024 * 1024);
     let drain_forge = forge.clone();
     assert_eq!(
         publisher.try_publish(StagingFileCommitted::new(
@@ -256,7 +257,8 @@ async fn pg_bifrost_forge_incremental_sustained() {
     .fetch_one(fixture.operator_pool.pool())
     .await
     .expect("sustained row count");
-    assert_eq!(rows, 1_600_002);
+    // The seeded fixture contributes two rows in addition to 16×100,000 rows.
+    assert_eq!(rows, 1_600_004);
     assert!(
         fixture
             .operation_count("forge.file_compact.committed")

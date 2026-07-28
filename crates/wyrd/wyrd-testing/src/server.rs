@@ -147,6 +147,8 @@ pub struct WyrdTestServerBuilder {
     trusted_issuer_configs: Vec<IssuerEntry>,
     workload_binding_configs: Vec<WorkloadBindingEntry>,
     forge_interval: Duration,
+    /// Test-tier bin width makes three-file current-day journeys deterministic.
+    forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
 }
@@ -164,6 +166,7 @@ impl Default for WyrdTestServerBuilder {
             trusted_issuer_configs: Vec::new(),
             workload_binding_configs: Vec::new(),
             forge_interval: Duration::from_secs(60),
+            forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
         }
@@ -1349,7 +1352,8 @@ impl WyrdTestServerBuilder {
             scribe_admission.scribe_memory_limit_bytes,
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let forge_config = ForgeConfig::default();
+        let mut forge_config = ForgeConfig::default();
+        forge_config.max_files_per_bin = self.forge_max_files_per_bin;
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(

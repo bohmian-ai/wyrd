@@ -170,16 +170,7 @@ async fn active_partition_incremental_compaction() {
         .exchange_api_key(&api_key)
         .await
         .expect("exchange API key for JWT");
-    let pod_forges = harness.server_forges();
-    let shutdown = CancellationToken::new();
-    let schedulers = pod_forges
-        .iter()
-        .map(|forge| {
-            let forge = forge.clone();
-            let stop = shutdown.clone();
-            tokio::spawn(async move { forge.run(stop).await })
-        })
-        .collect::<Vec<_>>();
+    let publishers = harness.server_forge_publishers();
     let mut generator = RandomTraceGenerator::from_seed_at(
         0xA11CE,
         u64::try_from(
@@ -222,10 +213,13 @@ async fn active_partition_incremental_compaction() {
             assert!(response.partial_success.is_none());
         }
     }
-    for pod in servers {
+    for (index, pod) in servers.iter().enumerate() {
+        let before = publishers[index].capacity_for_test();
         pod.flush_bifrost_for_tenant(tenant)
             .await
             .expect("server-owned Scribe flush");
+        let after_flush = publishers[index].capacity_for_test();
+        assert!(after_flush <= before);
     }
     let total_files: i64 =
         sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1")
@@ -241,12 +235,71 @@ async fn active_partition_incremental_compaction() {
             .await
             .expect("OTLP file-list rows");
     assert!(total_files > 0, "OTLP flush produced no file-list rows");
-    tokio::time::sleep(Duration::from_millis(250)).await;
     let operator_pool = server
         .state()
         .postgres
         .operator_pool()
         .expect("operator pool");
+    let rows = sqlx::query_as::<_, (String, String, chrono::NaiveDate, bool, Option<i64>, i64, i64)>(
+        "SELECT namespace, table_name, partition_day, compacted, committed_snapshot_id, file_size, row_count FROM vala.file_list WHERE data_tenant_id = $1 ORDER BY created_at",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_all(operator_pool.pool())
+    .await
+    .expect("OTLP file-list diagnostics");
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(
+        |(namespace, table, day, compacted, snapshot, _, row_count)| {
+            namespace == "vala.traces"
+                && table == "spans"
+                && *day == chrono::Utc::now().date_naive()
+                && !compacted
+                && snapshot.is_none()
+                && *row_count == 12
+        }
+    ));
+    for publisher in &publishers {
+        for _ in 0..100 {
+            if publisher.capacity_for_test() == 256 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(publisher.capacity_for_test(), 256);
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let mut audit_conn = server
+        .state()
+        .postgres
+        .vala()
+        .tenant_conn(tenant)
+        .await
+        .expect("Forge audit tenant connection");
+    let audit_rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT operation, result, detail FROM vala.audit_outbox WHERE data_tenant_id = $1 AND resource LIKE 'bifrost://%/vala.traces/spans' ORDER BY created_at",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_all(&mut **audit_conn.transaction())
+    .await
+    .expect("Forge audit diagnostics");
+    drop(audit_conn);
+    let leases_now: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.maintenance_leases WHERE lease_key LIKE 'forge:table:%'",
+    )
+    .fetch_one(operator_pool.pool())
+    .await
+    .expect("Forge lease diagnostics");
+    assert!(
+        audit_rows
+            .iter()
+            .any(|(operation, _, _)| operation == "forge.file_compact.prepared")
+    );
+    assert!(
+        audit_rows
+            .iter()
+            .any(|(operation, _, _)| operation == "forge.file_compact.committed")
+    );
+    assert_eq!(leases_now, 0);
     let mut compacted = 0_i64;
     for _ in 0..100 {
         compacted = sqlx::query_scalar(
@@ -265,13 +318,6 @@ async fn active_partition_incremental_compaction() {
         compacted > 0,
         "active OTLP files must compact; compacted={compacted}"
     );
-    shutdown.cancel();
-    for scheduler in schedulers {
-        scheduler
-            .await
-            .expect("active scheduler")
-            .expect("scheduler shutdown");
-    }
     let fixture = seed_forge_group_for_tenant_with_schema_and_days(
         server,
         tenant,

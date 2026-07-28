@@ -81,6 +81,13 @@ impl StagingFilePublisher {
             }
         }
     }
+
+    /// Return available bounded-channel capacity for lifecycle tests.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn capacity_for_test(&self) -> usize {
+        self.sender.capacity()
+    }
 }
 
 impl StagingFileInbox {

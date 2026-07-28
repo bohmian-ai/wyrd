@@ -910,33 +910,82 @@ mod pg_tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+    use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+    use vala_bifrost_redux::forge::{Forge, ForgeBuildConfig};
+    use vala_bifrost_redux::maintenance::{StagingFileCommitted, staging_file_channel};
+    use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
+    use vala_sql::OperatorPool;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
 
-    /// Production boot retains one Forge allocation for both state and supervision.
+    /// Compose one real Forge from the retained test fixture resources.
+    async fn composed_test_state() -> (
+        AppState,
+        vala_bifrost_redux::maintenance::StagingFilePublisher,
+    ) {
+        let state = make_test_state().await;
+        let storage = crate::test_support::test_storage().await;
+        let redux = crate::test_support::test_redux_catalog().await;
+        let vala = crate::test_support::test_vala_postgres().await;
+        let operator_pool: OperatorPool = crate::test_support::test_operator_pool().await;
+        let (publisher, inbox) = staging_file_channel(16).expect("hint channel");
+        let memory = BifrostMemoryGovernor::new(256 * 1024 * 1024).expect("memory governor");
+        let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
+        let config = ForgeConfig {
+            max_hints_per_wake: 16,
+            ..ForgeConfig::default()
+        };
+        let spill = Box::leak(Box::new(tempdir().expect("spill directory")));
+        let rewrite_runtime =
+            ForgeRewriteRuntime::new(query_memory, spill.path(), config.spill_limit_bytes)
+                .expect("rewrite runtime");
+        let staging = Arc::new(storage.operator().clone());
+        let object_store: Arc<dyn ForgeObjectStore> =
+            Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
+        let forge = Arc::new(
+            Forge::new(ForgeBuildConfig {
+                vala,
+                operator_pool,
+                catalog: redux.iceberg_catalog(),
+                staging,
+                object_store,
+                rewrite_runtime,
+                hints: inbox,
+                config,
+                maintenance_interval: Duration::from_millis(10),
+            })
+            .expect("Forge"),
+        );
+        (state.with_bifrost_redux(redux).with_forge(forge), publisher)
+    }
+
+    /// Production-shaped boot retains one Forge allocation for state and supervision.
     #[tokio::test]
-    #[ignore = "requires the canonical Postgres-backed server boot environment"]
     async fn forge_is_composed_once_and_supervised_directly() {
-        let state = build_app_state().await.expect("production app state");
+        let (state, _publisher) = composed_test_state().await;
         let retained = state.forge_handle().expect("retained Forge").clone();
-        let supervised = spawn_maintenance_scheduler(&state, CancellationToken::new())
-            .expect("Forge supervisor future");
+        let shutdown = CancellationToken::new();
+        let supervised =
+            spawn_maintenance_scheduler(&state, shutdown.clone()).expect("Forge supervisor future");
         assert!(Arc::ptr_eq(&retained, state.forge_handle().expect("Forge")));
-        let result = tokio::time::timeout(Duration::from_secs(2), supervised)
-            .await
-            .expect("supervisor remains bounded");
+        let task = tokio::spawn(supervised);
+        tokio::task::yield_now().await;
+        shutdown.cancel();
         assert!(
-            result.is_err(),
-            "uncancelled scheduler should still be running"
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("supervisor bound")
+                .expect("supervisor join")
+                .is_ok()
         );
     }
 
     /// Production Forge cancellation remains bounded at idle and active edges.
     #[tokio::test]
-    #[ignore = "requires the canonical Postgres-backed server boot environment"]
     async fn forge_shutdown_is_bounded_at_idle_and_active_boundaries() {
-        let state = build_app_state().await.expect("production app state");
+        let (state, publisher) = composed_test_state().await;
         let idle_shutdown = CancellationToken::new();
         idle_shutdown.cancel();
         let idle =
@@ -952,7 +1001,22 @@ mod pg_tests {
         let active = spawn_maintenance_scheduler(&state, active_shutdown.clone())
             .expect("active Forge supervisor");
         let task = tokio::spawn(active);
-        tokio::task::yield_now().await;
+        let tenant = crate::test_support::test_tenant().await;
+        let binding = TenantTableBinding::resolve((
+            tenant,
+            TableRef::new(BifrostNamespace::Bifrost, "lifecycle_probe"),
+        ))
+        .expect("binding");
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 27).expect("day");
+        assert_eq!(
+            publisher.try_publish(StagingFileCommitted::new(binding, day)),
+            vala_bifrost_redux::maintenance::StagingPublishOutcome::Published
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while publisher.capacity_for_test() < 16 {
+            assert!(tokio::time::Instant::now() < deadline, "hint not consumed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         active_shutdown.cancel();
         assert!(
             tokio::time::timeout(Duration::from_secs(2), task)

@@ -25,7 +25,7 @@ struct OutputPutBarrier {
     reached: tokio::sync::Notify,
     /// Retains the reached signal for waiters that start after the callback.
     reached_flag: AtomicBool,
-    /// Counts output boundaries so the first output can be committed before theft.
+    /// Counts output boundaries so the first output boundary is paused.
     calls: std::sync::atomic::AtomicUsize,
     /// Releases the paused pre-fence boundary.
     release: tokio::sync::Notify,
@@ -59,7 +59,7 @@ impl OutputPutBarrier {
 #[async_trait]
 impl vala_bifrost_redux::forge::ForgeObjectStore for OutputPutBarrier {
     async fn before_output_put(&self, _path: &str) -> opendal::Result<()> {
-        if self.calls.fetch_add(1, Ordering::AcqRel) != 1 {
+        if self.calls.fetch_add(1, Ordering::AcqRel) != 0 {
             return Ok(());
         }
         self.reached_flag.store(true, Ordering::Release);
@@ -513,11 +513,14 @@ async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs()
     config.output_file_bytes = 1;
     let context = fixture.context_with_object_store(config, Arc::clone(&barrier));
     let task = tokio::spawn(async move { context.run_once().await });
-    barrier.wait_until_reached().await;
+    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_reached())
+        .await
+        .expect("rewrite reached bounded pre-PUT barrier");
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     barrier.release();
-    let outcome = task
+    let outcome = tokio::time::timeout(Duration::from_secs(30), task)
         .await
+        .expect("stale output task completed after barrier release")
         .expect("stale output task")
         .expect("stale output tick reports failure");
     assert_eq!(outcome.tables_failed, 1);

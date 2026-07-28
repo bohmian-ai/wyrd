@@ -1,10 +1,15 @@
 //! Gated sustained Forge journey over durable Scribe-shaped inputs.
 
+use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use arrow::datatypes::{DataType, Field};
+use arrow::array::{FixedSizeBinaryArray, Int64Array, StringArray, TimestampMicrosecondArray};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use arrow::ipc::reader::StreamReader;
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
@@ -193,6 +198,11 @@ async fn pg_bifrost_forge_incremental_sustained() {
         &[chrono::Utc::now().date_naive()],
     )
     .await;
+    fixture
+        .catalog
+        .drop_table(&fixture.binding.table_ident())
+        .await
+        .expect("replace unregistered fixture table before Redux registration");
     server
         .state()
         .bifrost_redux
@@ -209,6 +219,27 @@ async fn pg_bifrost_forge_incremental_sustained() {
         })
         .await
         .expect("register sustained physical table in Redux control plane");
+    sqlx::query("UPDATE vala.file_list SET table_name = $1 WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4")
+        .bind(format!("{}_legacy_seed", fixture.binding.table_name))
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("isolate incompatible seed rows");
+    for sequence in 0..2_i64 {
+        fixture
+            .staging
+            .delete(&format!(
+                "{}/journey-{sequence}.parquet",
+                fixture.binding.object_prefix
+            ))
+            .await
+            .expect("remove incompatible seed object");
+    }
+    for sequence in 0..2_i64 {
+        write_canonical_forge_file(&fixture, sequence, 2).await;
+    }
     let machine = server
         .bootstrap_service("incremental-sustained-query", &["admin"])
         .await
@@ -265,12 +296,8 @@ async fn pg_bifrost_forge_incremental_sustained() {
         async move { forge.run(stop).await }
     });
     for sequence in 0..8_i64 {
-        fixture
-            .append_forge_file_with_rows(100 + sequence * 2, 100_000)
-            .await;
-        fixture
-            .append_forge_file_with_rows(101 + sequence * 2, 100_000)
-            .await;
+        write_canonical_forge_file(&fixture, 100 + sequence * 2, 100_000).await;
+        write_canonical_forge_file(&fixture, 101 + sequence * 2, 100_000).await;
         let _ = publisher.try_publish(StagingFileCommitted::new(
             fixture.binding.clone(),
             chrono::Utc::now().date_naive(),
@@ -382,19 +409,96 @@ async fn pg_bifrost_forge_incremental_sustained() {
     server.shutdown().await.expect("server shutdown");
 }
 
+/// Write one canonical managed-schema Parquet file and its aged file-list row.
+///
+/// # Panics
+/// Panics when test data cannot be encoded or persisted.
+async fn write_canonical_forge_file(fixture: &ForgeFixture, sequence: i64, rows: usize) {
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
+    let base = day
+        .and_hms_opt(12, 0, 0)
+        .expect("timestamp")
+        .and_utc()
+        .timestamp_micros()
+        + sequence * 1_000_000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("value", DataType::Int64, false),
+        Field::new("run_id", DataType::Utf8, true),
+        Field::new("card_uid", DataType::Utf8, true),
+        Field::new("principal_id", DataType::Utf8, true),
+        Field::new("wyrd_request_id", DataType::Utf8, false),
+        Field::new(
+            "wyrd_event_time",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new(
+            "wyrd_ingested_at",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        ),
+        Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
+        Field::new("data_tenant_id", DataType::Utf8, false),
+    ]));
+    let times = (0..rows)
+        .map(|i| base + i64::try_from(i).expect("row offset") * 1_000)
+        .collect::<Vec<_>>();
+    let batch_ids =
+        FixedSizeBinaryArray::try_from_iter((0..rows).map(|_| vec![0_u8; 16])).expect("batch ids");
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(
+                (0..rows)
+                    .map(|i| sequence * 1_000_000 + i as i64)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::new_null(rows)),
+            Arc::new(StringArray::new_null(rows)),
+            Arc::new(StringArray::new_null(rows)),
+            Arc::new(StringArray::from(vec![format!("request-{sequence}"); rows])),
+            Arc::new(TimestampMicrosecondArray::from(times.clone()).with_timezone("UTC")),
+            Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+            Arc::new(batch_ids),
+            Arc::new(StringArray::from(vec![fixture.tenant.to_string(); rows])),
+        ],
+    )
+    .expect("canonical batch");
+    let mut bytes = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("Parquet writer");
+    writer.write(&batch).expect("Parquet batch");
+    writer.close().expect("Parquet close");
+    let path = format!(
+        "{}/canonical-{sequence}.parquet",
+        fixture.binding.object_prefix
+    );
+    fixture
+        .staging
+        .write(&path, opendal::Buffer::from(bytes.clone()))
+        .await
+        .expect("staging write");
+    sqlx::query("INSERT INTO vala.file_list (id,data_tenant_id,namespace,table_name,file_path,file_size,row_count,min_event_time,max_event_time,partition_day,node_id,writer_epoch,wal_lsn_min,wal_lsn_max,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now()-interval '3 minutes')")
+        .bind(uuid::Uuid::now_v7()).bind(fixture.tenant.as_uuid()).bind(&fixture.binding.logical_namespace).bind(&fixture.binding.table_name).bind(path)
+        .bind(i64::try_from(bytes.len()).expect("file size")).bind(i64::try_from(rows).expect("row count")).bind(chrono::DateTime::from_timestamp_micros(base).expect("min time"))
+        .bind(chrono::DateTime::from_timestamp_micros(base + i64::try_from(rows).expect("rows") * 1_000).expect("max time")).bind(day)
+        .bind(uuid::Uuid::now_v7()).bind(1_i64).bind(sequence * 2 + 1).bind(sequence * 2 + 2).execute(fixture.operator_pool.pool()).await.expect("file-list row");
+}
+
 /// Query the bound server's authenticated Oracle endpoint for one tenant table.
 ///
 /// # Panics
 ///
-/// Panics when the public request fails or omits a valid row-count header.
+/// Panics when the public request fails, the response is malformed, or the
+/// aggregate count is not representable as an unsigned row count.
 async fn oracle_table_rows(server: &WyrdTestServer, jwt: &str, fixture: &ForgeFixture) -> u64 {
     let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(url)
         .header("x-wyrd-access-token", format!("Bearer {jwt}"))
         .json(&SyncQueryRequest {
             sql: format!(
-                "SELECT * FROM \"vala.bifrost.{}\"",
+                "SELECT count(*) AS row_count FROM \"vala.bifrost.{}\"",
                 fixture.binding.table_name
             ),
             params: Vec::new(),
@@ -403,12 +507,27 @@ async fn oracle_table_rows(server: &WyrdTestServer, jwt: &str, fixture: &ForgeFi
         .await
         .expect("Oracle request")
         .error_for_status()
-        .expect("Oracle response")
-        .headers()
-        .get("x-wyrd-row-count")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .expect("Oracle row-count header")
+        .expect("Oracle response");
+    assert_eq!(
+        response
+            .headers()
+            .get("x-wyrd-row-count")
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "Oracle count query must return one aggregate row"
+    );
+    let body = response.bytes().await.expect("Oracle Arrow body");
+    let mut reader = StreamReader::try_new(Cursor::new(body), None).expect("Oracle Arrow stream");
+    let batch = reader
+        .next()
+        .expect("Oracle aggregate batch")
+        .expect("Oracle aggregate batch read");
+    let counts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("Oracle count column");
+    u64::try_from(counts.value(0)).expect("Oracle row count fits u64")
 }
 
 async fn pending_file_count(fixture: &ForgeFixture) -> i64 {

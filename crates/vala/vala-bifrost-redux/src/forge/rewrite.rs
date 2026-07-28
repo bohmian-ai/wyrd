@@ -38,8 +38,10 @@ use uuid::Uuid;
 use super::binpack::{CandidateFile, RewriteBin};
 use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
+use super::lease::ForgeLease;
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::bifrost_writer_properties;
+use vala_sql::OperatorPool;
 
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
@@ -145,13 +147,15 @@ impl ForgeRewritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns schema, tenant, Parquet, object-store, `DataFusion`, cancellation,
-    /// spill-ceiling, or invariant failures. No durable SQL or Iceberg
-    /// transition occurs in this method.
+    /// Returns schema, tenant, Parquet, object-store, lease, `DataFusion`,
+    /// cancellation, spill-ceiling, or invariant failures. No durable SQL or
+    /// Iceberg transition occurs in this method.
     pub(crate) async fn rewrite(
         &self,
         request: RewriteRequest<'_>,
         stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
     ) -> Result<RewriteOutput, ForgeError> {
         let initial_spill = self.runtime.runtime.spilling_progress();
         if initial_spill.active_files_count != 0 {
@@ -192,7 +196,15 @@ impl ForgeRewritePipeline {
                     })?;
                     let ordinal = files.len();
                     let (file, path) = self
-                        .finish_output(active, writer_rows, ordinal, &request, stop)
+                        .finish_output(
+                            active,
+                            writer_rows,
+                            ordinal,
+                            &request,
+                            stop,
+                            lease,
+                            operator_pool,
+                        )
                         .await?;
                     output_rows = output_rows.saturating_add(writer_rows);
                     output_paths.push(path);
@@ -225,7 +237,15 @@ impl ForgeRewritePipeline {
             {
                 let ordinal = files.len();
                 let (file, path) = self
-                    .finish_output(active, writer_rows, ordinal, &request, stop)
+                    .finish_output(
+                        active,
+                        writer_rows,
+                        ordinal,
+                        &request,
+                        stop,
+                        lease,
+                        operator_pool,
+                    )
                     .await?;
                 output_rows = output_rows.saturating_add(writer_rows);
                 output_paths.push(path);
@@ -364,8 +384,9 @@ impl ForgeRewritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns cancellation, Parquet, object-store, path, or metadata-builder
-    /// failures. The caller remains responsible for deleting prior outputs.
+    /// Returns cancellation, lease, Parquet, object-store, path, or
+    /// metadata-builder failures. The caller remains responsible for deleting
+    /// prior outputs.
     async fn finish_output(
         &self,
         writer: ArrowWriter<Vec<u8>>,
@@ -373,6 +394,8 @@ impl ForgeRewritePipeline {
         ordinal: usize,
         request: &RewriteRequest<'_>,
         stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
     ) -> Result<(DataFile, String), ForgeError> {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
@@ -391,6 +414,17 @@ impl ForgeRewritePipeline {
             .ok_or_else(|| ForgeError::Invariant {
                 detail: format!("Forge output escaped table prefix: {object_path}"),
             })?;
+        self.object_store
+            .before_output_put(&object_path)
+            .await
+            .map_err(ForgeError::ObjectStore)?;
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
+        lease.require_fence(operator_pool).await?;
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
         self.staging
             .write(&object_path, Buffer::from(bytes.clone()))
             .await

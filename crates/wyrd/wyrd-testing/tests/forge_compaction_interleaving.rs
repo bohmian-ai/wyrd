@@ -1,15 +1,93 @@
 //! Replay the real Forge tick through bounded phase schedules.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use opendal::{Buffer, Entry, Metadata};
 use tokio_util::sync::CancellationToken;
+use vala_bifrost_redux::forge::ForgeObjectStore;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
-    CommitUncertaintyCatalog, seed_forge_group, seed_forge_group_for_tenant_with_schema,
-    seed_forge_group_for_tenant_with_schema_and_days,
+    CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group,
+    seed_forge_group_for_tenant_with_schema, seed_forge_group_for_tenant_with_schema_and_days,
 };
+
+/// Pauses the rewrite fence boundary so a test can take over the lease before
+/// the production staging PUT is attempted.
+#[derive(Debug)]
+struct OutputPutBarrier {
+    /// Real object-store seam used for all source reads and cleanup deletes.
+    inner: Arc<ForgeObjectStoreControl>,
+    /// Signals that the next output reached the pre-fence boundary.
+    reached: tokio::sync::Notify,
+    /// Retains the reached signal for waiters that start after the callback.
+    reached_flag: AtomicBool,
+    /// Counts output boundaries so the first output can be committed before theft.
+    calls: std::sync::atomic::AtomicUsize,
+    /// Releases the paused pre-fence boundary.
+    release: tokio::sync::Notify,
+}
+
+impl OutputPutBarrier {
+    /// Wrap a real Forge object-store control with one output barrier.
+    fn new(inner: Arc<ForgeObjectStoreControl>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            reached: tokio::sync::Notify::new(),
+            reached_flag: AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Wait until the stale rewrite reaches its first output boundary.
+    async fn wait_until_reached(&self) {
+        while !self.reached_flag.load(Ordering::Acquire) {
+            self.reached.notified().await;
+        }
+    }
+
+    /// Resume the stale rewrite after the successor acquires the lease.
+    fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait]
+impl vala_bifrost_redux::forge::ForgeObjectStore for OutputPutBarrier {
+    async fn before_output_put(&self, _path: &str) -> opendal::Result<()> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) != 1 {
+            return Ok(());
+        }
+        self.reached_flag.store(true, Ordering::Release);
+        self.reached.notify_waiters();
+        self.release.notified().await;
+        Ok(())
+    }
+
+    async fn read(&self, path: &str) -> opendal::Result<Buffer> {
+        self.inner.read(path).await
+    }
+
+    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
+        self.inner.read_range(path, range).await
+    }
+
+    async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
+        self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, path: &str) -> opendal::Result<Metadata> {
+        self.inner.stat(path).await
+    }
+
+    async fn delete(&self, path: &str) -> opendal::Result<()> {
+        self.inner.delete(path).await
+    }
+}
 
 async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uuid::Uuid, i64) {
     let lease_key = format!(
@@ -414,6 +492,90 @@ async fn forge_compaction_lease_theft_before_catalog_commit_fails_closed() {
         )
         .await
         .expect("successor release")
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Tests that lease loss immediately before an output PUT prevents every
+/// stale output and leaves no rewrite-owned object for the successor.
+async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "compaction_output_fence_rows").await;
+    let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let barrier = OutputPutBarrier::new(Arc::clone(&control));
+    let mut config = fixture.config.clone();
+    config.output_file_bytes = 1;
+    let context = fixture.context_with_object_store(config, Arc::clone(&barrier));
+    let task = tokio::spawn(async move { context.run_once().await });
+    barrier.wait_until_reached().await;
+    let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
+    barrier.release();
+    let outcome = task
+        .await
+        .expect("stale output task")
+        .expect("stale output tick reports failure");
+    assert_eq!(outcome.tables_failed, 1);
+    let entries = control
+        .list(&fixture.binding.object_prefix)
+        .await
+        .expect("list rewrite-owned objects");
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry.path().contains("/data/forge-")),
+        "stale worker left output objects: {entries:?}"
+    );
+    assert_eq!(
+        fixture.operation_count("forge.file_compact.prepared").await,
+        0
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
+        0
+    );
+
+    let lease_key = format!(
+        "forge:table:{}:{}:{}",
+        fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+    );
+    assert!(
+        vala_sql::queries::maintenance_leases::release_lease_fenced(
+            &fixture.operator_pool,
+            &lease_key,
+            successor_owner,
+            successor_token,
+        )
+        .await
+        .expect("successor release")
+    );
+    fixture
+        .forge
+        .run_once()
+        .await
+        .expect("successor convergence");
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("successor table");
+    assert_eq!(table.metadata().snapshots().len(), 1);
+    assert_eq!(
+        fixture.operation_count("forge.file_compact.prepared").await,
+        1
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
+        1
     );
     server.shutdown().await.expect("server shutdown");
 }

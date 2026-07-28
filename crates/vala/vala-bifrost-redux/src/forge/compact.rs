@@ -178,6 +178,20 @@ impl ForgeConfig {
 /// directly for producer writes.
 #[async_trait]
 pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
+    /// Pause or fail a rewrite immediately before its lease fence is checked.
+    ///
+    /// Production implementations return successfully. Test implementations
+    /// use this seam to deterministically interleave lease takeover with an
+    /// output PUT while preserving the production write path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an injected object-store error when a test deliberately rejects
+    /// the output boundary.
+    async fn before_output_put(&self, _path: &str) -> opendal::Result<()> {
+        Ok(())
+    }
+
     /// Read one staged or Iceberg-owned object.
     ///
     /// # Errors
@@ -739,6 +753,8 @@ async fn compact_bin(
                 partition_spec_id: table.metadata().default_partition_spec_id(),
             },
             stop,
+            lease,
+            &context.operator_pool,
         )
         .await?;
     tracing::debug!(

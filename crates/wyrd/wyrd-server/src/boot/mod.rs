@@ -908,10 +908,60 @@ mod pg_tests {
     use super::*;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::tempdir;
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
+
+    /// Production boot retains one Forge allocation for both state and supervision.
+    #[tokio::test]
+    #[ignore = "requires the canonical Postgres-backed server boot environment"]
+    async fn forge_is_composed_once_and_supervised_directly() {
+        let state = build_app_state().await.expect("production app state");
+        let retained = state.forge_handle().expect("retained Forge").clone();
+        let supervised = spawn_maintenance_scheduler(&state, CancellationToken::new())
+            .expect("Forge supervisor future");
+        assert!(Arc::ptr_eq(&retained, state.forge_handle().expect("Forge")));
+        let result = tokio::time::timeout(Duration::from_secs(2), supervised)
+            .await
+            .expect("supervisor remains bounded");
+        assert!(
+            result.is_err(),
+            "uncancelled scheduler should still be running"
+        );
+    }
+
+    /// Production Forge cancellation remains bounded at idle and active edges.
+    #[tokio::test]
+    #[ignore = "requires the canonical Postgres-backed server boot environment"]
+    async fn forge_shutdown_is_bounded_at_idle_and_active_boundaries() {
+        let state = build_app_state().await.expect("production app state");
+        let idle_shutdown = CancellationToken::new();
+        idle_shutdown.cancel();
+        let idle =
+            spawn_maintenance_scheduler(&state, idle_shutdown).expect("idle Forge supervisor");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), idle)
+                .await
+                .expect("idle shutdown bound")
+                .is_ok()
+        );
+
+        let active_shutdown = CancellationToken::new();
+        let active = spawn_maintenance_scheduler(&state, active_shutdown.clone())
+            .expect("active Forge supervisor");
+        let task = tokio::spawn(active);
+        tokio::task::yield_now().await;
+        active_shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("active shutdown bound")
+                .expect("supervisor join")
+                .is_ok()
+        );
+    }
 
     async fn make_test_state() -> AppState {
         let app_pool = PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new());

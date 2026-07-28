@@ -138,7 +138,7 @@ struct RewriteBatchState {
     output_rows: u64,
     /// Peak spill bytes observed while consuming sorted batches.
     peak_spill_bytes: u64,
-    /// Shared DataFusion pool reservation for encoded output capacity.
+    /// Shared `DataFusion` pool reservation for encoded output capacity.
     output_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
     /// Per-output NaN counts keyed by Iceberg field ID.
     nan_value_counts: NanValueCountVisitor,
@@ -146,7 +146,7 @@ struct RewriteBatchState {
 
 impl RewriteBatchState {
     /// Create empty state for isolated batch-state tests and callers without
-    /// a shared DataFusion reservation.
+    /// a shared `DataFusion` reservation.
     #[cfg(test)]
     fn new() -> Self {
         Self::with_reservation(None)
@@ -332,6 +332,116 @@ struct RewriteOutputContext<'a, 'b> {
     operator_pool: &'a OperatorPool,
 }
 
+/// Inputs needed to finalize a completed rewrite after its stream is dropped.
+struct RewriteFinalization<'a> {
+    /// Terminal batch state, including all rewrite-owned output paths.
+    batch: RewriteBatchResult,
+    /// Validated target binding used for cleanup ownership checks.
+    binding: &'a TenantTableBinding,
+    /// Cancellation source checked before cleanup side effects.
+    stop: &'a CancellationToken,
+    /// Mutable lease that proves cleanup still belongs to this Forge owner.
+    lease: &'a mut ForgeLease,
+    /// Operator pool used for lease-fence validation.
+    operator_pool: &'a OperatorPool,
+}
+
+/// Blocking inputs for deriving Iceberg metadata from one completed Parquet output.
+struct OutputMetadataRequest {
+    /// Closed in-memory Parquet writer whose bytes become the staged object.
+    writer: ArrowWriter<Vec<u8>>,
+    /// Per-field NaN counts required by Iceberg file metadata.
+    nan_value_counts: HashMap<i32, u64>,
+    /// Rows encoded into the completed Parquet output.
+    rows: u64,
+    /// Iceberg schema carrying field identifiers for file metadata.
+    iceberg_schema: IcebergSchemaRef,
+    /// Catalog-visible Iceberg path for the output file.
+    table_path: String,
+    /// Day partition assigned to the entire output.
+    partition_day: chrono::NaiveDate,
+    /// Iceberg partition-spec identifier for the destination table.
+    partition_spec_id: i32,
+}
+
+/// Bytes and Iceberg metadata derived together from one completed Parquet output.
+struct FinalizedOutput {
+    /// Exact Parquet bytes to persist to the staging object store.
+    bytes: Bytes,
+    /// Iceberg data-file metadata derived from those bytes.
+    file: DataFile,
+}
+
+/// Close one Parquet writer and derive the matching Iceberg data-file metadata.
+///
+/// This pure blocking stage owns no `ForgeRewritePipeline` state: it converts a
+/// completed writer into bytes and validates that the metadata describes those
+/// exact bytes before the async caller persists them.
+///
+/// # Errors
+///
+/// Returns Parquet or metadata errors when the writer cannot close, its footer
+/// cannot be read, or the derived Iceberg file disagrees with the completed
+/// Parquet bytes.
+fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedOutput, ForgeError> {
+    let OutputMetadataRequest {
+        writer,
+        nan_value_counts,
+        rows,
+        iceberg_schema,
+        table_path,
+        partition_day,
+        partition_spec_id,
+    } = request;
+    let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
+        detail: error.to_string(),
+    })?;
+    let output_size = u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
+        detail: format!("output size does not fit u64: {error}"),
+    })?;
+    let bytes = Bytes::from(bytes);
+    let parquet_metadata = Arc::new(
+        parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes)
+            .map_err(|error| ForgeError::Parquet {
+                detail: format!("Forge output footer parsing failed: {error}"),
+            })?,
+    );
+    let mut file = ParquetWriter::parquet_to_data_file_builder(
+        iceberg_schema,
+        Arc::clone(&parquet_metadata),
+        bytes.len(),
+        table_path,
+        nan_value_counts,
+    )
+    .map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge output metadata conversion failed: {error}"),
+    })?;
+    let partition = Struct::from_iter([Some(Literal::date(
+        partition_day.num_days_from_ce() - 719_163,
+    ))]);
+    file.partition(partition)
+        .partition_spec_id(partition_spec_id);
+    let file = file.build().map_err(|error| ForgeError::Invariant {
+        detail: format!("Forge output metadata is incomplete: {error}"),
+    })?;
+    if file.record_count() != rows || file.file_size_in_bytes() != output_size {
+        return Err(ForgeError::Invariant {
+            detail: "Forge output metadata disagrees with finalized Parquet bytes".to_owned(),
+        });
+    }
+    let row_groups = parquet_metadata.row_groups();
+    let split_offsets = file.split_offsets().ok_or_else(|| ForgeError::Invariant {
+        detail: "Forge output metadata omitted row-group split offsets".to_owned(),
+    })?;
+    if split_offsets.len() != row_groups.len() {
+        return Err(ForgeError::Invariant {
+            detail: "Forge output split offsets do not match row groups".to_owned(),
+        });
+    }
+    Ok(FinalizedOutput { bytes, file })
+}
+
 impl ForgeRewritePipeline {
     /// Compose a rewrite pipeline from host-provisioned runtime dependencies.
     ///
@@ -399,32 +509,20 @@ impl ForgeRewritePipeline {
         let result = self
             .rewrite_batches(&mut stream, &request, stop, lease, operator_pool)
             .await;
-        let RewriteBatchResult {
-            result,
-            files,
-            output_paths,
-            input_rows,
-            output_rows,
-            mut peak_spill_bytes,
-        } = result;
+        let mut result = result;
         // Dropping the physical stream releases SortExec and its spill handles.
         // This must happen before observing spill progress or returning on cancel.
         drop(stream);
-        peak_spill_bytes = peak_spill_bytes.max(
+        result.peak_spill_bytes = result.peak_spill_bytes.max(
             u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX),
         );
-        self.finalize_rewrite(
-            result,
-            files,
-            output_paths,
-            input_rows,
-            output_rows,
-            peak_spill_bytes,
-            request.binding,
+        self.finalize_rewrite(RewriteFinalization {
+            batch: result,
+            binding: request.binding,
             stop,
             lease,
             operator_pool,
-        )
+        })
         .await
     }
 
@@ -628,17 +726,23 @@ impl ForgeRewritePipeline {
     /// conservation invariant after deleting rewrite-owned outputs best-effort.
     async fn finalize_rewrite(
         &self,
-        result: Result<(), ForgeError>,
-        files: Vec<DataFile>,
-        output_paths: Vec<String>,
-        input_rows: u64,
-        output_rows: u64,
-        peak_spill_bytes: u64,
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        lease: &mut ForgeLease,
-        operator_pool: &OperatorPool,
+        finalization: RewriteFinalization<'_>,
     ) -> Result<RewriteOutput, ForgeError> {
+        let RewriteFinalization {
+            batch,
+            binding,
+            stop,
+            lease,
+            operator_pool,
+        } = finalization;
+        let RewriteBatchResult {
+            result,
+            files,
+            output_paths,
+            input_rows,
+            output_rows,
+            peak_spill_bytes,
+        } = batch;
         if let Err(error) = self.await_spill_cleanup().await {
             self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
                 .await;
@@ -817,7 +921,6 @@ impl ForgeRewritePipeline {
         );
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
-        let operation_id = request.operation_id;
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -827,55 +930,15 @@ impl ForgeRewritePipeline {
         };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
-                detail: error.to_string(),
-            })?;
-            let output_size =
-                u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
-                    detail: format!("output size does not fit u64: {error}"),
-                })?;
-            let bytes = Bytes::from(bytes);
-            let parquet_metadata = Arc::new(
-                parquet::file::metadata::ParquetMetaDataReader::new()
-                    .parse_and_finish(&bytes)
-                    .map_err(|error| ForgeError::Parquet {
-                        detail: format!("Forge output footer parsing failed: {error}"),
-                    })?,
-            );
-            let mut file = ParquetWriter::parquet_to_data_file_builder(
-                iceberg_schema,
-                Arc::clone(&parquet_metadata),
-                bytes.len(),
-                table_path,
+            finalize_output_metadata(OutputMetadataRequest {
+                writer,
                 nan_value_counts,
-            )
-            .map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge output metadata conversion failed: {error}"),
-            })?;
-            let partition = Struct::from_iter([Some(Literal::date(
-                partition_day.num_days_from_ce() - 719_163,
-            ))]);
-            file.partition(partition)
-                .partition_spec_id(partition_spec_id);
-            let file = file.build().map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge output metadata is incomplete: {error}"),
-            })?;
-            if file.record_count() != rows || file.file_size_in_bytes() != output_size {
-                return Err(ForgeError::Invariant {
-                    detail: "Forge output metadata disagrees with finalized Parquet bytes"
-                        .to_owned(),
-                });
-            }
-            let row_groups = parquet_metadata.row_groups();
-            let split_offsets = file.split_offsets().ok_or_else(|| ForgeError::Invariant {
-                detail: "Forge output metadata omitted row-group split offsets".to_owned(),
-            })?;
-            if split_offsets.len() != row_groups.len() {
-                return Err(ForgeError::Invariant {
-                    detail: "Forge output split offsets do not match row groups".to_owned(),
-                });
-            }
-            Ok::<_, ForgeError>((bytes, file, operation_id))
+                rows,
+                iceberg_schema,
+                table_path,
+                partition_day,
+                partition_spec_id,
+            })
         });
         tokio::pin!(join);
         let finalized = tokio::select! {
@@ -887,9 +950,10 @@ impl ForgeRewritePipeline {
                 return Err(ForgeError::Shutdown);
             }
         };
-        let (bytes, file, _) = finalized.map_err(|error| ForgeError::Invariant {
-            detail: format!("Forge output finalization task failed: {error}"),
-        })??;
+        let FinalizedOutput { bytes, file } =
+            finalized.map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge output finalization task failed: {error}"),
+            })??;
         if catalog_path_to_object_key(request.table_location, request.binding, file.file_path())
             .as_deref()
             != Some(object_path.as_str())

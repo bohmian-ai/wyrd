@@ -213,6 +213,10 @@ pub enum CardScopeMintKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditDetail {
     /// A Forge compaction operation and its external Iceberg boundary.
+    ///
+    /// The ordered `output_paths` list is the sole greenfield output shape;
+    /// prepared and terminal audit rows preserve writer-rotation order and do
+    /// not expose a scalar compatibility form.
     ForgeCompaction {
         /// Deterministic identifier shared by prepared and terminal rows.
         operation_id: uuid::Uuid,
@@ -225,6 +229,10 @@ pub enum AuditDetail {
         /// Exact staging paths consumed by the operation.
         input_paths: Vec<StoragePath>,
         /// Deterministic compacted output paths in writer-rotation order.
+        ///
+        /// This ordered collection is the only output representation for
+        /// greenfield Forge audit rows, shared by prepared and terminal
+        /// phases without a scalar compatibility field.
         output_paths: Vec<StoragePath>,
         /// Iceberg snapshot returned by a committed operation, when known.
         snapshot_id: Option<i64>,

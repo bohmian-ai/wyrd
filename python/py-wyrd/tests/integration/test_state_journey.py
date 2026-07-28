@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 import wyrd
+import yaml
 from wyrd.cards import CardRef, Cards
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
@@ -76,17 +77,35 @@ class RuntimeServiceFixture:
         return cards.register_from_path(str(self.source / "training.yaml")).root
 
     def write_service_tree(self, primary: CardRef, shadow: CardRef, data: CardRef) -> Path:
-        del primary, shadow, data
         service = self.source / "typed-service.yaml"
-        service.write_text(
-            service.read_text()
-            + "    - alias: shared_prompt\n"
-            + "      ref:\n        kind: Prompt\n        name: triage-prompt\n"
-            + "        version: 1.0.0\n        space: default\n"
+        document = yaml.safe_load(service.read_text())
+        refs = {"model_primary": primary, "model_shadow": shadow, "training_data": data}
+        for component in document["spec"]["components"]:
+            ref = refs.get(component["alias"])
+            if ref is not None:
+                component["ref"] = {
+                    "kind": str(ref.kind),
+                    "name": ref.name,
+                    "version": ref.version,
+                    "space": ref.space,
+                    "uid": ref.uid,
+                }
+        document["spec"]["components"].append(
+            {
+                "alias": "shared_prompt",
+                "ref": {
+                    "kind": "Prompt",
+                    "name": "triage-prompt",
+                    "version": "1.0.0",
+                    "space": "default",
+                },
+            }
         )
+        service.write_text(yaml.safe_dump(document, sort_keys=False))
         return self.source
 
     def run_cli(self, server: WyrdTestServer, *arguments: str) -> dict[str, Any]:
+        previous = {key: os.environ.get(key) for key in ("WYRD_SERVER_URL", "WYRD_API_KEY")}
         os.environ["WYRD_SERVER_URL"], os.environ["WYRD_API_KEY"] = server.base_url, server.api_key
         old, sys.argv = sys.argv, ["wyrd", *arguments]
         out, err = io.StringIO(), io.StringIO()
@@ -95,6 +114,11 @@ class RuntimeServiceFixture:
                 code = wyrd.run_wyrd_cli()
         finally:
             sys.argv = old
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         assert code == 0, err.getvalue() or out.getvalue()
         return json.loads(out.getvalue())
 

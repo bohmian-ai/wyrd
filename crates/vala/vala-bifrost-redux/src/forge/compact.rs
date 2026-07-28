@@ -201,24 +201,14 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
 
     /// Read one bounded byte range from a staged object.
     ///
-    /// Implementations backed by a remote object store should issue a native
-    /// ranged request. The compatibility default preserves existing fixtures;
-    /// rewrite production paths override it to avoid whole-object buffers.
+    /// Implementations must issue a native ranged request. Falling back to a
+    /// whole-object read would defeat Parquet footer/row-group admission and
+    /// can exhaust the rewrite memory budget before `DataFusion` sees a batch.
     ///
     /// # Errors
     ///
     /// Returns the backend read error when the object cannot be fetched.
-    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
-        let bytes = self.read(path).await?;
-        let data = bytes.to_bytes();
-        let start = usize::try_from(range.start)
-            .unwrap_or(data.len())
-            .min(data.len());
-        let end = usize::try_from(range.end)
-            .unwrap_or(data.len())
-            .min(data.len());
-        Ok(Buffer::from(data.slice(start..end)))
-    }
+    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer>;
 
     /// List all objects below a table-owned prefix.
     ///
@@ -368,7 +358,7 @@ impl Forge {
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
         let mut reconciled = 0;
-        for key in load_reconciliation_keys(&self.core).await? {
+        for key in self.load_reconciliation_keys().await? {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
@@ -389,10 +379,10 @@ impl Forge {
         binding: &TenantTableBinding,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
-        let rows =
-            select_candidate_groups(&self.core.operator_pool, table_key, &self.core.config).await?;
+        let rows = self.select_candidate_groups(table_key).await?;
         let mut budget = ForgeTickBudget::default();
-        compact_candidate_rows(&self.core, lease, binding, rows, &mut budget, stop).await
+        self.compact_candidate_rows(lease, binding, rows, &mut budget, stop)
+            .await
     }
 
     /// Query and compact one exact durable day after an advisory hint.
@@ -408,10 +398,9 @@ impl Forge {
         budget: &mut ForgeTickBudget,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
-        let rows =
-            select_targeted_candidate_group(&self.core.operator_pool, key, &self.core.config)
-                .await?;
-        compact_candidate_rows(&self.core, lease, binding, rows, budget, stop).await
+        let rows = self.select_targeted_candidate_group(key).await?;
+        self.compact_candidate_rows(lease, binding, rows, budget, stop)
+            .await
     }
 }
 
@@ -421,68 +410,74 @@ impl Forge {
 ///
 /// Returns a fence, catalog, rewrite, or durable bookkeeping error. Budget
 /// exhaustion is represented in the returned outcome rather than as failure.
-async fn compact_candidate_rows(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    binding: &TenantTableBinding,
-    rows: Vec<CandidateRow>,
-    budget: &mut ForgeTickBudget,
-    stop: &CancellationToken,
-) -> Result<ForgeTickOutcome, ForgeError> {
-    let mut outcome = ForgeTickOutcome::default();
-    'groups: for row in rows {
-        outcome.groups_seen += 1;
-        let plan = plan_incremental_bins(
-            row.files,
-            context.config.target_bin_bytes,
-            context.config.max_files_per_bin,
-            row.key.partition_day,
-            Utc::now().date_naive(),
-        );
-        for bin in plan.rewrite_bins {
-            if stop.is_cancelled() {
-                return Ok(outcome);
+impl Forge {
+    async fn compact_candidate_rows(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        rows: Vec<CandidateRow>,
+        budget: &mut ForgeTickBudget,
+        stop: &CancellationToken,
+    ) -> Result<ForgeTickOutcome, ForgeError> {
+        let mut outcome = ForgeTickOutcome::default();
+        'groups: for row in rows {
+            outcome.groups_seen += 1;
+            let plan = plan_incremental_bins(
+                row.files,
+                self.core.config.target_bin_bytes,
+                self.core.config.max_files_per_bin,
+                row.key.partition_day,
+                Utc::now().date_naive(),
+            );
+            for bin in plan.rewrite_bins {
+                if stop.is_cancelled() {
+                    return Ok(outcome);
+                }
+                if budget.bins >= self.core.config.max_bins_per_tick {
+                    break;
+                }
+                if budget.files.saturating_add(bin.files.len())
+                    > self.core.config.max_files_per_tick
+                    || budget.bytes.saturating_add(bin.total_bytes)
+                        > self.core.config.max_bytes_per_tick
+                {
+                    outcome.bins_skipped += 1;
+                    outcome.budget_skips += 1;
+                    break 'groups;
+                }
+                if !lease.renew(&self.core.operator_pool).await? {
+                    return Err(ForgeError::FenceLost {
+                        lease_key: lease.lease_key.clone(),
+                    });
+                }
+                if !lease.commit_window_fits(self.core.config.commit_window()) {
+                    outcome.bins_skipped += 1;
+                    outcome.budget_skips += 1;
+                    break 'groups;
+                }
+                let stats = self
+                    .compact_bin(lease, &row.key, binding, &bin, stop)
+                    .await?;
+                outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
+                outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
+                outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
+                outcome.outputs_committed = outcome
+                    .outputs_committed
+                    .saturating_add(stats.outputs_committed);
+                budget.files += bin.files.len();
+                budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
+                budget.bins += 1;
+                outcome.bins_committed += 1;
             }
-            if budget.bins >= context.config.max_bins_per_tick {
+            if budget.bins >= self.core.config.max_bins_per_tick
+                || budget.files >= self.core.config.max_files_per_tick
+                || budget.bytes >= self.core.config.max_bytes_per_tick
+            {
                 break;
             }
-            if budget.files.saturating_add(bin.files.len()) > context.config.max_files_per_tick
-                || budget.bytes.saturating_add(bin.total_bytes) > context.config.max_bytes_per_tick
-            {
-                outcome.bins_skipped += 1;
-                outcome.budget_skips += 1;
-                break 'groups;
-            }
-            if !lease.renew(&context.operator_pool).await? {
-                return Err(ForgeError::FenceLost {
-                    lease_key: lease.lease_key.clone(),
-                });
-            }
-            if !lease.commit_window_fits(context.config.commit_window()) {
-                outcome.bins_skipped += 1;
-                outcome.budget_skips += 1;
-                break 'groups;
-            }
-            let stats = compact_bin(context, lease, &row.key, binding, &bin, stop).await?;
-            outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
-            outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
-            outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
-            outcome.outputs_committed = outcome
-                .outputs_committed
-                .saturating_add(stats.outputs_committed);
-            budget.files += bin.files.len();
-            budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
-            budget.bins += 1;
-            outcome.bins_committed += 1;
         }
-        if budget.bins >= context.config.max_bins_per_tick
-            || budget.files >= context.config.max_files_per_tick
-            || budget.bytes >= context.config.max_bytes_per_tick
-        {
-            break;
-        }
+        Ok(outcome)
     }
-    Ok(outcome)
 }
 
 #[derive(Debug, Clone)]
@@ -493,18 +488,18 @@ pub(crate) struct CandidateRow {
     files: Vec<CandidateFile>,
 }
 
-/// Load bounded, old-enough staging candidates for one tenant/table.
-///
-/// The query uses the operator pool because Forge discovers work across tenant
-/// rows. Results are grouped by partition day and ordered deterministically so
-/// repeated ticks make the same selection under the same durable state.
-pub(crate) async fn select_candidate_groups(
-    operator_pool: &vala_sql::OperatorPool,
-    table_key: &ForgeTableKey,
-    config: &ForgeConfig,
-) -> Result<Vec<CandidateRow>, ForgeError> {
-    let rows = sqlx::query(
-        r"
+impl Forge {
+    /// Load bounded, old-enough staging candidates for one tenant/table.
+    ///
+    /// The query uses the operator pool because Forge discovers work across tenant
+    /// rows. Results are grouped by partition day and ordered deterministically so
+    /// repeated ticks make the same selection under the same durable state.
+    async fn select_candidate_groups(
+        &self,
+        table_key: &ForgeTableKey,
+    ) -> Result<Vec<CandidateRow>, ForgeError> {
+        let rows = sqlx::query(
+            r"
         SELECT id, file_path, file_size, min_event_time, max_event_time,
                partition_day
           FROM vala.file_list
@@ -516,99 +511,100 @@ pub(crate) async fn select_candidate_groups(
          ORDER BY partition_day, min_event_time, max_event_time, id
          LIMIT $4
         ",
-    )
-    .bind(table_key.tenant.as_uuid())
-    .bind(table_key.table_ref.namespace.as_str())
-    .bind(&table_key.table_ref.name)
-    .bind(
-        i64::try_from(config.max_files_per_tick).map_err(|_| ForgeError::InvalidConfig {
-            detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
-        })?,
-    )
-    .fetch_all(operator_pool.pool())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
+        )
+        .bind(table_key.tenant.as_uuid())
+        .bind(table_key.table_ref.namespace.as_str())
+        .bind(&table_key.table_ref.name)
+        .bind(
+            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
+                }
+            })?,
+        )
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
 
-    let mut groups = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
-    for row in rows {
-        let id: Uuid = row.try_get("id").map_err(|error| ForgeError::Group {
-            detail: error.to_string(),
-        })?;
-        let path: String = row
-            .try_get("file_path")
-            .map_err(|error| ForgeError::Group {
+        let mut groups = BTreeMap::<NaiveDate, Vec<CandidateFile>>::new();
+        for row in rows {
+            let id: Uuid = row.try_get("id").map_err(|error| ForgeError::Group {
                 detail: error.to_string(),
             })?;
-        let file_size: i64 = row
-            .try_get("file_size")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-        let min_event_time: DateTime<Utc> =
-            row.try_get("min_event_time")
+            let path: String = row
+                .try_get("file_path")
                 .map_err(|error| ForgeError::Group {
                     detail: error.to_string(),
                 })?;
-        let max_event_time: DateTime<Utc> =
-            row.try_get("max_event_time")
+            let file_size: i64 = row
+                .try_get("file_size")
                 .map_err(|error| ForgeError::Group {
                     detail: error.to_string(),
                 })?;
-        let partition_day: NaiveDate =
-            row.try_get("partition_day")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?;
-        groups
-            .entry(partition_day)
-            .or_default()
-            .push(CandidateFile {
-                id,
-                path,
-                size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
-                    detail: "negative file size".to_owned(),
-                })?,
-                min_event_time,
-                max_event_time,
-            });
+            let min_event_time: DateTime<Utc> =
+                row.try_get("min_event_time")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?;
+            let max_event_time: DateTime<Utc> =
+                row.try_get("max_event_time")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?;
+            let partition_day: NaiveDate =
+                row.try_get("partition_day")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?;
+            groups
+                .entry(partition_day)
+                .or_default()
+                .push(CandidateFile {
+                    id,
+                    path,
+                    size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
+                        detail: "negative file size".to_owned(),
+                    })?,
+                    min_event_time,
+                    max_event_time,
+                });
+        }
+
+        Ok(groups
+            .into_iter()
+            .filter(|(_, files)| {
+                files.len() >= usize::try_from(self.core.config.min_files).unwrap_or(usize::MAX)
+                    || files
+                        .iter()
+                        .map(|file| file.size)
+                        .fold(0_u64, u64::saturating_add)
+                        < self.core.config.target_bin_bytes
+            })
+            .map(|(partition_day, files)| CandidateRow {
+                key: ForgeGroupKey {
+                    tenant: table_key.tenant,
+                    table_ref: table_key.table_ref.clone(),
+                    partition_day,
+                },
+                files,
+            })
+            .collect())
     }
 
-    Ok(groups
-        .into_iter()
-        .filter(|(_, files)| {
-            files.len() >= usize::try_from(config.min_files).unwrap_or(usize::MAX)
-                || files
-                    .iter()
-                    .map(|file| file.size)
-                    .fold(0_u64, u64::saturating_add)
-                    < config.target_bin_bytes
-        })
-        .map(|(partition_day, files)| CandidateRow {
-            key: ForgeGroupKey {
-                tenant: table_key.tenant,
-                table_ref: table_key.table_ref.clone(),
-                partition_day,
-            },
-            files,
-        })
-        .collect())
-}
-
-/// Load one exact durable candidate group without the periodic age guard.
-///
-/// All other periodic predicates and deterministic ordering remain identical,
-/// so a hint accelerates discovery without becoming work authority.
-///
-/// # Errors
-///
-/// Returns SQL, identifier, file-size, or candidate-row decoding failures.
-async fn select_targeted_candidate_group(
-    operator_pool: &vala_sql::OperatorPool,
-    key: &ForgeGroupKey,
-    config: &ForgeConfig,
-) -> Result<Vec<CandidateRow>, ForgeError> {
-    let rows = sqlx::query(
-        r"
+    /// Load one exact durable candidate group without the periodic age guard.
+    ///
+    /// All other periodic predicates and deterministic ordering remain identical,
+    /// so a hint accelerates discovery without becoming work authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns SQL, identifier, file-size, or candidate-row decoding failures.
+    async fn select_targeted_candidate_group(
+        &self,
+        key: &ForgeGroupKey,
+    ) -> Result<Vec<CandidateRow>, ForgeError> {
+        let rows = sqlx::query(
+            r"
         SELECT id, file_path, file_size, min_event_time, max_event_time,
                partition_day
           FROM vala.file_list
@@ -620,168 +616,183 @@ async fn select_targeted_candidate_group(
          ORDER BY partition_day, min_event_time, max_event_time, id
          LIMIT $5
         ",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(
-        i64::try_from(config.max_files_per_tick).map_err(|_| ForgeError::InvalidConfig {
-            detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
-        })?,
-    )
-    .fetch_all(operator_pool.pool())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-
-    let mut files = Vec::with_capacity(rows.len());
-    for row in rows {
-        let file_size: i64 = row
-            .try_get("file_size")
-            .map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
-            })?;
-        files.push(CandidateFile {
-            id: row.try_get("id").map_err(|error| ForgeError::Group {
-                detail: error.to_string(),
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(
+            i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "max_files_per_tick exceeds PostgreSQL bigint".to_owned(),
+                }
             })?,
-            path: row
-                .try_get("file_path")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?,
-            size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
-                detail: "negative file size".to_owned(),
-            })?,
-            min_event_time: row
-                .try_get("min_event_time")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?,
-            max_event_time: row
-                .try_get("max_event_time")
-                .map_err(|error| ForgeError::Group {
-                    detail: error.to_string(),
-                })?,
-        });
-    }
-    if files.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(vec![CandidateRow {
-        key: key.clone(),
-        files,
-    }])
-}
+        )
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
 
-/// Load groups whose prepared SQL transition has no committed snapshot ID.
-async fn load_reconciliation_keys(context: &ForgeCore) -> Result<Vec<ForgeGroupKey>, ForgeError> {
-    let rows = sqlx::query(
-        r"SELECT DISTINCT data_tenant_id, namespace, table_name, partition_day
+        let mut files = Vec::with_capacity(rows.len());
+        for row in rows {
+            let file_size: i64 = row
+                .try_get("file_size")
+                .map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?;
+            files.push(CandidateFile {
+                id: row.try_get("id").map_err(|error| ForgeError::Group {
+                    detail: error.to_string(),
+                })?,
+                path: row
+                    .try_get("file_path")
+                    .map_err(|error| ForgeError::Group {
+                        detail: error.to_string(),
+                    })?,
+                size: u64::try_from(file_size).map_err(|_| ForgeError::Group {
+                    detail: "negative file size".to_owned(),
+                })?,
+                min_event_time: row.try_get("min_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+                max_event_time: row.try_get("max_event_time").map_err(|error| {
+                    ForgeError::Group {
+                        detail: error.to_string(),
+                    }
+                })?,
+            });
+        }
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(vec![CandidateRow {
+            key: key.clone(),
+            files,
+        }])
+    }
+
+    /// Load groups whose prepared SQL transition has no committed snapshot ID.
+    async fn load_reconciliation_keys(&self) -> Result<Vec<ForgeGroupKey>, ForgeError> {
+        let rows = sqlx::query(
+            r"SELECT DISTINCT data_tenant_id, namespace, table_name, partition_day
              FROM vala.file_list
             WHERE compacted AND committed_snapshot_id IS NULL
             ORDER BY data_tenant_id, namespace, table_name, partition_day",
-    )
-    .fetch_all(context.operator_pool.pool())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    rows.into_iter()
-        .map(|row| {
-            let tenant_uuid: Uuid =
-                row.try_get("data_tenant_id")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            let tenant = data_tenant_from_uuid(tenant_uuid)?;
-            let namespace: String =
-                row.try_get("namespace")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            let table_name: String =
-                row.try_get("table_name")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            let partition_day: NaiveDate =
-                row.try_get("partition_day")
-                    .map_err(|error| ForgeError::Group {
-                        detail: error.to_string(),
-                    })?;
-            ForgeGroupKey::from_sql(tenant, &namespace, &table_name, partition_day)
-                .map_err(|detail| ForgeError::Group { detail })
+        )
+        .fetch_all(self.core.operator_pool.pool())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        rows.into_iter()
+            .map(|row| {
+                let tenant_uuid: Uuid =
+                    row.try_get("data_tenant_id")
+                        .map_err(|error| ForgeError::Group {
+                            detail: error.to_string(),
+                        })?;
+                let tenant = Self::data_tenant_from_uuid(tenant_uuid)?;
+                let namespace: String =
+                    row.try_get("namespace")
+                        .map_err(|error| ForgeError::Group {
+                            detail: error.to_string(),
+                        })?;
+                let table_name: String =
+                    row.try_get("table_name")
+                        .map_err(|error| ForgeError::Group {
+                            detail: error.to_string(),
+                        })?;
+                let partition_day: NaiveDate =
+                    row.try_get("partition_day")
+                        .map_err(|error| ForgeError::Group {
+                            detail: error.to_string(),
+                        })?;
+                ForgeGroupKey::from_sql(tenant, &namespace, &table_name, partition_day)
+                    .map_err(|detail| ForgeError::Group { detail })
+            })
+            .collect()
+    }
+
+    /// Convert a database UUID into a validated data-tenant ID.
+    fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
+        DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
+            detail: error.to_string(),
         })
-        .collect()
-}
+    }
 
-/// Convert a database UUID into a validated data-tenant ID.
-fn data_tenant_from_uuid(value: Uuid) -> Result<DataTenantId, ForgeError> {
-    DataTenantId::try_from(value).map_err(|error| ForgeError::Group {
-        detail: error.to_string(),
-    })
-}
-
-/// Execute one fenced compaction operation from staged files to Iceberg.
-///
-/// The sequence is read and validate, write the output, mark inputs prepared,
-/// commit the Iceberg transaction, and stamp the committed snapshot. Every
-/// external boundary is fenced so a stale lease cannot finish the operation.
-async fn compact_bin(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    binding: &TenantTableBinding,
-    bin: &RewriteBin,
-    stop: &CancellationToken,
-) -> Result<CompactStats, ForgeError> {
-    let operation_id = operation_id(key, bin);
-    let table = load_table(context, &binding.table_ident()).await?;
-    let schema = Arc::new(
-        iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
-            .map_err(ForgeError::Catalog)?,
-    );
-    let rewrite = context
-        .rewrite
-        .rewrite(
-            RewriteRequest {
-                operation_id,
-                binding,
-                schema,
-                bin,
-                partition_day: key.partition_day,
-                table_location: table.metadata().location(),
-                partition_spec_id: table.metadata().default_partition_spec_id(),
-            },
-            stop,
+    /// Execute one fenced compaction operation from staged files to Iceberg.
+    ///
+    /// The sequence is read and validate, write the output, mark inputs prepared,
+    /// commit the Iceberg transaction, and stamp the committed snapshot. Every
+    /// external boundary is fenced so a stale lease cannot finish the operation.
+    async fn compact_bin(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        binding: &TenantTableBinding,
+        bin: &RewriteBin,
+        stop: &CancellationToken,
+    ) -> Result<CompactStats, ForgeError> {
+        let operation_id = operation_id(key, bin);
+        let table = load_table(&self.core, &binding.table_ident()).await?;
+        let schema = Arc::new(
+            iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
+                .map_err(ForgeError::Catalog)?,
+        );
+        let rewrite = self
+            .core
+            .rewrite
+            .rewrite(
+                RewriteRequest {
+                    operation_id,
+                    binding,
+                    schema,
+                    bin,
+                    partition_day: key.partition_day,
+                    table_location: table.metadata().location(),
+                    partition_spec_id: table.metadata().default_partition_spec_id(),
+                },
+                stop,
+                lease,
+                &self.core.operator_pool,
+            )
+            .await?;
+        tracing::debug!(
+            operation_id = %operation_id,
+            input_rows = rewrite.input_rows,
+            output_rows = rewrite.output_rows,
+            output_files = rewrite.object_paths.len(),
+            spill_bytes = rewrite.spill_bytes,
+            "Forge streaming rewrite completed"
+        );
+        lease.require_fence(&self.core.operator_pool).await?;
+        let prepared = forge_detail(
+            key,
+            bin,
+            &rewrite.files,
+            operation_id,
+            ForgeCompactionPhase::Prepared,
+            None,
+        )?;
+        self.prepare_inputs(&self.core, lease, key, bin, prepared)
+            .await?;
+        self.commit_rewrite(
+            &self.core,
             lease,
-            &context.operator_pool,
+            key,
+            binding,
+            bin,
+            operation_id,
+            &rewrite,
+            stop,
         )
         .await?;
-    tracing::debug!(
-        operation_id = %operation_id,
-        input_rows = rewrite.input_rows,
-        output_rows = rewrite.output_rows,
-        output_files = rewrite.object_paths.len(),
-        spill_bytes = rewrite.spill_bytes,
-        "Forge streaming rewrite completed"
-    );
-    lease.require_fence(&context.operator_pool).await?;
-    let prepared = forge_detail(
-        key,
-        bin,
-        &rewrite.files,
-        operation_id,
-        ForgeCompactionPhase::Prepared,
-        None,
-    )?;
-    prepare_inputs(context, lease, key, bin, prepared).await?;
-    commit_rewrite(context, lease, key, binding, bin, operation_id, &rewrite).await?;
-    Ok(CompactStats {
-        spill_bytes: rewrite.spill_bytes,
-        input_rows: rewrite.input_rows,
-        output_rows: rewrite.output_rows,
-        outputs_committed: rewrite.object_paths.len(),
-    })
+        Ok(CompactStats {
+            spill_bytes: rewrite.spill_bytes,
+            input_rows: rewrite.input_rows,
+            output_rows: rewrite.output_rows,
+            outputs_committed: rewrite.object_paths.len(),
+        })
+    }
 }
 
 /// Rewrite statistics returned only after the Iceberg commit succeeds.
@@ -797,97 +808,109 @@ struct CompactStats {
     outputs_committed: usize,
 }
 
-/// Commit one completed rewrite and stamp its shared terminal snapshot.
-///
-/// All rotated outputs enter one `RewriteFilesAction`. A definite catalog
-/// failure resets the prepared inputs only while this owner still holds the
-/// fence; uncertain failures remain prepared for reconciliation.
-///
-/// # Errors
-///
-/// Returns fence, catalog, timeout, reconciliation, SQL, or audit failures.
-async fn commit_rewrite(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    binding: &TenantTableBinding,
-    bin: &RewriteBin,
-    operation_id: Uuid,
-    rewrite: &RewriteOutput,
-) -> Result<(), ForgeError> {
-    lease.require_fence(&context.operator_pool).await?;
-    if !lease.commit_window_fits(context.config.commit_window()) {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    let table = load_table(context, &binding.table_ident()).await?;
-    let mut properties = HashMap::new();
-    properties.insert("forge.operation_id".to_owned(), operation_id.to_string());
-    properties.insert("forge.group".to_owned(), key.audit_resource());
-    let tx = Transaction::new(&table);
-    let action = tx
-        .rewrite_files()
-        .delete_files(Vec::<String>::new())
-        .add_data_files(rewrite.files.iter().cloned())
-        .set_commit_uuid(operation_id)
-        .set_snapshot_properties(properties);
-    let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
-    lease.require_fence(&context.operator_pool).await?;
-    if !lease.commit_window_fits(context.config.commit_window()) {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    match tokio::time::timeout(
-        context.config.iceberg_total_retry_timeout,
-        transaction.commit(context.catalog.as_ref()),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            if !is_retryable(&error) {
-                if lease.require_fence(&context.operator_pool).await.is_ok() {
-                    reset_inputs(context, lease, key, bin, &rewrite.files, operation_id).await?;
-                } else {
-                    tracing::warn!(
-                        lease_key = %lease.lease_key,
-                        operation_id = %operation_id,
-                        "definite Iceberg failure could not be reset after fence loss"
-                    );
-                }
-            }
-            return Err(ForgeError::Catalog(error));
-        }
-        Err(_) => {
-            return Err(ForgeError::Timeout {
-                operation: "Iceberg commit",
+impl Forge {
+    /// Commit one completed rewrite and stamp its shared terminal snapshot.
+    ///
+    /// All rotated outputs enter one `RewriteFilesAction`. A definite catalog
+    /// failure resets the prepared inputs only while this owner still holds the
+    /// fence; uncertain failures remain prepared for reconciliation.
+    /// Cancellation while the catalog future is unresolved returns shutdown
+    /// without resetting inputs, allowing the normal lease-release path and a
+    /// successor reconciliation tick to decide the terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns fence, catalog, timeout, reconciliation, SQL, or audit failures.
+    async fn commit_rewrite(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        binding: &TenantTableBinding,
+        bin: &RewriteBin,
+        operation_id: Uuid,
+        rewrite: &RewriteOutput,
+        stop: &CancellationToken,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&context.operator_pool).await?;
+        if !lease.commit_window_fits(context.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
             });
         }
+        let table = load_table(context, &binding.table_ident()).await?;
+        let mut properties = HashMap::new();
+        properties.insert("forge.operation_id".to_owned(), operation_id.to_string());
+        properties.insert("forge.group".to_owned(), key.audit_resource());
+        let tx = Transaction::new(&table);
+        let action = tx
+            .rewrite_files()
+            .delete_files(Vec::<String>::new())
+            .add_data_files(rewrite.files.iter().cloned())
+            .set_commit_uuid(operation_id)
+            .set_snapshot_properties(properties);
+        let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
+        lease.require_fence(&context.operator_pool).await?;
+        if !lease.commit_window_fits(context.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        let commit = transaction.commit(context.catalog.as_ref());
+        tokio::pin!(commit);
+        let response = tokio::select! {
+            response = tokio::time::timeout(
+                context.config.iceberg_total_retry_timeout,
+                &mut commit,
+            ) => response,
+            () = stop.cancelled() => return Err(ForgeError::Shutdown),
+        };
+        match response {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                if !Self::is_retryable(&error) {
+                    if lease.require_fence(&context.operator_pool).await.is_ok() {
+                        reset_inputs(context, lease, key, bin, &rewrite.files, operation_id)
+                            .await?;
+                    } else {
+                        tracing::warn!(
+                            lease_key = %lease.lease_key,
+                            operation_id = %operation_id,
+                            "definite Iceberg failure could not be reset after fence loss"
+                        );
+                    }
+                }
+                return Err(ForgeError::Catalog(error));
+            }
+            Err(_) => {
+                return Err(ForgeError::Timeout {
+                    operation: "Iceberg commit",
+                });
+            }
+        }
+        let committed_table = load_table(context, &binding.table_ident()).await?;
+        let snapshot_id = committed_table
+            .metadata()
+            .current_snapshot_id()
+            .ok_or_else(|| ForgeError::Reconciliation {
+                detail: "Iceberg replace committed without a current snapshot".to_owned(),
+            })?;
+        stamp_committed(
+            context,
+            lease,
+            key,
+            bin,
+            &rewrite.files,
+            operation_id,
+            snapshot_id,
+        )
+        .await
     }
-    let committed_table = load_table(context, &binding.table_ident()).await?;
-    let snapshot_id = committed_table
-        .metadata()
-        .current_snapshot_id()
-        .ok_or_else(|| ForgeError::Reconciliation {
-            detail: "Iceberg replace committed without a current snapshot".to_owned(),
-        })?;
-    stamp_committed(
-        context,
-        lease,
-        key,
-        bin,
-        &rewrite.files,
-        operation_id,
-        snapshot_id,
-    )
-    .await
-}
 
-/// Return whether Iceberg classified an error as safe to retry.
-fn is_retryable(error: &iceberg::Error) -> bool {
-    error.retryable()
+    /// Return whether Iceberg classified an error as safe to retry.
+    fn is_retryable(error: &iceberg::Error) -> bool {
+        error.retryable()
+    }
 }
 
 /// Reject a staging batch containing a missing, malformed, or foreign tenant.
@@ -953,51 +976,54 @@ pub(crate) fn project_by_name(
     })
 }
 
-/// Mark input rows prepared and append the matching prepared audit event.
-///
-/// The SQL transition and audit append share one tenant transaction, which is
-/// fenced immediately before commit.
-async fn prepare_inputs(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    bin: &RewriteBin,
-    detail: AuditDetail,
-) -> Result<(), ForgeError> {
-    if !lease.renew(&context.operator_pool).await? {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
-    let result = sqlx::query(
-        r"UPDATE vala.file_list
+impl Forge {
+    /// Mark input rows prepared and append the matching prepared audit event.
+    ///
+    /// The SQL transition and audit append share one tenant transaction, which is
+    /// fenced immediately before commit.
+    async fn prepare_inputs(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+        detail: AuditDetail,
+    ) -> Result<(), ForgeError> {
+        if !lease.renew(&context.operator_pool).await? {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        let mut conn = context
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
+        let result = sqlx::query(
+            r"UPDATE vala.file_list
               SET compacted = true
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5) AND NOT compacted",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(&ids)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
-        return Err(ForgeError::Reconciliation {
-            detail: "prepared transition did not claim every input file".to_owned(),
-        });
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(&ids)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
+            return Err(ForgeError::Reconciliation {
+                detail: "prepared transition did not claim every input file".to_owned(),
+            });
+        }
+        lease.require_fence(&context.operator_pool).await?;
+        append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail).await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
     }
-    lease.require_fence(&context.operator_pool).await?;
-    append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail).await?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
 }
 
 /// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.

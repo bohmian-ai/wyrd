@@ -126,11 +126,20 @@ struct RewriteBatchState {
     output_rows: u64,
     /// Peak spill bytes observed while consuming sorted batches.
     peak_spill_bytes: u64,
+    /// Shared DataFusion pool reservation for encoded output capacity.
+    output_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
 }
 
 impl RewriteBatchState {
     /// Create empty state before the first sorted batch is consumed.
     fn new() -> Self {
+        Self::with_reservation(None)
+    }
+
+    /// Create state with an optional shared-pool output reservation.
+    fn with_reservation(
+        reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    ) -> Self {
         Self {
             writer: None,
             writer_rows: 0,
@@ -139,6 +148,7 @@ impl RewriteBatchState {
             input_rows: 0,
             output_rows: 0,
             peak_spill_bytes: 0,
+            output_reservation: reservation,
         }
     }
 
@@ -176,6 +186,13 @@ impl RewriteBatchState {
     /// Returns a Parquet encoding failure or [`ForgeError::Invariant`] when
     /// the batch row count cannot fit the rewrite's `u64` counters.
     fn write_batch(&mut self, schema: &SchemaRef, batch: &RecordBatch) -> Result<(), ForgeError> {
+        if let Some(reservation) = &self.output_reservation {
+            reservation
+                .try_grow(batch.get_array_memory_size())
+                .map_err(|error| ForgeError::Invariant {
+                    detail: format!("Forge output reservation rejected batch: {error}"),
+                })?;
+        }
         if self.writer.is_none() {
             self.writer = Some(
                 ArrowWriter::try_new(
@@ -215,6 +232,9 @@ impl RewriteBatchState {
 
     /// Record one finalized output and clear its rows from the active writer.
     fn record_output(&mut self, file: DataFile, path: String) {
+        if let Some(reservation) = &self.output_reservation {
+            reservation.free();
+        }
         self.output_rows = self.output_rows.saturating_add(self.writer_rows);
         self.writer_rows = 0;
         self.output_paths.push(path);
@@ -363,6 +383,10 @@ impl ForgeRewritePipeline {
             input_rows,
             output_rows,
             peak_spill_bytes,
+            request.binding,
+            stop,
+            lease,
+            operator_pool,
         )
         .await
     }
@@ -386,7 +410,10 @@ impl ForgeRewritePipeline {
         lease: &mut ForgeLease,
         operator_pool: &OperatorPool,
     ) -> RewriteBatchResult {
-        let mut state = RewriteBatchState::new();
+        let reservation =
+            datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-output")
+                .register(&self.runtime.runtime.memory_pool);
+        let mut state = RewriteBatchState::with_reservation(Some(reservation));
         while let Some(batch) = tokio::select! {
             () = stop.cancelled() => return state.fail(ForgeError::Shutdown),
             batch = stream.next() => batch,
@@ -462,7 +489,24 @@ impl ForgeRewritePipeline {
             )
             .await?;
         }
-        state.write_batch(&request.schema, batch)?;
+        let mut detached = std::mem::replace(
+            state,
+            RewriteBatchState::with_reservation(Some(
+                datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-output")
+                    .register(&self.runtime.runtime.memory_pool),
+            )),
+        );
+        let schema = Arc::clone(&request.schema);
+        let batch = batch.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let result = detached.write_batch(&schema, &batch);
+            (detached, result)
+        });
+        let (returned, result) = join.await.map_err(|error| ForgeError::Invariant {
+            detail: format!("Forge output encoding task failed: {error}"),
+        })?;
+        *state = returned;
+        result?;
         state.observe_spill(self.runtime.runtime.spilling_progress().current_bytes);
         Ok(())
     }
@@ -527,24 +571,32 @@ impl ForgeRewritePipeline {
         input_rows: u64,
         output_rows: u64,
         peak_spill_bytes: u64,
+        binding: &TenantTableBinding,
+        stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
     ) -> Result<RewriteOutput, ForgeError> {
         if let Err(error) = self.await_spill_cleanup().await {
-            self.cleanup_paths(&output_paths).await;
+            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
+                .await;
             return Err(error);
         }
         if let Err(error) = result {
-            self.cleanup_paths(&output_paths).await;
+            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
+                .await;
             return Err(error);
         }
         let final_spill = self.runtime.runtime.spilling_progress();
         if final_spill.active_files_count != 0 {
-            self.cleanup_paths(&output_paths).await;
+            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
+                .await;
             return Err(ForgeError::Invariant {
                 detail: "Forge rewrite ended with active spill files".to_owned(),
             });
         }
         if input_rows != output_rows {
-            self.cleanup_paths(&output_paths).await;
+            self.cleanup_paths(&output_paths, binding, stop, lease, operator_pool)
+                .await;
             return Err(ForgeError::Invariant {
                 detail: format!(
                     "Forge rewrite row mismatch: accepted {input_rows}, encoded {output_rows}"
@@ -679,6 +731,7 @@ impl ForgeRewritePipeline {
             request.operation_id,
             ordinal,
         );
+        validate_table_location(request.binding, request.table_location)?;
         request
             .binding
             .validate_object_path(&object_path)
@@ -696,8 +749,11 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
+        let output_size = u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
+            detail: format!("output size does not fit u64: {error}"),
+        })?;
         self.staging
-            .write(&object_path, Buffer::from(bytes.clone()))
+            .write(&object_path, Buffer::from(bytes))
             .await
             .map_err(ForgeError::ObjectStore)?;
         let table_path = format!(
@@ -715,11 +771,7 @@ impl ForgeRewritePipeline {
             .partition(partition)
             .partition_spec_id(request.partition_spec_id)
             .record_count(rows)
-            .file_size_in_bytes(u64::try_from(bytes.len()).map_err(|error| {
-                ForgeError::Invariant {
-                    detail: format!("output size does not fit u64: {error}"),
-                }
-            })?)
+            .file_size_in_bytes(output_size)
             .build()
             .map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge output metadata is incomplete: {error}"),
@@ -727,17 +779,58 @@ impl ForgeRewritePipeline {
         let file = match file {
             Ok(file) => file,
             Err(error) => {
-                self.cleanup_paths(std::slice::from_ref(&object_path)).await;
+                self.cleanup_paths(
+                    std::slice::from_ref(&object_path),
+                    request.binding,
+                    stop,
+                    lease,
+                    operator_pool,
+                )
+                .await;
                 return Err(error);
             }
         };
         Ok((file, object_path))
     }
 
-    /// Delete rewrite-owned paths without masking the original operation error.
-    async fn cleanup_paths(&self, paths: &[String]) {
+    /// Delete rewrite-owned paths only after binding and fence validation.
+    ///
+    /// Cleanup is deliberately best effort: the caller's primary rewrite or
+    /// metadata error remains authoritative. A cancelled operation, lost
+    /// fence, invalid binding, or uncertain ownership leaves all remaining
+    /// objects for the fenced orphan-GC pass rather than risking a successor's
+    /// committed output.
+    async fn cleanup_paths(
+        &self,
+        paths: &[String],
+        binding: &TenantTableBinding,
+        stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
+    ) {
+        if stop.is_cancelled() {
+            return;
+        }
         for path in paths {
-            if let Err(cleanup_error) = self.object_store.delete(path).await {
+            let Some(path) = binding.validate_object_path(path) else {
+                tracing::warn!(path, "Forge cleanup refused path outside table binding");
+                continue;
+            };
+            if stop.is_cancelled() {
+                return;
+            }
+            if let Err(fence_error) = lease.require_fence(operator_pool).await {
+                tracing::warn!(
+                    path,
+                    error = %fence_error,
+                    "Forge cleanup deferred after fence loss"
+                );
+                return;
+            }
+            if stop.is_cancelled() {
+                return;
+            }
+            if let Err(cleanup_error) = self.object_store.delete(&path).await {
                 tracing::warn!(
                     path,
                     error = %cleanup_error,
@@ -769,6 +862,28 @@ fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -
         "{}/data/forge-{operation_id}-{ordinal:05}.parquet",
         prefix.trim_end_matches('/')
     )
+}
+
+/// Verify that Iceberg's catalog location names this table's exact object
+/// prefix before any rewrite output side effect occurs.
+///
+/// # Errors
+/// Returns [`ForgeError::Invariant`] when the catalog location is empty or
+/// does not end at the binding-derived table prefix.
+fn validate_table_location(
+    binding: &TenantTableBinding,
+    table_location: &str,
+) -> Result<(), ForgeError> {
+    let location = table_location.trim_end_matches('/');
+    let prefix = binding.object_prefix.trim_end_matches('/');
+    if location.is_empty() || prefix.is_empty() || !location.ends_with(prefix) {
+        return Err(ForgeError::Invariant {
+            detail: format!(
+                "catalog table location does not match tenant binding: location={table_location}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// `DataFusion` leaf plan that owns bounded staging-file decoding.

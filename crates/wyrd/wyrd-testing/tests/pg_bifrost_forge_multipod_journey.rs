@@ -424,7 +424,7 @@ async fn active_partition_incremental_compaction() {
         server,
         fixture.tenant,
         "periodic_lost_hint_recovery",
-        false,
+        true,
         &[chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("aged day")],
     )
     .await;

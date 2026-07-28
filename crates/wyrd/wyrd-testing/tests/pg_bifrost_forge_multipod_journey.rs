@@ -318,7 +318,7 @@ async fn active_partition_incremental_compaction() {
             .any(|(operation, _, _)| operation == "forge.file_compact.committed")
     );
     assert_eq!(leases_now, 0);
-    let oracle_before = oracle_rows(server, &jwt).await;
+    let oracle_before = wait_for_oracle_rows(server, &jwt, 36).await;
     assert_eq!(
         oracle_before, 36,
         "Oracle sees all flushed Scribe rows before Forge"
@@ -464,6 +464,10 @@ async fn assert_forge_terminal_once(fixture: &wyrd_testing::bifrost::ForgeFixtur
 }
 
 /// Query the bound server's public Oracle endpoint and return its durable row count.
+///
+/// # Panics
+///
+/// Panics when the public request fails or omits a valid row-count header.
 async fn oracle_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
     let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
     let response = reqwest::Client::new()
@@ -484,4 +488,25 @@ async fn oracle_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse().ok())
         .expect("Oracle row-count header")
+}
+
+/// Wait for Oracle's hot-plus-durable view to retire flushed live-tail rows.
+///
+/// # Panics
+///
+/// Panics when Oracle does not converge to the exact expected row count within
+/// five seconds.
+async fn wait_for_oracle_rows(server: &WyrdTestServer, jwt: &str, expected: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = oracle_rows(server, jwt).await;
+        if rows == expected {
+            return rows;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Oracle did not converge to {expected} rows; observed {rows}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }

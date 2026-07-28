@@ -297,9 +297,13 @@ def register_and_apply(
 
 def _interfaces() -> dict[str, Any]:
     return {
-        "model_primary": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_primary"]),
+        "model_primary": JourneyModelInterface(
+            RuntimeServiceFixture.artifact_bytes["model_primary"]
+        ),
         "model_shadow": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_shadow"]),
-        "training_data": JourneyDataInterface(RuntimeServiceFixture.artifact_bytes["training_data"]),
+        "training_data": JourneyDataInterface(
+            RuntimeServiceFixture.artifact_bytes["training_data"]
+        ),
     }
 
 

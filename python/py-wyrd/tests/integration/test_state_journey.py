@@ -10,6 +10,7 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import wyrd
@@ -138,6 +139,11 @@ class RuntimeServiceFixture:
         path.write_text(yaml.safe_dump(document, sort_keys=False))
         return self.source
 
+
+def writer_api_key(server: WyrdTestServer) -> str:
+    """Mint a valid writer key for the journey's real server boundary."""
+    return server.bootstrap_service(["writer"], name=f"state-journey-{uuid4().hex[:12]}")
+
     def run_cli(
         self,
         server: WyrdTestServer,
@@ -146,7 +152,10 @@ class RuntimeServiceFixture:
         check: bool = True,
     ) -> dict[str, Any]:
         previous = {key: os.environ.get(key) for key in ("WYRD_SERVER_URL", "WYRD_API_KEY")}
-        os.environ.update(WYRD_SERVER_URL=server.base_url, WYRD_API_KEY=api_key or server.api_key)
+        os.environ.update(
+            WYRD_SERVER_URL=server.base_url,
+            WYRD_API_KEY=api_key or writer_api_key(server),
+        )
         old, sys.argv = sys.argv, ["wyrd", *arguments]
         out, err = io.StringIO(), io.StringIO()
         try:
@@ -206,7 +215,7 @@ def download_fixture(tmp_path: Path) -> tuple[RuntimeServiceFixture, Path, CardR
     fixture, bundle = RuntimeServiceFixture(tmp_path), tmp_path / "wyrd-state"
     fixture.bundle = bundle
     with WyrdTestServer(mutate_env=False) as server:
-        cards = Cards(server_url=server.base_url, api_key=server.api_key)
+        cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
         refs = {
             ("Model", "primary"): fixture.register_model(cards, "model_primary"),
             ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),
@@ -225,7 +234,7 @@ def register_and_apply(
     fixture: RuntimeServiceFixture, server: WyrdTestServer, bundle: Path
 ) -> CardRef:
     """Register and apply the fixture graph against the supplied live server."""
-    cards = Cards(server_url=server.base_url, api_key=server.api_key)
+    cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
     refs = {
         ("Model", "primary"): fixture.register_model(cards, "model_primary"),
         ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),
@@ -290,7 +299,7 @@ def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> Non
     """Reject a bundle produced by the public metadata-only CLI mode."""
     fixture, bundle = RuntimeServiceFixture(tmp_path), tmp_path / "metadata-only"
     with WyrdTestServer(mutate_env=False) as server:
-        cards = Cards(server_url=server.base_url, api_key=server.api_key)
+        cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
         refs = {
             ("Model", "primary"): fixture.register_model(cards, "model_primary"),
             ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),

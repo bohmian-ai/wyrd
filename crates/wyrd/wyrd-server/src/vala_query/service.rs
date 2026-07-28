@@ -58,7 +58,7 @@ use crate::components::auth::Caller;
 pub(crate) const DEFAULT_WINDOW_DAYS: i64 = 7;
 
 /// One durable staging row included in Oracle's table publication token.
-#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 struct OracleFilePublication {
     /// Stable `vala.file_list` row identity.
     id: Uuid,
@@ -77,7 +77,7 @@ struct OracleFilePublication {
 }
 
 /// One ordered Forge audit transition used to classify unresolved cutovers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 struct ForgeOperationTransition {
     /// Stable compaction operation shared by prepared and terminal transitions.
     operation_id: Uuid,
@@ -291,12 +291,16 @@ impl<'a> OracleSnapshot<'a> {
         Ok(provider)
     }
 
-    /// Read one repeatable SQL snapshot of table publication and Forge state.
+    /// Read one RLS-bound statement snapshot of publication and Forge state.
+    ///
+    /// Both ordered aggregates are scalar subqueries in the same SQL statement,
+    /// so PostgreSQL's READ COMMITTED semantics expose one MVCC snapshot without
+    /// changing the transaction mode after tenant binding.
     ///
     /// # Errors
     ///
-    /// Returns [`WyrdError::Internal`] when the operator pool is unavailable,
-    /// transaction setup fails, SQL rows cannot be decoded, or commit fails.
+    /// Returns [`WyrdError::Internal`] when the tenant connection cannot be
+    /// acquired, SQL rows cannot be decoded, or commit fails.
     ///
     /// # Cancellation
     ///
@@ -305,55 +309,73 @@ impl<'a> OracleSnapshot<'a> {
         let Some(tail) = &self.tail else {
             return Ok(None);
         };
-        let pool = self
+        let mut conn = self
             .state
             .postgres
-            .operator_pool()
-            .ok_or_else(|| WyrdError::Internal {
-                message: "operator pool unavailable for Oracle WAL fence".to_owned(),
-                details: serde_json::Value::Null,
-            })?;
-        let mut transaction = pool.pool().begin().await.map_err(oracle_fence_error)?;
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            .execute(&mut *transaction)
+            .vala()
+            .tenant_conn(self.tenant)
             .await
             .map_err(oracle_fence_error)?;
-        let publication_rows = sqlx::query_as::<_, OracleFilePublication>(
-            "SELECT id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, compacted,
-                    committed_snapshot_id
-               FROM vala.file_list
-              WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              ORDER BY node_id, writer_epoch, wal_lsn_min, wal_lsn_max, id",
-        )
-        .bind(self.tenant.as_uuid())
-        .bind(&self.binding.logical_namespace)
-        .bind(&self.binding.table_name)
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(oracle_fence_error)?;
         let resource = format!(
             "bifrost://{}/{}/{}",
             self.tenant, self.binding.logical_namespace, self.binding.table_name
         );
-        let transitions = sqlx::query_as::<_, ForgeOperationTransition>(
-            "SELECT (detail::jsonb ->> 'operation_id')::uuid AS operation_id,
-                    operation = 'forge.file_compact.prepared' AS is_prepared
-               FROM vala.audit_outbox
-              WHERE data_tenant_id = $1 AND resource = $2
-                AND operation IN (
-                    'forge.file_compact.prepared',
-                    'forge.file_compact.committed',
-                    'forge.file_compact.recovered',
-                    'forge.file_compact.reset'
-                )
-              ORDER BY seq",
+        let (sqlx::types::Json(publication_rows), sqlx::types::Json(transitions)): (
+            sqlx::types::Json<Vec<OracleFilePublication>>,
+            sqlx::types::Json<Vec<ForgeOperationTransition>>,
+        ) = sqlx::query_as(
+            "SELECT
+                COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'id', id,
+                                'node_id', node_id,
+                                'writer_epoch', writer_epoch,
+                                'wal_lsn_min', wal_lsn_min,
+                                'wal_lsn_max', wal_lsn_max,
+                                'compacted', compacted,
+                                'committed_snapshot_id', committed_snapshot_id
+                            )
+                            ORDER BY node_id, writer_epoch, wal_lsn_min, wal_lsn_max, id
+                        )
+                        FROM vala.file_list
+                        WHERE data_tenant_id = $1
+                          AND namespace = $2
+                          AND table_name = $3
+                    ),
+                    '[]'::jsonb
+                ) AS publication_rows,
+                COALESCE(
+                    (
+                        SELECT jsonb_agg(
+                            jsonb_build_object(
+                                'operation_id', detail::jsonb ->> 'operation_id',
+                                'is_prepared', operation = 'forge.file_compact.prepared'
+                            )
+                            ORDER BY seq
+                        )
+                        FROM vala.audit_outbox
+                        WHERE data_tenant_id = $1
+                          AND resource = $4
+                          AND operation IN (
+                              'forge.file_compact.prepared',
+                              'forge.file_compact.committed',
+                              'forge.file_compact.recovered',
+                              'forge.file_compact.reset'
+                          )
+                    ),
+                    '[]'::jsonb
+                ) AS transitions",
         )
         .bind(self.tenant.as_uuid())
+        .bind(&self.binding.logical_namespace)
+        .bind(&self.binding.table_name)
         .bind(resource)
-        .fetch_all(&mut *transaction)
+        .fetch_one(&mut **conn.transaction())
         .await
         .map_err(oracle_fence_error)?;
-        transaction.commit().await.map_err(oracle_fence_error)?;
+        conn.commit().await.map_err(oracle_fence_error)?;
         Ok(Some(OracleFence::derive(
             publication_rows,
             &transitions,
@@ -457,7 +479,7 @@ fn unresolved_prepared_operations(transitions: &[ForgeOperationTransition]) -> V
 }
 
 /// Map one SQL fence failure to the fail-closed Oracle error.
-fn oracle_fence_error(error: sqlx::Error) -> WyrdError {
+fn oracle_fence_error(error: impl std::fmt::Display) -> WyrdError {
     WyrdError::Internal {
         message: "Oracle publication fence lookup failed".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),

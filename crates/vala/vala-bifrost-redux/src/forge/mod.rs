@@ -103,6 +103,7 @@ impl Forge {
         let rewrite = ForgeRewritePipeline::new(
             build.rewrite_runtime,
             Arc::clone(&build.staging),
+            Arc::clone(&build.catalog),
             Arc::clone(&build.object_store),
             build.config.max_concurrent_reads,
             build.config.output_file_bytes,

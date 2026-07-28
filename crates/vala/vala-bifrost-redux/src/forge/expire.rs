@@ -18,10 +18,10 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 
+use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::{Forge, ForgeCore};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -83,7 +83,7 @@ impl Forge {
     ///
     /// Returns a SQL error when no complete discovery set can be formed.
     pub(super) async fn discover_tables(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        self.discover_tables_inner(&self.core).await
+        self.discover_tables_inner().await
     }
 
     /// Reconcile and expire snapshots while retaining the shared table fence.
@@ -97,7 +97,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
-        self.run_snapshot_expiry_for_table_inner(&self.core, lease, key, binding)
+        self.run_snapshot_expiry_for_table_inner(lease, key, binding)
             .await
     }
 }
@@ -107,16 +107,13 @@ impl Forge {
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
 impl Forge {
-    async fn discover_tables_inner(
-        &self,
-        context: &ForgeCore,
-    ) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
+    async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
         let rows = sqlx::query(
             r"SELECT DISTINCT data_tenant_id, namespace, table_name
              FROM vala.file_list
             ORDER BY data_tenant_id, namespace, table_name",
         )
-        .fetch_all(context.operator_pool.pool())
+        .fetch_all(self.core.operator_pool.pool())
         .await
         .map_err(|error| ForgeError::Sql(error.into()))?;
         let mut failures = 0;
@@ -171,35 +168,28 @@ impl Forge {
     /// commit so a stale prepared selection cannot delete a newly protected head.
     async fn run_snapshot_expiry_for_table_inner(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
-        let mut recovered = self.reconcile_expiry(context, lease, key, binding).await?;
+        let mut recovered = self.reconcile_expiry(lease, key, binding).await?;
         let table = self.load_table(&binding.table_ident()).await?;
-        let cutoff_ms = expiry_cutoff_ms(context.config.snapshot_retention)?;
+        let cutoff_ms = expiry_cutoff_ms(self.core.config.snapshot_retention)?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
         let selected = select_expirable_snapshots(
             &summaries,
             table.metadata().current_snapshot_id(),
             &ref_heads,
             cutoff_ms,
-            context.config.retain_last,
+            self.core.config.retain_last,
         );
         if selected.is_empty() {
             return Ok(recovered);
         }
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
-        self.append_expiry_audit(
-            context,
-            lease,
-            key.tenant,
-            &detail,
-            "forge.snapshot_expire.prepared",
-        )
-        .await?;
-        self.complete_expiry(context, lease, key, binding, &detail, false)
+        self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
+            .await?;
+        self.complete_expiry(lease, key, binding, &detail, false)
             .await?;
         recovered += 1;
         Ok(recovered)
@@ -286,7 +276,6 @@ fn expiry_detail(
 impl Forge {
     async fn complete_expiry(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
@@ -315,12 +304,12 @@ impl Forge {
                 detail: "expiry audit detail is not canonical".to_owned(),
             });
         }
-        if !lease.renew(&context.operator_pool).await? {
+        if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        if !lease.commit_window_fits(context.config.commit_window()) {
+        if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
@@ -330,7 +319,7 @@ impl Forge {
             &table,
             selected_snapshot_ids,
             *cutoff_ms,
-            context.config.retain_last,
+            self.core.config.retain_last,
         )? {
             return Err(ForgeError::SnapshotExpiry {
                 detail: "reloaded Iceberg metadata no longer matches the prepared selection"
@@ -342,24 +331,24 @@ impl Forge {
             .expire_snapshots()
             .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
             .expire_older_than_ms(*cutoff_ms)
-            .retain_last(context.config.retain_last.max(1));
+            .retain_last(self.core.config.retain_last.max(1));
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
-        lease.require_fence(&context.operator_pool).await?;
-        if !lease.commit_window_fits(context.config.commit_window()) {
+        lease.require_fence(&self.core.operator_pool).await?;
+        if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
         }
         tokio::time::timeout(
-            context.config.iceberg_total_retry_timeout,
-            transaction.commit(context.catalog.as_ref()),
+            self.core.config.iceberg_total_retry_timeout,
+            transaction.commit(self.core.catalog.as_ref()),
         )
         .await
         .map_err(|_| ForgeError::Timeout {
             operation: "Iceberg snapshot expiry commit",
         })?
         .map_err(ForgeError::Catalog)?;
-        lease.require_fence(&context.operator_pool).await?;
+        lease.require_fence(&self.core.operator_pool).await?;
         let terminal = terminal_expiry_detail(
             detail,
             if recovered {
@@ -369,7 +358,6 @@ impl Forge {
             },
         );
         self.append_expiry_audit(
-            context,
             lease,
             key.tenant,
             &terminal,
@@ -411,12 +399,11 @@ fn selected_ids_are_eligible(
 impl Forge {
     async fn reconcile_expiry(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
-        let (prepared, terminal) = self.load_expiry_audits(context, key).await?;
+        let (prepared, terminal) = self.load_expiry_audits(key).await?;
         let mut recovered = 0;
         for (operation_id, (detail, created_at)) in prepared {
             if terminal.contains(&operation_id) {
@@ -434,9 +421,8 @@ impl Forge {
                 .iter()
                 .all(|id| table.metadata().snapshot_by_id(*id).is_none());
             if all_absent {
-                lease.require_fence(&context.operator_pool).await?;
+                lease.require_fence(&self.core.operator_pool).await?;
                 self.append_expiry_audit(
-                    context,
                     lease,
                     key.tenant,
                     &terminal_expiry_detail(&detail, ForgeSnapshotExpirePhase::Recovered),
@@ -450,11 +436,11 @@ impl Forge {
                 .signed_duration_since(created_at)
                 .to_std()
                 .unwrap_or_default()
-                < context.config.uncertainty_bound
+                < self.core.config.uncertainty_bound
             {
                 continue;
             }
-            self.complete_expiry(context, lease, key, binding, &detail, true)
+            self.complete_expiry(lease, key, binding, &detail, true)
                 .await?;
             recovered += 1;
         }
@@ -466,10 +452,10 @@ impl Forge {
 impl Forge {
     async fn load_expiry_audits(
         &self,
-        context: &ForgeCore,
         key: &ForgeTableKey,
     ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
-        let mut conn = context
+        let mut conn = self
+            .core
             .vala
             .tenant_conn(key.tenant)
             .await
@@ -482,7 +468,7 @@ impl Forge {
                 &mut conn,
                 &table_resource_for_key(key),
                 after_seq,
-                context.config.audit_page_size,
+                self.core.config.audit_page_size,
             )
             .await
             .map_err(ForgeError::Sql)?;
@@ -524,7 +510,7 @@ impl Forge {
                     }
                 }
             }
-            if page_len < usize::try_from(context.config.audit_page_size).unwrap_or(usize::MAX) {
+            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
                 break;
             }
         }
@@ -535,7 +521,6 @@ impl Forge {
     /// Append a fenced snapshot-expiry audit event in the tenant transaction.
     async fn append_expiry_audit(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         tenant: DataTenantId,
         detail: &AuditDetail,
@@ -564,8 +549,9 @@ impl Forge {
             payload_summary: operation.to_owned(),
             detail: Some(detail.clone()),
         };
-        lease.require_fence(&context.operator_pool).await?;
-        let mut conn = context
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
             .vala
             .tenant_conn(tenant)
             .await

@@ -18,11 +18,11 @@ use wyrd_spec::vala::api::{
 
 use crate::catalog::TenantTableBinding;
 
+use super::Forge;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
-use super::{Forge, ForgeCore};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -72,7 +72,7 @@ impl Forge {
         binding: &TenantTableBinding,
         live_set: &ProtectedLiveSet,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        self.run_orphan_gc_for_table_inner(&self.core, lease, key, binding, live_set)
+        self.run_orphan_gc_for_table_inner(lease, key, binding, live_set)
             .await
     }
 
@@ -87,15 +87,13 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &iceberg::table::Table,
     ) -> Result<ProtectedLiveSet, ForgeError> {
-        self.build_live_set_inner(&self.core, key, binding, table)
-            .await
+        self.build_live_set_inner(key, binding, table).await
     }
 }
 
 impl Forge {
     async fn run_orphan_gc_for_table_inner(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
@@ -131,7 +129,6 @@ pub(crate) struct OrphanGcOutcome {
 impl Forge {
     async fn build_live_set_inner(
         &self,
-        context: &ForgeCore,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         table: &iceberg::table::Table,
@@ -180,7 +177,8 @@ impl Forge {
             }
         }
 
-        let mut conn = context
+        let mut conn = self
+            .core
             .vala
             .tenant_conn(key.tenant)
             .await

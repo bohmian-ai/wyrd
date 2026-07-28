@@ -28,6 +28,7 @@ use datafusion::physical_plan::{
 use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
+use iceberg::Catalog;
 use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
@@ -55,10 +56,14 @@ pub(crate) struct ForgeRewritePipeline {
     runtime: ForgeRewriteRuntime,
     /// Staging operator used for deterministic rewritten-object PUTs.
     staging: Arc<opendal::Operator>,
+    /// Iceberg catalog used to re-check live references before cleanup.
+    catalog: Arc<dyn Catalog>,
     /// Testable object-store seam used for source reads and failure cleanup.
     object_store: Arc<dyn ForgeObjectStore>,
     /// Upper bound for concurrently open source readers.
     max_concurrent_reads: usize,
+    /// Bounds CPU-heavy Parquet encode/finalize tasks.
+    blocking_permits: Arc<tokio::sync::Semaphore>,
     /// Encoded byte threshold checked before writing each next batch.
     output_file_bytes: u64,
 }
@@ -131,7 +136,8 @@ struct RewriteBatchState {
 }
 
 impl RewriteBatchState {
-    /// Create empty state before the first sorted batch is consumed.
+    /// Create empty state for isolated batch-state tests and callers without
+    /// a shared DataFusion reservation.
     fn new() -> Self {
         Self::with_reservation(None)
     }
@@ -308,6 +314,7 @@ impl ForgeRewritePipeline {
     pub(crate) fn new(
         runtime: ForgeRewriteRuntime,
         staging: Arc<opendal::Operator>,
+        catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         max_concurrent_reads: usize,
         output_file_bytes: u64,
@@ -320,8 +327,10 @@ impl ForgeRewritePipeline {
         Ok(Self {
             runtime,
             staging,
+            catalog,
             object_store,
             max_concurrent_reads,
+            blocking_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
             output_file_bytes,
         })
     }
@@ -498,7 +507,16 @@ impl ForgeRewritePipeline {
         );
         let schema = Arc::clone(&request.schema);
         let batch = batch.clone();
+        let permit = self
+            .blocking_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge blocking permit closed: {error}"),
+            })?;
         let join = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let result = detached.write_batch(&schema, &batch);
             (detached, result)
         });
@@ -723,15 +741,12 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
-            detail: error.to_string(),
-        })?;
         let object_path = deterministic_output_path(
             &request.binding.object_prefix,
             request.operation_id,
             ordinal,
         );
-        validate_table_location(request.binding, request.table_location)?;
+        self.validate_table_location(request.binding, request.table_location)?;
         request
             .binding
             .validate_object_path(&object_path)
@@ -749,47 +764,63 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
-        let output_size = u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
-            detail: format!("output size does not fit u64: {error}"),
-        })?;
-        self.staging
-            .write(&object_path, Buffer::from(bytes))
-            .await
-            .map_err(ForgeError::ObjectStore)?;
         let table_path = format!(
             "{}/data/forge-{}-{ordinal:05}.parquet",
             request.table_location.trim_end_matches('/'),
             request.operation_id
         );
-        let partition = Struct::from_iter([Some(Literal::date(
-            request.partition_day.num_days_from_ce() - 719_163,
-        ))]);
-        let file = DataFileBuilder::default()
-            .content(DataContentType::Data)
-            .file_path(table_path)
-            .file_format(DataFileFormat::Parquet)
-            .partition(partition)
-            .partition_spec_id(request.partition_spec_id)
-            .record_count(rows)
-            .file_size_in_bytes(output_size)
-            .build()
+        let partition_day = request.partition_day;
+        let partition_spec_id = request.partition_spec_id;
+        let operation_id = request.operation_id;
+        let permit = self
+            .blocking_permits
+            .clone()
+            .acquire_owned()
+            .await
             .map_err(|error| ForgeError::Invariant {
-                detail: format!("Forge output metadata is incomplete: {error}"),
+                detail: format!("Forge blocking permit closed: {error}"),
+            })?;
+        let join = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
+                detail: error.to_string(),
+            })?;
+            let output_size =
+                u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
+                    detail: format!("output size does not fit u64: {error}"),
+                })?;
+            let partition = Struct::from_iter([Some(Literal::date(
+                partition_day.num_days_from_ce() - 719_163,
+            ))]);
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(table_path)
+                .file_format(DataFileFormat::Parquet)
+                .partition(partition)
+                .partition_spec_id(partition_spec_id)
+                .record_count(rows)
+                .file_size_in_bytes(output_size)
+                .build()
+                .map_err(|error| ForgeError::Invariant {
+                    detail: format!("Forge output metadata is incomplete: {error}"),
+                })?;
+            Ok::<_, ForgeError>((bytes, file, operation_id))
+        });
+        let (bytes, file, _) = join.await.map_err(|error| ForgeError::Invariant {
+            detail: format!("Forge output finalization task failed: {error}"),
+        })??;
+        if catalog_path_to_object_key(request.table_location, request.binding, file.file_path())
+            .as_deref()
+            != Some(object_path.as_str())
+        {
+            return Err(ForgeError::Invariant {
+                detail: "Forge DataFile path does not map to its exact object key".to_owned(),
             });
-        let file = match file {
-            Ok(file) => file,
-            Err(error) => {
-                self.cleanup_paths(
-                    std::slice::from_ref(&object_path),
-                    request.binding,
-                    stop,
-                    lease,
-                    operator_pool,
-                )
-                .await;
-                return Err(error);
-            }
-        };
+        }
+        self.staging
+            .write(&object_path, Buffer::from(bytes))
+            .await
+            .map_err(ForgeError::ObjectStore)?;
         Ok((file, object_path))
     }
 
@@ -811,6 +842,20 @@ impl ForgeRewritePipeline {
         if stop.is_cancelled() {
             return;
         }
+        let table = match self.catalog.load_table(&binding.table_ident()).await {
+            Ok(table) => table,
+            Err(error) => {
+                tracing::warn!(error = %error, "Forge cleanup deferred because catalog live set is uncertain");
+                return;
+            }
+        };
+        let live_set = match self.current_live_set(binding, &table).await {
+            Ok(live_set) => live_set,
+            Err(error) => {
+                tracing::warn!(error = %error, "Forge cleanup deferred because live-set loading failed");
+                return;
+            }
+        };
         for path in paths {
             let Some(path) = binding.validate_object_path(path) else {
                 tracing::warn!(path, "Forge cleanup refused path outside table binding");
@@ -818,6 +863,10 @@ impl ForgeRewritePipeline {
             };
             if stop.is_cancelled() {
                 return;
+            }
+            if live_set.contains(&path) {
+                tracing::warn!(path, "Forge cleanup refused a currently referenced object");
+                continue;
             }
             if let Err(fence_error) = lease.require_fence(operator_pool).await {
                 tracing::warn!(
@@ -838,6 +887,89 @@ impl ForgeRewritePipeline {
                 );
             }
         }
+    }
+
+    /// Load the current catalog and control-plane references as object keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns a catalog, manifest, or binding invariant error when the live
+    /// set cannot be established exactly.
+    async fn current_live_set(
+        &self,
+        binding: &TenantTableBinding,
+        table: &iceberg::table::Table,
+    ) -> Result<std::collections::HashSet<String>, ForgeError> {
+        let mut live = std::collections::HashSet::new();
+        let mut add = |path: &str| {
+            let key = catalog_path_to_object_key(table.metadata().location(), binding, path)
+                .ok_or_else(|| ForgeError::Invariant {
+                    detail: format!("catalog reference escaped table binding: {path}"),
+                })?;
+            live.insert(key);
+            Ok::<(), ForgeError>(())
+        };
+        add(table
+            .metadata_location_result()
+            .map_err(ForgeError::Catalog)?)?;
+        for entry in table.metadata().metadata_log() {
+            add(&entry.metadata_file)?;
+        }
+        for snapshot in table.metadata().snapshots() {
+            add(snapshot.manifest_list())?;
+            let manifests = table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for manifest_file in manifests.entries() {
+                add(&manifest_file.manifest_path)?;
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .map_err(ForgeError::Catalog)?;
+                for entry in manifest.entries() {
+                    add(entry.data_file().file_path())?;
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// Validate catalog location and object-store identity before any output PUT.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the catalog location is not the
+    /// exact configured staging warehouse/table binding.
+    fn validate_table_location(
+        &self,
+        binding: &TenantTableBinding,
+        table_location: &str,
+    ) -> Result<(), ForgeError> {
+        validate_table_location(binding, table_location)?;
+        let info = self.staging.info();
+        let expected_scheme = match info.scheme() {
+            "fs" => "file",
+            scheme => scheme,
+        };
+        if !table_location.starts_with(&format!("{expected_scheme}://")) {
+            return Err(ForgeError::Invariant {
+                detail: format!("catalog scheme does not match staging store: {table_location}"),
+            });
+        }
+        if expected_scheme != "file" {
+            let authority = table_location
+                .strip_prefix(&format!("{expected_scheme}://"))
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default();
+            if authority != info.name() {
+                return Err(ForgeError::Invariant {
+                    detail: "catalog warehouse authority does not match staging store".to_owned(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Preserve the public spill-ceiling distinction for resource exhaustion.
@@ -869,14 +1001,19 @@ fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -
 ///
 /// # Errors
 /// Returns [`ForgeError::Invariant`] when the catalog location is empty or
-/// does not end at the binding-derived table prefix.
+/// does not contain the binding-derived table prefix as an exact path segment.
 fn validate_table_location(
     binding: &TenantTableBinding,
     table_location: &str,
 ) -> Result<(), ForgeError> {
     let location = table_location.trim_end_matches('/');
-    let prefix = binding.object_prefix.trim_end_matches('/');
-    if location.is_empty() || prefix.is_empty() || !location.ends_with(prefix) {
+    let prefix = binding.object_prefix.trim_matches('/');
+    let marker = format!("/{prefix}");
+    if location.is_empty()
+        || prefix.is_empty()
+        || !location.ends_with(&marker)
+        || location[..location.len() - marker.len()].ends_with('/')
+    {
         return Err(ForgeError::Invariant {
             detail: format!(
                 "catalog table location does not match tenant binding: location={table_location}"
@@ -884,6 +1021,25 @@ fn validate_table_location(
         });
     }
     Ok(())
+}
+
+/// Map one catalog URI to the exact relative object key for this binding.
+fn catalog_path_to_object_key(
+    table_location: &str,
+    binding: &TenantTableBinding,
+    path: &str,
+) -> Option<String> {
+    if let Some(path) = binding.validate_object_path(path) {
+        return Some(path);
+    }
+    let location = table_location.trim_end_matches('/');
+    let relative = path.strip_prefix(&format!("{location}/"))?;
+    let key = format!(
+        "{}/{}",
+        binding.object_prefix.trim_end_matches('/'),
+        relative
+    );
+    binding.validate_object_path(&key)
 }
 
 /// `DataFusion` leaf plan that owns bounded staging-file decoding.

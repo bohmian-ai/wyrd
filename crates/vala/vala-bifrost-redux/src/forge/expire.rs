@@ -18,7 +18,7 @@ use wyrd_spec::vala::api::{
 use crate::catalog::{TableRef, TenantTableBinding};
 use crate::namespaces::BifrostNamespace;
 
-use super::compact::{ForgeTableKey, load_table};
+use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::{Forge, ForgeCore};
@@ -177,7 +177,7 @@ impl Forge {
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
         let mut recovered = self.reconcile_expiry(context, lease, key, binding).await?;
-        let table = load_table(context, &binding.table_ident()).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
         let cutoff_ms = expiry_cutoff_ms(context.config.snapshot_retention)?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
         let selected = select_expirable_snapshots(
@@ -325,7 +325,7 @@ impl Forge {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let table = load_table(context, &binding.table_ident()).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
         if !selected_ids_are_eligible(
             &table,
             selected_snapshot_ids,
@@ -429,7 +429,7 @@ impl Forge {
             else {
                 continue;
             };
-            let table = load_table(context, &binding.table_ident()).await?;
+            let table = self.load_table(&binding.table_ident()).await?;
             let all_absent = selected_snapshot_ids
                 .iter()
                 .all(|id| table.metadata().snapshot_by_id(*id).is_none());

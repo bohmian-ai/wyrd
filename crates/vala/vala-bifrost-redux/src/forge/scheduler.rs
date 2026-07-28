@@ -405,7 +405,7 @@ impl Forge {
             return Ok(true);
         }
 
-        let table = super::compact::load_table(&self.core, &binding.table_ident()).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
         let live_set = self.build_live_set(key, binding, &table).await?;
         if stop.is_cancelled() {
             return Ok(true);

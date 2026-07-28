@@ -30,11 +30,11 @@ use wyrd_spec::vala::api::{
     StoragePath,
 };
 
+use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_bins};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
-use super::{Forge, ForgeCore};
 use crate::catalog::TenantTableBinding;
 
 const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
@@ -324,27 +324,32 @@ pub(crate) struct ForgeTickBudget {
     bins: usize,
 }
 
-/// Load one Iceberg table with the configured catalog request timeout.
-pub(crate) async fn load_table(
-    context: &ForgeCore,
-    ident: &iceberg::TableIdent,
-) -> Result<iceberg::table::Table, ForgeError> {
-    tokio::time::timeout(
-        context.config.catalog_request_timeout,
-        context.catalog.load_table(ident),
-    )
-    .await
-    .map_err(|_| ForgeError::Timeout {
-        operation: "catalog table load",
-    })?
-    .map_err(ForgeError::Catalog)
-}
-
 /// Reconcile prepared compaction audits for one tenant/table before new work.
 ///
 /// A prepared operation is marked committed when its output is still live in
 /// Iceberg, or reset when the output is absent after the uncertainty window.
 impl Forge {
+    /// Loads one Iceberg table under Forge's bounded catalog timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout or catalog errors; cancellation leaves durable state
+    /// unchanged for the next reconciliation tick.
+    pub(super) async fn load_table(
+        &self,
+        ident: &iceberg::TableIdent,
+    ) -> Result<iceberg::table::Table, ForgeError> {
+        tokio::time::timeout(
+            self.core.config.catalog_request_timeout,
+            self.core.catalog.load_table(ident),
+        )
+        .await
+        .map_err(|_| ForgeError::Timeout {
+            operation: "catalog table load",
+        })?
+        .map_err(ForgeError::Catalog)
+    }
+
     /// Reconcile prepared compactions before admitting new table work.
     ///
     /// # Errors
@@ -362,9 +367,7 @@ impl Forge {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
-            reconciled += self
-                .reconcile_group(&self.core, lease, &key, binding)
-                .await?;
+            reconciled += self.reconcile_group(lease, &key, binding).await?;
         }
         Ok(reconciled)
     }
@@ -735,7 +738,7 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<CompactStats, ForgeError> {
         let operation_id = operation_id(key, bin);
-        let table = load_table(&self.core, &binding.table_ident()).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
         let schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(ForgeError::Catalog)?,
@@ -775,19 +778,9 @@ impl Forge {
             ForgeCompactionPhase::Prepared,
             None,
         )?;
-        self.prepare_inputs(&self.core, lease, key, bin, prepared)
+        self.prepare_inputs(lease, key, bin, prepared).await?;
+        self.commit_rewrite(lease, key, binding, bin, operation_id, &rewrite, stop)
             .await?;
-        self.commit_rewrite(
-            &self.core,
-            lease,
-            key,
-            binding,
-            bin,
-            operation_id,
-            &rewrite,
-            stop,
-        )
-        .await?;
         Ok(CompactStats {
             spill_bytes: rewrite.spill_bytes,
             input_rows: rewrite.input_rows,
@@ -825,7 +818,6 @@ impl Forge {
     /// Returns fence, catalog, timeout, reconciliation, SQL, or audit failures.
     async fn commit_rewrite(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
@@ -834,13 +826,13 @@ impl Forge {
         rewrite: &RewriteOutput,
         stop: &CancellationToken,
     ) -> Result<(), ForgeError> {
-        lease.require_fence(&context.operator_pool).await?;
-        if !lease.commit_window_fits(context.config.commit_window()) {
+        lease.require_fence(&self.core.operator_pool).await?;
+        if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let table = load_table(context, &binding.table_ident()).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
         let mut properties = HashMap::new();
         properties.insert("forge.operation_id".to_owned(), operation_id.to_string());
         properties.insert("forge.group".to_owned(), key.audit_resource());
@@ -852,17 +844,17 @@ impl Forge {
             .set_commit_uuid(operation_id)
             .set_snapshot_properties(properties);
         let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
-        lease.require_fence(&context.operator_pool).await?;
-        if !lease.commit_window_fits(context.config.commit_window()) {
+        lease.require_fence(&self.core.operator_pool).await?;
+        if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let commit = transaction.commit(context.catalog.as_ref());
+        let commit = transaction.commit(self.core.catalog.as_ref());
         tokio::pin!(commit);
         let response = tokio::select! {
             response = tokio::time::timeout(
-                context.config.iceberg_total_retry_timeout,
+                self.core.config.iceberg_total_retry_timeout,
                 &mut commit,
             ) => response,
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -871,8 +863,8 @@ impl Forge {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
                 if !Self::is_retryable(&error) {
-                    if lease.require_fence(&context.operator_pool).await.is_ok() {
-                        reset_inputs(context, lease, key, bin, &rewrite.files, operation_id)
+                    if lease.require_fence(&self.core.operator_pool).await.is_ok() {
+                        self.reset_inputs(lease, key, bin, &rewrite.files, operation_id)
                             .await?;
                     } else {
                         tracing::warn!(
@@ -890,23 +882,15 @@ impl Forge {
                 });
             }
         }
-        let committed_table = load_table(context, &binding.table_ident()).await?;
+        let committed_table = self.load_table(&binding.table_ident()).await?;
         let snapshot_id = committed_table
             .metadata()
             .current_snapshot_id()
             .ok_or_else(|| ForgeError::Reconciliation {
                 detail: "Iceberg replace committed without a current snapshot".to_owned(),
             })?;
-        stamp_committed(
-            context,
-            lease,
-            key,
-            bin,
-            &rewrite.files,
-            operation_id,
-            snapshot_id,
-        )
-        .await
+        self.stamp_committed(lease, key, bin, &rewrite.files, operation_id, snapshot_id)
+            .await
     }
 
     /// Return whether Iceberg classified an error as safe to retry.
@@ -985,18 +969,18 @@ impl Forge {
     /// fenced immediately before commit.
     async fn prepare_inputs(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
         bin: &RewriteBin,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
-        if !lease.renew(&context.operator_pool).await? {
+        if !lease.renew(&self.core.operator_pool).await? {
             return Err(ForgeError::FenceLost {
                 lease_key: lease.lease_key.clone(),
             });
         }
-        let mut conn = context
+        let mut conn = self
+            .core
             .vala
             .tenant_conn(key.tenant)
             .await
@@ -1021,114 +1005,121 @@ impl Forge {
                 detail: "prepared transition did not claim every input file".to_owned(),
             });
         }
-        lease.require_fence(&context.operator_pool).await?;
-        append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail).await?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        self.append_system_audit(&mut conn, key, "forge.file_compact.prepared", detail)
+            .await?;
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }
 }
 
-/// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
-async fn stamp_committed(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    bin: &RewriteBin,
-    outputs: &[DataFile],
-    operation_id: Uuid,
-    snapshot_id: i64,
-) -> Result<(), ForgeError> {
-    lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
-    let result = sqlx::query(
-        r"UPDATE vala.file_list
+impl Forge {
+    /// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
+    async fn stamp_committed(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+        outputs: &[DataFile],
+        operation_id: Uuid,
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
+        let result = sqlx::query(
+            r"UPDATE vala.file_list
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
               AND compacted AND committed_snapshot_id IS NULL",
-    )
-    .bind(snapshot_id)
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(&ids)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
-        return Err(ForgeError::Reconciliation {
-            detail: "committed transition did not stamp every input file".to_owned(),
-        });
-    }
-    let detail = forge_detail(
-        key,
-        bin,
-        outputs,
-        operation_id,
-        ForgeCompactionPhase::Committed,
-        Some(snapshot_id),
-    )?;
-    lease.require_fence(&context.operator_pool).await?;
-    append_system_audit(&mut conn, key, "forge.file_compact.committed", detail).await?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
-}
-
-/// Restore prepared input rows to the uncompacted state after a definite
-/// Iceberg failure.
-async fn reset_inputs(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    bin: &RewriteBin,
-    outputs: &[DataFile],
-    operation_id: Uuid,
-) -> Result<(), ForgeError> {
-    lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
+        )
+        .bind(snapshot_id)
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(&ids)
+        .execute(&mut **conn.transaction())
         .await
-        .map_err(ForgeError::Sql)?;
-    let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
-    let result = sqlx::query(
-        r"UPDATE vala.file_list
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
+            return Err(ForgeError::Reconciliation {
+                detail: "committed transition did not stamp every input file".to_owned(),
+            });
+        }
+        let detail = forge_detail(
+            key,
+            bin,
+            outputs,
+            operation_id,
+            ForgeCompactionPhase::Committed,
+            Some(snapshot_id),
+        )?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        self.append_system_audit(&mut conn, key, "forge.file_compact.committed", detail)
+            .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Restore prepared input rows to the uncompacted state after a definite
+    /// Iceberg failure.
+    async fn reset_inputs(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+        outputs: &[DataFile],
+        operation_id: Uuid,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let ids: Vec<Uuid> = bin.files.iter().map(|file| file.id).collect();
+        let result = sqlx::query(
+            r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5) AND compacted
               AND committed_snapshot_id IS NULL",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(&ids)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
-        return Err(ForgeError::Reconciliation {
-            detail: "reset transition did not restore every input file".to_owned(),
-        });
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(&ids)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if result.rows_affected() != u64::try_from(ids.len()).unwrap_or(u64::MAX) {
+            return Err(ForgeError::Reconciliation {
+                detail: "reset transition did not restore every input file".to_owned(),
+            });
+        }
+        let detail = forge_detail(
+            key,
+            bin,
+            outputs,
+            operation_id,
+            ForgeCompactionPhase::Reset,
+            None,
+        )?;
+        lease.require_fence(&self.core.operator_pool).await?;
+        self.append_system_audit(&mut conn, key, "forge.file_compact.reset", detail)
+            .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
     }
-    let detail = forge_detail(
-        key,
-        bin,
-        outputs,
-        operation_id,
-        ForgeCompactionPhase::Reset,
-        None,
-    )?;
-    lease.require_fence(&context.operator_pool).await?;
-    append_system_audit(&mut conn, key, "forge.file_compact.reset", detail).await?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
 }
 
 impl Forge {
@@ -1138,13 +1129,12 @@ impl Forge {
     /// uncertainty window resets the hidden inputs so a future tick can retry.
     async fn reconcile_group(
         &self,
-        context: &ForgeCore,
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
         let resource = key.audit_resource();
-        let latest = load_reconciliation_audits(context, key, &resource).await?;
+        let latest = self.load_reconciliation_audits(key, &resource).await?;
         let mut recovered = 0;
         for (_operation_id, (detail, created_at)) in latest {
             if !matches!(
@@ -1164,25 +1154,27 @@ impl Forge {
             else {
                 continue;
             };
-            if detail_group(&detail) != resource {
+            if Self::detail_group(&detail) != resource {
                 return Err(ForgeError::Reconciliation {
                     detail: "audit detail group differs from its resource".to_owned(),
                 });
             }
-            verify_hidden_inputs(context, key, input_file_ids, &detail).await?;
-            if !lease.renew(&context.operator_pool).await? {
+            self.verify_hidden_inputs(key, input_file_ids, &detail)
+                .await?;
+            if !lease.renew(&self.core.operator_pool).await? {
                 return Err(ForgeError::FenceLost {
                     lease_key: lease.lease_key.clone(),
                 });
             }
-            let table = load_table(context, &binding.table_ident()).await?;
-            if let Some(snapshot_id) = live_snapshot_for_paths(&table, output_paths).await? {
-                if !lease.renew(&context.operator_pool).await? {
+            let table = self.load_table(&binding.table_ident()).await?;
+            if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
+                if !lease.renew(&self.core.operator_pool).await? {
                     return Err(ForgeError::FenceLost {
                         lease_key: lease.lease_key.clone(),
                     });
                 }
-                stamp_reconciled(context, lease, key, input_file_ids, &detail, snapshot_id).await?;
+                self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
+                    .await?;
                 recovered += 1;
                 continue;
             }
@@ -1190,28 +1182,31 @@ impl Forge {
                 .signed_duration_since(created_at)
                 .to_std()
                 .unwrap_or_default()
-                < context.config.uncertainty_bound
+                < self.core.config.uncertainty_bound
             {
                 continue;
             }
-            let first_reload = load_table(context, &binding.table_ident()).await?;
-            if live_snapshot_for_paths(&first_reload, output_paths)
+            let first_reload = self.load_table(&binding.table_ident()).await?;
+            if self
+                .live_snapshot_for_paths(&first_reload, output_paths)
                 .await?
                 .is_some()
             {
                 continue;
             }
-            let second_reload = load_table(context, &binding.table_ident()).await?;
-            if live_snapshot_for_paths(&second_reload, output_paths)
+            let second_reload = self.load_table(&binding.table_ident()).await?;
+            if self
+                .live_snapshot_for_paths(&second_reload, output_paths)
                 .await?
                 .is_none()
             {
-                if !lease.renew(&context.operator_pool).await? {
+                if !lease.renew(&self.core.operator_pool).await? {
                     return Err(ForgeError::FenceLost {
                         lease_key: lease.lease_key.clone(),
                     });
                 }
-                reset_reconciled(context, lease, key, input_file_ids, &detail).await?;
+                self.reset_reconciled(lease, key, input_file_ids, &detail)
+                    .await?;
                 recovered += 1;
             }
         }
@@ -1220,344 +1215,355 @@ impl Forge {
 }
 
 /// Load the latest audit detail for each compaction operation in a group.
-async fn load_reconciliation_audits(
-    context: &ForgeCore,
-    key: &ForgeGroupKey,
-    resource: &str,
-) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
-    let mut after_seq = 0_i64;
-    let mut latest = HashMap::new();
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    loop {
-        let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-            &mut conn,
-            resource,
-            after_seq,
-            context.config.audit_page_size,
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
-        let page_len = page.len();
-        for row in page {
-            after_seq = row.seq;
-            let Some(detail) = row.detail else { continue };
-            let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                ForgeError::Reconciliation {
-                    detail: error.to_string(),
-                }
-            })?;
-            validate_reconciliation_detail(&detail, resource)?;
-            let AuditDetail::ForgeCompaction { operation_id, .. } = &detail else {
-                continue;
-            };
-            latest.insert(*operation_id, (detail, row.created_at));
+impl Forge {
+    async fn load_reconciliation_audits(
+        &self,
+        key: &ForgeGroupKey,
+        resource: &str,
+    ) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
+        let mut after_seq = 0_i64;
+        let mut latest = HashMap::new();
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        loop {
+            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn,
+                resource,
+                after_seq,
+                self.core.config.audit_page_size,
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+            let page_len = page.len();
+            for row in page {
+                after_seq = row.seq;
+                let Some(detail) = row.detail else { continue };
+                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
+                    ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    }
+                })?;
+                Self::validate_reconciliation_detail(&detail, resource)?;
+                let AuditDetail::ForgeCompaction { operation_id, .. } = &detail else {
+                    continue;
+                };
+                latest.insert(*operation_id, (detail, row.created_at));
+            }
+            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
+                break;
+            }
         }
-        if page_len < usize::try_from(context.config.audit_page_size).unwrap_or(usize::MAX) {
-            break;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok(latest)
+    }
+
+    /// Validate the identity and ordering fields needed for compaction recovery.
+    fn validate_reconciliation_detail(
+        detail: &AuditDetail,
+        resource: &str,
+    ) -> Result<(), ForgeError> {
+        let AuditDetail::ForgeCompaction {
+            group,
+            input_file_ids,
+            input_paths,
+            output_paths,
+            ..
+        } = detail
+        else {
+            return Ok(());
+        };
+        if group != resource {
+            return Err(ForgeError::Reconciliation {
+                detail: "audit detail group differs from its resource".to_owned(),
+            });
+        }
+        if input_file_ids.len() < 2
+            || input_file_ids.len() != input_paths.len()
+            || input_file_ids.windows(2).any(|pair| pair[0] >= pair[1])
+            || output_paths.is_empty()
+            || output_paths.iter().any(|path| path.as_str().is_empty())
+            || output_paths.windows(2).any(|pair| pair[0] == pair[1])
+        {
+            return Err(ForgeError::Reconciliation {
+                detail: "audit detail does not contain sorted complete input identity".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Extract the group resource from a compaction audit detail.
+    fn detail_group(detail: &AuditDetail) -> String {
+        match detail {
+            AuditDetail::ForgeCompaction { group, .. } => group.clone(),
+            _ => String::new(),
         }
     }
-    conn.commit().await.map_err(ForgeError::Sql)?;
-    Ok(latest)
-}
 
-/// Validate the identity and ordering fields needed for compaction recovery.
-fn validate_reconciliation_detail(detail: &AuditDetail, resource: &str) -> Result<(), ForgeError> {
-    let AuditDetail::ForgeCompaction {
-        group,
-        input_file_ids,
-        input_paths,
-        output_paths,
-        ..
-    } = detail
-    else {
-        return Ok(());
-    };
-    if group != resource {
-        return Err(ForgeError::Reconciliation {
-            detail: "audit detail group differs from its resource".to_owned(),
-        });
-    }
-    if input_file_ids.len() < 2
-        || input_file_ids.len() != input_paths.len()
-        || input_file_ids.windows(2).any(|pair| pair[0] >= pair[1])
-        || output_paths.is_empty()
-        || output_paths.iter().any(|path| path.as_str().is_empty())
-        || output_paths.windows(2).any(|pair| pair[0] == pair[1])
-    {
-        return Err(ForgeError::Reconciliation {
-            detail: "audit detail does not contain sorted complete input identity".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Extract the group resource from a compaction audit detail.
-fn detail_group(detail: &AuditDetail) -> String {
-    match detail {
-        AuditDetail::ForgeCompaction { group, .. } => group.clone(),
-        _ => String::new(),
-    }
-}
-
-/// Find the current snapshot only when every operation output remains live.
-async fn live_snapshot_for_paths(
-    table: &iceberg::table::Table,
-    paths: &[StoragePath],
-) -> Result<Option<i64>, ForgeError> {
-    if paths.is_empty() {
-        return Ok(None);
-    }
-    let Some(snapshot) = table.metadata().current_snapshot() else {
-        return Ok(None);
-    };
-    let mut remaining = paths
-        .iter()
-        .map(StoragePath::as_str)
-        .collect::<std::collections::HashSet<_>>();
-    let manifest_list = table
-        .manifest_list_reader(snapshot)
-        .load()
-        .await
-        .map_err(ForgeError::Catalog)?;
-    for manifest_file in manifest_list.entries() {
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
+    /// Find the current snapshot only when every operation output remains live.
+    async fn live_snapshot_for_paths(
+        &self,
+        table: &iceberg::table::Table,
+        paths: &[StoragePath],
+    ) -> Result<Option<i64>, ForgeError> {
+        if paths.is_empty() {
+            return Ok(None);
+        }
+        let Some(snapshot) = table.metadata().current_snapshot() else {
+            return Ok(None);
+        };
+        let mut remaining = paths
+            .iter()
+            .map(StoragePath::as_str)
+            .collect::<std::collections::HashSet<_>>();
+        let manifest_list = table
+            .manifest_list_reader(snapshot)
+            .load()
             .await
             .map_err(ForgeError::Catalog)?;
-        for entry in manifest.entries() {
-            if entry.is_alive() {
-                remaining.remove(entry.data_file().file_path());
-                if remaining.is_empty() {
-                    return Ok(Some(snapshot.snapshot_id()));
+        for manifest_file in manifest_list.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .map_err(ForgeError::Catalog)?;
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    remaining.remove(entry.data_file().file_path());
+                    if remaining.is_empty() {
+                        return Ok(Some(snapshot.snapshot_id()));
+                    }
                 }
             }
         }
+        Ok(None)
     }
-    Ok(None)
-}
 
-/// Confirm that prepared audit inputs still match hidden `file_list` rows.
-async fn verify_hidden_inputs(
-    context: &ForgeCore,
-    key: &ForgeGroupKey,
-    input_file_ids: &[Uuid],
-    detail: &AuditDetail,
-) -> Result<(), ForgeError> {
-    let AuditDetail::ForgeCompaction { input_paths, .. } = detail else {
-        return Err(ForgeError::Reconciliation {
-            detail: "prepared audit detail is not a Forge compaction".to_owned(),
-        });
-    };
-    if input_file_ids.len() != input_paths.len() {
-        return Err(ForgeError::Reconciliation {
-            detail: "prepared audit detail has unpaired input IDs and paths".to_owned(),
-        });
-    }
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    let rows = sqlx::query(
-        r"SELECT id, file_path
+    /// Confirm that prepared audit inputs still match hidden `file_list` rows.
+    async fn verify_hidden_inputs(
+        &self,
+        key: &ForgeGroupKey,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+    ) -> Result<(), ForgeError> {
+        let AuditDetail::ForgeCompaction { input_paths, .. } = detail else {
+            return Err(ForgeError::Reconciliation {
+                detail: "prepared audit detail is not a Forge compaction".to_owned(),
+            });
+        };
+        if input_file_ids.len() != input_paths.len() {
+            return Err(ForgeError::Reconciliation {
+                detail: "prepared audit detail has unpaired input IDs and paths".to_owned(),
+            });
+        }
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let rows = sqlx::query(
+            r"SELECT id, file_path
              FROM vala.file_list
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
               AND compacted AND committed_snapshot_id IS NULL
             ORDER BY id",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(input_file_ids)
-    .fetch_all(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    conn.commit().await.map_err(ForgeError::Sql)?;
-
-    let observed = rows
-        .into_iter()
-        .map(|row| {
-            Ok::<_, ForgeError>((
-                row.try_get::<Uuid, _>("id")
-                    .map_err(|error| ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    })?,
-                row.try_get::<String, _>("file_path").map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut expected = input_file_ids
-        .iter()
-        .copied()
-        .zip(input_paths.iter().map(|path| path.as_str().to_owned()))
-        .collect::<Vec<_>>();
-    expected.sort_by_key(|(id, _)| *id);
-    if observed != expected {
-        return Err(ForgeError::Reconciliation {
-            detail: "prepared audit inputs no longer match hidden file_list rows".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Stamp a recovered compaction with the snapshot that already contains its
-/// output.
-async fn stamp_reconciled(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    input_file_ids: &[Uuid],
-    detail: &AuditDetail,
-    snapshot_id: i64,
-) -> Result<(), ForgeError> {
-    lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(input_file_ids)
+        .fetch_all(&mut **conn.transaction())
         .await
-        .map_err(ForgeError::Sql)?;
-    let result = sqlx::query(
-        r"UPDATE vala.file_list
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+
+        let observed = rows
+            .into_iter()
+            .map(|row| {
+                Ok::<_, ForgeError>((
+                    row.try_get::<Uuid, _>("id")
+                        .map_err(|error| ForgeError::Reconciliation {
+                            detail: error.to_string(),
+                        })?,
+                    row.try_get::<String, _>("file_path").map_err(|error| {
+                        ForgeError::Reconciliation {
+                            detail: error.to_string(),
+                        }
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut expected = input_file_ids
+            .iter()
+            .copied()
+            .zip(input_paths.iter().map(|path| path.as_str().to_owned()))
+            .collect::<Vec<_>>();
+        expected.sort_by_key(|(id, _)| *id);
+        if observed != expected {
+            return Err(ForgeError::Reconciliation {
+                detail: "prepared audit inputs no longer match hidden file_list rows".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Stamp a recovered compaction with the snapshot that already contains its
+    /// output.
+    async fn stamp_reconciled(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let result = sqlx::query(
+            r"UPDATE vala.file_list
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
               AND compacted AND committed_snapshot_id IS NULL",
-    )
-    .bind(snapshot_id)
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(input_file_ids)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    if result.rows_affected() != u64::try_from(input_file_ids.len()).unwrap_or(u64::MAX) {
-        return Err(ForgeError::Reconciliation {
-            detail: "recovery transition did not stamp every input file".to_owned(),
-        });
-    }
-    append_system_audit(
-        &mut conn,
-        key,
-        "forge.file_compact.recovered",
-        terminal_detail(detail, ForgeCompactionPhase::Recovered, Some(snapshot_id)),
-    )
-    .await?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
-}
-
-/// Reset a recovered compaction whose output was never committed.
-async fn reset_reconciled(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeGroupKey,
-    input_file_ids: &[Uuid],
-    detail: &AuditDetail,
-) -> Result<(), ForgeError> {
-    lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
+        )
+        .bind(snapshot_id)
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(input_file_ids)
+        .execute(&mut **conn.transaction())
         .await
-        .map_err(ForgeError::Sql)?;
-    let result = sqlx::query(
-        r"UPDATE vala.file_list
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if result.rows_affected() != u64::try_from(input_file_ids.len()).unwrap_or(u64::MAX) {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovery transition did not stamp every input file".to_owned(),
+            });
+        }
+        self.append_system_audit(
+            &mut conn,
+            key,
+            "forge.file_compact.recovered",
+            Self::terminal_detail(detail, ForgeCompactionPhase::Recovered, Some(snapshot_id)),
+        )
+        .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Reset a recovered compaction whose output was never committed.
+    async fn reset_reconciled(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+    ) -> Result<(), ForgeError> {
+        lease.require_fence(&self.core.operator_pool).await?;
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let result = sqlx::query(
+            r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
               AND compacted AND committed_snapshot_id IS NULL",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(key.partition_day)
-    .bind(input_file_ids)
-    .execute(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-    if result.rows_affected() != u64::try_from(input_file_ids.len()).unwrap_or(u64::MAX) {
-        return Err(ForgeError::Reconciliation {
-            detail: "recovery reset did not restore every input file".to_owned(),
-        });
-    }
-    append_system_audit(
-        &mut conn,
-        key,
-        "forge.file_compact.reset",
-        terminal_detail(detail, ForgeCompactionPhase::Reset, None),
-    )
-    .await?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
-}
-
-/// Convert a prepared compaction detail into a terminal audit phase.
-fn terminal_detail(
-    detail: &AuditDetail,
-    phase: ForgeCompactionPhase,
-    snapshot_id: Option<i64>,
-) -> AuditDetail {
-    match detail {
-        AuditDetail::ForgeCompaction {
-            operation_id,
-            group,
-            input_file_ids,
-            input_paths,
-            output_paths,
-            writer_recipe_version,
-            ..
-        } => AuditDetail::ForgeCompaction {
-            operation_id: *operation_id,
-            phase,
-            group: group.clone(),
-            input_file_ids: input_file_ids.clone(),
-            input_paths: input_paths.clone(),
-            output_paths: output_paths.clone(),
-            snapshot_id,
-            writer_recipe_version: writer_recipe_version.clone(),
-        },
-        _ => detail.clone(),
-    }
-}
-
-/// Append a system-owned Forge audit event to the caller's tenant transaction.
-async fn append_system_audit(
-    conn: &mut vala_sql::TenantConn<'_>,
-    key: &ForgeGroupKey,
-    operation: &str,
-    detail: AuditDetail,
-) -> Result<(), ForgeError> {
-    let event = AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource: key.audit_resource(),
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:forge".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: operation.to_owned(),
-        detail: Some(detail),
-    };
-    vala_sql::queries::audit_outbox::append_audit(conn, &event)
+        )
+        .bind(key.tenant.as_uuid())
+        .bind(key.table_ref.namespace.as_str())
+        .bind(&key.table_ref.name)
+        .bind(key.partition_day)
+        .bind(input_file_ids)
+        .execute(&mut **conn.transaction())
         .await
-        .map(|_| ())
-        .map_err(ForgeError::Sql)
+        .map_err(|error| ForgeError::Sql(error.into()))?;
+        if result.rows_affected() != u64::try_from(input_file_ids.len()).unwrap_or(u64::MAX) {
+            return Err(ForgeError::Reconciliation {
+                detail: "recovery reset did not restore every input file".to_owned(),
+            });
+        }
+        self.append_system_audit(
+            &mut conn,
+            key,
+            "forge.file_compact.reset",
+            Self::terminal_detail(detail, ForgeCompactionPhase::Reset, None),
+        )
+        .await?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Convert a prepared compaction detail into a terminal audit phase.
+    fn terminal_detail(
+        detail: &AuditDetail,
+        phase: ForgeCompactionPhase,
+        snapshot_id: Option<i64>,
+    ) -> AuditDetail {
+        match detail {
+            AuditDetail::ForgeCompaction {
+                operation_id,
+                group,
+                input_file_ids,
+                input_paths,
+                output_paths,
+                writer_recipe_version,
+                ..
+            } => AuditDetail::ForgeCompaction {
+                operation_id: *operation_id,
+                phase,
+                group: group.clone(),
+                input_file_ids: input_file_ids.clone(),
+                input_paths: input_paths.clone(),
+                output_paths: output_paths.clone(),
+                snapshot_id,
+                writer_recipe_version: writer_recipe_version.clone(),
+            },
+            _ => detail.clone(),
+        }
+    }
+
+    /// Append a system-owned Forge audit event to the caller's tenant transaction.
+    async fn append_system_audit(
+        &self,
+        conn: &mut vala_sql::TenantConn<'_>,
+        key: &ForgeGroupKey,
+        operation: &str,
+        detail: AuditDetail,
+    ) -> Result<(), ForgeError> {
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: operation.to_owned(),
+            resource: key.audit_resource(),
+            card_ref: None,
+            principal_id: SYSTEM_PRINCIPAL,
+            principal_kind: PrincipalKindTag::Service,
+            auth_method: AuthMethod::Internal,
+            permission: "bifrost:forge".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: operation.to_owned(),
+            detail: Some(detail),
+        };
+        vala_sql::queries::audit_outbox::append_audit(conn, &event)
+            .await
+            .map(|_| ())
+            .map_err(ForgeError::Sql)
+    }
 }
 
 /// Build the canonical audit detail for one compaction operation.

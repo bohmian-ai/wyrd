@@ -933,6 +933,68 @@ impl StagingParquetExec {
             properties,
         }
     }
+
+    /// Opens one bounded Parquet stream for this leaf plan's source seam.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` execution error when path validation, metadata,
+    /// permit acquisition, Parquet construction, or batch decoding fails.
+    async fn open_staging_stream_with_permits(
+        &self,
+        file: CandidateFile,
+        permits: Arc<tokio::sync::Semaphore>,
+    ) -> datafusion::error::Result<
+        BoxStream<'static, datafusion::error::Result<arrow::record_batch::RecordBatch>>,
+    > {
+        let path = self
+            .binding
+            .validate_object_path(&file.path)
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Execution(format!(
+                    "Forge staging input escaped table prefix: {}",
+                    file.path
+                ))
+            })?;
+        let permit = permits
+            .acquire_owned()
+            .await
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let size = self
+            .object_store
+            .stat(&path)
+            .await
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+            .content_length();
+        let reader = ForgeParquetReader {
+            store: Arc::clone(&self.object_store),
+            path,
+            size,
+        };
+        let stream = ParquetRecordBatchStreamBuilder::new(reader)
+            .await
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+            .with_batch_size(REWRITE_BATCH_ROWS)
+            .build()
+            .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+        let tenant = self.binding.tenant;
+        let schema = Arc::clone(&self.schema);
+        let projected = async_stream::try_stream! {
+            futures_util::pin_mut!(stream);
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+                validate_tenant_column(&batch, tenant)
+                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+                let projected = project_by_name(&batch, Arc::clone(&schema))
+                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+                if projected.num_rows() > 0 {
+                    yield projected;
+                }
+            }
+            drop(permit);
+        };
+        Ok(Box::pin(projected))
+    }
 }
 
 impl DisplayAs for StagingParquetExec {
@@ -992,61 +1054,6 @@ impl AsyncFileReader for ForgeParquetReader {
             Ok(Arc::new(metadata))
         })
     }
-}
-
-/// Open one bounded Parquet stream while holding one read permit.
-///
-/// # Errors
-///
-/// Returns an execution error for invalid paths, metadata reads, or Parquet
-/// stream construction failures.
-async fn open_staging_stream(
-    file: CandidateFile,
-    binding: TenantTableBinding,
-    schema: SchemaRef,
-    store: Arc<dyn ForgeObjectStore>,
-    permits: Arc<tokio::sync::Semaphore>,
-) -> datafusion::error::Result<
-    BoxStream<'static, datafusion::error::Result<arrow::record_batch::RecordBatch>>,
-> {
-    let path = binding.validate_object_path(&file.path).ok_or_else(|| {
-        datafusion::error::DataFusionError::Execution(format!(
-            "Forge staging input escaped table prefix: {}",
-            file.path
-        ))
-    })?;
-    let permit = permits
-        .acquire_owned()
-        .await
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-    let size = store
-        .stat(&path)
-        .await
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
-        .content_length();
-    let reader = ForgeParquetReader { store, path, size };
-    let stream = ParquetRecordBatchStreamBuilder::new(reader)
-        .await
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
-        .with_batch_size(REWRITE_BATCH_ROWS)
-        .build()
-        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-    let tenant = binding.tenant;
-    let projected = async_stream::try_stream! {
-        futures_util::pin_mut!(stream);
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-            validate_tenant_column(&batch, tenant)
-                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-            let projected = project_by_name(&batch, Arc::clone(&schema))
-                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-            if projected.num_rows() > 0 {
-                yield projected;
-            }
-        }
-        drop(permit);
-    };
-    Ok(Box::pin(projected))
 }
 
 impl ExecutionPlan for StagingParquetExec {
@@ -1115,13 +1122,24 @@ impl ExecutionPlan for StagingParquetExec {
         let store = Arc::clone(&self.object_store);
         let permits = Arc::clone(&self.permits);
         let stream_schema = Arc::clone(&schema);
+        let max_concurrent_reads = self.max_concurrent_reads;
         let stream = futures_util::stream::iter(files)
             .map(move |file| {
                 let binding = binding.clone();
                 let schema = Arc::clone(&schema);
                 let store = Arc::clone(&store);
                 let permits = Arc::clone(&permits);
-                async move { open_staging_stream(file, binding, schema, store, permits).await }
+                async move {
+                    StagingParquetExec::new(
+                        Vec::new(),
+                        binding,
+                        schema,
+                        store,
+                        max_concurrent_reads,
+                    )
+                    .open_staging_stream_with_permits(file, permits)
+                    .await
+                }
             })
             .buffer_unordered(self.max_concurrent_reads)
             .try_flatten();

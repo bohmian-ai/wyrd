@@ -164,9 +164,7 @@ impl ForgeRewritePipeline {
         let mut files = Vec::new();
         let mut writer: Option<ArrowWriter<Vec<u8>>> = None;
         let mut writer_rows = 0_u64;
-        let mut input_rows = 0_u64;
-        let mut output_rows = 0_u64;
-        let mut peak_spill_bytes = 0_u64;
+        let (mut input_rows, mut output_rows, mut peak_spill_bytes) = (0_u64, 0_u64, 0_u64);
 
         let result = async {
             while let Some(batch) = stream.next().await {

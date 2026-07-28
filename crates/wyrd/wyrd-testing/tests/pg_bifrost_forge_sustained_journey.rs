@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use futures_util::TryStreamExt;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
@@ -182,7 +183,6 @@ async fn pg_bifrost_forge_incremental_sustained() {
         &[chrono::Utc::now().date_naive()],
     )
     .await;
-    server.cancel_bound_workers();
     let baseline_memory = fixture.memory_snapshot().bifrost_total_bytes;
     let mut peak_shared_memory = baseline_memory;
     let mut config = fixture.config.clone();
@@ -225,7 +225,6 @@ async fn pg_bifrost_forge_incremental_sustained() {
         ));
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
-    server.cancel_bound_workers();
     let mut spill_bytes = 0_u64;
     let mut outputs_committed = 0_usize;
     for _ in 0..20 {
@@ -263,6 +262,35 @@ async fn pg_bifrost_forge_incremental_sustained() {
     .expect("sustained row count");
     // The seeded fixture contributes two rows in addition to 16×100,000 rows.
     assert_eq!(rows, 1_600_004);
+    assert_eq!(
+        oracle_table_rows(&fixture).await,
+        1_600_004,
+        "Oracle provider must read every compacted sustained row"
+    );
+    let live_outputs = fixture
+        .object_store
+        .list(&fixture.binding.object_prefix)
+        .await
+        .expect("list committed Forge outputs")
+        .into_iter()
+        .filter(|entry| entry.path().contains("/forge-") && entry.metadata().is_file())
+        .collect::<Vec<_>>();
+    assert!(
+        !live_outputs.is_empty(),
+        "committed Forge outputs must remain live"
+    );
+    for output in live_outputs {
+        assert!(
+            fixture
+                .object_store
+                .stat(output.path())
+                .await
+                .expect("stat committed Forge output")
+                .is_file(),
+            "committed output was deleted: {}",
+            output.path()
+        );
+    }
     assert!(
         fixture
             .operation_count("forge.file_compact.committed")
@@ -290,6 +318,36 @@ async fn pg_bifrost_forge_incremental_sustained() {
         "shared memory did not return near baseline"
     );
     server.shutdown().await.expect("server shutdown");
+}
+
+/// Scan the committed Iceberg snapshot through its production table reader.
+///
+/// # Panics
+///
+/// Panics when the committed table cannot be loaded, registered, planned, or
+/// scanned.
+async fn oracle_table_rows(fixture: &ForgeFixture) -> u64 {
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("load committed Oracle table");
+    let scan = table
+        .scan()
+        .select_all()
+        .build()
+        .expect("build committed Oracle scan");
+    let batches = scan
+        .to_arrow()
+        .await
+        .expect("create committed Oracle stream")
+        .try_fold(
+            0_usize,
+            |rows, batch| async move { Ok(rows + batch.num_rows()) },
+        )
+        .await
+        .expect("scan committed Oracle table");
+    u64::try_from(batches).expect("Oracle row count fits u64")
 }
 
 async fn pending_file_count(fixture: &ForgeFixture) -> i64 {

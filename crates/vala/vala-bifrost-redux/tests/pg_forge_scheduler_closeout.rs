@@ -79,6 +79,25 @@ mod pg_tests {
             self.operator.read(path).await
         }
 
+        /// Read exactly the requested byte range from one fixture object.
+        ///
+        /// This keeps the production-shaped scheduler fixture on the same
+        /// bounded Parquet footer/row-group path as the real Forge store;
+        /// using `read` here would silently turn a sub-object request into a
+        /// whole-object allocation.
+        ///
+        /// # Errors
+        ///
+        /// Returns the filesystem backend error when the object or requested
+        /// range cannot be read.
+        async fn read_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> opendal::Result<Buffer> {
+            self.operator.reader(path).await?.read(range).await
+        }
+
         /// Recursively list one fixture prefix.
         ///
         /// # Errors

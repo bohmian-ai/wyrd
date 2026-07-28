@@ -402,7 +402,60 @@ mod pg_tests {
             for entry in manifest.entries() {
                 if entry.is_alive() {
                     output_files += 1;
-                    output_rows += entry.data_file().record_count();
+                    let data_file = entry.data_file();
+                    output_rows += data_file.record_count();
+                    assert_eq!(
+                        data_file.file_format(),
+                        iceberg::spec::DataFileFormat::Parquet
+                    );
+                    assert!(data_file.file_size_in_bytes() > 0);
+                    assert_eq!(
+                        data_file
+                            .value_counts()
+                            .keys()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        [1, 2, 3].into_iter().collect()
+                    );
+                    assert_eq!(
+                        data_file
+                            .column_sizes()
+                            .keys()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        [1, 2, 3].into_iter().collect()
+                    );
+                    assert_eq!(
+                        data_file
+                            .lower_bounds()
+                            .keys()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        [1, 2, 3].into_iter().collect()
+                    );
+                    assert_eq!(
+                        data_file
+                            .upper_bounds()
+                            .keys()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        [1, 2, 3].into_iter().collect()
+                    );
+                    assert!(
+                        data_file
+                            .value_counts()
+                            .values()
+                            .all(|count| *count == data_file.record_count())
+                    );
+                    assert!(data_file.null_value_counts().is_empty());
+                    assert!(data_file.nan_value_counts().is_empty());
+                    let split_offsets = data_file.split_offsets().expect("Parquet split offsets");
+                    assert!(!split_offsets.is_empty());
+                    assert!(
+                        split_offsets
+                            .windows(2)
+                            .all(|offsets| offsets[0] < offsets[1])
+                    );
                 }
             }
         }

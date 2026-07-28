@@ -53,6 +53,28 @@ pub struct ForgeFixture {
     pub tenant: DataTenantId,
 }
 
+/// Read-only probe for the DataFusion pool owned by one Forge fixture.
+#[derive(Clone)]
+pub struct ForgeMemoryProbe {
+    /// Closure-backed reservation read that avoids exposing DataFusion types.
+    sample: Arc<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl ForgeMemoryProbe {
+    /// Build a probe over the exact pool supplied to Forge.
+    fn new(sample: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        Self {
+            sample: Arc::new(sample),
+        }
+    }
+
+    /// Return the pool's current reservation in bytes.
+    #[must_use]
+    pub fn current_reserved(&self) -> usize {
+        (self.sample)()
+    }
+}
+
 /// Catalog wrapper used by uncertainty tests.
 ///
 /// `update_table` delegates the real commit first, then returns one retryable
@@ -432,12 +454,30 @@ impl ForgeFixture {
         config: ForgeConfig,
         memory_limit_bytes: usize,
     ) -> (Arc<Forge>, StagingFilePublisher) {
-        self.build_forge_with_publisher_and_memory(
+        self.build_forge_with_publisher_and_memory_probe(
             config,
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
             Some(memory_limit_bytes),
         )
+        .map(|(forge, publisher, _probe)| (forge, publisher))
+        .expect("validated Forge fixture config")
+    }
+
+    /// Build a constrained Forge and expose an active-run memory probe.
+    #[must_use]
+    pub fn context_with_constrained_memory_and_probe(
+        &self,
+        config: ForgeConfig,
+        memory_limit_bytes: usize,
+    ) -> (Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe) {
+        self.build_forge_with_publisher_and_memory_probe(
+            config,
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.object_store),
+            Some(memory_limit_bytes),
+        )
+        .expect("validated Forge fixture config")
     }
 
     /// Build a Forge with a scoped catalog and its paired local hint publisher.
@@ -516,6 +556,29 @@ impl ForgeFixture {
         object_store: Arc<dyn ForgeObjectStore>,
         memory_limit_bytes: Option<usize>,
     ) -> (Arc<Forge>, StagingFilePublisher) {
+        let (forge, publisher, _probe) = self
+            .build_forge_with_publisher_and_memory_probe(
+                config,
+                catalog,
+                object_store,
+                memory_limit_bytes,
+            )
+            .expect("validated Forge fixture config");
+        (forge, publisher)
+    }
+
+    /// Construct Forge and a probe over its exact DataFusion pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied Forge configuration is invalid.
+    fn build_forge_with_publisher_and_memory_probe(
+        &self,
+        config: ForgeConfig,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<dyn ForgeObjectStore>,
+        memory_limit_bytes: Option<usize>,
+    ) -> Result<(Arc<Forge>, StagingFilePublisher, ForgeMemoryProbe), &'static str> {
         let (publisher, inbox) =
             staging_file_channel(config.max_hints_per_wake).expect("validated Forge hint capacity");
         let query_memory = if let Some(limit) = memory_limit_bytes {
@@ -527,6 +590,8 @@ impl ForgeFixture {
                 ),
             )
         };
+        let probe_pool = Arc::clone(&query_memory);
+        let probe = ForgeMemoryProbe::new(move || probe_pool.reserved());
         let runtime = ForgeRewriteRuntime::new(
             query_memory,
             &self
@@ -548,9 +613,9 @@ impl ForgeFixture {
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
             })
-            .expect("validated Forge fixture config"),
+            .map_err(|_| "invalid Forge fixture config")?,
         );
-        (forge, publisher)
+        Ok((forge, publisher, probe))
     }
 
     /// Append one aged Scribe-shaped Parquet file and its durable file-list row.

@@ -9,6 +9,9 @@ use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Constrained DataFusion parent ceiling used by the Forge benchmark.
+const SHARED_PARENT_MEMORY_CEILING: u64 = 16 * 1024 * 1024;
+
 /// Evidence emitted by the Forge benchmark's real rewrite and commit path.
 #[derive(Debug, Serialize)]
 struct ForgeBenchmarkReport {
@@ -112,6 +115,11 @@ async fn pending_rows(fixture: &crate::bifrost::ForgeFixture) -> Result<u64, Ben
 }
 
 /// Run one typed Forge maintenance scenario.
+///
+/// # Errors
+///
+/// Returns an error when fixture setup, Forge execution, report serialization,
+/// or any readiness gate fails.
 pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     if scenario.lane != BifrostLane::Forge {
         return Err("Forge adapter received a non-Forge scenario".into());
@@ -137,9 +145,22 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         fixture.append_forge_file_with_rows(sequence, 100_000).await;
     }
     let (input_bytes, expected_rows, input_files) = staged_totals(&fixture).await?;
-    let (forge, _publisher) =
-        fixture.context_with_constrained_memory_and_publisher(config, 16 * 1024 * 1024);
-    let outcome = forge.run_once().await?;
+    let (forge, _publisher, probe) = fixture.context_with_constrained_memory_and_probe(
+        config,
+        usize::try_from(SHARED_PARENT_MEMORY_CEILING)?,
+    );
+    let operation = forge.run_once();
+    tokio::pin!(operation);
+    let mut peak_parent_memory = 0_u64;
+    let outcome = loop {
+        tokio::select! {
+            result = &mut operation => break result?,
+            () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                peak_parent_memory = peak_parent_memory.max(u64::try_from(probe.current_reserved())?);
+            }
+        }
+    };
+    peak_parent_memory = peak_parent_memory.max(u64::try_from(probe.current_reserved())?);
     let (output_bytes, output_files) = output_totals(&fixture).await?;
     let pending = pending_rows(&fixture).await?;
     let prepared = fixture.operation_count("forge.file_compact.prepared").await;
@@ -150,7 +171,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let exact_row_conservation =
         outcome.input_rows == outcome.output_rows && outcome.input_rows == expected_rows;
     let convergence = pending == 0;
-    let below_demand_shared_memory = input_bytes > 16 * 1024 * 1024;
+    let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
     let negative_flows = if scenario.require_negative_flows {
         let retry = fixture.forge.run_once().await?;
         NegativeFlowReport::executed(
@@ -162,6 +183,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     };
     let verified = outcome.spill_bytes > 0
         && below_demand_shared_memory
+        && peak_parent_memory > 0
+        && peak_parent_memory <= SHARED_PARENT_MEMORY_CEILING
         && outcome.outputs_committed > 1
         && bookkeeping_converged
         && exact_row_conservation
@@ -182,7 +205,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         output_files,
         output_rows: outcome.output_rows,
         spill_bytes: outcome.spill_bytes,
-        peak_parent_memory: u64::try_from(fixture.memory_snapshot().bifrost_total_bytes)?,
+        peak_parent_memory,
         below_demand_shared_memory,
         outputs_per_operation: u64::try_from(outcome.outputs_committed)?,
         bookkeeping_converged,

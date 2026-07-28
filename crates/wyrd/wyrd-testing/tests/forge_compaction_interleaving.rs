@@ -692,7 +692,7 @@ async fn forge_incremental_interleaving() {
                 .await,
         1
     );
-    let mut cancel_fixture = hinted.clone();
+    let mut cancel_fixture = seed_forge_group(&server, "cancel_spill_rows").await;
     cancel_fixture
         .append_forge_file_with_rows(2, 3_200_000)
         .await;

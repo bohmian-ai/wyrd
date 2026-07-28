@@ -54,6 +54,11 @@ impl OutputPutBarrier {
     fn release(&self) {
         self.release.notify_waiters();
     }
+
+    /// Return how many output PUT boundaries the rewrite reached.
+    fn output_boundaries(&self) -> usize {
+        self.calls.load(Ordering::Acquire)
+    }
 }
 
 #[async_trait]
@@ -716,13 +721,17 @@ async fn forge_incremental_interleaving() {
         let stop = cancel_stop.clone();
         async move { cancel_forge.run(stop).await }
     });
-    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_reached())
-        .await
-        .expect("rewrite reached output while spill active");
-    assert!(
-        !cancel_fixture.spill_root_is_empty(),
-        "spill must be active"
-    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while cancel_fixture.spill_root_is_empty() {
+            assert!(
+                !cancel_task.is_finished(),
+                "rewrite completed before active spill was observed"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("active spill observation bound");
     cancel_stop.cancel();
     barrier.release();
     tokio::time::timeout(Duration::from_secs(3), cancel_task)
@@ -731,6 +740,13 @@ async fn forge_incremental_interleaving() {
         .expect("cancelled Forge")
         .expect("cancelled Forge shutdown");
     assert!(cancel_fixture.spill_root_is_empty());
+    assert_eq!(barrier.output_boundaries(), 0);
+    assert_eq!(
+        cancel_fixture
+            .operation_count("forge.file_compact.committed")
+            .await,
+        0
+    );
     assert_eq!(
         cancel_fixture.memory_snapshot().bifrost_total_bytes,
         baseline_memory.bifrost_total_bytes

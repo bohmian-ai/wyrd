@@ -58,11 +58,6 @@ pub struct ForgeConfig {
     pub max_bytes_per_tick: u64,
     /// Maximum bins committed by one tick.
     pub max_bins_per_tick: usize,
-    /// Minimum staging age before periodic discovery may compact a file.
-    ///
-    /// Advisory hints bypass this delay; the periodic path applies it to avoid
-    /// rewriting files that are still likely to receive adjacent arrivals.
-    pub candidate_min_age: Duration,
     /// Lease duration used to fence one table's maintenance work.
     pub lease_ttl: Duration,
     /// Total time reserved for a retried Iceberg commit.
@@ -103,7 +98,6 @@ impl Default for ForgeConfig {
             max_files_per_tick: 1_024,
             max_bytes_per_tick: 2 * DEFAULT_TARGET_BIN_BYTES,
             max_bins_per_tick: 64,
-            candidate_min_age: Duration::from_mins(2),
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
             catalog_request_timeout: Duration::from_secs(30),
@@ -518,21 +512,14 @@ impl Forge {
            AND namespace = $2
            AND table_name = $3
            AND NOT compacted
-           AND created_at < now() - ($4 * interval '1 second')
+           AND created_at < now() - interval '2 min'
          ORDER BY partition_day, min_event_time, max_event_time, id
-         LIMIT $5
+         LIMIT $4
         ",
         )
         .bind(table_key.tenant.as_uuid())
         .bind(table_key.table_ref.namespace.as_str())
         .bind(&table_key.table_ref.name)
-        .bind(
-            i64::try_from(self.core.config.candidate_min_age.as_secs()).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "candidate_min_age exceeds PostgreSQL bigint seconds".to_owned(),
-                }
-            })?,
-        )
         .bind(
             i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
                 ForgeError::InvalidConfig {
@@ -793,8 +780,18 @@ impl Forge {
             None,
         )?;
         self.prepare_inputs(lease, key, bin, prepared).await?;
-        self.commit_rewrite(lease, key, binding, bin, operation_id, &rewrite, stop)
-            .await?;
+        self.commit_rewrite(
+            lease,
+            CommitRewriteRequest {
+                key,
+                binding,
+                bin,
+                operation_id,
+                rewrite: &rewrite,
+                stop,
+            },
+        )
+        .await?;
         Ok(CompactStats {
             spill_bytes: rewrite.spill_bytes,
             input_rows: rewrite.input_rows,
@@ -817,6 +814,22 @@ struct CompactStats {
     outputs_committed: usize,
 }
 
+/// Immutable inputs for one fenced Iceberg commit and its durable bookkeeping.
+struct CommitRewriteRequest<'a> {
+    /// Physical candidate group whose staged inputs become visible.
+    key: &'a ForgeGroupKey,
+    /// Server-resolved physical table binding for the group.
+    binding: &'a TenantTableBinding,
+    /// Exact staged inputs prepared for this operation.
+    bin: &'a RewriteBin,
+    /// Stable operation identity shared by Iceberg and audit records.
+    operation_id: Uuid,
+    /// Rewritten outputs awaiting Iceberg publication.
+    rewrite: &'a RewriteOutput,
+    /// Cancellation source observed while the catalog commit is unresolved.
+    stop: &'a CancellationToken,
+}
+
 impl Forge {
     /// Commit one completed rewrite and stamp its shared terminal snapshot.
     ///
@@ -833,13 +846,16 @@ impl Forge {
     async fn commit_rewrite(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeGroupKey,
-        binding: &TenantTableBinding,
-        bin: &RewriteBin,
-        operation_id: Uuid,
-        rewrite: &RewriteOutput,
-        stop: &CancellationToken,
+        request: CommitRewriteRequest<'_>,
     ) -> Result<(), ForgeError> {
+        let CommitRewriteRequest {
+            key,
+            binding,
+            bin,
+            operation_id,
+            rewrite,
+            stop,
+        } = request;
         lease.require_fence(&self.core.operator_pool).await?;
         if !lease.commit_window_fits(self.core.config.commit_window()) {
             return Err(ForgeError::FenceLost {

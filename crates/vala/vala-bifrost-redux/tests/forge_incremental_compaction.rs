@@ -196,7 +196,10 @@ mod pg_tests {
                 ..ForgeConfig::default()
             };
             let runtime = ForgeRewriteRuntime::new(
-                Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024)),
+                // DataFusion 53 reserves 10 MiB for an external-sort merge.
+                // Leave that reservation available, then make the fixture
+                // exceed the remaining bounded pool with real Arrow batches.
+                Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024)),
                 &root.path().join("spill"),
                 config.spill_limit_bytes,
             )
@@ -345,7 +348,10 @@ mod pg_tests {
     #[tokio::test]
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
         let fixture = Fixture::new().await;
-        fixture.seed_files(0, true).await;
+        // The default fixture seeds four files. Thirty-two more 100k-row files
+        // make the sort exceed the bounded 16 MiB pool while keeping the
+        // external journey deterministic and reasonably sized.
+        fixture.seed_files(32, true).await;
         let outcome = fixture.forge.run_once().await.expect("rewrite");
         assert_eq!(outcome.bins_committed, 1, "outcome: {outcome:?}");
         assert!(
@@ -354,8 +360,8 @@ mod pg_tests {
         );
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
-        assert_eq!(outcome.input_rows, 400_000);
-        assert_eq!(outcome.output_rows, 400_000);
+        assert_eq!(outcome.input_rows, 3_600_000);
+        assert_eq!(outcome.output_rows, 3_600_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
@@ -386,7 +392,7 @@ mod pg_tests {
         }
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
-            output_rows, 400_000,
+            output_rows, 3_600_000,
             "rewrite must conserve every input row"
         );
     }

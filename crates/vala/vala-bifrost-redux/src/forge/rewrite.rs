@@ -353,8 +353,12 @@ impl ForgeRewritePipeline {
             datafusion::prelude::SessionConfig::new(),
             self.runtime.runtime(),
         );
+        let sort_plan: Arc<dyn ExecutionPlan> = sort.clone();
+        let stream =
+            execute_stream(sort_plan, session.task_ctx()).map_err(ForgeError::DataFusion)?;
+        // DataFusion populates the plan metrics during `execute_stream`; read
+        // them only after execution has registered the SortExec metrics set.
         let metrics = sort.metrics().unwrap_or_default();
-        let stream = execute_stream(sort, session.task_ctx()).map_err(ForgeError::DataFusion)?;
         Ok((stream, metrics))
     }
 

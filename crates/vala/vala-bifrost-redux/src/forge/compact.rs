@@ -185,6 +185,27 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
     /// Returns the backend error when the object cannot be read completely.
     async fn read(&self, path: &str) -> opendal::Result<Buffer>;
 
+    /// Read one bounded byte range from a staged object.
+    ///
+    /// Implementations backed by a remote object store should issue a native
+    /// ranged request. The compatibility default preserves existing fixtures;
+    /// rewrite production paths override it to avoid whole-object buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend read error when the object cannot be fetched.
+    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
+        let bytes = self.read(path).await?;
+        let data = bytes.to_bytes();
+        let start = usize::try_from(range.start)
+            .unwrap_or(data.len())
+            .min(data.len());
+        let end = usize::try_from(range.end)
+            .unwrap_or(data.len())
+            .min(data.len());
+        Ok(Buffer::from(data.slice(start..end)))
+    }
+
     /// List all objects below a table-owned prefix.
     ///
     /// # Errors

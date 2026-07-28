@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
 use chrono::Datelike;
 use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::MemoryPool;
@@ -21,11 +22,15 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
     execute_stream,
 };
-use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
+use futures_util::stream::BoxStream;
+use futures_util::{StreamExt, TryStreamExt};
 use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
+use std::ops::Range;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -321,8 +326,20 @@ impl ForgeRewritePipeline {
                     detail: "Iceberg schema lacks wyrd_event_time".to_owned(),
                 })?;
         let ordering = LexOrdering::new(vec![
-            PhysicalSortExpr::new_default(Arc::new(Column::new("data_tenant_id", tenant_index))),
-            PhysicalSortExpr::new_default(Arc::new(Column::new("wyrd_event_time", time_index))),
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("data_tenant_id", tenant_index)),
+                arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            ),
+            PhysicalSortExpr::new(
+                Arc::new(Column::new("wyrd_event_time", time_index)),
+                arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                },
+            ),
         ])
         .ok_or_else(|| ForgeError::Invariant {
             detail: "Forge sort ordering unexpectedly contained no expressions".to_owned(),
@@ -454,6 +471,8 @@ struct StagingParquetExec {
     object_store: Arc<dyn ForgeObjectStore>,
     /// Permits limiting simultaneously open source files.
     permits: Arc<tokio::sync::Semaphore>,
+    /// Configured source-stream concurrency ceiling.
+    max_concurrent_reads: usize,
     /// `DataFusion` physical properties for one bounded source partition.
     properties: Arc<PlanProperties>,
 }
@@ -482,6 +501,7 @@ impl StagingParquetExec {
             schema,
             object_store,
             permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
+            max_concurrent_reads,
             properties,
         }
     }
@@ -496,6 +516,109 @@ impl DisplayAs for StagingParquetExec {
     ) -> fmt::Result {
         write!(formatter, "StagingParquetExec files={}", self.files.len())
     }
+}
+
+/// Adapter that turns the Forge ranged-read seam into Parquet's async reader.
+#[derive(Debug)]
+struct ForgeParquetReader {
+    /// Object-store capability used for every footer and row-group range.
+    store: Arc<dyn ForgeObjectStore>,
+    /// Validated object path being decoded.
+    path: String,
+    /// Object size required to locate the Parquet footer.
+    size: u64,
+}
+
+impl AsyncFileReader for ForgeParquetReader {
+    /// Fetch exactly the requested Parquet byte range without materializing the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the object-store or Parquet external error for a failed range.
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        let store = Arc::clone(&self.store);
+        let path = self.path.clone();
+        Box::pin(async move {
+            store
+                .read_range(&path, range)
+                .await
+                .map(|buffer| buffer.to_bytes())
+                .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))
+        })
+    }
+
+    /// Fetch and decode footer metadata using bounded suffix/range requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the Parquet metadata error when footer decoding fails.
+    fn get_metadata<'a>(
+        &'a mut self,
+        _options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<parquet::file::metadata::ParquetMetaData>>> {
+        let size = self.size;
+        Box::pin(async move {
+            let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+                .load_and_finish(&mut *self, size)
+                .await?;
+            Ok(Arc::new(metadata))
+        })
+    }
+}
+
+/// Open one bounded Parquet stream while holding one read permit.
+///
+/// # Errors
+///
+/// Returns an execution error for invalid paths, metadata reads, or Parquet
+/// stream construction failures.
+async fn open_staging_stream(
+    file: CandidateFile,
+    binding: TenantTableBinding,
+    schema: SchemaRef,
+    store: Arc<dyn ForgeObjectStore>,
+    permits: Arc<tokio::sync::Semaphore>,
+) -> datafusion::error::Result<
+    BoxStream<'static, datafusion::error::Result<arrow::record_batch::RecordBatch>>,
+> {
+    let path = binding.validate_object_path(&file.path).ok_or_else(|| {
+        datafusion::error::DataFusionError::Execution(format!(
+            "Forge staging input escaped table prefix: {}",
+            file.path
+        ))
+    })?;
+    let permit = permits
+        .acquire_owned()
+        .await
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+    let size = store
+        .stat(&path)
+        .await
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+        .content_length();
+    let reader = ForgeParquetReader { store, path, size };
+    let stream = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
+        .with_batch_size(REWRITE_BATCH_ROWS)
+        .build()
+        .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+    let tenant = binding.tenant;
+    let projected = async_stream::try_stream! {
+        futures_util::pin_mut!(stream);
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+            validate_tenant_column(&batch, tenant)
+                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+            let projected = project_by_name(&batch, Arc::clone(&schema))
+                .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+            if projected.num_rows() > 0 {
+                yield projected;
+            }
+        }
+        drop(permit);
+    };
+    Ok(Box::pin(projected))
 }
 
 impl ExecutionPlan for StagingParquetExec {
@@ -564,62 +687,16 @@ impl ExecutionPlan for StagingParquetExec {
         let store = Arc::clone(&self.object_store);
         let permits = Arc::clone(&self.permits);
         let stream_schema = Arc::clone(&schema);
-        let stream = async_stream::try_stream! {
-            for file in files {
-                let path = binding
-                    .validate_object_path(&file.path)
-                    .ok_or_else(|| datafusion::error::DataFusionError::Execution(
-                        format!("Forge staging input escaped table prefix: {}", file.path)
-                    ))?;
-                let permit = Arc::clone(&permits)
-                    .acquire_owned()
-                    .await
-                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-                let bytes = store
-                    .read(&path)
-                    .await
-                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
-                    .to_bytes();
-                let target = Arc::clone(&schema);
-                let tenant = binding.tenant;
-                let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
-                let decoder = tokio::task::spawn_blocking(move || {
-                    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
-                        .map_err(|error| ForgeError::Parquet {
-                            detail: error.to_string(),
-                        })?
-                        .with_batch_size(REWRITE_BATCH_ROWS)
-                        .build()
-                        .map_err(|error| ForgeError::Parquet {
-                            detail: error.to_string(),
-                        })?;
-                    for batch in reader {
-                        let projected = (|| {
-                            let batch = batch.map_err(|error| ForgeError::Parquet {
-                                detail: error.to_string(),
-                            })?;
-                            validate_tenant_column(&batch, tenant)?;
-                            project_by_name(&batch, Arc::clone(&target))
-                        })();
-                        let failed = projected.is_err();
-                        if sender.blocking_send(projected).is_err() || failed {
-                            break;
-                        }
-                    }
-                    Ok::<(), ForgeError>(())
-                });
-                while let Some(batch) = receiver.recv().await {
-                    yield batch.map_err(|error| {
-                        datafusion::error::DataFusionError::External(Box::new(error))
-                    })?;
-                }
-                decoder
-                    .await
-                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?
-                    .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
-                drop(permit);
-            }
-        };
+        let stream = futures_util::stream::iter(files)
+            .map(move |file| {
+                let binding = binding.clone();
+                let schema = Arc::clone(&schema);
+                let store = Arc::clone(&store);
+                let permits = Arc::clone(&permits);
+                async move { open_staging_stream(file, binding, schema, store, permits).await }
+            })
+            .buffer_unordered(self.max_concurrent_reads)
+            .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             stream_schema,
             stream,

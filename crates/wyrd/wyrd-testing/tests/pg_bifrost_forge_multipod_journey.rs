@@ -383,7 +383,7 @@ async fn active_partition_incremental_compaction() {
         .run_once()
         .await
         .expect("closed remainder tick");
-    assert_forge_terminal_once(&closed).await;
+    assert_forge_terminal_once(&closed, "closed remainder").await;
     let tail = seed_forge_group_for_tenant_with_schema_and_days(
         server,
         fixture.tenant,
@@ -419,7 +419,7 @@ async fn active_partition_incremental_compaction() {
         .run_once()
         .await
         .expect("open-tail completion tick");
-    assert_forge_terminal_once(&tail).await;
+    assert_forge_terminal_once(&tail, "open tail").await;
     let lost_hint = seed_forge_group_for_tenant_with_schema_and_days(
         server,
         fixture.tenant,
@@ -433,30 +433,41 @@ async fn active_partition_incremental_compaction() {
         .run_once()
         .await
         .expect("periodic lost-hint tick");
-    assert_forge_terminal_once(&lost_hint).await;
+    assert_forge_terminal_once(&lost_hint, "periodic lost hint").await;
     let oracle_after = oracle_rows(server, &jwt).await;
     assert_eq!(oracle_after, oracle_before, "Oracle parity after Forge");
     harness.shutdown().await.expect("harness shutdown");
 }
 
 /// Assert one durable Forge operation has exactly one terminal transition and snapshot.
-async fn assert_forge_terminal_once(fixture: &wyrd_testing::bifrost::ForgeFixture) {
-    let prepared = fixture.operation_count("forge.file_compact.prepared").await;
-    let terminal = fixture
-        .operation_count("forge.file_compact.committed")
-        .await
-        + fixture
-            .operation_count("forge.file_compact.recovered")
+async fn assert_forge_terminal_once(fixture: &wyrd_testing::bifrost::ForgeFixture, scenario: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (prepared, terminal) = loop {
+        let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+        let terminal = fixture
+            .operation_count("forge.file_compact.committed")
             .await
-        + fixture.operation_count("forge.file_compact.reset").await;
-    assert_eq!(prepared, 1);
-    assert_eq!(terminal, 1);
+            + fixture
+                .operation_count("forge.file_compact.recovered")
+                .await
+            + fixture.operation_count("forge.file_compact.reset").await;
+        if prepared == 1 && terminal == 1 {
+            break (prepared, terminal);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{scenario} did not reach one prepared and terminal audit"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(prepared, 1, "{scenario} prepared audit");
+    assert_eq!(terminal, 1, "{scenario} terminal audit");
     let table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
         .await
         .expect("snapshot");
-    assert_eq!(table.metadata().snapshots().len(), 1);
+    assert_eq!(table.metadata().snapshots().len(), 1, "{scenario} snapshot");
 }
 
 /// Query the bound server's public Oracle endpoint and return its durable row count.

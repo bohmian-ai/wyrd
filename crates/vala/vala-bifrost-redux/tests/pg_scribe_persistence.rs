@@ -13,6 +13,7 @@ use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
 use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
+use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
 use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
 use vala_bifrost_redux::scribe::audit_envelope::encode_audit_event;
@@ -38,6 +39,8 @@ struct PersistenceFixture {
     operator: Arc<opendal::Operator>,
     scribe: Arc<ScribeImpl>,
     faults: PersistenceFaults,
+    /// Receiver retained so post-commit hints remain observable until assertions finish.
+    _hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
     wal_root: TempDir,
     _warehouse: Option<TempDir>,
     tenant: DataTenantId,
@@ -64,6 +67,7 @@ impl PersistenceFixture {
             .expect("WAL writer"),
         );
         let faults = PersistenceFaults::default();
+        let (staging_file_publisher, hint_inbox) = staging_file_channel(16).expect("hint channel");
         let persistence =
             ScribePersistenceConfig::new(Arc::new(database.vala_postgres().clone()), 16, 2)
                 .with_test_faults(faults.clone());
@@ -88,7 +92,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             memory_budget: Some(memory.scribe_budget()),
-            staging_file_publisher: None,
+            staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("empty WAL replay");
         Self {
@@ -96,6 +100,7 @@ impl PersistenceFixture {
             operator,
             scribe,
             faults,
+            _hint_inbox: hint_inbox,
             wal_root,
             _warehouse: None,
             tenant,
@@ -168,6 +173,7 @@ impl PersistenceFixture {
         drop(wal);
 
         let faults = PersistenceFaults::default();
+        let (staging_file_publisher, hint_inbox) = staging_file_channel(16).expect("hint channel");
         if fail_replay_write {
             faults.fail_next_object_write();
         }
@@ -198,7 +204,7 @@ impl PersistenceFixture {
             execution_pools: pools,
             persistence: Some(persistence),
             memory_budget: Some(memory.scribe_budget()),
-            staging_file_publisher: None,
+            staging_file_publisher: Some(staging_file_publisher),
         }));
         scribe.replay_wal_async().await.expect("replay");
         Self {
@@ -206,6 +212,7 @@ impl PersistenceFixture {
             operator,
             scribe,
             faults,
+            _hint_inbox: hint_inbox,
             wal_root,
             _warehouse: Some(warehouse),
             tenant,
@@ -442,6 +449,19 @@ async fn wait_for_state(fixture: &PersistenceFixture, pending: usize) {
     }
 }
 
+/// Poll the fixture's bounded wake-up inbox after persistence settles.
+///
+/// # Errors
+/// Returns the channel's empty or closed status when no advisory signal is available.
+fn hint_outcome(
+    fixture: &mut PersistenceFixture,
+) -> Result<
+    vala_bifrost_redux::maintenance::StagingFileCommitted,
+    tokio::sync::mpsc::error::TryRecvError,
+> {
+    fixture._hint_inbox.try_recv_for_test()
+}
+
 async fn retry_and_wait(fixture: &PersistenceFixture) {
     fixture.scribe.check_age(Instant::now());
     wait_for_state(fixture, 0).await;
@@ -654,6 +674,79 @@ async fn sql_failure_keeps_wal_and_file_list_unchanged() {
     assert_eq!(fixture.scribe.wal_bytes_on_disk(), wal_before);
     assert!(rows(&fixture).await.is_empty());
     assert_eq!(audit_count(&fixture).await, 0);
+    fixture.stop().await;
+}
+
+/// A confirmed file-list transaction publishes exactly one advisory wake-up.
+#[tokio::test]
+async fn confirmed_commit_publishes_hint() {
+    let mut fixture = PersistenceFixture::start().await;
+    append_one(&fixture, "confirmed_hint_events", 1).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("confirmed flush");
+    wait_for_state(&fixture, 0).await;
+
+    assert!(hint_outcome(&mut fixture).is_ok());
+    assert!(matches!(
+        hint_outcome(&mut fixture),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    fixture.stop().await;
+}
+
+/// Pre-commit object and SQL failures publish no wake-up signal.
+#[tokio::test]
+async fn precommit_and_commit_failure_publish_no_hint() {
+    let mut fixture = PersistenceFixture::start().await;
+    fixture.faults.fail_next_object_write();
+    append_one(&fixture, "precommit_hint_events", 1).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("object failure flush");
+    wait_for_state(&fixture, 1).await;
+    assert!(matches!(
+        hint_outcome(&mut fixture),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    retry_and_wait(&fixture).await;
+    fixture.faults.fail_next_sql_commit();
+    append_one(&fixture, "commit_hint_events", 2).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("SQL failure flush");
+    wait_for_state(&fixture, 1).await;
+    assert!(matches!(
+        hint_outcome(&mut fixture),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    fixture.stop().await;
+}
+
+/// A manifest failure after SQL commit still publishes the durable-row hint.
+#[tokio::test]
+async fn manifest_failure_after_commit_still_publishes_hint() {
+    let mut fixture = PersistenceFixture::start().await;
+    fixture.faults.fail_next_manifest_publication();
+    append_one(&fixture, "manifest_hint_events", 1).await;
+    fixture
+        .scribe
+        .flush_writable_for_test()
+        .await
+        .expect("manifest failure flush");
+    wait_for_state(&fixture, 1).await;
+    assert_eq!(
+        rows_for_table(&fixture, "manifest_hint_events").await.len(),
+        1
+    );
+    assert!(hint_outcome(&mut fixture).is_ok());
     fixture.stop().await;
 }
 

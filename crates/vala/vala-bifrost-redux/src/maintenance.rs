@@ -95,6 +95,18 @@ impl StagingFileInbox {
     ) -> Result<StagingFileCommitted, tokio::sync::mpsc::error::TryRecvError> {
         self.receiver.try_recv()
     }
+
+    /// Poll one advisory signal from a test-owned inbox without waiting.
+    #[cfg(any(test, feature = "test-support"))]
+    ///
+    /// # Errors
+    /// Returns [`tokio::sync::mpsc::error::TryRecvError::Empty`] when no signal
+    /// is currently queued, or `Closed` after the publisher is dropped.
+    pub fn try_recv_for_test(
+        &mut self,
+    ) -> Result<StagingFileCommitted, tokio::sync::mpsc::error::TryRecvError> {
+        self.try_recv()
+    }
 }
 
 /// Build a bounded local channel for advisory staging-file wake-ups.

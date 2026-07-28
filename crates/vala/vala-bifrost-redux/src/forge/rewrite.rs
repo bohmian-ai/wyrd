@@ -2,10 +2,12 @@
 
 use std::any::Any;
 use std::fmt;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Datelike;
 use datafusion::execution::TaskContext;
@@ -31,7 +33,6 @@ use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder};
-use std::ops::Range;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -45,12 +46,12 @@ use vala_sql::OperatorPool;
 
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
-/// Upper bound for DataFusion spill handles to finish dropping after cancel.
+/// Upper bound for `DataFusion` spill handles to finish dropping after cancel.
 const SPILL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Owned rewrite dependencies shared by every serialized Forge operation.
 pub(crate) struct ForgeRewritePipeline {
-    /// Process-wide `DataFusion` runtime and its owned spill directory.
+    /// Process-wide [`DataFusion`] runtime and its owned spill directory.
     runtime: ForgeRewriteRuntime,
     /// Staging operator used for deterministic rewritten-object PUTs.
     staging: Arc<opendal::Operator>,
@@ -103,6 +104,178 @@ pub(crate) struct RewriteOutput {
     pub(crate) output_rows: u64,
     /// Peak bytes observed in the operation's `DataFusion` spill directory.
     pub(crate) spill_bytes: u64,
+}
+
+/// Mutable writer and accounting state for one streamed rewrite operation.
+///
+/// The state owns every output path as soon as its PUT succeeds and retains
+/// that ownership across later batch failures so rewrite finalization can
+/// delete the complete accumulated set.
+struct RewriteBatchState {
+    /// Currently open bounded Parquet writer, if any batch has been accepted.
+    writer: Option<ArrowWriter<Vec<u8>>>,
+    /// Rows buffered in `writer` and not yet transferred to an output object.
+    writer_rows: u64,
+    /// Iceberg metadata accumulated for successfully finalized outputs.
+    files: Vec<DataFile>,
+    /// Object paths still owned by rewrite cleanup.
+    output_paths: Vec<String>,
+    /// Rows accepted from source batches.
+    input_rows: u64,
+    /// Rows transferred into successfully finalized output objects.
+    output_rows: u64,
+    /// Peak spill bytes observed while consuming sorted batches.
+    peak_spill_bytes: u64,
+}
+
+impl RewriteBatchState {
+    /// Create empty state before the first sorted batch is consumed.
+    fn new() -> Self {
+        Self {
+            writer: None,
+            writer_rows: 0,
+            files: Vec::new(),
+            output_paths: Vec::new(),
+            input_rows: 0,
+            output_rows: 0,
+            peak_spill_bytes: 0,
+        }
+    }
+
+    /// Count one non-empty source batch before attempting output rotation.
+    ///
+    /// Counting first preserves accepted-input diagnostics when the pending
+    /// output cannot be fenced or persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the batch row count cannot fit
+    /// the rewrite's `u64` counters.
+    fn record_input(&mut self, batch: &RecordBatch) -> Result<(), ForgeError> {
+        let rows = u64::try_from(batch.num_rows()).map_err(|error| ForgeError::Invariant {
+            detail: format!("rewrite row count does not fit u64: {error}"),
+        })?;
+        self.input_rows = self.input_rows.saturating_add(rows);
+        Ok(())
+    }
+
+    /// Report whether the active non-empty writer reached the output bound.
+    fn should_rotate(&self, output_file_bytes: u64) -> bool {
+        self.writer.as_ref().is_some_and(|writer| {
+            self.writer_rows > 0
+                && u64::try_from(writer.bytes_written() + writer.in_progress_size())
+                    .unwrap_or(u64::MAX)
+                    >= output_file_bytes
+        })
+    }
+
+    /// Append one validated batch to the active bounded Parquet writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Parquet encoding failure or [`ForgeError::Invariant`] when
+    /// the batch row count cannot fit the rewrite's `u64` counters.
+    fn write_batch(&mut self, schema: &SchemaRef, batch: &RecordBatch) -> Result<(), ForgeError> {
+        if self.writer.is_none() {
+            self.writer = Some(
+                ArrowWriter::try_new(
+                    Vec::new(),
+                    Arc::clone(schema),
+                    Some(bifrost_writer_properties(batch.num_rows())),
+                )
+                .map_err(|error| ForgeError::Parquet {
+                    detail: error.to_string(),
+                })?,
+            );
+        }
+        let writer = self.writer.as_mut().ok_or_else(|| ForgeError::Invariant {
+            detail: "Forge rewrite failed to retain its active writer".to_owned(),
+        })?;
+        writer.write(batch).map_err(|error| ForgeError::Parquet {
+            detail: error.to_string(),
+        })?;
+        let rows = u64::try_from(batch.num_rows()).map_err(|error| ForgeError::Invariant {
+            detail: format!("rewrite row count does not fit u64: {error}"),
+        })?;
+        self.writer_rows = self.writer_rows.saturating_add(rows);
+        Ok(())
+    }
+
+    /// Take the active writer for close, PUT, and metadata derivation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when rotation is requested without an
+    /// active writer.
+    fn take_writer(&mut self) -> Result<ArrowWriter<Vec<u8>>, ForgeError> {
+        self.writer.take().ok_or_else(|| ForgeError::Invariant {
+            detail: "Forge output rotation lost its active writer".to_owned(),
+        })
+    }
+
+    /// Record one finalized output and clear its rows from the active writer.
+    fn record_output(&mut self, file: DataFile, path: String) {
+        self.output_rows = self.output_rows.saturating_add(self.writer_rows);
+        self.writer_rows = 0;
+        self.output_paths.push(path);
+        self.files.push(file);
+    }
+
+    /// Retain the largest runtime spill observation seen between batches.
+    fn observe_spill(&mut self, spill_bytes: u64) {
+        self.peak_spill_bytes = self.peak_spill_bytes.max(spill_bytes);
+    }
+
+    /// Transfer accumulated output ownership alongside a successful terminal result.
+    fn complete(self) -> RewriteBatchResult {
+        self.into_result(Ok(()))
+    }
+
+    /// Transfer accumulated output ownership alongside the terminal failure.
+    fn fail(self, error: ForgeError) -> RewriteBatchResult {
+        self.into_result(Err(error))
+    }
+
+    /// Drop any unfinished writer and move finalized state into the terminal result.
+    fn into_result(mut self, result: Result<(), ForgeError>) -> RewriteBatchResult {
+        self.writer.take();
+        RewriteBatchResult {
+            result,
+            files: self.files,
+            output_paths: self.output_paths,
+            input_rows: self.input_rows,
+            output_rows: self.output_rows,
+            peak_spill_bytes: self.peak_spill_bytes,
+        }
+    }
+}
+
+/// Accumulated rewrite state retained when a stream stage fails.
+struct RewriteBatchResult {
+    /// Terminal stream result, preserving errors after output rotation.
+    result: Result<(), ForgeError>,
+    /// Iceberg metadata accumulated before the terminal result.
+    files: Vec<DataFile>,
+    /// Object paths still owned by rewrite cleanup.
+    output_paths: Vec<String>,
+    /// Rows accepted from source batches.
+    input_rows: u64,
+    /// Rows encoded into output files.
+    output_rows: u64,
+    /// Peak spill bytes observed while consuming the stream.
+    peak_spill_bytes: u64,
+}
+
+/// Inputs shared by every output close, PUT, and metadata derivation.
+struct RewriteOutputContext<'a, 'b> {
+    /// Immutable rewrite identity and destination metadata.
+    request: &'a RewriteRequest<'b>,
+    /// Cancellation source checked before side effects.
+    stop: &'a CancellationToken,
+    /// Mutable table lease renewed immediately before each PUT.
+    lease: &'a mut ForgeLease,
+    /// Operator pool used to validate the lease fence.
+    operator_pool: &'a OperatorPool,
 }
 
 impl ForgeRewritePipeline {
@@ -166,101 +339,17 @@ impl ForgeRewritePipeline {
             });
         }
         let (mut stream, sort_metrics) = self.sorted_stream(&request)?;
-        let mut output_paths = Vec::new();
-        let mut files = Vec::new();
-        let mut writer: Option<ArrowWriter<Vec<u8>>> = None;
-        let mut writer_rows = 0_u64;
-        let (mut input_rows, mut output_rows, mut peak_spill_bytes) = (0_u64, 0_u64, 0_u64);
-
-        let result = async {
-            while let Some(batch) = tokio::select! {
-                () = stop.cancelled() => return Err(ForgeError::Shutdown),
-                batch = stream.next() => batch,
-            } {
-                let batch = batch.map_err(|error| self.map_datafusion_error(error))?;
-                if batch.num_rows() == 0 {
-                    continue;
-                }
-                input_rows = input_rows.saturating_add(u64::try_from(batch.num_rows()).map_err(
-                    |error| ForgeError::Invariant {
-                        detail: format!("rewrite row count does not fit u64: {error}"),
-                    },
-                )?);
-                let rotate = writer.as_ref().is_some_and(|active| {
-                    writer_rows > 0
-                        && u64::try_from(active.bytes_written() + active.in_progress_size())
-                            .unwrap_or(u64::MAX)
-                            >= self.output_file_bytes
-                });
-                if rotate {
-                    let active = writer.take().ok_or_else(|| ForgeError::Invariant {
-                        detail: "Forge output rotation lost its active writer".to_owned(),
-                    })?;
-                    let ordinal = files.len();
-                    let (file, path) = self
-                        .finish_output(
-                            active,
-                            writer_rows,
-                            ordinal,
-                            &request,
-                            stop,
-                            lease,
-                            operator_pool,
-                        )
-                        .await?;
-                    output_rows = output_rows.saturating_add(writer_rows);
-                    output_paths.push(path);
-                    files.push(file);
-                    writer_rows = 0;
-                }
-                let active = writer.get_or_insert(
-                    ArrowWriter::try_new(
-                        Vec::new(),
-                        Arc::clone(&request.schema),
-                        Some(bifrost_writer_properties(batch.num_rows())),
-                    )
-                    .map_err(|error| ForgeError::Parquet {
-                        detail: error.to_string(),
-                    })?,
-                );
-                active.write(&batch).map_err(|error| ForgeError::Parquet {
-                    detail: error.to_string(),
-                })?;
-                writer_rows = writer_rows.saturating_add(u64::try_from(batch.num_rows()).map_err(
-                    |error| ForgeError::Invariant {
-                        detail: format!("rewrite row count does not fit u64: {error}"),
-                    },
-                )?);
-                peak_spill_bytes =
-                    peak_spill_bytes.max(self.runtime.runtime.spilling_progress().current_bytes);
-            }
-            if let Some(active) = writer.take()
-                && writer_rows > 0
-            {
-                let ordinal = files.len();
-                let (file, path) = self
-                    .finish_output(
-                        active,
-                        writer_rows,
-                        ordinal,
-                        &request,
-                        stop,
-                        lease,
-                        operator_pool,
-                    )
-                    .await?;
-                output_rows = output_rows.saturating_add(writer_rows);
-                output_paths.push(path);
-                files.push(file);
-            }
-            if files.is_empty() {
-                return Err(ForgeError::Invariant {
-                    detail: "Forge rewrite produced no non-empty output".to_owned(),
-                });
-            }
-            Ok(())
-        }
-        .await;
+        let result = self
+            .rewrite_batches(&mut stream, &request, stop, lease, operator_pool)
+            .await;
+        let RewriteBatchResult {
+            result,
+            files,
+            output_paths,
+            input_rows,
+            output_rows,
+            mut peak_spill_bytes,
+        } = result;
         // Dropping the physical stream releases SortExec and its spill handles.
         // This must happen before observing spill progress or returning on cancel.
         drop(stream);
@@ -276,6 +365,152 @@ impl ForgeRewritePipeline {
             peak_spill_bytes,
         )
         .await
+    }
+
+    /// Consume sorted batches, rotate bounded writers, and collect output metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns source, Parquet, cancellation, lease, object-store, or invariant
+    /// failures encountered while processing the stream.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation stops before the next batch or output PUT. Previously
+    /// finalized paths remain in the returned state for complete-set cleanup.
+    async fn rewrite_batches(
+        &self,
+        stream: &mut SendableRecordBatchStream,
+        request: &RewriteRequest<'_>,
+        stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
+    ) -> RewriteBatchResult {
+        let mut state = RewriteBatchState::new();
+        while let Some(batch) = tokio::select! {
+            () = stop.cancelled() => return state.fail(ForgeError::Shutdown),
+            batch = stream.next() => batch,
+        } {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => return state.fail(self.map_datafusion_error(error)),
+            };
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let context = RewriteOutputContext {
+                request,
+                stop,
+                lease,
+                operator_pool,
+            };
+            if let Err(error) = self.process_batch(&mut state, &batch, context).await {
+                return state.fail(error);
+            }
+        }
+        let context = RewriteOutputContext {
+            request,
+            stop,
+            lease,
+            operator_pool,
+        };
+        if let Err(error) = self.finish_pending_output(&mut state, context).await {
+            return state.fail(error);
+        }
+        if state.files.is_empty() {
+            return state.fail(ForgeError::Invariant {
+                detail: "Forge rewrite produced no non-empty output".to_owned(),
+            });
+        }
+        state.complete()
+    }
+
+    /// Account for, rotate before, and encode one non-empty sorted batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns row-count, Parquet, cancellation, lease, object-store, path, or
+    /// metadata failures. A successful rotated PUT remains in `state` for
+    /// final ownership transfer or complete-set cleanup.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is observed before a rotated output PUT. Outputs completed
+    /// by earlier batches remain owned by `state`.
+    async fn process_batch(
+        &self,
+        state: &mut RewriteBatchState,
+        batch: &RecordBatch,
+        context: RewriteOutputContext<'_, '_>,
+    ) -> Result<(), ForgeError> {
+        let RewriteOutputContext {
+            request,
+            stop,
+            lease,
+            operator_pool,
+        } = context;
+        state.record_input(batch)?;
+        if state.should_rotate(self.output_file_bytes) {
+            self.rotate_output(
+                state,
+                RewriteOutputContext {
+                    request,
+                    stop,
+                    lease: &mut *lease,
+                    operator_pool,
+                },
+            )
+            .await?;
+        }
+        state.write_batch(&request.schema, batch)?;
+        state.observe_spill(self.runtime.runtime.spilling_progress().current_bytes);
+        Ok(())
+    }
+
+    /// Finalize the last non-empty writer after stream exhaustion.
+    ///
+    /// # Errors
+    ///
+    /// Returns cancellation, lease, object-store, Parquet, path, or metadata
+    /// failures. An empty writer produces no output.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation before the final PUT returns [`ForgeError::Shutdown`];
+    /// earlier output paths remain owned by `state`.
+    async fn finish_pending_output(
+        &self,
+        state: &mut RewriteBatchState,
+        context: RewriteOutputContext<'_, '_>,
+    ) -> Result<(), ForgeError> {
+        if state.writer_rows > 0 {
+            self.rotate_output(state, context).await?;
+        }
+        Ok(())
+    }
+
+    /// Close the current writer and transfer its bytes to one output object.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, cancellation, object-store, Parquet, path, or metadata
+    /// errors from the output finalization seam.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is checked before the PUT. Earlier finalized paths remain
+    /// in `state` for cleanup.
+    async fn rotate_output(
+        &self,
+        state: &mut RewriteBatchState,
+        context: RewriteOutputContext<'_, '_>,
+    ) -> Result<(), ForgeError> {
+        let writer = state.take_writer()?;
+        let (file, path) = self
+            .finish_output(writer, state.writer_rows, state.files.len(), context)
+            .await?;
+        state.record_output(file, path);
+        Ok(())
     }
 
     /// Validate cleanup and row invariants before transferring output ownership.
@@ -325,7 +560,7 @@ impl ForgeRewritePipeline {
         })
     }
 
-    /// Wait for DataFusion's dropped physical plan to release all spill files.
+    /// Wait for `DataFusion`'s dropped physical plan to release all spill files.
     ///
     /// # Errors
     ///
@@ -348,7 +583,7 @@ impl ForgeRewritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns schema, invariant, or `DataFusion` plan-execution errors.
+    /// Returns schema, invariant, or [`DataFusion`] plan-execution errors.
     fn sorted_stream(
         &self,
         request: &RewriteRequest<'_>,
@@ -414,16 +649,25 @@ impl ForgeRewritePipeline {
     /// Returns cancellation, lease, Parquet, object-store, path, or
     /// metadata-builder failures. The caller remains responsible for deleting
     /// prior outputs.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation is checked before fence validation and again before PUT.
+    /// After PUT succeeds, synchronous metadata construction either returns the
+    /// path or deletes that just-written path before returning an error.
     async fn finish_output(
         &self,
         writer: ArrowWriter<Vec<u8>>,
         rows: u64,
         ordinal: usize,
-        request: &RewriteRequest<'_>,
-        stop: &CancellationToken,
-        lease: &mut ForgeLease,
-        operator_pool: &OperatorPool,
+        context: RewriteOutputContext<'_, '_>,
     ) -> Result<(DataFile, String), ForgeError> {
+        let RewriteOutputContext {
+            request,
+            stop,
+            lease,
+            operator_pool,
+        } = context;
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -911,5 +1155,33 @@ mod tests {
         assert!(second.contains(&operation_id.to_string()));
         assert!(first.ends_with("-00000.parquet"));
         assert!(second.ends_with("-00001.parquet"));
+    }
+
+    /// A later batch failure retains every finalized file and path for cleanup.
+    #[test]
+    fn batch_failure_preserves_complete_output_ownership() {
+        let file = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path("table/data/forge.parquet".to_owned())
+            .file_format(DataFileFormat::Parquet)
+            .partition(Struct::from_iter([Some(Literal::date(0))]))
+            .partition_spec_id(0)
+            .record_count(7)
+            .file_size_in_bytes(128)
+            .build()
+            .expect("test output metadata must be complete");
+        let mut state = RewriteBatchState::new();
+        state.writer_rows = 7;
+        state.record_output(file, "tenant/table/data/forge.parquet".to_owned());
+
+        let result = state.fail(ForgeError::Shutdown);
+
+        assert!(matches!(result.result, Err(ForgeError::Shutdown)));
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(
+            result.output_paths,
+            ["tenant/table/data/forge.parquet".to_owned()]
+        );
+        assert_eq!(result.output_rows, 7);
     }
 }

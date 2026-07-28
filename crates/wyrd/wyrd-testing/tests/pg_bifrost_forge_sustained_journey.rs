@@ -1,5 +1,7 @@
 //! Gated sustained Forge journey over durable Scribe-shaped inputs.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::TryStreamExt;
@@ -183,15 +185,29 @@ async fn pg_bifrost_forge_incremental_sustained() {
         &[chrono::Utc::now().date_naive()],
     )
     .await;
-    let baseline_memory = fixture.memory_snapshot().bifrost_total_bytes;
-    let mut peak_shared_memory = baseline_memory;
     let mut config = fixture.config.clone();
     config.max_hints_per_wake = 1;
     config.max_files_per_bin = 2;
     config.output_file_bytes = 1;
     assert!(config.max_hints_per_wake <= 1);
-    let (forge, publisher) =
-        fixture.context_with_constrained_memory_and_publisher(config, 16 * 1024 * 1024);
+    let (forge, publisher, probe) =
+        fixture.context_with_constrained_memory_and_probe(config, 16 * 1024 * 1024);
+    let peak_reserved = Arc::new(AtomicUsize::new(probe.current_reserved()));
+    let sample_stop = CancellationToken::new();
+    let sampler = tokio::spawn({
+        let probe = probe.clone();
+        let peak_reserved = Arc::clone(&peak_reserved);
+        let sample_stop = sample_stop.clone();
+        async move {
+            loop {
+                peak_reserved.fetch_max(probe.current_reserved(), Ordering::Relaxed);
+                tokio::select! {
+                    () = sample_stop.cancelled() => break,
+                    () = tokio::task::yield_now() => {}
+                }
+            }
+        }
+    });
     let drain_forge = forge.clone();
     assert_eq!(
         publisher.try_publish(StagingFileCommitted::new(
@@ -233,7 +249,6 @@ async fn pg_bifrost_forge_incremental_sustained() {
             .await
             .expect("incremental drain tick");
         spill_bytes = spill_bytes.max(outcome.spill_bytes);
-        peak_shared_memory = peak_shared_memory.max(fixture.memory_snapshot().bifrost_total_bytes);
         outputs_committed = outputs_committed.saturating_add(outcome.outputs_committed);
         if maintenance_settled(&fixture).await {
             break;
@@ -246,7 +261,6 @@ async fn pg_bifrost_forge_incremental_sustained() {
         "incremental rewrite must exercise DataFusion spill"
     );
     assert!(spill_bytes <= fixture.config.spill_limit_bytes);
-    assert!(peak_shared_memory >= baseline_memory);
     assert!(
         outputs_committed > 1,
         "small output ceiling must rotate outputs"
@@ -312,10 +326,22 @@ async fn pg_bifrost_forge_incremental_sustained() {
         .await
         .expect("sustained scheduler")
         .expect("scheduler shutdown");
-    assert!(fixture.spill_root_is_empty());
+    sample_stop.cancel();
+    sampler.await.expect("memory sampler");
+    let peak_reserved = peak_reserved.load(Ordering::Relaxed);
     assert!(
-        fixture.memory_snapshot().bifrost_total_bytes <= baseline_memory + 2,
-        "shared memory did not return near baseline"
+        peak_reserved > 0,
+        "sustained rewrite must reserve Forge memory"
+    );
+    assert!(
+        peak_reserved <= 16 * 1024 * 1024,
+        "Forge memory reservation exceeded configured ceiling: {peak_reserved}"
+    );
+    assert!(fixture.spill_root_is_empty());
+    assert_eq!(
+        probe.current_reserved(),
+        0,
+        "constrained Forge memory must be released after completion"
     );
     server.shutdown().await.expect("server shutdown");
 }

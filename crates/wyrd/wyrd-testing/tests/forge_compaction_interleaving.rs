@@ -706,8 +706,8 @@ async fn forge_incremental_interleaving() {
     cancel_fixture.object_store = barrier.clone();
     let mut cancel_config = cancel_fixture.config.clone();
     cancel_config.output_file_bytes = 1;
-    let (cancel_forge, cancel_publisher) = cancel_fixture
-        .context_with_constrained_memory_and_publisher(cancel_config, 16 * 1024 * 1024);
+    let (cancel_forge, cancel_publisher, cancel_probe) =
+        cancel_fixture.context_with_constrained_memory_and_probe(cancel_config, 16 * 1024 * 1024);
     assert_eq!(
         cancel_publisher.try_publish(StagingFileCommitted::new(
             cancel_fixture.binding.clone(),
@@ -715,20 +715,25 @@ async fn forge_incremental_interleaving() {
         )),
         StagingPublishOutcome::Published
     );
-    let baseline_memory = cancel_fixture.memory_snapshot();
     let cancel_stop = CancellationToken::new();
     let cancel_task = tokio::spawn({
         let stop = cancel_stop.clone();
         async move { cancel_forge.run(stop).await }
     });
     tokio::time::timeout(Duration::from_secs(30), async {
-        while cancel_fixture.spill_root_is_empty() {
+        let mut observed_reserved = 0_usize;
+        while cancel_fixture.spill_root_is_empty() || observed_reserved == 0 {
             assert!(
                 !cancel_task.is_finished(),
                 "rewrite completed before active spill was observed"
             );
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            observed_reserved = observed_reserved.max(cancel_probe.current_reserved());
+            tokio::task::yield_now().await;
         }
+        assert!(
+            observed_reserved > 0,
+            "active spill must reserve constrained Forge memory"
+        );
     })
     .await
     .expect("active spill observation bound");
@@ -748,8 +753,9 @@ async fn forge_incremental_interleaving() {
         0
     );
     assert_eq!(
-        cancel_fixture.memory_snapshot().bifrost_total_bytes,
-        baseline_memory.bifrost_total_bytes
+        cancel_probe.current_reserved(),
+        0,
+        "constrained Forge memory must be released before scheduler return"
     );
     server.shutdown().await.expect("server shutdown");
 }

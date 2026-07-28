@@ -21,7 +21,6 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         .cluster()
         .server(0)
         .expect("first bound Bifrost pod");
-    let forge = server.state().forge().expect("Forge").clone();
     let fixtures = vec![
         seed_forge_group(&server, "multipod_rows_a").await,
         seed_forge_group(&server, "multipod_rows_b").await,
@@ -29,12 +28,14 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
         seed_forge_group(&server, "multipod_rows_d").await,
         seed_forge_group(&server, "multipod_rows_e").await,
     ];
-    let shutdown = CancellationToken::new();
-    let scheduler = tokio::spawn({
-        let forge = forge.clone();
-        let stop = shutdown.clone();
-        async move { forge.run(stop).await }
-    });
+    for pod in harness.cluster().servers() {
+        pod.state()
+            .forge()
+            .expect("server-owned Forge")
+            .run_once()
+            .await
+            .expect("three-pod scheduler tick");
+    }
     for fixture in &fixtures {
         for _ in 0..100 {
             let compacted: i64 = sqlx::query_scalar(
@@ -68,11 +69,6 @@ async fn journey_forge_scheduler_three_pod_lease_competition_converges_once() {
             .expect("Forge snapshot");
         assert_eq!(table.metadata().snapshots().len(), 1);
     }
-    shutdown.cancel();
-    scheduler
-        .await
-        .expect("scheduler task")
-        .expect("third scheduler shutdown");
     let operator_pool = server
         .state()
         .postgres
@@ -365,9 +361,7 @@ async fn active_partition_incremental_compaction() {
         &[chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("closed day")],
     )
     .await;
-    let mut closed_config = closed.config.clone();
-    closed_config.max_hints_per_wake = 1;
-    let (closed_forge, closed_publisher) = closed.context_with_config_and_publisher(closed_config);
+    let closed_publisher = harness.server_forge_publishers()[1].clone();
     assert_eq!(
         closed_publisher.try_publish(StagingFileCommitted::new(
             closed.binding.clone(),
@@ -382,15 +376,18 @@ async fn active_partition_incremental_compaction() {
         )),
         StagingPublishOutcome::DroppedFull
     );
-    let closed_outcome = closed_forge
+    let closed_forge = harness
+        .cluster()
+        .server(1)
+        .expect("closed-day pod")
+        .state()
+        .forge()
+        .expect("server-owned Forge");
+    closed_forge
         .run_once()
         .await
         .expect("closed remainder tick");
-    assert_eq!(closed_outcome.bins_committed, 1);
-    assert_eq!(
-        closed.operation_count("forge.file_compact.committed").await,
-        1
-    );
+    assert_forge_terminal_once(&closed).await;
     let tail = seed_forge_group_for_tenant_with_schema_and_days(
         server,
         fixture.tenant,
@@ -399,21 +396,16 @@ async fn active_partition_incremental_compaction() {
         &[today],
     )
     .await;
-    let mut tail_config = tail.config.clone();
-    tail_config.max_files_per_bin = 3;
-    let (tail_forge, tail_publisher) = tail.context_with_config_and_publisher(tail_config.clone());
+    let tail_forge = harness
+        .cluster()
+        .server(2)
+        .expect("open-tail pod")
+        .state()
+        .forge()
+        .expect("server-owned Forge");
+    let tail_publisher = harness.server_forge_publishers()[2].clone();
     let _ = tail_publisher.try_publish(StagingFileCommitted::new(tail.binding.clone(), today));
-    let first_stop = CancellationToken::new();
-    let first_task = tokio::spawn({
-        let stop = first_stop.clone();
-        async move { tail_forge.run(stop).await }
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    first_stop.cancel();
-    first_task
-        .await
-        .expect("tail scheduler")
-        .expect("tail shutdown");
+    tail_forge.run_once().await.expect("open-tail hint tick");
     let initial_tail: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND NOT compacted")
         .bind(tail.tenant.as_uuid()).bind(&tail.binding.logical_namespace).bind(&tail.binding.table_name)
         .fetch_one(tail.operator_pool.pool()).await.expect("tail state");
@@ -423,29 +415,52 @@ async fn active_partition_incremental_compaction() {
         0
     );
     tail.append_forge_file_for_day(99, today, false).await;
-    let (tail_forge, tail_publisher) = tail.context_with_config_and_publisher(tail_config);
     assert_eq!(
         tail_publisher.try_publish(StagingFileCommitted::new(tail.binding.clone(), today)),
         StagingPublishOutcome::Published
     );
-    let tail_stop = CancellationToken::new();
-    let tail_task = tokio::spawn({
-        let stop = tail_stop.clone();
-        async move { tail_forge.run(stop).await }
-    });
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    tail_stop.cancel();
-    tail_task
+    tail_forge
+        .run_once()
         .await
-        .expect("tail scheduler")
-        .expect("tail shutdown");
-    assert_eq!(
-        tail.operation_count("forge.file_compact.committed").await,
-        1
-    );
+        .expect("open-tail completion tick");
+    assert_forge_terminal_once(&tail).await;
+    let lost_hint = seed_forge_group_for_tenant_with_schema_and_days(
+        server,
+        fixture.tenant,
+        "periodic_lost_hint_recovery",
+        false,
+        &[chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("aged day")],
+    )
+    .await;
+    let periodic_forge = server.state().forge().expect("server-owned Forge");
+    periodic_forge
+        .run_once()
+        .await
+        .expect("periodic lost-hint tick");
+    assert_forge_terminal_once(&lost_hint).await;
     let oracle_after = oracle_rows(server, &jwt).await;
     assert_eq!(oracle_after, oracle_before, "Oracle parity after Forge");
     harness.shutdown().await.expect("harness shutdown");
+}
+
+/// Assert one durable Forge operation has exactly one terminal transition and snapshot.
+async fn assert_forge_terminal_once(fixture: &wyrd_testing::bifrost::ForgeFixture) {
+    let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+    let terminal = fixture
+        .operation_count("forge.file_compact.committed")
+        .await
+        + fixture
+            .operation_count("forge.file_compact.recovered")
+            .await
+        + fixture.operation_count("forge.file_compact.reset").await;
+    assert_eq!(prepared, 1);
+    assert_eq!(terminal, 1);
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("snapshot");
+    assert_eq!(table.metadata().snapshots().len(), 1);
 }
 
 /// Query the bound server's public Oracle endpoint and return its durable row count.

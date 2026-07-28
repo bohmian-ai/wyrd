@@ -9,7 +9,6 @@ use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
 use chrono::Duration as ChronoDuration;
-use datafusion::execution::memory_pool::MemoryPool;
 use ed25519_dalek::VerifyingKey;
 use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
@@ -1380,7 +1379,7 @@ impl WyrdTestServerBuilder {
         };
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let query_memory: Arc<dyn MemoryPool> = Arc::new(
+        let query_memory = Arc::new(
             vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(
                 bifrost_memory.clone(),
             ),
@@ -1389,7 +1388,7 @@ impl WyrdTestServerBuilder {
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let forge_runtime = ForgeRewriteRuntime::new(
-            Arc::clone(&query_memory),
+            query_memory.clone(),
             spill_root.path(),
             forge_config.spill_limit_bytes,
         )

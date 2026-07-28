@@ -40,7 +40,7 @@ struct PersistenceFixture {
     scribe: Arc<ScribeImpl>,
     faults: PersistenceFaults,
     /// Receiver retained so post-commit hints remain observable until assertions finish.
-    _hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
+    hint_inbox: vala_bifrost_redux::maintenance::StagingFileInbox,
     wal_root: TempDir,
     _warehouse: Option<TempDir>,
     tenant: DataTenantId,
@@ -100,7 +100,7 @@ impl PersistenceFixture {
             operator,
             scribe,
             faults,
-            _hint_inbox: hint_inbox,
+            hint_inbox,
             wal_root,
             _warehouse: None,
             tenant,
@@ -212,7 +212,7 @@ impl PersistenceFixture {
             operator,
             scribe,
             faults,
-            _hint_inbox: hint_inbox,
+            hint_inbox,
             wal_root,
             _warehouse: Some(warehouse),
             tenant,
@@ -459,7 +459,7 @@ fn hint_outcome(
     vala_bifrost_redux::maintenance::StagingFileCommitted,
     tokio::sync::mpsc::error::TryRecvError,
 > {
-    fixture._hint_inbox.try_recv_for_test()
+    fixture.hint_inbox.try_recv_for_test()
 }
 
 async fn retry_and_wait(fixture: &PersistenceFixture) {

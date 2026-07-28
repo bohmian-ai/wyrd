@@ -45,6 +45,8 @@ use vala_sql::OperatorPool;
 
 /// Maximum rows decoded from one Parquet source batch.
 const REWRITE_BATCH_ROWS: usize = 8_192;
+/// Upper bound for DataFusion spill handles to finish dropping after cancel.
+const SPILL_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Owned rewrite dependencies shared by every serialized Forge operation.
 pub(crate) struct ForgeRewritePipeline {
@@ -171,10 +173,10 @@ impl ForgeRewritePipeline {
         let (mut input_rows, mut output_rows, mut peak_spill_bytes) = (0_u64, 0_u64, 0_u64);
 
         let result = async {
-            while let Some(batch) = stream.next().await {
-                if stop.is_cancelled() {
-                    return Err(ForgeError::Shutdown);
-                }
+            while let Some(batch) = tokio::select! {
+                () = stop.cancelled() => return Err(ForgeError::Shutdown),
+                batch = stream.next() => batch,
+            } {
                 let batch = batch.map_err(|error| self.map_datafusion_error(error))?;
                 if batch.num_rows() == 0 {
                     continue;
@@ -259,6 +261,8 @@ impl ForgeRewritePipeline {
             Ok(())
         }
         .await;
+        // Dropping the physical stream releases SortExec and its spill handles.
+        // This must happen before observing spill progress or returning on cancel.
         drop(stream);
         peak_spill_bytes = peak_spill_bytes.max(
             u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX),
@@ -289,6 +293,10 @@ impl ForgeRewritePipeline {
         output_rows: u64,
         peak_spill_bytes: u64,
     ) -> Result<RewriteOutput, ForgeError> {
+        if let Err(error) = self.await_spill_cleanup().await {
+            self.cleanup_paths(&output_paths).await;
+            return Err(error);
+        }
         if let Err(error) = result {
             self.cleanup_paths(&output_paths).await;
             return Err(error);
@@ -315,6 +323,25 @@ impl ForgeRewritePipeline {
             output_rows,
             spill_bytes: peak_spill_bytes,
         })
+    }
+
+    /// Wait for DataFusion's dropped physical plan to release all spill files.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invariant error when spill handles remain active beyond the
+    /// bounded shutdown interval.
+    async fn await_spill_cleanup(&self) -> Result<(), ForgeError> {
+        let cleanup = async {
+            while self.runtime.runtime.spilling_progress().active_files_count != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(SPILL_CLEANUP_TIMEOUT, cleanup)
+            .await
+            .map_err(|_| ForgeError::Invariant {
+                detail: "Forge rewrite spill cleanup exceeded its shutdown bound".to_owned(),
+            })
     }
 
     /// Build the single-partition spillable sort stream for one rewrite.

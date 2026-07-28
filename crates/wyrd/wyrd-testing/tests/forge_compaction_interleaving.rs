@@ -698,9 +698,11 @@ async fn forge_incremental_interleaving() {
         let stop = cancel_stop.clone();
         async move { cancel_forge.run(stop).await }
     });
+    tokio::task::yield_now().await;
     cancel_stop.cancel();
-    cancel_task
+    tokio::time::timeout(Duration::from_secs(3), cancel_task)
         .await
+        .expect("cancelled Forge shutdown bound")
         .expect("cancelled Forge")
         .expect("cancelled Forge shutdown");
     server.shutdown().await.expect("server shutdown");

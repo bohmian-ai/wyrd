@@ -1017,6 +1017,9 @@ mod pg_tests {
             assert!(tokio::time::Instant::now() < deadline, "hint not consumed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        // Let the supervised task enter its active tick before cancellation;
+        // this exercises the same lifecycle edge as a rewrite holding spill.
+        tokio::task::yield_now().await;
         active_shutdown.cancel();
         assert!(
             tokio::time::timeout(Duration::from_secs(2), task)

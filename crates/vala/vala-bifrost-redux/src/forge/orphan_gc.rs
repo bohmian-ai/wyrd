@@ -211,6 +211,10 @@ impl Forge {
 }
 
 impl Forge {
+    /// Lists aged table-owned objects absent from the caller's protected live set.
+    ///
+    /// # Errors
+    /// Returns object-store listing failures. Cancellation leaves objects untouched.
     async fn list_gc_candidates(
         &self,
         binding: &TenantTableBinding,
@@ -245,6 +249,10 @@ impl Forge {
         Ok(candidates)
     }
 
+    /// Deletes a prepared candidate batch with a final fence and reference check.
+    ///
+    /// # Errors
+    /// Returns lease, catalog, object-store, SQL, or audit failures.
     async fn delete_gc_batch(
         &self,
         lease: &mut ForgeLease,
@@ -351,6 +359,10 @@ impl Forge {
     /// narrower lookup is the required final race check immediately before an
     /// object delete; it avoids rebuilding the complete set for every candidate
     /// while still protecting a reference that appeared after the initial list.
+    /// Rechecks Iceberg and SQL references immediately before one deletion.
+    ///
+    /// # Errors
+    /// Returns catalog or SQL lookup failures; no deletion occurs in this method.
     async fn path_is_referenced(
         &self,
         key: &ForgeTableKey,
@@ -433,6 +445,10 @@ impl Forge {
         Ok(count > 0)
     }
 
+    /// Replays prepared orphan-GC audits that lack a terminal event.
+    ///
+    /// # Errors
+    /// Returns audit, lease, object-store, catalog, or SQL failures.
     async fn reconcile_gc(
         &self,
         lease: &mut ForgeLease,
@@ -455,6 +471,10 @@ impl Forge {
         Ok(outcome)
     }
 
+    /// Loads prepared and terminal orphan-GC audit records for one table.
+    ///
+    /// # Errors
+    /// Returns SQL or audit decoding failures. Cancellation leaves audit state unchanged.
     async fn load_gc_audits(
         &self,
         key: &ForgeTableKey,
@@ -582,6 +602,10 @@ impl Forge {
             .collect()
     }
 
+    /// Appends one fenced orphan-GC audit event in a tenant transaction.
+    ///
+    /// # Errors
+    /// Returns lease, SQL, or audit append failures.
     async fn append_gc_audit(
         &self,
         lease: &mut ForgeLease,

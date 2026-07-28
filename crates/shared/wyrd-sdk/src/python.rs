@@ -54,6 +54,8 @@ struct PythonLoadConfig {
     interface_by_ref: std::collections::BTreeMap<String, Py<PyAny>>,
     /// JSON-compatible loader kwargs retained by exact `CardRef`.
     kwargs_by_ref: std::collections::BTreeMap<String, Py<PyAny>>,
+    /// Normalized JSON values used to detect conflicting aliases.
+    kwargs_normalized: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 /// Python wrapper for a locally hydrated `WyrdState`.
@@ -417,14 +419,24 @@ fn parse_load_config(
     let mut config = PythonLoadConfig {
         interface_by_ref: std::collections::BTreeMap::new(),
         kwargs_by_ref: std::collections::BTreeMap::new(),
+        kwargs_normalized: std::collections::BTreeMap::new(),
     };
     if let Some(mapping) = interfaces {
         for (alias, value) in mapping_items(mapping)? {
             let reference = state.card_ref(&alias)?;
             require_model_data(&alias, reference)?;
-            config
-                .interface_by_ref
-                .insert(reference.to_string(), value.unbind());
+            let key = reference.to_string();
+            if let Some(existing) = config.interface_by_ref.get(&key)
+                && !existing.bind(py).is(&value)
+            {
+                return Err(WyrdPyError::from(
+                    wyrd_spec::error::WyrdError::SdkRuntimeHydrationFailed {
+                        message: "conflicting interface overrides for one Card".to_owned(),
+                        details: serde_json::json!({"alias": alias, "card_ref": reference, "stage": "interface", "reason": "aliases resolving to one Card must use the identical interface object"}),
+                    },
+                ));
+            }
+            config.interface_by_ref.insert(key, value.unbind());
         }
     }
     if let Some(mapping) = load_kwargs {
@@ -432,8 +444,20 @@ fn parse_load_config(
             let reference = state.card_ref(&alias)?;
             require_model_data(&alias, reference)?;
             let normalized = wyrd_utils::py::pyobject_to_json(&value)?;
+            let key = reference.to_string();
+            if let Some(existing) = config.kwargs_normalized.get(&key)
+                && existing != &normalized
+            {
+                return Err(WyrdPyError::from(
+                    wyrd_spec::error::WyrdError::SdkRuntimeHydrationFailed {
+                        message: "conflicting loader kwargs for one Card".to_owned(),
+                        details: serde_json::json!({"alias": alias, "card_ref": reference, "stage": "interface", "reason": "aliases resolving to one Card must use equivalent loader kwargs"}),
+                    },
+                ));
+            }
             let py_value = json_to_py(py, &normalized)?;
-            config.kwargs_by_ref.insert(reference.to_string(), py_value);
+            config.kwargs_normalized.insert(key.clone(), normalized);
+            config.kwargs_by_ref.insert(key, py_value);
         }
     }
     Ok(config)
@@ -449,6 +473,41 @@ fn require_model_data(alias: &str, reference: &wyrd_spec::reference::CardRef) ->
         ));
     }
     Ok(())
+}
+
+/// Convert a constructor-stage failure into the stable redacted SDK error.
+fn runtime_hydration_error(
+    state: &WyrdState,
+    key: &str,
+    stage_name: &str,
+    reason: impl std::fmt::Display,
+) -> WyrdPyError {
+    let alias = state
+        .aliases()
+        .find(|alias| {
+            state
+                .card_ref(alias)
+                .is_ok_and(|reference| reference.to_string() == key)
+        })
+        .unwrap_or("unknown");
+    let card_ref = state
+        .card_ref(alias)
+        .cloned()
+        .unwrap_or_else(|_| state.root_ref().clone());
+    WyrdPyError::from(wyrd_spec::error::WyrdError::SdkRuntimeHydrationFailed {
+        message: format!("runtime hydration failed at {stage_name}"),
+        details: serde_json::json!({"alias": alias, "card_ref": card_ref, "stage": stage_name, "reason": reason.to_string()}),
+    })
+}
+
+/// Report a missing verified artifact directory without touching the filesystem.
+fn missing_runtime_artifacts(state: &WyrdState, key: &str) -> WyrdPyError {
+    runtime_hydration_error(
+        state,
+        key,
+        "artifact_load",
+        "verified artifact directory is missing",
+    )
 }
 
 fn build_envelopes(
@@ -489,9 +548,16 @@ fn build_prompts(
         if reference.kind != CardKind::Prompt {
             continue;
         }
-        let mut card = PromptCard::from_card(state.card(alias)?.clone())?;
-        card.hydrate_prompt(py)?;
-        values.insert(reference.to_string(), Py::new(py, card)?);
+        let key = reference.to_string();
+        let mut card = PromptCard::from_card(state.card(alias)?.clone())
+            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+        card.hydrate_prompt(py)
+            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+        values.insert(
+            key.clone(),
+            Py::new(py, card)
+                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+        );
     }
     Ok(values)
 }
@@ -506,9 +572,16 @@ fn build_agents(
         if reference.kind != CardKind::Agent {
             continue;
         }
-        let mut card = wyrd_cards::agent::PyAgentCard::from_card(py, state.card(alias)?.clone())?;
-        card.hydrate_resolved_prompt(py, state.agent_prompt(alias)?.clone())?;
-        values.insert(reference.to_string(), Py::new(py, card)?);
+        let key = reference.to_string();
+        let mut card = wyrd_cards::agent::PyAgentCard::from_card(py, state.card(alias)?.clone())
+            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+        card.hydrate_resolved_prompt(py, state.agent_prompt(alias)?.clone())
+            .map_err(|e| runtime_hydration_error(state, &key, "prompt", e))?;
+        values.insert(
+            key.clone(),
+            Py::new(py, card)
+                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+        );
     }
     Ok(values)
 }
@@ -525,18 +598,29 @@ fn build_models(
             continue;
         }
         let key = reference.to_string();
-        let mut card = ModelCard::from_card(state.card(alias)?.clone())?;
+        let mut card = ModelCard::from_card(state.card(alias)?.clone())
+            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
         let interface = config
             .interface_by_ref
             .get(&key)
             .map(|value| value.bind(py));
-        card.hydrate_interface(py, interface)?;
+        card.hydrate_interface(py, interface)
+            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
+        let artifact_dir = state
+            .artifact_dir(alias)?
+            .map(PathBuf::from)
+            .ok_or_else(|| missing_runtime_artifacts(state, &key))?;
         card.load(
             py,
-            state.artifact_dir(alias)?.map(PathBuf::from),
+            Some(artifact_dir),
             config.kwargs_by_ref.get(&key).map(|value| value.bind(py)),
-        )?;
-        values.insert(key, Py::new(py, card)?);
+        )
+        .map_err(|e| runtime_hydration_error(state, &key, "artifact_load", e))?;
+        values.insert(
+            key.clone(),
+            Py::new(py, card)
+                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+        );
     }
     Ok(values)
 }
@@ -553,18 +637,29 @@ fn build_data(
             continue;
         }
         let key = reference.to_string();
-        let mut card = DataCard::from_card(state.card(alias)?.clone())?;
+        let mut card = DataCard::from_card(state.card(alias)?.clone())
+            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
         let interface = config
             .interface_by_ref
             .get(&key)
             .map(|value| value.bind(py));
-        card.hydrate_interface(py, interface)?;
+        card.hydrate_interface(py, interface)
+            .map_err(|e| runtime_hydration_error(state, &key, "interface", e))?;
+        let artifact_dir = state
+            .artifact_dir(alias)?
+            .map(PathBuf::from)
+            .ok_or_else(|| missing_runtime_artifacts(state, &key))?;
         card.load(
             py,
-            state.artifact_dir(alias)?.map(PathBuf::from),
+            Some(artifact_dir),
             config.kwargs_by_ref.get(&key).map(|value| value.bind(py)),
-        )?;
-        values.insert(key, Py::new(py, card)?);
+        )
+        .map_err(|e| runtime_hydration_error(state, &key, "artifact_load", e))?;
+        values.insert(
+            key.clone(),
+            Py::new(py, card)
+                .map_err(|e| runtime_hydration_error(state, &key, "python_allocation", e))?,
+        );
     }
     Ok(values)
 }

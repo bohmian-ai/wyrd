@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -15,6 +16,8 @@ import pytest
 import wyrd
 import yaml
 from wyrd.cards import CardRef, Cards
+from wyrd.data import DataCard, DataStats, FieldSpec
+from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
@@ -32,15 +35,42 @@ class _Transformer:
 
 
 class JourneyModelInterface(TinyModelInterface):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__()
+        self.payload = payload
+
+    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
+        del save_kwargs
+        output = path / "model" / "model.bin"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(self.payload)
+        return DataStats(byte_count=len(self.payload), sha256=_sha256(self.payload))
+
     def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
         super().load(path, load_kwargs)
         self.model, self.preprocessor, self.processor = _Predictor(), _Transformer(), _Transformer()
 
 
 class JourneyDataInterface(TinyDataInterface):
+    def __init__(self, payload: bytes) -> None:
+        super().__init__()
+        self.payload = payload
+
+    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
+        del save_kwargs
+        output = path / "data" / "data.bin"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(self.payload)
+        return DataStats(byte_count=len(self.payload), sha256=_sha256(self.payload))
+
     def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
         super().load(path, load_kwargs)
         self.data = _Transformer()
+
+
+def _sha256(payload: bytes) -> str:
+    """Return the hexadecimal digest used by deterministic holder artifacts."""
+    return hashlib.sha256(payload).hexdigest()
 
 
 class RuntimeServiceFixture:
@@ -79,12 +109,31 @@ class RuntimeServiceFixture:
         self.artifact_count = len(self.artifact_bytes)
 
     def register_model(self, cards: Cards, alias: str) -> CardRef:
-        name = "model-primary.yaml" if alias == "model_primary" else "model-shadow.yaml"
-        return cards.register_from_path(str(self.source / name)).root
+        name = "primary" if alias == "model_primary" else "shadow"
+        payload = self.artifact_bytes[alias]
+        card = ModelCard(
+            JourneyModelInterface(payload),
+            space="default",
+            name=name,
+            version="1.0.0",
+            metadata=ModelCardMetadata(
+                task_type="other",
+                signature=ModelSignature(
+                    [FieldSpec("feature", "float64")],
+                    [FieldSpec("prediction", "float64")],
+                ),
+            ),
+        )
+        return cards.model.register(card).root
 
     def register_data(self, cards: Cards, alias: str) -> CardRef:
-        del alias
-        return cards.register_from_path(str(self.source / "training.yaml")).root
+        card = DataCard(
+            JourneyDataInterface(self.artifact_bytes[alias]),
+            space="default",
+            name="training",
+            version="1.0.0",
+        )
+        return cards.data.register(card).root
 
     def register_graph(self, cards: Cards) -> dict[tuple[str, str], CardRef]:
         refs: dict[tuple[str, str], CardRef] = {}
@@ -248,9 +297,9 @@ def register_and_apply(
 
 def _interfaces() -> dict[str, Any]:
     return {
-        "model_primary": JourneyModelInterface(),
-        "model_shadow": JourneyModelInterface(),
-        "training_data": JourneyDataInterface(),
+        "model_primary": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_primary"]),
+        "model_shadow": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_shadow"]),
+        "training_data": JourneyDataInterface(RuntimeServiceFixture.artifact_bytes["training_data"]),
     }
 
 

@@ -92,8 +92,8 @@ fn graph_diagnostic(
 ) -> Diagnostic {
     let path = match error {
         GraphError::Cycle { cycle } => cycle.first(),
-        GraphError::InvalidServiceComponentKind { service, .. } => Some(service),
-        GraphError::UnpublishedObservabilityPeer { peer, .. } => Some(peer),
+        GraphError::InvalidServiceComponentKind { service, .. } => Some(service.as_ref()),
+        GraphError::UnpublishedObservabilityPeer { peer, .. } => Some(peer.as_ref()),
         _ => None,
     }
     .and_then(|card_ref| {
@@ -101,8 +101,10 @@ fn graph_diagnostic(
             .iter()
             .position(|candidate| candidate.same_identity(card_ref))
     })
-    .map(|index| cards[index].source_path.clone())
-    .unwrap_or_else(|| "<loader>".into());
+    .map_or_else(
+        || "<loader>".into(),
+        |index| cards[index].source_path.clone(),
+    );
 
     let message = error.to_string();
     let error = match error {
@@ -174,13 +176,13 @@ mod tests {
     }
 
     /// Build an authored Card from a typed JSON spec fixture.
-    fn authored(name: &str, kind: CardKind, spec: serde_json::Value) -> AuthoredCard {
+    fn authored(name: &str, kind: &CardKind, spec: serde_json::Value) -> AuthoredCard {
         AuthoredCard {
             source_path: PathBuf::from(format!("{name}.yaml")),
             api_version: ApiVersion::v1(),
             kind: kind.clone(),
             metadata: metadata(name),
-            spec: Spec::from_kind_and_value(&kind, spec).expect("test spec is valid"),
+            spec: Spec::from_kind_and_value(kind, spec).expect("test spec is valid"),
             artifacts: Vec::new(),
         }
     }
@@ -275,7 +277,7 @@ mod tests {
         });
         let eval = authored(
             "quality",
-            CardKind::Eval,
+            &CardKind::Eval,
             serde_json::json!({ "tasks": {} }),
         );
 
@@ -294,7 +296,7 @@ mod tests {
         let service = service("app", None);
         let eval = authored(
             "quality",
-            CardKind::Eval,
+            &CardKind::Eval,
             serde_json::json!({ "tasks": {} }),
         );
 

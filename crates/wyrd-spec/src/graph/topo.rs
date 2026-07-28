@@ -36,11 +36,11 @@ pub enum GraphError {
     )]
     InvalidServiceComponentKind {
         /// Service declaring the invalid component.
-        service: CardRef,
+        service: Box<CardRef>,
         /// Authored component alias.
         alias: String,
         /// Peer card incorrectly declared as a component.
-        component: CardRef,
+        component: Box<CardRef>,
         /// Exact component field containing the invalid reference.
         field: String,
     },
@@ -48,9 +48,9 @@ pub enum GraphError {
     #[error("Service-root bundle {root} contains unpublished observability peer {peer}")]
     UnpublishedObservabilityPeer {
         /// Selected Service root for the composite submission.
-        root: CardRef,
+        root: Box<CardRef>,
         /// Eval or Drift submission with no incoming publication.
-        peer: CardRef,
+        peer: Box<CardRef>,
     },
     /// A submission spec could not be decoded for typed reference traversal.
     #[error("invalid submission spec: {message}")]

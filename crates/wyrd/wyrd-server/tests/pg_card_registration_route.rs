@@ -1868,6 +1868,99 @@ async fn dependency_cycle_rejects_before_writes() {
     server.shutdown().await.expect("test server shuts down");
 }
 
+/// Reject malformed Service peer composition through the raw authenticated HTTP route.
+#[tokio::test(flavor = "current_thread")]
+async fn service_peer_composition_rejects_before_registry_resolution() {
+    if !enabled() {
+        return;
+    }
+    let server = WyrdTestServer::start_in_process()
+        .await
+        .expect("test server starts");
+    let Bootstrap::User { jwt, .. } = server
+        .bootstrap_user("registry-composition-writer", &["writer"])
+        .await
+        .expect("writer bootstraps")
+    else {
+        panic!("user bootstrap returned a non-user principal");
+    };
+
+    let invalid_component = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "invalid-component-001",
+                json!({ "submissions": [{
+                    "apiVersion": "wyrd/v1",
+                    "kind": "Service",
+                    "metadata": {
+                        "name": "component-service",
+                        "version": "1.0.0",
+                        "space": "default"
+                    },
+                    "spec": { "components": [{
+                        "alias": "quality",
+                        "ref": {
+                            "kind": "Eval",
+                            "name": "quality",
+                            "version": "1.0.0",
+                            "space": "default"
+                        }
+                    }] },
+                    "artifacts": []
+                }] }),
+            ),
+        )
+        .await
+        .expect("invalid component registration responds");
+    assert_eq!(invalid_component.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(invalid_component).await["code"],
+        "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND"
+    );
+
+    let orphan_peer = server
+        .oneshot_authenticated(
+            &jwt,
+            request_with_body(
+                "orphan-peer-001",
+                json!({ "submissions": [
+                    {
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Service",
+                        "metadata": {
+                            "name": "orphan-service",
+                            "version": "1.0.0",
+                            "space": "default"
+                        },
+                        "spec": {},
+                        "artifacts": []
+                    },
+                    {
+                        "apiVersion": "wyrd/v1",
+                        "kind": "Eval",
+                        "metadata": {
+                            "name": "orphan-quality",
+                            "version": "1.0.0",
+                            "space": "default"
+                        },
+                        "spec": { "tasks": {} },
+                        "artifacts": []
+                    }
+                ] }),
+            ),
+        )
+        .await
+        .expect("orphan peer registration responds");
+    assert_eq!(orphan_peer.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response_json(orphan_peer).await["code"],
+        "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
+    );
+
+    server.shutdown().await.expect("test server shuts down");
+}
+
 /// Canonical hashing replays an identical graph authored in another wire order.
 #[tokio::test(flavor = "current_thread")]
 async fn wire_order_permutation_replays_identical_graph() {

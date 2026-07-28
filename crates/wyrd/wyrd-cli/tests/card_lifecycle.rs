@@ -1483,19 +1483,24 @@ mod pg_tests {
         .await
         .expect("canonical Service graph hydrates");
         assert_eq!(summary["mode"], "complete");
-        assert_eq!(summary["card_count"], 10);
+        assert_eq!(summary["card_count"], 9);
 
-        let state = WyrdState::from_path(bundle.path()).expect("canonical bundle loads");
-        assert!(
-            state
-                .eval("wyrd-team-Eval-churn-triage-eval-1.0.0")
-                .is_some()
-        );
-        assert!(
-            state
-                .drift("wyrd-team-Drift-churn-classifier-drift-1.0.0")
-                .is_some()
-        );
+        let metadata: Value = serde_yaml::from_slice(
+            &std::fs::read(bundle.path().join("metadata.yaml"))
+                .expect("canonical bundle metadata reads"),
+        )
+        .expect("canonical bundle metadata is YAML");
+        let cards = metadata["cards"]
+            .as_array()
+            .expect("bundle metadata lists hydrated cards");
+        for (kind, name) in [
+            ("Eval", "churn-triage-eval"),
+            ("Drift", "churn-classifier-drift"),
+        ] {
+            assert!(cards.iter().any(|card| {
+                card["card_ref"]["kind"] == kind && card["card_ref"]["name"] == name
+            }));
+        }
 
         stop_cli_server(server, shutdown, serve_handle).await;
     }

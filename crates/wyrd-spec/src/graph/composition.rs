@@ -47,9 +47,9 @@ pub fn validate_composition(
             };
             if is_peer_only_component(&component_ref.kind) {
                 return Err(GraphError::InvalidServiceComponentKind {
-                    service: service_ref,
+                    service: Box::new(service_ref),
                     alias: component.alias.clone(),
-                    component: component_ref.clone(),
+                    component: Box::new(component_ref.clone()),
                     field: format!("spec.components[{index}].ref"),
                 });
             }
@@ -74,8 +74,8 @@ pub fn validate_composition(
         let peer = submission_card_ref(submission).ok_or(GraphError::Empty)?;
         if !published.contains(&identity_key(&peer)) {
             return Err(GraphError::UnpublishedObservabilityPeer {
-                root: root.root.clone(),
-                peer,
+                root: Box::new(root.root.clone()),
+                peer: Box::new(peer),
             });
         }
     }

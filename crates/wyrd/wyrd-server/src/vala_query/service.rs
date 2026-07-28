@@ -454,7 +454,13 @@ fn ordered_publication(
                 }
             }
             (false, None) if valid_lsn => {
+                // A durable staging row is not in Iceberg yet. Oracle only
+                // reads Iceberg plus this pod's live tail, so the row cannot
+                // be proven present in the candidate snapshot. Fail closed
+                // instead of returning a partial result when the row has
+                // already retired from the tail or belongs to another pod.
                 *blocked = true;
+                unresolved = true;
             }
             _ => {
                 *blocked = true;
@@ -524,6 +530,9 @@ mod oracle_fence_tests {
     }
 
     /// Published rows advance through numeric WAL gaps until the first unpublished row.
+    ///
+    /// Any durable uncompacted row marks the table unresolved because this
+    /// Oracle path does not load staging Parquet into its provider snapshot.
     #[test]
     fn ordered_prefix_ignores_numeric_adjacency_and_stops_at_unpublished_tail() {
         let node = Uuid::from_u128(1);
@@ -534,7 +543,7 @@ mod oracle_fence_tests {
         ];
         let publication = ordered_publication(&rows, stream(node, 7));
         assert_eq!(publication.cutoff.as_u64(), 12);
-        assert!(!publication.unresolved);
+        assert!(publication.unresolved);
     }
 
     /// A published row after an earlier unpublished table row fails closed.

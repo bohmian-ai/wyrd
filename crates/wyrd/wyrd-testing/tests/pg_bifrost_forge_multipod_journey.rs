@@ -312,6 +312,11 @@ async fn active_partition_incremental_compaction() {
                 && *row_count == 12
         }
     ));
+    assert_eq!(
+        oracle_status(server, &jwt).await,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "Oracle must fail closed while durable staging rows await Forge publication"
+    );
     for publisher in &publishers {
         for _ in 0..100 {
             if publisher.capacity_for_test() == 256 {
@@ -462,6 +467,19 @@ async fn active_partition_incremental_compaction() {
         &[chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("aged day")],
     )
     .await;
+    assert_eq!(
+        oracle_status_for_sql(
+            server,
+            &jwt,
+            &format!(
+                "SELECT * FROM \"{}.{}\"",
+                lost_hint.binding.logical_namespace, lost_hint.binding.table_name
+            ),
+        )
+        .await,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "Oracle remains fail closed while dropped-hint staging rows are durable"
+    );
     let periodic_forge = server.state().forge().expect("server-owned Forge");
     periodic_forge
         .run_once()
@@ -559,13 +577,27 @@ async fn wait_for_oracle_rows(server: &WyrdTestServer, jwt: &str, expected: u64)
 ///
 /// Panics when the HTTP request cannot be sent.
 async fn oracle_status(server: &WyrdTestServer, jwt: &str) -> reqwest::StatusCode {
+    oracle_status_for_sql(
+        server,
+        jwt,
+        "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'",
+    )
+    .await
+}
+
+/// Query one Oracle SQL statement and return its HTTP status without
+/// converting fail-closed responses into test panics.
+async fn oracle_status_for_sql(
+    server: &WyrdTestServer,
+    jwt: &str,
+    sql: &str,
+) -> reqwest::StatusCode {
     let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
     reqwest::Client::new()
         .post(url)
         .header("x-wyrd-access-token", format!("Bearer {jwt}"))
         .json(&SyncQueryRequest {
-            sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
-                .to_owned(),
+            sql: sql.to_owned(),
             params: Vec::new(),
         })
         .send()

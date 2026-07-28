@@ -762,6 +762,134 @@ async fn forge_incremental_interleaving() {
 
 #[tokio::test]
 #[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Exercises cancellation on both sides of the Iceberg commit acceptance
+/// boundary and proves the successor reconciles exactly one durable result.
+///
+/// The first fixture pauses immediately before catalog acceptance.  The stop
+/// token is then cancelled while the catalog future is held, and the paused
+/// call is released so the supervised scheduler can return within a bound.
+/// The second fixture repeats the sequence after the real catalog has accepted
+/// the commit but before its response reaches Forge.  Both paths retain the
+/// prepared audit state until a successor tick reconciles it, release the
+/// table lease, and produce one snapshot without a duplicate terminal event.
+///
+/// # Errors
+///
+/// The journey fails when the real Wyrd server, SQL lease, Iceberg catalog, or
+/// audit transitions do not satisfy the cancellation and reconciliation
+/// contract. Cancellation is intentionally cooperative: the test releases the
+/// controlled catalog boundary after signalling stop and bounds the join.
+async fn forge_commit_cancellation_windows_reconcile_once() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+
+    let before = seed_forge_group(&server, "cancel_before_acceptance").await;
+    let before_control = CommitUncertaintyCatalog::new(Arc::clone(&before.catalog));
+    before_control.pause_before_commit();
+    let (before_forge, before_publisher) =
+        before.context_with_catalog_and_publisher(before.config.clone(), before_control.clone());
+    let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("partition day");
+    assert_eq!(
+        before_publisher.try_publish(StagingFileCommitted::new(before.binding.clone(), day)),
+        StagingPublishOutcome::Published
+    );
+    let before_stop = CancellationToken::new();
+    let before_task = tokio::spawn({
+        let forge = before_forge.clone();
+        let stop = before_stop.clone();
+        async move { forge.run(stop).await }
+    });
+    before_control.wait_for_before_commit().await;
+    before_stop.cancel();
+    before_control.reject_paused_before_commit();
+    tokio::time::timeout(Duration::from_secs(3), before_task)
+        .await
+        .expect("before-acceptance scheduler exit bound")
+        .expect("before-acceptance scheduler task")
+        .expect("before-acceptance scheduler shutdown");
+    assert_eq!(
+        before.operation_count("forge.file_compact.prepared").await,
+        1
+    );
+    assert_eq!(
+        before.operation_count("forge.file_compact.committed").await,
+        0
+    );
+    before_forge
+        .run_once()
+        .await
+        .expect("before-acceptance reconciliation");
+    assert_eq!(
+        before.operation_count("forge.file_compact.committed").await,
+        1
+    );
+    assert_eq!(
+        before
+            .catalog
+            .load_table(&before.binding.table_ident())
+            .await
+            .expect("before-acceptance table")
+            .metadata()
+            .snapshots()
+            .len(),
+        1
+    );
+
+    let after = seed_forge_group(&server, "cancel_after_acceptance").await;
+    let after_control = CommitUncertaintyCatalog::new(Arc::clone(&after.catalog));
+    after_control.pause_after_commit();
+    let (after_forge, after_publisher) =
+        after.context_with_catalog_and_publisher(after.config.clone(), after_control.clone());
+    assert_eq!(
+        after_publisher.try_publish(StagingFileCommitted::new(after.binding.clone(), day)),
+        StagingPublishOutcome::Published
+    );
+    let after_stop = CancellationToken::new();
+    let after_task = tokio::spawn({
+        let forge = after_forge.clone();
+        let stop = after_stop.clone();
+        async move { forge.run(stop).await }
+    });
+    after_control.wait_for_commit().await;
+    after_stop.cancel();
+    after_control.reject_paused_commit();
+    tokio::time::timeout(Duration::from_secs(3), after_task)
+        .await
+        .expect("after-acceptance scheduler exit bound")
+        .expect("after-acceptance scheduler task")
+        .expect("after-acceptance scheduler shutdown");
+    assert_eq!(
+        after.operation_count("forge.file_compact.prepared").await,
+        1
+    );
+    after_forge
+        .run_once()
+        .await
+        .expect("after-acceptance reconciliation");
+    assert_eq!(
+        after.operation_count("forge.file_compact.committed").await
+            + after.operation_count("forge.file_compact.recovered").await,
+        1
+    );
+    assert_eq!(
+        after
+            .catalog
+            .load_table(&after.binding.table_ident())
+            .await
+            .expect("after-acceptance table")
+            .metadata()
+            .snapshots()
+            .len(),
+        1
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests expiry fencing after the real snapshot-expiry commit and before its
 /// recovered terminal audit append.
 ///

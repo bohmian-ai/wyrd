@@ -1352,8 +1352,10 @@ impl WyrdTestServerBuilder {
             scribe_admission.scribe_memory_limit_bytes,
         )
         .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let mut forge_config = ForgeConfig::default();
-        forge_config.max_files_per_bin = self.forge_max_files_per_bin;
+        let forge_config = ForgeConfig {
+            max_files_per_bin: self.forge_max_files_per_bin,
+            ..ForgeConfig::default()
+        };
         let (forge_publisher, forge_inbox) = staging_file_channel(forge_config.max_hints_per_wake)
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
         let query_memory = Arc::new(

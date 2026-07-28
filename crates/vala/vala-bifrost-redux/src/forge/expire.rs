@@ -176,7 +176,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
     ) -> Result<usize, ForgeError> {
-        let mut recovered = reconcile_expiry(context, lease, key, binding).await?;
+        let mut recovered = self.reconcile_expiry(context, lease, key, binding).await?;
         let table = load_table(context, &binding.table_ident()).await?;
         let cutoff_ms = expiry_cutoff_ms(context.config.snapshot_retention)?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
@@ -191,7 +191,7 @@ impl Forge {
             return Ok(recovered);
         }
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
-        append_expiry_audit(
+        self.append_expiry_audit(
             context,
             lease,
             key.tenant,
@@ -199,7 +199,8 @@ impl Forge {
             "forge.snapshot_expire.prepared",
         )
         .await?;
-        complete_expiry(context, lease, key, binding, &detail, false).await?;
+        self.complete_expiry(context, lease, key, binding, &detail, false)
+            .await?;
         recovered += 1;
         Ok(recovered)
     }
@@ -282,100 +283,104 @@ fn expiry_detail(
 ///
 /// `recovered` selects the terminal audit phase used when completing a
 /// prepared operation left by an earlier Forge process.
-async fn complete_expiry(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeTableKey,
-    binding: &TenantTableBinding,
-    detail: &AuditDetail,
-    recovered: bool,
-) -> Result<(), ForgeError> {
-    let AuditDetail::ForgeSnapshotExpire {
-        operation_id: _,
-        selected_snapshot_ids,
-        cutoff_ms,
-        group,
-        ..
-    } = detail
-    else {
-        return Err(ForgeError::SnapshotExpiry {
-            detail: "expiry audit detail has the wrong kind".to_owned(),
-        });
-    };
-    if group != &table_resource_for_key(key)
-        || selected_snapshot_ids.is_empty()
-        || selected_snapshot_ids
-            .windows(2)
-            .any(|pair| pair[0] >= pair[1])
-    {
-        return Err(ForgeError::SnapshotExpiry {
-            detail: "expiry audit detail is not canonical".to_owned(),
-        });
+impl Forge {
+    async fn complete_expiry(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        detail: &AuditDetail,
+        recovered: bool,
+    ) -> Result<(), ForgeError> {
+        let AuditDetail::ForgeSnapshotExpire {
+            operation_id: _,
+            selected_snapshot_ids,
+            cutoff_ms,
+            group,
+            ..
+        } = detail
+        else {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "expiry audit detail has the wrong kind".to_owned(),
+            });
+        };
+        if group != &table_resource_for_key(key)
+            || selected_snapshot_ids.is_empty()
+            || selected_snapshot_ids
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "expiry audit detail is not canonical".to_owned(),
+            });
+        }
+        if !lease.renew(&context.operator_pool).await? {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        if !lease.commit_window_fits(context.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        let table = load_table(context, &binding.table_ident()).await?;
+        if !selected_ids_are_eligible(
+            &table,
+            selected_snapshot_ids,
+            *cutoff_ms,
+            context.config.retain_last,
+        )? {
+            return Err(ForgeError::SnapshotExpiry {
+                detail: "reloaded Iceberg metadata no longer matches the prepared selection"
+                    .to_owned(),
+            });
+        }
+        let tx = Transaction::new(&table);
+        let action = tx
+            .expire_snapshots()
+            .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
+            .expire_older_than_ms(*cutoff_ms)
+            .retain_last(context.config.retain_last.max(1));
+        let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
+        lease.require_fence(&context.operator_pool).await?;
+        if !lease.commit_window_fits(context.config.commit_window()) {
+            return Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            });
+        }
+        tokio::time::timeout(
+            context.config.iceberg_total_retry_timeout,
+            transaction.commit(context.catalog.as_ref()),
+        )
+        .await
+        .map_err(|_| ForgeError::Timeout {
+            operation: "Iceberg snapshot expiry commit",
+        })?
+        .map_err(ForgeError::Catalog)?;
+        lease.require_fence(&context.operator_pool).await?;
+        let terminal = terminal_expiry_detail(
+            detail,
+            if recovered {
+                ForgeSnapshotExpirePhase::Recovered
+            } else {
+                ForgeSnapshotExpirePhase::Committed
+            },
+        );
+        self.append_expiry_audit(
+            context,
+            lease,
+            key.tenant,
+            &terminal,
+            if recovered {
+                "forge.snapshot_expire.recovered"
+            } else {
+                "forge.snapshot_expire.committed"
+            },
+        )
+        .await
     }
-    if !lease.renew(&context.operator_pool).await? {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    if !lease.commit_window_fits(context.config.commit_window()) {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    let table = load_table(context, &binding.table_ident()).await?;
-    if !selected_ids_are_eligible(
-        &table,
-        selected_snapshot_ids,
-        *cutoff_ms,
-        context.config.retain_last,
-    )? {
-        return Err(ForgeError::SnapshotExpiry {
-            detail: "reloaded Iceberg metadata no longer matches the prepared selection".to_owned(),
-        });
-    }
-    let tx = Transaction::new(&table);
-    let action = tx
-        .expire_snapshots()
-        .expire_snapshot_ids(selected_snapshot_ids.iter().copied())
-        .expire_older_than_ms(*cutoff_ms)
-        .retain_last(context.config.retain_last.max(1));
-    let transaction = ApplyTransactionAction::apply(action, tx).map_err(ForgeError::Catalog)?;
-    lease.require_fence(&context.operator_pool).await?;
-    if !lease.commit_window_fits(context.config.commit_window()) {
-        return Err(ForgeError::FenceLost {
-            lease_key: lease.lease_key.clone(),
-        });
-    }
-    tokio::time::timeout(
-        context.config.iceberg_total_retry_timeout,
-        transaction.commit(context.catalog.as_ref()),
-    )
-    .await
-    .map_err(|_| ForgeError::Timeout {
-        operation: "Iceberg snapshot expiry commit",
-    })?
-    .map_err(ForgeError::Catalog)?;
-    lease.require_fence(&context.operator_pool).await?;
-    let terminal = terminal_expiry_detail(
-        detail,
-        if recovered {
-            ForgeSnapshotExpirePhase::Recovered
-        } else {
-            ForgeSnapshotExpirePhase::Committed
-        },
-    );
-    append_expiry_audit(
-        context,
-        lease,
-        key.tenant,
-        &terminal,
-        if recovered {
-            "forge.snapshot_expire.recovered"
-        } else {
-            "forge.snapshot_expire.committed"
-        },
-    )
-    .await
 }
 
 /// Check that every selected snapshot is still eligible under current metadata.
@@ -403,166 +408,174 @@ fn selected_ids_are_eligible(
 /// A selection already absent from Iceberg is recorded as recovered. A
 /// selection still present is retried only after the uncertainty bound has
 /// elapsed.
-async fn reconcile_expiry(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    key: &ForgeTableKey,
-    binding: &TenantTableBinding,
-) -> Result<usize, ForgeError> {
-    let (prepared, terminal) = load_expiry_audits(context, key).await?;
-    let mut recovered = 0;
-    for (operation_id, (detail, created_at)) in prepared {
-        if terminal.contains(&operation_id) {
-            continue;
-        }
-        let AuditDetail::ForgeSnapshotExpire {
-            selected_snapshot_ids,
-            ..
-        } = &detail
-        else {
-            continue;
-        };
-        let table = load_table(context, &binding.table_ident()).await?;
-        let all_absent = selected_snapshot_ids
-            .iter()
-            .all(|id| table.metadata().snapshot_by_id(*id).is_none());
-        if all_absent {
-            lease.require_fence(&context.operator_pool).await?;
-            append_expiry_audit(
-                context,
-                lease,
-                key.tenant,
-                &terminal_expiry_detail(&detail, ForgeSnapshotExpirePhase::Recovered),
-                "forge.snapshot_expire.recovered",
-            )
-            .await?;
-            recovered += 1;
-            continue;
-        }
-        if Utc::now()
-            .signed_duration_since(created_at)
-            .to_std()
-            .unwrap_or_default()
-            < context.config.uncertainty_bound
-        {
-            continue;
-        }
-        complete_expiry(context, lease, key, binding, &detail, true).await?;
-        recovered += 1;
-    }
-    Ok(recovered)
-}
-
-/// Read the latest prepared and terminal expiry audit state for one table.
-async fn load_expiry_audits(
-    context: &ForgeCore,
-    key: &ForgeTableKey,
-) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
-    let mut conn = context
-        .vala
-        .tenant_conn(key.tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    let mut after_seq = 0_i64;
-    let mut prepared = HashMap::new();
-    let mut terminal = HashSet::new();
-    loop {
-        let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-            &mut conn,
-            &table_resource_for_key(key),
-            after_seq,
-            context.config.audit_page_size,
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
-        let page_len = page.len();
-        for row in page {
-            after_seq = row.seq;
-            let Some(detail) = row.detail else { continue };
-            let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                ForgeError::Reconciliation {
-                    detail: error.to_string(),
-                }
-            })?;
+impl Forge {
+    async fn reconcile_expiry(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+    ) -> Result<usize, ForgeError> {
+        let (prepared, terminal) = self.load_expiry_audits(context, key).await?;
+        let mut recovered = 0;
+        for (operation_id, (detail, created_at)) in prepared {
+            if terminal.contains(&operation_id) {
+                continue;
+            }
             let AuditDetail::ForgeSnapshotExpire {
-                operation_id,
-                phase,
-                group,
                 selected_snapshot_ids,
                 ..
             } = &detail
             else {
                 continue;
             };
-            if group != &table_resource_for_key(key)
-                || selected_snapshot_ids.is_empty()
-                || selected_snapshot_ids
-                    .windows(2)
-                    .any(|pair| pair[0] >= pair[1])
+            let table = load_table(context, &binding.table_ident()).await?;
+            let all_absent = selected_snapshot_ids
+                .iter()
+                .all(|id| table.metadata().snapshot_by_id(*id).is_none());
+            if all_absent {
+                lease.require_fence(&context.operator_pool).await?;
+                self.append_expiry_audit(
+                    context,
+                    lease,
+                    key.tenant,
+                    &terminal_expiry_detail(&detail, ForgeSnapshotExpirePhase::Recovered),
+                    "forge.snapshot_expire.recovered",
+                )
+                .await?;
+                recovered += 1;
+                continue;
+            }
+            if Utc::now()
+                .signed_duration_since(created_at)
+                .to_std()
+                .unwrap_or_default()
+                < context.config.uncertainty_bound
             {
-                return Err(ForgeError::Reconciliation {
-                    detail: "snapshot-expiry audit detail is not canonical".to_owned(),
-                });
+                continue;
             }
-            match phase {
-                ForgeSnapshotExpirePhase::Prepared => {
-                    prepared.insert(*operation_id, (detail, row.created_at));
-                }
-                ForgeSnapshotExpirePhase::Committed | ForgeSnapshotExpirePhase::Recovered => {
-                    terminal.insert(*operation_id);
-                }
-            }
+            self.complete_expiry(context, lease, key, binding, &detail, true)
+                .await?;
+            recovered += 1;
         }
-        if page_len < usize::try_from(context.config.audit_page_size).unwrap_or(usize::MAX) {
-            break;
-        }
+        Ok(recovered)
     }
-    conn.commit().await.map_err(ForgeError::Sql)?;
-    Ok((prepared, terminal))
 }
 
-/// Append a fenced snapshot-expiry audit event in the tenant transaction.
-async fn append_expiry_audit(
-    context: &ForgeCore,
-    lease: &mut ForgeLease,
-    tenant: DataTenantId,
-    detail: &AuditDetail,
-    operation: &str,
-) -> Result<(), ForgeError> {
-    let resource = match detail {
-        AuditDetail::ForgeSnapshotExpire { group, .. } => group.clone(),
-        _ => {
-            return Err(ForgeError::SnapshotExpiry {
-                detail: "snapshot-expiry audit detail has the wrong kind".to_owned(),
-            });
+/// Read the latest prepared and terminal expiry audit state for one table.
+impl Forge {
+    async fn load_expiry_audits(
+        &self,
+        context: &ForgeCore,
+        key: &ForgeTableKey,
+    ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
+        let mut conn = context
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let mut after_seq = 0_i64;
+        let mut prepared = HashMap::new();
+        let mut terminal = HashSet::new();
+        loop {
+            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
+                &mut conn,
+                &table_resource_for_key(key),
+                after_seq,
+                context.config.audit_page_size,
+            )
+            .await
+            .map_err(ForgeError::Sql)?;
+            let page_len = page.len();
+            for row in page {
+                after_seq = row.seq;
+                let Some(detail) = row.detail else { continue };
+                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
+                    ForgeError::Reconciliation {
+                        detail: error.to_string(),
+                    }
+                })?;
+                let AuditDetail::ForgeSnapshotExpire {
+                    operation_id,
+                    phase,
+                    group,
+                    selected_snapshot_ids,
+                    ..
+                } = &detail
+                else {
+                    continue;
+                };
+                if group != &table_resource_for_key(key)
+                    || selected_snapshot_ids.is_empty()
+                    || selected_snapshot_ids
+                        .windows(2)
+                        .any(|pair| pair[0] >= pair[1])
+                {
+                    return Err(ForgeError::Reconciliation {
+                        detail: "snapshot-expiry audit detail is not canonical".to_owned(),
+                    });
+                }
+                match phase {
+                    ForgeSnapshotExpirePhase::Prepared => {
+                        prepared.insert(*operation_id, (detail, row.created_at));
+                    }
+                    ForgeSnapshotExpirePhase::Committed | ForgeSnapshotExpirePhase::Recovered => {
+                        terminal.insert(*operation_id);
+                    }
+                }
+            }
+            if page_len < usize::try_from(context.config.audit_page_size).unwrap_or(usize::MAX) {
+                break;
+            }
         }
-    };
-    let event = AuditEvent {
-        request_id: RequestId::now_v7(),
-        trace_id: None,
-        operation: operation.to_owned(),
-        resource,
-        card_ref: None,
-        principal_id: SYSTEM_PRINCIPAL,
-        principal_kind: PrincipalKindTag::Service,
-        auth_method: AuthMethod::Internal,
-        permission: "bifrost:forge".to_owned(),
-        decision: AuditDecision::Allow,
-        result: AuditResult::Success,
-        payload_summary: operation.to_owned(),
-        detail: Some(detail.clone()),
-    };
-    lease.require_fence(&context.operator_pool).await?;
-    let mut conn = context
-        .vala
-        .tenant_conn(tenant)
-        .await
-        .map_err(ForgeError::Sql)?;
-    vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
-        .await
-        .map_err(ForgeError::Sql)?;
-    lease.assert_transaction_fence(&mut conn).await?;
-    conn.commit().await.map_err(ForgeError::Sql)
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        Ok((prepared, terminal))
+    }
+
+    /// Append a fenced snapshot-expiry audit event in the tenant transaction.
+    async fn append_expiry_audit(
+        &self,
+        context: &ForgeCore,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        detail: &AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        let resource = match detail {
+            AuditDetail::ForgeSnapshotExpire { group, .. } => group.clone(),
+            _ => {
+                return Err(ForgeError::SnapshotExpiry {
+                    detail: "snapshot-expiry audit detail has the wrong kind".to_owned(),
+                });
+            }
+        };
+        let event = AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: operation.to_owned(),
+            resource,
+            card_ref: None,
+            principal_id: SYSTEM_PRINCIPAL,
+            principal_kind: PrincipalKindTag::Service,
+            auth_method: AuthMethod::Internal,
+            permission: "bifrost:forge".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: operation.to_owned(),
+            detail: Some(detail.clone()),
+        };
+        lease.require_fence(&context.operator_pool).await?;
+        let mut conn = context
+            .vala
+            .tenant_conn(tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
+            .await
+            .map_err(ForgeError::Sql)?;
+        lease.assert_transaction_fence(&mut conn).await?;
+        conn.commit().await.map_err(ForgeError::Sql)
+    }
 }
 
 /// Copy an expiry detail while replacing its lifecycle phase.

@@ -196,7 +196,7 @@ mod pg_tests {
                 ..ForgeConfig::default()
             };
             let runtime = ForgeRewriteRuntime::new(
-                Arc::new(GreedyMemoryPool::new(1024 * 1024)),
+                Arc::new(GreedyMemoryPool::new(8 * 1024 * 1024)),
                 &root.path().join("spill"),
                 config.spill_limit_bytes,
             )
@@ -256,7 +256,7 @@ mod pg_tests {
                 .timestamp_micros();
             let mut rows = Vec::new();
             for index in 0..count {
-                let row_count = 3_000_i64;
+                let row_count = 100_000_i64;
                 let batch = RecordBatch::try_new(
                     Arc::new(schema.clone()),
                     vec![
@@ -354,8 +354,8 @@ mod pg_tests {
         );
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
-        assert_eq!(outcome.input_rows, 12_000);
-        assert_eq!(outcome.output_rows, 12_000);
+        assert_eq!(outcome.input_rows, 400_000);
+        assert_eq!(outcome.output_rows, 400_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
@@ -385,6 +385,9 @@ mod pg_tests {
             }
         }
         assert!(output_files >= 2, "rotation must commit multiple outputs");
-        assert_eq!(output_rows, 12_000, "rewrite must conserve every input row");
+        assert_eq!(
+            output_rows, 400_000,
+            "rewrite must conserve every input row"
+        );
     }
 }

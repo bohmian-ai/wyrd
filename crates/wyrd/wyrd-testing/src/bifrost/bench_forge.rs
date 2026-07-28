@@ -3,9 +3,113 @@
 use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
+use serde::Serialize;
+use sqlx::Row;
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Evidence emitted by the Forge benchmark's real rewrite and commit path.
+#[derive(Debug, Serialize)]
+struct ForgeBenchmarkReport {
+    /// Shared benchmark envelope and readiness classification.
+    envelope: wyrd_bench::BifrostReportEnvelope,
+    /// Wall-clock duration of setup, rewrite, and verification.
+    elapsed_us: u64,
+    /// Whether every declared Forge readiness gate passed.
+    verified: bool,
+    /// Input rows accepted by the rewrite.
+    rows: u64,
+    /// Bytes represented by staged input files.
+    input_bytes: u64,
+    /// Bytes represented by committed Forge output objects.
+    output_bytes: u64,
+    /// Number of staged input files selected for the operation.
+    input_files: u64,
+    /// Number of rotated output files committed by the operation.
+    output_files: u64,
+    /// Rows encoded into committed outputs.
+    output_rows: u64,
+    /// Peak DataFusion spill usage observed by Forge.
+    spill_bytes: u64,
+    /// Peak bytes charged to the shared Bifrost parent during the run.
+    peak_parent_memory: u64,
+    /// Whether the input exceeded the constrained rewrite memory budget.
+    below_demand_shared_memory: bool,
+    /// Whether one operation produced multiple committed outputs.
+    outputs_per_operation: u64,
+    /// Whether prepared and terminal audit bookkeeping converged.
+    bookkeeping_converged: bool,
+    /// Whether durable staged rows no longer remain uncompacted.
+    convergence: bool,
+    /// Whether input and output row counts match exactly.
+    exact_row_conservation: bool,
+}
+
+/// Return the repository report location used by the canonical benchmark lanes.
+fn report_path() -> std::path::PathBuf {
+    std::env::var_os("WYRD_BIFROST_REPORT").map_or_else(
+        || {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../..")
+                .join("target/bifrost-benchmarks/task16/forge.json")
+        },
+        std::path::PathBuf::from,
+    )
+}
+
+/// Sum the durable staged input bytes and rows for the fixture's physical table.
+async fn staged_totals(
+    fixture: &crate::bifrost::ForgeFixture,
+) -> Result<(u64, u64, u64), BenchError> {
+    let row = sqlx::query(
+        "SELECT coalesce(sum(file_size), 0)::bigint AS bytes, coalesce(sum(row_count), 0)::bigint AS rows, count(*)::bigint AS files FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND compacted = false",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await?;
+    let bytes: i64 = row.try_get("bytes")?;
+    let rows: i64 = row.try_get("rows")?;
+    let files: i64 = row.try_get("files")?;
+    Ok((
+        u64::try_from(bytes)?,
+        u64::try_from(rows)?,
+        u64::try_from(files)?,
+    ))
+}
+
+/// Sum committed Forge output object sizes under one table prefix.
+async fn output_totals(fixture: &crate::bifrost::ForgeFixture) -> Result<(u64, u64), BenchError> {
+    let entries = fixture
+        .object_store
+        .list(&fixture.binding.object_prefix)
+        .await?;
+    let mut bytes = 0_u64;
+    let mut files = 0_u64;
+    for entry in entries {
+        let path = entry.path();
+        if path.contains("/forge-") && entry.metadata().is_file() {
+            bytes = bytes.saturating_add(entry.metadata().content_length());
+            files = files.saturating_add(1);
+        }
+    }
+    Ok((bytes, files))
+}
+
+/// Count durable staged rows that still await compaction.
+async fn pending_rows(fixture: &crate::bifrost::ForgeFixture) -> Result<u64, BenchError> {
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT coalesce(sum(row_count), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND compacted = false",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .fetch_one(fixture.operator_pool.pool())
+    .await?;
+    Ok(u64::try_from(rows)?)
+}
 
 /// Run one typed Forge maintenance scenario.
 pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
@@ -25,7 +129,28 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .first()
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
-    let outcome = fixture.forge.run_once().await?;
+    let mut config = fixture.config.clone();
+    config.target_bin_bytes = 512 * 1024 * 1024;
+    config.max_bytes_per_tick = u64::MAX;
+    config.output_file_bytes = 64 * 1024;
+    for sequence in 0_i64..32 {
+        fixture.append_forge_file_with_rows(sequence, 100_000).await;
+    }
+    let (input_bytes, expected_rows, input_files) = staged_totals(&fixture).await?;
+    let (forge, _publisher) =
+        fixture.context_with_constrained_memory_and_publisher(config, 16 * 1024 * 1024);
+    let outcome = forge.run_once().await?;
+    let (output_bytes, output_files) = output_totals(&fixture).await?;
+    let pending = pending_rows(&fixture).await?;
+    let prepared = fixture.operation_count("forge.file_compact.prepared").await;
+    let terminal = fixture
+        .operation_count("forge.file_compact.committed")
+        .await;
+    let bookkeeping_converged = prepared > 0 && prepared == terminal;
+    let exact_row_conservation =
+        outcome.input_rows == outcome.output_rows && outcome.input_rows == expected_rows;
+    let convergence = pending == 0;
+    let below_demand_shared_memory = input_bytes > 16 * 1024 * 1024;
     let negative_flows = if scenario.require_negative_flows {
         let retry = fixture.forge.run_once().await?;
         NegativeFlowReport::executed(
@@ -35,18 +160,43 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     } else {
         NegativeFlowReport::skipped()
     };
-    let verified =
-        (outcome.tables_succeeded > 0 || outcome.tables_skipped > 0) && negative_flows.passed;
+    let verified = outcome.spill_bytes > 0
+        && below_demand_shared_memory
+        && outcome.outputs_committed > 1
+        && bookkeeping_converged
+        && exact_row_conservation
+        && convergence
+        && (outcome.tables_succeeded > 0 || outcome.tables_skipped > 0)
+        && negative_flows.passed;
     let mut envelope =
         wyrd_bench::BifrostReportEnvelope::new(scenario, super::bench_report::readiness(verified));
     envelope.negative_flows = negative_flows;
-    let report = super::bench_report::LaneExecutionReport {
+    let report = ForgeBenchmarkReport {
         envelope,
         elapsed_us: u64::try_from(started.elapsed().as_micros())?,
         verified,
-        rows: 1,
+        rows: outcome.output_rows,
+        input_bytes,
+        output_bytes,
+        input_files,
+        output_files,
+        output_rows: outcome.output_rows,
+        spill_bytes: outcome.spill_bytes,
+        peak_parent_memory: u64::try_from(fixture.memory_snapshot().bifrost_total_bytes)?,
+        below_demand_shared_memory,
+        outputs_per_operation: u64::try_from(outcome.outputs_committed)?,
+        bookkeeping_converged,
+        convergence,
+        exact_row_conservation,
     };
-    super::bench_report::emit_report(&report, "forge")?;
+    let path = report_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
     harness.shutdown().await?;
     if !verified {
         return Err("Forge benchmark verification failed".into());

@@ -477,7 +477,8 @@ async fn oracle_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
         .post(url)
         .header("x-wyrd-access-token", format!("Bearer {jwt}"))
         .json(&SyncQueryRequest {
-            sql: "SELECT * FROM \"vala.traces.spans\"".to_owned(),
+            sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
+                .to_owned(),
             params: Vec::new(),
         })
         .send()

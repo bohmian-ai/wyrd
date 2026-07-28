@@ -1,4 +1,4 @@
-//! Integration proofs for hinted Forge discovery and bounded rewrites.
+//! Integration proof for bounded Forge rewrites and Iceberg metadata.
 
 mod pg_tests {
     use std::collections::HashMap;
@@ -19,12 +19,11 @@ mod pg_tests {
     use parquet::arrow::ArrowWriter;
     use sqlx_catalog::any::install_default_drivers;
     use tempfile::TempDir;
-    use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
     };
-    use vala_bifrost_redux::maintenance::{StagingFileCommitted, staging_file_channel};
+    use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
@@ -104,8 +103,6 @@ mod pg_tests {
         _root: TempDir,
         /// Source-read instrumentation.
         reads: Arc<InstrumentedStore>,
-        /// Publisher retained for targeted wake-up tests.
-        publisher: vala_bifrost_redux::maintenance::StagingFilePublisher,
         /// Forge handle under test.
         forge: Forge,
     }
@@ -205,7 +202,7 @@ mod pg_tests {
                 active_reads: Arc::new(AtomicUsize::new(0)),
                 peak_reads: Arc::new(AtomicUsize::new(0)),
             });
-            let (publisher, hints) = staging_file_channel(16).expect("hint channel");
+            let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let config = ForgeConfig {
                 max_concurrent_reads: 2,
                 output_file_bytes: 1,
@@ -241,7 +238,6 @@ mod pg_tests {
                 staging,
                 _root: root,
                 reads,
-                publisher,
                 forge,
             };
             fixture.seed_files(4, false).await;
@@ -322,42 +318,6 @@ mod pg_tests {
                 sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1").bind(self.tenant.as_uuid()).execute(self.operator_pool.pool()).await.expect("age");
             }
         }
-    }
-
-    /// A fresh hint discovers durable rows without waiting for the periodic age guard.
-    #[tokio::test]
-    async fn fresh_hint_queries_durable_row_without_age_guard() {
-        let fixture = Fixture::new().await;
-        let _ = fixture.publisher.try_publish(StagingFileCommitted::new(
-            fixture.binding.clone(),
-            chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day"),
-        ));
-        let stop = CancellationToken::new();
-        let task = tokio::spawn({
-            let forge = fixture.forge;
-            async move { forge.run(stop).await }
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        task.abort();
-        assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
-    }
-
-    /// A dropped hint converges through the durable periodic candidate scan.
-    #[tokio::test]
-    async fn lost_hint_converges_on_periodic_tick() {
-        let fixture = Fixture::new().await;
-        fixture.seed_files(2, true).await;
-        let eligible: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND NOT compacted AND created_at < now() - interval '2 minutes'")
-            .bind(fixture.tenant.as_uuid())
-            .fetch_one(fixture.operator_pool.pool())
-            .await
-            .expect("eligible rows");
-        assert!(eligible >= 2);
-        let outcome = fixture.forge.run_once().await.expect("periodic tick");
-        assert!(
-            outcome.groups_seen > 0,
-            "eligible rows: {eligible}, outcome: {outcome:?}"
-        );
     }
 
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.

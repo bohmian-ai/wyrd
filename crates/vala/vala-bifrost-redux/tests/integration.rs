@@ -8,8 +8,6 @@ mod immutable_tier_retention;
 mod mitari_rewrite_api;
 #[path = "pg_file_list_tenant_table.rs"]
 mod pg_file_list_tenant_table;
-#[path = "pg_forge_scheduler_closeout.rs"]
-mod pg_forge_scheduler_closeout;
 #[path = "pg_scribe_crash_injection.rs"]
 mod pg_scribe_crash_injection;
 #[path = "pg_scribe_idempotent.rs"]

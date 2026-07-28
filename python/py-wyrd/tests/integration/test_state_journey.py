@@ -413,5 +413,5 @@ def test_missing_custom_interface_returns_recoverable_runtime_error(tmp_path: Pa
         WyrdState.from_path(download_fixture(tmp_path)[1])
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model_primary"
-    assert caught.value.details["stage"] == "artifact_load"
+    assert caught.value.details["stage"] == "interface"
     assert caught.value.details["card_ref"]["name"] == "primary"

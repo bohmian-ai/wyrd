@@ -137,7 +137,7 @@ class RuntimeServiceFixture:
             }
         )
         path.write_text(yaml.safe_dump(document, sort_keys=False))
-        return self.source
+        return path
 
     def run_cli(
         self,

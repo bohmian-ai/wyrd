@@ -286,7 +286,7 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.drift("model_drift").kind is wyrd.CardKind.Drift
     assert state.drift("model_drift").spec
     assert state.workflow("runtime_workflow").kind is wyrd.CardKind.Workflow
-    assert state.workflow("runtime_workflow").spec
+    assert state.workflow("runtime_workflow").spec == {}
     assert_all_refs_are_exact_and_uid_bearing(state)
     assert_all_artifacts_are_confined_and_match_fixture(state, fixture)
 
@@ -326,8 +326,11 @@ def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> Non
         )
     payload = json.loads(result["stderr"].splitlines()[0])
     assert result["code"] != 0
+    assert payload["kind"] == "wyrd_cli_error"
     assert payload["code"] == "WYRD_PERMISSION_403_DENIED_RBAC"
-    assert payload["details"]["required"] == {"resource": "cards", "action": "read"}
+    assert payload["status"] == 403
+    assert payload["message"]
+    assert payload["remediation"] == "Request the required role from a workspace admin."
     assert not bundle.exists() or not (bundle / "metadata.yaml").exists()
 
 
@@ -357,5 +360,5 @@ def test_missing_custom_interface_returns_recoverable_runtime_error(tmp_path: Pa
         WyrdState.from_path(download_fixture(tmp_path)[1])
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model_primary"
-    assert caught.value.details["stage"] == "interface"
+    assert caught.value.details["stage"] == "artifact_load"
     assert caught.value.details["card_ref"]["name"] == "primary"

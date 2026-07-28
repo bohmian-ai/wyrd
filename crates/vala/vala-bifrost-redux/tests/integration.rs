@@ -1,5 +1,7 @@
 #[path = "force_seal_ordering.rs"]
 mod force_seal_ordering;
+#[path = "forge_incremental_compaction.rs"]
+mod forge_incremental_compaction;
 #[path = "immutable_tier_retention.rs"]
 mod immutable_tier_retention;
 #[path = "mitari_rewrite_api.rs"]

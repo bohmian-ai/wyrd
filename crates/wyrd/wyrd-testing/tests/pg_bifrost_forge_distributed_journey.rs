@@ -3,12 +3,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::auth::PrincipalId;
 use wyrd_spec::request_id::RequestId;
-use wyrd_spec::vala::api::{
-    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeCompactionPhase,
-    StoragePath, SyncQueryRequest,
-};
+use wyrd_spec::vala::api::{AuditDetail, AuditEvent, AuditResult, AuthMethod};
 use wyrd_testing::bifrost::{
     BifrostHarness, seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days,
 };

@@ -898,6 +898,9 @@ impl ForgeRewritePipeline {
                 detail: "Forge DataFile path does not map to its exact object key".to_owned(),
             });
         }
+        if stop.is_cancelled() {
+            return Err(ForgeError::Shutdown);
+        }
         self.staging
             .write(&object_path, Buffer::from(bytes))
             .await

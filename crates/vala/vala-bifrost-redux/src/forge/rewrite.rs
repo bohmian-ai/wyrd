@@ -1,6 +1,7 @@
 //! Bounded, spillable staging-to-Iceberg rewrite execution.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::Path;
@@ -29,7 +30,12 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::BoxStream;
 use futures_util::{StreamExt, TryStreamExt};
 use iceberg::Catalog;
-use iceberg::spec::{DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal, Struct};
+use iceberg::arrow::NanValueCountVisitor;
+use iceberg::spec::{
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, Literal,
+    SchemaRef as IcebergSchemaRef, Struct,
+};
+use iceberg::writer::file_writer::ParquetWriter;
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
@@ -87,6 +93,8 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) binding: &'a TenantTableBinding,
     /// Physical Arrow schema registered by the destination Iceberg table.
     pub(crate) schema: SchemaRef,
+    /// Iceberg schema carrying field IDs required for complete file metrics.
+    pub(crate) iceberg_schema: IcebergSchemaRef,
     /// Ordered candidate files assigned to this rewrite bin.
     pub(crate) bin: &'a RewriteBin,
     /// Physical day partition shared by every candidate in the bin.
@@ -133,6 +141,8 @@ struct RewriteBatchState {
     peak_spill_bytes: u64,
     /// Shared DataFusion pool reservation for encoded output capacity.
     output_reservation: Option<datafusion::execution::memory_pool::MemoryReservation>,
+    /// Per-output NaN counts keyed by Iceberg field ID.
+    nan_value_counts: NanValueCountVisitor,
 }
 
 impl RewriteBatchState {
@@ -155,6 +165,7 @@ impl RewriteBatchState {
             output_rows: 0,
             peak_spill_bytes: 0,
             output_reservation: reservation,
+            nan_value_counts: NanValueCountVisitor::new(),
         }
     }
 
@@ -191,7 +202,17 @@ impl RewriteBatchState {
     ///
     /// Returns a Parquet encoding failure or [`ForgeError::Invariant`] when
     /// the batch row count cannot fit the rewrite's `u64` counters.
-    fn write_batch(&mut self, schema: &SchemaRef, batch: &RecordBatch) -> Result<(), ForgeError> {
+    fn write_batch(
+        &mut self,
+        schema: &SchemaRef,
+        iceberg_schema: &IcebergSchemaRef,
+        batch: &RecordBatch,
+    ) -> Result<(), ForgeError> {
+        self.nan_value_counts
+            .compute(Arc::clone(iceberg_schema), batch.clone())
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge NaN metric derivation failed: {error}"),
+            })?;
         if let Some(reservation) = &self.output_reservation {
             reservation
                 .try_grow(batch.get_array_memory_size())
@@ -237,6 +258,12 @@ impl RewriteBatchState {
     }
 
     /// Record one finalized output and clear its rows from the active writer.
+    /// Transfer the current output's NaN metrics and reset the visitor state.
+    fn take_nan_value_counts(&mut self) -> HashMap<i32, u64> {
+        std::mem::take(&mut self.nan_value_counts).nan_value_counts
+    }
+
+    /// Record one finalized output and clear its rows and per-file metrics.
     fn record_output(&mut self, file: DataFile, path: String) {
         if let Some(reservation) = &self.output_reservation {
             reservation.free();
@@ -245,6 +272,7 @@ impl RewriteBatchState {
         self.writer_rows = 0;
         self.output_paths.push(path);
         self.files.push(file);
+        self.nan_value_counts = NanValueCountVisitor::new();
     }
 
     /// Retain the largest runtime spill observation seen between batches.
@@ -506,6 +534,7 @@ impl ForgeRewritePipeline {
             )),
         );
         let schema = Arc::clone(&request.schema);
+        let iceberg_schema = Arc::clone(&request.iceberg_schema);
         let batch = batch.clone();
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -515,7 +544,7 @@ impl ForgeRewritePipeline {
         };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let result = detached.write_batch(&schema, &batch);
+            let result = detached.write_batch(&schema, &iceberg_schema, &batch);
             (detached, result)
         });
         let (returned, result) = join.await.map_err(|error| ForgeError::Invariant {
@@ -566,8 +595,15 @@ impl ForgeRewritePipeline {
         context: RewriteOutputContext<'_, '_>,
     ) -> Result<(), ForgeError> {
         let writer = state.take_writer()?;
+        let nan_value_counts = state.take_nan_value_counts();
         let (file, path) = self
-            .finish_output(writer, state.writer_rows, state.files.len(), context)
+            .finish_output(
+                writer,
+                nan_value_counts,
+                state.writer_rows,
+                state.files.len(),
+                context,
+            )
             .await?;
         state.record_output(file, path);
         Ok(())
@@ -726,6 +762,7 @@ impl ForgeRewritePipeline {
     async fn finish_output(
         &self,
         writer: ArrowWriter<Vec<u8>>,
+        nan_value_counts: HashMap<i32, u64>,
         rows: u64,
         ordinal: usize,
         context: RewriteOutputContext<'_, '_>,
@@ -770,6 +807,7 @@ impl ForgeRewritePipeline {
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
         let operation_id = request.operation_id;
+        let iceberg_schema = Arc::clone(&request.iceberg_schema);
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
             permit = self.blocking_permits.clone().acquire_owned() => permit.map_err(|error| ForgeError::Invariant {
@@ -785,21 +823,47 @@ impl ForgeRewritePipeline {
                 u64::try_from(bytes.len()).map_err(|error| ForgeError::Invariant {
                     detail: format!("output size does not fit u64: {error}"),
                 })?;
+            let bytes = Bytes::from(bytes);
+            let parquet_metadata = Arc::new(
+                parquet::file::metadata::ParquetMetaDataReader::new()
+                    .parse_and_finish(&bytes)
+                    .map_err(|error| ForgeError::Parquet {
+                        detail: format!("Forge output footer parsing failed: {error}"),
+                    })?,
+            );
+            let mut file = ParquetWriter::parquet_to_data_file_builder(
+                iceberg_schema,
+                Arc::clone(&parquet_metadata),
+                bytes.len(),
+                table_path,
+                nan_value_counts,
+            )
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge output metadata conversion failed: {error}"),
+            })?;
             let partition = Struct::from_iter([Some(Literal::date(
                 partition_day.num_days_from_ce() - 719_163,
             ))]);
-            let file = DataFileBuilder::default()
-                .content(DataContentType::Data)
-                .file_path(table_path)
-                .file_format(DataFileFormat::Parquet)
-                .partition(partition)
-                .partition_spec_id(partition_spec_id)
-                .record_count(rows)
-                .file_size_in_bytes(output_size)
-                .build()
-                .map_err(|error| ForgeError::Invariant {
-                    detail: format!("Forge output metadata is incomplete: {error}"),
-                })?;
+            file.partition(partition)
+                .partition_spec_id(partition_spec_id);
+            let file = file.build().map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge output metadata is incomplete: {error}"),
+            })?;
+            if file.record_count() != rows || file.file_size_in_bytes() != output_size {
+                return Err(ForgeError::Invariant {
+                    detail: "Forge output metadata disagrees with finalized Parquet bytes"
+                        .to_owned(),
+                });
+            }
+            let row_groups = parquet_metadata.row_groups();
+            let split_offsets = file.split_offsets().ok_or_else(|| ForgeError::Invariant {
+                detail: "Forge output metadata omitted row-group split offsets".to_owned(),
+            })?;
+            if split_offsets.len() != row_groups.len() {
+                return Err(ForgeError::Invariant {
+                    detail: "Forge output split offsets do not match row groups".to_owned(),
+                });
+            }
             Ok::<_, ForgeError>((bytes, file, operation_id))
         });
         let (bytes, file, _) = join.await.map_err(|error| ForgeError::Invariant {

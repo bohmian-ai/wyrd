@@ -751,6 +751,7 @@ impl Forge {
                     operation_id,
                     binding,
                     schema,
+                    iceberg_schema: table.metadata().current_schema().clone(),
                     bin,
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),

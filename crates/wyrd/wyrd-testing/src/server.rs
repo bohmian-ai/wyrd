@@ -116,6 +116,8 @@ struct WyrdTestServerInner {
     #[allow(dead_code)]
     storage_root: Option<Arc<tempfile::TempDir>>,
     _scribe_wal_root: Arc<tempfile::TempDir>,
+    /// Lifetime guard for the Forge DataFusion spill directory.
+    _forge_spill_root: Arc<tempfile::TempDir>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -1355,8 +1357,9 @@ impl WyrdTestServerBuilder {
                 bifrost_memory.clone(),
             ),
         );
-        let spill_root =
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let spill_root = Arc::new(
+            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+        );
         let forge_runtime = ForgeRewriteRuntime::new(
             query_memory,
             spill_root.path(),
@@ -1460,6 +1463,7 @@ impl WyrdTestServerBuilder {
                 fixture,
                 storage_root,
                 _scribe_wal_root: scribe_wal_root,
+                _forge_spill_root: spill_root,
                 state,
                 router,
                 verifier,

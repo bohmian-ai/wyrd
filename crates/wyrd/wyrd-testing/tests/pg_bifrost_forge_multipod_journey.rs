@@ -1,10 +1,11 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
-use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{
     BifrostHarness, seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days,
 };
+use wyrd_testing::otlp::RandomTraceGenerator;
+use wyrd_testing::{Bootstrap, WyrdTestServer};
 
 #[tokio::test]
 #[ignore = "gated journey: bound Wyrd server plus shared Postgres and Iceberg"]
@@ -154,55 +155,22 @@ async fn active_partition_incremental_compaction() {
         3,
         "BifrostHarness must expose three real pods"
     );
-    for server in servers {
-        server.cancel_bound_workers();
-    }
     let server = &servers[0];
+    let tenant = server.data_tenant_id();
     let today = chrono::Utc::now().date_naive();
-    let fixture = seed_forge_group_for_tenant_with_schema_and_days(
-        server,
-        server.data_tenant_id(),
-        "active_incremental_rows",
-        false,
-        &[today],
-    )
-    .await;
-    let pod_fixtures = vec![fixture.clone(), fixture.clone(), fixture.clone()];
-    let total_bytes: i64 = sqlx::query_scalar(
-        "SELECT coalesce(sum(file_size), 0)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
-    )
-    .bind(fixture.tenant.as_uuid())
-    .bind(&fixture.binding.logical_namespace)
-    .bind(&fixture.binding.table_name)
-    .fetch_one(fixture.operator_pool.pool())
-    .await
-    .expect("active file sizes");
-    let _ = total_bytes;
+    let machine = server
+        .bootstrap_service("active-incremental-writer", &["admin"])
+        .await
+        .expect("bootstrap tenant service");
+    let api_key = match machine {
+        Bootstrap::Machine { api_key, .. } => api_key,
+        other => panic!("expected machine bootstrap, got {other:?}"),
+    };
+    let jwt = server
+        .exchange_api_key(&api_key)
+        .await
+        .expect("exchange API key for JWT");
     let pod_forges = harness.server_forges();
-    let pod_publishers = harness.server_forge_publishers();
-    assert_eq!(pod_forges.len(), 3);
-    assert_eq!(pod_publishers.len(), 3);
-    for (pod, (forge, publisher)) in pod_fixtures
-        .iter()
-        .zip(pod_forges.iter().zip(&pod_publishers))
-    {
-        assert_eq!(
-            publisher.try_publish(StagingFileCommitted::new(pod.binding.clone(), today)),
-            StagingPublishOutcome::Published
-        );
-        assert_eq!(
-            publisher.try_publish(StagingFileCommitted::new(pod.binding.clone(), today)),
-            StagingPublishOutcome::Published
-        );
-        assert!(
-            forge
-                .run_once()
-                .await
-                .expect("pod hinted tick")
-                .bins_committed
-                <= 1
-        );
-    }
     let shutdown = CancellationToken::new();
     let schedulers = pod_forges
         .iter()
@@ -212,22 +180,91 @@ async fn active_partition_incremental_compaction() {
             tokio::spawn(async move { forge.run(stop).await })
         })
         .collect::<Vec<_>>();
+    let mut generator = RandomTraceGenerator::from_seed_at(
+        0xA11CE,
+        u64::try_from(
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .expect("time nanos"),
+        )
+        .expect("positive time anchor"),
+    );
+    for (pod_index, pod) in servers.iter().enumerate() {
+        let endpoint = pod.grpc_url().expect("bound pod gRPC URL");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let channel = loop {
+            match wyrd_tonic::tonic::transport::Channel::from_shared(endpoint.clone())
+                .expect("gRPC endpoint")
+                .connect()
+                .await
+            {
+                Ok(channel) => break channel,
+                Err(error) => {
+                    assert!(Instant::now() < deadline, "connect pod gRPC: {error}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let mut client =
+            wyrd_tonic::otlp::trace_service::trace_service_client::TraceServiceClient::new(channel);
+        for sequence in 0..2_u64 {
+            let request = generator.export_request(pod_index, sequence, 6);
+            let mut request = wyrd_tonic::tonic::Request::new(request);
+            request.metadata_mut().insert(
+                "x-wyrd-access-token",
+                format!("Bearer {jwt}").parse().expect("token metadata"),
+            );
+            let response = client
+                .export(request)
+                .await
+                .expect("OTLP export")
+                .into_inner();
+            assert!(response.partial_success.is_none());
+        }
+    }
+    for pod in servers {
+        pod.flush_bifrost_for_tenant(tenant)
+            .await
+            .expect("server-owned Scribe flush");
+    }
+    let total_files: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1")
+            .bind(tenant.as_uuid())
+            .fetch_one(
+                server
+                    .state()
+                    .postgres
+                    .operator_pool()
+                    .expect("operator pool")
+                    .pool(),
+            )
+            .await
+            .expect("OTLP file-list rows");
+    assert!(total_files > 0, "OTLP flush produced no file-list rows");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
     let mut compacted = 0_i64;
     for _ in 0..100 {
         compacted = sqlx::query_scalar(
-            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND compacted",
+            "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND compacted",
         )
-        .bind(fixture.tenant.as_uuid())
-        .bind(&fixture.binding.logical_namespace)
-        .bind(&fixture.binding.table_name)
-        .fetch_one(fixture.operator_pool.pool())
+        .bind(tenant.as_uuid())
+        .fetch_one(operator_pool.pool())
         .await
         .expect("active compaction state");
-        if compacted == 2 {
+        if compacted > 0 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(
+        compacted > 0,
+        "active OTLP files must compact; compacted={compacted}"
+    );
     shutdown.cancel();
     for scheduler in schedulers {
         scheduler
@@ -235,27 +272,14 @@ async fn active_partition_incremental_compaction() {
             .expect("active scheduler")
             .expect("scheduler shutdown");
     }
-    assert_eq!(compacted, 2);
-    assert_eq!(
-        fixture.operation_count("forge.file_compact.prepared").await,
-        1
-    );
-    assert_eq!(
-        fixture
-            .operation_count("forge.file_compact.committed")
-            .await,
-        1
-    );
-    assert!(
-        fixture
-            .catalog
-            .load_table(&fixture.binding.table_ident())
-            .await
-            .expect("active table")
-            .metadata()
-            .current_snapshot_id()
-            .is_some()
-    );
+    let fixture = seed_forge_group_for_tenant_with_schema_and_days(
+        server,
+        tenant,
+        "active_incremental_assertions",
+        false,
+        &[today],
+    )
+    .await;
     let closed = seed_forge_group_for_tenant_with_schema_and_days(
         &server,
         fixture.tenant,

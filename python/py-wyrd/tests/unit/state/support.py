@@ -204,7 +204,6 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
             "outputs": [{"name": "output", "dtype": "float64"}],
         },
         "card_refs": [],
-        "publishes_to": [],
     }
     data_spec = {
         "interface": {
@@ -213,7 +212,6 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
         },
         "schema": {"columns": []},
         "card_refs": [],
-        "publishes_to": [],
         "splits": {},
         "target_columns": [],
         "stats": {"row_count": None, "col_count": None, "byte_count": 0, "sha256": "0" * 64},

@@ -246,7 +246,6 @@ mod pg_tests {
                 byte_count: 1,
                 sha256: "a".repeat(64),
             },
-            publishes_to: Vec::new(),
         })
     }
 

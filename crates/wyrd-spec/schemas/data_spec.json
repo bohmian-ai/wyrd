@@ -25,13 +25,6 @@
         }
       ]
     },
-    "publishes_to": {
-      "description": "Eval and Drift cards that receive observations from this data card.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      }
-    },
     "schema": {
       "description": "Ordered schema fields for tabular interfaces.",
       "allOf": [

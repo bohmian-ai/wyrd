@@ -54,9 +54,9 @@ pub struct EvalRecordObservation {
 
     /// Reference to the Eval card this record feeds.
     ///
-    /// `None` lets the server route through the publisher's configured
-    /// `publishes_to` targets. `Some` scores against exactly this card, as used
-    /// by targeted CLI/CI replay.
+    /// `None` lets the server route through the active Service-component or
+    /// standalone-Agent `publishes_to` binding. `Some` scores against exactly
+    /// this card, as used by targeted CLI/CI replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub eval_ref: Option<CardRef>,
 

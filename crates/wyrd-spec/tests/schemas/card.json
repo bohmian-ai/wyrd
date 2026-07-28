@@ -1871,13 +1871,6 @@
             }
           ]
         },
-        "publishes_to": {
-          "description": "Eval and Drift cards that receive observations from this data card.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Ref"
-          }
-        },
         "schema": {
           "description": "Ordered schema fields for tabular interfaces.",
           "allOf": [
@@ -5252,13 +5245,6 @@
               "$ref": "#/definitions/ModelInterface"
             }
           ]
-        },
-        "publishes_to": {
-          "description": "Eval and Drift cards that receive observations from this model card.",
-          "type": "array",
-          "items": {
-            "$ref": "#/definitions/Ref"
-          }
         },
         "sample_input": {
           "description": "Optional canonical sample input description.",
@@ -9418,6 +9404,13 @@
           "type": "array",
           "items": {
             "$ref": "#/definitions/CredentialRef"
+          }
+        },
+        "publishes_to": {
+          "description": "Eval and Drift cards that receive observations from this component in this Service.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Ref"
           }
         },
         "ref": {

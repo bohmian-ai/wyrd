@@ -6344,13 +6344,6 @@ Schema source: crates/wyrd-spec/schemas/data_spec.json
       ],
       "description": "Declared interface family and interface-specific metadata."
     },
-    "publishes_to": {
-      "description": "Eval and Drift cards that receive observations from this data card.",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      },
-      "type": "array"
-    },
     "schema": {
       "allOf": [
         {
@@ -14819,13 +14812,6 @@ Schema source: crates/wyrd-spec/schemas/model_spec.json
       ],
       "description": "Framework interface tag and per-interface config metadata."
     },
-    "publishes_to": {
-      "description": "Eval and Drift cards that receive observations from this model card.",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      },
-      "type": "array"
-    },
     "sample_input": {
       "anyOf": [
         {
@@ -19897,6 +19883,13 @@ Schema source: crates/wyrd-spec/schemas/service_spec.json
           "description": "Component credential references. TODO: does this earn its place?",
           "items": {
             "$ref": "#/definitions/CredentialRef"
+          },
+          "type": "array"
+        },
+        "publishes_to": {
+          "description": "Eval and Drift cards that receive observations from this component in this Service.",
+          "items": {
+            "$ref": "#/definitions/Ref"
           },
           "type": "array"
         },

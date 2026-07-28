@@ -19,7 +19,7 @@
       "format": "date-time"
     },
     "eval_ref": {
-      "description": "Reference to the Eval card this record feeds.\n\n`None` lets the server route through the publisher's configured `publishes_to` targets. `Some` scores against exactly this card, as used by targeted CLI/CI replay.",
+      "description": "Reference to the Eval card this record feeds.\n\n`None` lets the server route through the active Service-component or standalone-Agent `publishes_to` binding. `Some` scores against exactly this card, as used by targeted CLI/CI replay.",
       "anyOf": [
         {
           "$ref": "#/definitions/CardRef"

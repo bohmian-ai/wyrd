@@ -30,8 +30,3 @@ spec:
       space: wyrd-team
       name: churn-classifier-data
       version: "1.4.2"
-
-  # Publishes to a sibling Drift card in this composite.
-  # `path:` variant — loader binds to the sibling's identity at wire assembly.
-  publishes_to:
-    - ./drift.yaml

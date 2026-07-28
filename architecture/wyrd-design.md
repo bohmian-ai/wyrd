@@ -38,17 +38,20 @@ Downstream artifacts are brought up to this version in a sync pass.
    deployment unit is a directory of card YAMLs applied together.
 2. **One fact, one owning Kind.** If a field could live in two places, the
    doctrine has a gap. Surface it.
-3. **Publishers declare subscriptions; monitors are subject-less.**
-   Component kinds (Model, Data, Agent, Service) declare
-   `publishes_to: [CardRef]` naming peer Drift/Eval cards that receive
-   their runtime observations. Peer cards (Drift, Eval, Operator) carry
-   no `subject_ref` — subject identity is supplied by the publisher at
-   observation time. Triggers filter subscriptions by subject via
-   `TriggerSource.*.subject_filter: Option<CardRef>`.
+3. **Deployment composition declares subscriptions; monitors are subject-less.**
+   `ServiceComponent.publishes_to` binds a reusable component Card to the peer
+   Drift/Eval cards that receive its observations in that exact Service
+   version. `Service.publishes_to` covers Service-subject observations, while a
+   standalone Agent may declare its own `publishes_to`. Reusable Model and Data
+   lineage anchors never encode deployment-specific monitor bindings. Peer
+   cards (Drift, Eval, Operator) carry no `subject_ref` — subject identity is
+   supplied by the runtime observation. Triggers filter subscriptions by
+   subject via `TriggerSource.*.subject_filter: Option<CardRef>`.
 4. **Reactions are Operators; wiring is Triggers.** Drift/Eval/Policy never
    inline reaction logic.
-5. **Service composes for deployment, not observation.** Drift/Eval/Trigger/
-   Operator/Audit/Source are peer cards, not Service components.
+5. **Service composes deployment and subscription wiring, not monitor
+   definitions.** Drift/Eval/Trigger/Operator/Audit/Source are peer cards, not
+   Service components; component publication bindings point to those peers.
 6. **Enforcement is composed at the enforcing surface.** Service
    composes Policy for runtime gates.
 7. **Native observation first; external data by reading only.** AI services
@@ -187,16 +190,18 @@ Downstream artifacts are brought up to this version in a sync pass.
     batch. A bug that only appears when state crosses a module boundary is
     exactly what a journey catches and an isolated test misses. See AGENTS.md
     §11 for the tier definitions and gates.
-21. **`publishes_to` is the subscription contract.** Component kinds
-    (Model, Data, Agent, Service) MAY declare
-    `publishes_to: Vec<CardRef>`. Each ref MUST resolve to `Eval` or
-    `Drift` — no other kind is a publication target. The field is a
-    **static declaration**, not a runtime routing table: at runtime the
-    publisher emits observations tagged with its own `card_ref` as
-    subject, and the server routes them to declared peers. Mutating
-    `publishes_to` bumps the publisher's `spec_hash` and produces a new
-    version — declared subscriptions are part of the contract, not
-    incidental configuration. Duplicate targets are rejected with
+21. **`publishes_to` is the versioned deployment subscription contract.**
+    `ServiceComponent`, `Service`, and standalone `Agent` MAY declare
+    `publishes_to: Vec<CardRef>`. Each ref MUST resolve to `Eval` or `Drift` —
+    no other kind is a publication target. A component binding applies only
+    when that component emits under the containing Service version; the same
+    Model, Data, or Agent may therefore use different monitors in different
+    Services without creating a new component Card version.
+    `Service.publishes_to` applies only when the observation subject is the
+    Service itself. These fields are **static declarations**, not a per-request
+    runtime routing table: changing a component binding bumps the containing
+    Service's `spec_hash`, while changing a standalone Agent binding bumps the
+    Agent's `spec_hash`. Duplicate targets within one binding are rejected with
     `WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET`; non-`Eval`/`Drift` targets
     with `WYRD_SPEC_400_INVALID_PUBLISH_TARGET_KIND`. `publishes_to`
     also authorizes emit — a card enters a principal's emit scope when
@@ -256,7 +261,6 @@ spec:
   target_columns: [ColumnName]
   sql?: SqlLogic
   stats: DataStats
-  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 ### Model
@@ -268,7 +272,6 @@ spec:
   signature: ModelSignature
   sample_input?: SampleInput
   card_refs: [CardRef]           # → Artifact
-  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
 ```
 
 ### Artifact
@@ -317,7 +320,7 @@ spec:
   prompt: InlineableRef<Prompt>  # Ref (→ Prompt), authored Path, or inline Prompt
   tool_names: [string]
   run_config: AgentRunConfigSpec # max_iterations, tool_concurrency_cap, session_recent_limit, timeout_ms
-  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
+  publishes_to: [CardRef]        # → Eval | Drift for a standalone Agent principal
 ```
 
 ### Workflow
@@ -351,11 +354,11 @@ directory, not Service components.
 ```yaml
 spec:
   description?: string
-  components: [ServiceComponent] # { alias, ref | path }
+  components: [ServiceComponent] # { alias, ref | path, publishes_to: [Eval | Drift] }
   entry_point?: string           # SDK AppState bootstrap module (e.g. `acme.copilot.app:app`).
                                  # Importing it materializes the service's locked card snapshot
                                  # at runtime. Wyrd doesn't import this; the deploy image does.
-  publishes_to: [CardRef]        # → Eval | Drift (subscription contract; see Doctrine #21)
+  publishes_to: [CardRef]        # → Eval | Drift for Service-subject observations
 ```
 
 Identity is derived from the Service's `card_ref` and bound on first deploy
@@ -553,13 +556,15 @@ Consequences, stated so they stop drifting:
   never a composite that encodes the card.
 - **`Card → Run → Observation` is the `(card_ref, run_id)` pair on the row;** the
   request spine is the `wyrd_request_id` label that joins many runs across hops.
-- **Publishers own subject identity.** Under pub/sub (Doctrine #3, #21),
-  the publisher's `card_ref` IS the subject on every observation row —
-  no separate `subject_ref` on the envelope, no monitor-emits-about-a-
-  different-card case. A publisher's declared `publishes_to` targets
-  enter its emit scope through the transitive card-ref graph
-  (Doctrine #18), so authorization reduces to the one `card_ref` on
-  the row.
+- **The observation owns subject identity.** Under pub/sub (Doctrine #3, #21),
+  the observation's `card_ref` IS its subject — no separate `subject_ref` on
+  the envelope and no monitor-emits-about-a-different-card case. For a Service
+  principal, the server selects the publication binding from the locked
+  Service version and the matching component `card_ref`; Service-level
+  `publishes_to` applies only when the subject is the Service Card itself.
+  Declared targets enter the principal's emit scope through the transitive
+  card-ref graph (Doctrine #18), so authorization still reduces to the one
+  `card_ref` on the row.
 
 ### Runtime authz: `POST /v1/authz/check`
 
@@ -792,7 +797,7 @@ typed refs is a versioned breaking change that adds variants.
 
 | Variant           | Source-card fields                                                          |
 |-------------------|-----------------------------------------------------------------------------|
-| `Publication`     | `Model.publishes_to`, `Data.publishes_to`, `Agent.publishes_to`, `Service.publishes_to` |
+| `Publication`     | `Service.components[].publishes_to`, `Service.publishes_to`, `Agent.publishes_to` |
 | `SubjectFilter`   | `Trigger.source.*.subject_filter`                                           |
 | `Component`       | `Service.components[].ref`, `Workflow.steps[].target`                       |
 | `Artifact`        | `Data.card_refs[]`, `Model.card_refs[]`                                     |
@@ -804,6 +809,11 @@ typed refs is a versioned breaking change that adds variants.
 | `Operator`        | `Trigger.operator_ref`                                                      |
 | `Workflow`  | `Operator.action.workflow_ref`                                    |
 | `Hook`      | `Operator.pre_invoke`, `Operator.post_invoke`                     |
+
+For `Service.components[].publishes_to`, the derived publication edge is
+`Service → Eval|Drift`, and `Relationship.via` preserves the exact component
+field path. The reusable component Card is the observation subject at runtime,
+but it does not own a global relationship to the monitor.
 
 **Integrity.** Both `LineageNode.attributes_digest` and the Audit card's
 own `digest` use the same recipe: **JCS canonicalization (RFC 8785) +
@@ -960,18 +970,18 @@ of refs is the mode):
 
 | `dataset` | `source_ref` | Runtime behavior |
 |---------------|--------------|------------------|
-| set           | unset        | Offline batch. Engine invokes the publisher (declared by `publishes_to`) against the Data card's scenario rows, captures traces inline. |
+| set           | unset        | Offline batch. Engine invokes the subject selected by its Service-component or standalone-Agent publication binding against the Data card's scenario rows, captures traces inline. |
 | unset         | set          | Online / archived (deferred — DESIGN §13). Engine reads the user's sink, filters records by publisher `card_ref`, samples records into the task workflow. |
 | set           | set          | Same tasks, both modes (online deferred — DESIGN §13). Offline gate and online monitor share one task definition. |
 | unset         | unset        | Online over `vala`'s default observation archive. |
 
-**Directional flow.** Publisher declares `publishes_to: [Eval]` and emits
-observations at runtime; each observation carries the publisher's
-`card_ref` as its subject identity. Engine resolves `source_ref` (read
-location, deferred — see DESIGN.md §13), opens the Source, queries records
-scoped to the publisher's identity, feeds them into the `tasks` workflow,
-aggregates per-task pass/fail into a score stream consumed downstream by
-a `Drift` card with `DriftSignal::EvalScore`.
+**Directional flow.** A Service component binding or standalone Agent declares
+`publishes_to: [Eval]` and the runtime emits observations carrying the
+component's `card_ref` as subject identity. The engine resolves `source_ref`
+(read location, deferred — see DESIGN.md §13), opens the Source, queries
+records scoped to that subject identity, feeds them into the `tasks` workflow,
+and aggregates per-task pass/fail into a score stream consumed downstream by a
+`Drift` card with `DriftSignal::EvalScore`.
 
 `EvalTask` is a closed tagged union. Every variant carries `id: TaskId`,
 `depends_on: Vec<TaskId>`, and `condition: Option<EvalCondition>`.
@@ -1526,14 +1536,15 @@ The same two reference types apply at **every** reference slot, light or
 heavy. There is one canonical slot inventory, and the loader, diagnostics, and
 relationship tests all project from it:
 
-- `Service.components[]` (light and heavy targets)
+- `Service.components[].ref` (light and heavy targets)
+- `Service.components[].publishes_to`
 - `Agent.prompt`
 - `Trigger.target`
 - `Workflow.steps[].target`
 - `Eval` task refs, including `EvalTask::LlmJudge.judge_ref`
 - `Drift.signal.eval_ref`, `Drift.signal.source_ref`
 - `TriggerSource.*.subject_filter`
-- `Model.publishes_to`, `Data.publishes_to`, `Agent.publishes_to`, `Service.publishes_to`
+- `Agent.publishes_to`, `Service.publishes_to`
 - Heavy anchors: `Model`/`Data`/`Experiment` `*_refs`, `Artifact` refs
 
  A new reference-bearing field is added to this inventory in one place; it then
@@ -1702,15 +1713,15 @@ cross-tenant card import is a supported workflow.
 
 | Card    | Refs that authored on it             | Refs that point at it          |
 |---------|--------------------------------------|--------------------------------|
-| Data    | `card_refs`, `splits`, `publishes_to` | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
-| Model   | `card_refs`, `publishes_to`          | `Service.components.ref`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
+| Data    | `card_refs`, `splits`                 | `Drift.signal.baseline_ref`, `Eval.dataset`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
+| Model   | `card_refs`                           | `Service.components.ref`, `Experiment.target_refs`, `TriggerSource.*.subject_filter` |
 | Agent   | `prompt`, `tool_names`, `publishes_to` | `Service.components.ref`, Agent prompts (sub-agent calls), `TriggerSource.*.subject_filter` |
 | Workflow| `steps.*.target`                     | `Service.components.ref`, `Operator.action.workflow_ref`, `TriggerSource.*.subject_filter` |
 | Mcp     | `server_name`, `transport`, `scopes` | `Service.components.ref` |
 | Drift   | `signal.*` (`baseline_ref` \| `eval_ref` \| `source_ref`) | `TriggerSource.DriftObservation.drift_ref`, `Drift.signal.eval_ref` (other Drifts watching an Eval indirectly) |
 | Eval    | `dataset`, `source_ref` (deferred), `tasks[].LlmJudge.judge_ref` (Agent ref) | `Drift.signal.eval_ref`, `TriggerSource.EvalObservation.eval_ref` |
 | Audit   | `subject_refs`, `query` (roots), `lineage` (nodes), `investigator` (Agent variant) | — |
-| Service | `components[].ref`, `publishes_to`   | `TriggerSource.*.subject_filter` (service-level) |
+| Service | `components[].ref`, `components[].publishes_to`, `publishes_to` | `TriggerSource.*.subject_filter` (service-level) |
 | Policy  | `rules`                              | `Service.components.ref` |
 | Trigger | `schedule`, `source.drift_ref` \| `source.eval_ref`, `source.subject_filter?`, `operator_ref` | — |
 | Operator| `action` (`workflow_ref` \| typed `channel` shape \| `auth.env`) | `Trigger.operator_ref` |

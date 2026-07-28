@@ -62,10 +62,20 @@ fn check_duplicate_identities(cards: &[AuthoredCard], diagnostics: &mut Vec<Diag
 /// parsing or reference resolution.
 fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
     match &card.spec {
-        Spec::Data(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
-        Spec::Model(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
-        Spec::Agent(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
-        Spec::Service(spec) => validate_publications(&spec.publishes_to, card, diagnostics),
+        Spec::Agent(spec) => {
+            validate_publications(&spec.publishes_to, "spec.publishes_to", card, diagnostics);
+        }
+        Spec::Service(spec) => {
+            validate_publications(&spec.publishes_to, "spec.publishes_to", card, diagnostics);
+            for (index, component) in spec.components.iter().enumerate() {
+                validate_publications(
+                    &component.publishes_to,
+                    &format!("spec.components[{index}].publishes_to"),
+                    card,
+                    diagnostics,
+                );
+            }
+        }
         Spec::Eval(spec) => {
             if let Err(error) = spec.validate() {
                 diagnostics.push(catalog_error(card, &error.into()));
@@ -83,6 +93,8 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
         | Spec::Policy(_)
         | Spec::Audit(_)
         | Spec::Source(_)
+        | Spec::Data(_)
+        | Spec::Model(_)
         | Spec::Artifact(_)
         | Spec::Experiment(_)
         | Spec::Operator(_) => {}
@@ -92,6 +104,7 @@ fn validate_card(card: &AuthoredCard, diagnostics: &mut Vec<Diagnostic>) {
 /// Validate publication target kinds and reject duplicate publication targets.
 fn validate_publications(
     publications: &[Ref],
+    field: &str,
     card: &AuthoredCard,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -105,11 +118,12 @@ fn validate_publications(
                 card,
                 &WyrdError::SpecInvalidPublishTargetKind {
                     message: format!(
-                        "publishes_to target {} has kind {}",
+                        "{field} target {} has kind {}",
                         target.name,
                         target.kind.wire_name()
                     ),
                     details: serde_json::json!({
+                        "field": field,
                         "target": target,
                         "expected_kinds": ["Eval", "Drift"]
                     }),
@@ -121,8 +135,8 @@ fn validate_publications(
             diagnostics.push(catalog_error(
                 card,
                 &WyrdError::SpecDuplicatePublishTarget {
-                    message: format!("duplicate publishes_to target {identity}"),
-                    details: serde_json::json!({ "target": target }),
+                    message: format!("duplicate {field} target {identity}"),
+                    details: serde_json::json!({ "field": field, "target": target }),
                 },
             ));
         }
@@ -352,6 +366,7 @@ mod tests {
                         space: None,
                         uid: None,
                     }),
+                    publishes_to: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -367,5 +382,64 @@ mod tests {
                 .iter()
                 .any(|diagnostic| { diagnostic.message.contains("no resolved space") })
         );
+    }
+
+    /// Reject duplicate publication targets within one Service component binding.
+    #[test]
+    fn validate_rejects_duplicate_component_publication_targets() {
+        let eval_ref = CardRef {
+            kind: CardKind::Eval,
+            name: CardName::new("quality").expect("test card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("test version is valid"),
+            space: Some(SpaceName::new("default").expect("test space is valid")),
+            uid: None,
+        };
+        let card = AuthoredCard {
+            source_path: PathBuf::from("service.yaml"),
+            api_version: ApiVersion::v1(),
+            kind: CardKind::Service,
+            metadata: Metadata {
+                name: CardName::new("service").expect("test card name is valid"),
+                version: Some(
+                    VersionBlock::parse("1.0.0")
+                        .expect("test version is valid")
+                        .into(),
+                ),
+                bump: None,
+                space: Some(SpaceName::new("default").expect("test space is valid")),
+                uid: None,
+                labels: BTreeMap::new(),
+                annotations: BTreeMap::new(),
+                spec_hash: None,
+                artifact_hash: None,
+                origin: None,
+            },
+            spec: Spec::Service(ServiceSpec {
+                components: vec![ServiceComponent {
+                    alias: "model".to_owned(),
+                    card_ref: Ref::Ref(CardRef {
+                        kind: CardKind::Model,
+                        name: CardName::new("classifier").expect("test card name is valid"),
+                        version: VersionBlock::parse("1.0.0").expect("test version is valid"),
+                        space: Some(SpaceName::new("default").expect("test space is valid")),
+                        uid: None,
+                    }),
+                    publishes_to: vec![Ref::Ref(eval_ref.clone()), Ref::Ref(eval_ref)],
+                    source: None,
+                    config: BTreeMap::new(),
+                    credential_refs: Vec::new(),
+                }],
+                ..Default::default()
+            }),
+            artifacts: Vec::new(),
+        };
+
+        let diagnostics = validate_tree(&[card]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET"
+                && diagnostic
+                    .message
+                    .contains("spec.components[0].publishes_to")
+        }));
     }
 }

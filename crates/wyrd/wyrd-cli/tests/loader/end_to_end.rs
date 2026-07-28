@@ -11,6 +11,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Load the canonical Service tree and prove all references resolve before submission.
 #[test]
 fn load_end_to_end_reference_tree() {
     let tree = load(&fixture("end_to_end")).expect("canonical loader fixture must load");
@@ -27,9 +28,12 @@ fn load_end_to_end_reference_tree() {
             .position(|card| card.submission.metadata.name.as_str() == name)
             .expect("fixture card must be present")
     };
-    assert!(position("churn-classifier-drift") < position("churn-classifier"));
-    assert!(position("churn-triage-eval") < position("churn-triage"));
-    assert!(position("churn-triage-eval") < position("retention-runbook"));
+    let service_position = position("churn-response-service");
+    assert!(position("churn-classifier-drift") < service_position);
+    assert!(position("churn-classifier") < service_position);
+    assert!(position("churn-triage-eval") < service_position);
+    assert!(position("churn-triage") < service_position);
+    assert!(position("retention-runbook") < service_position);
     assert!(position("slack-ops-alerts") < position("churn-triage-eval-fail"));
     assert!(position("churn-triage") < position("churn-triage-eval-fail"));
 
@@ -66,11 +70,11 @@ fn load_end_to_end_reference_tree() {
                 .to_string()
                 .contains("Walk the steps");
         }
-        if loaded.submission.metadata.name.as_str() == "churn-classifier" {
-            let Spec::Model(model) = &spec else {
-                panic!("churn-classifier must remain a Model spec");
+        if loaded.submission.metadata.name.as_str() == "churn-response-service" {
+            let Spec::Service(service) = &spec else {
+                panic!("churn-response-service must remain a Service spec");
             };
-            assert_eq!(model.publishes_to.len(), 1);
+            assert_eq!(service.components[0].publishes_to.len(), 1);
         }
         if loaded.submission.metadata.name.as_str() == "churn-triage-eval-fail" {
             let Spec::Trigger(trigger) = &spec else {

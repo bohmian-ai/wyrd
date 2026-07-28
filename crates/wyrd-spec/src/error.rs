@@ -1472,7 +1472,7 @@ pub enum WyrdError {
         code = "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER",
         status = 400,
         title = "Unpublished observability peer",
-        remediation = "Add the Eval or Drift CardRef to publishes_to on a submitted Data, Model, Agent, or Service, or register the shared peer separately."
+        remediation = "Add the Eval or Drift CardRef to the Service, a Service component, or a submitted Agent publishes_to list, or register the shared peer separately."
     )]
     SpecUnpublishedObservabilityPeer {
         /// Human-readable error message.

@@ -764,12 +764,14 @@ mod tests {
         assert!(!with_uid.same_identity(&different_space));
     }
 
+    /// Confirm unresolved Service paths include component-local publication bindings.
     #[test]
     fn unresolved_card_ref_paths_include_top_level_slots() {
         let mut spec = ServiceSpec::default();
         spec.components.push(ServiceComponent {
             alias: "model".to_owned(),
             card_ref: Ref::Path(PathBuf::from("components/model.yaml")),
+            publishes_to: vec![Ref::Path(PathBuf::from("publishes/model-eval.yaml"))],
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
@@ -781,6 +783,7 @@ mod tests {
             unresolved_card_ref_paths(&Spec::Service(spec)),
             vec![
                 PathBuf::from("components/model.yaml"),
+                PathBuf::from("publishes/model-eval.yaml"),
                 PathBuf::from("publishes/eval.yaml")
             ]
         );
@@ -883,6 +886,7 @@ mod tests {
             card_ref: Ref::Sibling {
                 sibling: top_level.clone(),
             },
+            publishes_to: Vec::new(),
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),
@@ -914,6 +918,7 @@ mod tests {
             ServiceComponent {
                 alias: "durable".to_owned(),
                 card_ref: Ref::Ref(durable),
+                publishes_to: Vec::new(),
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),
@@ -921,6 +926,7 @@ mod tests {
             ServiceComponent {
                 alias: "path".to_owned(),
                 card_ref: Ref::Path(path),
+                publishes_to: Vec::new(),
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),

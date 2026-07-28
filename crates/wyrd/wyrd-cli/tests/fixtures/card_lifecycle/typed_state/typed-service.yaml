@@ -13,6 +13,8 @@ spec:
         name: primary
         version: 1.0.0
         space: default
+      publishes_to:
+        - ./model-drift.yaml
     - alias: model_shadow
       ref:
         kind: Model
@@ -20,26 +22,14 @@ spec:
         version: 1.0.0
         space: default
     - alias: agent_triage
-      ref:
-        kind: Agent
-        name: triage
-        version: 1.0.0
-        space: default
+      ref: ./agent-triage.yaml
+      publishes_to:
+        - ./quality.yaml
     - alias: agent_inline
-      ref:
-        kind: Agent
-        name: inline
-        version: 1.0.0
-        space: default
+      ref: ./agent-inline.yaml
     - alias: triage_prompt
-      ref:
-        kind: Prompt
-        name: triage-prompt
-        version: 1.0.0
-        space: default
+      ref: ./triage-prompt.yaml
+    - alias: shared_prompt
+      ref: ./triage-prompt.yaml
     - alias: runtime_workflow
-      ref:
-        kind: Workflow
-        name: runtime
-        version: 1.0.0
-        space: default
+      ref: ./runtime.yaml

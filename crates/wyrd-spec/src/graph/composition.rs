@@ -13,7 +13,8 @@ use crate::registry::CardSubmission;
 /// Trigger, Operator, Audit, and Source remain peer cards and cannot appear in
 /// `Service.spec.components`. When the selected root is a Service, every Eval
 /// or Drift submitted in the same bundle must also be the target of a
-/// `publishes_to` reference from a submitted Data, Model, Agent, or Service.
+/// `publishes_to` reference from the Service, one of its components, or a
+/// submitted standalone Agent.
 /// Standalone peer-card submissions are intentionally unaffected.
 ///
 /// # Errors
@@ -63,7 +64,7 @@ pub fn validate_composition(
     let published = decoded
         .iter()
         .flat_map(publications)
-        .filter_map(Ref::as_card_ref)
+        .filter_map(|reference| reference.as_card_ref())
         .map(identity_key)
         .collect::<BTreeSet<_>>();
 
@@ -96,14 +97,25 @@ fn is_peer_only_component(kind: &CardKind) -> bool {
     )
 }
 
-/// Return the observability publication targets declared by a publisher spec.
-fn publications(spec: &Spec) -> &[Ref] {
+/// Collect observability publication targets declared by one submitted spec.
+///
+/// Service component lists are flattened with the Service-level list because
+/// both forms bind peer cards into the same composite registration graph.
+fn publications(spec: &Spec) -> Vec<&Ref> {
     match spec {
-        Spec::Data(spec) => &spec.publishes_to,
-        Spec::Model(spec) => &spec.publishes_to,
-        Spec::Agent(spec) => &spec.publishes_to,
-        Spec::Service(spec) => &spec.publishes_to,
-        Spec::Prompt(_)
+        Spec::Agent(spec) => spec.publishes_to.iter().collect(),
+        Spec::Service(spec) => spec
+            .publishes_to
+            .iter()
+            .chain(
+                spec.components
+                    .iter()
+                    .flat_map(|component| component.publishes_to.iter()),
+            )
+            .collect(),
+        Spec::Data(_)
+        | Spec::Model(_)
+        | Spec::Prompt(_)
         | Spec::Workflow(_)
         | Spec::Mcp(_)
         | Spec::Policy(_)
@@ -114,7 +126,7 @@ fn publications(spec: &Spec) -> &[Ref] {
         | Spec::Trigger(_)
         | Spec::Artifact(_)
         | Spec::Experiment(_)
-        | Spec::Operator(_) => &[],
+        | Spec::Operator(_) => Vec::new(),
     }
 }
 
@@ -243,6 +255,31 @@ mod tests {
 
         validate_composition(&[service, eval], &root)
             .expect("published Eval is a valid Service peer");
+    }
+
+    /// Accept an Eval peer bound to one reusable component in a Service-root bundle.
+    #[test]
+    fn accepts_component_published_eval_in_service_root_bundle() {
+        let eval_ref = card_ref(CardKind::Eval, "quality");
+        let model_ref = card_ref(CardKind::Model, "classifier");
+        let service = submission(
+            CardKind::Service,
+            "app",
+            json!({
+                "components": [{
+                    "alias": "classifier",
+                    "ref": model_ref,
+                    "publishes_to": [eval_ref],
+                }]
+            }),
+        );
+        let eval = submission(CardKind::Eval, "quality", eval_spec());
+        let root = RootPick {
+            root: card_ref(CardKind::Service, "app"),
+        };
+
+        validate_composition(&[service, eval], &root)
+            .expect("component-published Eval is a valid Service peer");
     }
 
     /// Preserve standalone Eval registration without requiring a publisher.

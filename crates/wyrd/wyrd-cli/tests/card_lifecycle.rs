@@ -207,6 +207,7 @@ impl RuntimeServiceFixture {
         "model_shadow",
         "root",
         "runtime_workflow",
+        "shared_prompt",
         "triage_prompt",
     ];
 
@@ -262,11 +263,11 @@ impl RuntimeServiceFixture {
         &self.bundle_dir
     }
 
-    /// Register every dependency in the fixture through the public Cards API.
+    /// Register the heavy lineage anchors through the public Cards API.
     ///
     /// Models and Data carry the three artifact payloads whose bytes the
-    /// offline state later verifies. The remaining Cards make the Service
-    /// graph complete before the public CLI apply call.
+    /// offline state later verifies. The Service apply resolves and registers
+    /// every light dependency from its authored path tree.
     ///
     /// # Errors
     /// Returns the first registry or fixture-loading error encountered while
@@ -275,17 +276,7 @@ impl RuntimeServiceFixture {
         &self,
         cards: &wyrd_registry::Cards,
     ) -> Result<(), wyrd_spec::error::WyrdError> {
-        for relative in [
-            "training.yaml",
-            "quality.yaml",
-            "model-drift.yaml",
-            "triage-prompt.yaml",
-            "model-primary.yaml",
-            "model-shadow.yaml",
-            "agent-triage.yaml",
-            "agent-inline.yaml",
-            "runtime.yaml",
-        ] {
+        for relative in ["training.yaml", "model-primary.yaml", "model-shadow.yaml"] {
             cards.register_from_path(&self.path(relative)).await?;
         }
         Ok(())

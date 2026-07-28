@@ -14,7 +14,6 @@ from uuid import uuid4
 
 import pytest
 import wyrd
-import yaml
 from wyrd.cards import CardRef, Cards
 from wyrd.data import DataCard, DataStats, FieldSpec
 from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature
@@ -80,15 +79,14 @@ class RuntimeServiceFixture:
         "agent_inline",
         "agent_triage",
         "default-Data-training-1.0.0",
+        "default-Drift-model-drift-1.0.0",
+        "default-Eval-quality-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
-        "model_drift",
         "model_primary",
         "model_shadow",
-        "quality_eval",
         "root",
         "runtime_workflow",
         "shared_prompt",
-        "training_data",
         "triage_prompt",
     )
     artifact_bytes = {
@@ -135,56 +133,11 @@ class RuntimeServiceFixture:
         )
         return cards.data.register(card).root
 
-    def register_graph(self, cards: Cards) -> dict[tuple[str, str], CardRef]:
-        refs: dict[tuple[str, str], CardRef] = {}
-        for name in (
-            "triage-prompt.yaml",
-            "agent-triage.yaml",
-            "agent-inline.yaml",
-            "quality.yaml",
-            "model-drift.yaml",
-            "runtime.yaml",
-        ):
-            ref = cards.register_from_path(str(self.source / name)).root
-            refs[(ref.kind.name, ref.name)] = ref
-        return refs
-
-    def write_service_tree(self, refs: dict[tuple[str, str], CardRef]) -> Path:
-        path = self.source / "typed-service.yaml"
-        document = yaml.safe_load(path.read_text())
-
-        def rewrite(value: Any) -> Any:
-            if isinstance(value, dict):
-                if {"kind", "name", "version"} <= value.keys():
-                    ref = refs.get((value["kind"], value["name"]))
-                    if ref is not None:
-                        return {
-                            "kind": ref.kind.name,
-                            "name": ref.name,
-                            "version": ref.version,
-                            "space": ref.space,
-                        }
-                return {key: rewrite(item) for key, item in value.items()}
-            if isinstance(value, list):
-                return [rewrite(item) for item in value]
-            return value
-
-        document = rewrite(document)
-        document["spec"]["components"].append(
-            {
-                "alias": "shared_prompt",
-                "ref": rewrite(
-                    {
-                        "kind": "Prompt",
-                        "name": "triage-prompt",
-                        "version": "1.0.0",
-                        "space": "default",
-                    }
-                ),
-            }
-        )
-        path.write_text(yaml.safe_dump(document, sort_keys=False))
-        return path
+    def register_heavy_cards(self, cards: Cards) -> None:
+        """Register reusable Model and Data lineage anchors before Service apply."""
+        self.register_model(cards, "model_primary")
+        self.register_model(cards, "model_shadow")
+        self.register_data(cards, "training_data")
 
     def run_cli(
         self,
@@ -250,7 +203,13 @@ def assert_all_artifacts_are_confined_and_match_fixture(
 ) -> None:
     """Hydrate the complete CLI bundle into usable offline Python objects."""
     assert fixture.bundle is not None
-    for alias, expected in fixture.artifact_bytes.items():
+    aliases = {
+        "model_primary": "model_primary",
+        "model_shadow": "model_shadow",
+        "training_data": "default-Data-training-1.0.0",
+    }
+    for fixture_name, expected in fixture.artifact_bytes.items():
+        alias = aliases[fixture_name]
         artifact = state.artifacts(alias)[0]
         assert artifact.local_path.is_file()
         assert artifact.local_path.read_bytes() == expected
@@ -262,14 +221,9 @@ def download_fixture(tmp_path: Path) -> tuple[RuntimeServiceFixture, Path, CardR
     fixture.bundle = bundle
     with WyrdTestServer(mutate_env=False) as server:
         cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
-        refs = {
-            ("Model", "primary"): fixture.register_model(cards, "model_primary"),
-            ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),
-            ("Data", "training"): fixture.register_data(cards, "training_data"),
-        }
-        refs.update(fixture.register_graph(cards))
+        fixture.register_heavy_cards(cards)
         applied = fixture.run_cli(
-            server, "apply", str(fixture.write_service_tree(refs)), "--format", "json"
+            server, "apply", str(fixture.source / "typed-service.yaml"), "--format", "json"
         )
         service_ref = CardRef(**applied["root"])
         fixture.last_get_result = fixture.run_cli(server, *exact_get_arguments(service_ref, bundle))
@@ -281,14 +235,9 @@ def register_and_apply(
 ) -> CardRef:
     """Register and apply the fixture graph against the supplied live server."""
     cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
-    refs = {
-        ("Model", "primary"): fixture.register_model(cards, "model_primary"),
-        ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),
-        ("Data", "training"): fixture.register_data(cards, "training_data"),
-    }
-    refs.update(fixture.register_graph(cards))
+    fixture.register_heavy_cards(cards)
     receipt = fixture.run_cli(
-        server, "apply", str(fixture.write_service_tree(refs)), "--format", "json"
+        server, "apply", str(fixture.source / "typed-service.yaml"), "--format", "json"
     )
     service_ref = CardRef(**receipt["root"])
     fixture.run_cli(server, *exact_get_arguments(service_ref, bundle))
@@ -301,7 +250,7 @@ def _interfaces() -> dict[str, Any]:
             RuntimeServiceFixture.artifact_bytes["model_primary"]
         ),
         "model_shadow": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_shadow"]),
-        "training_data": JourneyDataInterface(
+        "default-Data-training-1.0.0": JourneyDataInterface(
             RuntimeServiceFixture.artifact_bytes["training_data"]
         ),
     }
@@ -325,7 +274,7 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.model("model_shadow").model.predict([1]) == [2]
     assert state.model("model_primary").preprocessor.transform([1]) == [2]
     assert state.model("model_shadow").processor.transform([1]) == [2]
-    assert state.data("training_data").data.transform([1]) == [2]
+    assert state.data("default-Data-training-1.0.0").data.transform([1]) == [2]
     assert (
         state.agent("agent_triage").prompt is not None
         and state.agent("agent_inline").prompt is not None
@@ -334,10 +283,10 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     assert state.prompt("triage_prompt") is state.prompt("default-Prompt-triage-prompt-1.0.0")
     assert state.prompt("triage_prompt") is state.prompt("shared_prompt")
     assert state.model("model_primary") is not state.model("model_shadow")
-    assert state.eval("quality_eval").kind is wyrd.CardKind.Eval
-    assert state.eval("quality_eval").spec
-    assert state.drift("model_drift").kind is wyrd.CardKind.Drift
-    assert state.drift("model_drift").spec
+    assert state.eval("default-Eval-quality-1.0.0").kind is wyrd.CardKind.Eval
+    assert state.eval("default-Eval-quality-1.0.0").spec
+    assert state.drift("default-Drift-model-drift-1.0.0").kind is wyrd.CardKind.Drift
+    assert state.drift("default-Drift-model-drift-1.0.0").spec
     assert state.workflow("runtime_workflow").kind is wyrd.CardKind.Workflow
     assert state.workflow("runtime_workflow").spec == {}
     assert_all_refs_are_exact_and_uid_bearing(state)
@@ -350,14 +299,13 @@ def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> Non
     fixture, bundle = RuntimeServiceFixture(tmp_path), tmp_path / "metadata-only"
     with WyrdTestServer(mutate_env=False) as server:
         cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
-        refs = {
-            ("Model", "primary"): fixture.register_model(cards, "model_primary"),
-            ("Model", "shadow"): fixture.register_model(cards, "model_shadow"),
-            ("Data", "training"): fixture.register_data(cards, "training_data"),
-        }
-        refs.update(fixture.register_graph(cards))
+        fixture.register_heavy_cards(cards)
         receipt = fixture.run_cli(
-            server, "apply", str(fixture.write_service_tree(refs)), "--format", "json"
+            server,
+            "apply",
+            str(fixture.source / "typed-service.yaml"),
+            "--format",
+            "json",
         )
         fixture.run_cli(server, *exact_get_arguments(CardRef(**receipt["root"]), bundle, True))
     with pytest.raises(wyrd.WyrdError) as caught:

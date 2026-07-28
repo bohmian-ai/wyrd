@@ -14,8 +14,3 @@ spec:
   run_config:
     max_iterations: 5
     timeout_ms: 45000
-
-  # Publishes to a sibling Eval card. `path:` variant — Team B's agent can
-  # publish to the same Eval without this Agent reversioning.
-  publishes_to:
-    - ./eval.yaml

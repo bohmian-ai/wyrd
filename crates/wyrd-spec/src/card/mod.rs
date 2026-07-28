@@ -134,7 +134,6 @@ mod data_methods_tests {
             target_columns: vec![col("target")],
             sql: None,
             stats: stats(),
-            publishes_to: Vec::new(),
         };
         spec.validate().unwrap();
 
@@ -275,7 +274,6 @@ mod data_roundtrip_tests {
             target_columns: Vec::new(),
             sql,
             stats: stats(),
-            publishes_to: Vec::new(),
         };
         spec.validate().unwrap();
         spec
@@ -455,7 +453,6 @@ mod data_validation_tests {
             target_columns: vec![col("target")],
             sql,
             stats: valid_stats(),
-            publishes_to: Vec::new(),
         }
     }
 
@@ -531,7 +528,6 @@ mod data_validation_tests {
                 target_columns: vec![col("target")],
                 sql: None,
                 stats: valid_stats(),
-                publishes_to: Vec::new(),
             },
             DataSpec {
                 interface: DataInterface::Sql(SqlMeta {
@@ -547,7 +543,6 @@ mod data_validation_tests {
                     default_query: Some(query("main")),
                 }),
                 stats: valid_stats(),
-                publishes_to: Vec::new(),
             },
         ];
         for spec in specs {
@@ -721,7 +716,6 @@ mod data_validation_tests {
             target_columns: Vec::new(),
             sql: None,
             stats: valid_stats(),
-            publishes_to: Vec::new(),
         };
         assert_eq!(
             validate_data_spec(&spec),
@@ -769,7 +763,6 @@ mod data_validation_tests {
                 target_columns: Vec::new(),
                 sql: None,
                 stats: valid_stats(),
-                publishes_to: Vec::new(),
             };
             assert!(
                 validate_data_spec(&spec).is_ok(),
@@ -794,7 +787,6 @@ mod data_validation_tests {
                 target_columns: Vec::new(),
                 sql: None,
                 stats: valid_stats(),
-                publishes_to: Vec::new(),
             };
             assert_eq!(
                 validate_data_spec(&spec),
@@ -1181,7 +1173,6 @@ mod model_roundtrip_tests {
             signature: signature(),
             sample_input: Some(SampleInput::new(SampleInputKind::Dict)),
             card_refs: vec![model_ref("model")],
-            publishes_to: Vec::new(),
         }
     }
 
@@ -1479,7 +1470,6 @@ mod model_validation_tests {
             signature: valid_signature(),
             sample_input: None,
             card_refs: Vec::new(),
-            publishes_to: Vec::new(),
         }
     }
 

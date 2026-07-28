@@ -33,9 +33,6 @@ pub struct ModelSpec {
     /// Durable Artifact card references linked to this model card.
     #[serde(default)]
     pub card_refs: Vec<Ref>,
-    /// Eval and Drift cards that receive observations from this model card.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publishes_to: Vec<Ref>,
 }
 
 impl ModelSpec {
@@ -56,7 +53,6 @@ impl ModelSpec {
             signature,
             sample_input,
             card_refs,
-            publishes_to: Vec::new(),
         };
         spec.validate()?;
         Ok(spec)

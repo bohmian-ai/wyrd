@@ -1610,6 +1610,7 @@ mod tests {
                     ServiceComponent {
                         alias: "model".to_owned(),
                         card_ref: Ref::Ref(model_ref.clone()),
+                        publishes_to: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -1617,6 +1618,7 @@ mod tests {
                     ServiceComponent {
                         alias: "backup".to_owned(),
                         card_ref: Ref::Ref(backup_ref.clone()),
+                        publishes_to: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -1866,6 +1868,7 @@ mod tests {
                     spec.components.push(ServiceComponent {
                         alias: "workflow".to_owned(),
                         card_ref: Ref::Ref(workflow_ref.clone()),
+                        publishes_to: Vec::new(),
                         source: None,
                         config: BTreeMap::new(),
                         credential_refs: Vec::new(),
@@ -2108,7 +2111,6 @@ mod tests {
             ),
             sample_input: None,
             card_refs: Vec::new(),
-            publishes_to: Vec::new(),
         }
     }
 
@@ -2170,7 +2172,6 @@ mod tests {
             }),
             schema: DataSchema::empty(),
             card_refs: Vec::new(),
-            publishes_to: Vec::new(),
             splits: std::collections::HashMap::new(),
             target_columns: Vec::new(),
             sql: None,
@@ -2504,6 +2505,7 @@ mod tests {
                 spec.components.push(ServiceComponent {
                     alias: "training".to_owned(),
                     card_ref: Ref::Ref(data_ref.clone()),
+                    publishes_to: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),

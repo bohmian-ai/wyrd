@@ -386,6 +386,13 @@
             "$ref": "#/definitions/CredentialRef"
           }
         },
+        "publishes_to": {
+          "description": "Eval and Drift cards that receive observations from this component in this Service.",
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/Ref"
+          }
+        },
         "ref": {
           "description": "Canonical Card reference.",
           "allOf": [

@@ -950,7 +950,6 @@ fn model_spec_from_metadata(
         signature: metadata.signature.clone(),
         sample_input: metadata.sample_input.clone(),
         card_refs: metadata.card_refs.iter().cloned().map(Ref::Ref).collect(),
-        publishes_to: Vec::new(),
     }
 }
 

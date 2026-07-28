@@ -213,6 +213,7 @@ mod tests {
                             uid: None,
                         },
                     },
+                    publishes_to: Vec::new(),
                     source: None,
                     config: BTreeMap::new(),
                     credential_refs: Vec::new(),
@@ -271,6 +272,7 @@ mod tests {
             card_ref: Ref::Sibling {
                 sibling: card_ref(CardKind::Eval, "quality"),
             },
+            publishes_to: Vec::new(),
             source: None,
             config: BTreeMap::new(),
             credential_refs: Vec::new(),

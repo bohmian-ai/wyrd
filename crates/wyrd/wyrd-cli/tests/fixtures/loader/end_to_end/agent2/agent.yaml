@@ -34,8 +34,3 @@ spec:
   run_config:
     max_iterations: 10
     timeout_ms: 120000
-
-  # Same Eval as agent1 — proves shared peer reuse. Eval version does not
-  # move when the second publisher opts in.
-  publishes_to:
-    - ../agent1/eval.yaml

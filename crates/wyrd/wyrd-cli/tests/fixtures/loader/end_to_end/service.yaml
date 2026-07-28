@@ -23,14 +23,22 @@ spec:
         space: wyrd-team
         name: churn-classifier
         version: "1.4.2"
+      # Monitoring is deployment-specific, so the Service binds this reusable
+      # model to the sibling Drift card.
+      publishes_to:
+        - ./model/drift.yaml
 
     - alias: agent1
       # `path:` — sibling submission in this composite; loader binds to its
       # resolved identity at wire assembly.
       ref: agent1/agent.yaml
+      publishes_to:
+        - agent1/eval.yaml
 
     - alias: agent2
       ref: agent2/agent.yaml
+      publishes_to:
+        - agent1/eval.yaml
 
   # Optional service-level publications (deploy/scale/health events). Empty
   # here — this service has no first-class lifecycle observations.

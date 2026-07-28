@@ -82,6 +82,7 @@ pub trait Visit {
 }
 
 impl Visit for DataSpec {
+    /// Visit intrinsic Data lineage and materialization references.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -92,7 +93,6 @@ impl Visit for DataSpec {
                 value: SlotValue::Durable(card_ref),
             });
         }
-        visit_publishes_to(&mut self.publishes_to, f);
         for (label, split) in &mut self.splits {
             if let SplitStrategy::Materialized(card_ref) = &mut split.strategy {
                 f(SlotEntry {
@@ -124,6 +124,7 @@ impl Visit for DataSpec {
 }
 
 impl Visit for ModelSpec {
+    /// Visit intrinsic Model artifact and lineage references.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -134,7 +135,6 @@ impl Visit for ModelSpec {
                 value: SlotValue::Durable(card_ref),
             });
         }
-        visit_publishes_to(&mut self.publishes_to, f);
     }
 }
 
@@ -281,6 +281,7 @@ impl Visit for DriftSpec {
 }
 
 impl Visit for ServiceSpec {
+    /// Visit component identities, component publication bindings, and Service publications.
     fn visit<F>(&mut self, f: &mut F)
     where
         F: FnMut(SlotEntry<'_>),
@@ -290,8 +291,13 @@ impl Visit for ServiceSpec {
                 path: format!("spec.components[{}].card_ref", i),
                 value: SlotValue::Durable(&mut component.card_ref),
             });
+            visit_publishes_to(
+                &mut component.publishes_to,
+                &format!("spec.components[{i}].publishes_to"),
+                f,
+            );
         }
-        visit_publishes_to(&mut self.publishes_to, f);
+        visit_publishes_to(&mut self.publishes_to, "spec.publishes_to", f);
     }
 }
 
@@ -399,13 +405,14 @@ impl Visit for OperatorSpec {
     }
 }
 
-fn visit_publishes_to<F>(publishes_to: &mut [Ref], f: &mut F)
+/// Visit one publication list using the exact owning field path.
+fn visit_publishes_to<F>(publishes_to: &mut [Ref], path: &str, f: &mut F)
 where
     F: FnMut(SlotEntry<'_>),
 {
     for (index, card_ref) in publishes_to.iter_mut().enumerate() {
         f(SlotEntry {
-            path: format!("spec.publishes_to[{index}]"),
+            path: format!("{path}[{index}]"),
             value: SlotValue::Durable(card_ref),
         });
     }
@@ -548,7 +555,6 @@ mod completeness_tests {
                 byte_count: 1,
                 sha256: "a".repeat(64),
             },
-            publishes_to: Vec::new(),
         }
     }
 
@@ -571,7 +577,6 @@ mod completeness_tests {
             ),
             sample_input: None,
             card_refs: vec![Ref::Ref(card_ref(CardKind::Artifact, "model-artifact"))],
-            publishes_to: Vec::new(),
         }
     }
 
@@ -650,6 +655,7 @@ mod completeness_tests {
         paths
     }
 
+    /// Confirm the canonical visitor exposes every supported reference slot exactly once.
     #[test]
     fn every_spec_ref_field_is_ref_or_inlineable_ref() {
         let image = data(DataInterface::Image(ImageMeta {
@@ -686,6 +692,7 @@ mod completeness_tests {
             components: vec![ServiceComponent {
                 alias: "model".to_owned(),
                 card_ref: Ref::Ref(card_ref(CardKind::Model, "component")),
+                publishes_to: vec![Ref::Ref(card_ref(CardKind::Eval, "component-quality"))],
                 source: None,
                 config: BTreeMap::new(),
                 credential_refs: Vec::new(),
@@ -747,7 +754,11 @@ mod completeness_tests {
         ] {
             count += visit_paths(spec).len();
         }
-        assert_eq!(count, 31);
+        assert_eq!(count, 32);
+        assert!(
+            visit_paths(Spec::Service(service.clone()))
+                .contains(&("spec.components[0].publishes_to[0]".to_owned(), "durable"))
+        );
 
         let _ = (
             &mut image,

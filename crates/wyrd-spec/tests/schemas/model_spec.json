@@ -25,13 +25,6 @@
         }
       ]
     },
-    "publishes_to": {
-      "description": "Eval and Drift cards that receive observations from this model card.",
-      "type": "array",
-      "items": {
-        "$ref": "#/definitions/Ref"
-      }
-    },
     "sample_input": {
       "description": "Optional canonical sample input description.",
       "anyOf": [

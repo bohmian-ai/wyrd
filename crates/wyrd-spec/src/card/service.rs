@@ -121,6 +121,9 @@ pub struct ServiceComponent {
     /// Canonical Card reference.
     #[serde(rename = "ref")]
     pub card_ref: Ref,
+    /// Eval and Drift cards that receive observations from this component in this Service.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub publishes_to: Vec<Ref>,
     /// Optional development-time source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ComponentSource>,

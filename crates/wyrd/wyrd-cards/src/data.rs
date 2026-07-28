@@ -963,7 +963,6 @@ fn data_spec_from_metadata(metadata: &DataCardMetadata, interface: RustDataInter
         target_columns: metadata.target_columns.clone(),
         sql: metadata.sql.clone(),
         stats: metadata.stats.clone(),
-        publishes_to: Vec::new(),
     }
 }
 

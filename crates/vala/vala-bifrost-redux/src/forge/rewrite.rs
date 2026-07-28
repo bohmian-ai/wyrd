@@ -16,6 +16,7 @@ use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSort
 use datafusion::physical_plan::execution_plan::{
     Boundedness, EmissionType, PlanProperties, SchedulingType,
 };
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -158,7 +159,7 @@ impl ForgeRewritePipeline {
                 detail: "Forge rewrite began with active spill files".to_owned(),
             });
         }
-        let mut stream = self.sorted_stream(&request)?;
+        let (mut stream, sort_metrics) = self.sorted_stream(&request)?;
         let mut output_paths = Vec::new();
         let mut files = Vec::new();
         let mut writer: Option<ArrowWriter<Vec<u8>>> = None;
@@ -241,6 +242,9 @@ impl ForgeRewritePipeline {
         }
         .await;
         drop(stream);
+        peak_spill_bytes = peak_spill_bytes.max(
+            u64::try_from(sort_metrics.spilled_bytes().unwrap_or_default()).unwrap_or(u64::MAX),
+        );
         self.finalize_rewrite(
             result,
             files,
@@ -303,7 +307,7 @@ impl ForgeRewritePipeline {
     fn sorted_stream(
         &self,
         request: &RewriteRequest<'_>,
-    ) -> Result<SendableRecordBatchStream, ForgeError> {
+    ) -> Result<(SendableRecordBatchStream, MetricsSet), ForgeError> {
         let source = Arc::new(StagingParquetExec::new(
             request.bin.files.clone(),
             request.binding.clone(),
@@ -349,7 +353,9 @@ impl ForgeRewritePipeline {
             datafusion::prelude::SessionConfig::new(),
             self.runtime.runtime(),
         );
-        execute_stream(sort, session.task_ctx()).map_err(ForgeError::DataFusion)
+        let metrics = sort.metrics().unwrap_or_default();
+        let stream = execute_stream(sort, session.task_ctx()).map_err(ForgeError::DataFusion)?;
+        Ok((stream, metrics))
     }
 
     /// Close, PUT, and derive Iceberg metadata for one rotated output.

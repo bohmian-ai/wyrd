@@ -1,7 +1,14 @@
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 use vala_bifrost_redux::maintenance::{StagingFileCommitted, StagingPublishOutcome};
-use wyrd_spec::vala::api::SyncQueryRequest;
+use wyrd_spec::DataTenantId;
+use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+use wyrd_spec::request_id::RequestId;
+use wyrd_spec::vala::api::{
+    AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeCompactionPhase,
+    StoragePath, SyncQueryRequest,
+};
 use wyrd_testing::bifrost::{
     BifrostHarness, seed_forge_group, seed_forge_group_for_tenant_with_schema_and_days,
 };
@@ -155,9 +162,9 @@ async fn journey_forge_scheduler_restart_preserves_reads_and_live_files() {
 
 #[tokio::test]
 #[ignore = "gated journey: active-day incremental compaction against shared Postgres and Iceberg"]
-/// Proves active-day rows are compacted from durable file-list state without
-/// waiting for the periodic age guard, using the public Forge handle and the
-/// authenticated physical tenant/table/day identity.
+/// Proves active-day rows compact without the periodic age guard and Oracle
+/// fails closed for a real prepared-without-terminal audit transition before
+/// returning exact rows after the matching terminal transition.
 ///
 /// # Errors
 ///
@@ -189,6 +196,33 @@ async fn active_partition_incremental_compaction() {
         .await
         .expect("exchange API key for JWT");
     let oracle_baseline = oracle_rows(server, &jwt).await;
+    let unresolved_operation = Uuid::now_v7();
+    append_oracle_fence_transition(
+        server,
+        tenant,
+        unresolved_operation,
+        "forge.file_compact.prepared",
+        ForgeCompactionPhase::Prepared,
+    )
+    .await;
+    assert_eq!(
+        oracle_status(server, &jwt).await,
+        reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+        "Oracle fails closed while the latest Forge operation is prepared"
+    );
+    append_oracle_fence_transition(
+        server,
+        tenant,
+        unresolved_operation,
+        "forge.file_compact.reset",
+        ForgeCompactionPhase::Reset,
+    )
+    .await;
+    assert_eq!(
+        oracle_rows(server, &jwt).await,
+        oracle_baseline,
+        "a matching terminal transition restores Oracle reads"
+    );
     let expected_oracle_rows = oracle_baseline + 36;
     let publishers = harness.server_forge_publishers();
     let mut generator = RandomTraceGenerator::from_seed_at(
@@ -517,4 +551,85 @@ async fn wait_for_oracle_rows(server: &WyrdTestServer, jwt: &str, expected: u64)
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+}
+
+/// Query the public Oracle endpoint without converting a fail-closed response.
+///
+/// # Panics
+///
+/// Panics when the HTTP request cannot be sent.
+async fn oracle_status(server: &WyrdTestServer, jwt: &str) -> reqwest::StatusCode {
+    let url = format!("{}/v1/query", server.base_url().expect("bound URL"));
+    reqwest::Client::new()
+        .post(url)
+        .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+        .json(&SyncQueryRequest {
+            sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
+                .to_owned(),
+            params: Vec::new(),
+        })
+        .send()
+        .await
+        .expect("Oracle request")
+        .status()
+}
+
+/// Append one real hash-chained Forge transition for Oracle fence classification.
+///
+/// The helper writes through `vala_sql::append_audit`, so the journey exercises
+/// the production JSON operation-ID projection and latest-transition SQL rather
+/// than only the pure classifier.
+///
+/// # Panics
+///
+/// Panics when a typed audit value is invalid or the tenant transaction cannot
+/// append and commit the requested transition.
+async fn append_oracle_fence_transition(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    operation_id: Uuid,
+    operation: &str,
+    phase: ForgeCompactionPhase,
+) {
+    let resource = format!("bifrost://{tenant}/vala.traces/spans");
+    let input_file_ids = vec![Uuid::from_u128(1), Uuid::from_u128(2)];
+    let detail = AuditDetail::ForgeCompaction {
+        operation_id,
+        phase,
+        group: resource.clone(),
+        input_file_ids,
+        input_paths: vec![
+            StoragePath::new("oracle-fence/input-1.parquet").expect("first input path"),
+            StoragePath::new("oracle-fence/input-2.parquet").expect("second input path"),
+        ],
+        output_paths: vec![StoragePath::new("oracle-fence/output.parquet").expect("output path")],
+        snapshot_id: None,
+        writer_recipe_version: "bifrost-writer-v1".to_owned(),
+    };
+    let event = AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource,
+        card_ref: None,
+        principal_id: PrincipalId::new(Uuid::nil()),
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost:forge".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: operation.to_owned(),
+        detail: Some(detail),
+    };
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
+        .tenant_conn(tenant)
+        .await
+        .expect("Oracle fence tenant connection");
+    vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
+        .await
+        .expect("append Oracle fence transition");
+    conn.commit().await.expect("commit Oracle fence transition");
 }

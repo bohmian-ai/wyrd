@@ -18,6 +18,7 @@
 //!   - String column name differences (start_time vs started_at, service_name vs service)
 //!     are resolved in the extraction layer in routes.rs.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -26,6 +27,7 @@ use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::{DataFrame, SessionContext, col, lit};
 use datafusion::scalar::ScalarValue;
+use uuid::Uuid;
 use vala_bifrost::BifrostNamespace;
 use vala_bifrost::error::BifrostError as EngineBifrostError;
 use vala_bifrost::session::wyrd_session_context;
@@ -33,11 +35,14 @@ use vala_bifrost_redux::catalog::{
     BifrostCatalogError as ReduxCatalogError, TableRef as ReduxTableRef, TenantTableBinding,
 };
 use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
+use vala_bifrost_redux::provider::ReduxTableProvider;
 use vala_bifrost_redux::scribe::seal_key::EventDay;
-use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
+use vala_bifrost_redux::scribe::stream_identity::StreamIdentity;
+use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService};
 use vala_bifrost_redux::scribe::wal::WalLsn;
 use vala_bifrost_redux::tables::builtin_table;
 use wyrd_runtime::{Action, Permission, Resource};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
     GetTraceRequest, MAX_QUERY_PAGE_SIZE, QueryAgentTracesRequest, QueryDriftRequest,
@@ -52,52 +57,520 @@ use crate::components::auth::Caller;
 /// Default time window for `GetTrace` and listing queries (F-08: no unbounded scans).
 pub(crate) const DEFAULT_WINDOW_DAYS: i64 = 7;
 
-/// Resolve the immutable WAL fence for one Scribe stream.
-///
-/// Forge stamps each sealed `file_list` row with the stream's `(node_id,
-/// writer_epoch)` identity and its maximum WAL position. Using that durable
-/// fence prevents Oracle's live-tail union from replaying rows already present
-/// in Iceberg after a seal. A stream with no sealed rows starts at LSN zero.
-///
-/// # Errors
-///
-/// Returns [`WyrdError::Internal`] when the operator pool is unavailable, the
-/// durable lookup fails, or a stored LSN cannot be represented as [`WalLsn`].
-async fn sealed_stream_lsn(
-    state: &AppState,
-    tenant: wyrd_spec::ids::DataTenantId,
-    binding: &TenantTableBinding,
-    stream: vala_bifrost_redux::scribe::stream_identity::StreamIdentity,
-) -> Result<WalLsn, WyrdError> {
-    let pool = state
-        .postgres
-        .operator_pool()
-        .ok_or_else(|| WyrdError::Internal {
-            message: "operator pool unavailable for Oracle WAL fence".to_owned(),
-            details: serde_json::Value::Null,
+/// One durable staging row included in Oracle's table publication token.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+struct OracleFilePublication {
+    /// Stable `vala.file_list` row identity.
+    id: Uuid,
+    /// Scribe node that owns the row's WAL sequence.
+    node_id: Uuid,
+    /// Scribe boot epoch that scopes the row's WAL sequence.
+    writer_epoch: i64,
+    /// First WAL position represented by the staged file.
+    wal_lsn_min: i64,
+    /// Last WAL position represented by the staged file.
+    wal_lsn_max: i64,
+    /// Whether Forge has claimed the row for compaction.
+    compacted: bool,
+    /// Iceberg snapshot that has published the row, when SQL stamping completed.
+    committed_snapshot_id: Option<i64>,
+}
+
+/// One ordered Forge audit transition used to classify unresolved cutovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+struct ForgeOperationTransition {
+    /// Stable compaction operation shared by prepared and terminal transitions.
+    operation_id: Uuid,
+    /// Whether this row is a prepared transition instead of a terminal transition.
+    is_prepared: bool,
+}
+
+/// Result of resolving ordered publication rows without assuming adjacent LSNs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OrderedPublication {
+    /// Highest published WAL position for the queried pod-local stream.
+    cutoff: WalLsn,
+    /// Whether a partial cutover, invalid row, or published-after-unpublished gap exists.
+    unresolved: bool,
+}
+
+/// Coherence token spanning Oracle's Iceberg-provider and hot-tail load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OracleFence {
+    /// Live-tail exclusion point derived from the local stream's published prefix.
+    cutoff: WalLsn,
+    /// Complete ordered table publication state observed in one SQL snapshot.
+    publication_rows: Vec<OracleFilePublication>,
+    /// Whether the ordered rows contain a publication gap or partial state.
+    unresolved_publication: bool,
+    /// Prepared Forge operations whose latest durable transition is not terminal.
+    unresolved_operations: Vec<Uuid>,
+}
+
+impl OracleFence {
+    /// Derive one fence token from ordered SQL rows and Forge transitions.
+    ///
+    /// The cutoff is local to `stream`, while publication-gap validation covers
+    /// every stream in the physical table. Numeric adjacency is intentionally
+    /// ignored because one WAL stream can interleave multiple tables and shards.
+    #[must_use]
+    fn derive(
+        publication_rows: Vec<OracleFilePublication>,
+        transitions: &[ForgeOperationTransition],
+        stream: StreamIdentity,
+    ) -> Self {
+        let publication = ordered_publication(&publication_rows, stream);
+        Self {
+            cutoff: publication.cutoff,
+            publication_rows,
+            unresolved_publication: publication.unresolved,
+            unresolved_operations: unresolved_prepared_operations(transitions),
+        }
+    }
+
+    /// Reject a token that cannot prove one complete Iceberg-plus-hot snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] for a publication gap, a partial SQL
+    /// stamp, or a prepared Forge operation without a matching latest terminal
+    /// transition.
+    fn require_resolved(&self) -> Result<(), WyrdError> {
+        if !self.unresolved_publication && self.unresolved_operations.is_empty() {
+            return Ok(());
+        }
+        Err(WyrdError::Internal {
+            message: "Oracle snapshot is awaiting Forge publication".to_owned(),
+            details: serde_json::json!({
+                "unresolved_publication": self.unresolved_publication,
+                "unresolved_operations": self.unresolved_operations,
+            }),
+        })
+    }
+
+    /// Require the post-provider token to match this pre-provider token exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when any table publication row, cutoff,
+    /// or unresolved-operation classification changed while the provider loaded.
+    fn require_unchanged(&self, after: &Self) -> Result<(), WyrdError> {
+        if self == after {
+            return Ok(());
+        }
+        Err(WyrdError::Internal {
+            message: "Oracle snapshot and publication fence changed during provider load"
+                .to_owned(),
+            details: serde_json::json!({
+                "before_cutoff": self.cutoff.as_u64(),
+                "after_cutoff": after.cutoff.as_u64(),
+            }),
+        })
+    }
+}
+
+/// Owns one table-scoped Oracle snapshot workflow and its live Scribe reader.
+struct OracleSnapshot<'a> {
+    /// Server state containing SQL, Redux catalog, and Scribe dependencies.
+    state: &'a AppState,
+    /// Authenticated tenant whose physical table is being queried.
+    tenant: DataTenantId,
+    /// Tenant-qualified physical table identity used by SQL and Scribe.
+    binding: TenantTableBinding,
+    /// Logical Redux table used to load the Iceberg provider.
+    table: ReduxTableRef,
+    /// Pod-local Scribe reader whose stream defines the live-tail cutoff.
+    tail: Option<FetchLiveTailService>,
+    /// First event day included in the bounded hot snapshot.
+    start_day: EventDay,
+    /// Last event day included in the bounded hot snapshot.
+    end_day: EventDay,
+}
+
+impl<'a> OracleSnapshot<'a> {
+    /// Build the snapshot owner for one authenticated table and bounded window.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when the physical binding is invalid or
+    /// the configured Scribe cannot construct its pod-local tail service.
+    fn new(
+        state: &'a AppState,
+        table: &ReduxTableRef,
+        tenant: DataTenantId,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<Self, WyrdError> {
+        let binding = TenantTableBinding::resolve((tenant, table.clone())).map_err(|error| {
+            WyrdError::Internal {
+                message: "invalid tenant table binding".to_owned(),
+                details: serde_json::json!({ "detail": error.to_string() }),
+            }
         })?;
-    let max_lsn: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(wal_lsn_max) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND node_id = $4 AND writer_epoch = $5",
-    )
-    .bind(tenant.as_uuid())
-    .bind(&binding.logical_namespace)
-    .bind(&binding.table_name)
-    .bind(stream.node_id.as_uuid())
-    .bind(stream.writer_epoch.as_i64())
-    .fetch_one(pool.pool())
-    .await
-    .map_err(|error| WyrdError::Internal {
-        message: "Oracle WAL fence lookup failed".to_owned(),
+        let tail = state
+            .bifrost_ingest
+            .as_ref()
+            .map(|runtime| runtime.scribe().tail_service())
+            .transpose()
+            .map_err(|error| WyrdError::Internal {
+                message: "Scribe hot-read service unavailable".to_owned(),
+                details: serde_json::json!({ "detail": error.to_string() }),
+            })?;
+        let now = Utc::now();
+        let start = since.unwrap_or_else(|| now - Duration::days(DEFAULT_WINDOW_DAYS));
+        let end = until.unwrap_or(now);
+        Ok(Self {
+            state,
+            tenant,
+            binding,
+            table: table.clone(),
+            tail,
+            start_day: EventDay::from_timestamp(start),
+            end_day: EventDay::from_timestamp(end),
+        })
+    }
+
+    /// Load the Redux Iceberg provider and hot tail under one stable fence.
+    ///
+    /// The method reads an actual SQL token before loading the hot batches and
+    /// Iceberg provider, then reads the token again. Either unresolved token or
+    /// any token change fails closed. Once the provider is built and the token
+    /// is stable, later commits are outside this query snapshot and are safe.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when SQL, Scribe, catalog, provider
+    /// construction, or fence validation fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation can stop the read between stages. No durable state changes,
+    /// and the read-only SQL transaction rolls back when dropped.
+    async fn load_provider(&self) -> Result<Option<ReduxTableProvider>, WyrdError> {
+        let before = self.load_fence().await?;
+        if let Some(fence) = &before {
+            fence.require_resolved()?;
+        }
+        let cutoff = before.as_ref().map_or(WalLsn::ZERO, |fence| fence.cutoff);
+        let hot_batches = self.fetch_hot_batches_after(cutoff).await?;
+        let catalog = self
+            .state
+            .bifrost_redux
+            .as_deref()
+            .ok_or_else(|| WyrdError::Internal {
+                message: "Redux Bifrost catalog is not configured".to_owned(),
+                details: serde_json::Value::Null,
+            })?;
+        let provider = match catalog
+            .provider_with_hot_batches(&self.table, self.tenant, hot_batches)
+            .await
+        {
+            Ok(provider) => Some(provider),
+            Err(ReduxCatalogError::TableNotFound(_)) => None,
+            Err(error) => {
+                return Err(WyrdError::Internal {
+                    message: "bifrost provider error".to_owned(),
+                    details: serde_json::json!({ "detail": error.to_string() }),
+                });
+            }
+        };
+        let after = self.load_fence().await?;
+        if let Some(fence) = &after {
+            fence.require_resolved()?;
+        }
+        match (&before, &after) {
+            (Some(before), Some(after)) => before.require_unchanged(after)?,
+            (None, None) => {}
+            _ => {
+                return Err(WyrdError::Internal {
+                    message: "Oracle Scribe availability changed during provider load".to_owned(),
+                    details: serde_json::Value::Null,
+                });
+            }
+        }
+        Ok(provider)
+    }
+
+    /// Read one repeatable SQL snapshot of table publication and Forge state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when the operator pool is unavailable,
+    /// transaction setup fails, SQL rows cannot be decoded, or commit fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation drops the read-only transaction without durable effects.
+    async fn load_fence(&self) -> Result<Option<OracleFence>, WyrdError> {
+        let Some(tail) = &self.tail else {
+            return Ok(None);
+        };
+        let pool = self
+            .state
+            .postgres
+            .operator_pool()
+            .ok_or_else(|| WyrdError::Internal {
+                message: "operator pool unavailable for Oracle WAL fence".to_owned(),
+                details: serde_json::Value::Null,
+            })?;
+        let mut transaction = pool.pool().begin().await.map_err(oracle_fence_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(oracle_fence_error)?;
+        let publication_rows = sqlx::query_as::<_, OracleFilePublication>(
+            "SELECT id, node_id, writer_epoch, wal_lsn_min, wal_lsn_max, compacted,
+                    committed_snapshot_id
+               FROM vala.file_list
+              WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
+              ORDER BY node_id, writer_epoch, wal_lsn_min, wal_lsn_max, id",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(&self.binding.logical_namespace)
+        .bind(&self.binding.table_name)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(oracle_fence_error)?;
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            self.tenant, self.binding.logical_namespace, self.binding.table_name
+        );
+        let transitions = sqlx::query_as::<_, ForgeOperationTransition>(
+            "SELECT (detail::jsonb ->> 'operation_id')::uuid AS operation_id,
+                    operation = 'forge.file_compact.prepared' AS is_prepared
+               FROM vala.audit_outbox
+              WHERE data_tenant_id = $1 AND resource = $2
+                AND operation IN (
+                    'forge.file_compact.prepared',
+                    'forge.file_compact.committed',
+                    'forge.file_compact.recovered',
+                    'forge.file_compact.reset'
+                )
+              ORDER BY seq",
+        )
+        .bind(self.tenant.as_uuid())
+        .bind(resource)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(oracle_fence_error)?;
+        transaction.commit().await.map_err(oracle_fence_error)?;
+        Ok(Some(OracleFence::derive(
+            publication_rows,
+            &transitions,
+            tail.stream(),
+        )))
+    }
+
+    /// Fetch direct Arrow handles newer than the supplied published cutoff.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WyrdError::Internal`] when the pod-local Scribe snapshot fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation abandons the in-memory snapshot request without durable
+    /// effects.
+    async fn fetch_hot_batches_after(
+        &self,
+        cutoff: WalLsn,
+    ) -> Result<Vec<arrow::record_batch::RecordBatch>, WyrdError> {
+        let Some(tail) = &self.tail else {
+            return Ok(Vec::new());
+        };
+        if self.start_day > self.end_day {
+            return Ok(Vec::new());
+        }
+        let request = FetchLiveTailRequest {
+            binding: self.binding.clone(),
+            target_stream: tail.stream(),
+            start_day: self.start_day,
+            end_day: self.end_day,
+            after_lsn: cutoff,
+            required_columns: Vec::new(),
+        };
+        tail.fetch_hot_batches(request)
+            .await
+            .map(|batches| batches.into_iter().map(|batch| batch.rows).collect())
+            .map_err(|error| WyrdError::Internal {
+                message: "Scribe hot-read failed".to_owned(),
+                details: serde_json::json!({ "detail": error.to_string() }),
+            })
+    }
+}
+
+/// Resolve the published prefix for every ordered stream and the local cutoff.
+///
+/// A normal unpublished tail blocks later rows in only its own stream. Numeric
+/// gaps are accepted because WAL positions can belong to other tables or
+/// shards. A published row after that barrier, a partial snapshot stamp, or an
+/// invalid WAL range marks the table unresolved.
+#[must_use]
+fn ordered_publication(
+    rows: &[OracleFilePublication],
+    local_stream: StreamIdentity,
+) -> OrderedPublication {
+    let mut blocked_by_stream = BTreeMap::<(Uuid, i64), bool>::new();
+    let mut cutoff = WalLsn::ZERO;
+    let mut unresolved = false;
+    for row in rows {
+        let stream = (row.node_id, row.writer_epoch);
+        let blocked = blocked_by_stream.entry(stream).or_default();
+        let valid_lsn = row.wal_lsn_min >= 0
+            && row.wal_lsn_max >= row.wal_lsn_min
+            && u64::try_from(row.wal_lsn_max).is_ok();
+        match (row.compacted, row.committed_snapshot_id) {
+            (true, Some(_)) if valid_lsn => {
+                if *blocked {
+                    unresolved = true;
+                } else if row.node_id == local_stream.node_id.as_uuid()
+                    && row.writer_epoch == local_stream.writer_epoch.as_i64()
+                {
+                    let published_lsn = u64::try_from(row.wal_lsn_max)
+                        .expect("validated non-negative WAL LSN must fit u64");
+                    cutoff = WalLsn::new(cutoff.as_u64().max(published_lsn));
+                }
+            }
+            (false, None) if valid_lsn => {
+                *blocked = true;
+            }
+            _ => {
+                *blocked = true;
+                unresolved = true;
+            }
+        }
+    }
+    OrderedPublication { cutoff, unresolved }
+}
+
+/// Return operations whose latest ordered audit transition remains prepared.
+#[must_use]
+fn unresolved_prepared_operations(transitions: &[ForgeOperationTransition]) -> Vec<Uuid> {
+    let mut latest = BTreeMap::new();
+    for transition in transitions {
+        latest.insert(transition.operation_id, transition.is_prepared);
+    }
+    latest
+        .into_iter()
+        .filter_map(|(operation_id, is_prepared)| is_prepared.then_some(operation_id))
+        .collect()
+}
+
+/// Map one SQL fence failure to the fail-closed Oracle error.
+fn oracle_fence_error(error: sqlx::Error) -> WyrdError {
+    WyrdError::Internal {
+        message: "Oracle publication fence lookup failed".to_owned(),
         details: serde_json::json!({ "detail": error.to_string() }),
-    })?;
-    let Some(max_lsn) = max_lsn else {
-        return Ok(WalLsn::ZERO);
+    }
+}
+
+/// Pure regression tests for ordered publication and fence-token invariants.
+#[cfg(test)]
+mod oracle_fence_tests {
+    use super::{
+        ForgeOperationTransition, OracleFence, OracleFilePublication, ordered_publication,
+        unresolved_prepared_operations,
     };
-    let max_lsn = u64::try_from(max_lsn).map_err(|error| WyrdError::Internal {
-        message: "Oracle WAL fence is invalid".to_owned(),
-        details: serde_json::json!({ "wal_lsn_max": max_lsn, "detail": error.to_string() }),
-    })?;
-    Ok(WalLsn::new(max_lsn))
+    use uuid::Uuid;
+    use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
+    use vala_bifrost_redux::scribe::wal::WalLsn;
+
+    /// Build one deterministic stream identity for pure fence tests.
+    fn stream(node: Uuid, epoch: i64) -> StreamIdentity {
+        StreamIdentity::new(NodeId::new(node), WriterEpoch::new(epoch))
+    }
+
+    /// Build one publication row with deterministic identity and state.
+    fn row(
+        id: u128,
+        node_id: Uuid,
+        epoch: i64,
+        min: i64,
+        max: i64,
+        compacted: bool,
+        snapshot: Option<i64>,
+    ) -> OracleFilePublication {
+        OracleFilePublication {
+            id: Uuid::from_u128(id),
+            node_id,
+            writer_epoch: epoch,
+            wal_lsn_min: min,
+            wal_lsn_max: max,
+            compacted,
+            committed_snapshot_id: snapshot,
+        }
+    }
+
+    /// Published rows advance through numeric WAL gaps until the first unpublished row.
+    #[test]
+    fn ordered_prefix_ignores_numeric_adjacency_and_stops_at_unpublished_tail() {
+        let node = Uuid::from_u128(1);
+        let rows = vec![
+            row(1, node, 7, 1, 3, true, Some(10)),
+            row(2, node, 7, 9, 12, true, Some(11)),
+            row(3, node, 7, 20, 24, false, None),
+        ];
+        let publication = ordered_publication(&rows, stream(node, 7));
+        assert_eq!(publication.cutoff.as_u64(), 12);
+        assert!(!publication.unresolved);
+    }
+
+    /// A published row after an earlier unpublished table row fails closed.
+    #[test]
+    fn ordered_publication_rejects_published_row_after_gap() {
+        let node = Uuid::from_u128(2);
+        let rows = vec![
+            row(1, node, 9, 1, 3, false, None),
+            row(2, node, 9, 10, 14, true, Some(12)),
+        ];
+        let publication = ordered_publication(&rows, stream(node, 9));
+        assert_eq!(publication.cutoff, WalLsn::ZERO);
+        assert!(publication.unresolved);
+    }
+
+    /// Latest-transition classification treats a retried prepared operation as unresolved.
+    #[test]
+    fn latest_prepared_transition_is_unresolved_after_an_older_terminal() {
+        let operation_id = Uuid::from_u128(20);
+        let transitions = [
+            ForgeOperationTransition {
+                operation_id,
+                is_prepared: true,
+            },
+            ForgeOperationTransition {
+                operation_id,
+                is_prepared: false,
+            },
+            ForgeOperationTransition {
+                operation_id,
+                is_prepared: true,
+            },
+        ];
+        assert_eq!(
+            unresolved_prepared_operations(&transitions),
+            vec![operation_id]
+        );
+    }
+
+    /// Any publication-state change produces a different coherence token.
+    #[test]
+    fn fence_token_change_fails_coherence_validation() {
+        let node = Uuid::from_u128(3);
+        let before = OracleFence::derive(
+            vec![row(1, node, 4, 1, 3, true, Some(10))],
+            &[],
+            stream(node, 4),
+        );
+        let after = OracleFence::derive(
+            vec![
+                row(1, node, 4, 1, 3, true, Some(10)),
+                row(2, node, 4, 8, 9, false, None),
+            ],
+            &[],
+            stream(node, 4),
+        );
+        assert!(before.require_unchanged(&after).is_err());
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -115,60 +588,47 @@ pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
         .min(MAX_QUERY_PAGE_SIZE)
 }
 
-/// Fetch the bounded active/immutable Scribe tail for one query table.
-pub(crate) async fn fetch_hot_batches(
+/// Load one Redux provider through the coherent Oracle snapshot workflow.
+///
+/// This narrow module adapter keeps existing query-service callers from
+/// constructing or observing the private [`OracleSnapshot`] owner.
+///
+/// # Errors
+///
+/// Returns [`WyrdError::Internal`] when the SQL fence, hot Scribe snapshot,
+/// Iceberg provider, or post-load coherence validation fails.
+///
+/// # Cancellation
+///
+/// Cancellation abandons read-only SQL and provider work without durable
+/// effects.
+pub(crate) async fn load_redux_provider_with_fence(
     state: &AppState,
     table: &ReduxTableRef,
-    tenant: wyrd_spec::ids::DataTenantId,
+    tenant: DataTenantId,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, WyrdError> {
-    let Some(scribe) = state
-        .bifrost_ingest
-        .as_ref()
-        .map(|runtime| runtime.scribe())
-    else {
-        return Ok(Vec::new());
-    };
-    let now = Utc::now();
-    let start = since.unwrap_or_else(|| now - Duration::days(DEFAULT_WINDOW_DAYS));
-    let end = until.unwrap_or(now);
-    if start > end {
-        return Ok(Vec::new());
-    }
-    let binding = TenantTableBinding::resolve((tenant, table.clone())).map_err(|error| {
-        WyrdError::Internal {
-            message: "invalid tenant table binding".to_owned(),
-            details: serde_json::json!({ "detail": error.to_string() }),
-        }
-    })?;
-    let service = scribe.tail_service().map_err(|error| WyrdError::Internal {
-        message: "Scribe hot-read service unavailable".to_owned(),
-        details: serde_json::json!({ "detail": error.to_string() }),
-    })?;
-    let stream = service.stream();
-    let after_lsn = sealed_stream_lsn(state, tenant, &binding, stream).await?;
-    let request = FetchLiveTailRequest {
-        binding,
-        target_stream: stream,
-        start_day: EventDay::from_timestamp(start),
-        end_day: EventDay::from_timestamp(end),
-        after_lsn,
-        required_columns: Vec::new(),
-    };
-    service
-        .fetch_hot_batches(request)
+) -> Result<Option<ReduxTableProvider>, WyrdError> {
+    OracleSnapshot::new(state, table, tenant, since, until)?
+        .load_provider()
         .await
-        .map(|batches| batches.into_iter().map(|batch| batch.rows).collect())
-        .map_err(|error| WyrdError::Internal {
-            message: "Scribe hot-read failed".to_owned(),
-            details: serde_json::json!({ "detail": error.to_string() }),
-        })
 }
 
-/// Register a domain table provider in `ctx`. A missing table (not yet materialized)
-/// is silently skipped — DataFusion planning will surface the error if the table is
-/// actually referenced.
+/// Register one coherent Redux domain-table provider in `ctx`.
+///
+/// A missing physical table receives the built-in empty schema when available;
+/// otherwise registration is skipped and DataFusion planning surfaces a
+/// referenced-table error.
+///
+/// # Errors
+///
+/// Returns [`WyrdError`] when namespace resolution, Oracle snapshot loading, or
+/// DataFusion registration fails.
+///
+/// # Cancellation
+///
+/// Cancellation abandons read-only SQL, Scribe, Iceberg, and DataFusion setup
+/// without durable effects.
 async fn attach_redux_table_provider(
     ctx: &SessionContext,
     state: &AppState,
@@ -183,39 +643,23 @@ async fn attach_redux_table_provider(
             details: serde_json::json!({ "namespace": ns.as_str() }),
         })?;
     let table = ReduxTableRef::new(redux_ns, table_name);
-    let hot_batches =
-        fetch_hot_batches(state, &table, scope.tenant, scope.since, scope.until).await?;
-    let catalog = state
-        .bifrost_redux
-        .as_deref()
-        .ok_or_else(|| WyrdError::Internal {
-            message: "Redux Bifrost catalog is not configured".to_owned(),
-            details: serde_json::Value::Null,
-        })?;
-    match catalog
-        .provider_with_hot_batches(&table, scope.tenant, hot_batches)
-        .await
+    match load_redux_provider_with_fence(state, &table, scope.tenant, scope.since, scope.until)
+        .await?
     {
-        Ok(provider) => {
+        Some(provider) => {
             ctx.register_table(TableReference::bare(scope.fqn), Arc::new(provider))
                 .map_err(|e| WyrdError::Internal {
                     message: "failed to register domain table".to_owned(),
                     details: serde_json::json!({ "detail": e.to_string() }),
                 })?;
         }
-        Err(ReduxCatalogError::TableNotFound(_)) => {
+        None => {
             let Some(definition) = builtin_table(segment, table_name) else {
                 return Ok(());
             };
             let empty = MemTable::try_new((definition.schema)(), vec![vec![]]).map_err(df_err)?;
             ctx.register_table(TableReference::bare(scope.fqn), Arc::new(empty))
                 .map_err(df_err)?;
-        }
-        Err(error) => {
-            return Err(WyrdError::Internal {
-                message: "bifrost provider error".to_owned(),
-                details: serde_json::json!({ "detail": error.to_string() }),
-            });
         }
     }
     Ok(())

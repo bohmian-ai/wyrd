@@ -29,45 +29,54 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
     }
 }
 
-/// Build the active backend signer.
+/// Build the active backend signer in a cloud-enabled build.
+///
+/// Cloud backends may perform SDK setup and boot probing, so this variant
+/// awaits the backend-specific construction IO. Local construction remains
+/// synchronous inside the same future.
 ///
 /// # Errors
 /// Returns a storage error when SDK construction or boot probing fails.
+#[cfg(feature = "cloud")]
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
     match backend {
         BackendConfig::Local { root } => {
-            #[cfg(not(feature = "cloud"))]
-            std::future::ready(()).await;
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))
         }
-        #[cfg(feature = "cloud")]
         BackendConfig::S3(config) => Ok(BackendSigner::Cloud(Box::new(
             crate::cloud::CloudSigner::S3(s3::build_signer(config).await?),
         ))),
-        #[cfg(feature = "cloud")]
         BackendConfig::Gcs(config) => Ok(BackendSigner::Cloud(Box::new(
             crate::cloud::CloudSigner::Gcs(gcs::build_signer(config).await?),
         ))),
-        #[cfg(feature = "cloud")]
         BackendConfig::Azure(config) => Ok(BackendSigner::Cloud(Box::new(
             crate::cloud::CloudSigner::Azure(azure::build_signer(config).await?),
         ))),
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::S3(_) => {
-            std::future::ready(()).await;
-            Err(cloud_disabled(backend))
-        }
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::Gcs(_) => {
-            std::future::ready(()).await;
-            Err(cloud_disabled(backend))
-        }
-        #[cfg(not(feature = "cloud"))]
-        BackendConfig::Azure(_) => {
-            std::future::ready(()).await;
-            Err(cloud_disabled(backend))
-        }
     }
+}
+
+/// Build the active backend signer in a build without cloud support.
+///
+/// The returned immediately-ready future preserves the awaitable factory API
+/// without creating an asynchronous state machine for local construction or a
+/// deterministic cloud-capability error.
+///
+/// # Errors
+/// Returns a storage error when local signer construction fails or a cloud
+/// backend is selected without the `cloud` feature.
+#[cfg(not(feature = "cloud"))]
+pub fn build_signer(
+    backend: &BackendConfig,
+) -> std::future::Ready<Result<BackendSigner, StorageError>> {
+    let result = match backend {
+        BackendConfig::Local { root } => {
+            local::build_signer(root.clone()).map(BackendSigner::Local)
+        }
+        BackendConfig::S3(_) | BackendConfig::Gcs(_) | BackendConfig::Azure(_) => {
+            Err(cloud_disabled(backend))
+        }
+    };
+    std::future::ready(result)
 }
 
 fn finish_op<B: opendal::Builder>(

@@ -76,12 +76,12 @@ impl BackendSigner {
         }
     }
 
-    /// Presign one multipart part URL.
+    /// Presign one multipart part URL in a cloud-enabled build.
     ///
     /// # Errors
     /// Returns [`StorageError::BackendCapabilityMismatch`] for backends that do
-    /// not use per-part presigning.
-    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
+    /// not use per-part presigning, or a backend error when cloud signing fails.
+    #[cfg(feature = "cloud")]
     pub async fn presign_part(
         &self,
         path: &ValidatedPath,
@@ -96,15 +96,33 @@ impl BackendSigner {
                     .presign_part(path, backend_upload_id, part_number, ttl)
                     .await
             }
-            Self::Local(_) => {
-                #[cfg(not(feature = "cloud"))]
-                std::future::ready((path, backend_upload_id, part_number, ttl)).await;
-                Err(StorageError::BackendCapabilityMismatch {
-                    signer: self.kind(),
-                    op: "presign_part",
-                })
-            }
+            Self::Local(_) => Err(StorageError::BackendCapabilityMismatch {
+                signer: self.kind(),
+                op: "presign_part",
+            }),
         }
+    }
+
+    /// Presign one multipart part URL in a build without cloud support.
+    ///
+    /// No local backend uses per-part presigning, so this returns the typed
+    /// capability error in an immediately-ready future while preserving the
+    /// awaitable signer API.
+    ///
+    /// # Errors
+    /// Always returns [`StorageError::BackendCapabilityMismatch`].
+    #[cfg(not(feature = "cloud"))]
+    pub fn presign_part(
+        &self,
+        _path: &ValidatedPath,
+        _backend_upload_id: &str,
+        _part_number: u32,
+        _ttl: Duration,
+    ) -> std::future::Ready<Result<String, StorageError>> {
+        std::future::ready(Err(StorageError::BackendCapabilityMismatch {
+            signer: self.kind(),
+            op: "presign_part",
+        }))
     }
 
     /// Complete a server-side finalization step.
@@ -143,27 +161,39 @@ impl BackendSigner {
         }
     }
 
-    /// Abort a multipart upload.
+    /// Abort a multipart upload in a cloud-enabled build.
     ///
     /// # Errors
     /// Returns a backend error when abort fails. GCS returns a capability
     /// mismatch because its resumable session URI is bearer-equivalent and is
     /// not persisted server-side.
-    #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
+    #[cfg(feature = "cloud")]
     pub async fn abort_multipart(
         &self,
         path: &ValidatedPath,
         backend_upload_id: &str,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Local(_) => {
-                #[cfg(not(feature = "cloud"))]
-                std::future::ready((path, backend_upload_id)).await;
-                Ok(())
-            }
+            Self::Local(_) => Ok(()),
             #[cfg(feature = "cloud")]
             Self::Cloud(cloud) => cloud.abort_multipart(path, backend_upload_id).await,
         }
+    }
+
+    /// Abort a multipart upload in a build without cloud support.
+    ///
+    /// Local uploads do not create remote multipart sessions, so abort is a
+    /// deterministic no-op returned through an immediately-ready future.
+    ///
+    /// # Errors
+    /// This operation does not fail for the local backend.
+    #[cfg(not(feature = "cloud"))]
+    pub fn abort_multipart(
+        &self,
+        _path: &ValidatedPath,
+        _backend_upload_id: &str,
+    ) -> std::future::Ready<Result<(), StorageError>> {
+        std::future::ready(Ok(()))
     }
 
     /// Presign a GET URL.

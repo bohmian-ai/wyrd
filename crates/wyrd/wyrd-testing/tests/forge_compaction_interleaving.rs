@@ -692,19 +692,48 @@ async fn forge_incremental_interleaving() {
                 .await,
         1
     );
+    let mut cancel_fixture = hinted.clone();
+    cancel_fixture
+        .append_forge_file_with_rows(2, 3_200_000)
+        .await;
+    let control = ForgeObjectStoreControl::new(Arc::clone(&cancel_fixture.staging));
+    let barrier = OutputPutBarrier::new(control);
+    cancel_fixture.object_store = barrier.clone();
+    let mut cancel_config = cancel_fixture.config.clone();
+    cancel_config.output_file_bytes = 1;
+    let (cancel_forge, cancel_publisher) = cancel_fixture
+        .context_with_constrained_memory_and_publisher(cancel_config, 16 * 1024 * 1024);
+    cancel_publisher
+        .try_publish(StagingFileCommitted::new(
+            cancel_fixture.binding.clone(),
+            day,
+        ))
+        .expect("cancel hint published");
+    let baseline_memory = cancel_fixture.memory_snapshot();
     let cancel_stop = CancellationToken::new();
-    let cancel_forge = hinted.context_with_config(hinted.config.clone());
     let cancel_task = tokio::spawn({
         let stop = cancel_stop.clone();
         async move { cancel_forge.run(stop).await }
     });
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_reached())
+        .await
+        .expect("rewrite reached output while spill active");
+    assert!(
+        !cancel_fixture.spill_root_is_empty(),
+        "spill must be active"
+    );
     cancel_stop.cancel();
+    barrier.release();
     tokio::time::timeout(Duration::from_secs(3), cancel_task)
         .await
         .expect("cancelled Forge shutdown bound")
         .expect("cancelled Forge")
         .expect("cancelled Forge shutdown");
+    assert!(cancel_fixture.spill_root_is_empty());
+    assert_eq!(
+        cancel_fixture.memory_snapshot().bifrost_total_bytes,
+        baseline_memory.bifrost_total_bytes
+    );
     server.shutdown().await.expect("server shutdown");
 }
 

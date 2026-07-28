@@ -96,10 +96,14 @@ impl BackendSigner {
                     .presign_part(path, backend_upload_id, part_number, ttl)
                     .await
             }
-            Self::Local(_) => Err(StorageError::BackendCapabilityMismatch {
-                signer: self.kind(),
-                op: "presign_part",
-            }),
+            Self::Local(_) => {
+                #[cfg(not(feature = "cloud"))]
+                std::future::ready((path, backend_upload_id, part_number, ttl)).await;
+                Err(StorageError::BackendCapabilityMismatch {
+                    signer: self.kind(),
+                    op: "presign_part",
+                })
+            }
         }
     }
 
@@ -152,7 +156,11 @@ impl BackendSigner {
         backend_upload_id: &str,
     ) -> Result<(), StorageError> {
         match self {
-            Self::Local(_) => Ok(()),
+            Self::Local(_) => {
+                #[cfg(not(feature = "cloud"))]
+                std::future::ready((path, backend_upload_id)).await;
+                Ok(())
+            }
             #[cfg(feature = "cloud")]
             Self::Cloud(cloud) => cloud.abort_multipart(path, backend_upload_id).await,
         }

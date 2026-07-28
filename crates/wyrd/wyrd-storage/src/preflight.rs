@@ -13,4 +13,6 @@ pub async fn run(signer: &BackendSigner) {
     if let BackendSigner::Cloud(cloud) = signer {
         cloud.preflight().await;
     }
+    #[cfg(not(feature = "cloud"))]
+    std::future::ready(signer).await;
 }

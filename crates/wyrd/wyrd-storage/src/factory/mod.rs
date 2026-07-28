@@ -36,6 +36,8 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
     match backend {
         BackendConfig::Local { root } => {
+            #[cfg(not(feature = "cloud"))]
+            std::future::ready(()).await;
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))
         }
         #[cfg(feature = "cloud")]
@@ -51,11 +53,20 @@ pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, Stor
             crate::cloud::CloudSigner::Azure(azure::build_signer(config).await?),
         ))),
         #[cfg(not(feature = "cloud"))]
-        BackendConfig::S3(_) => Err(cloud_disabled(backend)),
+        BackendConfig::S3(_) => {
+            std::future::ready(()).await;
+            Err(cloud_disabled(backend))
+        }
         #[cfg(not(feature = "cloud"))]
-        BackendConfig::Gcs(_) => Err(cloud_disabled(backend)),
+        BackendConfig::Gcs(_) => {
+            std::future::ready(()).await;
+            Err(cloud_disabled(backend))
+        }
         #[cfg(not(feature = "cloud"))]
-        BackendConfig::Azure(_) => Err(cloud_disabled(backend)),
+        BackendConfig::Azure(_) => {
+            std::future::ready(()).await;
+            Err(cloud_disabled(backend))
+        }
     }
 }
 

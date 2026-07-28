@@ -715,6 +715,7 @@ async fn precommit_and_commit_failure_publish_no_hint() {
     ));
 
     retry_and_wait(&fixture).await;
+    let _ = hint_outcome(&mut fixture);
     fixture.faults.fail_next_sql_commit();
     append_one(&fixture, "commit_hint_events", 2).await;
     fixture

@@ -931,7 +931,7 @@ mod pg_tests {
         let vala = crate::test_support::test_vala_postgres().await;
         let operator_pool: OperatorPool = crate::test_support::test_operator_pool().await;
         let (publisher, inbox) = staging_file_channel(16).expect("hint channel");
-        let memory = BifrostMemoryGovernor::new(256 * 1024 * 1024).expect("memory governor");
+        let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
         let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
         let config = ForgeConfig {
             max_hints_per_wake: 16,

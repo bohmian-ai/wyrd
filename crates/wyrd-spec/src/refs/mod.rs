@@ -288,7 +288,7 @@ impl Visit for ServiceSpec {
     {
         for (i, component) in self.components.iter_mut().enumerate() {
             f(SlotEntry {
-                path: format!("spec.components[{}].card_ref", i),
+                path: format!("spec.components[{i}].ref"),
                 value: SlotValue::Durable(&mut component.card_ref),
             });
             visit_publishes_to(
@@ -758,6 +758,10 @@ mod completeness_tests {
         assert!(
             visit_paths(Spec::Service(service.clone()))
                 .contains(&("spec.components[0].publishes_to[0]".to_owned(), "durable"))
+        );
+        assert!(
+            visit_paths(Spec::Service(service.clone()))
+                .contains(&("spec.components[0].ref".to_owned(), "durable"))
         );
 
         let _ = (

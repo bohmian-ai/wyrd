@@ -703,12 +703,13 @@ async fn forge_incremental_interleaving() {
     cancel_config.output_file_bytes = 1;
     let (cancel_forge, cancel_publisher) = cancel_fixture
         .context_with_constrained_memory_and_publisher(cancel_config, 16 * 1024 * 1024);
-    cancel_publisher
-        .try_publish(StagingFileCommitted::new(
+    assert_eq!(
+        cancel_publisher.try_publish(StagingFileCommitted::new(
             cancel_fixture.binding.clone(),
             day,
-        ))
-        .expect("cancel hint published");
+        )),
+        StagingPublishOutcome::Published
+    );
     let baseline_memory = cancel_fixture.memory_snapshot();
     let cancel_stop = CancellationToken::new();
     let cancel_task = tokio::spawn({

@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -145,28 +144,27 @@ class RuntimeServiceFixture:
         api_key: str | None = None,
         check: bool = True,
     ) -> dict[str, Any]:
-        previous = {key: os.environ.get(key) for key in ("WYRD_SERVER_URL", "WYRD_API_KEY")}
-        os.environ.update(
+        environment = os.environ.copy()
+        environment.update(
             WYRD_SERVER_URL=server.base_url,
             WYRD_API_KEY=api_key or writer_api_key(server),
         )
-        old, sys.argv = sys.argv, ["wyrd", *arguments]
-        out, err = io.StringIO(), io.StringIO()
-        try:
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = wyrd.run_wyrd_cli()
-        finally:
-            sys.argv = old
-            for key, value in previous.items():
-                (
-                    os.environ.__setitem__(key, value)
-                    if value is not None
-                    else os.environ.pop(key, None)
-                )
+        executable = Path(sys.executable).with_name("wyrd")
+        completed = subprocess.run(
+            [str(executable), *arguments],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         if not check:
-            return {"code": code, "stdout": out.getvalue(), "stderr": err.getvalue()}
-        assert code == 0, err.getvalue() or out.getvalue()
-        return json.loads(out.getvalue())
+            return {
+                "code": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+        return json.loads(completed.stdout)
 
 
 def writer_api_key(server: WyrdTestServer) -> str:

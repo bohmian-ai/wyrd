@@ -535,6 +535,14 @@ impl ForgeRewritePipeline {
         );
         let schema = Arc::clone(&request.schema);
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
+        let clone_reservation =
+            datafusion::execution::memory_pool::MemoryConsumer::new("forge-rewrite-batch-clone")
+                .register(&self.runtime.runtime.memory_pool);
+        clone_reservation
+            .try_grow(batch.get_array_memory_size())
+            .map_err(|error| ForgeError::Invariant {
+                detail: format!("Forge batch clone reservation rejected batch: {error}"),
+            })?;
         let batch = batch.clone();
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -544,6 +552,7 @@ impl ForgeRewritePipeline {
         };
         let join = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            let _clone_reservation = clone_reservation;
             let result = detached.write_batch(&schema, &iceberg_schema, &batch);
             (detached, result)
         });
@@ -587,8 +596,10 @@ impl ForgeRewritePipeline {
     ///
     /// # Cancellation
     ///
-    /// Cancellation is checked before the PUT. Earlier finalized paths remain
-    /// in `state` for cleanup.
+    /// Cancellation is checked before the PUT and while the bounded blocking
+    /// finalization task runs. On cancellation, that task is always joined so
+    /// no writer, permit, or metadata buffer is detached; earlier finalized
+    /// paths remain in `state` for cleanup.
     async fn rotate_output(
         &self,
         state: &mut RewriteBatchState,
@@ -866,7 +877,17 @@ impl ForgeRewritePipeline {
             }
             Ok::<_, ForgeError>((bytes, file, operation_id))
         });
-        let (bytes, file, _) = join.await.map_err(|error| ForgeError::Invariant {
+        tokio::pin!(join);
+        let finalized = tokio::select! {
+            result = &mut join => result,
+            () = stop.cancelled() => {
+                // The blocking task is never detached: reclaim its result before
+                // returning cancellation, so its permits and buffers are dropped.
+                let _ = (&mut join).await;
+                return Err(ForgeError::Shutdown);
+            }
+        };
+        let (bytes, file, _) = finalized.map_err(|error| ForgeError::Invariant {
             detail: format!("Forge output finalization task failed: {error}"),
         })??;
         if catalog_path_to_object_key(request.table_location, request.binding, file.file_path())

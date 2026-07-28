@@ -938,9 +938,12 @@ mod pg_tests {
             ..ForgeConfig::default()
         };
         let spill = Box::leak(Box::new(tempdir().expect("spill directory")));
-        let rewrite_runtime =
-            ForgeRewriteRuntime::new(query_memory, spill.path(), config.spill_limit_bytes)
-                .expect("rewrite runtime");
+        let rewrite_runtime = ForgeRewriteRuntime::new(
+            Arc::clone(&query_memory),
+            spill.path(),
+            config.spill_limit_bytes,
+        )
+        .expect("rewrite runtime");
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
@@ -958,7 +961,13 @@ mod pg_tests {
             })
             .expect("Forge"),
         );
-        (state.with_bifrost_redux(redux).with_forge(forge), publisher)
+        (
+            state
+                .with_bifrost_redux(redux)
+                .with_bifrost_memory_pool(memory, query_memory)
+                .with_forge(forge),
+            publisher,
+        )
     }
 
     /// Production-shaped boot retains one Forge allocation for state and supervision.
@@ -966,10 +975,19 @@ mod pg_tests {
     async fn forge_is_composed_once_and_supervised_directly() {
         let (state, _publisher) = composed_test_state().await;
         let retained = state.forge_handle().expect("retained Forge").clone();
+        let retained_pool = state
+            .bifrost_query_memory
+            .as_ref()
+            .expect("retained query pool")
+            .clone();
         let shutdown = CancellationToken::new();
         let supervised =
             spawn_maintenance_scheduler(&state, shutdown.clone()).expect("Forge supervisor future");
         assert!(Arc::ptr_eq(&retained, state.forge_handle().expect("Forge")));
+        assert!(Arc::ptr_eq(
+            &retained_pool,
+            state.bifrost_query_memory.as_ref().expect("query pool")
+        ));
         let task = tokio::spawn(supervised);
         tokio::task::yield_now().await;
         shutdown.cancel();

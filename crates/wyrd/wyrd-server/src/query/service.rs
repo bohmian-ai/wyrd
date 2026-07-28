@@ -25,6 +25,7 @@ use vala_bifrost::session::{
     wyrd_session_context, wyrd_session_context_with_memory, wyrd_session_context_with_pool,
 };
 use vala_bifrost::{BifrostNamespace, SchemaFingerprint};
+use vala_bifrost_redux::catalog::BifrostCatalogError as ReduxCatalogError;
 use vala_bifrost_redux::catalog::TableRef as ReduxTableRef;
 use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
 use vala_bifrost_redux::tables::builtin_table;
@@ -44,7 +45,7 @@ use crate::bifrost::convert;
 use crate::components::auth::Caller;
 use crate::http::error::permission_deny_reason_to_wyrd;
 use crate::query::floor;
-use crate::vala_query::service::load_redux_provider_with_fence;
+use crate::vala_query::service::fetch_hot_batches;
 
 /// Materialized sync-query result: the Arrow IPC stream plus the header metadata
 /// the axum adapter stamps onto the response.
@@ -136,16 +137,16 @@ fn ipc_error(error: arrow::error::ArrowError) -> WyrdError {
     }
 }
 
-/// Register one coherently fenced Redux provider for a SQL table reference.
+/// Register one tenant-qualified Redux provider for a SQL table reference.
 ///
-/// The provider and its Scribe hot union load through the shared Oracle
-/// snapshot workflow. A missing physical table receives its built-in empty
-/// schema when available.
+/// The provider includes the bounded Scribe hot tail, matching the typed Vala
+/// query service. A missing physical table receives its built-in empty schema
+/// when available; no Oracle snapshot or publication fence is required.
 ///
 /// # Errors
 ///
-/// Returns [`WyrdError`] when namespace resolution, Oracle fence validation,
-/// provider construction, or DataFusion registration fails.
+/// Returns [`WyrdError`] when namespace resolution, Scribe hot-read, provider
+/// construction, or DataFusion registration fails.
 ///
 /// # Cancellation
 ///
@@ -166,12 +167,23 @@ async fn register_redux_provider(
             details: json!({ "namespace": ns.as_str() }),
         })?;
     let table = ReduxTableRef::new(redux_ns, name);
-    match load_redux_provider_with_fence(state, &table, tenant, None, None).await? {
-        Some(provider) => ctx
+    let hot_batches = fetch_hot_batches(state, &table, tenant, None, None).await?;
+    let catalog = state
+        .bifrost_redux
+        .as_deref()
+        .ok_or_else(|| WyrdError::Internal {
+            message: "Redux Bifrost catalog is not configured".to_owned(),
+            details: JsonValue::Null,
+        })?;
+    match catalog
+        .provider_with_hot_batches(&table, tenant, hot_batches)
+        .await
+    {
+        Ok(provider) => ctx
             .register_table(TableReference::bare(fqn), Arc::new(provider))
             .map_err(map_datafusion_error)
             .map(|_| ()),
-        None => {
+        Err(ReduxCatalogError::TableNotFound(_)) => {
             let Some(definition) = builtin_table(segment, name) else {
                 return Ok(());
             };
@@ -181,6 +193,10 @@ async fn register_redux_provider(
                 .map_err(map_datafusion_error)
                 .map(|_| ())
         }
+        Err(error) => Err(WyrdError::Internal {
+            message: "bifrost provider error".to_owned(),
+            details: json!({ "detail": error.to_string() }),
+        }),
     }
 }
 

@@ -160,7 +160,10 @@ pub struct AppState {
     /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
     pub bifrost_ingest: Option<Arc<BifrostIngestRuntime>>,
     /// Shared Redux Forge owner used by supervision and maintenance tests.
-    pub forge: Option<Arc<Forge>>,
+    ///
+    /// This is private so every server path observes the one supervised Forge
+    /// graph assembled at boot rather than replacing it after construction.
+    forge: Option<Arc<Forge>>,
     /// Authentication handles: token issuance + verification + issuer/binding resolution.
     pub auth: ServerAuth,
     /// Authorization handles: policy decision + RBAC evaluation + decision audit.
@@ -293,17 +296,11 @@ impl AppState {
         self
     }
 
-    /// Attach the process-global Bifrost memory governor.
-    #[must_use]
-    pub fn with_bifrost_memory(mut self, memory: BifrostMemoryGovernor) -> Self {
-        self.bifrost_query_memory = Some(Arc::new(
-            vala_bifrost_redux::scribe::memory::BifrostDataFusionMemoryPool::new(memory.clone()),
-        ));
-        self.bifrost_memory = Some(memory);
-        self
-    }
-
     /// Attach the process-wide Bifrost memory governor and its shared DataFusion pool.
+    ///
+    /// The supplied pool is retained verbatim and must also be passed to Forge;
+    /// this preserves one bounded DataFusion allocation graph across query,
+    /// rewrite, and ingest paths. Construction remains synchronous.
     #[must_use]
     pub fn with_bifrost_memory_pool(
         mut self,
@@ -326,6 +323,9 @@ impl AppState {
     }
 
     /// Attach the single production Forge owner used by the supervised worker.
+    ///
+    /// The caller must pass the Forge built from the same memory-pool Arc stored
+    /// by [`Self::with_bifrost_memory_pool`].
     #[must_use]
     pub fn with_forge(mut self, forge: Arc<Forge>) -> Self {
         self.forge = Some(forge);

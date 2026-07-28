@@ -72,6 +72,19 @@ impl ForgeObjectStore for TestForgeObjectStore {
         self.operator.read(path).await
     }
 
+    /// Read exactly the requested byte range through OpenDAL's native reader.
+    ///
+    /// Forge uses bounded reads for Parquet metadata and row-group admission;
+    /// fetching the entire object here would bypass that memory guardrail.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OpenDAL error when the reader cannot open or fetch the
+    /// requested range.
+    async fn read_range(&self, path: &str, range: std::ops::Range<u64>) -> opendal::Result<Buffer> {
+        self.operator.reader(path).await?.read(range).await
+    }
+
     async fn list(&self, prefix: &str) -> opendal::Result<Vec<Entry>> {
         self.operator.list_with(prefix).recursive(true).await
     }
@@ -1252,6 +1265,11 @@ impl WyrdTestServerBuilder {
     /// The caller owns the shared fixture, storage root, and catalog for the
     /// lifetime of every server created from them. Each server still binds
     /// its own HTTP and gRPC sockets and creates its own application state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when fixture resources, authentication state, Forge,
+    /// Scribe, or the application router cannot be constructed.
     pub(crate) async fn start_with_resources(
         self,
         fixture: Arc<PgFixture>,
@@ -1260,6 +1278,9 @@ impl WyrdTestServerBuilder {
         bifrost_redux: Arc<BifrostCatalog>,
         storage_root: Option<Arc<tempfile::TempDir>>,
     ) -> Result<WyrdTestServer, WyrdTestServerError> {
+        // Keep one governor and one DataFusion pool in this graph. Forge and
+        // AppState must observe the same pool so query and rewrite admission
+        // share accounting rather than silently creating independent budgets.
         let tenant_id = fixture.data_tenant_id();
 
         let issuing_key = Arc::new(
@@ -1367,7 +1388,7 @@ impl WyrdTestServerBuilder {
             tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
         let forge_runtime = ForgeRewriteRuntime::new(
-            query_memory,
+            Arc::clone(&query_memory),
             spill_root.path(),
             forge_config.spill_limit_bytes,
         )
@@ -1443,7 +1464,7 @@ impl WyrdTestServerBuilder {
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(bifrost_redux)
-            .with_bifrost_memory(bifrost_memory)
+            .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_forge(forge)
             .with_bifrost_ingest(ingest)
             .with_auth(wyrd_server::components::auth::ServerAuth {

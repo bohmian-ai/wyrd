@@ -604,6 +604,12 @@ dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python scripts/run_unit_tests.py"
 
+[tasks."py:test:wyrdstate:unit"]
+description = "Run the focused offline WyrdState hydration tests"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q tests/unit/state tests/test_wyrdstate_surface.py"
+
 [tasks."py:test:tensorflow"]
 hide = true
 description = "Run TensorFlow-marked Python unit tests"

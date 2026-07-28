@@ -19,12 +19,6 @@ spec:
         name: shadow
         version: 1.0.0
         space: default
-    - alias: training_data
-      ref:
-        kind: Data
-        name: training
-        version: 1.0.0
-        space: default
     - alias: agent_triage
       ref:
         kind: Agent
@@ -41,18 +35,6 @@ spec:
       ref:
         kind: Prompt
         name: triage-prompt
-        version: 1.0.0
-        space: default
-    - alias: quality_eval
-      ref:
-        kind: Eval
-        name: quality
-        version: 1.0.0
-        space: default
-    - alias: model_drift
-      ref:
-        kind: Drift
-        name: model-drift
         version: 1.0.0
         space: default
     - alias: runtime_workflow

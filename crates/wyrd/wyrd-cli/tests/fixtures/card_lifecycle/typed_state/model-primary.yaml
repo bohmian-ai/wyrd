@@ -16,6 +16,11 @@ spec:
       - { name: feature, dtype: float64 }
     outputs:
       - { name: prediction, dtype: float64 }
+  publishes_to:
+    - kind: Drift
+      name: model-drift
+      version: 1.0.0
+      space: default
 artifacts:
   - relative_path: primary.bin
     sha256: SSYBzqXrKT24Q4cUWMSLFTC+xG1mpiWYRfb0J6sV8jg=

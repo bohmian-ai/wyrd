@@ -34,7 +34,12 @@ pub fn order_cards(cards: &[AuthoredCard]) -> Result<Vec<usize>, Vec<Diagnostic>
         .collect::<Vec<_>>();
 
     let order = wyrd_spec::graph::topo_sort(&nodes, &edges)
-        .and_then(wyrd_spec::graph::root_last)
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
+    let root = wyrd_spec::graph::pick_root(&order)
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
+    wyrd_spec::graph::validate_composition(&graph_submissions, &root)
+        .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
+    let order = wyrd_spec::graph::root_last(order)
         .map_err(|error| vec![graph_diagnostic(&error, cards, &card_refs)])?;
 
     order
@@ -79,22 +84,24 @@ pub(crate) fn submission_for(card: &AuthoredCard) -> Result<CardSubmission, Diag
     })
 }
 
+/// Convert a shared graph failure into a source-bound loader diagnostic.
 fn graph_diagnostic(
     error: &GraphError,
     cards: &[AuthoredCard],
     card_refs: &[wyrd_spec::reference::CardRef],
 ) -> Diagnostic {
-    let path = match &error {
-        GraphError::Cycle { cycle } => cycle
-            .first()
-            .and_then(|card_ref| {
-                card_refs
-                    .iter()
-                    .position(|candidate| candidate.same_identity(card_ref))
-            })
-            .map(|index| cards[index].source_path.clone()),
+    let path = match error {
+        GraphError::Cycle { cycle } => cycle.first(),
+        GraphError::InvalidServiceComponentKind { service, .. } => Some(service),
+        GraphError::UnpublishedObservabilityPeer { peer, .. } => Some(peer),
         _ => None,
     }
+    .and_then(|card_ref| {
+        card_refs
+            .iter()
+            .position(|candidate| candidate.same_identity(card_ref))
+    })
+    .map(|index| cards[index].source_path.clone())
     .unwrap_or_else(|| "<loader>".into());
 
     let message = error.to_string();
@@ -103,6 +110,30 @@ fn graph_diagnostic(
             message,
             details: serde_json::json!({ "participants": cycle }),
         },
+        GraphError::InvalidServiceComponentKind {
+            service,
+            alias,
+            component,
+            field,
+        } => WyrdError::SpecInvalidServiceComponentKind {
+            message,
+            details: serde_json::json!({
+                "service": service,
+                "alias": alias,
+                "component_ref": component,
+                "field": field,
+            }),
+        },
+        GraphError::UnpublishedObservabilityPeer { root, peer } => {
+            WyrdError::SpecUnpublishedObservabilityPeer {
+                message,
+                details: serde_json::json!({
+                    "root": root,
+                    "peer": peer,
+                    "publisher_kinds": ["Data", "Model", "Agent", "Service"],
+                }),
+            }
+        }
         GraphError::DuplicateIdentity { .. }
         | GraphError::Empty
         | GraphError::MissingSpace
@@ -142,6 +173,30 @@ mod tests {
         }
     }
 
+    /// Build an authored Card from a typed JSON spec fixture.
+    fn authored(name: &str, kind: CardKind, spec: serde_json::Value) -> AuthoredCard {
+        AuthoredCard {
+            source_path: PathBuf::from(format!("{name}.yaml")),
+            api_version: ApiVersion::v1(),
+            kind: kind.clone(),
+            metadata: metadata(name),
+            spec: Spec::from_kind_and_value(&kind, spec).expect("test spec is valid"),
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Build an exact local reference for graph-order tests.
+    fn card_ref(kind: CardKind, name: &str) -> wyrd_spec::reference::CardRef {
+        wyrd_spec::reference::CardRef {
+            kind,
+            name: CardName::new(name).unwrap(),
+            version: VersionBlock::parse("1.0.0").unwrap(),
+            space: Some(SpaceName::new("default").unwrap()),
+            uid: None,
+        }
+    }
+
+    /// Build a Service fixture with an optional Service dependency.
     fn service(name: &str, dependency: Option<&str>) -> AuthoredCard {
         let components = dependency
             .map(|dependency| {
@@ -200,5 +255,56 @@ mod tests {
         let order = order_cards(&[v2, v1]).expect("different versions form one graph");
 
         assert_eq!(order, vec![1, 0]);
+    }
+
+    /// Surface the stable peer-component diagnostic at the authored Service path.
+    #[test]
+    fn order_rejects_eval_service_component_with_stable_code() {
+        let mut service = service("app", None);
+        let Spec::Service(spec) = &mut service.spec else {
+            panic!("test Service fixture has a Service spec");
+        };
+        spec.components.push(ServiceComponent {
+            alias: "quality".to_owned(),
+            card_ref: Ref::Sibling {
+                sibling: card_ref(CardKind::Eval, "quality"),
+            },
+            source: None,
+            config: BTreeMap::new(),
+            credential_refs: Vec::new(),
+        });
+        let eval = authored(
+            "quality",
+            CardKind::Eval,
+            serde_json::json!({ "tasks": {} }),
+        );
+
+        let diagnostics = order_cards(&[service, eval]).expect_err("Eval component is invalid");
+
+        assert_eq!(
+            diagnostics[0].code,
+            "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND"
+        );
+        assert_eq!(diagnostics[0].path, PathBuf::from("app.yaml"));
+    }
+
+    /// Surface the stable orphan-peer diagnostic at the authored Eval path.
+    #[test]
+    fn order_rejects_unpublished_eval_peer_with_stable_code() {
+        let service = service("app", None);
+        let eval = authored(
+            "quality",
+            CardKind::Eval,
+            serde_json::json!({ "tasks": {} }),
+        );
+
+        let diagnostics =
+            order_cards(&[service, eval]).expect_err("Service-root Eval needs a publisher");
+
+        assert_eq!(
+            diagnostics[0].code,
+            "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
+        );
+        assert_eq!(diagnostics[0].path, PathBuf::from("quality.yaml"));
     }
 }

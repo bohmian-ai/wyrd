@@ -1,0 +1,18 @@
+apiVersion: wyrd/v1
+kind: Data
+metadata:
+  space: wyrd-team
+  name: churn-classifier-data
+  version: "1.4.2"
+spec:
+  interface:
+    kind: Custom
+    meta:
+      loader_module: fixtures
+      loader_class: ChurnData
+      extra: {}
+  schema:
+    columns: []
+  stats:
+    byte_count: 0
+    sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

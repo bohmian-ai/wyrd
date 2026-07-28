@@ -18,7 +18,7 @@ use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
-    topo_sort,
+    topo_sort, validate_composition,
 };
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -386,13 +386,14 @@ pub async fn register_card(
 ) -> Result<CreateCardResponse, WyrdError> {
     validate_request(&request)?;
     let request_hash = hash_request(&request)?;
+    let (order, root) = plan_registration_graph(&request.submissions)?;
     if let Some((operation_id, seed)) =
         replay(state, caller, idempotency_key, &request_hash).await?
     {
         return initialize_uploads(state, caller, operation_id, seed, idempotency_key).await;
     }
     let external_refs = resolve_external(state, caller, &request.submissions).await?;
-    let plan = plan_registration(request, request_hash, external_refs)?;
+    let plan = plan_registration(request, request_hash, external_refs, order, root);
     let (operation_id, seed) = write_registration(state, caller, idempotency_key, plan).await?;
     initialize_uploads(state, caller, operation_id, seed, idempotency_key).await
 }
@@ -803,23 +804,37 @@ async fn resolve_external(
     Ok(resolved)
 }
 
-/// Build graph order and root from the authored request.
+/// Validate composition and build graph order before any registry I/O.
+///
+/// # Errors
+/// Returns a stable Wyrd error when graph construction, root selection, or
+/// Service-root composition validation fails.
+fn plan_registration_graph(
+    submissions: &[CardSubmission],
+) -> Result<(TopoOrder, RootPick), WyrdError> {
+    let graph_submissions = graph_ready_submissions(submissions).map_err(graph_error)?;
+    let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
+    let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
+    let root = pick_root(&order).map_err(graph_error)?;
+    validate_composition(&graph_submissions, &root).map_err(graph_error)?;
+    Ok((order, root))
+}
+
+/// Assemble the validated graph with resolved external dependencies.
 fn plan_registration(
     request: CreateCardRequest,
     request_hash: String,
     external_refs: ResolvedRefs,
-) -> Result<RegistrationPlan, WyrdError> {
-    let graph_submissions = graph_ready_submissions(&request.submissions).map_err(graph_error)?;
-    let (nodes, edges) = build(&graph_submissions).map_err(graph_error)?;
-    let order = topo_sort(&nodes, &edges).map_err(graph_error)?;
-    let root = pick_root(&order).map_err(graph_error)?;
-    Ok(RegistrationPlan {
+    order: TopoOrder,
+    root: RootPick,
+) -> RegistrationPlan {
+    RegistrationPlan {
         submissions: request.submissions,
         request_hash,
         order,
         root,
         external_refs,
-    })
+    }
 }
 
 /// Reserve idempotency and atomically persist every topo-ordered node and audit.
@@ -1186,6 +1201,39 @@ fn graph_error(error: GraphError) -> WyrdError {
                 .to_owned(),
             details: serde_json::json!({ "candidates": candidates }),
         },
+        GraphError::InvalidServiceComponentKind {
+            service,
+            alias,
+            component,
+            field,
+        } => WyrdError::SpecInvalidServiceComponentKind {
+            message: format!(
+                "Service {} component {alias} cannot reference {}",
+                service.name,
+                component.kind.wire_name()
+            ),
+            details: serde_json::json!({
+                "service": service,
+                "alias": alias,
+                "component_ref": component,
+                "field": field,
+            }),
+        },
+        GraphError::UnpublishedObservabilityPeer { root, peer } => {
+            WyrdError::SpecUnpublishedObservabilityPeer {
+                message: format!(
+                    "{} {} has no submitted publisher in Service-root bundle {}",
+                    peer.kind.wire_name(),
+                    peer.name,
+                    root.name
+                ),
+                details: serde_json::json!({
+                    "root": root,
+                    "peer": peer,
+                    "publisher_kinds": ["Data", "Model", "Agent", "Service"],
+                }),
+            }
+        }
         GraphError::InvalidSpec { message } => WyrdError::registry_invalid_card_spec(message),
     }
 }
@@ -2152,7 +2200,10 @@ fn map_storage_error(error: StorageError) -> WyrdError {
 
 #[cfg(test)]
 mod tests {
-    use super::{card_upload_entry, hash_request, immutable_card_blob_bytes, validate_request};
+    use super::{
+        card_upload_entry, hash_request, immutable_card_blob_bytes, plan_registration_graph,
+        validate_request,
+    };
     use uuid::Uuid;
     use wyrd_spec::registry::CreateCardRequest;
     use wyrd_spec::storage::{UploadId, UploadPlan};
@@ -2171,6 +2222,75 @@ mod tests {
             "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] },
             "artifacts": []
         })
+    }
+
+    /// Build one Service submission fixture with the provided spec.
+    fn service(name: &str, spec: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Service",
+            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "spec": spec,
+            "artifacts": []
+        })
+    }
+
+    /// Build one empty Eval submission fixture.
+    fn eval(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Eval",
+            "metadata": { "name": name, "version": "1.0.0", "space": "default" },
+            "spec": { "tasks": {} },
+            "artifacts": []
+        })
+    }
+
+    /// Reject peer-only Service components before registry access.
+    #[test]
+    fn registration_graph_rejects_eval_service_component() {
+        let request = request(serde_json::json!({
+            "submissions": [service("app", serde_json::json!({
+                "components": [{
+                    "alias": "quality",
+                    "ref": {
+                        "kind": "Eval",
+                        "name": "quality",
+                        "version": "1.0.0",
+                        "space": "default"
+                    }
+                }]
+            }))]
+        }));
+
+        let error = plan_registration_graph(&request.submissions)
+            .expect_err("Eval Service component must fail before registry I/O");
+
+        assert_eq!(error.code(), "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND");
+    }
+
+    /// Reject an orphan Eval submitted beside a Service root before registry access.
+    #[test]
+    fn registration_graph_rejects_unpublished_eval_peer() {
+        let request = request(serde_json::json!({
+            "submissions": [service("app", serde_json::json!({})), eval("quality")]
+        }));
+
+        let error = plan_registration_graph(&request.submissions)
+            .expect_err("Service-root Eval requires a submitted publisher");
+
+        assert_eq!(error.code(), "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER");
+    }
+
+    /// Preserve standalone Eval registration at the server boundary.
+    #[test]
+    fn registration_graph_accepts_standalone_eval() {
+        let request = request(serde_json::json!({
+            "submissions": [eval("quality")]
+        }));
+
+        plan_registration_graph(&request.submissions)
+            .expect("standalone Eval registration remains valid");
     }
 
     /// Prove canonical request hashing is independent of submission wire order.

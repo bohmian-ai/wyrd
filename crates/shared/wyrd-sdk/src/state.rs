@@ -656,10 +656,11 @@ impl WyrdState {
     ///
     /// Returns `WYRD_SDK_400_UNHYDRATED_ARTIFACT` when metadata is absent or
     /// not a regular file, and an invalid-state-bundle error when YAML cannot
-    /// be read or decoded.
+    /// be read or decoded. Existing metadata is resolved through the canonical
+    /// bundle root so a symlink cannot redirect loading outside the bundle.
     fn read_manifest(bundle: &Path) -> Result<HydratedBundleManifest, WyrdError> {
         let metadata_path = bundle.join("metadata.yaml");
-        let metadata = fs::metadata(&metadata_path).map_err(|error| {
+        let metadata = fs::symlink_metadata(&metadata_path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 unhydrated_error(&metadata_path, "hydrated bundle metadata.yaml is absent")
             } else {
@@ -669,12 +670,13 @@ impl WyrdState {
                 )
             }
         })?;
-        if !metadata.is_file() {
+        if !metadata.file_type().is_symlink() && !metadata.is_file() {
             return Err(unhydrated_error(
                 &metadata_path,
                 "hydrated bundle metadata.yaml is not a regular file",
             ));
         }
+        let metadata_path = confined_existing_file(bundle, "metadata.yaml")?;
         read_yaml(&metadata_path)
     }
 
@@ -1519,6 +1521,8 @@ struct AliasRecord {
 }
 
 #[cfg(test)]
+/// Exercises local hydrated-bundle loading, typed Card projections, reference
+/// closure, alias identity, and artifact confinement without network access.
 mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -1550,21 +1554,38 @@ mod tests {
 
     use super::WyrdState;
 
+    /// Deterministic payload metadata used to materialize a hydrated artifact
+    /// in a temporary bundle fixture.
     #[derive(Clone)]
     struct TestArtifact {
+        /// Bundle-relative payload path recorded in the artifact manifest.
         relative_path: String,
+        /// Exact bytes written to the fixture payload and hashed in its manifest.
         bytes: Vec<u8>,
+        /// Optional content type copied into the hydrated artifact manifest.
         content_type: Option<String>,
     }
 
+    /// Owns a complete temporary hydrated bundle and the in-memory values used
+    /// to rewrite projections while testing validation failures.
     struct TestBundle {
+        /// Temporary directory containing metadata, Card projections, aliases,
+        /// and verified artifact payloads.
         root: TempDir,
+        /// Mutable hydrated-bundle manifest serialized by [`Self::write`].
         manifest: HydratedBundleManifest,
+        /// Card envelopes keyed by their exact canonical `CardRef` string.
         cards: RefCell<BTreeMap<String, Card>>,
+        /// Artifact bytes keyed by exact `CardRef` and relative payload path.
         artifact_bytes: RefCell<BTreeMap<(String, String), Vec<u8>>>,
     }
 
     impl TestBundle {
+        /// Build the smallest complete Service graph used by validation tests.
+        ///
+        /// # Panics
+        /// Panics if the temporary directory cannot be created or fixture
+        /// values cannot be serialized and written.
         fn complete_service() -> Self {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);
@@ -1654,6 +1675,11 @@ mod tests {
             bundle
         }
 
+        /// Add one deterministic Model artifact to the complete Service graph.
+        ///
+        /// # Panics
+        /// Panics if the model entry is absent, fixture sizes cannot convert,
+        /// or the updated bundle cannot be written.
         fn with_artifact() -> Self {
             let mut bundle = Self::complete_service();
             let model_ref = test_ref(CardKind::Model, "model", 2);
@@ -1688,6 +1714,9 @@ mod tests {
 
         /// Build a graph containing every typed SDK projection and two prompt
         /// forms while keeping artifact bytes outside the holder values.
+        ///
+        /// # Panics
+        /// Panics if fixture construction or serialization fails.
         fn with_typed_cards() -> Self {
             let mut bundle = Self::complete_service();
             let prompt_ref = test_ref(CardKind::Prompt, "triage", 4);
@@ -1792,6 +1821,9 @@ mod tests {
         }
 
         /// Add a Workflow whose inline Agent prompt uses the supplied reference form.
+        ///
+        /// # Panics
+        /// Panics if the workflow fixture cannot be rewritten or serialized.
         fn with_nested_prompt(&mut self, prompt_ref: CardRef, sibling: bool) -> CardRef {
             let workflow_ref = test_ref(CardKind::Workflow, "workflow", 4);
             let workflow = WorkflowSpec {
@@ -1844,6 +1876,10 @@ mod tests {
             workflow_ref
         }
 
+        /// Add a Card, aliases, manifest projections, and optional payloads.
+        ///
+        /// # Panics
+        /// Panics if artifact sizes cannot convert to the manifest type.
         fn add_card(&mut self, alias: &str, card: Card, artifacts: &[TestArtifact]) -> CardRef {
             let card_ref = card_ref_from_card(&card);
             let key = card_ref.to_string();
@@ -1878,6 +1914,10 @@ mod tests {
             card_ref
         }
 
+        /// Add another persisted alias for an existing exact `CardRef`.
+        ///
+        /// # Panics
+        /// Panics if the target Card is absent from the fixture manifest.
         fn add_alias(&mut self, alias: &str, target: &CardRef) {
             let entry = self
                 .manifest
@@ -1888,6 +1928,10 @@ mod tests {
             entry.aliases.push(alias.to_owned());
         }
 
+        /// Materialize all fixture projections, payloads, aliases, and metadata.
+        ///
+        /// # Panics
+        /// Panics if any fixture value is missing or filesystem/YAML writing fails.
         fn write(&self) {
             fs::create_dir_all(self.root.path().join("aliases"))
                 .expect("fixture aliases dir writes");
@@ -1946,10 +1990,15 @@ mod tests {
             write_yaml(&self.root.path().join("metadata.yaml"), &manifest);
         }
 
+        /// Return the temporary bundle root used by `WyrdState::from_path`.
         fn path(&self) -> &Path {
             self.root.path()
         }
 
+        /// Mutate and persist the manifest and each affected artifact inventory.
+        ///
+        /// # Panics
+        /// Panics if updated projections cannot be serialized or written.
         fn rewrite_manifest(&mut self, f: impl FnOnce(&mut HydratedBundleManifest)) {
             f(&mut self.manifest);
             write_yaml(&self.root.path().join("metadata.yaml"), &self.manifest);
@@ -1961,6 +2010,10 @@ mod tests {
             }
         }
 
+        /// Mutate and persist one Card projection while retaining fixture state.
+        ///
+        /// # Panics
+        /// Panics if the Card or manifest entry is absent or serialization fails.
         fn rewrite_card(&self, card_ref: &CardRef, f: impl FnOnce(&mut Card)) {
             let mut cards = self.cards.borrow_mut();
             let card = cards
@@ -1976,6 +2029,10 @@ mod tests {
             write_yaml(&self.root.path().join(&entry.card_path), card);
         }
 
+        /// Replace one local artifact payload without changing its manifest digest.
+        ///
+        /// # Panics
+        /// Panics if the Card, artifact entry, or local path is absent, or writing fails.
         fn rewrite_artifact(&self, card_ref: &CardRef, relative: &str, bytes: &[u8]) {
             let entry = self
                 .manifest
@@ -1998,6 +2055,11 @@ mod tests {
         }
     }
 
+    /// Build a complete Card envelope with identity copied from `card_ref`.
+    ///
+    /// # Panics
+    /// This pure constructor does not panic itself; invalid fixture identities
+    /// are rejected by callers when constructing the input `CardRef`.
     fn card(card_ref: &CardRef, kind: CardKind, spec: Spec, relationships: Relationships) -> Card {
         Card {
             api_version: ApiVersion::v1(),
@@ -2020,6 +2082,10 @@ mod tests {
         }
     }
 
+    /// Build a valid custom Model spec for typed-holder fixtures.
+    ///
+    /// # Panics
+    /// Panics if fixture field names violate identifier grammar.
     fn model_spec() -> ModelSpec {
         ModelSpec {
             interface: ModelInterface::Custom(CustomMeta {
@@ -2046,6 +2112,10 @@ mod tests {
         }
     }
 
+    /// Project the exact pinned identity from a fixture Card envelope.
+    ///
+    /// # Panics
+    /// Panics if fixture metadata has no pinned version.
     fn card_ref_from_card(card: &Card) -> CardRef {
         CardRef {
             kind: card.kind.clone(),
@@ -2061,6 +2131,9 @@ mod tests {
     }
 
     /// Build a minimal valid native prompt for typed-state fixtures.
+    ///
+    /// # Panics
+    /// Panics if the fixture chat request or prompt violates Skald validation.
     fn prompt(text: &str) -> skald_spec::Prompt {
         let request: OpenAiChatRequest = serde_json::from_value(serde_json::json!({
             "model": "fixture-model",
@@ -2077,11 +2150,17 @@ mod tests {
     }
 
     /// Build a valid Prompt Card spec for the typed-state fixture.
+    ///
+    /// # Panics
+    /// Panics if the generated prompt fails `PromptSpec` validation.
     fn prompt_spec(text: &str) -> PromptSpec {
         PromptSpec::new(prompt(text)).expect("fixture prompt spec is valid")
     }
 
     /// Build a valid custom Data Card spec without embedding artifact bytes.
+    ///
+    /// # Panics
+    /// This pure constructor does not panic; validation occurs when its Card is loaded.
     fn data_spec() -> DataSpec {
         DataSpec {
             interface: DataInterface::Custom(CustomDataMeta {
@@ -2105,6 +2184,9 @@ mod tests {
     }
 
     /// Build an empty Eval spec used to prove pure-spec borrowing.
+    ///
+    /// # Panics
+    /// This pure constructor does not panic.
     fn eval_spec() -> wyrd_spec::vala::eval::EvalSpec {
         wyrd_spec::vala::eval::EvalSpec {
             dataset: None,
@@ -2116,6 +2198,10 @@ mod tests {
         }
     }
 
+    /// Build a deterministic UID-bearing exact `CardRef` for fixture identities.
+    ///
+    /// # Panics
+    /// Panics if generated identifiers violate their grammar.
     fn test_ref(kind: CardKind, name: &str, uid_suffix: u8) -> CardRef {
         let uid = format!("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b{uid_suffix:02x}");
         CardRef {
@@ -2127,10 +2213,15 @@ mod tests {
         }
     }
 
+    /// Compute the base64-encoded SHA-256 digest stored in artifact manifests.
     fn digest(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(Sha256::digest(bytes))
     }
 
+    /// Serialize a fixture projection as YAML, creating its parent directory.
+    ///
+    /// # Panics
+    /// Panics if the path has no parent, serialization fails, or filesystem I/O fails.
     fn write_yaml<T: Serialize>(path: &Path, value: &T) {
         fs::create_dir_all(path.parent().expect("fixture YAML path has parent"))
             .expect("fixture YAML parent exists");
@@ -2141,10 +2232,15 @@ mod tests {
         .expect("fixture YAML writes");
     }
 
+    /// Extract the structured details object from a public Wyrd error.
     fn problem_details(error: &wyrd_spec::error::WyrdError) -> Value {
         error.as_problem_json()["details"].clone()
     }
 
+    /// Assert a state-construction failure has the expected stable code/detail.
+    ///
+    /// # Panics
+    /// Panics if construction succeeds, the code differs, or the detail field is absent.
     fn assert_error(
         result: Result<WyrdState, wyrd_spec::error::WyrdError>,
         code: &str,
@@ -2173,6 +2269,10 @@ mod tests {
     }
 
     #[test]
+    /// Loads a complete hydrated Service graph locally and resolves its root and model aliases.
+    ///
+    /// # Panics
+    /// Panics if the complete fixture cannot load or an expected alias/card assertion fails.
     fn loads_complete_service_graph_without_network() {
         let bundle = TestBundle::complete_service();
         let state = WyrdState::from_path(bundle.path()).expect("complete graph loads");
@@ -2186,6 +2286,9 @@ mod tests {
 
     /// Prove every runtime-relevant typed accessor returns its native Rust
     /// projection while Eval and Drift remain borrowed envelope specs.
+    ///
+    /// # Panics
+    /// Panics if typed-card loading, alias resolution, or projection assertions fail.
     #[test]
     fn typed_accessors_return_native_rust_cards() {
         let bundle = TestBundle::with_typed_cards();
@@ -2228,6 +2331,9 @@ mod tests {
     }
 
     /// Prove two exact Model Card identities retain distinct native holders.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load, either alias is absent, or identity assertions fail.
     #[test]
     fn two_model_aliases_return_distinct_holders() {
         let bundle = TestBundle::complete_service();
@@ -2240,6 +2346,9 @@ mod tests {
     }
 
     /// Prove duplicate aliases for one Prompt Card share one stored holder.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot be rewritten or either prompt alias fails to resolve.
     #[test]
     fn duplicate_prompt_aliases_return_same_holder_address() {
         let mut bundle = TestBundle::with_typed_cards();
@@ -2256,6 +2365,9 @@ mod tests {
     }
 
     /// Prove inline Agent prompts are borrowed directly from the Agent spec.
+    ///
+    /// # Panics
+    /// Panics if the typed fixture cannot load or the inline prompt assertion fails.
     #[test]
     fn agent_prompt_resolves_inline_prompt() {
         let bundle = TestBundle::with_typed_cards();
@@ -2267,6 +2379,9 @@ mod tests {
     }
 
     /// Prove an exact Prompt Card reference resolves through the graph key.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or the referenced prompt cannot be resolved.
     #[test]
     fn agent_prompt_resolves_exact_prompt_card() {
         let bundle = TestBundle::with_typed_cards();
@@ -2285,6 +2400,9 @@ mod tests {
 
     /// Prove a loader-resolved sibling identity uses the full `CardRef` key when
     /// the durable bundle has converted the request-time form to a reference.
+    ///
+    /// # Panics
+    /// Panics if the rewritten bundle cannot load or the sibling prompt cannot resolve.
     #[test]
     fn agent_prompt_resolves_sibling_prompt_card() {
         let bundle = TestBundle::with_typed_cards();
@@ -2311,6 +2429,9 @@ mod tests {
 
     /// Prove an Agent prompt target absent from the validated graph fails as an
     /// invalid bundle instead of becoming an unknown runtime alias.
+    ///
+    /// # Panics
+    /// Panics if the malformed fixture is accepted or the expected error details are absent.
     #[test]
     fn agent_prompt_rejects_missing_target() {
         let bundle = TestBundle::with_typed_cards();
@@ -2331,6 +2452,9 @@ mod tests {
 
     /// Prove an Agent prompt target with another kind fails closed at bundle
     /// validation rather than being coerced into a Prompt holder.
+    ///
+    /// # Panics
+    /// Panics if loading, wrong-kind rejection, or its error details violate the contract.
     #[test]
     fn agent_prompt_rejects_non_prompt_target() {
         let bundle = TestBundle::with_typed_cards();
@@ -2352,6 +2476,9 @@ mod tests {
 
     /// Prove native holders retain only declarative metadata while verified
     /// model and data payloads remain available through state artifact paths.
+    ///
+    /// # Panics
+    /// Panics if artifact setup, state loading, file reads, or holder metadata assertions fail.
     #[test]
     fn model_and_data_artifacts_remain_external_to_holders() {
         let mut bundle = TestBundle::with_artifact();
@@ -2416,6 +2543,9 @@ mod tests {
     }
 
     /// Prove every typed accessor reports the requested and actual kinds.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or any wrong-kind lookup is unexpectedly accepted.
     #[test]
     fn each_typed_accessor_reports_expected_and_actual_kind() {
         let bundle = TestBundle::with_typed_cards();
@@ -2442,6 +2572,9 @@ mod tests {
     }
 
     /// Prove generic Card access remains available for unprojected kinds.
+    ///
+    /// # Panics
+    /// Panics if the typed fixture cannot load or either generic Card assertion fails.
     #[test]
     fn generic_card_supports_unprojected_kinds() {
         let bundle = TestBundle::with_typed_cards();
@@ -2457,6 +2590,10 @@ mod tests {
     }
 
     #[test]
+    /// Confirms aliases for one Card resolve the same stored envelope address.
+    ///
+    /// # Panics
+    /// Panics if alias fixture setup, state loading, or pointer identity checks fail.
     fn aliases_for_same_card_resolve_same_address() {
         let mut bundle = TestBundle::complete_service();
         let target = test_ref(CardKind::Model, "model", 2);
@@ -2470,6 +2607,10 @@ mod tests {
     }
 
     #[test]
+    /// Confirms persisted aliases are returned in deterministic lexical order.
+    ///
+    /// # Panics
+    /// Panics if the fixture cannot load or the sorted alias list differs from the contract.
     fn aliases_are_stably_sorted() {
         let mut bundle = TestBundle::complete_service();
         bundle.add_alias("aaa", &test_ref(CardKind::Model, "model", 2));
@@ -2483,6 +2624,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a path without hydrated metadata using the stable unhydrated error.
+    ///
+    /// # Panics
+    /// Panics if the temporary fixture cannot be created or the expected rejection is absent.
     fn rejects_missing_manifest_as_unhydrated() {
         let bundle = tempdir().expect("test tempdir is available");
         assert_error(
@@ -2493,6 +2638,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects metadata-only bundles because `WyrdState` requires complete hydration.
+    ///
+    /// # Panics
+    /// Panics if fixture rewriting fails or the expected unhydrated error is not returned.
     fn rejects_metadata_only_bundle_as_unhydrated() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.hydration = HydrationMode::MetadataOnly);
@@ -2504,6 +2653,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects manifests whose declared Card count disagrees with their contents.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or count validation does not return the expected error.
     fn rejects_inconsistent_manifest_counts() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.card_count += 1);
@@ -2515,6 +2668,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a hydrated bundle whose manifest root is not a Service Card.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or root-kind validation accepts the malformed bundle.
     fn rejects_non_service_root() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.root.kind = CardKind::Model);
@@ -2526,6 +2683,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a manifest root whose identity differs from the loaded root Card.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or identity validation returns no error.
     fn rejects_root_manifest_identity_mismatch() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| {
@@ -2539,6 +2700,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a root `CardRef` without the UID required for hydrated identity.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or UID validation accepts the malformed root.
     fn rejects_root_without_uid() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.root.uid = None);
@@ -2550,6 +2715,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a child Card that omits its durable UID.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or child identity validation accepts the missing UID.
     fn rejects_child_without_uid() {
         let bundle = TestBundle::complete_service();
         let child = test_ref(CardKind::Model, "model", 2);
@@ -2562,6 +2731,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a manifest `CardRef` that does not match its persisted Card envelope.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or manifest identity validation misses the mismatch.
     fn rejects_manifest_card_identity_mismatch() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| {
@@ -2576,6 +2749,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects duplicate exact `CardRef`s rather than silently replacing a loaded Card.
+    ///
+    /// # Panics
+    /// Panics if fixture assumptions fail or duplicate-identity validation accepts the bundle.
     fn rejects_duplicate_exact_card_ref() {
         let mut bundle = TestBundle::complete_service();
         let model = test_ref(CardKind::Model, "model", 2);
@@ -2600,6 +2777,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an alias that points to a different Card than its existing projection.
+    ///
+    /// # Panics
+    /// Panics if alias fixture setup fails or conflicting-alias validation is bypassed.
     fn rejects_conflicting_alias() {
         let mut bundle = TestBundle::complete_service();
         bundle.add_alias("model", &test_ref(CardKind::Model, "backup", 3));
@@ -2612,6 +2793,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an alias projection whose `CardRef` disagrees with the manifest index.
+    ///
+    /// # Panics
+    /// Panics if fixture writing fails or projection validation accepts the mismatch.
     fn rejects_alias_projection_mismatch() {
         let bundle = TestBundle::complete_service();
         write_yaml(
@@ -2626,6 +2811,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a relationship projection that differs from the Card envelope.
+    ///
+    /// # Panics
+    /// Panics if fixture writing fails or relationship projection validation misses the mismatch.
     fn rejects_relationship_projection_mismatch() {
         let bundle = TestBundle::complete_service();
         write_yaml(
@@ -2640,6 +2829,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an artifact inventory projection that omits the manifest entries.
+    ///
+    /// # Panics
+    /// Panics if fixture writing fails or inventory validation accepts the mismatch.
     fn rejects_artifact_inventory_projection_mismatch() {
         let bundle = TestBundle::with_artifact();
         write_yaml(
@@ -2654,6 +2847,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a relationship that targets a Card absent from the loaded graph.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation or projection writing fails, or the missing target is accepted.
     fn rejects_missing_relationship_target() {
         let bundle = TestBundle::complete_service();
         let child = test_ref(CardKind::Model, "model", 2);
@@ -2681,6 +2878,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects authored nested path references that should have been hydrated to `CardRef`s.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or unresolved-path validation accepts the bundle.
     fn rejects_unresolved_nested_path_reference() {
         let bundle = TestBundle::complete_service();
         bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
@@ -2696,6 +2897,9 @@ mod tests {
     }
 
     /// Reject a registration-only sibling in a top-level Service component.
+    ///
+    /// # Panics
+    /// Panics if sibling validation does not return the expected structured rejection.
     #[test]
     fn rejects_top_level_sibling_reference() {
         let bundle = TestBundle::complete_service();
@@ -2712,6 +2916,9 @@ mod tests {
     }
 
     /// Reject a sibling in the prompt slot of a nested inline Agent.
+    ///
+    /// # Panics
+    /// Panics if nested sibling validation does not return the expected structured rejection.
     #[test]
     fn rejects_nested_inline_agent_prompt_sibling_reference() {
         let sibling = test_ref(CardKind::Model, "model", 2);
@@ -2722,6 +2929,9 @@ mod tests {
     }
 
     /// Load the nested inline Agent when its prompt uses a durable reference.
+    ///
+    /// # Panics
+    /// Panics if the durable nested reference cannot load or resolve to the workflow Card.
     #[test]
     fn loads_nested_inline_agent_prompt_durable_reference() {
         let target = test_ref(CardKind::Model, "model", 2);
@@ -2736,6 +2946,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects a durable spec reference that is not represented in the hydrated graph.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or graph-closure validation accepts the absent reference.
     fn rejects_spec_ref_absent_from_graph() {
         let bundle = TestBundle::complete_service();
         bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
@@ -2751,6 +2965,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects manifest Card paths that escape the hydrated bundle root.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or path confinement accepts the escaping path.
     fn rejects_escaping_manifest_path() {
         let mut bundle = TestBundle::complete_service();
         bundle.rewrite_manifest(|manifest| manifest.cards[0].card_path = "../card.yaml".to_owned());
@@ -2762,6 +2980,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects aliases containing path traversal components.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or alias confinement accepts the unsafe alias.
     fn rejects_unsafe_alias() {
         let mut bundle = TestBundle::complete_service();
         bundle
@@ -2774,6 +2996,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an artifact manifest whose local payload is missing.
+    ///
+    /// # Panics
+    /// Panics if fixture deletion fails or payload validation accepts the missing file.
     fn rejects_missing_artifact_payload() {
         let bundle = TestBundle::with_artifact();
         fs::remove_file(bundle.path().join("cards/model/artifacts/weights.bin"))
@@ -2786,6 +3012,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an artifact path that resolves to a directory instead of a regular file.
+    ///
+    /// # Panics
+    /// Panics if fixture replacement fails or payload validation accepts the directory.
     fn rejects_non_file_artifact_payload() {
         let bundle = TestBundle::with_artifact();
         fs::remove_file(bundle.path().join("cards/model/artifacts/weights.bin"))
@@ -2801,6 +3031,10 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    /// Rejects an artifact symlink that escapes the bundle root.
+    ///
+    /// # Panics
+    /// Panics if symlink setup fails or path confinement accepts the external target.
     fn rejects_symlinked_artifact_escape() {
         let bundle = TestBundle::with_artifact();
         let payload = bundle.path().join("cards/model/artifacts/weights.bin");
@@ -2815,9 +3049,53 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
+    /// Keeps the artifact symlink regression test portable on non-Unix systems.
+    ///
+    /// # Panics
+    /// This no-op has no panic path.
     fn rejects_symlinked_artifact_escape() {}
 
+    /// Reject a metadata manifest symlink whose target is outside the bundle.
+    ///
+    /// The stable invalid-bundle error must retain the manifest path detail so
+    /// callers can identify the rejected projection without exposing the
+    /// external target path.
+    ///
+    /// # Panics
+    /// Panics if symlink setup fails or metadata path confinement accepts the external target.
+    #[cfg(unix)]
     #[test]
+    fn rejects_external_metadata_symlink() {
+        let bundle = TestBundle::complete_service();
+        let external = tempdir().expect("external fixture tempdir is available");
+        let target = external.path().join("metadata.yaml");
+        fs::write(&target, "apiVersion: wyrd/hydrated-bundle/v1\n")
+            .expect("external metadata fixture writes");
+        fs::remove_file(bundle.path().join("metadata.yaml"))
+            .expect("bundle metadata fixture exists");
+        std::os::unix::fs::symlink(&target, bundle.path().join("metadata.yaml"))
+            .expect("external metadata symlink creates");
+
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "path",
+        );
+    }
+
+    /// Keep the Unix-only metadata symlink regression test portable.
+    ///
+    /// # Panics
+    /// This no-op has no panic path.
+    #[cfg(not(unix))]
+    #[test]
+    fn rejects_external_metadata_symlink() {}
+
+    #[test]
+    /// Rejects an artifact manifest whose expected size differs from the local payload.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or size verification accepts the mismatch.
     fn rejects_artifact_size_mismatch() {
         let mut bundle = TestBundle::with_artifact();
         bundle.rewrite_manifest(|manifest| manifest.cards[1].artifacts[0].size_bytes += 1);
@@ -2829,6 +3107,10 @@ mod tests {
     }
 
     #[test]
+    /// Rejects an artifact whose SHA-256 digest differs from its manifest digest.
+    ///
+    /// # Panics
+    /// Panics if fixture mutation fails or digest verification accepts the mismatch.
     fn rejects_artifact_digest_mismatch() {
         let bundle = TestBundle::with_artifact();
         bundle.rewrite_artifact(
@@ -2844,6 +3126,10 @@ mod tests {
     }
 
     #[test]
+    /// Reports a stable unknown-alias error including the available graph aliases.
+    ///
+    /// # Panics
+    /// Panics if the graph cannot load or the unknown-alias details differ from the contract.
     fn unknown_alias_lists_available_aliases() {
         let bundle = TestBundle::complete_service();
         let state = WyrdState::from_path(bundle.path()).expect("complete graph loads");
@@ -2856,6 +3142,10 @@ mod tests {
     }
 
     #[test]
+    /// Confirms artifact paths are absolute, bundle-confined, and content-verified.
+    ///
+    /// # Panics
+    /// Panics if artifact loading, canonicalization, or path and metadata assertions fail.
     fn artifact_paths_are_absolute_confined_and_verified() {
         let bundle = TestBundle::with_artifact();
         let state = WyrdState::from_path(bundle.path()).expect("complete artifact graph loads");

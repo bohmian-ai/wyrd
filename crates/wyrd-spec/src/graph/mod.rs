@@ -13,10 +13,12 @@ use crate::registry::CardSubmission;
 use wyrd_semver::{VersionBlock, VersionSpec};
 
 mod canonical;
+mod composition;
 mod root;
 mod topo;
 
 pub use canonical::canonical_order;
+pub use composition::validate_composition;
 pub use root::{pick_root, root_last};
 pub use topo::{GraphError, topo_sort};
 
@@ -189,7 +191,7 @@ pub(crate) fn identity_key(card_ref: &CardRef) -> CardRefIdentity {
     card_ref.identity_key()
 }
 
-fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
+pub(super) fn submission_card_ref(submission: &CardSubmission) -> Option<CardRef> {
     Some(CardRef {
         kind: submission.kind.clone(),
         name: submission.metadata.name.clone(),

@@ -200,14 +200,13 @@ impl RuntimeServiceFixture {
         "agent_inline",
         "agent_triage",
         "default-Data-training-1.0.0",
+        "default-Drift-model-drift-1.0.0",
+        "default-Eval-quality-1.0.0",
         "default-Prompt-triage-prompt-1.0.0",
-        "model_drift",
         "model_primary",
         "model_shadow",
-        "quality_eval",
         "root",
         "runtime_workflow",
-        "training_data",
         "triage_prompt",
     ];
 
@@ -277,14 +276,14 @@ impl RuntimeServiceFixture {
         cards: &wyrd_registry::Cards,
     ) -> Result<(), wyrd_spec::error::WyrdError> {
         for relative in [
+            "training.yaml",
+            "quality.yaml",
+            "model-drift.yaml",
             "triage-prompt.yaml",
             "model-primary.yaml",
             "model-shadow.yaml",
-            "training.yaml",
             "agent-triage.yaml",
             "agent-inline.yaml",
-            "quality.yaml",
-            "model-drift.yaml",
             "runtime.yaml",
         ] {
             cards.register_from_path(&self.path(relative)).await?;
@@ -347,6 +346,91 @@ fn invalid_local_reference_returns_card_load_error_without_credentials() {
     let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
     assert_eq!(report["ok"], false);
     assert_eq!(first_stderr_json(&output)["code"], "WYRD_CLI_400_CARD_LOAD");
+}
+
+/// Reject peer-only Service components during local CLI planning.
+#[test]
+fn plan_rejects_eval_service_component_with_stable_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir creates");
+    let path = temp.path().join("service.yaml");
+    std::fs::write(
+        &path,
+        "apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: invalid-service
+  version: 1.0.0
+  space: default
+spec:
+  components:
+    - alias: quality
+      ref:
+        kind: Eval
+        name: quality
+        version: 1.0.0
+        space: default
+",
+    )
+    .expect("invalid Service fixture writes");
+
+    let output = run_cli(&[
+        "plan",
+        path.to_str().expect("Service path is UTF-8"),
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(64));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
+    assert_eq!(
+        report["diagnostics"][0]["code"],
+        "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND"
+    );
+}
+
+/// Reject an orphan Eval in a Service-root directory during local CLI planning.
+#[test]
+fn plan_rejects_unpublished_eval_peer_with_stable_diagnostic() {
+    let temp = tempfile::tempdir().expect("tempdir creates");
+    std::fs::write(
+        temp.path().join("service.yaml"),
+        "apiVersion: wyrd/v1
+kind: Service
+metadata:
+  name: invalid-service
+  version: 1.0.0
+  space: default
+spec: {}
+",
+    )
+    .expect("Service fixture writes");
+    std::fs::write(
+        temp.path().join("quality.yaml"),
+        "apiVersion: wyrd/v1
+kind: Eval
+metadata:
+  name: quality
+  version: 1.0.0
+  space: default
+spec:
+  tasks: {}
+",
+    )
+    .expect("Eval fixture writes");
+
+    let output = run_cli(&[
+        "plan",
+        temp.path().to_str().expect("fixture path is UTF-8"),
+        "--format",
+        "json",
+    ]);
+
+    assert_eq!(output.status.code(), Some(64));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("plan error is JSON");
+    assert_eq!(
+        report["diagnostics"][0]["code"],
+        "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER"
+    );
 }
 
 #[test]
@@ -626,7 +710,7 @@ mod pg_tests {
         for (alias, expected) in [
             ("model_primary", b"primary-model\n".as_slice()),
             ("model_shadow", b"shadow-model\n".as_slice()),
-            ("training_data", b"training-data\n".as_slice()),
+            ("default-Data-training-1.0.0", b"training-data\n".as_slice()),
         ] {
             let artifact = state.artifacts(alias).expect("artifact list resolves");
             assert_eq!(artifact.len(), 1, "{alias} has one fixture artifact");
@@ -1226,7 +1310,10 @@ mod pg_tests {
             "shadow"
         );
         assert_eq!(
-            state.data("training_data").expect("data resolves").name,
+            state
+                .data("default-Data-training-1.0.0")
+                .expect("data resolves")
+                .name,
             "training"
         );
         assert_eq!(
@@ -1268,14 +1355,14 @@ mod pg_tests {
         );
         assert!(
             state
-                .eval("quality_eval")
+                .eval("default-Eval-quality-1.0.0")
                 .expect("eval resolves")
                 .tasks
                 .is_empty()
         );
         assert_eq!(
             state
-                .drift("model_drift")
+                .drift("default-Drift-model-drift-1.0.0")
                 .expect("drift resolves")
                 .description
                 .as_deref(),
@@ -1293,6 +1380,124 @@ mod pg_tests {
         assert_no_unresolved_paths(&state);
         let aliases = state.aliases().collect::<Vec<_>>();
         assert_eq!(aliases, RuntimeServiceFixture::expected_aliases());
+    }
+
+    /// Exercise the canonical authored-directory fixture through real CLI and server boundaries.
+    ///
+    /// The journey first plans the complete directory, registers the external
+    /// Data and Model prerequisites exactly as separate user workflows would,
+    /// applies all eleven canonical submissions, and hydrates the reachable
+    /// Service graph through CLI `get`.
+    ///
+    /// # Panics
+    /// Panics when the committed fixture drifts, any CLI operation fails, the
+    /// server returns an incomplete receipt, or complete hydration omits an
+    /// observability peer.
+    ///
+    /// # Cancellation
+    /// Cancellation may leave the in-process server awaiting harness cleanup;
+    /// all registered state belongs to the journey's isolated tenant.
+    #[tokio::test]
+    async fn canonical_authored_directory_runs_real_cli_journey() {
+        if std::env::var("WYRD_CLI_E2E").as_deref() != Ok("1") {
+            return;
+        }
+
+        let fixture_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/loader/end_to_end");
+        let data_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/loader/end_to_end_prerequisites/churn-classifier-data.yaml");
+        let model_path = fixture_root.join("model/card.yaml");
+        let plan = run_cli_owned(vec![
+            "plan".to_owned(),
+            fixture_root
+                .to_str()
+                .expect("canonical fixture path is UTF-8")
+                .to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ])
+        .await;
+        assert!(
+            plan.status.success(),
+            "{}",
+            String::from_utf8_lossy(&plan.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&plan.stdout).expect("plan output is JSON");
+        assert_eq!(plan["cards"].as_array().map(Vec::len), Some(11));
+
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("canonical-directory-writer", &["writer"])
+            .await
+            .expect("journey writer bootstraps")
+        else {
+            panic!("journey bootstrap returned a non-user principal");
+        };
+
+        for path in [&data_path, &model_path] {
+            run_cli_json(
+                vec![
+                    "apply".to_owned(),
+                    path.to_str()
+                        .expect("prerequisite path is UTF-8")
+                        .to_owned(),
+                    "--server".to_owned(),
+                    base_url.clone(),
+                    "--format".to_owned(),
+                    "json".to_owned(),
+                ],
+                &jwt,
+            )
+            .await
+            .expect("canonical prerequisite applies");
+        }
+
+        let receipt = run_cli_json(
+            vec![
+                "apply".to_owned(),
+                fixture_root
+                    .to_str()
+                    .expect("canonical fixture path is UTF-8")
+                    .to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("canonical authored directory applies");
+        assert_eq!(receipt["outcomes"].as_array().map(Vec::len), Some(11));
+        let service_ref = exact_root_ref(&receipt).expect("receipt root is an exact CardRef");
+        assert_eq!(service_ref.kind, wyrd_spec::envelope::CardKind::Service);
+        assert_eq!(service_ref.name.as_str(), "churn-response-service");
+
+        let bundle = tempfile::tempdir().expect("canonical bundle destination creates");
+        let summary = run_cli_json(
+            exact_get_args(&service_ref, bundle.path(), &base_url)
+                .expect("exact get arguments build"),
+            &jwt,
+        )
+        .await
+        .expect("canonical Service graph hydrates");
+        assert_eq!(summary["mode"], "complete");
+        assert_eq!(summary["card_count"], 10);
+
+        let state = WyrdState::from_path(bundle.path()).expect("canonical bundle loads");
+        assert!(
+            state
+                .eval("wyrd-team-Eval-churn-triage-eval-1.0.0")
+                .is_some()
+        );
+        assert!(
+            state
+                .drift("wyrd-team-Drift-churn-classifier-drift-1.0.0")
+                .is_some()
+        );
+
+        stop_cli_server(server, shutdown, serve_handle).await;
     }
 
     /// Prove real registry output hydrates into runtime state and rejects metadata-only output.

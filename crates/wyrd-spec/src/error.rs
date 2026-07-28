@@ -1452,6 +1452,34 @@ pub enum WyrdError {
         /// Structured detail payload.
         details: serde_json::Value,
     },
+    /// A Service component references a peer-only Card kind.
+    #[error("[WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_INVALID_SERVICE_COMPONENT_KIND",
+        status = 400,
+        title = "Invalid Service component kind",
+        remediation = "Move Eval, Drift, Trigger, Operator, Audit, and Source cards out of Service.components; connect observability peers with publishes_to."
+    )]
+    SpecInvalidServiceComponentKind {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
+    /// A Service-root bundle includes an Eval or Drift with no local publisher.
+    #[error("[WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER] {message}")]
+    #[wyrd_error(
+        code = "WYRD_SPEC_400_UNPUBLISHED_OBSERVABILITY_PEER",
+        status = 400,
+        title = "Unpublished observability peer",
+        remediation = "Add the Eval or Drift CardRef to publishes_to on a submitted Data, Model, Agent, or Service, or register the shared peer separately."
+    )]
+    SpecUnpublishedObservabilityPeer {
+        /// Human-readable error message.
+        message: String,
+        /// Structured detail payload.
+        details: serde_json::Value,
+    },
     /// TypeScript heavy-upload support is deferred to another surface.
     #[error("[WYRD_TS_501_HEAVY_UPLOAD_DEFERRED] {message}")]
     #[wyrd_error(
@@ -2868,6 +2896,8 @@ impl WyrdError {
             | Self::SpecDuplicatePublishTarget { message, details }
             | Self::SpecDuplicateSubmission { message, details }
             | Self::SpecInvalidPublishTargetKind { message, details }
+            | Self::SpecInvalidServiceComponentKind { message, details }
+            | Self::SpecUnpublishedObservabilityPeer { message, details }
             | Self::TsHeavyUploadDeferred { message, details }
             | Self::PrincipalOrphaned { message, details }
             | Self::ServerNotReady { message, details }

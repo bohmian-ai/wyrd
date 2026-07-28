@@ -30,6 +30,28 @@ pub enum GraphError {
         /// Repeated submission references.
         candidates: Vec<CardRef>,
     },
+    /// A Service lists a peer-only card kind as an owned component.
+    #[error(
+        "Service {service} component {alias} cannot reference peer-only card {component} at {field}"
+    )]
+    InvalidServiceComponentKind {
+        /// Service declaring the invalid component.
+        service: CardRef,
+        /// Authored component alias.
+        alias: String,
+        /// Peer card incorrectly declared as a component.
+        component: CardRef,
+        /// Exact component field containing the invalid reference.
+        field: String,
+    },
+    /// A Service-root bundle contains an Eval or Drift with no local publisher.
+    #[error("Service-root bundle {root} contains unpublished observability peer {peer}")]
+    UnpublishedObservabilityPeer {
+        /// Selected Service root for the composite submission.
+        root: CardRef,
+        /// Eval or Drift submission with no incoming publication.
+        peer: CardRef,
+    },
     /// A submission spec could not be decoded for typed reference traversal.
     #[error("invalid submission spec: {message}")]
     InvalidSpec {

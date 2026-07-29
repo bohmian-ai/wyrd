@@ -407,8 +407,25 @@ mod pg_tests {
                             .values()
                             .all(|count| *count == data_file.record_count())
                     );
-                    assert!(data_file.null_value_counts().is_empty());
-                    assert!(data_file.nan_value_counts().is_empty());
+                    assert_eq!(
+                        data_file
+                            .null_value_counts()
+                            .keys()
+                            .copied()
+                            .collect::<std::collections::BTreeSet<_>>(),
+                        [1, 2, 3].into_iter().collect()
+                    );
+                    assert!(
+                        data_file
+                            .null_value_counts()
+                            .values()
+                            .all(|count| *count == 0),
+                        "non-null fixture columns must retain explicit zero null counts"
+                    );
+                    assert!(
+                        data_file.nan_value_counts().is_empty(),
+                        "a schema without floating columns must not report NaN counts"
+                    );
                     let split_offsets = data_file.split_offsets().expect("Parquet split offsets");
                     assert!(!split_offsets.is_empty());
                     assert!(

@@ -143,7 +143,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
     sqlx::query(
-        "DELETE FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+        "UPDATE vala.file_list SET compacted = true WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
     )
     .bind(fixture.tenant.as_uuid())
     .bind(&fixture.binding.logical_namespace)

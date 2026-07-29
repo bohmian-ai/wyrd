@@ -1,7 +1,7 @@
 interface:
   display_name: "Wyrd Implement"
-  short_description: "Execute one bounded Wyrd task faithfully"
-  default_prompt: "Use $wyrd-implement to execute this one approved Wyrd task with focused verification and structured evidence."
+  short_description: "Complete one bounded Wyrd task or prove it blocked"
+  default_prompt: "Use $wyrd-implement to execute this one approved Wyrd task through verified completion or a genuine escalation blocker."
 
 policy:
   allow_implicit_invocation: true

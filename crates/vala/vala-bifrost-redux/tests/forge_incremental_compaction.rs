@@ -13,8 +13,11 @@ mod pg_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use iceberg::Catalog;
-    use iceberg::spec::{NullOrder, SortDirection, Transform};
-    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    use iceberg::spec::{
+        DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
+        PrimitiveType, SortDirection, Struct, Transform, Type,
+    };
+    use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
     use opendal::services::Fs;
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
@@ -32,6 +35,7 @@ mod pg_tests {
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::vala::WYRD_EVENT_TIME;
     use wyrd_storage::BackendConfig;
 
     /// Counts ranged source reads while delegating bytes to a local operator.
@@ -201,9 +205,10 @@ mod pg_tests {
         async fn new() -> Self {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let tenant = pg.data_tenant_id();
+            let table_name = format!("incremental_rows_{}", uuid::Uuid::now_v7().simple());
             let binding = TenantTableBinding::resolve((
                 tenant,
-                TableRef::new(BifrostNamespace::Bifrost, "incremental_rows"),
+                TableRef::new(BifrostNamespace::Bifrost, table_name),
             ))
             .expect("binding");
             let root = tempfile::tempdir().expect("warehouse root");
@@ -279,6 +284,20 @@ mod pg_tests {
         /// Panics when fixture encoding, object writes, or durable inserts
         /// fail; each operation is required to establish the test invariant.
         async fn seed_files(&self, count: usize, aged: bool) {
+            self.seed_files_at(0, count, aged).await;
+        }
+
+        /// Seed uniquely named Parquet objects and durable file-list rows.
+        ///
+        /// The caller supplies `start` so one catalog fixture can retain files
+        /// from multiple manifest-writing stages without replacing an earlier
+        /// object path.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture encoding, object writes, or durable inserts
+        /// fail; each operation is required to establish the test invariant.
+        async fn seed_files_at(&self, start: i64, count: usize, aged: bool) {
             let schema = Self::schema();
             let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
             let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
@@ -286,7 +305,9 @@ mod pg_tests {
                 .timestamp_micros();
             let mut rows = Vec::new();
             for index in 0..count {
-                let index = i64::try_from(index).expect("file index fits i64");
+                let index = start
+                    .checked_add(i64::try_from(index).expect("file index fits i64"))
+                    .expect("fixture file index fits i64");
                 let row_count = 100_000_i64;
                 let row_count_usize = usize::try_from(row_count).expect("row count fits usize");
                 let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(row_count_usize, 16);
@@ -351,6 +372,78 @@ mod pg_tests {
             if aged {
                 sqlx::query("UPDATE vala.file_list SET created_at = now() - interval '3 minutes' WHERE data_tenant_id = $1").bind(self.tenant.as_uuid()).execute(self.operator_pool.pool()).await.expect("age");
             }
+        }
+
+        /// Append one existing fixture Parquet object under the table's current schema.
+        ///
+        /// This bypasses staging eligibility so manifest-schema tests construct
+        /// a precise Iceberg snapshot without coupling to unrelated scheduler
+        /// state in the shared integration database.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture metadata cannot form a valid complete Iceberg
+        /// data-file entry or the catalog rejects the test append.
+        async fn append_seed_manifest(&self, table: &iceberg::table::Table, index: i64) {
+            let object_path = format!("{}/input-{index}.parquet", self.binding.object_prefix);
+            let catalog_path = format!(
+                "{}/input-{index}.parquet",
+                table.metadata().location().trim_end_matches('/')
+            );
+            let size = self
+                .staging
+                .stat(&object_path)
+                .await
+                .expect("seed object metadata")
+                .content_length();
+            let event_time_id = table
+                .metadata()
+                .current_schema()
+                .field_by_name(WYRD_EVENT_TIME)
+                .expect("event time field")
+                .id;
+            let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                .expect("time")
+                .timestamp_micros();
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+            let partition_days = i32::try_from(day.signed_duration_since(epoch).num_days())
+                .expect("fixture partition day fits i32");
+            let data_file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(catalog_path)
+                .file_format(DataFileFormat::Parquet)
+                .partition(Struct::from_iter([Some(Literal::int(partition_days))]))
+                .record_count(100_000)
+                .file_size_in_bytes(size)
+                .lower_bounds(std::collections::HashMap::from([(
+                    event_time_id,
+                    Datum::try_from_bytes(&base.to_le_bytes(), PrimitiveType::Timestamptz)
+                        .expect("lower event bound"),
+                )]))
+                .upper_bounds(std::collections::HashMap::from([(
+                    event_time_id,
+                    Datum::try_from_bytes(
+                        &(base + 99_999).to_le_bytes(),
+                        PrimitiveType::Timestamptz,
+                    )
+                    .expect("upper event bound"),
+                )]))
+                .sort_order_id(
+                    i32::try_from(table.metadata().default_sort_order_id())
+                        .expect("sort order ID fits i32"),
+                )
+                .partition_spec_id(table.metadata().default_partition_spec_id())
+                .build()
+                .expect("seed data file");
+            let append = Transaction::new(table)
+                .fast_append()
+                .add_data_files([data_file]);
+            ApplyTransactionAction::apply(append, Transaction::new(table))
+                .expect("seed append action")
+                .commit(self.catalog.as_ref())
+                .await
+                .expect("seed manifest append");
         }
     }
 
@@ -482,5 +575,207 @@ mod pg_tests {
             output_rows, 3_200_000,
             "rewrite must conserve every input row"
         );
+    }
+
+    /// Discovers one real current snapshot through manifests and preserves its
+    /// complete candidate identity in a deterministic table plan.
+    #[tokio::test]
+    async fn current_snapshot_preserves_manifest_writer_schema_identity() {
+        let fixture = Fixture::new().await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("initial table");
+        fixture.append_seed_manifest(&table, 0).await;
+        let old_table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("old-schema table");
+        let old_snapshot = old_table
+            .metadata()
+            .current_snapshot()
+            .expect("old-schema snapshot");
+        let old_schema_id = old_snapshot.schema_id().expect("old schema");
+        let schema_action =
+            Transaction::new(&old_table)
+                .update_schema()
+                .add_column(AddColumn::optional(
+                    "evolved_value",
+                    Type::Primitive(PrimitiveType::String),
+                ));
+        ApplyTransactionAction::apply(schema_action, Transaction::new(&old_table))
+            .expect("schema action")
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("schema evolution");
+        let evolved_table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("evolved table");
+        let current_schema_id = evolved_table.metadata().current_schema_id();
+        assert_ne!(
+            old_schema_id, current_schema_id,
+            "schema update must commit"
+        );
+        let manifests = old_table
+            .manifest_list_reader(old_snapshot)
+            .load()
+            .await
+            .expect("old manifest list");
+        let mut old_file = None;
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(old_table.file_io())
+                .await
+                .expect("old manifest");
+            if let Some(entry) = manifest.entries().iter().find(|entry| entry.is_alive()) {
+                old_file = Some(entry.data_file().clone());
+                break;
+            }
+        }
+        let old_file = old_file.expect("old live file");
+        let current_path = format!(
+            "{}/data/mixed-schema-current.parquet",
+            evolved_table.metadata().location().trim_end_matches('/')
+        );
+        let current_object_path = format!(
+            "{}/data/mixed-schema-current.parquet",
+            fixture.binding.object_prefix
+        );
+        let bytes = fixture
+            .staging
+            .read(&format!(
+                "{}/input-0.parquet",
+                fixture.binding.object_prefix
+            ))
+            .await
+            .expect("read old-schema fixture object");
+        fixture
+            .staging
+            .write(&current_object_path, bytes)
+            .await
+            .expect("write current-schema fixture object");
+        let append = Transaction::new(&evolved_table)
+            .fast_append()
+            .add_data_files([copied_data_file(
+                &old_file,
+                current_path,
+                evolved_table.metadata().default_partition_spec_id(),
+            )]);
+        ApplyTransactionAction::apply(append, Transaction::new(&evolved_table))
+            .expect("append action")
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("current-schema append");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("current table");
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot");
+        assert_eq!(
+            snapshot.schema_id().expect("current schema"),
+            current_schema_id,
+            "new manifest must use the evolved current schema"
+        );
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+
+        let first = fixture
+            .forge
+            .discover_live_rewrites_for_test(&fixture.binding, &table, current_day)
+            .await
+            .expect("manifest discovery");
+        let second = fixture
+            .forge
+            .discover_live_rewrites_for_test(&fixture.binding, &table, current_day)
+            .await
+            .expect("repeat manifest discovery");
+
+        assert_eq!(first, second, "manifest order cannot affect the table plan");
+        let groups = first.groups_for_test();
+        let ordered_files = groups
+            .iter()
+            .flat_map(|group| group.files_for_test())
+            .collect::<Vec<_>>();
+        let schema_ids = ordered_files
+            .iter()
+            .map(|file| file.schema_id_for_test())
+            .collect::<Vec<_>>();
+        let order_keys = ordered_files
+            .iter()
+            .map(|file| file.sort_key_for_test())
+            .collect::<Vec<_>>();
+
+        assert!(
+            order_keys.windows(2).all(|pair| pair[0] <= pair[1]),
+            "groups preserve the discovery and T2 input order"
+        );
+        assert_eq!(
+            schema_ids
+                .iter()
+                .filter(|&&schema_id| schema_id == current_schema_id)
+                .count(),
+            1,
+            "the appended manifest keeps its evolved writer schema"
+        );
+        assert!(
+            schema_ids
+                .iter()
+                .any(|&schema_id| schema_id == old_schema_id),
+            "the current snapshot retains at least one old-schema manifest file"
+        );
+        for group in groups {
+            let files = group.files_for_test();
+            assert!(
+                files
+                    .windows(2)
+                    .all(|pair| pair[0].sort_key_for_test() <= pair[1].sort_key_for_test()),
+                "T2 receives each group in candidate order"
+            );
+            for file in files {
+                assert_eq!(
+                    group.is_obsolete_schema_for_test(),
+                    file.schema_id_for_test() == old_schema_id,
+                    "only old-manifest candidates are obsolete-schema rewrites: {group:?}"
+                );
+            }
+        }
+    }
+
+    /// Clone one complete manifest data-file identity for a distinct fixture path.
+    ///
+    /// The copied Parquet bytes retain valid metrics and partition values while
+    /// the following fast append writes a manifest under the evolved schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the pinned Iceberg builder rejects a complete data-file
+    /// identity copied from the old live manifest.
+    fn copied_data_file(source: &DataFile, file_path: String, partition_spec_id: i32) -> DataFile {
+        let mut builder = DataFileBuilder::default();
+        builder
+            .content(source.content_type())
+            .file_path(file_path)
+            .file_format(source.file_format())
+            .partition(source.partition().clone())
+            .record_count(source.record_count())
+            .file_size_in_bytes(source.file_size_in_bytes())
+            .column_sizes(source.column_sizes().clone())
+            .value_counts(source.value_counts().clone())
+            .null_value_counts(source.null_value_counts().clone())
+            .nan_value_counts(source.nan_value_counts().clone())
+            .lower_bounds(source.lower_bounds().clone())
+            .upper_bounds(source.upper_bounds().clone())
+            .partition_spec_id(partition_spec_id);
+        if let Some(sort_order_id) = source.sort_order_id() {
+            builder.sort_order_id(sort_order_id);
+        }
+        builder.build().expect("complete copied data-file identity")
     }
 }

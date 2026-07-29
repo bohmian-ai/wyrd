@@ -1,6 +1,6 @@
 ---
 name: wyrd-implement
-description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Do not use to plan, decompose, or close an entire implementation plan; use wyrd-implement-plan instead. Do not use for Svelte UI work; use wyrd-ui instead.
+description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task through verified completion or a genuine escalation blocker in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Do not use to plan, decompose, or close an entire implementation plan; use wyrd-implement-plan instead. Do not use for Svelte UI work; use wyrd-ui instead.
 ---
 
 # Wyrd Implement
@@ -10,6 +10,10 @@ execution, the smallest reviewable diff, repository consistency, objective
 verification, and clear escalation. Do not act as a secondary planner.
 Every execution rule below is mandatory; do not trade it for speed,
 convenience, or agent autonomy.
+
+Execution is an autonomous completion loop, not a partial-work handoff. Keep
+working until the task is verified `COMPLETE` or an escalation condition makes
+correct completion `BLOCKED`.
 
 ## Enforce the task boundary
 
@@ -42,14 +46,23 @@ ambiguous, unsafe, or outside the approved task.
 Before editing:
 
 1. Read the active task to EOF. Never rely on a partial excerpt or
-   conversational summary.
+   conversational summary. Prove the read reached the file's final line. When
+   tool output is truncated, paginated, or line-bounded, determine the total
+   line count and continue from the last returned line until EOF. Never infer
+   that a section is absent from an incomplete read.
 2. When the task was produced by `$wyrd-plan`, read
    `.codex/skills/wyrd-plan/references/task-packet-format.md` to EOF and
    run `.codex/skills/wyrd-plan/scripts/validate_plan_artifacts.py` against the
    task's parent plan directory. Every required heading must exist in order; an
    inapplicable section must use
    `Not applicable: <one-sentence reason>`. Stop before source inspection when
-   validation fails or the packet is not marked `Ready`.
+   validation fails or the packet is not marked `Ready`. A successful validator
+   result is authoritative for structural heading presence, order, and
+   non-empty sections. Do not report a structural omission after validation
+   passes. If a manual read appears to disagree, rerun the validator and an
+   exact level-two-heading scan against the same resolved task path, then read
+   the missing range through EOF; block on structure only when the validator
+   reports an error.
 3. Read the referenced plan sections and all applicable `AGENTS.md` files to
    EOF.
 4. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md` to EOF.
@@ -124,6 +137,11 @@ For a standardized `$wyrd-plan` task, report a concise pre-edit contract check:
   commands;
 - escalation conditions and completion evidence.
 
+Derive `schema: valid or invalid` from the canonical validator result, not from
+an independent reinterpretation of a partial task read. A structurally valid
+packet may still be substantively ambiguous or inconsistent; report that
+specific executability blocker without relabeling the schema invalid.
+
 Do not repair, reinterpret, or silently complete a malformed task. Return it to
 planning.
 
@@ -143,6 +161,57 @@ Do not silently reinterpret the task. Follow the full deviation protocol in
 `architecture/references/languages/implementation-execution.md`; stop before
 implementation and wait for replanning or explicit approval. Do not escalate
 minor local choices that preserve semantics and established patterns.
+
+## Execute until a terminal outcome
+
+Build a live checklist from the active task's required changes, acceptance
+criteria, required tests, focused commands, and completion evidence. Derive
+the checklist only from approved scope. Do not invent remaining work from
+later tasks, non-goals, or adjacent milestones.
+
+Run this loop autonomously:
+
+```text
+inspect -> implement -> test -> diagnose -> fix -> verify -> diff audit
+   ^                                                          |
+   +---------- while approved actionable work remains --------+
+```
+
+After every edit or command result, update the checklist and perform the next
+action that advances an unchecked item. Continue through implementation,
+tests, failure diagnosis, repairs, reruns, and final audit without waiting for
+another user prompt.
+
+Classify failures instead of treating them as handoff points:
+
+1. If the implementation caused the failure, fix it and rerun the affected
+   check.
+2. If the command, filter, feature selection, or test lane was wrong, correct
+   it to the task-prescribed invocation and rerun it.
+3. If a failure is proven unrelated and does not prevent required proof,
+   record it under risks and continue every remaining task check.
+4. If a proven external or pre-existing condition prevents required proof and
+   no approved alternative can establish it, report `BLOCKED` with the command,
+   evidence, and authority needed to resume.
+
+Remaining in-scope work, elapsed time, task difficulty, context length,
+context compaction, a convenient handoff point, partial implementation, tests
+not yet written, or a recoverable tool failure are never terminal conditions.
+After compaction or a recoverable interruption, reconstruct the checklist from
+the complete task, current diff, and verification evidence, then resume from
+the first unchecked item. A progress or status update is an interim
+checkpoint; provide it and continue unless the user explicitly stops or
+changes the task.
+
+The only voluntary terminal states are:
+
+- `COMPLETE`: every approved checklist item and acceptance criterion is
+  satisfied and verified.
+- `BLOCKED`: a documented escalation condition or unavailable required
+  authority prevents correct completion.
+
+Never voluntarily return partial work as `INCOMPLETE`. If no escalation
+condition applies, continue the loop.
 
 ## Implement the required design
 
@@ -222,6 +291,7 @@ fields or logs the task explicitly permits.
 
 Apply the exact completion standard and structured report in
 `architecture/references/languages/implementation-execution.md`. Do not report
-`COMPLETE` while any acceptance criterion is failed or unverified. Use
-`INCOMPLETE` when work remains and `BLOCKED` when escalation prevents correct
+`COMPLETE` while any acceptance criterion is failed or unverified. Do not
+return a final report while approved actionable work remains. Use `BLOCKED`
+only when escalation or unavailable required authority prevents correct
 completion.

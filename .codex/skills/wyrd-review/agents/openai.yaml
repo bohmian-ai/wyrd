@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd Review"
+  short_description: "Review Wyrd work and plan confirmed fixes"
+  default_prompt: "Use $wyrd-review to write a durable implementation review and route confirmed findings through $wyrd-plan into task packets for $wyrd-implement."
+
+policy:
+  allow_implicit_invocation: true

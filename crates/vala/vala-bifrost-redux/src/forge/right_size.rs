@@ -179,7 +179,16 @@ impl ForgeRightSizePolicy {
                     partition_is_open,
                 );
             }
-            if file.file_size_bytes > self.maximum_file_size_bytes {
+            if let Some(reason) = self.identity_reason(&file) {
+                Self::finish_undersized(
+                    &mut pending,
+                    &mut pending_bytes,
+                    &mut groups,
+                    self.target_file_size_bytes,
+                    partition_is_open,
+                );
+                groups.push(IcebergRewriteGroup::singleton(file, reason));
+            } else if file.file_size_bytes > self.maximum_file_size_bytes {
                 Self::finish_undersized(
                     &mut pending,
                     &mut pending_bytes,
@@ -191,15 +200,6 @@ impl ForgeRightSizePolicy {
                     file,
                     IcebergRewriteReason::Oversized,
                 ));
-            } else if let Some(reason) = self.identity_reason(&file) {
-                Self::finish_undersized(
-                    &mut pending,
-                    &mut pending_bytes,
-                    &mut groups,
-                    self.target_file_size_bytes,
-                    partition_is_open,
-                );
-                groups.push(IcebergRewriteGroup::singleton(file, reason));
             } else if file.file_size_bytes < self.minimum_file_size_bytes {
                 if !pending.is_empty()
                     && pending_bytes.saturating_add(file.file_size_bytes)
@@ -276,8 +276,12 @@ impl ForgeRightSizePolicy {
 pub struct IcebergCandidateFile {
     /// Stable catalog path used as the final ordering tie-breaker.
     pub(crate) catalog_path: String,
+    /// Binding-validated relative object key used for rewrite reads.
+    pub(crate) object_path: String,
     /// Compressed on-disk file size.
     pub(crate) file_size_bytes: u64,
+    /// Number of rows recorded in the manifest entry.
+    pub(crate) record_count: u64,
     /// Schema identity attached to the file.
     pub(crate) schema_id: i32,
     /// Partition specification that produced the file.
@@ -292,11 +296,17 @@ pub struct IcebergCandidateFile {
     pub(crate) min_event_time: DateTime<Utc>,
     /// Latest event timestamp in the file.
     pub(crate) max_event_time: DateTime<Utc>,
+    /// Snapshot that added this exact data file.
+    pub(crate) source_snapshot_id: i64,
+    /// Optional Iceberg data sequence identity.
+    pub(crate) data_sequence_number: Option<i64>,
+    /// Optional Iceberg file sequence identity.
+    pub(crate) file_sequence_number: Option<i64>,
 }
 
 impl IcebergCandidateFile {
     /// Return the canonical planner order for this file.
-    fn sort_key(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
+    pub(crate) fn sort_key(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
         (
             self.partition_spec_id,
             self.partition_day,
@@ -304,6 +314,27 @@ impl IcebergCandidateFile {
             self.max_event_time,
             &self.catalog_path,
         )
+    }
+
+    /// Return the manifest schema identity for catalog integration assertions.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn schema_id_for_test(&self) -> i32 {
+        self.schema_id
+    }
+
+    /// Return the catalog URI used to establish deterministic input order.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn catalog_path_for_test(&self) -> &str {
+        &self.catalog_path
+    }
+
+    /// Return the complete planner key used to order test-support inputs.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn sort_key_for_test(&self) -> (i32, NaiveDate, DateTime<Utc>, DateTime<Utc>, &str) {
+        self.sort_key()
     }
 }
 
@@ -334,6 +365,22 @@ pub struct IcebergRewriteGroup {
 }
 
 impl IcebergRewriteGroup {
+    /// Return the ordered candidate inputs for catalog integration assertions.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn files_for_test(&self) -> &[IcebergCandidateFile] {
+        &self.files
+    }
+
+    /// Report whether this group rewrites an obsolete manifest schema.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn is_obsolete_schema_for_test(&self) -> bool {
+        matches!(self.reason, IcebergRewriteReason::ObsoleteSchema)
+    }
+}
+
+impl IcebergRewriteGroup {
     /// Build a forced one-file rewrite group.
     fn singleton(file: IcebergCandidateFile, reason: IcebergRewriteReason) -> Self {
         Self {
@@ -350,6 +397,26 @@ pub struct IcebergRewritePlan {
     pub(crate) groups: Vec<IcebergRewriteGroup>,
     /// Whether the table has no remaining useful operation.
     pub(crate) convergence: IcebergConvergence,
+}
+
+/// Complete deterministic rewrite decision for one observed Iceberg snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IcebergTablePlan {
+    /// Snapshot observed before manifest discovery.
+    pub(crate) base_snapshot_id: i64,
+    /// Ordered useful rewrite operations across every partition group.
+    pub(crate) groups: Vec<IcebergRewriteGroup>,
+    /// Aggregate convergence after all groups are planned.
+    pub(crate) convergence: IcebergConvergence,
+}
+
+impl IcebergTablePlan {
+    /// Return the ordered rewrite groups for catalog integration assertions.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn groups_for_test(&self) -> &[IcebergRewriteGroup] {
+        &self.groups
+    }
 }
 
 /// Convergence proof for the supplied table view.
@@ -447,7 +514,9 @@ mod tests {
     fn file(path: &str, bytes: u64, day: NaiveDate) -> IcebergCandidateFile {
         IcebergCandidateFile {
             catalog_path: path.to_owned(),
+            object_path: path.to_owned(),
             file_size_bytes: bytes,
+            record_count: 1,
             schema_id: 1,
             partition_spec_id: 1,
             partition_day: day,
@@ -455,6 +524,9 @@ mod tests {
             writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
             min_event_time: DateTime::from_timestamp(1, 0).expect("fixed timestamp is valid"),
             max_event_time: DateTime::from_timestamp(2, 0).expect("fixed timestamp is valid"),
+            source_snapshot_id: 1,
+            data_sequence_number: Some(1),
+            file_sequence_number: Some(1),
         }
     }
 

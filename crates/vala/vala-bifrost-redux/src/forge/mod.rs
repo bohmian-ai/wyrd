@@ -13,10 +13,12 @@ use iceberg::Catalog;
 
 pub(crate) mod binpack;
 pub(crate) mod compact;
+mod discovery;
 pub(crate) mod error;
 pub(crate) mod expire;
 pub(crate) mod lease;
 pub(crate) mod orphan_gc;
+mod path;
 pub(crate) mod rewrite;
 pub(crate) mod right_size;
 mod scheduler;

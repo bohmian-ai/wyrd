@@ -23,6 +23,7 @@ use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
+use super::path::{catalog_path_to_object_key, validate_table_location};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
@@ -133,47 +134,44 @@ impl Forge {
         binding: &TenantTableBinding,
         table: &iceberg::table::Table,
     ) -> Result<ProtectedLiveSet, ForgeError> {
-        Self::assert_table_location(table.metadata(), binding)?;
+        self.assert_table_location(table.metadata(), binding)?;
         let mut live = ProtectedLiveSet::default();
-        let prefix = &binding.object_prefix;
-        Self::add_path(
-            &mut live,
-            prefix,
-            table
-                .metadata_location_result()
-                .map_err(ForgeError::Catalog)?,
-        )?;
+        let table_location = table.metadata().location();
+        let mut add = |path: &str| self.add_path(&mut live, binding, table_location, path);
+        add(table
+            .metadata_location_result()
+            .map_err(ForgeError::Catalog)?)?;
         for metadata_log in table.metadata().metadata_log() {
-            Self::add_path(&mut live, prefix, &metadata_log.metadata_file)?;
+            add(&metadata_log.metadata_file)?;
         }
         for snapshot in table.metadata().snapshots() {
-            Self::add_path(&mut live, prefix, snapshot.manifest_list())?;
+            add(snapshot.manifest_list())?;
             let manifest_list = table
                 .manifest_list_reader(snapshot)
                 .load()
                 .await
                 .map_err(ForgeError::Catalog)?;
             for manifest_file in manifest_list.entries() {
-                Self::add_path(&mut live, prefix, &manifest_file.manifest_path)?;
+                add(&manifest_file.manifest_path)?;
                 let manifest = manifest_file
                     .load_manifest(table.file_io())
                     .await
                     .map_err(ForgeError::Catalog)?;
                 for entry in manifest.entries() {
-                    Self::add_path(&mut live, prefix, entry.data_file().file_path())?;
+                    add(entry.data_file().file_path())?;
                 }
             }
             if let Some(statistics) = table
                 .metadata()
                 .statistics_for_snapshot(snapshot.snapshot_id())
             {
-                Self::add_path(&mut live, prefix, &statistics.statistics_path)?;
+                add(&statistics.statistics_path)?;
             }
             if let Some(statistics) = table
                 .metadata()
                 .partition_statistics_for_snapshot(snapshot.snapshot_id())
             {
-                Self::add_path(&mut live, prefix, &statistics.statistics_path)?;
+                add(&statistics.statistics_path)?;
             }
         }
 
@@ -202,7 +200,7 @@ impl Forge {
                 .map_err(|error| ForgeError::LiveSet {
                     detail: error.to_string(),
                 })?;
-            Self::add_path(&mut live, prefix, &path)?;
+            add(&path)?;
         }
         Ok(live)
     }
@@ -285,10 +283,12 @@ impl Forge {
             lease.require_fence(&self.core.operator_pool).await?;
             let table = self.load_table(&binding.table_ident()).await?;
             let now = Timestamp::now();
-            let normalized = Self::normalize_path(&binding.object_prefix, path.as_str())
-                .ok_or_else(|| ForgeError::LiveSet {
-                    detail: format!("GC candidate escaped table prefix: {path}"),
-                })?;
+            let normalized = catalog_path_to_object_key(
+                table.metadata().location(),
+                binding,
+                &self.core.staging,
+                path.as_str(),
+            )?;
             let metadata = match self.core.object_store.stat(&normalized).await {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -368,25 +368,31 @@ impl Forge {
         table: &iceberg::table::Table,
         path: &str,
     ) -> Result<bool, ForgeError> {
-        let path = Self::normalize_path(&binding.object_prefix, path).ok_or_else(|| {
-            ForgeError::LiveSet {
-                detail: format!("GC candidate escaped table prefix: {path}"),
-            }
-        })?;
-        if table
-            .metadata_location_result()
-            .map_err(ForgeError::Catalog)?
-            == path
-            || table
-                .metadata()
-                .metadata_log()
-                .iter()
-                .any(|entry| entry.metadata_file == path)
-        {
+        let path = catalog_path_to_object_key(
+            table.metadata().location(),
+            binding,
+            &self.core.staging,
+            path,
+        )?;
+        let table_location = table.metadata().location();
+        let matches = |reference: &str| {
+            catalog_path_to_object_key(table_location, binding, &self.core.staging, reference)
+                .map(|key| key == path)
+        };
+        if matches(
+            table
+                .metadata_location_result()
+                .map_err(ForgeError::Catalog)?,
+        )? {
             return Ok(true);
         }
+        for entry in table.metadata().metadata_log() {
+            if matches(&entry.metadata_file)? {
+                return Ok(true);
+            }
+        }
         for snapshot in table.metadata().snapshots() {
-            if snapshot.manifest_list() == path {
+            if matches(snapshot.manifest_list())? {
                 return Ok(true);
             }
             let manifest_list = table
@@ -395,29 +401,31 @@ impl Forge {
                 .await
                 .map_err(ForgeError::Catalog)?;
             for manifest_file in manifest_list.entries() {
-                if manifest_file.manifest_path == path {
+                if matches(&manifest_file.manifest_path)? {
                     return Ok(true);
                 }
                 let manifest = manifest_file
                     .load_manifest(table.file_io())
                     .await
                     .map_err(ForgeError::Catalog)?;
-                if manifest
-                    .entries()
-                    .iter()
-                    .any(|entry| entry.data_file().file_path() == path)
-                {
-                    return Ok(true);
+                for entry in manifest.entries() {
+                    if matches(entry.data_file().file_path())? {
+                        return Ok(true);
+                    }
                 }
             }
             if table
                 .metadata()
                 .statistics_for_snapshot(snapshot.snapshot_id())
-                .is_some_and(|statistics| statistics.statistics_path == path)
+                .map(|statistics| matches(&statistics.statistics_path))
+                .transpose()?
+                .unwrap_or(false)
                 || table
                     .metadata()
                     .partition_statistics_for_snapshot(snapshot.snapshot_id())
-                    .is_some_and(|statistics| statistics.statistics_path == path)
+                    .map(|statistics| matches(&statistics.statistics_path))
+                    .transpose()?
+                    .unwrap_or(false)
             {
                 return Ok(true);
             }
@@ -648,58 +656,38 @@ impl Forge {
         conn.commit().await.map_err(ForgeError::Sql)
     }
 
-    fn add_path(live: &mut ProtectedLiveSet, prefix: &str, path: &str) -> Result<(), ForgeError> {
-        let normalized = Self::normalize_path(prefix, path).ok_or_else(|| ForgeError::LiveSet {
-            detail: format!("Iceberg reference escaped table prefix: {path}"),
-        })?;
+    /// Insert one catalog-owned reference after converting it through Forge's
+    /// shared store and binding contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the location or path belongs to
+    /// another table or object store.
+    fn add_path(
+        &self,
+        live: &mut ProtectedLiveSet,
+        binding: &TenantTableBinding,
+        table_location: &str,
+        path: &str,
+    ) -> Result<(), ForgeError> {
+        let normalized =
+            catalog_path_to_object_key(table_location, binding, &self.core.staging, path)?;
         live.insert(normalized);
         Ok(())
     }
 
-    fn normalize_path(prefix: &str, path: &str) -> Option<String> {
-        let prefix = prefix.trim_end_matches('/');
-        let prefixed = format!("{prefix}/");
-        if path == prefix || path.starts_with(&prefixed) {
-            if path.contains('\\')
-                || path
-                    .split('/')
-                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-            {
-                return None;
-            }
-            return Some(path.to_owned());
-        }
-        path.match_indices(prefix).find_map(|(index, _)| {
-            if index > 0 && !path[..index].ends_with('/') {
-                return None;
-            }
-            let candidate = &path[index..];
-            if candidate.contains('\\')
-                || candidate
-                    .split('/')
-                    .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-            {
-                return None;
-            }
-            (candidate == prefix || candidate.starts_with(&prefixed))
-                .then_some(candidate.to_owned())
-        })
-    }
-
+    /// Confirm this table's metadata location belongs to the configured store and binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when the catalog location escapes the
+    /// binding or does not match the configured object-store endpoint.
     fn assert_table_location(
+        &self,
         metadata: &TableMetadata,
         binding: &TenantTableBinding,
     ) -> Result<(), ForgeError> {
-        if Self::normalize_path(&binding.object_prefix, metadata.location()).is_none() {
-            return Err(ForgeError::LiveSet {
-                detail: format!(
-                    "Iceberg table location {} escaped {}",
-                    metadata.location(),
-                    binding.object_prefix
-                ),
-            });
-        }
-        Ok(())
+        validate_table_location(binding, metadata.location(), &self.core.staging)
     }
 
     fn known_iceberg_object(path: &str) -> bool {

@@ -11,6 +11,7 @@ evidence. Whole-plan ordering and integrated closeout belong to
 - [Authority](#authority)
 - [Required Task Contract](#required-task-contract)
 - [Repository Preflight](#repository-preflight)
+- [Autonomous Execution Loop](#autonomous-execution-loop)
 - [Escalation and Deviations](#escalation-and-deviations)
 - [Implementation Rules](#implementation-rules)
 - [Risk-Specific Rules](#risk-specific-rules)
@@ -76,6 +77,55 @@ Inspect only the task's affected surface:
 Proceed only when the approved behavior is clear, its owner exists, contracts
 fit the approved design, dependencies and features are available, and the
 acceptance criteria fit the allowed scope.
+
+## Autonomous Execution Loop
+
+One bounded task is one autonomous execution loop. Before editing, build a live
+checklist containing every required change, acceptance criterion, required
+test, focused verification command, and completion-evidence item. The checklist
+must come only from the approved task; non-goals, later tasks, and adjacent
+milestones are not remaining work.
+
+Run:
+
+```text
+inspect -> implement -> test -> diagnose -> fix -> verify -> diff audit
+   ^                                                          |
+   +---------- while approved actionable work remains --------+
+```
+
+Update the checklist after each material result and take the next action that
+advances an unchecked item. Do not pause for another prompt between coding,
+test creation, diagnosis, repairs, verification reruns, and final audit.
+
+Route every failure deliberately:
+
+1. An implementation-caused failure returns to implementation and repair.
+2. An incorrect command, filter, feature set, or test lane is corrected to the
+   task-prescribed invocation and rerun.
+3. A proven unrelated failure that does not prevent required proof is recorded
+   and does not stop remaining checks.
+4. A proven external or pre-existing failure that prevents required proof and
+   has no approved alternative is `BLOCKED`; report the evidence and authority
+   or environmental change required to resume.
+
+Elapsed time, difficulty, context length, context compaction, partial progress,
+a convenient handoff point, unwritten tests, remaining approved work, or a
+recoverable tool failure do not end the loop. After compaction or recoverable
+interruption, reconstruct state from the complete task, current diff, and
+verification evidence and resume at the first unchecked item. Status updates
+are interim checkpoints and do not terminate execution unless the user
+explicitly stops or replaces the task.
+
+The only voluntary terminal outcomes are:
+
+- `COMPLETE`: every checklist item and acceptance criterion is satisfied and
+  verified.
+- `BLOCKED`: an escalation condition or unavailable required authority
+  prevents correct completion.
+
+Never voluntarily return partial work as `INCOMPLETE`. If actionable approved
+work remains and no escalation condition applies, continue the loop.
 
 ## Escalation and Deviations
 
@@ -190,8 +240,11 @@ Follow task-provided commands exactly. Otherwise run:
 7. `git diff --check`;
 8. final diff inspection.
 
-Fix a failing command before starting later commands unless the failure is
-proven unrelated and the task permits continuing.
+Fix a task-caused failing command before starting later commands. Correct and
+rerun a command that used the wrong filter, feature set, or test lane. When a
+failure is proven unrelated, continue if it does not prevent the task's
+required proof; otherwise report `BLOCKED` with evidence rather than returning
+partial work.
 
 Prefer a repository `mise` task after confirming it exists, its implementation
 and feature selection match the task, and it does not duplicate a later
@@ -236,16 +289,17 @@ sequentially; required `mise` tasks and only approved features were used; no
 prohibited or unrelated change remains; and every deviation has explicit
 approval.
 
-Use `INCOMPLETE` when work remains and `BLOCKED` when an escalation condition
-prevents correct completion. Do not report `COMPLETE` with a failed or
-unverified acceptance criterion.
+Report `BLOCKED` only when an escalation condition or unavailable required
+authority prevents correct completion. Do not return a final report while
+approved actionable work remains, and do not report `COMPLETE` with a failed
+or unverified acceptance criterion.
 
 Use this report:
 
 ```markdown
 ## Task Result
 
-Status: COMPLETE | INCOMPLETE | BLOCKED
+Status: COMPLETE | BLOCKED
 
 ### Summary
 <Implemented outcome>
@@ -270,7 +324,7 @@ Features enabled:
 - None | <deviation, approval, and impact>
 
 ### Remaining Work
-- None | <incomplete item>
+- None | <blocked item and exact condition required to resume>
 
 ### Risks and Notes
 - None | <unresolved non-blocking observation>

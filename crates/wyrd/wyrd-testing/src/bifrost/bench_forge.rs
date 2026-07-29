@@ -203,8 +203,10 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         outcome.input_rows == outcome.output_rows && outcome.input_rows == expected_rows;
     let convergence = pending == 0;
     let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
+    let mut retry_outcome = None;
     let negative_flows = if scenario.require_negative_flows {
         let retry = forge.run_once().await?;
+        retry_outcome = Some((retry.bins_committed, retry.tables_failed, retry.tables_skipped));
         NegativeFlowReport::executed(
             ["completed_forge_tick_is_idempotent"],
             retry.bins_committed == 0 && retry.tables_failed == 0,
@@ -257,7 +259,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     harness.shutdown().await?;
     if !verified {
         return Err(format!(
-            "Forge benchmark verification failed: spill={}, outputs={}, pending={}, input_rows={}, output_rows={}, expected_rows={}, peak_memory={}, bookkeeping={}, negative_flows={}",
+            "Forge benchmark verification failed: spill={}, outputs={}, pending={}, input_rows={}, output_rows={}, expected_rows={}, peak_memory={}, bookkeeping={}, negative_flows={}, retry={retry_outcome:?}",
             outcome.spill_bytes,
             outcome.outputs_committed,
             pending,

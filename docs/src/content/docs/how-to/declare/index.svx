@@ -35,3 +35,12 @@ contracts and JSON Schemas, but their runtime implementation is not shipped yet.
 How-to pages for these kinds will be added as each kind's contract ships.
 
 See [Cards](/cards/) for the full catalog and shipping status.
+
+## Complete Service bundles
+
+For an offline handoff, use the CLI's complete Service `get` output rather than
+the metadata-only mode. The complete bundle contains the sorted manifest,
+Card envelopes, relationships, and verified artifact payloads. Load it with
+`WyrdState.from_path(path)` and provide interfaces only for custom loaders;
+built-in Data and trusted Model loaders run during construction. Agent and
+Workflow entries remain declarative envelope projections in this offline state.

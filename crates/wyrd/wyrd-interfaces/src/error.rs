@@ -26,6 +26,14 @@ pub enum WyrdPyError {
     /// Python boundary failure converted to an owned string.
     #[error("Python error: {0}")]
     Python(String),
+    /// Python boundary failure retaining a safe textual cause for exception chaining.
+    #[error("Python error: {message}")]
+    PythonWithCause {
+        /// Stable boundary message shown to the caller.
+        message: String,
+        /// Redacted source text attached as Python `__cause__`.
+        cause: String,
+    },
     /// Python object downcast failure converted to an owned string.
     #[error("Failed to downcast Python object: {0}")]
     Downcast(String),
@@ -178,11 +186,20 @@ impl WyrdPyError {
         Self::Internal(message.into())
     }
 
+    /// Build a boundary error that exposes a redacted Python cause through `__cause__`.
+    pub fn python_with_cause(message: impl Into<String>, cause: impl Into<String>) -> Self {
+        Self::PythonWithCause {
+            message: message.into(),
+            cause: cause.into(),
+        }
+    }
+
     #[cfg(feature = "python")]
     fn into_wyrd_error(self) -> WyrdError {
         match self {
             Self::Spec(error) => error,
             Self::Python(source) => internal_from_source("Python boundary failed", &source),
+            Self::PythonWithCause { message, cause } => internal_from_source(&message, &cause),
             Self::Downcast(source) => {
                 internal_from_source("Python object downcast failed", &source)
             }
@@ -244,7 +261,17 @@ impl From<pyo3::PyErr> for WyrdPyError {
 #[cfg(feature = "python")]
 impl From<WyrdPyError> for pyo3::PyErr {
     fn from(error: WyrdPyError) -> Self {
-        wyrd_utils::py::wyrd_error_to_py_err(error.into_wyrd_error())
+        let cause = match &error {
+            WyrdPyError::PythonWithCause { cause, .. } => Some(cause.clone()),
+            _ => None,
+        };
+        Python::attach(|py| {
+            let converted = wyrd_utils::py::wyrd_error_to_py_err(error.into_wyrd_error());
+            if let Some(cause) = cause {
+                converted.set_cause(py, Some(pyo3::exceptions::PyRuntimeError::new_err(cause)));
+            }
+            converted
+        })
     }
 }
 

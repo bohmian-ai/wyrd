@@ -72,7 +72,8 @@ def test_builtin_model_loads_from_bundle_artifact_directory(tmp_path: Path) -> N
     bundle = build_builtin_model_bundle(tmp_path)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(
-            bundle, interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()}
+            bundle,
+            interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()},
         )
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model"

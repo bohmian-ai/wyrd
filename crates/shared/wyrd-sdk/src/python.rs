@@ -776,6 +776,29 @@ fn runtime_hydration_error(
     })
 }
 
+/// Build a runtime-hydration error while retaining a safe textual Python cause.
+///
+/// The stable Wyrd details remain unchanged; the cause is attached only when
+/// the error crosses back into Python, so Rust state and logs never retain a
+/// Python-owned exception.
+fn runtime_hydration_error_with_cause(
+    state: &WyrdState,
+    key: &str,
+    stage_name: &str,
+    reason: &'static str,
+    cause: impl Into<String>,
+) -> WyrdPyError {
+    let base = runtime_hydration_error(state, key, stage_name, reason);
+    let cause = cause.into();
+    match base {
+        WyrdPyError::Spec(error) => WyrdPyError::PythonWithCause {
+            message: error.to_string(),
+            cause,
+        },
+        other => other,
+    }
+}
+
 /// Return the first persisted alias for a validated exact `CardRef`.
 ///
 /// Aliases are already sorted during native bundle assembly, so this is a
@@ -984,8 +1007,14 @@ impl PythonStateHydrator<'_> {
                 artifact_dir,
                 config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
             )
-            .map_err(|_| {
-                runtime_hydration_error(state, key, "artifact_load", "model artifact load failed")
+            .map_err(|error| {
+                runtime_hydration_error_with_cause(
+                    state,
+                    key,
+                    "artifact_load",
+                    "model artifact load failed",
+                    error,
+                )
             })?;
             values.insert(
                 key.to_owned(),
@@ -1035,8 +1064,14 @@ impl PythonStateHydrator<'_> {
                 artifact_dir,
                 config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
             )
-            .map_err(|_| {
-                runtime_hydration_error(state, key, "artifact_load", "data artifact load failed")
+            .map_err(|error| {
+                runtime_hydration_error_with_cause(
+                    state,
+                    key,
+                    "artifact_load",
+                    "data artifact load failed",
+                    error,
+                )
             })?;
             values.insert(
                 key.to_owned(),

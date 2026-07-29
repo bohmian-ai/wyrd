@@ -17,8 +17,8 @@ JsonValue: TypeAlias = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 class Card(Protocol):
     """Shared authoring capability implemented by native card holders.
 
-    `DataCard`, `ModelCard`, `PromptCard`, and `AgentCard` are the public
-    implementations.
+    `DataCard`, `ModelCard`, and `PromptCard` are the registerable public
+    implementations. `AgentCard` is an envelope holder, not a registry input.
     Pass one of those objects to `Cards.register`; do not construct `Card`
     directly.
     """
@@ -31,6 +31,8 @@ class Card(Protocol):
     def _to_card_envelope_json(self) -> str:
         """Return the holder's single Wyrd envelope conversion."""
         ...
+
+RegisterableCard: TypeAlias = DataCard | ModelCard | PromptCard
 
 class AgentCard:
     """Local Agent Card holder backed by the native Agent envelope.
@@ -149,7 +151,7 @@ class CardRef:
 class VersionBump:
     """Version intent applied by registration.
 
-    `Cards.register` defaults to `VersionBump.Minor`. Use `Patch` for a
+    `Cards.register` defaults to `VersionBump.Patch`.
     compatible correction, `Major` for a breaking change, or one of the
     factory methods when the version also needs pre-release or build metadata.
 
@@ -261,7 +263,7 @@ class Cards:
 
     def register(
         self,
-        card: Card,
+        card: RegisterableCard,
         version_bump: VersionBump = ...,
         save_args: DataSaveArgs | ModelSaveArgs | None = ...,
     ) -> RegistrationReceipt:
@@ -279,7 +281,7 @@ class Cards:
 
         Args:
             card: A `DataCard`, `ModelCard`, or `PromptCard`.
-            version_bump: Version intent. Defaults to `VersionBump.Minor`.
+            version_bump: Version intent. Defaults to `VersionBump.Patch`.
                 `VersionBump.pre`, `build`, and `pre_build` add version
                 metadata.
             save_args: Interface-specific save options. Use `DataSaveArgs`
@@ -357,7 +359,7 @@ class DataCardRegistry:
 
         Args:
             card: DataCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Minor`.
+            version_bump: Version intent. Defaults to `VersionBump.Patch`.
             save_args: Optional `DataSaveArgs` forwarded to the data interface.
 
         Returns:
@@ -468,7 +470,7 @@ class DataCardRegistry:
         """Delete a registered DataCard and its stored artifacts.
 
         Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and optionally `version`.
+        `name`, and the exact `version`.
 
         Raises:
             WyrdError: If the selector is invalid, the Card is not found, or
@@ -493,7 +495,7 @@ class ModelCardRegistry:
 
         Args:
             card: ModelCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Minor`.
+            version_bump: Version intent. Defaults to `VersionBump.Patch`.
             save_args: Optional `ModelSaveArgs` forwarded to the model
                 interface.
 
@@ -604,7 +606,7 @@ class ModelCardRegistry:
         """Delete a registered ModelCard and its stored artifacts.
 
         Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and optionally `version`.
+        `name`, and the exact `version`.
 
         Raises:
             WyrdError: If the selector is invalid, the Card is not found, or
@@ -628,7 +630,7 @@ class PromptCardRegistry:
 
         Args:
             card: PromptCard to register.
-            version_bump: Version intent. Defaults to `VersionBump.Minor`.
+            version_bump: Version intent. Defaults to `VersionBump.Patch`.
 
         Returns:
             Receipt for the completed registration.
@@ -726,7 +728,7 @@ class PromptCardRegistry:
         """Delete a registered PromptCard and its stored Card envelope.
 
         Provide `uid` for an exact deletion. Otherwise provide `space`,
-        `name`, and optionally `version`.
+        `name`, and the exact `version`.
 
         Raises:
             WyrdError: If the selector is invalid, the Card is not found, or

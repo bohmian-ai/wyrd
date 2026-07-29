@@ -615,6 +615,12 @@ dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run pytest -q tests/unit/state tests/test_wyrdstate_surface.py"
 
+[tasks."py:test:registry:unit"]
+description = "Run focused Python Card registry boundary tests"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q tests/unit/test_registry_surface.py"
+
 [tasks."py:test:tensorflow"]
 hide = true
 description = "Run TensorFlow-marked Python unit tests"

@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use serde::Serialize;
 use sqlx::Row;
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
@@ -137,6 +138,17 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .first()
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await?;
+    let action = Transaction::new(&table).update_table_properties().set(
+        "write.target-file-size-bytes".to_owned(),
+        "65536".to_owned(),
+    );
+    ApplyTransactionAction::apply(action, Transaction::new(&table))?
+        .commit(fixture.catalog.as_ref())
+        .await?;
     let mut config = fixture.config.clone();
     config.max_bytes_per_tick = u64::MAX;
     for sequence in 0_i64..32 {

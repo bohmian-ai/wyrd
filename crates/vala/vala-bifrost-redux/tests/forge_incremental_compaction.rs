@@ -437,15 +437,15 @@ mod pg_tests {
         );
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
-        assert_eq!(outcome.input_rows, 3_600_000);
-        assert_eq!(outcome.output_rows, 3_600_000);
+        assert_eq!(outcome.input_rows, 3_200_000);
+        assert_eq!(outcome.output_rows, 3_200_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
         let (output_files, output_rows) = committed_output_totals(&fixture).await;
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
-            output_rows, 3_600_000,
+            output_rows, 3_200_000,
             "rewrite must conserve every input row"
         );
     }

@@ -47,7 +47,7 @@ use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use crate::catalog::TenantTableBinding;
-use crate::parquet::writer_properties::bifrost_writer_properties;
+use crate::parquet::writer_properties::{BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties};
 use vala_sql::OperatorPool;
 
 /// Maximum rows decoded from one Parquet source batch.
@@ -69,8 +69,6 @@ pub(crate) struct ForgeRewritePipeline {
     max_concurrent_reads: usize,
     /// Bounds CPU-heavy Parquet encode/finalize tasks.
     blocking_permits: Arc<tokio::sync::Semaphore>,
-    /// Encoded byte threshold checked before writing each next batch.
-    output_file_bytes: u64,
 }
 
 impl fmt::Debug for ForgeRewritePipeline {
@@ -79,7 +77,6 @@ impl fmt::Debug for ForgeRewritePipeline {
         formatter
             .debug_struct("ForgeRewritePipeline")
             .field("max_concurrent_reads", &self.max_concurrent_reads)
-            .field("output_file_bytes", &self.output_file_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -102,6 +99,10 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) table_location: &'a str,
     /// Destination partition-spec identifier.
     pub(crate) partition_spec_id: i32,
+    /// Destination physical sort-order identifier recorded on every output.
+    pub(crate) sort_order_id: i32,
+    /// Output target resolved from this operation's Iceberg table metadata.
+    pub(crate) target_file_size_bytes: u64,
 }
 
 /// Complete multi-file result returned after rewrite-owned cleanup transfers.
@@ -362,6 +363,8 @@ struct OutputMetadataRequest {
     partition_day: chrono::NaiveDate,
     /// Iceberg partition-spec identifier for the destination table.
     partition_spec_id: i32,
+    /// Iceberg sort-order identifier for the destination table.
+    sort_order_id: i32,
 }
 
 /// Bytes and Iceberg metadata derived together from one completed Parquet output.
@@ -392,6 +395,7 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         table_path,
         partition_day,
         partition_spec_id,
+        sort_order_id,
     } = request;
     let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
         detail: error.to_string(),
@@ -421,7 +425,8 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         partition_day.num_days_from_ce() - 719_163,
     ))]);
     file.partition(partition)
-        .partition_spec_id(partition_spec_id);
+        .partition_spec_id(partition_spec_id)
+        .sort_order_id(sort_order_id);
     let file = file.build().map_err(|error| ForgeError::Invariant {
         detail: format!("Forge output metadata is incomplete: {error}"),
     })?;
@@ -447,17 +452,15 @@ impl ForgeRewritePipeline {
     ///
     /// # Errors
     ///
-    /// Returns [`ForgeError::InvalidConfig`] when a concurrency or output limit
-    /// is zero.
+    /// Returns [`ForgeError::InvalidConfig`] when the concurrency limit is zero.
     pub(crate) fn new(
         runtime: ForgeRewriteRuntime,
         staging: Arc<opendal::Operator>,
         catalog: Arc<dyn Catalog>,
         object_store: Arc<dyn ForgeObjectStore>,
         max_concurrent_reads: usize,
-        output_file_bytes: u64,
     ) -> Result<Self, ForgeError> {
-        if max_concurrent_reads == 0 || output_file_bytes == 0 {
+        if max_concurrent_reads == 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "rewrite limits must be positive".to_owned(),
             });
@@ -469,7 +472,6 @@ impl ForgeRewritePipeline {
             object_store,
             max_concurrent_reads,
             blocking_permits: Arc::new(tokio::sync::Semaphore::new(max_concurrent_reads)),
-            output_file_bytes,
         })
     }
 
@@ -612,7 +614,7 @@ impl ForgeRewritePipeline {
             operator_pool,
         } = context;
         state.record_input(batch)?;
-        if state.should_rotate(self.output_file_bytes) {
+        if state.should_rotate(request.target_file_size_bytes) {
             self.rotate_output(
                 state,
                 RewriteOutputContext {
@@ -915,12 +917,13 @@ impl ForgeRewritePipeline {
             return Err(ForgeError::Shutdown);
         }
         let table_path = format!(
-            "{}/data/forge-{}-{ordinal:05}.parquet",
+            "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{}-{ordinal:05}.parquet",
             request.table_location.trim_end_matches('/'),
             request.operation_id
         );
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
+        let sort_order_id = request.sort_order_id;
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -938,6 +941,7 @@ impl ForgeRewritePipeline {
                 table_path,
                 partition_day,
                 partition_spec_id,
+                sort_order_id,
             })
         });
         tokio::pin!(join);
@@ -1139,7 +1143,7 @@ impl ForgeRewritePipeline {
 /// Build one deterministic relative output path from operation identity.
 fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -> String {
     format!(
-        "{}/data/forge-{operation_id}-{ordinal:05}.parquet",
+        "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{operation_id}-{ordinal:05}.parquet",
         prefix.trim_end_matches('/')
     )
 }
@@ -1592,6 +1596,19 @@ mod tests {
         assert!(second.contains(&operation_id.to_string()));
         assert!(first.ends_with("-00000.parquet"));
         assert!(second.ends_with("-00001.parquet"));
+    }
+
+    /// A writer recipe change produces a distinct deterministic storage path.
+    #[test]
+    fn writer_recipe_version_changes_deterministic_path() {
+        let operation_id = Uuid::from_u128(42);
+        let path = deterministic_output_path("tenants/a/table", operation_id, 0);
+        assert_eq!(
+            path,
+            format!(
+                "tenants/a/table/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{operation_id}-00000.parquet"
+            )
+        );
     }
 
     /// A later batch failure retains every finalized file and path for cleanup.

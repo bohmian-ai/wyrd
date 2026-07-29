@@ -31,16 +31,19 @@ use wyrd_spec::vala::api::{
 };
 
 use super::Forge;
-use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_bins};
+use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
+use super::right_size::{
+    ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
+    validate_supported_layout,
+};
 use crate::catalog::TenantTableBinding;
+use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
-const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_OUTPUT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -48,8 +51,6 @@ const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 pub struct ForgeConfig {
     /// Minimum number of staged files that makes a group eligible.
     pub min_files: i64,
-    /// Target byte size for one rewrite bin.
-    pub target_bin_bytes: u64,
     /// Maximum number of files in one rewrite bin.
     pub max_files_per_bin: usize,
     /// Maximum number of input files processed by one tick.
@@ -82,8 +83,6 @@ pub struct ForgeConfig {
     pub max_concurrent_reads: usize,
     /// `DataFusion` spill ceiling for Forge rewrites.
     pub spill_limit_bytes: u64,
-    /// Maximum encoded bytes per rewritten output file.
-    pub output_file_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
 }
@@ -93,10 +92,9 @@ impl Default for ForgeConfig {
     fn default() -> Self {
         Self {
             min_files: 2,
-            target_bin_bytes: DEFAULT_TARGET_BIN_BYTES,
             max_files_per_bin: 256,
             max_files_per_tick: 1_024,
-            max_bytes_per_tick: 2 * DEFAULT_TARGET_BIN_BYTES,
+            max_bytes_per_tick: 2 * 512 * 1024 * 1024,
             max_bins_per_tick: 64,
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
@@ -110,7 +108,6 @@ impl Default for ForgeConfig {
             max_gc_candidates_per_batch: 256,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
-            output_file_bytes: DEFAULT_OUTPUT_FILE_BYTES,
             max_hints_per_wake: 256,
         }
     }
@@ -126,7 +123,6 @@ impl ForgeConfig {
     /// window.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.min_files < 2
-            || self.target_bin_bytes == 0
             || self.max_files_per_bin < 2
             || self.max_files_per_tick == 0
             || self.max_bytes_per_tick == 0
@@ -143,7 +139,6 @@ impl ForgeConfig {
             || self.max_gc_candidates_per_batch == 0
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
-            || self.output_file_bytes == 0
             || self.max_hints_per_wake == 0
         {
             return Err(ForgeError::InvalidConfig {
@@ -350,6 +345,45 @@ impl Forge {
         .map_err(ForgeError::Catalog)
     }
 
+    /// Resolve the table property that controls Forge packing and output rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog or invalid-property errors when the table does not
+    /// provide a target representable as `u64`.
+    async fn table_right_size_policy(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<ForgeRightSizePolicy, ForgeError> {
+        let table = self.load_table(&binding.table_ident()).await?;
+        let target = u64::try_from(
+            table
+                .metadata()
+                .table_properties()
+                .map_err(ForgeError::Catalog)?
+                .write_target_file_size_bytes,
+        )
+        .map_err(|_| ForgeError::InvalidConfig {
+            detail: "write.target-file-size-bytes exceeds u64".to_owned(),
+        })?;
+        if target == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "write.target-file-size-bytes must be positive".to_owned(),
+            });
+        }
+        validate_supported_layout(
+            table.metadata().current_schema(),
+            table.metadata().default_partition_spec(),
+            table.metadata().default_sort_order(),
+        )?;
+        ForgeRightSizePolicy::new(
+            target,
+            table.metadata().current_schema_id(),
+            table.metadata().default_partition_spec_id(),
+            table.metadata().default_sort_order_id(),
+        )
+    }
+
     /// Reconcile prepared compactions before admitting new table work.
     ///
     /// # Errors
@@ -385,8 +419,9 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_candidate_groups(table_key).await?;
+        let right_size_policy = self.table_right_size_policy(binding).await?;
         let mut budget = ForgeTickBudget::default();
-        self.compact_candidate_rows(lease, binding, rows, &mut budget, stop)
+        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, &mut budget, stop)
             .await
     }
 
@@ -404,7 +439,8 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_targeted_candidate_group(key).await?;
-        self.compact_candidate_rows(lease, binding, rows, budget, stop)
+        let right_size_policy = self.table_right_size_policy(binding).await?;
+        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, budget, stop)
             .await
     }
 }
@@ -421,20 +457,21 @@ impl Forge {
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
         rows: Vec<CandidateRow>,
+        right_size_policy: &ForgeRightSizePolicy,
         budget: &mut ForgeTickBudget,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let mut outcome = ForgeTickOutcome::default();
         'groups: for row in rows {
             outcome.groups_seen += 1;
-            let plan = plan_incremental_bins(
-                row.files,
-                self.core.config.target_bin_bytes,
+            let bins = plan_staging_bins(
+                right_size_policy,
+                &row.files,
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
                 Utc::now().date_naive(),
             );
-            for bin in plan.rewrite_bins {
+            for bin in bins {
                 if stop.is_cancelled() {
                     return Ok(outcome);
                 }
@@ -461,7 +498,7 @@ impl Forge {
                     break 'groups;
                 }
                 let stats = self
-                    .compact_bin(lease, &row.key, binding, &bin, stop)
+                    .compact_bin(lease, &row.key, binding, &bin, right_size_policy, stop)
                     .await?;
                 outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
                 outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
@@ -483,6 +520,65 @@ impl Forge {
         }
         Ok(outcome)
     }
+}
+
+/// Map durable staging facts into the live-file policy without reusing its
+/// separate [`CandidateFile`] domain, then map selected groups back to rewrite
+/// bins by their stable object paths.
+fn plan_staging_bins(
+    policy: &ForgeRightSizePolicy,
+    files: &[CandidateFile],
+    max_files: usize,
+    partition_day: NaiveDate,
+    current_day: NaiveDate,
+) -> Vec<RewriteBin> {
+    if max_files == 0 {
+        return Vec::new();
+    }
+    let mut by_path = HashMap::with_capacity(files.len());
+    let live = files
+        .iter()
+        .map(|file| {
+            by_path.insert(file.path.clone(), file.clone());
+            IcebergCandidateFile {
+                catalog_path: file.path.clone(),
+                file_size_bytes: file.size,
+                schema_id: policy.schema_id(),
+                partition_spec_id: policy.partition_spec_id(),
+                partition_day,
+                sort_order_id: Some(policy.sort_order_id()),
+                writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
+                min_event_time: file.min_event_time,
+                max_event_time: file.max_event_time,
+            }
+        })
+        .collect();
+    let plan = policy.plan_partition(live, partition_day >= current_day);
+    let groups = plan
+        .groups
+        .into_iter()
+        .flat_map(|group| {
+            let IcebergRewriteGroup { files, reason } = group;
+            files
+                .chunks(max_files)
+                .filter(|chunk| reason != IcebergRewriteReason::Undersized || chunk.len() >= 2)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let files = group
+                .into_iter()
+                .filter_map(|file| by_path.remove(&file.catalog_path))
+                .collect::<Vec<_>>();
+            (!files.is_empty()).then(|| RewriteBin {
+                total_bytes: files.iter().map(|file| file.size).sum(),
+                files,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -577,14 +673,6 @@ impl Forge {
 
         Ok(groups
             .into_iter()
-            .filter(|(_, files)| {
-                files.len() >= usize::try_from(self.core.config.min_files).unwrap_or(usize::MAX)
-                    || files
-                        .iter()
-                        .map(|file| file.size)
-                        .fold(0_u64, u64::saturating_add)
-                        < self.core.config.target_bin_bytes
-            })
             .map(|(partition_day, files)| CandidateRow {
                 key: ForgeGroupKey {
                     tenant: table_key.tenant,
@@ -735,6 +823,7 @@ impl Forge {
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
         bin: &RewriteBin,
+        right_size_policy: &ForgeRightSizePolicy,
         stop: &CancellationToken,
     ) -> Result<CompactStats, ForgeError> {
         let operation_id = operation_id(key, bin);
@@ -756,6 +845,11 @@ impl Forge {
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
+                    sort_order_id: i32::try_from(table.metadata().default_sort_order_id())
+                        .map_err(|_| ForgeError::InvalidConfig {
+                            detail: "Iceberg default sort-order ID exceeds i32".to_owned(),
+                        })?,
+                    target_file_size_bytes: right_size_policy.target_file_size_bytes(),
                 },
                 stop,
                 lease,
@@ -1682,5 +1776,66 @@ mod tests {
         let _ = Transaction::new;
         let config = ForgeConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// The staging seam consumes the right-size policy's selected groups.
+    #[test]
+    fn staging_planner_maps_policy_groups_without_healthy_fillers() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let file = |id: u128, path: &str, size| CandidateFile {
+            id: Uuid::from_u128(id),
+            path: path.to_owned(),
+            size,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(
+            &policy,
+            &[
+                file(1, "small-a", 20),
+                file(2, "healthy", 100),
+                file(3, "small-b", 20),
+            ],
+            256,
+            day,
+            day.succ_opt().expect("next day"),
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(
+            bins[0]
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["small-a", "small-b"]
+        );
+    }
+
+    /// A bounded undersized group never leaves a singleton remainder for a
+    /// worthless one-to-one rewrite.
+    #[test]
+    fn staging_planner_discards_undersized_singleton_remainder() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let file = |id: u128, path: &str| CandidateFile {
+            id: Uuid::from_u128(id),
+            path: path.to_owned(),
+            size: 20,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(
+            &policy,
+            &[file(1, "small-a"), file(2, "small-b"), file(3, "small-c")],
+            2,
+            day,
+            day.succ_opt().expect("next day"),
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].files.len(), 2);
+        assert_eq!(bins[0].total_bytes, 40);
     }
 }

@@ -18,6 +18,7 @@ pub(crate) mod expire;
 pub(crate) mod lease;
 pub(crate) mod orphan_gc;
 pub(crate) mod rewrite;
+pub(crate) mod right_size;
 mod scheduler;
 
 pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
@@ -106,7 +107,6 @@ impl Forge {
             Arc::clone(&build.catalog),
             Arc::clone(&build.object_store),
             build.config.max_concurrent_reads,
-            build.config.output_file_bytes,
         )?;
         let core = ForgeCore {
             vala: build.vala,

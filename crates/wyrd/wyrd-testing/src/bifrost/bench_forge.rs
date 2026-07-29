@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use serde::Serialize;
 use sqlx::Row;
 use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
@@ -23,6 +24,10 @@ struct ForgeBenchmarkReport {
     verified: bool,
     /// Input rows accepted by the rewrite.
     rows: u64,
+    /// Rows accepted from staged inputs before the rewrite.
+    input_rows: u64,
+    /// Rows expected from the durable staging fixture.
+    expected_rows: u64,
     /// Bytes represented by staged input files.
     input_bytes: u64,
     /// Bytes represented by committed Forge output objects.
@@ -93,7 +98,7 @@ async fn output_totals(fixture: &crate::bifrost::ForgeFixture) -> Result<(u64, u
     let mut files = 0_u64;
     for entry in entries {
         let path = entry.path();
-        if path.contains("/forge-") && entry.metadata().is_file() {
+        if path.contains("/forge/") && entry.metadata().is_file() {
             bytes = bytes.saturating_add(entry.metadata().content_length());
             files = files.saturating_add(1);
         }
@@ -137,10 +142,36 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .first()
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
+    sqlx::query(
+        "UPDATE vala.file_list SET compacted = true WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+    )
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .execute(fixture.operator_pool.pool())
+    .await?;
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await?;
+    let action = Transaction::new(&table).update_table_properties().set(
+        "write.target-file-size-bytes".to_owned(),
+        "65536".to_owned(),
+    );
+    ApplyTransactionAction::apply(action, Transaction::new(&table))?
+        .commit(fixture.catalog.as_ref())
+        .await?;
+    sqlx::query(
+        "UPDATE vala.file_list SET partition_day = $1, created_at = now() - interval '3 minutes' WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4",
+    )
+    .bind(chrono::NaiveDate::from_ymd_opt(2026, 7, 14).ok_or("invalid benchmark day")?)
+    .bind(fixture.tenant.as_uuid())
+    .bind(&fixture.binding.logical_namespace)
+    .bind(&fixture.binding.table_name)
+    .execute(fixture.operator_pool.pool())
+    .await?;
     let mut config = fixture.config.clone();
-    config.target_bin_bytes = 512 * 1024 * 1024;
     config.max_bytes_per_tick = u64::MAX;
-    config.output_file_bytes = 64 * 1024;
     for sequence in 0_i64..32 {
         fixture.append_forge_file_with_rows(sequence, 100_000).await;
     }
@@ -173,14 +204,16 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let convergence = pending == 0;
     let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
     let negative_flows = if scenario.require_negative_flows {
-        let retry = fixture.forge.run_once().await?;
+        let retry = forge.run_once().await?;
+        let retry_pending = pending_rows(&fixture).await?;
         NegativeFlowReport::executed(
             ["completed_forge_tick_is_idempotent"],
-            retry.bins_committed == 0 && retry.tables_failed == 0,
+            retry.bins_committed == 0 && retry_pending == 0,
         )
     } else {
         NegativeFlowReport::skipped()
     };
+    let negative_flows_passed = negative_flows.passed;
     let verified = outcome.spill_bytes > 0
         && below_demand_shared_memory
         && peak_parent_memory > 0
@@ -199,6 +232,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         elapsed_us: u64::try_from(started.elapsed().as_micros())?,
         verified,
         rows: outcome.output_rows,
+        input_rows: outcome.input_rows,
+        expected_rows,
         input_bytes,
         output_bytes,
         input_files,
@@ -222,7 +257,19 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     )?;
     harness.shutdown().await?;
     if !verified {
-        return Err("Forge benchmark verification failed".into());
+        return Err(format!(
+            "Forge benchmark verification failed: spill={}, outputs={}, pending={}, input_rows={}, output_rows={}, expected_rows={}, peak_memory={}, bookkeeping={}, negative_flows={}",
+            outcome.spill_bytes,
+            outcome.outputs_committed,
+            pending,
+            outcome.input_rows,
+            outcome.output_rows,
+            expected_rows,
+            peak_parent_memory,
+            bookkeeping_converged,
+            negative_flows_passed,
+        )
+        .into());
     }
     Ok(())
 }

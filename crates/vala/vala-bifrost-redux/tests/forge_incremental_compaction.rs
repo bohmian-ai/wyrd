@@ -1,33 +1,38 @@
 //! Integration proof for bounded Forge rewrites and Iceberg metadata.
 
 mod pg_tests {
-    use std::collections::HashMap;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
-    use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+    use arrow::array::{
+        FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
-    use iceberg::{Catalog, CatalogBuilder, TableCreation};
-    use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
-    use iceberg_storage_opendal::OpenDalResolvingStorageFactory;
+    use iceberg::Catalog;
+    use iceberg::spec::{NullOrder, SortDirection, Transform};
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use opendal::services::Fs;
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
-    use sqlx_catalog::any::install_default_drivers;
+    use secrecy::ExposeSecret;
     use tempfile::TempDir;
-    use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
+    use vala_bifrost_redux::catalog::{
+        BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
+    };
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::schema::with_managed_columns;
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+    use wyrd_storage::BackendConfig;
 
     /// Counts ranged source reads while delegating bytes to a local operator.
     #[derive(Debug)]
@@ -108,67 +113,83 @@ mod pg_tests {
     }
 
     impl Fixture {
-        /// Build the Iceberg catalog and registered table used by Forge tests.
+        /// Register the Forge table through the production Bifrost catalog.
         ///
         /// # Panics
         ///
-        /// Panics when catalog loading, namespace creation, schema conversion,
-        /// or table registration fails because those are fixture invariants.
+        /// Panics when production catalog registration or test-only target
+        /// configuration fails because those are fixture invariants.
         async fn build_catalog(
             pg: &PgFixture,
             root: &TempDir,
             binding: &TenantTableBinding,
-            schema: &Schema,
         ) -> Arc<dyn Catalog> {
-            install_default_drivers();
-            let factory = Arc::new(OpenDalResolvingStorageFactory::new());
-            let warehouse = format!("file://{}", root.path().display());
-            let catalog = SqlCatalogBuilder::default()
-                .with_storage_factory(factory)
-                .load(
-                    "wyrd",
-                    [
-                        (
-                            iceberg_catalog_sql::SQL_CATALOG_PROP_URI.to_owned(),
-                            pg.catalog_uri(),
-                        ),
-                        (
-                            iceberg_catalog_sql::SQL_CATALOG_PROP_WAREHOUSE.to_owned(),
-                            warehouse.clone(),
-                        ),
-                        (
-                            iceberg_catalog_sql::SQL_CATALOG_PROP_BIND_STYLE.to_owned(),
-                            SqlBindStyle::DollarNumeric.to_string(),
-                        ),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
-                .await
-                .expect("catalog");
-            let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-            let iceberg_schema = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(schema)
-                .expect("iceberg schema");
+            let backend = BackendConfig::Local {
+                root: root.path().to_path_buf(),
+            };
+            let catalog = BifrostCatalog::new(
+                pg.catalog_dsn().expose_secret(),
+                &backend,
+                pg.vala_postgres().clone(),
+            )
+            .await
+            .expect("production catalog");
             catalog
-                .create_namespace(binding.physical_namespace(), HashMap::new())
+                .create_table(CreateTableRequest {
+                    table: binding.table_ref.clone(),
+                    user_fields: vec![Field::new("value", DataType::Int64, false)],
+                    tenant: binding.tenant,
+                    audit: None,
+                })
                 .await
-                .expect("namespace");
-            catalog
-                .create_table(
-                    binding.physical_namespace(),
-                    TableCreation::builder()
-                        .name(binding.table_name.clone())
-                        .location(format!("{warehouse}/{}", binding.object_prefix))
-                        .schema(iceberg_schema.clone())
-                        .partition_spec(
-                            build_partition_spec(&iceberg_schema, &binding.partition_columns())
-                                .expect("partition spec"),
-                        )
-                        .build(),
-                )
+                .expect("production table registration");
+            let iceberg_catalog = catalog.iceberg_catalog();
+            let table = iceberg_catalog
+                .load_table(&binding.table_ident())
                 .await
-                .expect("table");
-            catalog
+                .expect("registered table");
+            Self::assert_physical_recipe(&table);
+            let action = Transaction::new(&table)
+                .update_table_properties()
+                .set("write.target-file-size-bytes".to_owned(), "3600".to_owned());
+            ApplyTransactionAction::apply(action, Transaction::new(&table))
+                .expect("target property action")
+                .commit(iceberg_catalog.as_ref())
+                .await
+                .expect("target property commit");
+            let configured = iceberg_catalog
+                .load_table(&binding.table_ident())
+                .await
+                .expect("configured table");
+            Self::assert_physical_recipe(&configured);
+            iceberg_catalog
+        }
+
+        /// Assert that registration emitted Forge's fixed Iceberg physical recipe.
+        fn assert_physical_recipe(table: &iceberg::table::Table) {
+            let schema = table.metadata().current_schema();
+            let event_time_id = schema
+                .field_by_name("wyrd_event_time")
+                .expect("event time field")
+                .id;
+            let tenant_id = schema
+                .field_by_name("data_tenant_id")
+                .expect("tenant field")
+                .id;
+            let partition_fields = table.metadata().default_partition_spec().fields();
+            assert_eq!(partition_fields.len(), 1);
+            assert_eq!(partition_fields[0].source_id, event_time_id);
+            assert_eq!(partition_fields[0].name, "wyrd_event_time_day");
+            assert_eq!(partition_fields[0].transform, Transform::Day);
+
+            let sort_fields = &table.metadata().default_sort_order().fields;
+            assert_eq!(sort_fields.len(), 2);
+            for (field, source_id) in sort_fields.iter().zip([tenant_id, event_time_id]) {
+                assert_eq!(field.source_id, source_id);
+                assert_eq!(field.transform, Transform::Identity);
+                assert_eq!(field.direction, SortDirection::Ascending);
+                assert_eq!(field.null_order, NullOrder::Last);
+            }
         }
 
         /// Build a real catalog, staging store, and Forge owner.
@@ -191,8 +212,7 @@ mod pg_tests {
                     .expect("operator")
                     .finish(),
             );
-            let schema = Self::schema();
-            let catalog = Self::build_catalog(&pg, &root, &binding, &schema).await;
+            let catalog = Self::build_catalog(&pg, &root, &binding).await;
             let operator_pool = OperatorPool::from(pg.platform_admin_pool().clone());
             let whole_reads = Arc::new(AtomicUsize::new(0));
             let reads = Arc::new(InstrumentedStore {
@@ -205,7 +225,6 @@ mod pg_tests {
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let config = ForgeConfig {
                 max_concurrent_reads: 2,
-                output_file_bytes: 1,
                 ..ForgeConfig::default()
             };
             let runtime = ForgeRewriteRuntime::new(
@@ -246,15 +265,11 @@ mod pg_tests {
 
         /// Return the stable three-column staging schema.
         fn schema() -> Schema {
-            Schema::new(vec![
-                Field::new("value", DataType::Int64, false),
-                Field::new(
-                    "wyrd_event_time",
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                    false,
-                ),
-                Field::new("data_tenant_id", DataType::Utf8, false),
-            ])
+            Schema::new(with_managed_columns(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )]))
         }
 
         /// Seed Parquet objects and durable file-list rows, optionally aged.
@@ -274,12 +289,22 @@ mod pg_tests {
                 let index = i64::try_from(index).expect("file index fits i64");
                 let row_count = 100_000_i64;
                 let row_count_usize = usize::try_from(row_count).expect("row count fits usize");
+                let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(row_count_usize, 16);
+                for _ in 0..row_count_usize {
+                    batch_ids
+                        .append_value([0_u8; 16])
+                        .expect("fixed batch identifier");
+                }
                 let batch = RecordBatch::try_new(
                     Arc::new(schema.clone()),
                     vec![
                         Arc::new(Int64Array::from(
                             (0..row_count).map(|row| index + row).collect::<Vec<_>>(),
                         )),
+                        Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
+                        Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
+                        Arc::new(StringArray::from(vec![None::<&str>; row_count_usize])),
+                        Arc::new(StringArray::from(vec!["request"; row_count_usize])),
                         Arc::new(
                             TimestampMicrosecondArray::from(
                                 (0..row_count)
@@ -288,6 +313,15 @@ mod pg_tests {
                             )
                             .with_timezone("UTC"),
                         ),
+                        Arc::new(
+                            TimestampMicrosecondArray::from(
+                                (0..row_count)
+                                    .map(|row| base + index + row)
+                                    .collect::<Vec<_>>(),
+                            )
+                            .with_timezone("UTC"),
+                        ),
+                        Arc::new(batch_ids.finish()),
                         Arc::new(StringArray::from(vec![
                             self.tenant.to_string();
                             row_count_usize
@@ -320,6 +354,107 @@ mod pg_tests {
         }
     }
 
+    /// Validate the field metrics emitted for one committed Parquet file.
+    fn assert_output_metrics(data_file: &iceberg::spec::DataFile) {
+        assert_eq!(
+            data_file.file_format(),
+            iceberg::spec::DataFileFormat::Parquet
+        );
+        assert!(data_file.file_size_in_bytes() > 0);
+        let expected = (1..=9).collect();
+        let expected_bounds = [1, 5, 6, 7, 8, 9].into_iter().collect();
+        assert_eq!(
+            data_file
+                .value_counts()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file
+                .column_sizes()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file
+                .lower_bounds()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_bounds
+        );
+        assert_eq!(
+            data_file
+                .upper_bounds()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_bounds
+        );
+        assert!(
+            data_file
+                .value_counts()
+                .values()
+                .all(|count| *count == data_file.record_count())
+        );
+        assert_eq!(
+            data_file
+                .null_value_counts()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file.null_value_counts().values().copied().sum::<u64>(),
+            data_file.record_count() * 3,
+            "the production schema carries three nullable correlation columns"
+        );
+        assert!(data_file.nan_value_counts().is_empty());
+        let offsets = data_file.split_offsets().expect("Parquet split offsets");
+        assert!(!offsets.is_empty());
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// Read the live manifest and validate every committed output file.
+    async fn committed_output_totals(fixture: &Fixture) -> (usize, u64) {
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("committed table");
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        let expected_sort_order_id = i32::try_from(table.metadata().default_sort_order_id())
+            .expect("fixture sort order ID fits i32");
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("manifest list");
+        let mut files = 0;
+        let mut rows = 0;
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("manifest");
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    files += 1;
+                    let data_file = entry.data_file();
+                    rows += data_file.record_count();
+                    assert_output_metrics(data_file);
+                    assert_eq!(data_file.sort_order_id(), Some(expected_sort_order_id));
+                }
+            }
+        }
+        (files, rows)
+    }
+
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
     #[tokio::test]
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
@@ -336,109 +471,15 @@ mod pg_tests {
         );
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
-        assert_eq!(outcome.input_rows, 3_600_000);
-        assert_eq!(outcome.output_rows, 3_600_000);
+        assert_eq!(outcome.input_rows, 3_200_000);
+        assert_eq!(outcome.output_rows, 3_200_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
-        let table = fixture
-            .catalog
-            .load_table(&fixture.binding.table_ident())
-            .await
-            .expect("committed table");
-        let snapshot = table.metadata().current_snapshot().expect("snapshot");
-        let manifests = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .expect("manifest list");
-        let mut output_files = 0_usize;
-        let mut output_rows = 0_u64;
-        for manifest_file in manifests.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .expect("manifest");
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    output_files += 1;
-                    let data_file = entry.data_file();
-                    output_rows += data_file.record_count();
-                    assert_eq!(
-                        data_file.file_format(),
-                        iceberg::spec::DataFileFormat::Parquet
-                    );
-                    assert!(data_file.file_size_in_bytes() > 0);
-                    assert_eq!(
-                        data_file
-                            .value_counts()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .column_sizes()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .lower_bounds()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .upper_bounds()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert!(
-                        data_file
-                            .value_counts()
-                            .values()
-                            .all(|count| *count == data_file.record_count())
-                    );
-                    assert_eq!(
-                        data_file
-                            .null_value_counts()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert!(
-                        data_file
-                            .null_value_counts()
-                            .values()
-                            .all(|count| *count == 0),
-                        "non-null fixture columns must retain explicit zero null counts"
-                    );
-                    assert!(
-                        data_file.nan_value_counts().is_empty(),
-                        "a schema without floating columns must not report NaN counts"
-                    );
-                    let split_offsets = data_file.split_offsets().expect("Parquet split offsets");
-                    assert!(!split_offsets.is_empty());
-                    assert!(
-                        split_offsets
-                            .windows(2)
-                            .all(|offsets| offsets[0] < offsets[1])
-                    );
-                }
-            }
-        }
+        let (output_files, output_rows) = committed_output_totals(&fixture).await;
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
-            output_rows, 3_600_000,
+            output_rows, 3_200_000,
             "rewrite must conserve every input row"
         );
     }

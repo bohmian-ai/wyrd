@@ -260,7 +260,6 @@ async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs()
     let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
     let barrier = OutputPutBarrier::new(Arc::clone(&control));
     let mut config = fixture.config.clone();
-    config.output_file_bytes = 1;
     let context = fixture.context_with_object_store(config, Arc::clone(&barrier));
     let task = tokio::spawn(async move { context.run_once().await });
     tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_reached())
@@ -281,7 +280,7 @@ async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs()
     assert!(
         !entries
             .iter()
-            .any(|entry| entry.path().contains("/data/forge-")),
+            .any(|entry| entry.path().contains("/data/forge/")),
         "stale worker left output objects: {entries:?}"
     );
     assert_eq!(

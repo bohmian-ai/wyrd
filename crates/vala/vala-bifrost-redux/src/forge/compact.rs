@@ -31,12 +31,13 @@ use wyrd_spec::vala::api::{
 };
 
 use super::Forge;
-use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_bins};
+use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
-use super::right_size::ForgeRightSizePolicy;
+use super::right_size::{ForgeRightSizePolicy, IcebergCandidateFile};
 use crate::catalog::TenantTableBinding;
+use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -455,14 +456,14 @@ impl Forge {
         let mut outcome = ForgeTickOutcome::default();
         'groups: for row in rows {
             outcome.groups_seen += 1;
-            let plan = plan_incremental_bins(
-                row.files,
-                right_size_policy.target_file_size_bytes(),
+            let bins = plan_staging_bins(
+                right_size_policy,
+                &row.files,
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
                 Utc::now().date_naive(),
             );
-            for bin in plan.rewrite_bins {
+            for bin in bins {
                 if stop.is_cancelled() {
                     return Ok(outcome);
                 }
@@ -511,6 +512,64 @@ impl Forge {
         }
         Ok(outcome)
     }
+}
+
+/// Map durable staging facts into the live-file policy without reusing its
+/// separate [`CandidateFile`] domain, then map selected groups back to rewrite
+/// bins by their stable object paths.
+fn plan_staging_bins(
+    policy: &ForgeRightSizePolicy,
+    files: &[CandidateFile],
+    max_files: usize,
+    partition_day: NaiveDate,
+    current_day: NaiveDate,
+) -> Vec<RewriteBin> {
+    if max_files == 0 {
+        return Vec::new();
+    }
+    let mut by_path = HashMap::with_capacity(files.len());
+    let live = files
+        .iter()
+        .map(|file| {
+            by_path.insert(file.path.clone(), file.clone());
+            IcebergCandidateFile {
+                catalog_path: file.path.clone(),
+                file_size_bytes: file.size,
+                schema_id: policy.schema_id(),
+                partition_spec_id: policy.partition_spec_id(),
+                partition_day,
+                sort_order_id: Some(policy.sort_order_id()),
+                writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
+                min_event_time: file.min_event_time,
+                max_event_time: file.max_event_time,
+            }
+        })
+        .collect();
+    let plan = policy.plan_partition(live, partition_day >= current_day);
+    let groups = plan
+        .groups
+        .into_iter()
+        .flat_map(|group| {
+            group
+                .files
+                .chunks(max_files)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    groups
+        .into_iter()
+        .filter_map(|group| {
+            let files = group
+                .into_iter()
+                .filter_map(|file| by_path.remove(&file.catalog_path))
+                .collect::<Vec<_>>();
+            (!files.is_empty()).then(|| RewriteBin {
+                total_bytes: files.iter().map(|file| file.size).sum(),
+                files,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1704,5 +1763,40 @@ mod tests {
         let _ = Transaction::new;
         let config = ForgeConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// The staging seam consumes the right-size policy's selected groups.
+    #[test]
+    fn staging_planner_maps_policy_groups_without_healthy_fillers() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let file = |id: u128, path: &str, size| CandidateFile {
+            id: Uuid::from_u128(id),
+            path: path.to_owned(),
+            size,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(
+            &policy,
+            &[
+                file(1, "small-a", 20),
+                file(2, "healthy", 100),
+                file(3, "small-b", 20),
+            ],
+            256,
+            day,
+            day.succ_opt().expect("next day"),
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(
+            bins[0]
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["small-a", "small-b"]
+        );
     }
 }

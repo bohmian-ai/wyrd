@@ -83,6 +83,7 @@ pub struct RewriteBin {
 
 /// Deterministic incremental compaction decision for one partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct IncrementalCompactionPlan {
     /// Complete bins eligible for one fenced rewrite operation each.
     pub(crate) rewrite_bins: Vec<RewriteBin>,
@@ -91,6 +92,7 @@ pub(crate) struct IncrementalCompactionPlan {
 }
 
 /// Plan bounded incremental bins while preserving every input file.
+#[cfg(test)]
 pub(crate) fn plan_incremental_bins(
     mut files: Vec<CandidateFile>,
     target_bytes: u64,

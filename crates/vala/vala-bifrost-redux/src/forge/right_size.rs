@@ -78,9 +78,32 @@ impl ForgeRightSizePolicy {
         self.target_file_size_bytes
     }
 
+    /// Return the schema identity carried by the current table metadata.
+    pub(crate) const fn schema_id(&self) -> i32 {
+        self.schema_id
+    }
+    /// Return the current table partition specification identity.
+    pub(crate) const fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+    /// Return the current table sort-order identity.
+    pub(crate) const fn sort_order_id(&self) -> i64 {
+        self.sort_order_id
+    }
+
     /// Produce ordered worthwhile rewrite groups without catalog or manifest IO.
     #[must_use]
-    pub fn plan(&self, mut files: Vec<IcebergCandidateFile>) -> IcebergRewritePlan {
+    #[cfg(test)]
+    pub fn plan(&self, files: Vec<IcebergCandidateFile>) -> IcebergRewritePlan {
+        self.plan_partition(files, false)
+    }
+
+    /// Plan files while retaining an undersized tail on an active partition.
+    pub(crate) fn plan_partition(
+        &self,
+        mut files: Vec<IcebergCandidateFile>,
+        partition_is_open: bool,
+    ) -> IcebergRewritePlan {
         files.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
         let mut groups = Vec::new();
         let mut pending = Vec::<IcebergCandidateFile>::new();
@@ -90,16 +113,34 @@ impl ForgeRightSizePolicy {
                 && (pending[0].partition_spec_id != file.partition_spec_id
                     || pending[0].partition_day != file.partition_day)
             {
-                Self::finish_undersized(&mut pending, &mut pending_bytes, &mut groups);
+                Self::finish_undersized(
+                    &mut pending,
+                    &mut pending_bytes,
+                    &mut groups,
+                    self.target_file_size_bytes,
+                    partition_is_open,
+                );
             }
             if file.file_size_bytes > self.maximum_file_size_bytes {
-                Self::finish_undersized(&mut pending, &mut pending_bytes, &mut groups);
+                Self::finish_undersized(
+                    &mut pending,
+                    &mut pending_bytes,
+                    &mut groups,
+                    self.target_file_size_bytes,
+                    partition_is_open,
+                );
                 groups.push(IcebergRewriteGroup::singleton(
                     file,
                     IcebergRewriteReason::Oversized,
                 ));
             } else if let Some(reason) = self.identity_reason(&file) {
-                Self::finish_undersized(&mut pending, &mut pending_bytes, &mut groups);
+                Self::finish_undersized(
+                    &mut pending,
+                    &mut pending_bytes,
+                    &mut groups,
+                    self.target_file_size_bytes,
+                    partition_is_open,
+                );
                 groups.push(IcebergRewriteGroup::singleton(file, reason));
             } else if file.file_size_bytes < self.minimum_file_size_bytes {
                 if !pending.is_empty()
@@ -107,13 +148,25 @@ impl ForgeRightSizePolicy {
                         > self.target_file_size_bytes
                     && pending.len() >= 2
                 {
-                    Self::finish_undersized(&mut pending, &mut pending_bytes, &mut groups);
+                    Self::finish_undersized(
+                        &mut pending,
+                        &mut pending_bytes,
+                        &mut groups,
+                        self.target_file_size_bytes,
+                        partition_is_open,
+                    );
                 }
                 pending_bytes = pending_bytes.saturating_add(file.file_size_bytes);
                 pending.push(file);
             }
         }
-        Self::finish_undersized(&mut pending, &mut pending_bytes, &mut groups);
+        Self::finish_undersized(
+            &mut pending,
+            &mut pending_bytes,
+            &mut groups,
+            self.target_file_size_bytes,
+            partition_is_open,
+        );
         let convergence = if groups.is_empty() {
             IcebergConvergence::Converged
         } else {
@@ -130,8 +183,10 @@ impl ForgeRightSizePolicy {
         pending: &mut Vec<IcebergCandidateFile>,
         pending_bytes: &mut u64,
         groups: &mut Vec<IcebergRewriteGroup>,
+        target: u64,
+        partition_is_open: bool,
     ) {
-        if pending.len() >= 2 {
+        if pending.len() >= 2 && (!partition_is_open || *pending_bytes >= target) {
             groups.push(IcebergRewriteGroup {
                 files: std::mem::take(pending),
                 reason: IcebergRewriteReason::Undersized,

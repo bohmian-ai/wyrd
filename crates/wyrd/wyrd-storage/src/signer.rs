@@ -89,6 +89,8 @@ impl BackendSigner {
         part_number: u32,
         ttl: Duration,
     ) -> Result<String, StorageError> {
+        #[cfg(not(feature = "cloud"))]
+        std::future::ready(()).await;
         match self {
             #[cfg(feature = "cloud")]
             Self::Cloud(cloud) => {
@@ -151,6 +153,8 @@ impl BackendSigner {
         path: &ValidatedPath,
         backend_upload_id: &str,
     ) -> Result<(), StorageError> {
+        #[cfg(not(feature = "cloud"))]
+        std::future::ready(()).await;
         match self {
             Self::Local(_) => Ok(()),
             #[cfg(feature = "cloud")]

@@ -9,6 +9,8 @@ use crate::signer::BackendSigner;
 /// feature. Local-only builds have no preflight work.
 #[cfg_attr(not(feature = "cloud"), allow(unused_variables))]
 pub async fn run(signer: &BackendSigner) {
+    #[cfg(not(feature = "cloud"))]
+    std::future::ready(()).await;
     #[cfg(feature = "cloud")]
     if let BackendSigner::Cloud(cloud) = signer {
         cloud.preflight().await;

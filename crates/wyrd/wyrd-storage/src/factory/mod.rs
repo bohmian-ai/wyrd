@@ -34,6 +34,8 @@ fn cloud_disabled(backend: &BackendConfig) -> StorageError {
 /// # Errors
 /// Returns a storage error when SDK construction or boot probing fails.
 pub async fn build_signer(backend: &BackendConfig) -> Result<BackendSigner, StorageError> {
+    #[cfg(not(feature = "cloud"))]
+    std::future::ready(()).await;
     match backend {
         BackendConfig::Local { root } => {
             Ok(BackendSigner::Local(local::build_signer(root.clone())?))

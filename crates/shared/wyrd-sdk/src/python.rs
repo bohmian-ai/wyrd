@@ -26,8 +26,10 @@ use wyrd_spec::registry::{
 
 use crate::WyrdState;
 
+mod registry;
 mod state;
 
+use registry::PythonCardRegistry;
 use state::{PythonLoadConfig, PythonStateHydrator};
 
 /// Immutable Python projection of one complete Card envelope.
@@ -1553,7 +1555,7 @@ impl PyCards {
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<PyRegistrationReceipt> {
-        register_python_card(py, &self.inner, card, version_bump, save_args, None)
+        PythonCardRegistry::new(&self.inner).register(py, card, version_bump, save_args)
     }
 
     /// Register a declarative Card bundle from a local path.
@@ -1688,7 +1690,13 @@ fn register_view_card(
     save_args: Option<&Bound<'_, PyAny>>,
     kind: &CardKind,
 ) -> CardPyResult<PyRegistrationReceipt> {
-    register_python_card(py, registry, card, version_bump, save_args, Some(kind))
+    PythonCardRegistry::new(registry).register_typed(
+        py,
+        card,
+        version_bump,
+        save_args,
+        kind.clone(),
+    )
 }
 
 #[pymethods]

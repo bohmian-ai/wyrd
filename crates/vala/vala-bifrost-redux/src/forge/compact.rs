@@ -35,7 +35,10 @@ use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
-use super::right_size::{ForgeRightSizePolicy, IcebergCandidateFile, validate_supported_layout};
+use super::right_size::{
+    ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
+    validate_supported_layout,
+};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
@@ -555,9 +558,10 @@ fn plan_staging_bins(
         .groups
         .into_iter()
         .flat_map(|group| {
-            group
-                .files
+            let IcebergRewriteGroup { files, reason } = group;
+            files
                 .chunks(max_files)
+                .filter(|chunk| reason != IcebergRewriteReason::Undersized || chunk.len() >= 2)
                 .map(ToOwned::to_owned)
                 .collect::<Vec<_>>()
         })
@@ -1803,5 +1807,31 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["small-a", "small-b"]
         );
+    }
+
+    /// A bounded undersized group never leaves a singleton remainder for a
+    /// worthless one-to-one rewrite.
+    #[test]
+    fn staging_planner_discards_undersized_singleton_remainder() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let file = |id: u128, path: &str| CandidateFile {
+            id: Uuid::from_u128(id),
+            path: path.to_owned(),
+            size: 20,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(
+            &policy,
+            &[file(1, "small-a"), file(2, "small-b"), file(3, "small-c")],
+            2,
+            day,
+            day.succ_opt().expect("next day"),
+        );
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].files.len(), 2);
+        assert_eq!(bins[0].total_bytes, 40);
     }
 }

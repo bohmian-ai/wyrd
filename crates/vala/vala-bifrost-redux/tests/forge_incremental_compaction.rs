@@ -323,6 +323,104 @@ mod pg_tests {
         }
     }
 
+    /// Validate the field metrics emitted for one committed Parquet file.
+    fn assert_output_metrics(data_file: &iceberg::spec::DataFile) {
+        assert_eq!(
+            data_file.file_format(),
+            iceberg::spec::DataFileFormat::Parquet
+        );
+        assert!(data_file.file_size_in_bytes() > 0);
+        let expected = [1, 2, 3].into_iter().collect();
+        assert_eq!(
+            data_file
+                .value_counts()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file
+                .column_sizes()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file
+                .lower_bounds()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert_eq!(
+            data_file
+                .upper_bounds()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(
+            data_file
+                .value_counts()
+                .values()
+                .all(|count| *count == data_file.record_count())
+        );
+        assert_eq!(
+            data_file
+                .null_value_counts()
+                .keys()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        assert!(
+            data_file
+                .null_value_counts()
+                .values()
+                .all(|count| *count == 0)
+        );
+        assert!(data_file.nan_value_counts().is_empty());
+        let offsets = data_file.split_offsets().expect("Parquet split offsets");
+        assert!(!offsets.is_empty());
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// Read the live manifest and validate every committed output file.
+    async fn committed_output_totals(fixture: &Fixture) -> (usize, u64) {
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("committed table");
+        let snapshot = table.metadata().current_snapshot().expect("snapshot");
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("manifest list");
+        let mut files = 0;
+        let mut rows = 0;
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("manifest");
+            for entry in manifest.entries() {
+                if entry.is_alive() {
+                    files += 1;
+                    let data_file = entry.data_file();
+                    rows += data_file.record_count();
+                    assert_output_metrics(data_file);
+                }
+            }
+        }
+        (files, rows)
+    }
+
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
     #[tokio::test]
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
@@ -344,101 +442,7 @@ mod pg_tests {
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
         assert!(fixture.reads.ranged_reads.load(Ordering::Relaxed) > 0);
         assert!(fixture.reads.peak_reads.load(Ordering::Relaxed) <= 2);
-        let table = fixture
-            .catalog
-            .load_table(&fixture.binding.table_ident())
-            .await
-            .expect("committed table");
-        let snapshot = table.metadata().current_snapshot().expect("snapshot");
-        let manifests = table
-            .manifest_list_reader(snapshot)
-            .load()
-            .await
-            .expect("manifest list");
-        let mut output_files = 0_usize;
-        let mut output_rows = 0_u64;
-        for manifest_file in manifests.entries() {
-            let manifest = manifest_file
-                .load_manifest(table.file_io())
-                .await
-                .expect("manifest");
-            for entry in manifest.entries() {
-                if entry.is_alive() {
-                    output_files += 1;
-                    let data_file = entry.data_file();
-                    output_rows += data_file.record_count();
-                    assert_eq!(
-                        data_file.file_format(),
-                        iceberg::spec::DataFileFormat::Parquet
-                    );
-                    assert!(data_file.file_size_in_bytes() > 0);
-                    assert_eq!(
-                        data_file
-                            .value_counts()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .column_sizes()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .lower_bounds()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert_eq!(
-                        data_file
-                            .upper_bounds()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert!(
-                        data_file
-                            .value_counts()
-                            .values()
-                            .all(|count| *count == data_file.record_count())
-                    );
-                    assert_eq!(
-                        data_file
-                            .null_value_counts()
-                            .keys()
-                            .copied()
-                            .collect::<std::collections::BTreeSet<_>>(),
-                        [1, 2, 3].into_iter().collect()
-                    );
-                    assert!(
-                        data_file
-                            .null_value_counts()
-                            .values()
-                            .all(|count| *count == 0),
-                        "non-null fixture columns must retain explicit zero null counts"
-                    );
-                    assert!(
-                        data_file.nan_value_counts().is_empty(),
-                        "a schema without floating columns must not report NaN counts"
-                    );
-                    let split_offsets = data_file.split_offsets().expect("Parquet split offsets");
-                    assert!(!split_offsets.is_empty());
-                    assert!(
-                        split_offsets
-                            .windows(2)
-                            .all(|offsets| offsets[0] < offsets[1])
-                    );
-                }
-            }
-        }
+        let (output_files, output_rows) = committed_output_totals(&fixture).await;
         assert!(output_files >= 2, "rotation must commit multiple outputs");
         assert_eq!(
             output_rows, 3_600_000,

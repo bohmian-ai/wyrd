@@ -164,6 +164,10 @@ mod pg_tests {
                             build_partition_spec(&iceberg_schema, &binding.partition_columns())
                                 .expect("partition spec"),
                         )
+                        .properties([(
+                            "write.target-file-size-bytes".to_owned(),
+                            "3600".to_owned(),
+                        )])
                         .build(),
                 )
                 .await
@@ -205,7 +209,6 @@ mod pg_tests {
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
             let config = ForgeConfig {
                 max_concurrent_reads: 2,
-                output_file_bytes: 1,
                 ..ForgeConfig::default()
             };
             let runtime = ForgeRewriteRuntime::new(

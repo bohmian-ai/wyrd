@@ -93,7 +93,7 @@ async fn output_totals(fixture: &crate::bifrost::ForgeFixture) -> Result<(u64, u
     let mut files = 0_u64;
     for entry in entries {
         let path = entry.path();
-        if path.contains("/forge-") && entry.metadata().is_file() {
+        if path.contains("/forge/") && entry.metadata().is_file() {
             bytes = bytes.saturating_add(entry.metadata().content_length());
             files = files.saturating_add(1);
         }
@@ -138,9 +138,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
     let mut config = fixture.config.clone();
-    config.target_bin_bytes = 512 * 1024 * 1024;
     config.max_bytes_per_tick = u64::MAX;
-    config.output_file_bytes = 64 * 1024;
     for sequence in 0_i64..32 {
         fixture.append_forge_file_with_rows(sequence, 100_000).await;
     }

@@ -37,10 +37,8 @@ use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
 use crate::catalog::TenantTableBinding;
 
-const DEFAULT_TARGET_BIN_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-const DEFAULT_OUTPUT_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -48,8 +46,6 @@ const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 pub struct ForgeConfig {
     /// Minimum number of staged files that makes a group eligible.
     pub min_files: i64,
-    /// Target byte size for one rewrite bin.
-    pub target_bin_bytes: u64,
     /// Maximum number of files in one rewrite bin.
     pub max_files_per_bin: usize,
     /// Maximum number of input files processed by one tick.
@@ -82,8 +78,6 @@ pub struct ForgeConfig {
     pub max_concurrent_reads: usize,
     /// `DataFusion` spill ceiling for Forge rewrites.
     pub spill_limit_bytes: u64,
-    /// Maximum encoded bytes per rewritten output file.
-    pub output_file_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
 }
@@ -93,10 +87,9 @@ impl Default for ForgeConfig {
     fn default() -> Self {
         Self {
             min_files: 2,
-            target_bin_bytes: DEFAULT_TARGET_BIN_BYTES,
             max_files_per_bin: 256,
             max_files_per_tick: 1_024,
-            max_bytes_per_tick: 2 * DEFAULT_TARGET_BIN_BYTES,
+            max_bytes_per_tick: 2 * 512 * 1024 * 1024,
             max_bins_per_tick: 64,
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
@@ -110,7 +103,6 @@ impl Default for ForgeConfig {
             max_gc_candidates_per_batch: 256,
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
-            output_file_bytes: DEFAULT_OUTPUT_FILE_BYTES,
             max_hints_per_wake: 256,
         }
     }
@@ -126,7 +118,6 @@ impl ForgeConfig {
     /// window.
     pub fn validate(&self) -> Result<(), ForgeError> {
         if self.min_files < 2
-            || self.target_bin_bytes == 0
             || self.max_files_per_bin < 2
             || self.max_files_per_tick == 0
             || self.max_bytes_per_tick == 0
@@ -143,7 +134,6 @@ impl ForgeConfig {
             || self.max_gc_candidates_per_batch == 0
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
-            || self.output_file_bytes == 0
             || self.max_hints_per_wake == 0
         {
             return Err(ForgeError::InvalidConfig {
@@ -350,6 +340,35 @@ impl Forge {
         .map_err(ForgeError::Catalog)
     }
 
+    /// Resolve the table property that controls Forge packing and output rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog or invalid-property errors when the table does not
+    /// provide a target representable as `u64`.
+    async fn table_target_file_size_bytes(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<u64, ForgeError> {
+        let table = self.load_table(&binding.table_ident()).await?;
+        let target = u64::try_from(
+            table
+                .metadata()
+                .table_properties()
+                .map_err(ForgeError::Catalog)?
+                .write_target_file_size_bytes,
+        )
+        .map_err(|_| ForgeError::InvalidConfig {
+            detail: "write.target-file-size-bytes exceeds u64".to_owned(),
+        })?;
+        if target == 0 {
+            return Err(ForgeError::InvalidConfig {
+                detail: "write.target-file-size-bytes must be positive".to_owned(),
+            });
+        }
+        Ok(target)
+    }
+
     /// Reconcile prepared compactions before admitting new table work.
     ///
     /// # Errors
@@ -385,9 +404,17 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_candidate_groups(table_key).await?;
+        let target_file_size_bytes = self.table_target_file_size_bytes(binding).await?;
         let mut budget = ForgeTickBudget::default();
-        self.compact_candidate_rows(lease, binding, rows, &mut budget, stop)
-            .await
+        self.compact_candidate_rows(
+            lease,
+            binding,
+            rows,
+            target_file_size_bytes,
+            &mut budget,
+            stop,
+        )
+        .await
     }
 
     /// Query and compact one exact durable day after an advisory hint.
@@ -404,7 +431,8 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_targeted_candidate_group(key).await?;
-        self.compact_candidate_rows(lease, binding, rows, budget, stop)
+        let target_file_size_bytes = self.table_target_file_size_bytes(binding).await?;
+        self.compact_candidate_rows(lease, binding, rows, target_file_size_bytes, budget, stop)
             .await
     }
 }
@@ -421,6 +449,7 @@ impl Forge {
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
         rows: Vec<CandidateRow>,
+        target_file_size_bytes: u64,
         budget: &mut ForgeTickBudget,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
@@ -429,7 +458,7 @@ impl Forge {
             outcome.groups_seen += 1;
             let plan = plan_incremental_bins(
                 row.files,
-                self.core.config.target_bin_bytes,
+                target_file_size_bytes,
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
                 Utc::now().date_naive(),
@@ -461,7 +490,7 @@ impl Forge {
                     break 'groups;
                 }
                 let stats = self
-                    .compact_bin(lease, &row.key, binding, &bin, stop)
+                    .compact_bin(lease, &row.key, binding, &bin, target_file_size_bytes, stop)
                     .await?;
                 outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
                 outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
@@ -577,14 +606,6 @@ impl Forge {
 
         Ok(groups
             .into_iter()
-            .filter(|(_, files)| {
-                files.len() >= usize::try_from(self.core.config.min_files).unwrap_or(usize::MAX)
-                    || files
-                        .iter()
-                        .map(|file| file.size)
-                        .fold(0_u64, u64::saturating_add)
-                        < self.core.config.target_bin_bytes
-            })
             .map(|(partition_day, files)| CandidateRow {
                 key: ForgeGroupKey {
                     tenant: table_key.tenant,
@@ -735,6 +756,7 @@ impl Forge {
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
         bin: &RewriteBin,
+        target_file_size_bytes: u64,
         stop: &CancellationToken,
     ) -> Result<CompactStats, ForgeError> {
         let operation_id = operation_id(key, bin);
@@ -756,6 +778,7 @@ impl Forge {
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
+                    target_file_size_bytes,
                 },
                 stop,
                 lease,

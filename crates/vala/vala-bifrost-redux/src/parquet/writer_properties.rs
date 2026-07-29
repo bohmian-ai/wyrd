@@ -4,6 +4,9 @@ use parquet::basic::{Compression, Encoding, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::schema::types::ColumnPath;
 
+/// Complete version marker for the Bifrost physical Parquet writer recipe.
+pub(crate) const BIFROST_WRITER_RECIPE_VERSION: &str = "bifrost-writer-v1";
+
 const MAX_ROW_GROUP_ROWS: usize = 131_072;
 const BLOOM_FPP: f64 = 0.01;
 const BLOOM_COLUMNS: [&str; 5] = [

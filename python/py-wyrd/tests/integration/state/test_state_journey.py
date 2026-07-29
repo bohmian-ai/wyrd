@@ -28,7 +28,7 @@ from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
 
 TYPED_STATE_SOURCE = (
-    Path(__file__).resolve().parents[4]
+    Path(__file__).resolve().parents[5]
     / "crates/wyrd/wyrd-cli/tests/fixtures/card_lifecycle/typed_state"
 )
 EXPECTED_ALIASES = (

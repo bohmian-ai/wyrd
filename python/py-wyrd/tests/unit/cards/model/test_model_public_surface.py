@@ -6,7 +6,7 @@ from pathlib import Path
 import wyrd
 import wyrd.model as model_module
 
-PACKAGE_ROOT = Path(__file__).resolve().parents[3] / "python" / "wyrd"
+PACKAGE_ROOT = Path(__file__).resolve().parents[4] / "python" / "wyrd"
 
 
 def _init_py_all_exports() -> set[str]:

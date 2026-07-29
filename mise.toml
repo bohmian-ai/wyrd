@@ -668,19 +668,19 @@ run = "uv run python scripts/run_unit_tests.py"
 description = "Run focused Python packaging tests for the shared Wyrd CLI"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/test_cli_surface.py"
+run = "uv run pytest -q tests/unit/cli/test_cli_surface.py"
 
 [tasks."py:test:wyrdstate:unit"]
 description = "Run the focused offline WyrdState hydration tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/state tests/test_wyrdstate_surface.py"
+run = "uv run pytest -q tests/unit/state"
 
 [tasks."py:test:registry:unit"]
 description = "Run focused Python Card registry boundary tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
-run = "uv run pytest -q tests/unit/test_registry_surface.py"
+run = "uv run pytest -q tests/unit/cards/test_registry_surface.py"
 
 [tasks."py:test:tensorflow"]
 hide = true
@@ -710,7 +710,7 @@ run = "uv run ruff check python/wyrd tests scripts"
 hide = true
 description = "Run ty over the generated Python stub surface"
 dir = "python/py-wyrd"
-run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/cards/data/test_public_surface.py"
+run = "uv run ty check python/wyrd/*.pyi python/wyrd/*/__init__.pyi tests/unit/cards/data/test_public_surface.py"
 
 [tasks."py:setup:testing"]
 hide = true
@@ -727,7 +727,7 @@ hide = true
 description = "Run the wyrd.testing harness pytest suite"
 dir = "python/py-wyrd"
 depends = ["py:setup:testing"]
-run = "uv run pytest -q tests/test_test_server.py"
+run = "uv run pytest -q tests/harness/test_test_server.py"
 
 [tasks."py:test:integration"]
 hide = true
@@ -743,7 +743,7 @@ description = "Run the focused real-server Python Card registry journey"
 dir = "python/py-wyrd"
 depends = ["setup:postgres", "py:setup:testing"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "uv run pytest -q -m integration tests/integration/test_cards_crud.py"
+run = "uv run pytest -q -m integration tests/integration/cards/test_cards_crud.py"
 
 [tasks."py:test:wyrdstate:integration"]
 hide = true
@@ -751,7 +751,7 @@ description = "Run the real-server Python-to-offline typed WyrdState journey"
 dir = "python/py-wyrd"
 depends = ["setup:postgres", "py:setup:testing"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_DATABASE_RECOVERY_PASSWORD = "vala_recovery_pw" }
-run = "uv run pytest -q -m integration tests/integration/test_state_journey.py"
+run = "uv run pytest -q -m integration tests/integration/state/test_state_journey.py"
 
 [tasks."check:py-wheel-no-testing"]
 hide = true

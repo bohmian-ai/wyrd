@@ -12,8 +12,7 @@ def main() -> int:
             "-q",
             "-m",
             "not tensorflow",
-            "--ignore=tests/test_test_server.py",
-            "--ignore=tests/integration",
+            "tests/unit",
         ]
     )
 

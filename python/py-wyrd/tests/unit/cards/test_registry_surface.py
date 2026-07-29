@@ -27,7 +27,7 @@ def test_agent_cards_are_not_registerable() -> None:
 
 def test_registry_stub_documents_patch_default_and_exact_delete() -> None:
     """Hand-authored registry contracts describe the native version policy."""
-    stub = Path(__file__).parents[2] / "python" / "wyrd" / "stubs" / "cards.pyi"
+    stub = Path(__file__).parents[3] / "python" / "wyrd" / "stubs" / "cards.pyi"
     text = stub.read_text(encoding="utf-8")
     assert "RegisterableCard: TypeAlias = DataCard | ModelCard | PromptCard" in text
     assert "VersionBump.Patch" in text

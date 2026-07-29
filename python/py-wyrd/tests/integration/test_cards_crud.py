@@ -9,7 +9,9 @@ from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+import pandas as pd
 import pytest
+from sklearn.linear_model import LogisticRegression
 from wyrd import WyrdError
 from wyrd.cards import (
     Cards,
@@ -19,12 +21,13 @@ from wyrd.cards import (
     ModelSaveArgs,
     VersionBump,
 )
-from wyrd.data import DataCard, DataInterface, DataStats, FieldSpec
+from wyrd.data import DataCard, DataInterface, DataStats, FieldSpec, PandasInterface
 from wyrd.model import (
     ModelCard,
     ModelCardMetadata,
     ModelInterface,
     ModelSignature,
+    SklearnInterface,
 )
 from wyrd.prompt import Prompt, PromptCard
 
@@ -189,6 +192,29 @@ def test_data_card_custom_interface_get_requires_interface_and_loads_artifacts(w
 
 
 @pytest.mark.integration
+def test_data_card_pandas_interface_eager_loads_after_real_registry_round_trip(wyrd_server) -> None:
+    """A Pandas DataCard retains its tabular values through eager artifact hydration."""
+    cards = _cards(wyrd_server)
+    data = pd.DataFrame({"customer_id": [101, 202], "score": [0.25, 0.75]})
+    card = DataCard(
+        PandasInterface(data=data),
+        space="python-e2e",
+        name=_name("pandas-data"),
+        version="0.1.0",
+    )
+
+    cards.data.register(card)
+    loaded = cards.data.get(uid=card.uid, interface=PandasInterface, eager_load=True)
+
+    assert loaded.uid == card.uid
+    pd.testing.assert_frame_equal(loaded.data, data)
+
+    cards.data.delete(uid=card.uid)
+    with pytest.raises(WyrdError):
+        cards.data.get(uid=card.uid, interface=PandasInterface)
+
+
+@pytest.mark.integration
 def test_eager_data_load_uses_constructed_server_and_retains_workspace(wyrd_server) -> None:
     """A Cards handle stays bound to server A when ambient config changes to B."""
     api_key = wyrd_server.bootstrap_service(["writer"], name=_name("eager-client"))
@@ -251,6 +277,33 @@ def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
     assert loaded.processor is None
 
     cards.model.delete(uid=card.uid)
+
+
+@pytest.mark.integration
+def test_model_card_sklearn_interface_eager_loads_after_real_registry_round_trip(
+    wyrd_server,
+) -> None:
+    """A scikit-learn ModelCard remains executable after eager artifact hydration."""
+    cards = _cards(wyrd_server)
+    features = [[0.0], [1.0], [2.0], [3.0]]
+    labels = [0, 0, 1, 1]
+    card = ModelCard(
+        SklearnInterface(model=LogisticRegression(random_state=0).fit(features, labels)),
+        space="python-e2e",
+        name=_name("sklearn-model"),
+        version="0.1.0",
+        metadata=_model_metadata(),
+    )
+
+    cards.model.register(card)
+    loaded = cards.model.get(uid=card.uid, eager_load=True)
+
+    assert loaded.uid == card.uid
+    assert loaded.model.predict([[0.0], [3.0]]).tolist() == [0, 1]
+
+    cards.model.delete(uid=card.uid)
+    with pytest.raises(WyrdError):
+        cards.model.get(uid=card.uid)
 
 
 @pytest.mark.integration

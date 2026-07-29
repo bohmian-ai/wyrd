@@ -4,12 +4,70 @@
 //! resulting groups through Forge's existing fenced commit workflow.
 
 use chrono::{DateTime, NaiveDate, Utc};
+use iceberg::spec::{NullOrder, PartitionSpec, Schema, SortDirection, SortOrder, Transform};
 
 use super::error::ForgeError;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 /// Iceberg's unsorted order identifier used when a data file omits the field.
 pub const ICEBERG_UNSORTED_ORDER_ID: i64 = 0;
+
+/// Validate the physical Iceberg layout that Forge's rewrite pipeline emits.
+///
+/// Forge rewrites are sorted by `(data_tenant_id, wyrd_event_time)` and are
+/// partitioned by `day(wyrd_event_time)`. Rejecting any other current layout
+/// before policy construction prevents files from being written with a false
+/// partition or sort identity.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::InvalidConfig`] when the partition spec or sort order
+/// differs from the fixed Bifrost physical recipe, or when either source field
+/// is absent from the current schema.
+pub(crate) fn validate_supported_layout(
+    schema: &Schema,
+    partition_spec: &PartitionSpec,
+    sort_order: &SortOrder,
+) -> Result<(), ForgeError> {
+    let tenant_field =
+        schema
+            .field_by_name("data_tenant_id")
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "Forge physical recipe requires data_tenant_id".to_owned(),
+            })?;
+    let event_time_field =
+        schema
+            .field_by_name("wyrd_event_time")
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "Forge physical recipe requires wyrd_event_time".to_owned(),
+            })?;
+    let partition_fields = partition_spec.fields();
+    if partition_fields.len() != 1
+        || partition_fields[0].source_id != event_time_field.id
+        || partition_fields[0].name != "wyrd_event_time_day"
+        || partition_fields[0].transform != Transform::Day
+    {
+        return Err(ForgeError::InvalidConfig {
+            detail: "Forge supports only day(wyrd_event_time) partitioning".to_owned(),
+        });
+    }
+    let sort_fields = &sort_order.fields;
+    let expected = [tenant_field.id, event_time_field.id];
+    if sort_fields.len() != expected.len()
+        || sort_fields.iter().zip(expected).any(|(field, source_id)| {
+            field.source_id != source_id
+                || field.transform != Transform::Identity
+                || field.direction != SortDirection::Ascending
+                || field.null_order != NullOrder::Last
+        })
+    {
+        return Err(ForgeError::InvalidConfig {
+            detail: "Forge supports only ascending (data_tenant_id, wyrd_event_time) sort order"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
 
 /// Current table identity and file-size bounds for a Forge operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +364,84 @@ pub enum IcebergConvergence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the two system columns used by Forge's fixed physical recipe.
+    fn physical_schema() -> Schema {
+        let arrow = arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new("data_tenant_id", arrow::datatypes::DataType::Utf8, false),
+            arrow::datatypes::Field::new(
+                "wyrd_event_time",
+                arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond,
+                    Some("UTC".into()),
+                ),
+                false,
+            ),
+        ]);
+        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&arrow)
+            .expect("physical test schema builds")
+    }
+
+    /// Build the supported day partition and ascending physical sort order.
+    fn physical_layout(schema: &Schema) -> (PartitionSpec, SortOrder) {
+        let partition_spec = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
+            .add_partition_field("wyrd_event_time", "wyrd_event_time_day", Transform::Day)
+            .expect("day partition field builds")
+            .build()
+            .expect("day partition spec binds");
+        let tenant_id = schema
+            .field_by_name("data_tenant_id")
+            .expect("tenant field")
+            .id;
+        let event_time_id = schema
+            .field_by_name("wyrd_event_time")
+            .expect("event time field")
+            .id;
+        let sort_order = SortOrder::builder()
+            .with_order_id(1)
+            .with_sort_field(iceberg::spec::SortField {
+                source_id: tenant_id,
+                transform: Transform::Identity,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            })
+            .with_sort_field(iceberg::spec::SortField {
+                source_id: event_time_id,
+                transform: Transform::Identity,
+                direction: SortDirection::Ascending,
+                null_order: NullOrder::Last,
+            })
+            .build(schema)
+            .expect("physical sort order binds");
+        (partition_spec, sort_order)
+    }
+
+    /// Reject a table whose default partition transform is not day on event time.
+    #[test]
+    fn unsupported_partition_layout_fails_before_policy_construction() {
+        let schema = physical_schema();
+        let (supported, sort_order) = physical_layout(&schema);
+        let unsupported = PartitionSpec::builder(std::sync::Arc::new(schema.clone()))
+            .add_partition_field("wyrd_event_time", "wyrd_event_time_month", Transform::Month)
+            .expect("month partition field builds")
+            .build()
+            .expect("month partition spec binds");
+        assert!(validate_supported_layout(&schema, &supported, &sort_order).is_ok());
+        let error = validate_supported_layout(&schema, &unsupported, &sort_order)
+            .expect_err("month partition must be rejected");
+        assert!(matches!(error, ForgeError::InvalidConfig { .. }));
+    }
+
+    /// Reject a table whose default sort order differs from Forge's row recipe.
+    #[test]
+    fn unsupported_sort_layout_fails_before_policy_construction() {
+        let schema = physical_schema();
+        let (partition_spec, mut sort_order) = physical_layout(&schema);
+        sort_order.fields[0].direction = SortDirection::Descending;
+        let error = validate_supported_layout(&schema, &partition_spec, &sort_order)
+            .expect_err("descending sort must be rejected");
+        assert!(matches!(error, ForgeError::InvalidConfig { .. }));
+    }
 
     /// Build one current-identity file with a stable ordering key.
     fn file(path: &str, bytes: u64, day: NaiveDate) -> IcebergCandidateFile {

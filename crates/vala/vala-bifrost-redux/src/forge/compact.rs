@@ -35,7 +35,7 @@ use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
-use super::right_size::{ForgeRightSizePolicy, IcebergCandidateFile};
+use super::right_size::{ForgeRightSizePolicy, IcebergCandidateFile, validate_supported_layout};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
@@ -368,6 +368,11 @@ impl Forge {
                 detail: "write.target-file-size-bytes must be positive".to_owned(),
             });
         }
+        validate_supported_layout(
+            table.metadata().current_schema(),
+            table.metadata().default_partition_spec(),
+            table.metadata().default_sort_order(),
+        )?;
         ForgeRightSizePolicy::new(
             target,
             table.metadata().current_schema_id(),

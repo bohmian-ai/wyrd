@@ -123,6 +123,11 @@ pub struct DataCard {
     #[cfg(feature = "python")]
     #[serde(skip)]
     pub interface: Option<Py<PyAny>>,
+    /// Temporary verified workspace retained while an eager registry load owns
+    /// interface paths beneath it.
+    #[cfg(feature = "python")]
+    #[serde(skip)]
+    pub artifact_workspace: Option<tempfile::TempDir>,
 }
 
 impl DataCard {
@@ -298,6 +303,8 @@ impl DataCard {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         })
     }
 
@@ -308,7 +315,39 @@ impl DataCard {
         py: Python<'_>,
         interface: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
-        self.attach_data(py, interface)
+        if let Some(interface) = interface {
+            let (interface, card_ref) =
+                DataCardInput::extract_bound(interface, true)?.into_parts(py, &self.metadata)?;
+            if card_ref.is_some() {
+                return Err(WyrdPyError::validation(
+                    "DataCard hydration interface must be a local DataInterface",
+                ));
+            }
+            let handle = interface.ok_or_else(|| {
+                WyrdPyError::validation("DataCard hydration interface is required")
+            })?;
+            let supplied = handle.to_spec_interface(py)?;
+            let matches_persisted = matches!(
+                (&supplied, &self.metadata.interface),
+                (
+                    wyrd_spec::card::data::DataInterface::Custom(_),
+                    wyrd_spec::card::data::DataInterface::Custom(_),
+                )
+            ) || supplied == self.metadata.interface;
+            if !matches_persisted {
+                return Err(WyrdPyError::validation_with_details(
+                    "DataCard hydration interface does not match persisted interface metadata",
+                    serde_json::json!({
+                        "persisted_interface": self.metadata.interface.kind(),
+                        "supplied_interface": supplied.kind(),
+                    }),
+                ));
+            }
+            self.interface = Some(handle.into_py_any(py)?);
+            return Ok(());
+        }
+        self.interface = Some(interface_from_spec(py, &self.metadata.interface)?);
+        Ok(())
     }
 }
 
@@ -380,6 +419,7 @@ impl DataCard {
             created_at: utc_now(),
             is_card: true,
             interface: interface.map(|handle| handle.into_py_any(py)).transpose()?,
+            artifact_workspace: None,
         })
     }
 
@@ -589,60 +629,32 @@ impl DataCard {
 
     /// Load data artifacts through the held interface.
     ///
-    /// Pass `path` to load an existing local materialization. Without a path,
-    /// call this on a `DataCard` returned by `Cards.data.get`; Wyrd uses the
-    /// configured Wyrd client to obtain the server's artifact inventory,
-    /// downloads and verifies the artifacts into an operation-local temporary
-    /// directory, and then invokes the interface.
+    /// Pass `path` to load an existing local materialization. Registry clients
+    /// materialize artifacts before calling this local-only holder operation.
     ///
     /// `get` itself only retrieves and validates the serialized Card envelope.
     /// This method is the explicit boundary where data bytes enter memory.
     /// The temporary directory remains alive until the interface load returns.
     ///
     /// # Arguments
-    /// * `path` - Optional local materialization directory. Omit it for a
-    ///   server-backed Card returned by `Cards.data.get`.
+    /// * `path` - Local materialization directory.
     /// * `load_kwargs` - Optional `DataLoadArgs` or JSON-compatible mapping
     ///   forwarded to the data interface.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the configured client is unavailable, the
-    /// Card has no server UID, artifact download or verification fails, no
-    /// interface is attached, or interface load fails.
+    /// Returns a Wyrd error when no local materialization path or interface is
+    /// supplied, or interface load fails.
     #[wyrd_test_contract_macros::critical("python:DataCard.load")]
-    #[pyo3(signature = (path=None, load_kwargs=None))]
+    #[pyo3(signature = (path, load_kwargs=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: Option<PathBuf>,
+        path: PathBuf,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
-        let temporary_directory = if path.is_none() {
-            let uid = self.as_card_ref()?.uid.ok_or_else(|| {
-                WyrdPyError::validation("DataCard.load requires a server-assigned Card UID")
-            })?;
-            let cards = wyrd_registry::Cards::new(None, None).map_err(WyrdPyError::from)?;
-            let temporary = tempfile::Builder::new()
-                .prefix("wyrd-data-")
-                .tempdir()
-                .map_err(|error| WyrdPyError::Io(error.to_string()))?;
-            let destination = temporary.path().to_path_buf();
-            py.detach(move || {
-                wyrd_runtime::runtime().block_on(cards.download_artifacts_to(&uid, &destination))
-            })
-            .map_err(WyrdPyError::from)?;
-            Some(temporary)
-        } else {
-            None
-        };
-        let path = path.or_else(|| {
-            temporary_directory
-                .as_ref()
-                .map(|directory| directory.path().to_path_buf())
-        });
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::validation("DataCard interface is required for local load")
         })?;
@@ -719,29 +731,6 @@ impl DataCard {
 
     fn __clear__(&mut self) {
         self.interface = None;
-    }
-}
-
-#[cfg(feature = "python")]
-impl DataCard {
-    fn attach_data(&mut self, py: Python<'_>, data: Option<&Bound<'_, PyAny>>) -> CardPyResult<()> {
-        if let Some(data) = data {
-            let (interface, card_ref) =
-                DataCardInput::extract_bound(data, true)?.into_parts(py, &self.metadata)?;
-            if let Some(handle) = interface {
-                self.metadata.interface = handle.to_spec_interface(py)?;
-                self.metadata.schema = infer_schema_from_handle(&handle, py)?;
-                self.metadata.sql = sql_logic_from_handle(&handle, py)?;
-                self.interface = Some(handle.into_py_any(py)?);
-            }
-            if let Some(card_ref) = card_ref {
-                self.metadata.card_refs.push(card_ref);
-            }
-            return Ok(());
-        }
-
-        self.interface = Some(interface_from_spec(py, &self.metadata.interface)?);
-        Ok(())
     }
 }
 
@@ -1031,6 +1020,8 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         };
 
         let spec = card.to_data_spec_from_metadata();
@@ -1074,6 +1065,8 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         };
         assert!(card.as_card_ref().is_err());
     }

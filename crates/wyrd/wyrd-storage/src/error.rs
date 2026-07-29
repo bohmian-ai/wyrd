@@ -50,6 +50,14 @@ pub enum ConfigParseError {
 /// Top-level error returned by storage operations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// An embedding server attempted to replace an already-bound public URL.
+    #[error("public base URL is already bound to `{existing}`, not `{requested}`")]
+    PublicBaseUrlConflict {
+        /// URL retained by the storage handle.
+        existing: String,
+        /// Conflicting URL requested by the caller.
+        requested: String,
+    },
     /// Tenant path validation failed.
     #[error("tenant path mismatch: {0}")]
     TenantPathMismatch(String),
@@ -278,6 +286,14 @@ impl LocalError {
 impl From<StorageError> for WyrdStorageError {
     fn from(error: StorageError) -> Self {
         match error {
+            StorageError::PublicBaseUrlConflict {
+                existing,
+                requested,
+            } => Self::Backend {
+                detail: format!(
+                    "public base URL conflict: existing `{existing}`, requested `{requested}`"
+                ),
+            },
             StorageError::TenantPathMismatch(detail) => Self::TenantPathMismatch { detail },
             StorageError::ArtifactTooLarge { actual, limit } => {
                 Self::ArtifactTooLarge { actual, limit }

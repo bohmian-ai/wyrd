@@ -1211,7 +1211,8 @@ impl WyrdTestServerBuilder {
         srv.inner
             .state
             .storage
-            .set_public_base_url(base_url.clone());
+            .set_public_base_url(base_url.clone())
+            .map_err(|error| WyrdTestServerError::Bind(error.to_string()))?;
 
         let serve_handle = wyrd_runtime::runtime().spawn(async move {
             let _ = bound.run().await;

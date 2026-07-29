@@ -121,6 +121,11 @@ pub struct ModelCard {
     #[cfg(feature = "python")]
     #[serde(skip)]
     pub interface: Option<Py<PyAny>>,
+    /// Temporary verified workspace retained while an eager registry load owns
+    /// interface paths beneath it.
+    #[cfg(feature = "python")]
+    #[serde(skip)]
+    pub artifact_workspace: Option<tempfile::TempDir>,
 }
 
 impl ModelCard {
@@ -319,6 +324,8 @@ impl ModelCard {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         })
     }
 
@@ -332,9 +339,24 @@ impl ModelCard {
         if let Some(interface) = interface {
             let handle =
                 ModelCardInput::extract_bound(interface, true)?.into_handle(py, &self.metadata)?;
-            self.metadata.interface = handle.to_spec_interface(py)?;
+            let supplied = handle.to_spec_interface(py)?;
+            let matches_persisted = matches!(
+                (&supplied, &self.metadata.interface),
+                (
+                    wyrd_spec::card::model::ModelInterface::Custom(_),
+                    wyrd_spec::card::model::ModelInterface::Custom(_),
+                )
+            ) || supplied == self.metadata.interface;
+            if !matches_persisted {
+                return Err(WyrdPyError::model_validation_with_details(
+                    "ModelCard hydration interface does not match persisted interface metadata",
+                    serde_json::json!({
+                        "persisted_interface": self.metadata.interface.kind(),
+                        "supplied_interface": supplied.kind(),
+                    }),
+                ));
+            }
             self.interface = Some(handle.into_py_any(py)?);
-            self.to_model_spec_from_metadata().validate()?;
             return Ok(());
         }
 
@@ -393,6 +415,7 @@ impl ModelCard {
             created_at: utc_now(),
             is_card: true,
             interface: Some(handle.into_py_any(py)?),
+            artifact_workspace: None,
         };
         card.to_model_spec_from_metadata().validate()?;
         Ok(card)
@@ -660,39 +683,16 @@ impl ModelCard {
     /// Card has no server UID, artifact download or verification fails, no
     /// interface is attached, or interface load fails.
     #[wyrd_test_contract_macros::critical("python:ModelCard.load")]
-    #[pyo3(signature = (path=None, load_kwargs=None))]
+    #[pyo3(signature = (path, load_kwargs=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: Option<PathBuf>,
+        path: PathBuf,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
-        let temporary_directory = if path.is_none() {
-            let uid = self.as_card_ref()?.uid.ok_or_else(|| {
-                WyrdPyError::model_validation("ModelCard.load requires a server-assigned Card UID")
-            })?;
-            let cards = wyrd_registry::Cards::new(None, None).map_err(WyrdPyError::from)?;
-            let temporary = tempfile::Builder::new()
-                .prefix("wyrd-model-")
-                .tempdir()
-                .map_err(|error| WyrdPyError::Io(error.to_string()))?;
-            let destination = temporary.path().to_path_buf();
-            py.detach(move || {
-                wyrd_runtime::runtime().block_on(cards.download_artifacts_to(&uid, &destination))
-            })
-            .map_err(WyrdPyError::from)?;
-            Some(temporary)
-        } else {
-            None
-        };
-        let path = path.or_else(|| {
-            temporary_directory
-                .as_ref()
-                .map(|directory| directory.path().to_path_buf())
-        });
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::model_validation("ModelCard interface is required for local load")
         })?;

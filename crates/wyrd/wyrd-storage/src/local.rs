@@ -63,12 +63,22 @@ impl LocalSigner {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).await?;
         }
-        let temp = target.with_extension("tmp");
-        let mut file = fs::File::create(&temp).await?;
+        let parent = target.parent().ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "local storage target has no parent directory",
+            ))
+        })?;
+        let temp = tempfile::Builder::new()
+            .prefix(".wyrd-write-")
+            .tempfile_in(parent)?;
+        let temp_path = temp.path().to_path_buf();
+        let std_file = temp.into_file();
+        let mut file = fs::File::from_std(std_file);
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
-        fs::rename(temp, target).await?;
+        fs::rename(&temp_path, target).await?;
         Ok(())
     }
 

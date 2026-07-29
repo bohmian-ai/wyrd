@@ -23,7 +23,8 @@ use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
 };
 use wyrd_spec::registry::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+    ArtifactManifestEntry, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
+    HydrationMode, RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
 
 /// One verified artifact payload in a local `WyrdState` bundle.
@@ -289,6 +290,33 @@ impl HydratedStateIndex {
         }
         Ok(self.artifact_dirs_by_ref.get(key).map(PathBuf::as_path))
     }
+
+    /// Compute the canonical artifact-manifest hash for one validated Card.
+    ///
+    /// The hydrated inventory was verified before this method becomes
+    /// reachable. Rebuilding the wire manifest here binds executable-loader
+    /// trust to the exact publication rather than to an alias or local bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state-bundle error when the exact Card key is absent
+    /// or an artifact path is not a valid wire path, and propagates
+    /// canonicalization failures from `wyrd-spec`.
+    fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
+        let manifest = self
+            .artifacts_by_key(key)?
+            .iter()
+            .map(|artifact| {
+                Ok(ArtifactManifestEntry {
+                    relative_path: RelativeArtifactPath::new(artifact.relative_path())?,
+                    sha256: artifact.sha256().to_owned(),
+                    size_bytes: artifact.size_bytes(),
+                    content_type: artifact.content_type().map(str::to_owned),
+                })
+            })
+            .collect::<Result<Vec<_>, WyrdError>>()?;
+        canonical_artifact_manifest_hash(&manifest)
+    }
 }
 
 /// A complete, local, non-executing Card graph.
@@ -305,15 +333,25 @@ pub struct WyrdState {
 /// public state API or into declarative Card values.
 #[derive(Debug)]
 struct HydratedBundleReader<'a> {
-    /// User-provided root which is confined before any manifest projection is read.
-    bundle: &'a Path,
+    /// Original root supplied by the caller for structured hydration failures.
+    requested_root: &'a Path,
+    /// Canonical directory that confines every bundle projection and payload.
+    root: PathBuf,
 }
 
 impl<'a> HydratedBundleReader<'a> {
-    /// Construct a reader for one candidate hydrated bundle root.
-    #[must_use]
-    fn new(bundle: &'a Path) -> Self {
-        Self { bundle }
+    /// Construct a reader for one canonical hydrated-bundle root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state-bundle error when the supplied root cannot be
+    /// inspected, is not a directory, or cannot be canonicalized before any
+    /// manifest-controlled path is read.
+    fn new(bundle: &'a Path) -> Result<Self, WyrdError> {
+        Ok(Self {
+            requested_root: bundle,
+            root: absolute_bundle(bundle)?,
+        })
     }
 
     /// Read the bundle manifest through the fixed confined metadata projection.
@@ -323,7 +361,25 @@ impl<'a> HydratedBundleReader<'a> {
     /// Returns the same stable hydration errors as `WyrdState::from_path` when
     /// metadata is absent, escapes the root, or cannot be decoded.
     fn read_manifest(&self) -> Result<HydratedBundleManifest, WyrdError> {
-        WyrdState::read_manifest(self.bundle)
+        let metadata_path = self.root.join("metadata.yaml");
+        let metadata = fs::symlink_metadata(&metadata_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                unhydrated_error(&metadata_path, "hydrated bundle metadata.yaml is absent")
+            } else {
+                state_bundle_error(
+                    "hydrated bundle metadata.yaml cannot be read",
+                    json!({ "path": metadata_path, "source": error.to_string() }),
+                )
+            }
+        })?;
+        if !metadata.file_type().is_symlink() && !metadata.is_file() {
+            return Err(unhydrated_error(
+                &metadata_path,
+                "hydrated bundle metadata.yaml is not a regular file",
+            ));
+        }
+        let metadata_path = confined_existing_file(&self.root, "metadata.yaml")?;
+        read_yaml(&metadata_path)
     }
 }
 
@@ -336,10 +392,10 @@ impl WyrdState {
     /// internally inconsistent, contains an unconfined path, or preserves a
     /// registration-only sibling reference.
     pub fn from_path(path: &Path) -> Result<Self, WyrdError> {
-        let reader = HydratedBundleReader::new(path);
+        let reader = HydratedBundleReader::new(path)?;
         let manifest = reader.read_manifest()?;
-        Self::validate_manifest_header(&manifest, path)?;
-        let index = Self::load_index(path, manifest)?;
+        reader.validate_manifest_header(&manifest)?;
+        let index = reader.load_index(manifest)?;
         Ok(Self {
             index: Arc::new(index),
         })
@@ -677,58 +733,42 @@ impl WyrdState {
     pub(crate) fn artifact_dir_by_key(&self, key: &str) -> Result<Option<&Path>, WyrdError> {
         self.index.artifact_dir_by_key(key)
     }
-}
 
-impl WyrdState {
-    /// Read the bundle manifest from the fixed metadata projection.
+    /// Return the canonical artifact-manifest hash for an exact indexed Card.
+    ///
+    /// Python hydration calls this only after native bundle validation and
+    /// before an executable serializer can run. `None` means the Card has no
+    /// declared artifacts.
     ///
     /// # Errors
     ///
-    /// Returns `WYRD_SDK_400_UNHYDRATED_ARTIFACT` when metadata is absent or
-    /// not a regular file, and an invalid-state-bundle error when YAML cannot
-    /// be read or decoded. Existing metadata is resolved through the canonical
-    /// bundle root so a symlink cannot redirect loading outside the bundle.
-    fn read_manifest(bundle: &Path) -> Result<HydratedBundleManifest, WyrdError> {
-        let metadata_path = bundle.join("metadata.yaml");
-        let metadata = fs::symlink_metadata(&metadata_path).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                unhydrated_error(&metadata_path, "hydrated bundle metadata.yaml is absent")
-            } else {
-                state_bundle_error(
-                    "hydrated bundle metadata.yaml cannot be read",
-                    json!({ "path": metadata_path, "source": error.to_string() }),
-                )
-            }
-        })?;
-        if !metadata.file_type().is_symlink() && !metadata.is_file() {
-            return Err(unhydrated_error(
-                &metadata_path,
-                "hydrated bundle metadata.yaml is not a regular file",
-            ));
-        }
-        let metadata_path = confined_existing_file(bundle, "metadata.yaml")?;
-        read_yaml(&metadata_path)
+    /// Returns an invalid-state-bundle or canonicalization error when the
+    /// validated index cannot reproduce the Card artifact manifest.
+    pub(crate) fn artifact_manifest_hash_by_key(
+        &self,
+        key: &str,
+    ) -> Result<Option<String>, WyrdError> {
+        self.index.artifact_manifest_hash_by_key(key)
     }
+}
 
+impl HydratedBundleReader<'_> {
     /// Validate bundle-level hydration mode, counts, and Service root identity.
     ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error for unsupported headers, count
     /// mismatches, non-Service roots, or roots without exact identity.
-    fn validate_manifest_header(
-        manifest: &HydratedBundleManifest,
-        path: &Path,
-    ) -> Result<(), WyrdError> {
+    fn validate_manifest_header(&self, manifest: &HydratedBundleManifest) -> Result<(), WyrdError> {
         if manifest.api_version != "wyrd/hydrated-bundle/v1" {
             return Err(state_bundle_error(
                 "unsupported hydrated bundle apiVersion",
-                json!({ "path": path, "api_version": manifest.api_version }),
+                json!({ "path": self.requested_root, "api_version": manifest.api_version }),
             ));
         }
         if manifest.hydration == HydrationMode::MetadataOnly {
             return Err(unhydrated_error(
-                path,
+                self.requested_root,
                 "hydrated bundle contains metadata only and cannot be used as runtime state",
             ));
         }
@@ -745,7 +785,7 @@ impl WyrdState {
             return Err(state_bundle_error(
                 "hydrated bundle manifest counts are inconsistent",
                 json!({
-                    "path": path,
+                    "path": self.requested_root,
                     "card_count": manifest.card_count,
                     "actual_card_count": manifest.cards.len(),
                     "artifact_count": manifest.artifact_count,
@@ -779,16 +819,15 @@ impl WyrdState {
     /// Returns an invalid-state-bundle or unhydrated-artifact error when any
     /// Card projection, reference, relationship, artifact, or root is invalid.
     fn load_index(
-        bundle: &Path,
+        &self,
         manifest: HydratedBundleManifest,
     ) -> Result<HydratedStateIndex, WyrdError> {
-        let bundle = absolute_bundle(bundle)?;
         let mut loaded = Vec::with_capacity(manifest.cards.len());
         let mut known = BTreeSet::new();
         let mut aliases = BTreeMap::new();
 
         for entry in &manifest.cards {
-            let item = Self::load_manifest_card(&bundle, entry)?;
+            let item = self.load_manifest_card(entry)?;
             if !known.insert(item.key.clone()) {
                 return Err(invalid_duplicate_ref(&item.card_ref));
             }
@@ -801,12 +840,12 @@ impl WyrdState {
         }
 
         for item in &loaded {
-            Self::validate_spec_refs(&item.card, &known)?;
-            Self::validate_relationships(&item.card, &aliases, &known)?;
+            self.validate_spec_refs(&item.card, &known)?;
+            self.validate_relationships(&item.card, &aliases, &known)?;
         }
 
-        Self::validate_root(&manifest.root, &loaded)?;
-        Self::validate_reachable_from_root(&manifest.root, &loaded)?;
+        self.validate_root(&manifest.root, &loaded)?;
+        self.validate_reachable_from_root(&manifest.root, &loaded)?;
         HydratedStateIndex::assemble(manifest.root, loaded, aliases)
     }
 
@@ -817,12 +856,12 @@ impl WyrdState {
     /// Returns an invalid-state-bundle or unhydrated-artifact error when a
     /// projection is missing, mismatched, malformed, unconfined, or unverifiable.
     fn load_manifest_card(
-        bundle: &Path,
+        &self,
         entry: &HydratedCardManifest,
     ) -> Result<LoadedManifestCard, WyrdError> {
-        let card_path = confined_existing_file(bundle, &entry.card_path)?;
-        let relationships_path = confined_existing_file(bundle, &entry.relationships_path)?;
-        let inventory_path = confined_existing_file(bundle, &entry.artifact_inventory_path)?;
+        let card_path = confined_existing_file(&self.root, &entry.card_path)?;
+        let relationships_path = confined_existing_file(&self.root, &entry.relationships_path)?;
+        let inventory_path = confined_existing_file(&self.root, &entry.artifact_inventory_path)?;
         let card: Card = read_yaml(&card_path)?;
         if card.api_version.as_str() != ApiVersion::V1 {
             return Err(state_bundle_error(
@@ -860,7 +899,7 @@ impl WyrdState {
 
         let mut artifacts = Vec::with_capacity(entry.artifacts.len());
         for artifact in &entry.artifacts {
-            artifacts.push(Self::validate_artifact(bundle, artifact)?);
+            artifacts.push(self.validate_artifact(artifact)?);
         }
         let artifact_dir = if artifacts.is_empty() {
             None
@@ -872,8 +911,8 @@ impl WyrdState {
                 )
             })?;
             let artifact_dir = confined_existing_dir(
-                bundle,
-                &relative_path(bundle, &card_dir.join("artifacts"))?,
+                &self.root,
+                &relative_path(&self.root, &card_dir.join("artifacts"))?,
             )?;
             for artifact in &artifacts {
                 let expected = artifact_dir.join(&artifact.relative_path);
@@ -889,7 +928,7 @@ impl WyrdState {
 
         for alias in &entry.aliases {
             validate_alias(alias)?;
-            let alias_path = confined_existing_file(bundle, &format!("aliases/{alias}.yaml"))?;
+            let alias_path = confined_existing_file(&self.root, &format!("aliases/{alias}.yaml"))?;
             let record: AliasRecord = read_yaml(&alias_path)?;
             if record.alias != *alias
                 || record.card_ref != card_ref
@@ -922,7 +961,7 @@ impl WyrdState {
     ///
     /// Returns an invalid-state-bundle error describing the first reference
     /// violation in the prescribed precedence order.
-    fn validate_spec_refs(card: &Card, known: &BTreeSet<String>) -> Result<(), WyrdError> {
+    fn validate_spec_refs(&self, card: &Card, known: &BTreeSet<String>) -> Result<(), WyrdError> {
         if let Some(path) = unresolved_card_ref_paths(&card.spec).first() {
             return Err(state_bundle_error(
                 "hydrated Card contains an unresolved path reference",
@@ -964,6 +1003,7 @@ impl WyrdState {
     /// Returns an invalid-state-bundle error when a relationship lacks a UID,
     /// points outside the graph, or disagrees with its alias projection.
     fn validate_relationships(
+        &self,
         card: &Card,
         aliases: &BTreeMap<String, String>,
         known: &BTreeSet<String>,
@@ -1012,17 +1052,17 @@ impl WyrdState {
     /// absent, or an invalid-state-bundle error when path, filesystem, size,
     /// or digest validation fails.
     fn validate_artifact(
-        bundle: &Path,
+        &self,
         entry: &HydratedArtifactManifest,
     ) -> Result<HydratedArtifact, WyrdError> {
         validate_artifact_path(&entry.relative_path)?;
         let local_path = entry.local_path.as_deref().ok_or_else(|| {
             unhydrated_error(
-                bundle,
+                &self.root,
                 "complete hydration is missing an artifact payload path",
             )
         })?;
-        let payload = confined_existing_file(bundle, local_path)?;
+        let payload = confined_existing_file(&self.root, local_path)?;
         let metadata = fs::metadata(&payload).map_err(|error| {
             state_bundle_error(
                 "hydrated artifact payload cannot be read",
@@ -1189,14 +1229,18 @@ fn typed_map_invariant(alias: &str, key: &str, expected: &CardKind) -> WyrdError
     )
 }
 
-impl WyrdState {
+impl HydratedBundleReader<'_> {
     /// Confirm that the manifest root is an exact, loaded Service Card.
     ///
     /// # Errors
     ///
     /// Returns an invalid-state-bundle error when the root is absent, has a
     /// mismatched identity, or is not a Service Card.
-    fn validate_root(root: &CardRef, loaded: &[LoadedManifestCard]) -> Result<(), WyrdError> {
+    fn validate_root(
+        &self,
+        root: &CardRef,
+        loaded: &[LoadedManifestCard],
+    ) -> Result<(), WyrdError> {
         let Some(item) = loaded.iter().find(|item| item.key == root.to_string()) else {
             return Err(state_bundle_error(
                 "hydrated bundle root is not present in its Card set",
@@ -1224,6 +1268,7 @@ impl WyrdState {
     /// Returns an invalid-state-bundle error when a published Card is not
     /// reachable from the declared root through canonical outbound references.
     fn validate_reachable_from_root(
+        &self,
         root: &CardRef,
         loaded: &[LoadedManifestCard],
     ) -> Result<(), WyrdError> {

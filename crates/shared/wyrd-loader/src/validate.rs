@@ -284,7 +284,7 @@ fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<
                 diagnostics.push(Diagnostic::invalid_envelope(
                     card.source_path.clone(),
                     format!(
-                        "conflicting artifact path {} with {} (first authored at {})",
+                        "duplicate artifact path {} conflicts with {} (first authored at {})",
                         artifact.relative_path,
                         first_artifact,
                         first_path.display()

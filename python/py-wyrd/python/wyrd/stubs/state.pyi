@@ -121,6 +121,7 @@ class WyrdState:
         *,
         interfaces: Mapping[str, object] | None = ...,
         load_kwargs: Mapping[str, ModelLoadArgs | DataLoadArgs | Mapping[str, object]] | None = ...,
+        trusted_artifact_hashes: Mapping[str, str] | None = ...,
     ) -> WyrdState:
         """Load, validate, and eagerly hydrate a complete local bundle.
 
@@ -129,6 +130,10 @@ class WyrdState:
             interfaces: Custom Model/Data interface classes or instances keyed
                 by friendly alias.
             load_kwargs: Model/Data loader arguments keyed by friendly alias.
+            trusted_artifact_hashes: Externally verified canonical artifact
+                manifest hashes keyed by Model/Data alias. Joblib-backed built-in
+                Models require an exact hash for their persisted CardRef before
+                local deserialization can run.
 
         Returns:
             A fully hydrated offline runtime state.

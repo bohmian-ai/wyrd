@@ -7,11 +7,11 @@ use sqlx::QueryBuilder;
 use uuid::Uuid;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_semver::{VersionBlock, VersionSpec};
-use wyrd_spec::envelope::{Card, CardKind};
+use wyrd_spec::envelope::{Card, CardKind, SpecCanonicalizationError};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{CardSubmission, RegistrationOperationId};
+use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, RegistrationOperationId};
 
 use crate::row_types::cards::CardStatus;
 use crate::tenant_conn::TenantConn;

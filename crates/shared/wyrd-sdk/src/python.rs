@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use pyo3::class::gc::{PyTraverseError, PyVisit};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyMapping, PyModule, PyTuple};
 use secrecy::SecretString;
@@ -24,6 +25,10 @@ use wyrd_spec::registry::{
 };
 
 use crate::WyrdState;
+
+mod state;
+
+use state::{PythonLoadConfig, PythonStateHydrator};
 
 /// Immutable Python projection of one complete Card envelope.
 #[pyclass(module = "wyrd.state", name = "CardEnvelope", frozen)]
@@ -49,14 +54,6 @@ pub struct PyHydratedArtifact {
     size_bytes: u64,
     /// Optional declared media type.
     content_type: Option<String>,
-}
-
-/// Normalized Python loader configuration keyed by exact `CardRef` identity.
-struct PythonLoadConfig {
-    /// Interface objects retained independently of borrowed Python lifetimes.
-    interface_by_ref: BTreeMap<String, Py<PyAny>>,
-    /// JSON-compatible loader kwargs retained by exact `CardRef`.
-    kwargs_by_ref: BTreeMap<String, Py<PyAny>>,
 }
 
 /// Python wrapper for a locally hydrated `WyrdState`.
@@ -99,13 +96,8 @@ impl PyWyrdState {
     /// Returns a stable SDK error for malformed bundles, mapping conversion,
     /// Card-kind conflicts, runtime loader failures, or Python allocation.
     ///
-    /// # Cancellation
-    ///
-    /// The detached filesystem operation can be cancelled by the caller; no
-    /// partially constructed Python state is returned, and a later call may
-    /// retry local reads.
     #[staticmethod]
-    #[pyo3(signature = (path, *, interfaces=None, load_kwargs=None))]
+    #[pyo3(signature = (path, *, interfaces=None, load_kwargs=None, trusted_artifact_hashes=None))]
     // justification: pyo3 boundary; the extractor produces an owned PathBuf, and the path is moved into the detached filesystem operation
     #[allow(clippy::needless_pass_by_value)]
     fn from_path(
@@ -113,23 +105,26 @@ impl PyWyrdState {
         path: PathBuf,
         interfaces: Option<&Bound<'_, PyMapping>>,
         load_kwargs: Option<&Bound<'_, PyMapping>>,
+        trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
     ) -> CardPyResult<Self> {
         let inner = py
             .detach(|| WyrdState::from_path(&path))
             .map_err(WyrdPyError::from)?;
-        let config = parse_load_config(py, &inner, interfaces, load_kwargs)?;
-        let envelopes = build_envelopes(py, &inner)?;
-        let prompts = build_prompts(py, &inner)?;
-        let agents = build_agents(py, &inner)?;
-        let models = build_models(py, &inner, &config)?;
-        let data = build_data(py, &inner, &config)?;
+        let config = PythonStateHydrator::normalize_config(
+            py,
+            &inner,
+            interfaces,
+            load_kwargs,
+            trusted_artifact_hashes,
+        )?;
+        let hydrated = PythonStateHydrator::new(&inner, config).hydrate(py)?;
         Ok(Self {
             inner,
-            envelopes,
-            agents,
-            prompts,
-            models,
-            data,
+            envelopes: hydrated.envelopes,
+            agents: hydrated.agents,
+            prompts: hydrated.prompts,
+            models: hydrated.models,
+            data: hydrated.data,
         })
     }
 
@@ -289,6 +284,37 @@ impl PyWyrdState {
             alias,
             Some(CardKind::Workflow),
         )
+    }
+
+    /// Visit every retained Python holder for cyclic garbage collection.
+    // justification: pyo3 GC callbacks receive their visitor by value.
+    #[allow(clippy::needless_pass_by_value)]
+    fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
+        for value in self.envelopes.values() {
+            visit.call(value)?;
+        }
+        for value in self.agents.values() {
+            visit.call(value)?;
+        }
+        for value in self.prompts.values() {
+            visit.call(value)?;
+        }
+        for value in self.models.values() {
+            visit.call(value)?;
+        }
+        for value in self.data.values() {
+            visit.call(value)?;
+        }
+        Ok(())
+    }
+
+    /// Break every retained Python reference before cyclic collection.
+    fn __clear__(&mut self) {
+        self.envelopes.clear();
+        self.agents.clear();
+        self.prompts.clear();
+        self.models.clear();
+        self.data.clear();
     }
 }
 
@@ -575,10 +601,12 @@ fn parse_load_config(
     state: &WyrdState,
     interfaces: Option<&Bound<'_, PyMapping>>,
     load_kwargs: Option<&Bound<'_, PyMapping>>,
+    trusted_artifact_hashes: Option<&Bound<'_, PyMapping>>,
 ) -> CardPyResult<PythonLoadConfig> {
     let mut config = PythonLoadConfig {
         interface_by_ref: BTreeMap::new(),
         kwargs_by_ref: BTreeMap::new(),
+        trusted_artifact_hashes_by_ref: BTreeMap::new(),
     };
     if let Some(mapping) = interfaces {
         for (alias, value) in mapping_items(mapping)? {
@@ -613,6 +641,32 @@ fn parse_load_config(
                 }
             }
             config.kwargs_by_ref.insert(key, normalized.into_any());
+        }
+    }
+    if let Some(mapping) = trusted_artifact_hashes {
+        for (alias, value) in mapping_items(mapping)? {
+            let reference = state.card_ref(&alias)?;
+            require_model_data(&alias, reference)?;
+            let expected = value.extract::<String>().map_err(|_| {
+                runtime_hydration_error(
+                    state,
+                    &reference.to_string(),
+                    "artifact_trust",
+                    "trusted artifact manifest hash must be a string",
+                )
+            })?;
+            let key = reference.to_string();
+            if let Some(existing) = config.trusted_artifact_hashes_by_ref.get(&key)
+                && existing != &expected
+            {
+                return Err(runtime_hydration_error(
+                    state,
+                    &key,
+                    "artifact_trust",
+                    "aliases resolving to one Card must use the identical trusted artifact manifest hash",
+                ));
+            }
+            config.trusted_artifact_hashes_by_ref.insert(key, expected);
         }
     }
     Ok(config)
@@ -766,41 +820,49 @@ fn missing_runtime_artifacts(state: &WyrdState, key: &str) -> WyrdPyError {
 /// # Errors
 ///
 /// Returns invalid-state or Python-allocation errors.
-fn build_envelopes(
-    py: Python<'_>,
-    state: &WyrdState,
-) -> CardPyResult<BTreeMap<String, Py<PyCardEnvelope>>> {
-    let mut values = BTreeMap::new();
-    for (key, card) in state.cards() {
-        let card_ref = state.card_ref_by_key(key)?.clone();
-        let aliases = state.aliases_by_key(key)?.to_vec();
-        if aliases.is_empty() {
-            return Err(WyrdPyError::from(WyrdError::SdkInvalidStateBundle {
-                message: "Card has no stable alias".to_owned(),
-                details: serde_json::json!({"card_ref": card_ref}),
-            }));
-        }
-        values.insert(
-            key.to_owned(),
-            Py::new(
-                py,
-                PyCardEnvelope {
-                    card: card.clone(),
-                    card_ref,
-                    aliases,
-                },
-            )
-            .map_err(|_| {
-                runtime_hydration_error(
-                    state,
-                    key,
-                    "python_allocation",
-                    "Python envelope allocation failed",
+impl PythonStateHydrator<'_> {
+    /// Allocate immutable envelope projections for every exact CardRef.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid-state or Python-allocation errors.
+    fn hydrate_envelopes(
+        &self,
+        py: Python<'_>,
+    ) -> CardPyResult<BTreeMap<String, Py<PyCardEnvelope>>> {
+        let state = self.state;
+        let mut values = BTreeMap::new();
+        for (key, card) in state.cards() {
+            let card_ref = state.card_ref_by_key(key)?.clone();
+            let aliases = state.aliases_by_key(key)?.to_vec();
+            if aliases.is_empty() {
+                return Err(WyrdPyError::from(WyrdError::SdkInvalidStateBundle {
+                    message: "Card has no stable alias".to_owned(),
+                    details: serde_json::json!({"card_ref": card_ref}),
+                }));
+            }
+            values.insert(
+                key.to_owned(),
+                Py::new(
+                    py,
+                    PyCardEnvelope {
+                        card: card.clone(),
+                        card_ref,
+                        aliases,
+                    },
                 )
-            })?,
-        );
+                .map_err(|_| {
+                    runtime_hydration_error(
+                        state,
+                        key,
+                        "python_allocation",
+                        "Python envelope allocation failed",
+                    )
+                })?,
+            );
+        }
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// Construct and hydrate each exact Prompt Card once.
@@ -808,31 +870,36 @@ fn build_envelopes(
 /// # Errors
 ///
 /// Returns prompt conversion, hydration, or Python-allocation errors.
-fn build_prompts(
-    py: Python<'_>,
-    state: &WyrdState,
-) -> CardPyResult<BTreeMap<String, Py<PromptCard>>> {
-    let mut values = BTreeMap::new();
-    for (key, envelope) in state.cards_of_kind(CardKind::Prompt) {
-        let mut card = PromptCard::from_card(envelope.clone()).map_err(|_| {
-            runtime_hydration_error(state, key, "prompt", "prompt holder construction failed")
-        })?;
-        card.hydrate_prompt(py).map_err(|_| {
-            runtime_hydration_error(state, key, "prompt", "prompt hydration failed")
-        })?;
-        values.insert(
-            key.to_owned(),
-            Py::new(py, card).map_err(|_| {
-                runtime_hydration_error(
-                    state,
-                    key,
-                    "python_allocation",
-                    "Python holder allocation failed",
-                )
-            })?,
-        );
+impl PythonStateHydrator<'_> {
+    /// Construct and hydrate every exact Prompt holder.
+    ///
+    /// # Errors
+    ///
+    /// Returns prompt conversion, hydration, or allocation errors.
+    fn hydrate_prompts(&self, py: Python<'_>) -> CardPyResult<BTreeMap<String, Py<PromptCard>>> {
+        let state = self.state;
+        let mut values = BTreeMap::new();
+        for (key, envelope) in state.cards_of_kind(CardKind::Prompt) {
+            let mut card = PromptCard::from_card(envelope.clone()).map_err(|_| {
+                runtime_hydration_error(state, key, "prompt", "prompt holder construction failed")
+            })?;
+            card.hydrate_prompt(py).map_err(|_| {
+                runtime_hydration_error(state, key, "prompt", "prompt hydration failed")
+            })?;
+            values.insert(
+                key.to_owned(),
+                Py::new(py, card).map_err(|_| {
+                    runtime_hydration_error(
+                        state,
+                        key,
+                        "python_allocation",
+                        "Python holder allocation failed",
+                    )
+                })?,
+            );
+        }
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// Construct each exact Agent Card and resolve only referenced prompts.
@@ -841,38 +908,48 @@ fn build_prompts(
 /// # Errors
 ///
 /// Returns agent conversion, prompt hydration, or Python-allocation errors.
-fn build_agents(
-    py: Python<'_>,
-    state: &WyrdState,
-) -> CardPyResult<BTreeMap<String, Py<PyAgentCard>>> {
-    let mut values = BTreeMap::new();
-    for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
-        let mut card = PyAgentCard::from_card(py, envelope.clone()).map_err(|_| {
-            runtime_hydration_error(state, key, "prompt", "agent holder construction failed")
-        })?;
-        let alias = primary_alias(state, key)?;
-        if !matches!(card.native().spec.prompt, InlineableRef::Inline(_)) {
-            let prompt = state.agent_prompt(alias).map_err(|_| {
-                runtime_hydration_error(state, key, "prompt", "agent prompt resolution failed")
+impl PythonStateHydrator<'_> {
+    /// Construct and hydrate every exact Agent holder.
+    ///
+    /// # Errors
+    ///
+    /// Returns agent conversion, prompt resolution, hydration, or allocation errors.
+    fn hydrate_agents(&self, py: Python<'_>) -> CardPyResult<BTreeMap<String, Py<PyAgentCard>>> {
+        let state = self.state;
+        let mut values = BTreeMap::new();
+        for (key, envelope) in state.cards_of_kind(CardKind::Agent) {
+            let mut card = PyAgentCard::from_card(py, envelope.clone()).map_err(|_| {
+                runtime_hydration_error(state, key, "prompt", "agent holder construction failed")
             })?;
-            card.hydrate_resolved_prompt(py, prompt.clone())
-                .map_err(|_| {
-                    runtime_hydration_error(state, key, "prompt", "agent prompt hydration failed")
+            let alias = primary_alias(state, key)?;
+            if !matches!(card.native().spec.prompt, InlineableRef::Inline(_)) {
+                let prompt = state.agent_prompt(alias).map_err(|_| {
+                    runtime_hydration_error(state, key, "prompt", "agent prompt resolution failed")
                 })?;
+                card.hydrate_resolved_prompt(py, prompt.clone())
+                    .map_err(|_| {
+                        runtime_hydration_error(
+                            state,
+                            key,
+                            "prompt",
+                            "agent prompt hydration failed",
+                        )
+                    })?;
+            }
+            values.insert(
+                key.to_owned(),
+                Py::new(py, card).map_err(|_| {
+                    runtime_hydration_error(
+                        state,
+                        key,
+                        "python_allocation",
+                        "Python holder allocation failed",
+                    )
+                })?,
+            );
         }
-        values.insert(
-            key.to_owned(),
-            Py::new(py, card).map_err(|_| {
-                runtime_hydration_error(
-                    state,
-                    key,
-                    "python_allocation",
-                    "Python holder allocation failed",
-                )
-            })?,
-        );
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// Construct and eagerly load each exact Model Card from keyed artifacts.
@@ -880,45 +957,50 @@ fn build_agents(
 /// # Errors
 ///
 /// Returns interface, artifact, loader, state, or Python-allocation errors.
-fn build_models(
-    py: Python<'_>,
-    state: &WyrdState,
-    config: &PythonLoadConfig,
-) -> CardPyResult<BTreeMap<String, Py<ModelCard>>> {
-    let mut values = BTreeMap::new();
-    for (key, envelope) in state.cards_of_kind(CardKind::Model) {
-        let mut card = ModelCard::from_card(envelope.clone()).map_err(|_| {
-            runtime_hydration_error(state, key, "interface", "model holder construction failed")
-        })?;
-        let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
-        card.hydrate_interface(py, interface).map_err(|_| {
-            runtime_hydration_error(state, key, "interface", "model interface hydration failed")
-        })?;
-        let artifact_dir = state
-            .artifact_dir_by_key(key)?
-            .map(PathBuf::from)
-            .ok_or_else(|| missing_runtime_artifacts(state, key))?;
-        card.load(
-            py,
-            Some(artifact_dir),
-            config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
-        )
-        .map_err(|_| {
-            runtime_hydration_error(state, key, "artifact_load", "model artifact load failed")
-        })?;
-        values.insert(
-            key.to_owned(),
-            Py::new(py, card).map_err(|_| {
-                runtime_hydration_error(
-                    state,
-                    key,
-                    "python_allocation",
-                    "Python holder allocation failed",
-                )
-            })?,
-        );
+impl PythonStateHydrator<'_> {
+    /// Construct and eagerly load every exact Model holder.
+    ///
+    /// # Errors
+    ///
+    /// Returns interface, artifact, loader, state, or Python-allocation errors.
+    fn hydrate_models(&self, py: Python<'_>) -> CardPyResult<BTreeMap<String, Py<ModelCard>>> {
+        let state = self.state;
+        let config = &self.config;
+        let mut values = BTreeMap::new();
+        for (key, envelope) in state.cards_of_kind(CardKind::Model) {
+            let mut card = ModelCard::from_card(envelope.clone()).map_err(|_| {
+                runtime_hydration_error(state, key, "interface", "model holder construction failed")
+            })?;
+            let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
+            card.hydrate_interface(py, interface).map_err(|_| {
+                runtime_hydration_error(state, key, "interface", "model interface hydration failed")
+            })?;
+            let artifact_dir = state
+                .artifact_dir_by_key(key)?
+                .map(PathBuf::from)
+                .ok_or_else(|| missing_runtime_artifacts(state, key))?;
+            card.load(
+                py,
+                artifact_dir,
+                config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
+            )
+            .map_err(|_| {
+                runtime_hydration_error(state, key, "artifact_load", "model artifact load failed")
+            })?;
+            values.insert(
+                key.to_owned(),
+                Py::new(py, card).map_err(|_| {
+                    runtime_hydration_error(
+                        state,
+                        key,
+                        "python_allocation",
+                        "Python holder allocation failed",
+                    )
+                })?,
+            );
+        }
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// Construct and eagerly load each exact Data Card from keyed artifacts.
@@ -926,45 +1008,50 @@ fn build_models(
 /// # Errors
 ///
 /// Returns interface, artifact, loader, state, or Python-allocation errors.
-fn build_data(
-    py: Python<'_>,
-    state: &WyrdState,
-    config: &PythonLoadConfig,
-) -> CardPyResult<BTreeMap<String, Py<DataCard>>> {
-    let mut values = BTreeMap::new();
-    for (key, envelope) in state.cards_of_kind(CardKind::Data) {
-        let mut card = DataCard::from_card(envelope.clone()).map_err(|_| {
-            runtime_hydration_error(state, key, "interface", "data holder construction failed")
-        })?;
-        let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
-        card.hydrate_interface(py, interface).map_err(|_| {
-            runtime_hydration_error(state, key, "interface", "data interface hydration failed")
-        })?;
-        let artifact_dir = state
-            .artifact_dir_by_key(key)?
-            .map(PathBuf::from)
-            .ok_or_else(|| missing_runtime_artifacts(state, key))?;
-        card.load(
-            py,
-            Some(artifact_dir),
-            config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
-        )
-        .map_err(|_| {
-            runtime_hydration_error(state, key, "artifact_load", "data artifact load failed")
-        })?;
-        values.insert(
-            key.to_owned(),
-            Py::new(py, card).map_err(|_| {
-                runtime_hydration_error(
-                    state,
-                    key,
-                    "python_allocation",
-                    "Python holder allocation failed",
-                )
-            })?,
-        );
+impl PythonStateHydrator<'_> {
+    /// Construct and eagerly load every exact Data holder.
+    ///
+    /// # Errors
+    ///
+    /// Returns interface, artifact, loader, state, or Python-allocation errors.
+    fn hydrate_data(&self, py: Python<'_>) -> CardPyResult<BTreeMap<String, Py<DataCard>>> {
+        let state = self.state;
+        let config = &self.config;
+        let mut values = BTreeMap::new();
+        for (key, envelope) in state.cards_of_kind(CardKind::Data) {
+            let mut card = DataCard::from_card(envelope.clone()).map_err(|_| {
+                runtime_hydration_error(state, key, "interface", "data holder construction failed")
+            })?;
+            let interface = config.interface_by_ref.get(key).map(|value| value.bind(py));
+            card.hydrate_interface(py, interface).map_err(|_| {
+                runtime_hydration_error(state, key, "interface", "data interface hydration failed")
+            })?;
+            let artifact_dir = state
+                .artifact_dir_by_key(key)?
+                .map(PathBuf::from)
+                .ok_or_else(|| missing_runtime_artifacts(state, key))?;
+            card.load(
+                py,
+                artifact_dir,
+                config.kwargs_by_ref.get(key).map(|value| value.bind(py)),
+            )
+            .map_err(|_| {
+                runtime_hydration_error(state, key, "artifact_load", "data artifact load failed")
+            })?;
+            values.insert(
+                key.to_owned(),
+                Py::new(py, card).map_err(|_| {
+                    runtime_hydration_error(
+                        state,
+                        key,
+                        "python_allocation",
+                        "Python holder allocation failed",
+                    )
+                })?,
+            );
+        }
+        Ok(values)
     }
-    Ok(values)
 }
 
 /// Python version bump used by registration.
@@ -1723,7 +1810,7 @@ impl PyDataCardRegistry {
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, the envelope fails validation, or a required custom interface is
     /// missing.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None, interface=None))]
+    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None, interface=None, eager_load=false, load_args=None))]
     fn get(
         &self,
         py: Python<'_>,
@@ -1732,11 +1819,31 @@ impl PyDataCardRegistry {
         name: Option<&str>,
         version: Option<&str>,
         interface: Option<&Bound<'_, PyAny>>,
+        eager_load: bool,
+        load_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<DataCard> {
         let selector = selector_for_kind(CardKind::Data, uid, space, name, version)?;
         let envelope = download_card(py, &self.inner, selector)?;
         let mut card = DataCard::from_card(envelope)?;
         card.hydrate_interface(py, interface)?;
+        if eager_load {
+            let uid = card.as_card_ref()?.uid.ok_or_else(|| {
+                WyrdPyError::validation("server DataCard response requires a Card UID")
+            })?;
+            let workspace = tempfile::Builder::new()
+                .prefix("wyrd-data-")
+                .tempdir()
+                .map_err(|error| WyrdPyError::Io(error.to_string()))?;
+            let path = workspace.path().join("artifacts");
+            let client = self.inner.clone();
+            let download_path = path.clone();
+            py.detach(move || {
+                wyrd_runtime::runtime().block_on(client.download_artifacts_to(&uid, &download_path))
+            })
+            .map_err(WyrdPyError::from)?;
+            card.load(py, path, load_args)?;
+            card.artifact_workspace = Some(workspace);
+        }
         Ok(card)
     }
 }
@@ -1893,7 +2000,7 @@ impl PyModelCardRegistry {
     /// Returns a Wyrd error when the selector is invalid, the Card is not
     /// found, the envelope fails validation, or a required custom interface is
     /// missing.
-    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None, interface=None))]
+    #[pyo3(signature = (*, uid=None, space=None, name=None, version=None, interface=None, eager_load=false, load_args=None))]
     fn get(
         &self,
         py: Python<'_>,
@@ -1902,11 +2009,31 @@ impl PyModelCardRegistry {
         name: Option<&str>,
         version: Option<&str>,
         interface: Option<&Bound<'_, PyAny>>,
+        eager_load: bool,
+        load_args: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<ModelCard> {
         let selector = selector_for_kind(CardKind::Model, uid, space, name, version)?;
         let envelope = download_card(py, &self.inner, selector)?;
         let mut card = ModelCard::from_card(envelope)?;
         card.hydrate_interface(py, interface)?;
+        if eager_load {
+            let uid = card.as_card_ref()?.uid.ok_or_else(|| {
+                WyrdPyError::model_validation("server ModelCard response requires a Card UID")
+            })?;
+            let workspace = tempfile::Builder::new()
+                .prefix("wyrd-model-")
+                .tempdir()
+                .map_err(|error| WyrdPyError::Io(error.to_string()))?;
+            let path = workspace.path().join("artifacts");
+            let client = self.inner.clone();
+            let download_path = path.clone();
+            py.detach(move || {
+                wyrd_runtime::runtime().block_on(client.download_artifacts_to(&uid, &download_path))
+            })
+            .map_err(WyrdPyError::from)?;
+            card.load(py, path, load_args)?;
+            card.artifact_workspace = Some(workspace);
+        }
         Ok(card)
     }
 }

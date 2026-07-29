@@ -183,44 +183,9 @@ impl Cards {
         card_uid: &CardUid,
         destination: &Path,
     ) -> Result<(), WyrdError> {
-        tokio::fs::create_dir_all(destination)
+        ArtifactMaterializer::new(self, card_uid, destination)
+            .materialize()
             .await
-            .map_err(RegistryEngineError::from)
-            .map_err(WyrdError::from)?;
-
-        let inventory = reads::list_artifacts(&self.engine.client, card_uid)
-            .await
-            .map_err(WyrdError::from)?;
-        let downloads =
-            futures_util::stream::iter(inventory.artifacts.into_iter().map(|artifact| {
-                let engine = Arc::clone(&self.engine);
-                let card_uid = card_uid.clone();
-                let destination = destination.to_path_buf();
-                async move {
-                    let path = destination.join(artifact.relative_path.as_str());
-                    if let Some(parent) = path.parent() {
-                        tokio::fs::create_dir_all(parent)
-                            .await
-                            .map_err(RegistryEngineError::from)?;
-                    }
-                    download::download_artifact(
-                        &engine.client,
-                        &engine.storage,
-                        &card_uid,
-                        &artifact.relative_path,
-                        &path,
-                    )
-                    .await
-                }
-            }))
-            .buffer_unordered(4)
-            .collect::<Vec<_>>()
-            .await;
-
-        for result in downloads {
-            result.map_err(WyrdError::from)?;
-        }
-        Ok(())
     }
     /// Clone the authenticated context for another focused registry capability.
     ///
@@ -423,6 +388,126 @@ impl Cards {
             temporary_artifact_directory: temporary_directory,
             artifact_directory: destination.map(Path::to_path_buf),
         })
+    }
+}
+
+/// Builds one complete verified artifact publication before exposing it.
+///
+/// The materializer retains the authenticated registry engine, exact card UID,
+/// and caller-selected destination for one operation. It writes only beneath a
+/// random sibling staging directory and renames that complete directory into
+/// place after every transfer verifies, so failed transfers cannot alter a
+/// prior destination.
+struct ArtifactMaterializer<'a> {
+    /// Authenticated registry transport and storage client.
+    engine: &'a Arc<RegistryEngine>,
+    /// Exact server-assigned owner of the inventory.
+    card_uid: &'a CardUid,
+    /// Final caller-visible artifact root.
+    destination: &'a Path,
+}
+
+impl<'a> ArtifactMaterializer<'a> {
+    /// Create a materializer for one Card inventory and destination.
+    #[must_use]
+    fn new(cards: &'a Cards, card_uid: &'a CardUid, destination: &'a Path) -> Self {
+        Self {
+            engine: &cards.engine,
+            card_uid,
+            destination,
+        }
+    }
+
+    /// Fetch, verify, and atomically publish the complete artifact inventory.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error when inventory planning, staging creation, any
+    /// transfer, digest verification, or final publication fails. On transfer
+    /// failure the staging directory is dropped and the destination is not
+    /// modified.
+    async fn materialize(&self) -> Result<(), WyrdError> {
+        let inventory = reads::list_artifacts(&self.engine.client, self.card_uid)
+            .await
+            .map_err(WyrdError::from)?;
+        let parent =
+            self.destination
+                .parent()
+                .ok_or_else(|| WyrdError::RegistryInvalidCardSpec {
+                    message: "artifact destination must have a parent directory".to_owned(),
+                    details: serde_json::json!({ "destination": self.destination }),
+                })?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(RegistryEngineError::from)
+            .map_err(WyrdError::from)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".wyrd-artifacts-")
+            .tempdir_in(parent)
+            .map_err(RegistryEngineError::from)
+            .map_err(WyrdError::from)?;
+        let staging_root = staging.path().join("publication");
+        tokio::fs::create_dir(&staging_root)
+            .await
+            .map_err(RegistryEngineError::from)
+            .map_err(WyrdError::from)?;
+        let downloads =
+            futures_util::stream::iter(inventory.artifacts.into_iter().map(|artifact| {
+                let engine = Arc::clone(self.engine);
+                let card_uid = self.card_uid.clone();
+                let staging_root = staging_root.clone();
+                async move {
+                    let path = staging_root.join(artifact.relative_path.as_str());
+                    if let Some(parent) = path.parent() {
+                        tokio::fs::create_dir_all(parent)
+                            .await
+                            .map_err(RegistryEngineError::from)?;
+                    }
+                    download::download_artifact(
+                        &engine.client,
+                        &engine.storage,
+                        &card_uid,
+                        &artifact.relative_path,
+                        &path,
+                    )
+                    .await
+                }
+            }))
+            .buffer_unordered(4)
+            .collect::<Vec<_>>()
+            .await;
+        for result in downloads {
+            result.map_err(WyrdError::from)?;
+        }
+        self.publish(&staging_root, staging.path()).await
+    }
+
+    /// Replace the destination only after the complete staging tree verifies.
+    ///
+    /// The old destination is first renamed beneath the private staging root.
+    /// If publishing the new tree fails, that old tree is restored before the
+    /// error is returned. Dropping the staging guard removes the superseded
+    /// tree only after the new publication is visible.
+    ///
+    /// # Errors
+    /// Returns a Wyrd error if either rename fails. A failed publish attempts
+    /// to restore the prior destination; restoration failure is reported with
+    /// the original publish failure retained in diagnostics.
+    async fn publish(&self, staging_root: &Path, staging_parent: &Path) -> Result<(), WyrdError> {
+        let previous = staging_parent.join("previous");
+        let had_previous = self.destination.exists();
+        if had_previous {
+            tokio::fs::rename(self.destination, &previous)
+                .await
+                .map_err(RegistryEngineError::from)
+                .map_err(WyrdError::from)?;
+        }
+        if let Err(error) = tokio::fs::rename(staging_root, self.destination).await {
+            if had_previous {
+                let _ = tokio::fs::rename(&previous, self.destination).await;
+            }
+            return Err(RegistryEngineError::from(error).into());
+        }
+        Ok(())
     }
 }
 

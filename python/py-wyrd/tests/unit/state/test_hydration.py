@@ -68,20 +68,28 @@ def test_agentcard_resolves_registered_prompt(tmp_path: Path) -> None:
 
 
 def test_builtin_model_loads_from_bundle_artifact_directory(tmp_path: Path) -> None:
-    """Built-in Sklearn hydration loads a usable model from local joblib bytes."""
+    """Joblib-backed built-ins require externally supplied exact manifest trust."""
     bundle = build_builtin_model_bundle(tmp_path)
-    state = WyrdState.from_path(
-        bundle, interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()}
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.from_path(
+            bundle, interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()}
+        )
+    assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
+    assert caught.value.details["alias"] == "model"
+    assert caught.value.details["stage"] == "artifact_trust"
+    assert caught.value.details["reason"] == (
+        "executable model requires an exact trusted artifact manifest hash"
     )
-    assert state.model("model").interface.kind == "Sklearn"
-    assert state.model("model").model.predict([[0.0]]) is not None
-    artifact = state.artifacts("model")[0]
-    assert artifact.local_path.is_file()
-    assert artifact.local_path.parent == bundle / "cards/model/artifacts"
-    assert artifact.relative_path == "model.joblib"
-    assert artifact.size_bytes > 0
-    assert artifact.content_type == "application/octet-stream"
-    assert artifact.sha256
+
+    with pytest.raises(wyrd.WyrdError) as wrong_hash:
+        WyrdState.from_path(
+            bundle,
+            interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()},
+            trusted_artifact_hashes={"model": "not-the-canonical-hash"},
+        )
+    assert wrong_hash.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
+    assert wrong_hash.value.details["stage"] == "artifact_trust"
+    assert wrong_hash.value.details["reason"] == "trusted artifact manifest hash does not match"
 
 
 def test_custom_model_exposes_model_and_preprocessor(tmp_path: Path) -> None:

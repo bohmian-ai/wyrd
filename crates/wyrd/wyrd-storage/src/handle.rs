@@ -242,8 +242,37 @@ impl StorageHandle {
     /// This is used by bound test servers whose ephemeral port is not known
     /// when the storage handle is first assembled. Production callers should
     /// configure `public_base_url` in [`StorageSettings`].
-    pub fn set_public_base_url(&self, base_url: String) {
-        let _ = self.public_base_url_override.set(base_url);
+    /// Bind the public base URL once the embedding server has selected its
+    /// listener address.
+    ///
+    /// Repeating the same assignment is harmless. A different assignment is
+    /// rejected because local download plans must retain one public authority
+    /// for the lifetime of this handle.
+    ///
+    /// # Errors
+    /// Returns [`StorageError::PublicBaseUrlConflict`] when another URL was
+    /// previously bound.
+    pub fn set_public_base_url(&self, base_url: String) -> Result<(), StorageError> {
+        if let Some(existing) = self.public_base_url_override.get() {
+            return if existing == &base_url {
+                Ok(())
+            } else {
+                Err(StorageError::PublicBaseUrlConflict {
+                    existing: existing.clone(),
+                    requested: base_url,
+                })
+            };
+        }
+        self.public_base_url_override
+            .set(base_url)
+            .map_err(|requested| StorageError::PublicBaseUrlConflict {
+                existing: self
+                    .public_base_url_override
+                    .get()
+                    .expect("invariant: failed OnceLock assignment has a bound URL")
+                    .clone(),
+                requested,
+            })
     }
 
     /// Probe the storage backend for liveness.

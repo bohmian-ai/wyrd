@@ -24,11 +24,11 @@ use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::{CardRef, CardRefIdentity, scope_child_card_refs};
 use wyrd_spec::registry::{
-    ArtifactInventoryResponse, CardLifecycleStatus, CardRegistrationOutcome, CardSubmission,
-    CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest, CreateCardResponse,
-    DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
-    RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed, RelativeArtifactPath,
-    canonical_artifact_manifest_hash,
+    ArtifactInventoryResponse, ArtifactManifestEntry, CardLifecycleStatus, CardRegistrationOutcome,
+    CardSubmission, CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest,
+    CreateCardResponse, DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse,
+    ListVersionsResponse, RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed,
+    RelativeArtifactPath, canonical_artifact_manifest_hash,
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
@@ -86,8 +86,11 @@ pub async fn get_card_by_uid(
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let row = sql_get_card_by_uid(&mut conn, card_uid).await?;
     let inbound = inbound_relationships(&mut conn, card_uid).await?;
+    let inventory = artifact_metadata::list_for_card(&mut conn, card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound).await
+    hydrate_card(state, caller, row, inbound, inventory).await
 }
 
 /// Load a fully hydrated Card by its exact tenant-scoped reference.
@@ -109,8 +112,11 @@ pub async fn get_card_by_ref(
     )
     .await?;
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
+    let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound).await
+    hydrate_card(state, caller, row, inbound, inventory).await
 }
 
 /// Resolve and load the newest stable Active Card in one identity line.
@@ -125,8 +131,11 @@ pub async fn get_latest_card(
     let mut conn = state.registry_tenant_conn(caller.data_tenant_id).await?;
     let row = get_latest_card_by_range(&mut conn, kind, &space, &name, &range).await?;
     let inbound = inbound_relationships(&mut conn, &row.card_uid).await?;
+    let inventory = artifact_metadata::list_for_card(&mut conn, row.card_uid.as_str())
+        .await
+        .map_err(|error| WyrdError::registry_unavailable(error.to_string()))?;
     conn.commit().await.map_err(registry_db_error)?;
-    hydrate_card(state, caller, row, inbound).await
+    hydrate_card(state, caller, row, inbound, inventory).await
 }
 
 /// List versions in one card identity line, excluding deleted rows.
@@ -226,6 +235,7 @@ async fn hydrate_card(
     caller: &Caller,
     row: wyrd_sql::row_types::cards::ParsedCardRow,
     inbound: Vec<CardRef>,
+    inventory: Vec<artifact_metadata::ArtifactMetadataRow>,
 ) -> Result<GetCardResponse, WyrdError> {
     let uri = row.card_blob_uri.as_deref().ok_or_else(|| {
         WyrdError::registry_card_not_found(
@@ -259,6 +269,7 @@ async fn hydrate_card(
             "stored Card blob identity does not match its registry row",
         ));
     }
+    verify_card_read_integrity(&row, &card, &inventory, caller)?;
     card.relationships.inbound = inbound.iter().map(ToString::to_string).collect();
     card.relationships.inbound_refs = inbound
         .into_iter()
@@ -277,6 +288,100 @@ async fn hydrate_card(
         created_at: row.created_at,
         updated_at: row.updated_at,
     })
+}
+
+/// Compare the immutable blob and stored artifact inventory with one registry row.
+///
+/// The registry row is the durable index, while the blob and storage inventory
+/// are independent materializations. A read must refuse to project a Card when
+/// any of the three copies diverge, rather than returning a plausible envelope
+/// with stale or substituted payload metadata.
+///
+/// # Errors
+///
+/// Returns a stable invalid-card-spec error when the blob's canonical spec or
+/// artifact hash disagrees with the registry row, an inventory path is outside
+/// the caller tenant/Card, an inventory size is invalid, or the canonical hash
+/// reconstructed from inventory differs from the row and blob.
+fn verify_card_read_integrity(
+    row: &wyrd_sql::row_types::cards::ParsedCardRow,
+    card: &Card,
+    inventory: &[artifact_metadata::ArtifactMetadataRow],
+    caller: &Caller,
+) -> Result<(), WyrdError> {
+    let manifest = inventory
+        .iter()
+        .map(|entry| {
+            let path = tenant_path::validate(&entry.storage_path, caller.data_tenant_id)
+                .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+            if path.card_uid != row.card_uid.as_str() {
+                return Err(WyrdError::registry_invalid_card_spec(
+                    "stored artifact inventory is not bound to its registry row",
+                ));
+            }
+            Ok(ArtifactManifestEntry {
+                relative_path: RelativeArtifactPath::new(&path.relative_path)
+                    .map_err(WyrdError::from)?,
+                sha256: entry.sha256.clone(),
+                size_bytes: u64::try_from(entry.size_bytes).map_err(|_| {
+                    WyrdError::registry_invalid_card_spec(
+                        "stored artifact inventory has a negative byte size",
+                    )
+                })?,
+                content_type: entry.content_type.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, WyrdError>>()?;
+    verify_card_hashes(
+        &row.spec_hash,
+        row.artifact_hash.as_deref(),
+        card,
+        &manifest,
+    )
+}
+
+/// Compare canonical blob hashes with the registry row and reconstructed inventory.
+///
+/// This is the pure integrity stage used after the server has tenant-validated
+/// storage metadata. Keeping it independent of SQL and storage makes the three
+/// materialized-value comparisons directly testable without a live server.
+///
+/// # Errors
+///
+/// Returns a stable invalid-card-spec error when the canonical blob spec hash,
+/// blob metadata hash, or sorted inventory manifest hash differs from the row.
+fn verify_card_hashes(
+    row_spec_hash: &str,
+    row_artifact_hash: Option<&str>,
+    card: &Card,
+    manifest: &[ArtifactManifestEntry],
+) -> Result<(), WyrdError> {
+    let blob_spec_hash = card
+        .spec
+        .canonical_hash()
+        .map_err(WyrdError::from_spec_canonicalization)?;
+    if blob_spec_hash.as_str() != row_spec_hash
+        || card
+            .metadata
+            .spec_hash
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref()
+            != Some(row_spec_hash)
+    {
+        return Err(WyrdError::registry_invalid_card_spec(
+            "stored Card blob spec hash does not match its registry row",
+        ));
+    }
+    let inventory_hash = canonical_artifact_manifest_hash(manifest)?;
+    if inventory_hash.as_deref() != row_artifact_hash
+        || card.metadata.artifact_hash.as_deref() != row_artifact_hash
+    {
+        return Err(WyrdError::registry_invalid_card_spec(
+            "stored Card blob artifact hash does not match its registry inventory",
+        ));
+    }
+    Ok(())
 }
 
 fn summary_from_row(row: &CardRow) -> Result<CardSummary, WyrdError> {
@@ -2234,10 +2339,13 @@ fn map_storage_error(error: StorageError) -> WyrdError {
 mod tests {
     use super::{
         card_upload_entry, hash_request, immutable_card_blob_bytes, plan_registration_graph,
-        validate_request,
+        validate_request, verify_card_hashes,
     };
     use uuid::Uuid;
-    use wyrd_spec::registry::CreateCardRequest;
+    use wyrd_spec::registry::{
+        ArtifactManifestEntry, CreateCardRequest, RelativeArtifactPath,
+        canonical_artifact_manifest_hash,
+    };
     use wyrd_spec::storage::{UploadId, UploadPlan};
 
     /// Decode a compact registration request used by pure composition tests.
@@ -2276,6 +2384,43 @@ mod tests {
             "spec": { "tasks": {} },
             "artifacts": []
         })
+    }
+
+    /// Build matching row/blob/inventory values for read-integrity regression tests.
+    fn matching_read_integrity_values() -> (
+        wyrd_spec::envelope::Card,
+        Vec<ArtifactManifestEntry>,
+        String,
+        String,
+    ) {
+        let manifest = vec![ArtifactManifestEntry {
+            relative_path: RelativeArtifactPath::new("weights.bin")
+                .expect("test_setup: artifact path is valid"),
+            sha256: "YQ==".to_owned(),
+            size_bytes: 1,
+            content_type: Some("application/octet-stream".to_owned()),
+        }];
+        let mut card: wyrd_spec::envelope::Card = serde_json::from_value(serde_json::json!({
+            "apiVersion": "wyrd/v1",
+            "kind": "Prompt",
+            "metadata": { "name": "integrity", "version": "1.0.0", "space": "default" },
+            "spec": { "provider": "openai", "model": "gpt-4o", "messages": ["hello"] }
+        }))
+        .expect("test_setup: blob card fixture is valid");
+        let spec_hash = card
+            .spec
+            .canonical_hash()
+            .expect("test_setup: prompt spec canonicalizes");
+        let artifact_hash = canonical_artifact_manifest_hash(&manifest)
+            .expect("test_setup: manifest canonicalizes")
+            .expect("test_setup: nonempty manifest has a hash");
+        card.metadata.spec_hash = Some(
+            spec_hash
+                .parse()
+                .expect("test_setup: canonical hash parses as spec hash"),
+        );
+        card.metadata.artifact_hash = Some(artifact_hash.clone());
+        (card, manifest, spec_hash.to_string(), artifact_hash)
     }
 
     /// Reject peer-only Service components before registry access.
@@ -2440,5 +2585,44 @@ mod tests {
                 .expect("JCS bytes are UTF-8")
                 .contains("status")
         );
+    }
+
+    /// Rejects a registry row whose spec hash diverges from immutable blob bytes.
+    #[test]
+    fn read_integrity_rejects_row_blob_spec_hash_divergence() {
+        let (card, manifest, _spec_hash, artifact_hash) = matching_read_integrity_values();
+
+        let error =
+            verify_card_hashes("different-row-hash", Some(&artifact_hash), &card, &manifest)
+                .expect_err("row/blob spec divergence must reject the read");
+
+        assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+        assert!(error.to_string().contains("spec hash"));
+    }
+
+    /// Rejects an immutable blob whose artifact metadata diverges from the row.
+    #[test]
+    fn read_integrity_rejects_row_blob_artifact_hash_divergence() {
+        let (mut card, manifest, spec_hash, artifact_hash) = matching_read_integrity_values();
+        card.metadata.artifact_hash = Some("different-blob-hash".to_owned());
+
+        let error = verify_card_hashes(&spec_hash, Some(&artifact_hash), &card, &manifest)
+            .expect_err("row/blob artifact divergence must reject the read");
+
+        assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+        assert!(error.to_string().contains("artifact hash"));
+    }
+
+    /// Rejects storage inventory whose sorted manifest hash diverges from row and blob.
+    #[test]
+    fn read_integrity_rejects_inventory_hash_divergence() {
+        let (card, mut manifest, spec_hash, artifact_hash) = matching_read_integrity_values();
+        manifest[0].sha256 = "Yg==".to_owned();
+
+        let error = verify_card_hashes(&spec_hash, Some(&artifact_hash), &card, &manifest)
+            .expect_err("inventory divergence must reject the read");
+
+        assert_eq!(error.code(), "WYRD_REGISTRY_400_INVALID_CARD_SPEC");
+        assert!(error.to_string().contains("artifact hash"));
     }
 }

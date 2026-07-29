@@ -60,6 +60,7 @@ axum = { workspace = true }
 base64 = { workspace = true }
 predicates = "3"
 sha2 = { workspace = true }
+sqlx = { workspace = true }
 tempfile = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }

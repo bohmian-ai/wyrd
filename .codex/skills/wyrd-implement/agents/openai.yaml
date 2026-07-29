@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd Implement"
+  short_description: "Execute one bounded Wyrd task faithfully"
+  default_prompt: "Use $wyrd-implement to execute this one approved Wyrd task with focused verification and structured evidence."
+
+policy:
+  allow_implicit_invocation: true

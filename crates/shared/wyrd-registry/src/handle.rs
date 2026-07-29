@@ -407,6 +407,7 @@ struct ArtifactMaterializer<'a> {
     destination: &'a Path,
 }
 
+/// Runs the staged download and atomic publication workflow.
 impl<'a> ArtifactMaterializer<'a> {
     /// Create a materializer for one Card inventory and destination.
     #[must_use]
@@ -513,11 +514,142 @@ impl<'a> ArtifactMaterializer<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::CardSelector;
+    use base64::Engine;
+    use secrecy::SecretString;
+    use sha2::{Digest, Sha256};
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{CardSelector, Cards};
     use wyrd_semver::VersionBlock;
     use wyrd_spec::envelope::CardKind;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 
+    /// Preserve an existing publication and remove private staging when a later
+    /// artifact fails integrity verification.
+    #[tokio::test]
+    async fn bad_second_digest_preserves_destination_and_removes_staging() {
+        let server = MockServer::start().await;
+        let card_uid =
+            CardUid::new("01890f28-7c4a-7cc3-98e7-4f4a3c2d1b00").expect("test uid is valid");
+        let first = b"verified-first";
+        let second = b"corrupt-second";
+        let first_digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(first));
+        let second_digest =
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(second));
+        Mock::given(method("POST"))
+            .and(path("/auth/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-access-token",
+                "refresh_token": "unused-refresh-token",
+                "token_type": "Bearer",
+                "expires_at": chrono::Utc::now() + chrono::Duration::hours(1)
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v1/cards/{card_uid}/artifacts")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "artifacts": [
+                    {
+                        "relative_path": "first.bin",
+                        "sha256": first_digest.clone(),
+                        "size_bytes": first.len(),
+                        "content_type": null
+                    },
+                    {
+                        "relative_path": "nested/second.bin",
+                        "sha256": second_digest.clone(),
+                        "size_bytes": second.len(),
+                        "content_type": null
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/cards/download/init"))
+            .and(body_json(serde_json::json!({
+                "card_uid": card_uid.clone(),
+                "relative_path": "first.bin",
+                "ttl_secs": null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan": {
+                    "get_url": format!("{}/download/first", server.uri()),
+                    "ttl_secs": 0
+                },
+                "size_bytes": first.len(),
+                "sha256": first_digest.clone()
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/cards/download/init"))
+            .and(body_json(serde_json::json!({
+                "card_uid": card_uid.clone(),
+                "relative_path": "nested/second.bin",
+                "ttl_secs": null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "plan": {
+                    "get_url": format!("{}/download/second", server.uri()),
+                    "ttl_secs": 0
+                },
+                "size_bytes": second.len(),
+                "sha256": first_digest.clone()
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/first"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(first))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download/second"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(second))
+            .mount(&server)
+            .await;
+
+        let parent = tempfile::tempdir().expect("test parent is created");
+        let destination = parent.path().join("artifacts");
+        std::fs::create_dir(&destination).expect("existing destination is created");
+        std::fs::write(destination.join("existing.txt"), b"keep")
+            .expect("existing publication is written");
+        let cards = Cards::new(
+            Some(&server.uri()),
+            Some(SecretString::from("test-api-key")),
+        )
+        .expect("test cards handle is configured");
+
+        let error = cards
+            .download_artifacts_to(&card_uid, &destination)
+            .await
+            .expect_err("bad second digest must reject the publication");
+
+        assert!(matches!(
+            error,
+            wyrd_spec::error::WyrdError::RegistryArtifactVerifyFailed { .. }
+        ));
+        assert_eq!(
+            std::fs::read(destination.join("existing.txt"))
+                .expect("existing publication remains readable"),
+            b"keep"
+        );
+        let staging_remains = std::fs::read_dir(parent.path())
+            .expect("test parent is readable")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wyrd-artifacts-")
+            });
+        assert!(!staging_remains);
+    }
+
+    /// Keep latest and exact selector construction semantically distinct.
     #[test]
     fn selector_constructors_keep_latest_and_exact_distinct() {
         let kind = CardKind::Prompt;

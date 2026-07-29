@@ -15,6 +15,7 @@ pub enum HydrationMode {
     Complete,
 }
 
+/// Renders hydration modes using their stable manifest values.
 impl std::fmt::Display for HydrationMode {
     /// Format the stable hydration mode stored in the bundle manifest.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,4 +76,72 @@ pub struct HydratedArtifactManifest {
     pub content_type: Option<String>,
     /// Relative local payload path when complete hydration downloaded the file.
     pub local_path: Option<String>,
+}
+
+/// Wire-compatibility fixtures for hydrated bundle projections.
+#[cfg(test)]
+mod tests {
+    use crate::{
+        envelope::CardKind,
+        ids::{CardName, SpaceName},
+        reference::CardRef,
+    };
+    use wyrd_semver::VersionBlock;
+
+    use super::{
+        HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+    };
+
+    /// Build the exact Service identity shared by the manifest root and Card projection.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if repository-owned static identity literals stop satisfying
+    /// the corresponding domain invariants.
+    fn service_ref() -> CardRef {
+        CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("service").expect("static Card name is valid"),
+            version: VersionBlock::parse("1.0.0").expect("static Card version is valid"),
+            space: Some(SpaceName::new("default").expect("static Card space is valid")),
+            uid: None,
+        }
+    }
+
+    /// Hydrated bundle DTO ownership preserves every field and its canonical JSON bytes.
+    #[test]
+    fn hydrated_bundle_manifest_preserves_wire_bytes() {
+        let card_ref = service_ref();
+        let manifest = HydratedBundleManifest {
+            api_version: "wyrd/hydrated-bundle/v1".to_owned(),
+            hydration: HydrationMode::Complete,
+            root: card_ref.clone(),
+            cards: vec![HydratedCardManifest {
+                aliases: vec!["root".to_owned()],
+                card_ref,
+                card_path: "cards/service/card.yaml".to_owned(),
+                relationships_path: "cards/service/relationships.yaml".to_owned(),
+                artifact_inventory_path: "cards/service/artifacts.yaml".to_owned(),
+                artifacts: vec![HydratedArtifactManifest {
+                    relative_path: "model.joblib".to_owned(),
+                    sha256: "YWJj".to_owned(),
+                    size_bytes: 3,
+                    content_type: Some("application/octet-stream".to_owned()),
+                    local_path: Some("cards/service/artifacts/model.joblib".to_owned()),
+                }],
+            }],
+            card_count: 1,
+            artifact_count: 1,
+            downloaded_artifact_count: 1,
+        };
+
+        let bytes = serde_json::to_vec(&manifest).expect("hydrated manifest serializes");
+        assert_eq!(
+            bytes,
+            br#"{"apiVersion":"wyrd/hydrated-bundle/v1","hydration":"complete","root":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"cards":[{"aliases":["root"],"card_ref":{"kind":"Service","name":"service","version":"1.0.0","space":"default"},"card_path":"cards/service/card.yaml","relationships_path":"cards/service/relationships.yaml","artifact_inventory_path":"cards/service/artifacts.yaml","artifacts":[{"relative_path":"model.joblib","sha256":"YWJj","size_bytes":3,"content_type":"application/octet-stream","local_path":"cards/service/artifacts/model.joblib"}]}],"card_count":1,"artifact_count":1,"downloaded_artifact_count":1}"#
+        );
+        let round_trip: HydratedBundleManifest =
+            serde_json::from_slice(&bytes).expect("hydrated manifest deserializes");
+        assert_eq!(round_trip, manifest);
+    }
 }

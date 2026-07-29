@@ -70,7 +70,7 @@ mod tests {
     use uuid::Uuid;
     use wyrd_runtime::principal::PrincipalId;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::envelope::{CardKind, Spec};
     use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::registry::{

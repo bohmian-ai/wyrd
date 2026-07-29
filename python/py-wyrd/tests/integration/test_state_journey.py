@@ -2,74 +2,30 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
+import blake3
+import numpy as np
+import pandas as pd
 import pytest
 import wyrd
+import yaml
 from wyrd.cards import CardRef, Cards
-from wyrd.data import DataCard, DataStats, FieldSpec
-from wyrd.model import ModelCard, ModelCardMetadata, ModelSignature
+from wyrd.data import DataCard, FieldSpec, PandasInterface
+from wyrd.model import (
+    ModelCard,
+    ModelCardMetadata,
+    ModelSignature,
+    SklearnInterface,
+)
 from wyrd.state import WyrdState
 from wyrd.testing import WyrdTestServer
-
-from tests.unit.state.support import TinyDataInterface, TinyModelInterface
-
-
-class _Predictor:
-    def predict(self, values: list[int]) -> list[int]:
-        return [value + 1 for value in values]
-
-
-class _Transformer:
-    def transform(self, values: list[int]) -> list[int]:
-        return [value * 2 for value in values]
-
-
-class JourneyModelInterface(TinyModelInterface):
-    def __init__(self, payload: bytes) -> None:
-        super().__init__()
-        self.payload = payload
-
-    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
-        del save_kwargs
-        output = path / "model" / "model.bin"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(self.payload)
-        return DataStats(byte_count=len(self.payload), sha256=_sha256(self.payload))
-
-    def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
-        super().load(path, load_kwargs)
-        self.model, self.preprocessor, self.processor = _Predictor(), _Transformer(), _Transformer()
-
-
-class JourneyDataInterface(TinyDataInterface):
-    def __init__(self, payload: bytes) -> None:
-        super().__init__()
-        self.payload = payload
-
-    def save(self, path: Path, save_kwargs: dict[str, Any] | None = None) -> DataStats:
-        del save_kwargs
-        output = path / "data" / "data.bin"
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(self.payload)
-        return DataStats(byte_count=len(self.payload), sha256=_sha256(self.payload))
-
-    def load(self, path: Path, load_kwargs: dict[str, Any] | None = None) -> None:
-        super().load(path, load_kwargs)
-        self.data = _Transformer()
-
-
-def _sha256(payload: bytes) -> str:
-    """Return the hexadecimal digest used by deterministic holder artifacts."""
-    return hashlib.sha256(payload).hexdigest()
 
 
 class RuntimeServiceFixture:
@@ -89,11 +45,7 @@ class RuntimeServiceFixture:
         "shared_prompt",
         "triage_prompt",
     )
-    artifact_bytes = {
-        "model_primary": b"primary-model\n",
-        "model_shadow": b"shadow-model\n",
-        "training_data": b"training-data\n",
-    }
+    training_data = pd.DataFrame({"feature": [0.0, 1.0], "label": [0, 1]})
 
     def __init__(self, root: Path) -> None:
         source = (
@@ -103,14 +55,18 @@ class RuntimeServiceFixture:
         self.source = root / "service"
         shutil.copytree(source, self.source)
         self.bundle: Path | None = None
-        self.last_get_result: dict[str, Any] | None = None
-        self.artifact_count = len(self.artifact_bytes)
+        self.last_get_result: dict[str, object] | None = None
+        self.artifact_count = 3
 
     def register_model(self, cards: Cards, alias: str) -> CardRef:
+        from sklearn.linear_model import LogisticRegression
+
         name = "primary" if alias == "model_primary" else "shadow"
-        payload = self.artifact_bytes[alias]
+        features = self.training_data[["feature"]].to_numpy()
+        labels = self.training_data["label"].to_numpy()
+        model = LogisticRegression(random_state=0).fit(features, labels)
         card = ModelCard(
-            JourneyModelInterface(payload),
+            SklearnInterface(model=model),
             space="default",
             name=name,
             version="1.0.0",
@@ -125,8 +81,9 @@ class RuntimeServiceFixture:
         return cards.model.register(card).root
 
     def register_data(self, cards: Cards, alias: str) -> CardRef:
+        del alias
         card = DataCard(
-            JourneyDataInterface(self.artifact_bytes[alias]),
+            PandasInterface(data=self.training_data),
             space="default",
             name="training",
             version="1.0.0",
@@ -145,7 +102,7 @@ class RuntimeServiceFixture:
         *arguments: str,
         api_key: str | None = None,
         check: bool = True,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         environment = os.environ.copy()
         environment.update(
             WYRD_SERVER_URL=server.base_url,
@@ -167,6 +124,34 @@ class RuntimeServiceFixture:
             }
         assert completed.returncode == 0, completed.stderr or completed.stdout
         return json.loads(completed.stdout)
+
+    def trusted_artifact_hashes(self) -> dict[str, str]:
+        """Return exact canonical manifest hashes for executable Model aliases."""
+        assert self.bundle is not None
+        manifest = yaml.safe_load((self.bundle / "metadata.yaml").read_text(encoding="utf-8"))
+        trusted: dict[str, str] = {}
+        for card in manifest["cards"]:
+            if card["card_ref"]["kind"] != "Model":
+                continue
+            artifacts = [
+                {
+                    "relative_path": artifact["relative_path"],
+                    "sha256": artifact["sha256"],
+                    "size_bytes": artifact["size_bytes"],
+                    "content_type": artifact.get("content_type"),
+                }
+                for artifact in card["artifacts"]
+            ]
+            artifacts.sort(key=lambda artifact: artifact["relative_path"])
+            canonical = json.dumps(
+                artifacts,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+            for alias in card["aliases"]:
+                trusted[alias] = blake3.blake3(canonical).hexdigest()
+        return trusted
 
 
 def writer_api_key(server: WyrdTestServer) -> str:
@@ -203,16 +188,9 @@ def assert_all_artifacts_are_confined_and_match_fixture(
 ) -> None:
     """Hydrate the complete CLI bundle into usable offline Python objects."""
     assert fixture.bundle is not None
-    aliases = {
-        "model_primary": "model_primary",
-        "model_shadow": "model_shadow",
-        "training_data": "default-Data-training-1.0.0",
-    }
-    for fixture_name, expected in fixture.artifact_bytes.items():
-        alias = aliases[fixture_name]
+    for alias in ("model_primary", "model_shadow", "default-Data-training-1.0.0"):
         artifact = state.artifacts(alias)[0]
         assert artifact.local_path.is_file()
-        assert artifact.local_path.read_bytes() == expected
         assert artifact.local_path.is_relative_to(fixture.bundle.resolve())
 
 
@@ -222,10 +200,8 @@ def download_fixture(tmp_path: Path) -> tuple[RuntimeServiceFixture, Path, CardR
     with WyrdTestServer(mutate_env=False) as server:
         cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
         fixture.register_heavy_cards(cards)
-        applied = fixture.run_cli(
-            server, "apply", str(fixture.source / "typed-service.yaml"), "--format", "json"
-        )
-        service_ref = CardRef(**applied["root"])
+        receipt = cards.register_from_path(str(fixture.source / "typed-service.yaml"))
+        service_ref = receipt.root
         fixture.last_get_result = fixture.run_cli(server, *exact_get_arguments(service_ref, bundle))
     return fixture, bundle, service_ref
 
@@ -236,24 +212,9 @@ def register_and_apply(
     """Register and apply the fixture graph against the supplied live server."""
     cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
     fixture.register_heavy_cards(cards)
-    receipt = fixture.run_cli(
-        server, "apply", str(fixture.source / "typed-service.yaml"), "--format", "json"
-    )
-    service_ref = CardRef(**receipt["root"])
+    service_ref = cards.register_from_path(str(fixture.source / "typed-service.yaml")).root
     fixture.run_cli(server, *exact_get_arguments(service_ref, bundle))
     return service_ref
-
-
-def _interfaces() -> dict[str, Any]:
-    return {
-        "model_primary": JourneyModelInterface(
-            RuntimeServiceFixture.artifact_bytes["model_primary"]
-        ),
-        "model_shadow": JourneyModelInterface(RuntimeServiceFixture.artifact_bytes["model_shadow"]),
-        "default-Data-training-1.0.0": JourneyDataInterface(
-            RuntimeServiceFixture.artifact_bytes["training_data"]
-        ),
-    }
 
 
 @pytest.mark.integration
@@ -263,18 +224,28 @@ def test_service_bundle_hydrates_complete_python_runtime_offline(
     """Hydrate the complete CLI bundle into usable offline Python objects."""
     fixture, bundle, service_ref = download_fixture(tmp_path)
     monkeypatch.setenv("WYRD_SERVER_URL", "http://127.0.0.1:1")
-    state = WyrdState.from_path(bundle, interfaces=_interfaces())
+    state = WyrdState.from_path(
+        bundle,
+        trusted_artifact_hashes=fixture.trusted_artifact_hashes(),
+    )
     assert fixture.last_get_result is not None
     assert fixture.last_get_result["mode"] == "complete"
     assert fixture.last_get_result["card_count"] == 10
     assert fixture.last_get_result["downloaded_artifact_count"] == fixture.artifact_count
     assert state.service.card_ref == service_ref
     assert state.aliases == fixture.expected_aliases
-    assert state.model("model_primary").model.predict([1]) == [2]
-    assert state.model("model_shadow").model.predict([1]) == [2]
-    assert state.model("model_primary").preprocessor.transform([1]) == [2]
-    assert state.model("model_shadow").processor.transform([1]) == [2]
-    assert state.data("default-Data-training-1.0.0").data.transform([1]) == [2]
+    np.testing.assert_array_equal(
+        state.model("model_primary").model.predict([[0.0], [1.0]]),
+        np.array([0, 1]),
+    )
+    np.testing.assert_array_equal(
+        state.model("model_shadow").model.predict([[0.0], [1.0]]),
+        np.array([0, 1]),
+    )
+    pd.testing.assert_frame_equal(
+        state.data("default-Data-training-1.0.0").data,
+        fixture.training_data,
+    )
     assert (
         state.agent("agent_triage").prompt is not None
         and state.agent("agent_inline").prompt is not None
@@ -300,14 +271,8 @@ def test_metadata_only_bundle_is_rejected_by_python_state(tmp_path: Path) -> Non
     with WyrdTestServer(mutate_env=False) as server:
         cards = Cards(server_url=server.base_url, api_key=writer_api_key(server))
         fixture.register_heavy_cards(cards)
-        receipt = fixture.run_cli(
-            server,
-            "apply",
-            str(fixture.source / "typed-service.yaml"),
-            "--format",
-            "json",
-        )
-        fixture.run_cli(server, *exact_get_arguments(CardRef(**receipt["root"]), bundle, True))
+        service_ref = cards.register_from_path(str(fixture.source / "typed-service.yaml")).root
+        fixture.run_cli(server, *exact_get_arguments(service_ref, bundle, True))
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_UNHYDRATED_ARTIFACT"
@@ -338,11 +303,18 @@ def test_underprivileged_get_publishes_no_runnable_bundle(tmp_path: Path) -> Non
 @pytest.mark.integration
 def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> None:
     """Reject downloaded artifact bytes that no longer match inventory."""
-    _, bundle, _ = download_fixture(tmp_path)
-    artifact = next(bundle.rglob("*.bin"))
+    fixture, bundle, _ = download_fixture(tmp_path)
+    artifact = next(
+        path
+        for path in bundle.rglob("*")
+        if path.is_file() and "artifacts" in path.parts and path.name != "artifacts.yaml"
+    )
     artifact.write_bytes(b"tampered")
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(bundle, interfaces=_interfaces())
+        WyrdState.from_path(
+            bundle,
+            trusted_artifact_hashes=fixture.trusted_artifact_hashes(),
+        )
     assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
     assert caught.value.details["path"]
 
@@ -350,16 +322,37 @@ def test_tampered_downloaded_artifact_is_rejected_offline(tmp_path: Path) -> Non
 @pytest.mark.integration
 def test_same_kind_aliases_return_correct_distinct_runtime_objects(tmp_path: Path) -> None:
     """Keep distinct same-kind Cards distinct at runtime."""
-    state = WyrdState.from_path(download_fixture(tmp_path)[1], interfaces=_interfaces())
+    fixture, bundle, _ = download_fixture(tmp_path)
+    state = WyrdState.from_path(
+        bundle,
+        trusted_artifact_hashes=fixture.trusted_artifact_hashes(),
+    )
     assert state.model("model_primary") is not state.model("model_shadow")
 
 
 @pytest.mark.integration
-def test_missing_custom_interface_returns_recoverable_runtime_error(tmp_path: Path) -> None:
-    """Report a stable recoverable error when a custom loader is absent."""
+def test_missing_model_trust_returns_recoverable_runtime_error(tmp_path: Path) -> None:
+    """Reject executable built-in Model hydration without external trust."""
+    _, bundle, _ = download_fixture(tmp_path)
     with pytest.raises(wyrd.WyrdError) as caught:
-        WyrdState.from_path(download_fixture(tmp_path)[1])
+        WyrdState.from_path(bundle)
     assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert caught.value.details["alias"] == "model_primary"
-    assert caught.value.details["stage"] == "interface"
+    assert caught.value.details["stage"] == "artifact_trust"
     assert caught.value.details["card_ref"]["name"] == "primary"
+
+
+@pytest.mark.integration
+def test_missing_relationship_projection_is_rejected_offline(tmp_path: Path) -> None:
+    """Reject a complete bundle whose projected relationship file is absent."""
+    fixture, bundle, _ = download_fixture(tmp_path)
+    manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
+    relationship_path = bundle / manifest["cards"][0]["relationships_path"]
+    relationship_path.unlink()
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.from_path(
+            bundle,
+            trusted_artifact_hashes=fixture.trusted_artifact_hashes(),
+        )
+    assert caught.value.code == "WYRD_SDK_400_INVALID_STATE_BUNDLE"
+    assert caught.value.details["path"]

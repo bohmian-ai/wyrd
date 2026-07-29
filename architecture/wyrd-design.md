@@ -10,6 +10,13 @@ When this disagrees with `wyrd-protocol.openapi.yaml`, `wyrd-protocol.md`,
 `specs/*.yaml`, or the Rust code in `crates/wyrd-spec`, **this file wins**.
 Downstream artifacts are brought up to this version in a sync pass.
 
+Current authority is not immutable design. An approved feature may replace a
+decision here when the new design better serves the user workflow. Such a
+change names the superseded decision and updates this document before or in the
+same cohesive change as the contracts and implementation that depend on it.
+Until that update lands, an unexplained disagreement is unresolved design
+drift, not permission for code and documentation to diverge.
+
 ---
 
 ## Table of contents

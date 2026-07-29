@@ -2,7 +2,27 @@
 
 The following rules are explicitly defined for the agents in the system. These rules govern the behavior, interactions, and responsibilities of agents to ensure a consistent and efficient operation within the architecture.
 
+- Read the complete active request, task, or plan before editing. Extract its
+  objective, requirements, non-goals, allowed and prohibited scope, interfaces,
+  acceptance criteria, dependencies and features, verification, and escalation
+  conditions. Validate those assumptions against repository reality before
+  accumulating patches.
+- Classify design conflicts instead of applying a rigid precedence rule. When
+  an approved feature explicitly improves or replaces current design, update
+  `architecture/wyrd-design.md` and any affected doctrine in the same cohesive
+  change, then implement the new authority. Follow current design over
+  implementation drift. Stop when a conflict is implicit, ambiguous, unsafe,
+  or outside the approved scope.
+- Every changed file must map to an active requirement or necessary
+  verification support. Do not implement later tasks, speculative extensions,
+  unrelated cleanup, dependency changes, or Cargo features outside the active
+  scope.
 - Cargo features must be earned. Creating new cargo features can invalidate compilation caches. Cargo features and mise tasks are designed around minimizing re-compilation across task suites. This is important. Wyrd is a big system.
+- Run Cargo-backed commands sequentially across every agent sharing the
+  checkout or target directory. Use default features or the exact required
+  feature set for task, milestone, and phase checks; reserve workspace
+  `--all-features` checks for integrated whole-plan closeout, `pre-pr`, release,
+  or an explicit user request.
 - Raw `sqlx::PgPool` is banned from library code. Two — and only two — connection abstractions are allowed in function signatures and struct fields: `&mut TenantConn<'_>` for tenant-scoped work (RLS-enforced under `wyrd_app`) and `&OperatorPool` for cross-tenant BYPASSRLS work (under `wyrd_platform_admin`). Never `&sqlx::PgPool`, `sqlx::Pool<Postgres>`, a naked `PgConnection`, or a `sqlx::Transaction<'_, Postgres>` handed in by a caller. Pool construction is a boundary concern: only `WyrdPostgres`/`ValaPostgres::connect_from_dsns`/`connect_after_wyrd` (production) and `from_pools` (unit-test fixture) build pools. `PgPool::connect_lazy` and friends are banned inside domain crates. Enforced by `check:from-pools-allowlist`; the allowlist is for pool *construction* sites only, never for propagating a pool through a signature.
 - A function accepting `&mut TenantConn<'_>` MUST NOT call `conn.commit()` or `conn.rollback()`. The caller opens the transaction (via `TenantConn::acquire` or a handle method like `WyrdPostgres::tenant_conn`) and owns its lifecycle. This preserves composition: a caller can chain N tenant-scoped writes into one atomic transaction without every callee racing to commit early.
 - Cross-tier imports go through the owning tier's re-exports, not the underlying crate. Vala and Bifrost code imports `use vala_sql::{TenantConn, OperatorPool, SqlError};` — never `use wyrd_sql::TenantConn;` or `use wyrd_sql::operator_pool::OperatorPool;` from outside `wyrd-sql` itself. The re-exports let the tier own its own surface and version its dependency on `wyrd-sql` independently. Same principle applies to any future tier crate.
@@ -15,6 +35,9 @@ The following rules are explicitly defined for the agents in the system. These r
 - Tests needing Postgres, Docker, or a live server go in `mod pg_tests` (or a `pg_*` file), never the fast lane. The family lanes run `--skip pg_tests` and must stay credential-free and Docker-free.
 - Run whole-crate tests through the crate's `mise` task, not raw `cargo test`. The task supplies the DB env, migrations, and generated artifacts; bare `cargo test` fails or silently skips setup. Raw `cargo test` is only for a narrow pure unit test that needs no repo setup.
 - Every user- or agent-facing capability ships a user-journey test (real SDK → real server). A unit test never substitutes for a missing journey.
+- Do not claim completion from confidence or narrative. Map every acceptance
+  criterion or plan outcome to source, tests, and exact command results; report
+  deviations and unverified work explicitly.
 - Never circumvent a gate to make it pass: no `#[allow]`, `#[ignore]`, deleting/weakening a test, or broadening a boundary glob to hide a violation. Fix the root cause. Use only a check's own sanctioned mechanism (e.g. a documented per-file allowlist) and only for a legitimately test-only, in-pattern case.
 - Clippy lints are diagnostic signals, not paperwork. `#[allow(clippy::...)]` in production code (`crates/**/*.rs` outside `tests/` and `examples/`) is banned unless the attribute line is immediately preceded by a `// justification: <one-line reason>` comment naming why the lint is wrong for that specific site. Mirrors the `// SAFETY:` convention for `unsafe`. Enforced by `mise run check:clippy-allow-audit`. The escape hatch is a last resort; each of the common suppressions has a correct fix that is almost always the right answer:
   - `#[allow(clippy::cast_possible_wrap)]` / `cast_possible_truncation` / `cast_sign_loss` — `as` casts across sign or width are a data-integrity smell. Use `i64::try_from(x).map_err(...)?`, a domain newtype that already carries the target range, or (when the value provably fits) an `expect("invariant: LSN ≤ i64::MAX")` that names the invariant. Never `as`-and-suppress.

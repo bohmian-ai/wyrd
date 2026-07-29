@@ -12,6 +12,7 @@ pub(super) struct PythonCardRegistry<'a> {
     registry: &'a Cards,
 }
 
+/// Delegates Python holders into the native registration workflow.
 impl<'a> PythonCardRegistry<'a> {
     /// Borrow an authenticated registry context for registration calls.
     pub(super) fn new(registry: &'a Cards) -> Self {
@@ -47,15 +48,8 @@ impl<'a> PythonCardRegistry<'a> {
         card: &Bound<'_, PyAny>,
         version_bump: Option<&Bound<'_, PyAny>>,
         save_args: Option<&Bound<'_, PyAny>>,
-        kind: CardKind,
+        kind: &CardKind,
     ) -> CardPyResult<PyRegistrationReceipt> {
-        register_python_card(
-            py,
-            self.registry,
-            card,
-            version_bump,
-            save_args,
-            Some(&kind),
-        )
+        register_python_card(py, self.registry, card, version_bump, save_args, Some(kind))
     }
 }

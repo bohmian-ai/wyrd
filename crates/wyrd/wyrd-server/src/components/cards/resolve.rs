@@ -231,7 +231,10 @@ fn require_uid(card_ref: &CardRef) -> Result<(), WyrdError> {
     }
 }
 
-/// Collect the exact `(kind, space, name, version)` identities that appear as siblings.
+/// Collect exact submitted identities eligible for sibling references.
+///
+/// Auto-versioned and scoped submissions cannot be sibling targets because a
+/// sibling reference carries an exact version before registration resolves.
 fn sibling_identities(
     submissions: &[CardSubmission],
 ) -> Result<BTreeSet<CardRefIdentity>, WyrdError> {
@@ -241,21 +244,19 @@ fn sibling_identities(
             let space = submission.metadata.space.as_ref().ok_or_else(|| {
                 WyrdError::registry_invalid_card_spec("metadata.space is required")
             })?;
-            let version = submission.metadata.resolved_pin().cloned().ok_or_else(|| {
-                WyrdError::registry_invalid_card_spec(
-                    "metadata.version must resolve to an exact pin at the registry boundary",
-                )
-            })?;
-            Ok(CardRef {
-                kind: submission.kind.clone(),
-                name: submission.metadata.name.clone(),
-                version,
-                space: Some(space.clone()),
-                uid: None,
-            }
-            .identity_key())
+            Ok(submission.metadata.resolved_pin().cloned().map(|version| {
+                CardRef {
+                    kind: submission.kind.clone(),
+                    name: submission.metadata.name.clone(),
+                    version,
+                    space: Some(space.clone()),
+                    uid: None,
+                }
+                .identity_key()
+            }))
         })
-        .collect()
+        .collect::<Result<Vec<_>, WyrdError>>()
+        .map(|identities| identities.into_iter().flatten().collect())
 }
 
 /// Return the exact identity used for sibling matching and UID binding.
@@ -472,6 +473,19 @@ mod tests {
 
         let identities = sibling_identities(&[first, second]).expect("identities resolve");
         assert_eq!(identities.len(), 2);
+    }
+
+    /// Scoped submissions remain registrable but cannot be sibling targets
+    /// until the server resolves their exact version.
+    #[test]
+    fn sibling_identities_skip_scoped_submissions() {
+        let mut scoped = submission("scoped");
+        scoped.metadata.version =
+            Some(VersionSpec::parse("1").expect("test_setup: scope is valid"));
+
+        let identities = sibling_identities(&[scoped]).expect("scoped submission is accepted");
+
+        assert!(identities.is_empty());
     }
 
     #[test]

@@ -980,7 +980,9 @@ async fn write_registration(
 
     let mut sibling_uids = HashMap::new();
     let mut outcomes = Vec::with_capacity(plan.order.nodes.len());
+    let mut resolved_root = None;
     for node in &plan.order.nodes {
+        let is_root = same_identity(&node.card_ref, &plan.root.root);
         let authored = find_submission(&plan.submissions, &node.card_ref)?;
         let mut submission = authored.clone();
         let mut spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
@@ -997,13 +999,13 @@ async fn write_registration(
                 .clone()
                 .ok_or_else(|| WyrdError::internal("registered outcome is missing uid"))?,
         );
+        if is_root {
+            resolved_root = Some(outcome.card_ref.clone());
+        }
         outcomes.push(outcome);
     }
-    let root = outcomes
-        .iter()
-        .find(|outcome| same_identity(&outcome.card_ref, &plan.root.root))
-        .map(|outcome| outcome.card_ref.clone())
-        .ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
+    let root =
+        resolved_root.ok_or_else(|| WyrdError::internal("root registration outcome is missing"))?;
     let response = CreateCardResponse {
         root,
         outcomes,
@@ -2414,11 +2416,7 @@ mod tests {
         let artifact_hash = canonical_artifact_manifest_hash(&manifest)
             .expect("test_setup: manifest canonicalizes")
             .expect("test_setup: nonempty manifest has a hash");
-        card.metadata.spec_hash = Some(
-            spec_hash
-                .parse()
-                .expect("test_setup: canonical hash parses as spec hash"),
-        );
+        card.metadata.spec_hash = Some(spec_hash.clone());
         card.metadata.artifact_hash = Some(artifact_hash.clone());
         (card, manifest, spec_hash.to_string(), artifact_hash)
     }

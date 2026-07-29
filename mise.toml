@@ -3,17 +3,21 @@
 # `mise tasks` lists only these; every other task is a CI shard or invariant
 # check that runs as a `pre-pr` dependency (still runnable by name, just hidden).
 #
-#   mise run check       Fast pre-commit loop: fmt --check + clippy + cargo check.
-#   mise run pre-pr      The full gate. Run this before pushing — it is the
-#                        answer to "make sure everything passes" (Rust + Python +
-#                        codegen + docs + every boundary invariant).
+#   mise run check:default   Milestone/phase integration: fmt --check + Clippy
+#                            with workspace default features.
+#   mise run check           Whole-plan closeout: fmt --check + Clippy with
+#                            all workspace features and targets.
+#   mise run pre-pr          The full gate. Run at integrated plan closeout,
+#                            before a release, or when shared CI/build/test
+#                            infrastructure changes (Rust + Python + codegen +
+#                            docs + every boundary invariant).
 #
 #   mise run test:unit   All Rust tests except Bifrost and real-cloud storage.
 #   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
 #   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
 #
-#   cargo test -p <crate> <name> --all-features    Iterate on one crate/test.
+#   cargo test -p <crate> <name>    Iterate with default or exact features.
 #
 # Need a hidden task? `mise run <name>` still works; `mise tasks --hidden` lists all.
 # ============================================================================
@@ -42,8 +46,17 @@ WYRD_DEV_PG_CACHE = "${HOME}/.cache/wyrd/pg"
 description = "Format all Rust code"
 run = "cargo fmt --all"
 
+[tasks."fmt:check"]
+hide = true
+description = "Check Rust formatting without rewriting files"
+run = "cargo fmt --all -- --check"
+
+[tasks."lints:default"]
+description = "Workspace Clippy with -D warnings (default features, all targets)"
+run = "cargo clippy --locked --workspace --all-targets -- -D warnings"
+
 [tasks.lints]
-description = "Workspace clippy with -D warnings (all features, all targets)"
+description = "Whole-plan workspace Clippy with -D warnings (all features, all targets)"
 run = "cargo clippy --locked --workspace --all-features --all-targets -- -D warnings"
 
 [tasks."lint:py-wyrd"]
@@ -359,6 +372,48 @@ hide = true
 description = "Verify the registry client artifact-materialization cone remains client-tier only"
 run = "cargo tree --locked -p wyrd-registry -e normal | rg 'wyrd-server|wyrd-sql|sqlx|deltalake|datafusion' && exit 1 || exit 0"
 
+[tasks."check:cli-client-tier"]
+hide = true
+description = "Verify standalone and Python-packaged CLI cones remain free of server and database dependencies"
+run = """
+set -eu
+for package in wyrd-cli py-wyrd; do
+  if cargo tree --locked -p "$package" -e normal | rg 'sqlx|wyrd-sql|vala-sql|wyrd-auth-issue|wyrd-server|wyrd-dev-fixtures|wyrd-testing'; then
+    echo "FAIL: $package production dependency cone contains a server, SQL, issuance, or test-tier crate"
+    exit 1
+  fi
+done
+"""
+
+[tasks."check:sdk-client-tier"]
+hide = true
+description = "Verify default wyrd-sdk excludes Python-only dependencies"
+run = """
+set -eu
+if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3|wyrd-registry|wyrd-loader|wyrd-runtime|tempfile'; then
+  echo "FAIL: default wyrd-sdk dependency cone contains a Python-only dependency"
+  exit 1
+fi
+"""
+
+[tasks."check:sdk-pyo3-scope"]
+hide = true
+description = "Verify PyO3 enters only wyrd-sdk's explicit Python feature cone"
+run = """
+set -eu
+for package in wyrd-spec wyrd-registry; do
+  if cargo tree --locked -p "$package" -e normal | rg 'pyo3'; then
+    echo "FAIL: $package normal dependency cone contains PyO3"
+    exit 1
+  fi
+done
+if cargo tree --locked -p wyrd-sdk -e normal | rg 'pyo3'; then
+  echo "FAIL: default wyrd-sdk dependency cone contains PyO3"
+  exit 1
+fi
+cargo tree --locked -p wyrd-sdk --features python -e normal | rg 'pyo3' >/dev/null
+"""
+
 [tasks."check:registry-no-server-routes"]
 hide = true
 description = "wyrd-sql must not import axum/hyper/tower from any module (registry seam is durable, not route)"
@@ -608,6 +663,12 @@ description = "Run Python unit tests except TensorFlow-marked tests"
 dir = "python/py-wyrd"
 depends = ["py:setup"]
 run = "uv run python scripts/run_unit_tests.py"
+
+[tasks."py:test:cli:unit"]
+description = "Run focused Python packaging tests for the shared Wyrd CLI"
+dir = "python/py-wyrd"
+depends = ["py:setup"]
+run = "uv run pytest -q tests/unit/test_cli_surface.py"
 
 [tasks."py:test:wyrdstate:unit"]
 description = "Run the focused offline WyrdState hydration tests"
@@ -883,11 +944,20 @@ trap 'kill $SERVER_PID $UI_PID 2>/dev/null' EXIT INT TERM
 wait $SERVER_PID $UI_PID
 """
 
-[tasks.check]
-description = "Phase 0 gate: fmt --check + clippy (clippy --all-targets already type-checks)"
+[tasks."check:default"]
+description = "Milestone/phase integration gate: fmt check + default-feature Clippy"
 run = """
-cargo fmt --all -- --check
-cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+set -eu
+mise run fmt:check
+mise run lints:default
+"""
+
+[tasks.check]
+description = "Whole-plan closeout gate: fmt check + all-feature Clippy"
+run = """
+set -eu
+mise run fmt:check
+mise run lints
 """
 
 [tasks."codegen:regen"]

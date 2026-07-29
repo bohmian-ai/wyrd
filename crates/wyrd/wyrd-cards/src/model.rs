@@ -663,35 +663,43 @@ impl ModelCard {
     /// Load model artifacts through the held interface.
     ///
     /// Pass `path` to load an existing local materialization. Without a path,
-    /// call this on a `ModelCard` returned by `Cards.model.get`; Wyrd uses the
-    /// configured Wyrd client to obtain the server's artifact inventory,
-    /// downloads and verifies the artifacts into an operation-local temporary
-    /// directory, and then invokes the interface.
+    /// call this only on a `ModelCard` returned by
+    /// `Cards.model.get(eager_load=True)`; Wyrd reuses the verified artifact
+    /// workspace retained by that eager operation.
     ///
-    /// `get` itself only retrieves and validates the serialized Card envelope.
     /// This method is the explicit boundary where model bytes enter memory.
-    /// The temporary directory remains alive until the interface load returns.
     ///
     /// # Arguments
-    /// * `path` - Optional local materialization directory. Omit it for a
-    ///   server-backed Card returned by `Cards.model.get`.
+    /// * `path` - Optional local materialization directory. Omit it only when
+    ///   reloading a holder returned by `Cards.model.get(eager_load=True)`.
     /// * `load_kwargs` - Optional `ModelLoadArgs` or JSON-compatible mapping
     ///   forwarded to the model interface.
     ///
     /// # Errors
-    /// Returns a Wyrd error when the configured client is unavailable, the
-    /// Card has no server UID, artifact download or verification fails, no
-    /// interface is attached, or interface load fails.
+    /// Returns a Wyrd error when neither a local path nor retained server
+    /// artifacts are available, no interface is attached, or interface load
+    /// fails.
     #[wyrd_test_contract_macros::critical("python:ModelCard.load")]
-    #[pyo3(signature = (path, load_kwargs=None))]
+    #[pyo3(signature = (path=None, load_kwargs=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: PathBuf,
+        path: Option<PathBuf>,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
+        let path = path
+            .or_else(|| {
+                self.artifact_workspace
+                    .as_ref()
+                    .map(|workspace| workspace.path().join("artifacts"))
+            })
+            .ok_or_else(|| {
+                WyrdPyError::model_validation(
+                    "ModelCard.load requires path for a holder without server artifacts",
+                )
+            })?;
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::model_validation("ModelCard interface is required for local load")
@@ -1127,6 +1135,8 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         }
     }
 

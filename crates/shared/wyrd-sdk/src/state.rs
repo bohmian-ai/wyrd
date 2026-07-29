@@ -22,9 +22,12 @@ use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
 };
+#[cfg(feature = "python")]
 use wyrd_spec::registry::{
-    ArtifactManifestEntry, HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest,
-    HydrationMode, RelativeArtifactPath, canonical_artifact_manifest_hash,
+    ArtifactManifestEntry, RelativeArtifactPath, canonical_artifact_manifest_hash,
+};
+use wyrd_spec::registry::{
+    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
 };
 
 /// One verified artifact payload in a local `WyrdState` bundle.
@@ -302,6 +305,7 @@ impl HydratedStateIndex {
     /// Returns an invalid-state-bundle error when the exact Card key is absent
     /// or an artifact path is not a valid wire path, and propagates
     /// canonicalization failures from `wyrd-spec`.
+    #[cfg(feature = "python")]
     fn artifact_manifest_hash_by_key(&self, key: &str) -> Result<Option<String>, WyrdError> {
         let manifest = self
             .artifacts_by_key(key)?
@@ -339,6 +343,7 @@ struct HydratedBundleReader<'a> {
     root: PathBuf,
 }
 
+/// Establishes the canonical filesystem confinement boundary.
 impl<'a> HydratedBundleReader<'a> {
     /// Construct a reader for one canonical hydrated-bundle root.
     ///
@@ -744,6 +749,7 @@ impl WyrdState {
     ///
     /// Returns an invalid-state-bundle or canonicalization error when the
     /// validated index cannot reproduce the Card artifact manifest.
+    #[cfg(feature = "python")]
     pub(crate) fn artifact_manifest_hash_by_key(
         &self,
         key: &str,
@@ -752,6 +758,7 @@ impl WyrdState {
     }
 }
 
+/// Validates bundle metadata and assembles its exact Card graph.
 impl HydratedBundleReader<'_> {
     /// Validate bundle-level hydration mode, counts, and Service root identity.
     ///
@@ -840,12 +847,12 @@ impl HydratedBundleReader<'_> {
         }
 
         for item in &loaded {
-            self.validate_spec_refs(&item.card, &known)?;
-            self.validate_relationships(&item.card, &aliases, &known)?;
+            Self::validate_spec_refs(&item.card, &known)?;
+            Self::validate_relationships(&item.card, &aliases, &known)?;
         }
 
-        self.validate_root(&manifest.root, &loaded)?;
-        self.validate_reachable_from_root(&manifest.root, &loaded)?;
+        Self::validate_root(&manifest.root, &loaded)?;
+        Self::validate_reachable_from_root(&manifest.root, &loaded)?;
         HydratedStateIndex::assemble(manifest.root, loaded, aliases)
     }
 
@@ -961,7 +968,7 @@ impl HydratedBundleReader<'_> {
     ///
     /// Returns an invalid-state-bundle error describing the first reference
     /// violation in the prescribed precedence order.
-    fn validate_spec_refs(&self, card: &Card, known: &BTreeSet<String>) -> Result<(), WyrdError> {
+    fn validate_spec_refs(card: &Card, known: &BTreeSet<String>) -> Result<(), WyrdError> {
         if let Some(path) = unresolved_card_ref_paths(&card.spec).first() {
             return Err(state_bundle_error(
                 "hydrated Card contains an unresolved path reference",
@@ -1003,7 +1010,6 @@ impl HydratedBundleReader<'_> {
     /// Returns an invalid-state-bundle error when a relationship lacks a UID,
     /// points outside the graph, or disagrees with its alias projection.
     fn validate_relationships(
-        &self,
         card: &Card,
         aliases: &BTreeMap<String, String>,
         known: &BTreeSet<String>,
@@ -1229,6 +1235,7 @@ fn typed_map_invariant(alias: &str, key: &str, expected: &CardKind) -> WyrdError
     )
 }
 
+/// Validates exact root identity and persisted relationship projections.
 impl HydratedBundleReader<'_> {
     /// Confirm that the manifest root is an exact, loaded Service Card.
     ///
@@ -1236,11 +1243,7 @@ impl HydratedBundleReader<'_> {
     ///
     /// Returns an invalid-state-bundle error when the root is absent, has a
     /// mismatched identity, or is not a Service Card.
-    fn validate_root(
-        &self,
-        root: &CardRef,
-        loaded: &[LoadedManifestCard],
-    ) -> Result<(), WyrdError> {
+    fn validate_root(root: &CardRef, loaded: &[LoadedManifestCard]) -> Result<(), WyrdError> {
         let Some(item) = loaded.iter().find(|item| item.key == root.to_string()) else {
             return Err(state_bundle_error(
                 "hydrated bundle root is not present in its Card set",
@@ -1268,7 +1271,6 @@ impl HydratedBundleReader<'_> {
     /// Returns an invalid-state-bundle error when a published Card is not
     /// reachable from the declared root through canonical outbound references.
     fn validate_reachable_from_root(
-        &self,
         root: &CardRef,
         loaded: &[LoadedManifestCard],
     ) -> Result<(), WyrdError> {
@@ -1866,16 +1868,10 @@ mod tests {
             );
             bundle.add_card(
                 "agent_triage",
-                card(
+                canonical_card(
                     &agent_ref,
                     CardKind::Agent,
-                    Spec::Agent(AgentSpec {
-                        prompt: InlineableRef::Ref(prompt_ref.clone()),
-                        tool_names: Vec::new(),
-                        run_config: AgentRunConfigSpec::default(),
-                        publishes_to: Vec::new(),
-                    }),
-                    Relationships::default(),
+                    registered_agent_spec(&prompt_ref),
                 ),
                 &[],
             );
@@ -1919,16 +1915,7 @@ mod tests {
                 card(
                     &drift_ref,
                     CardKind::Drift,
-                    Spec::Drift(DriftSpec {
-                        description: Some("fixture drift".to_owned()),
-                        method: DriftMethod::External,
-                        signal: DriftSignal::Metric {
-                            name: "score".to_owned(),
-                        },
-                        condition: DriftCondition::Statistical,
-                        profile: None,
-                        details: BTreeMap::new(),
-                    }),
+                    Spec::Drift(drift_spec()),
                     Relationships::default(),
                 ),
                 &[],
@@ -1943,6 +1930,21 @@ mod tests {
                 ),
                 &[],
             );
+            let root_ref = test_ref(CardKind::Service, "service", 1);
+            bundle.rewrite_card(&root_ref, |card| {
+                let Spec::Service(spec) = &mut card.spec else {
+                    panic!("fixture root is a Service");
+                };
+                spec.components.extend([
+                    service_component("triage_prompt", &prompt_ref),
+                    service_component("training_data", &data_ref),
+                    service_component("agent_triage", &agent_ref),
+                    service_component("agent_inline", &inline_prompt_ref),
+                    service_component("runtime_workflow", &workflow_ref),
+                ]);
+                spec.publishes_to
+                    .extend([Ref::Ref(eval_ref), Ref::Ref(drift_ref)]);
+            });
             bundle.write();
             bundle
         }
@@ -1979,12 +1981,7 @@ mod tests {
             };
             self.add_card(
                 "workflow",
-                card(
-                    &workflow_ref,
-                    CardKind::Workflow,
-                    Spec::Workflow(workflow),
-                    Relationships::default(),
-                ),
+                canonical_card(&workflow_ref, CardKind::Workflow, Spec::Workflow(workflow)),
                 &[],
             );
             let root_ref = test_ref(CardKind::Service, "service", 1);
@@ -2148,6 +2145,7 @@ mod tests {
                 .get_mut(&card_ref.to_string())
                 .expect("fixture Card exists");
             f(card);
+            card.relationships = relationships_from_spec(&card.spec);
             let entry = self
                 .manifest
                 .cards
@@ -2155,6 +2153,10 @@ mod tests {
                 .find(|entry| entry.card_ref == *card_ref)
                 .expect("fixture manifest Card exists");
             write_yaml(&self.root.path().join(&entry.card_path), card);
+            write_yaml(
+                &self.root.path().join(&entry.relationships_path),
+                &card.relationships,
+            );
         }
 
         /// Replace one local artifact payload without changing its manifest digest.
@@ -2207,6 +2209,25 @@ mod tests {
             spec,
             relationships,
             status: None,
+        }
+    }
+
+    /// Build a fixture Card with the canonical relationship projection derived
+    /// from its resolved spec.
+    fn canonical_card(card_ref: &CardRef, kind: CardKind, spec: Spec) -> Card {
+        let relationships = relationships_from_spec(&spec);
+        card(card_ref, kind, spec, relationships)
+    }
+
+    /// Build one runtime-owned Service component for a resolved fixture Card.
+    fn service_component(alias: &str, card_ref: &CardRef) -> ServiceComponent {
+        ServiceComponent {
+            alias: alias.to_owned(),
+            card_ref: Ref::Ref(card_ref.clone()),
+            publishes_to: Vec::new(),
+            source: None,
+            config: BTreeMap::new(),
+            credential_refs: Vec::new(),
         }
     }
 
@@ -2284,6 +2305,16 @@ mod tests {
         PromptSpec::new(prompt(text)).expect("fixture prompt spec is valid")
     }
 
+    /// Build an Agent spec that resolves its prompt through the fixture graph.
+    fn registered_agent_spec(prompt_ref: &CardRef) -> Spec {
+        Spec::Agent(AgentSpec {
+            prompt: InlineableRef::Ref(prompt_ref.clone()),
+            tool_names: Vec::new(),
+            run_config: AgentRunConfigSpec::default(),
+            publishes_to: Vec::new(),
+        })
+    }
+
     /// Build a valid custom Data Card spec without embedding artifact bytes.
     ///
     /// # Panics
@@ -2321,6 +2352,20 @@ mod tests {
             sampling: None,
             pass_gate: None,
             context_capture: None,
+        }
+    }
+
+    /// Build a deterministic external Drift spec for typed-state projection tests.
+    fn drift_spec() -> DriftSpec {
+        DriftSpec {
+            description: Some("fixture drift".to_owned()),
+            method: DriftMethod::External,
+            signal: DriftSignal::Metric {
+                name: "score".to_owned(),
+            },
+            condition: DriftCondition::Statistical,
+            profile: None,
+            details: BTreeMap::new(),
         }
     }
 
@@ -3010,21 +3055,15 @@ mod tests {
         let bundle = TestBundle::complete_service();
         let child = test_ref(CardKind::Model, "model", 2);
         bundle.rewrite_card(&test_ref(CardKind::Service, "service", 1), |card| {
-            card.relationships.outbound_refs[0].card_ref = CardRef {
+            let Spec::Service(spec) = &mut card.spec else {
+                panic!("fixture root is a Service");
+            };
+            spec.components[0].card_ref = Ref::Ref(CardRef {
                 name: CardName::new("missing").expect("fixture name is valid"),
                 ..child
-            };
+            });
         });
-        let root_card = bundle
-            .cards
-            .borrow()
-            .get(&test_ref(CardKind::Service, "service", 1).to_string())
-            .cloned()
-            .expect("fixture root exists");
-        write_yaml(
-            &bundle.path().join("cards/root/relationships.yaml"),
-            &root_card.relationships,
-        );
+        bundle.write();
         assert_error(
             WyrdState::from_path(bundle.path()),
             "WYRD_SDK_400_INVALID_STATE_BUNDLE",

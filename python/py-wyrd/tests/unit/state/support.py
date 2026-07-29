@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
+import blake3
 import joblib
 import yaml
 from sklearn.linear_model import LogisticRegression
@@ -139,7 +141,29 @@ def _ref(kind: str, name: str, uid: str) -> dict[str, str]:
     return {"kind": kind, "name": name, "version": "1.0.0", "space": "default", "uid": uid}
 
 
-def _card(ref: dict[str, str], spec: dict[str, Any]) -> dict[str, Any]:
+def _ref_string(ref: dict[str, str]) -> str:
+    """Render one fixture CardRef using the canonical Wyrd identity string."""
+    return f"{ref['space']}/{ref['kind']}/{ref['name']}@{ref['version']}#{ref['uid']}"
+
+
+def _relationships(
+    *entries: tuple[dict[str, str], str | None],
+) -> dict[str, list[Any]]:
+    """Project exact outbound references and optional Service aliases."""
+    ordered = sorted(entries, key=lambda entry: _ref_string(entry[0]))
+    return {
+        "outbound": [_ref_string(ref) for ref, _alias in ordered],
+        "outbound_refs": [{"ref": ref, "alias": alias} for ref, alias in ordered],
+        "inbound": [],
+        "inbound_refs": [],
+    }
+
+
+def _card(
+    ref: dict[str, str],
+    spec: dict[str, Any],
+    relationships: dict[str, list[Any]] | None = None,
+) -> dict[str, Any]:
     """Wrap a fixture spec in the complete ``wyrd/v1`` Card envelope.
 
     Args:
@@ -161,7 +185,7 @@ def _card(ref: dict[str, str], spec: dict[str, Any]) -> dict[str, Any]:
             "annotations": {},
         },
         "spec": spec,
-        "relationships": {"outbound": [], "outbound_refs": [], "inbound": [], "inbound_refs": []},
+        "relationships": relationships or _relationships(),
     }
 
 
@@ -231,7 +255,9 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
         "triage": (_card(prompt, prompt_spec), ["triage_prompt"]),
         "triage_agent": (
             _card(
-                agent, {"prompt": prompt, "tool_names": [], "run_config": {}, "publishes_to": []}
+                agent,
+                {"prompt": prompt, "tool_names": [], "run_config": {}, "publishes_to": []},
+                _relationships((prompt, None)),
             ),
             ["agent_triage"],
         ),
@@ -262,12 +288,20 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
                 {
                     "components": [
                         {"alias": "model", "ref": model},
+                        {"alias": "backup", "ref": backup},
                         {"alias": "training_data", "ref": data},
                         {"alias": "agent_triage", "ref": agent},
                         {"alias": "agent_inline", "ref": inline_agent},
                     ],
                     "publishes_to": [],
                 },
+                _relationships(
+                    (model, "model"),
+                    (backup, "backup"),
+                    (data, "training_data"),
+                    (agent, "agent_triage"),
+                    (inline_agent, "agent_inline"),
+                ),
             ),
             ["root"],
         ),
@@ -347,6 +381,29 @@ def build_complete_bundle(tmp_path: Path, *, duplicate_model_alias: bool = False
     }
     (root / "metadata.yaml").write_text(yaml.safe_dump(manifest, sort_keys=False), encoding="utf-8")
     return root
+
+
+def trusted_artifact_hash(bundle: Path, alias: str) -> str:
+    """Compute the exact canonical artifact-manifest hash trusted by WyrdState."""
+    manifest = yaml.safe_load((bundle / "metadata.yaml").read_text(encoding="utf-8"))
+    selected = next(card for card in manifest["cards"] if alias in card["aliases"])
+    artifacts = [
+        {
+            "relative_path": artifact["relative_path"],
+            "sha256": artifact["sha256"],
+            "size_bytes": artifact["size_bytes"],
+            "content_type": artifact.get("content_type"),
+        }
+        for artifact in selected["artifacts"]
+    ]
+    artifacts.sort(key=lambda artifact: artifact["relative_path"])
+    canonical = json.dumps(
+        artifacts,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return blake3.blake3(canonical).hexdigest()
 
 
 def build_builtin_model_bundle(tmp_path: Path) -> Path:

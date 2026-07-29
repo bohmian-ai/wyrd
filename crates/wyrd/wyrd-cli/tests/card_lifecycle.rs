@@ -488,12 +488,13 @@ fn get_requires_an_output_directory_before_client_construction() {
     );
 }
 
+/// Keep `get` help successful, hydration-specific, and free of argv credentials.
 #[test]
 fn get_help_describes_hydration_and_does_not_advertise_argv_credentials() {
     let output = run_cli(&["get", "--help"]);
     let help = String::from_utf8_lossy(&output.stdout);
 
-    assert_eq!(output.status.code(), Some(64));
+    assert_eq!(output.status.code(), Some(0));
     assert!(help.contains("reachable graph"));
     assert!(help.contains("--output-dir"));
     assert!(help.contains("complete artifact downloads"));

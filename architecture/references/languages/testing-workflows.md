@@ -1,8 +1,11 @@
 # Testing Workflows
 
-Use repository tasks from `mise.toml`. Prefer targeted checks while
-iterating; treat `mise run pre-pr` as the aggregate CI gate, not the
-per-slice default.
+Use this reference with
+`architecture/references/languages/implementation-execution.md`. A bounded
+task runs task-defined focused verification with default or exact features. A
+milestone or phase may add the default-feature workspace gate. Treat
+all-feature workspace checks and `mise run pre-pr` as whole-plan closeout
+gates, not per-task defaults.
 
 ## Three Tiers (Priority Order)
 
@@ -40,15 +43,26 @@ a unit test *only* is a coverage gap to flag in review.
 Run verification for the code you changed. Use the narrowest `mise` task
 that covers the touched surface:
 
-### Format and lint (always relevant)
+### Format and lint
 
 ```bash
-mise run fmt              # Rust formatting
-mise run lints            # Rust clippy, workspace-wide, --all-features
-mise run py:format        # Python (Ruff)
-mise run py:lints         # Python (Ruff lints)
-mise run py:typecheck     # ty type checker over generated stubs
+# Bounded task: run only commands required by its affected surface.
+mise run fmt            # when Rust changed
+mise run py:format      # when Python changed
+mise run py:lints       # when Python changed
+mise run py:typecheck   # when Python public typing changed
+
+# Milestone or phase integration:
+mise run check:default  # fmt check + workspace Clippy, default features
+
+# Whole-plan closeout:
+mise run check          # fmt check + workspace Clippy, --all-features
 ```
+
+Use the focused lint command named by the active task. Do not substitute
+`check:default` for missing task-level lint scope; return an under-specified
+task for correction when choosing a broader gate would materially expand
+verification.
 
 ### Rust crate changes
 
@@ -71,9 +85,10 @@ mise run test:storage:matrix  # storage emulator matrix (S3/GCS/Azure)
 mise exec -- cargo test --locked -p <crate> <test_name> -- --nocapture --test-threads=1
 ```
 
-`--all-features` in test tasks forces the heavy feature-union to
-recompile and defeats artifact reuse. Prefer the minimal feature set the
-test needs; lint and workspace typecheck already run `--all-features`.
+`--all-features` in bounded-task, milestone, or phase commands forces the heavy
+feature union to recompile and defeats artifact reuse. Prefer default features
+or the exact feature set the changed behavior needs. The integrated whole-plan
+`check` verifies the workspace feature union once at closeout.
 
 ### Python changes
 
@@ -133,15 +148,19 @@ a specific change will trip:
 
 ## Aggregate CI Gate
 
-`mise run pre-pr` runs the full battery: `check`, `test:unit`,
+`mise run pre-pr` runs the full battery: the all-feature `check`, `test:unit`,
 `test:bifrost`, `codegen:check`, `cardkind:check`, `check:design-sync`,
 every boundary gate above, `py:setup`, `py:format:check`, `py:lints`,
 `py:typecheck`, `py:test:unit`, plus example / docs / vocab gates.
 
-Run `pre-pr` when the change is broad, crosses several ownership
-boundaries, changes shared CI/build/test infra, prepares a release, or the
-user explicitly asks for it. It is a final confidence sweep, **not** the
-normal bar for every local slice.
+Run `pre-pr` after a complete integrated plan when the plan requires it, or
+when the change modifies shared CI/build/test infrastructure, prepares a
+release, or the user explicitly asks for it. It is a final confidence sweep,
+**not** the normal bar for a task, milestone, or phase.
+
+Run all Cargo-backed commands sequentially across agents sharing a checkout or
+target directory. Parallel source work must not create overlapping Cargo
+builds, tests, lints, docs, or codegen processes.
 
 ## Test Design
 

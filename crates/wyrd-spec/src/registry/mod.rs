@@ -1,6 +1,7 @@
 //! Card registration wire contracts.
 
 mod enums;
+/// Offline hydrated-bundle wire projections.
 mod hydrated;
 mod ids;
 mod reads;

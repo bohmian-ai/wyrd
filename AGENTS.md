@@ -14,7 +14,8 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
 2. Follow all agent rules listed in `architecture/agent-rules.md`.
 3. Read `architecture/wyrd-design.md`; it is the active design authority and
    wins over generated artifacts, older planning files, and implementation
-   drift.
+   drift. It is current authority, not immutable history: an approved feature
+   may revise it when the existing boundary is no longer the best design.
 4. Read `architecture/wyrd-doctrine.mdx` before changing
    Wyrd contracts, public or internal APIs, SDK surfaces, CLI, MCP, UI, docs,
    generated schemas, or implementation behavior.
@@ -25,7 +26,12 @@ this repository. Reproduce useful patterns under Wyrd vocabulary and Wyrd paths.
    relying on version-specific behavior.
 
 Do not invent a new architecture until the current Wyrd boundary proves wrong
-for the user workflow.
+for the user workflow. When an approved feature intentionally replaces a
+design decision, name the superseded decision and update
+`architecture/wyrd-design.md` before or in the same cohesive change as the code
+that relies on the replacement. Update `architecture/wyrd-doctrine.mdx` too
+when the underlying principle changes. A silent conflict is a blocker; an
+explicit, better design change is normal product evolution.
 
 
 ## 2. Current Decisions
@@ -35,7 +41,8 @@ Design dialogue, predecessor research, and older session history live in the
 org-internal). Active implementation authority now lives in this repo.
 `PLAN.md` remains the pointer back to planning history.
 
-Locked cross-cutting decisions that any contributor must honor:
+Current cross-cutting decisions that any contributor must honor until an
+approved design change updates the owning authority:
 
 - The protocol doctrine in `architecture/wyrd-design.md`
   is the first design filter for Wyrd nouns, layers, services, and public
@@ -159,10 +166,13 @@ Python, and TypeScript client surfaces where appropriate.
   input, database, storage, or external-service behavior in non-test code.
 - Use `expect()` only for true invariants, with a message naming the invariant.
 - Do not add wildcard dependency versions or per-crate profile blocks.
-- Lints, format checks, and workspace type-checks use `--all-features` so every
-  code path is verified. Test and build tasks declare only the minimal feature
-  set they need — `--all-features` in a test task forces the heavy cone to
-  recompile at a different feature-union and defeats artifact reuse.
+- Task, milestone, and phase checks use default features or the exact optional
+  features exercised by the change. Whole-plan closeout, `pre-pr`, release,
+  and explicitly requested aggregate checks use `--all-features` so every code
+  path is verified once after integration. Test and build tasks declare only
+  the minimal feature set they need — `--all-features` in a test task forces
+  the heavy cone to recompile at a different feature-union and defeats artifact
+  reuse.
 
 ## 5. Abstraction Rules
 
@@ -354,16 +364,33 @@ behavior has no cross-boundary state (record the reason).
 
 ### Verification Scope
 
-Run verification for the code you changed. `mise run pre-pr` is the aggregate
-CI gate; it is intentionally broad and slow, so do not make it the default
-requirement for every plan, PR, or implementation slice.
+Run verification for the code you changed. Verification has three explicit
+levels:
+
+1. **Bounded-task verification.** Run only the task-defined focused test,
+   boundary-check, format, and lint surface with default features or the exact
+   optional features required by the behavior. Do not silently expand to
+   workspace validation.
+2. **Milestone and phase integration.** After related tasks integrate, run
+   their integration coverage and `mise run check:default`.
+3. **Whole-plan closeout.** After all tasks are integrated, run the all-feature
+   workspace gate and every final gate required by the plan.
+
+`mise run pre-pr` is the aggregate CI gate; it is intentionally broad and slow,
+so do not make it the default requirement for every task, milestone, phase, or
+implementation slice.
 
 ```bash
-# Always run the relevant format and lint checks.
-mise run fmt           # Rust formatting
-mise run lints         # Rust clippy, workspace-wide
+# Bounded task: use only commands required by its affected surface.
+mise run fmt           # if Rust changed
 mise run py:format     # if Python files changed
 mise run py:lints      # if Python files changed
+
+# Milestone or phase integration.
+mise run check:default # fmt check + workspace Clippy, default features
+
+# Whole-plan closeout.
+mise run check         # fmt check + workspace Clippy, all features
 ```
 
 Then run the narrowest `mise` test/check tasks that cover the touched surface:
@@ -386,10 +413,16 @@ Then run the narrowest `mise` test/check tasks that cover the touched surface:
 - Example change: run the touched example task, or `mise run check:examples`
   when the change affects shared example behavior.
 
-Run `mise run pre-pr` when the change is intentionally broad, crosses several
-ownership boundaries, changes shared CI/build/test infrastructure, prepares a
-release, or when the user explicitly asks for the full gate. It remains useful
-as a final confidence sweep; it is not the normal bar for every local PR.
+Run `mise run pre-pr` at whole-plan closeout when the plan requires the
+aggregate lane, or when the change modifies shared CI/build/test
+infrastructure, prepares a release, or the user explicitly asks for the full
+gate. It remains useful as a final confidence sweep; it is not the normal bar
+for every local task or phase.
+
+Run all Cargo-backed commands sequentially, including commands launched by
+multiple agents sharing one checkout or target directory. Parallel code
+inspection and independent edits are allowed; overlapping Cargo builds, tests,
+lints, docs, or codegen are not.
 
 Real cloud storage integration tests (`test:storage:*:cloud`) run against live
 infrastructure separately.
@@ -455,14 +488,37 @@ A change is not done until:
 Planning lives in the [`wyrd`](https://github.com/wyrd-ai/wyrd) repo. Additional/older planning files live in the [`wyrd-plan`](https://github.com/wyrd-ai/wyrd-plan) repo.
 Code in this repo lands one session at a time, via dialogue-locked decisions.
 
+Sol planning must compile ambiguous intent into implementation-ready task
+packets sized for Terra/Luna. Each task packet names its objective,
+requirements, non-goals, allowed and prohibited scope, target paths and
+symbols, required code structure, interfaces and invariants, consequential
+control flow, dependencies and feature requirements, acceptance criteria,
+required tests, focused verification, escalation conditions, and expected
+completion evidence. Typed stubs and pseudocode carry the implementation
+decisions; they state whether semantics are normative or structure is
+illustrative. An implementation task is incomplete when its assigned model
+must choose architecture, public behavior, persistence, failure semantics,
+scope, or verification. Task authors and implementors follow
+`architecture/references/languages/implementation-execution.md` as the
+canonical bounded-execution contract.
+
+When a plan intentionally changes Wyrd design, the task packet names the
+superseded decision and includes the owning design and doctrine updates in its
+write set. Implementors update those authorities instead of treating current
+design as immutable or allowing code and docs to disagree.
+
 ### Codex agent skill bindings
 
+- Wyrd planning agents use `.codex/skills/wyrd-plan/SKILL.md` to investigate,
+  resolve decisions, design verification, and produce the canonical
+  `.dev/plan/<slug>/implementation-plan.md` plus one or more executable task
+  packets under `.dev/plan/<slug>/tasks/`.
 - The plan orchestrator reads this file, `architecture/wyrd-design.md`,
-  `architecture/wyrd-doctrine.mdx`, and the applicable repo-local skill before
-  decomposing work.
+  `architecture/wyrd-doctrine.mdx`, and the applicable repo-local
+  implementation skill before decomposing work.
 - Wyrd Rust, Python, TypeScript, server, CLI, MCP, storage, Vala, and contract
-  implementors must receive `.codex/skills/wyrd-implement/SKILL.md` in their
-  task packet.
+  implementors execute those packets with `.codex/skills/wyrd-implement/SKILL.md`,
+  which owns implementation and validation.
 - Wyrd UI implementors additionally receive
   `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
 - The complete integration review runs the global `review-and-plan` skill; its

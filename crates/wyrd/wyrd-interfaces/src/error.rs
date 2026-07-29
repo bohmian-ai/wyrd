@@ -23,6 +23,14 @@ pub enum WyrdPyError {
     /// Public Wyrd error with a stable code and rich metadata.
     #[error(transparent)]
     Spec(#[from] WyrdError),
+    /// Public Wyrd error retaining a safe textual Python cause.
+    #[error("{error}")]
+    SpecWithCause {
+        /// Stable public error preserved across the boundary.
+        error: WyrdError,
+        /// Redacted source text attached as Python `__cause__`.
+        cause: String,
+    },
     /// Python boundary failure converted to an owned string.
     #[error("Python error: {0}")]
     Python(String),
@@ -194,10 +202,18 @@ impl WyrdPyError {
         }
     }
 
+    /// Attach a redacted Python cause while preserving a stable Wyrd error.
+    pub fn spec_with_cause(error: WyrdError, cause: impl Into<String>) -> Self {
+        Self::SpecWithCause {
+            error,
+            cause: cause.into(),
+        }
+    }
+
     #[cfg(feature = "python")]
     fn into_wyrd_error(self) -> WyrdError {
         match self {
-            Self::Spec(error) => error,
+            Self::Spec(error) | Self::SpecWithCause { error, .. } => error,
             Self::Python(source) => internal_from_source("Python boundary failed", &source),
             Self::PythonWithCause { message, cause } => internal_from_source(&message, &cause),
             Self::Downcast(source) => {
@@ -262,7 +278,8 @@ impl From<pyo3::PyErr> for WyrdPyError {
 impl From<WyrdPyError> for pyo3::PyErr {
     fn from(error: WyrdPyError) -> Self {
         let cause = match &error {
-            WyrdPyError::PythonWithCause { cause, .. } => Some(cause.clone()),
+            WyrdPyError::SpecWithCause { cause, .. }
+            | WyrdPyError::PythonWithCause { cause, .. } => Some(cause.clone()),
             _ => None,
         };
         Python::attach(|py| {

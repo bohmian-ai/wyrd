@@ -17,6 +17,7 @@ pub struct Cli {
     pub command: Command,
 }
 
+/// Dispatches the parsed client command through its single owning CLI.
 impl Cli {
     /// Dispatch the selected client command through its owning CLI capability.
     ///

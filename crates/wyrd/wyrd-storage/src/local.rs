@@ -72,13 +72,12 @@ impl LocalSigner {
         let temp = tempfile::Builder::new()
             .prefix(".wyrd-write-")
             .tempfile_in(parent)?;
-        let temp_path = temp.path().to_path_buf();
-        let std_file = temp.into_file();
+        let (std_file, temp_path) = temp.into_parts();
         let mut file = fs::File::from_std(std_file);
         file.write_all(bytes).await?;
         file.sync_all().await?;
         drop(file);
-        fs::rename(&temp_path, target).await?;
+        fs::rename(&*temp_path, target).await?;
         Ok(())
     }
 

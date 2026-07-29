@@ -1,8 +1,8 @@
 # Wyrd Doctrine Reference Library
 
-Shared reference library consumed by `wyrd-implement` (Claude + Codex
-skills). Skills own *process*; this library owns *knowledge*. Skills load
-only the slices they need.
+Shared reference library consumed by Wyrd planning, implementation, and review
+skills. Skills own *process*; this library owns *knowledge*. Skills load only
+the slices they need.
 
 ## Layout
 
@@ -22,6 +22,7 @@ references/
 | `doctrine/architecture-constraints.md` | Terse boundary checklist (wyrd/vala/skald, `wyrd-spec` free-of list, deployment topologies, observation identity) |
 | `architecture/patterns.md` | Implementation doctrine: full crate inventory, contract placement, server/client/storage/provider/observability/audit patterns |
 | `languages/rust-core.md` | Rust ownership, traits, async, allocation, API shape, concrete idiomatic examples |
+| `languages/implementation-execution.md` | Mandatory single-task execution contract, escalation, focused verification, diff audit, completion evidence |
 | `languages/pyo3-boundaries.md` | PyO3 classes, `fn __new__` rule, GIL, lifetimes, boundary conversion, module registration |
 | `languages/errors.md` | Wyrd error codes, `WyrdError` derive, boundary conversion, Rust/Python/TS/HTTP/CLI mapping |
 | `languages/python-api-and-stubs.md` | Python exports, generated stubs, package layout, test conventions |
@@ -33,6 +34,7 @@ references/
 ## Consumers
 
 - `.claude/skills/wyrd-implement/SKILL.md`
+- `.codex/skills/wyrd-plan/SKILL.md`
 - `.codex/skills/wyrd-implement/SKILL.md`
 - Global Claude and Codex `wyrd-plan-reviewer` skills
 

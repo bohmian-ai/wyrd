@@ -21,6 +21,7 @@ otel = ["opentelemetry-api>=1.27"]
 
 [dependency-groups]
 dev = [
+    "blake3>=1.0.0",
     "catboost>=1.2.0",
     "datasets>=2.20.0",
     "lightgbm>=4.5.0",

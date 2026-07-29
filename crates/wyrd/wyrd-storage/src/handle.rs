@@ -236,14 +236,12 @@ impl StorageHandle {
             .or(self.public_base_url.as_deref())
     }
 
-    /// Override the public base URL once the embedding server has bound its
-    /// concrete listener address.
+    /// Bind the public base URL once the embedding server has selected its
+    /// listener address.
     ///
     /// This is used by bound test servers whose ephemeral port is not known
     /// when the storage handle is first assembled. Production callers should
     /// configure `public_base_url` in [`StorageSettings`].
-    /// Bind the public base URL once the embedding server has selected its
-    /// listener address.
     ///
     /// Repeating the same assignment is harmless. A different assignment is
     /// rejected because local download plans must retain one public authority
@@ -253,26 +251,17 @@ impl StorageHandle {
     /// Returns [`StorageError::PublicBaseUrlConflict`] when another URL was
     /// previously bound.
     pub fn set_public_base_url(&self, base_url: String) -> Result<(), StorageError> {
-        if let Some(existing) = self.public_base_url_override.get() {
-            return if existing == &base_url {
-                Ok(())
-            } else {
-                Err(StorageError::PublicBaseUrlConflict {
-                    existing: existing.clone(),
-                    requested: base_url,
-                })
-            };
-        }
-        self.public_base_url_override
-            .set(base_url)
-            .map_err(|requested| StorageError::PublicBaseUrlConflict {
-                existing: self
-                    .public_base_url_override
-                    .get()
-                    .expect("invariant: failed OnceLock assignment has a bound URL")
-                    .clone(),
-                requested,
+        let existing = self
+            .public_base_url_override
+            .get_or_init(|| base_url.clone());
+        if existing == &base_url {
+            Ok(())
+        } else {
+            Err(StorageError::PublicBaseUrlConflict {
+                existing: existing.clone(),
+                requested: base_url,
             })
+        }
     }
 
     /// Probe the storage backend for liveness.
@@ -330,10 +319,25 @@ impl StorageHandle {
         path: &ValidatedPath,
         bytes: Vec<u8>,
     ) -> Result<(), StorageError> {
+        #[cfg(not(feature = "cloud"))]
+        {
+            let BackendSigner::Local(local) = &self.signer;
+            return local
+                .write_atomically(std::path::Path::new(&path.full), &bytes)
+                .await;
+        }
+        #[cfg(feature = "cloud")]
+        if let BackendSigner::Local(local) = &self.signer {
+            return local
+                .write_atomically(std::path::Path::new(&path.full), &bytes)
+                .await;
+        }
+        #[cfg(feature = "cloud")]
         self.operator
             .write(&path.full, bytes)
             .await
             .map_err(|e| self.map_operator_error(&e, "put_object", &path.full))?;
+        #[cfg(feature = "cloud")]
         Ok(())
     }
 
@@ -452,6 +456,28 @@ mod tests {
         assert!(
             matches!(result, Err(StorageHealthError::LocalRoot(_))),
             "expected LocalRoot error, got {result:?}"
+        );
+    }
+
+    /// Verify local direct writes create nested parents before staging bytes.
+    #[tokio::test]
+    async fn put_object_local_creates_nested_parent() {
+        let dir = TempDir::new().expect("tempdir");
+        let handle = local_handle(dir.path());
+        let tenant = wyrd_spec::DataTenantId::new_v7();
+        let card = uuid::Uuid::now_v7().to_string();
+        let full = crate::tenant_path::build(tenant, &card, "blob/spec.json");
+        let path =
+            crate::tenant_path::validate(&full, tenant).expect("nested object path is valid");
+
+        handle
+            .put_object(&path, b"card".to_vec())
+            .await
+            .expect("nested local write succeeds");
+
+        assert_eq!(
+            std::fs::read(dir.path().join(full)).expect("written object is readable"),
+            b"card"
         );
     }
 }

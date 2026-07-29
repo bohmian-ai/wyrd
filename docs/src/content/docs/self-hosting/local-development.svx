@@ -28,32 +28,11 @@ curl -s http://localhost:8080/healthz   # -> ok
 curl -s http://localhost:8080/readyz     # -> readiness snapshot
 ```
 
-## Seed local credentials
-
-`wyrd dev bootstrap` provisions a ready-to-use local environment in one step. It starts the embedded Postgres, runs all database migrations, creates a `dev` tenant, seeds a `local-dev` service principal with an API key, and writes everything to `~/.config/wyrd/credentials.toml` at mode `0600`:
-
-```bash
-mise exec -- cargo run -p wyrd-cli -- dev bootstrap
-# credentials written to: /home/you/.config/wyrd/credentials.toml
-```
-
-The credentials file looks like this:
-
-```toml
-[default]
-api_key = "wyrd_sk_<tenant>_<random>"
-card_ref = "dev/Service/local-dev@1.0.0"
-```
-
-The Wyrd SDK and CLI pick up `[default]` automatically. You do not need to pass credentials on every invocation.
-
-`wyrd dev bootstrap` is idempotent: re-running it against an already-seeded database is a no-op for the tenant and principal rows. The credentials file is overwritten with the key already in the database.
-
-By default the command refuses to run against a non-loopback database. If you are intentionally seeding a non-local Postgres (not recommended), pass `--i-understand-this-is-not-production`.
-
 ## Get an admin key
 
-A fresh database has no credentials. Mint the first admin API key, then use it as a bearer token:
+The client-only `wyrd` CLI does not provision databases or credentials. A
+fresh database has no credentials. Mint the first admin API key with the
+server-owned bootstrap command, then use it as a bearer token:
 
 ```bash
 mise exec -- cargo run -p wyrd-server -- bootstrap-key --tenant acme

@@ -15,10 +15,11 @@ mod eval;
 pub mod load;
 mod principal;
 #[cfg(feature = "python")]
+/// Optional PyO3 adapter for the shared numeric CLI entrypoint.
 pub mod python;
 pub mod registration;
 
-use clap::Parser;
+use clap::{Parser, error::ErrorKind};
 
 pub use cli::{Cli, Command};
 
@@ -48,8 +49,12 @@ where
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
+            let success = matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            );
             let _ = error.print();
-            return 64;
+            return if success { 0 } else { 64 };
         }
     };
     match cli.dispatch().await {
@@ -61,10 +66,42 @@ where
     }
 }
 
+/// Convert the CLI's supported process codes into the numeric embedding form.
 fn code_to_u8(code: std::process::ExitCode) -> u8 {
     if code == std::process::ExitCode::SUCCESS {
         0
+    } else if code == std::process::ExitCode::from(2) {
+        2
+    } else if code == std::process::ExitCode::from(64) {
+        64
     } else {
         1
+    }
+}
+
+/// Exit-code contract tests for the shared native and Python CLI entrypoint.
+#[cfg(test)]
+mod tests {
+    use super::{code_to_u8, run_cli_code};
+
+    /// Preserve the process codes explicitly used by shared CLI dispatch.
+    #[test]
+    fn numeric_exit_conversion_preserves_supported_codes() {
+        assert_eq!(code_to_u8(std::process::ExitCode::SUCCESS), 0);
+        assert_eq!(code_to_u8(std::process::ExitCode::FAILURE), 1);
+        assert_eq!(code_to_u8(std::process::ExitCode::from(2)), 2);
+        assert_eq!(code_to_u8(std::process::ExitCode::from(64)), 64);
+    }
+
+    /// Treat Clap's non-executing help path as success.
+    #[tokio::test]
+    async fn top_level_help_returns_success() {
+        assert_eq!(run_cli_code(["wyrd", "--help"]).await, 0);
+    }
+
+    /// Keep removed development commands on the standard usage-error path.
+    #[tokio::test]
+    async fn removed_dev_bootstrap_returns_usage_error() {
+        assert_eq!(run_cli_code(["wyrd", "dev", "bootstrap"]).await, 64);
     }
 }

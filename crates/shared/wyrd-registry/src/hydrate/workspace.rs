@@ -221,9 +221,14 @@ fn take_publish_fault(fault: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use tempfile::TempDir;
 
     use super::{FAIL_CLEANUP, FAIL_PROMOTION, FAIL_RESTORE, HydrationWorkspace, PUBLISH_FAULTS};
+
+    /// Serializes tests that mutate the process-wide publication fault flags.
+    static PUBLISH_FAULT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Configures one-shot publication faults for rollback tests.
     fn inject_publish_faults(faults: u8) {
@@ -250,6 +255,10 @@ mod tests {
     /// Missing staging fails replacement and restores the previous bundle.
     #[test]
     fn failed_replacement_restores_the_previous_bundle() {
+        let _publish_fault_guard = PUBLISH_FAULT_LOCK
+            .lock()
+            .expect("publication fault lock remains available");
+        inject_publish_faults(0);
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("missing-staging");
@@ -273,6 +282,10 @@ mod tests {
     /// Promotion and restoration failures surface as an unrecoverable publication error.
     #[test]
     fn rollback_failure_is_reported_as_unrecoverable() {
+        let _publish_fault_guard = PUBLISH_FAULT_LOCK
+            .lock()
+            .expect("publication fault lock remains available");
+        inject_publish_faults(0);
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("staging");
@@ -302,6 +315,10 @@ mod tests {
     /// Cleanup failure does not hide a bundle that was already published.
     #[test]
     fn cleanup_failure_does_not_hide_a_published_bundle() {
+        let _publish_fault_guard = PUBLISH_FAULT_LOCK
+            .lock()
+            .expect("publication fault lock remains available");
+        inject_publish_faults(0);
         let temp = TempDir::new().expect("tempdir creates");
         let destination = temp.path().join("bundle");
         let staging = temp.path().join("staging");

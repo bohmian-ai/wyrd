@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 import wyrd
-from wyrd.cards import AgentCard, Cards, Prompt, PromptCard, PromptReference, VersionBump
+from wyrd.cards import AgentCard, Cards, VersionBump
+from wyrd.prompt import Prompt, PromptCard, PromptReference
+
+
+def _offline_cards() -> Cards:
+    """Construct a credential-complete client whose endpoint must never be used."""
+    return Cards(server_url="http://127.0.0.1:1", api_key="unit-test-key")
 
 
 def test_agent_cards_are_not_registerable() -> None:
@@ -16,7 +22,7 @@ def test_agent_cards_are_not_registerable() -> None:
         version="0.1.0",
     )
     with pytest.raises(wyrd.WyrdError, match="DataCard, ModelCard, or PromptCard"):
-        Cards().register(card)
+        _offline_cards().register(card)
 
 
 def test_registry_stub_documents_patch_default_and_exact_delete() -> None:
@@ -37,4 +43,4 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network() -> None:
         version="1.2.3",
     )
     with pytest.raises(wyrd.WyrdError, match="exact metadata.version pin"):
-        Cards().prompt.register(card, version_bump=VersionBump.Minor)
+        _offline_cards().prompt.register(card, version_bump=VersionBump.Minor)

@@ -632,12 +632,13 @@ impl DataCard {
     /// Pass `path` to load an existing local materialization. Registry clients
     /// materialize artifacts before calling this local-only holder operation.
     ///
-    /// `get` itself only retrieves and validates the serialized Card envelope.
-    /// This method is the explicit boundary where data bytes enter memory.
-    /// The temporary directory remains alive until the interface load returns.
+    /// Eager registry loads retain a verified artifact workspace on the
+    /// holder. This method is the explicit boundary where local bytes enter
+    /// memory.
     ///
     /// # Arguments
-    /// * `path` - Local materialization directory.
+    /// * `path` - Optional local materialization directory. Omit it only when
+    ///   reloading a holder returned by `Cards.data.get(eager_load=True)`.
     /// * `load_kwargs` - Optional `DataLoadArgs` or JSON-compatible mapping
     ///   forwarded to the data interface.
     ///
@@ -645,15 +646,26 @@ impl DataCard {
     /// Returns a Wyrd error when no local materialization path or interface is
     /// supplied, or interface load fails.
     #[wyrd_test_contract_macros::critical("python:DataCard.load")]
-    #[pyo3(signature = (path, load_kwargs=None))]
+    #[pyo3(signature = (path=None, load_kwargs=None))]
     // justification: pyo3 boundary; the extractor produces an owned value (PathBuf/PyRef/newtype), taking it by reference would require a caller-side clone
     #[allow(clippy::needless_pass_by_value)]
     pub fn load(
         &mut self,
         py: Python<'_>,
-        path: PathBuf,
+        path: Option<PathBuf>,
         load_kwargs: Option<&Bound<'_, PyAny>>,
     ) -> CardPyResult<()> {
+        let path = path
+            .or_else(|| {
+                self.artifact_workspace
+                    .as_ref()
+                    .map(|workspace| workspace.path().join("artifacts"))
+            })
+            .ok_or_else(|| {
+                WyrdPyError::validation(
+                    "DataCard.load requires path for a holder without server artifacts",
+                )
+            })?;
         let load_kwargs = normalize_load_kwargs(load_kwargs)?;
         let interface = self.interface.as_ref().ok_or_else(|| {
             WyrdPyError::validation("DataCard interface is required for local load")
@@ -1086,6 +1098,8 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         };
         assert!(card.as_card_ref().is_err());
     }
@@ -1110,6 +1124,8 @@ mod tests {
             is_card: true,
             #[cfg(feature = "python")]
             interface: None,
+            #[cfg(feature = "python")]
+            artifact_workspace: None,
         };
 
         let card_ref = card.as_card_ref().expect("identity is valid");

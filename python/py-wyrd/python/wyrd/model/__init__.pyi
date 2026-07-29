@@ -789,10 +789,9 @@ class ModelCard:
         """Hydrate model artifacts through the held interface.
 
         Pass `path` to load a saved local directory. Without a path, call this
-        on a card returned by `Cards.model.get`; Wyrd obtains the server artifact
-        inventory, downloads and verifies the artifacts into a temporary
-        directory, and then invokes the interface. `get` does not download
-        model bytes.
+        only to reload a card returned by `Cards.model.get(eager_load=True)`;
+        Wyrd reuses the verified workspace retained by that eager operation.
+        An envelope-only `get` does not download model bytes.
 
         Args:
             path (PathLike | None): Optional local materialization directory.
@@ -800,10 +799,9 @@ class ModelCard:
                 Optional interface-specific load options.
 
         Raises:
-            WyrdError: If no path is supplied to a card that was not returned
-                by `Cards.model.get`, the Card has no server UID, artifact
-                download or verification fails, no interface is attached, or
-                interface loading fails.
+            WyrdError: If neither a local path nor an eager-load workspace is
+                available, no interface is attached, or interface loading
+                fails.
         """
         ...
 

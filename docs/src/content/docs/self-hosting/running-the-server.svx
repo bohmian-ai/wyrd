@@ -103,4 +103,4 @@ When `metrics.enabled` is true (the default), the server serves Prometheus metri
 
 - [Configuration](/self-hosting/configuration/): the full env var and config file reference.
 - [Architecture](/self-hosting/architecture/): what supervises these tasks and how shutdown drains.
-- [Local development](/self-hosting/local-development/): `wyrd dev bootstrap` for zero-config local credentials.
+- [Local development](/self-hosting/local-development/): embedded Postgres and server-owned credential bootstrap.

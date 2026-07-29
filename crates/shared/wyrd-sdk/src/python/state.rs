@@ -13,11 +13,11 @@ use super::{PyCardEnvelope, WyrdState, parse_load_config, runtime_hydration_erro
 /// Normalized Python loader configuration keyed by exact `CardRef` identity.
 pub(super) struct PythonLoadConfig {
     /// Interface objects retained independently of borrowed Python lifetimes.
-    pub(super) interface_by_ref: BTreeMap<String, Py<PyAny>>,
+    pub(super) interfaces: BTreeMap<String, Py<PyAny>>,
     /// JSON-compatible loader kwargs retained by exact `CardRef`.
-    pub(super) kwargs_by_ref: BTreeMap<String, Py<PyAny>>,
-    /// Caller-approved canonical artifact manifests keyed by exact CardRef.
-    pub(super) trusted_artifact_hashes_by_ref: BTreeMap<String, String>,
+    pub(super) load_kwargs: BTreeMap<String, Py<PyAny>>,
+    /// Caller-approved canonical artifact manifests keyed by exact `CardRef`.
+    pub(super) trusted_artifact_hashes: BTreeMap<String, String>,
 }
 
 /// Builds every Python holder for one already-validated offline state bundle.
@@ -28,25 +28,26 @@ pub(super) struct PythonLoadConfig {
 /// network dependency.
 pub(super) struct PythonStateHydrator<'state> {
     /// Native graph that established exact references and artifact integrity.
-    state: &'state WyrdState,
+    pub(super) state: &'state WyrdState,
     /// Caller configuration normalized to exact persisted Card identities.
-    config: PythonLoadConfig,
+    pub(super) config: PythonLoadConfig,
 }
 
 /// Fully built Python holder maps waiting to be published by `PyWyrdState`.
 pub(super) struct HydratedPythonCards {
-    /// Generic envelope projections keyed by exact CardRef.
+    /// Generic envelope projections keyed by exact `CardRef`.
     pub(super) envelopes: BTreeMap<String, Py<PyCardEnvelope>>,
-    /// Eager Agent holders keyed by exact CardRef.
+    /// Eager Agent holders keyed by exact `CardRef`.
     pub(super) agents: BTreeMap<String, Py<PyAgentCard>>,
-    /// Eager Prompt holders keyed by exact CardRef.
+    /// Eager Prompt holders keyed by exact `CardRef`.
     pub(super) prompts: BTreeMap<String, Py<PromptCard>>,
-    /// Eager Model holders keyed by exact CardRef.
+    /// Eager Model holders keyed by exact `CardRef`.
     pub(super) models: BTreeMap<String, Py<ModelCard>>,
-    /// Eager Data holders keyed by exact CardRef.
+    /// Eager Data holders keyed by exact `CardRef`.
     pub(super) data: BTreeMap<String, Py<DataCard>>,
 }
 
+/// Normalizes configuration and constructs every retained Python holder.
 impl<'state> PythonStateHydrator<'state> {
     /// Create one all-or-nothing holder construction workflow.
     pub(super) fn new(state: &'state WyrdState, config: PythonLoadConfig) -> Self {
@@ -120,7 +121,7 @@ impl<'state> PythonStateHydrator<'state> {
                     "executable model has no artifact manifest",
                 ));
             };
-            match self.config.trusted_artifact_hashes_by_ref.get(key) {
+            match self.config.trusted_artifact_hashes.get(key) {
                 Some(expected) if expected == &actual => {}
                 Some(_) => {
                     return Err(runtime_hydration_error(

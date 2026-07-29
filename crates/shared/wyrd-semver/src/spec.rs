@@ -53,14 +53,17 @@ impl VersionSpec {
         if let Ok(block) = VersionBlock::parse(value) {
             return Ok(Self::Pin(block));
         }
-        let range = VersionRange::parse_loose(value)?;
-        if range.is_loose_partial() {
-            Ok(Self::Scope(range))
-        } else {
-            Err(VersionError::NotRepresentable {
-                reason: "register-path version must be a triple pin or bare partial",
-            })
+        let parts = value.split('.').collect::<Vec<_>>();
+        if (parts.len() == 1 || parts.len() == 2)
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return VersionRange::parse(value).map(Self::Scope);
         }
+        Err(VersionError::NotRepresentable {
+            reason: "register-path version must be a triple pin or bare partial",
+        })
     }
 
     /// Borrow the canonical wire-string for this spec.
@@ -244,7 +247,7 @@ mod tests {
     #[test]
     fn from_str_round_trips() {
         let spec: VersionSpec = "1.0".parse().unwrap();
-        assert_eq!(spec.to_string(), "~1.0");
+        assert_eq!(spec.to_string(), "1.0");
     }
 
     #[test]
@@ -254,14 +257,17 @@ mod tests {
         assert_eq!(json, "\"1.4.2\"");
     }
 
+    /// Preserve a registration scope exactly instead of converting it to a range.
     #[test]
-    fn serialize_scope_emits_normalized_form() {
+    fn serialize_scope_preserves_registerable_form() {
         let spec = VersionSpec::parse("1.0").unwrap();
         let json = serde_json::to_string(&spec).unwrap();
-        // Scope normalizes "1.0" → "~1.0" inside VersionRange; that's the
-        // wire form we round-trip. Round-trip stability matters more than
-        // preserving the original input.
-        assert_eq!(json, "\"~1.0\"");
+        assert_eq!(json, "\"1.0\"");
+        assert_eq!(
+            serde_json::from_str::<VersionSpec>(&json).unwrap(),
+            spec,
+            "serialized registration scopes must deserialize on the server"
+        );
     }
 
     #[test]

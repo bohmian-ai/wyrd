@@ -1,9 +1,11 @@
 """Offline holder hydration and loader-configuration contracts."""
 
 import gc
+import weakref
 from collections import UserDict
 from pathlib import Path
 
+import joblib
 import pytest
 import wyrd
 from wyrd.cards import DataLoadArgs, ModelLoadArgs
@@ -15,6 +17,7 @@ from .support import (
     TinyModelInterface,
     build_builtin_model_bundle,
     build_complete_bundle,
+    trusted_artifact_hash,
 )
 
 
@@ -67,9 +70,21 @@ def test_agentcard_resolves_registered_prompt(tmp_path: Path) -> None:
     assert state.agent("agent_triage").prompt.model == "gpt-4o"
 
 
-def test_builtin_model_loads_from_bundle_artifact_directory(tmp_path: Path) -> None:
+def test_builtin_model_loads_from_bundle_artifact_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Joblib-backed built-ins require externally supplied exact manifest trust."""
     bundle = build_builtin_model_bundle(tmp_path)
+    original_load = joblib.load
+    load_calls = 0
+
+    def tracking_load(*args, **kwargs):
+        """Count executable deserialization without changing joblib behavior."""
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(joblib, "load", tracking_load)
     with pytest.raises(wyrd.WyrdError) as caught:
         WyrdState.from_path(
             bundle,
@@ -91,6 +106,47 @@ def test_builtin_model_loads_from_bundle_artifact_directory(tmp_path: Path) -> N
     assert wrong_hash.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
     assert wrong_hash.value.details["stage"] == "artifact_trust"
     assert wrong_hash.value.details["reason"] == "trusted artifact manifest hash does not match"
+    assert load_calls == 0
+
+    state = WyrdState.from_path(
+        bundle,
+        interfaces={"backup": TinyModelInterface(), "training_data": TinyDataInterface()},
+        trusted_artifact_hashes={"model": trusted_artifact_hash(bundle, "model")},
+    )
+    prediction = state.model("model").model.predict([[0.0]])
+    assert prediction.shape == (1,)
+    assert load_calls == 1
+
+
+def test_builtin_override_is_rejected_before_artifact_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A contract-changing override cannot reach executable deserialization."""
+    bundle = build_builtin_model_bundle(tmp_path)
+    load_calls = 0
+
+    def forbidden_load(*args, **kwargs):
+        """Record an invalid executable load attempt."""
+        del args, kwargs
+        nonlocal load_calls
+        load_calls += 1
+        raise AssertionError("joblib.load must not run")
+
+    monkeypatch.setattr(joblib, "load", forbidden_load)
+    with pytest.raises(wyrd.WyrdError) as caught:
+        WyrdState.from_path(
+            bundle,
+            interfaces={
+                "model": TinyModelInterface(),
+                "backup": TinyModelInterface(),
+                "training_data": TinyDataInterface(),
+            },
+            trusted_artifact_hashes={"model": trusted_artifact_hash(bundle, "model")},
+        )
+    assert caught.value.code == "WYRD_SDK_400_RUNTIME_HYDRATION_FAILED"
+    assert caught.value.details["alias"] == "model"
+    assert caught.value.details["stage"] == "interface"
+    assert load_calls == 0
 
 
 def test_custom_model_exposes_model_and_preprocessor(tmp_path: Path) -> None:
@@ -163,6 +219,28 @@ def test_hydrated_objects_survive_gc(tmp_path: Path) -> None:
     model = state.model("model")
     gc.collect()
     assert model.model is not None
+
+
+def test_state_interface_cycle_is_collected(tmp_path: Path) -> None:
+    """State and retained interface cycles release both Python objects."""
+    model = TinyModelInterface()
+    interfaces = {
+        "model": model,
+        "backup": TinyModelInterface(),
+        "training_data": TinyDataInterface(),
+    }
+    state = WyrdState.from_path(build_complete_bundle(tmp_path), interfaces=interfaces)
+    model.state = state
+    state_ref = weakref.ref(state)
+    interface_ref = weakref.ref(model)
+
+    del state
+    del model
+    del interfaces
+    gc.collect()
+
+    assert state_ref() is None
+    assert interface_ref() is None
 
 
 def test_missing_custom_interface_names_alias_and_card_ref(tmp_path: Path) -> None:
@@ -288,6 +366,41 @@ def test_interface_load_failure_maps_to_runtime_hydration_error(tmp_path: Path) 
     assert caught.value.details["card_ref"]["name"] == "model"
     assert caught.value.details["stage"] == "artifact_load"
     assert caught.value.details["reason"] == "model artifact load failed"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "cannot load" in str(caught.value.__cause__)
+
+
+def test_late_loader_failure_publishes_no_state(tmp_path: Path) -> None:
+    """All Model loaders run before a later Data failure aborts publication."""
+
+    class FailingData(TinyDataInterface):
+        """Test-only Data interface that fails after Model hydration."""
+
+        def load(self, path: Path, load_kwargs=None) -> None:
+            """Raise at the final runtime-relevant holder stage."""
+            del path, load_kwargs
+            raise RuntimeError("late data failure")
+
+    model = TinyModelInterface()
+    backup = TinyModelInterface()
+    state = None
+    with pytest.raises(wyrd.WyrdError) as caught:
+        state = WyrdState.from_path(
+            build_complete_bundle(tmp_path),
+            interfaces={
+                "model": model,
+                "backup": backup,
+                "training_data": FailingData(),
+            },
+        )
+
+    assert state is None
+    assert model.loaded_path is not None
+    assert backup.loaded_path is not None
+    assert caught.value.details["alias"] == "training_data"
+    assert caught.value.details["stage"] == "artifact_load"
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert "late data failure" in str(caught.value.__cause__)
 
 
 def test_from_path_does_not_read_registry_configuration(

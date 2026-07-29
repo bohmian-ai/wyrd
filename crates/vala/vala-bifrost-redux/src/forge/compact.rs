@@ -35,6 +35,7 @@ use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin, plan_incremental_
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest};
+use super::right_size::ForgeRightSizePolicy;
 use crate::catalog::TenantTableBinding;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
@@ -346,10 +347,10 @@ impl Forge {
     ///
     /// Returns catalog or invalid-property errors when the table does not
     /// provide a target representable as `u64`.
-    async fn table_target_file_size_bytes(
+    async fn table_right_size_policy(
         &self,
         binding: &TenantTableBinding,
-    ) -> Result<u64, ForgeError> {
+    ) -> Result<ForgeRightSizePolicy, ForgeError> {
         let table = self.load_table(&binding.table_ident()).await?;
         let target = u64::try_from(
             table
@@ -366,7 +367,12 @@ impl Forge {
                 detail: "write.target-file-size-bytes must be positive".to_owned(),
             });
         }
-        Ok(target)
+        ForgeRightSizePolicy::new(
+            target,
+            table.metadata().current_schema_id(),
+            table.metadata().default_partition_spec_id(),
+            table.metadata().default_sort_order_id(),
+        )
     }
 
     /// Reconcile prepared compactions before admitting new table work.
@@ -404,17 +410,10 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_candidate_groups(table_key).await?;
-        let target_file_size_bytes = self.table_target_file_size_bytes(binding).await?;
+        let right_size_policy = self.table_right_size_policy(binding).await?;
         let mut budget = ForgeTickBudget::default();
-        self.compact_candidate_rows(
-            lease,
-            binding,
-            rows,
-            target_file_size_bytes,
-            &mut budget,
-            stop,
-        )
-        .await
+        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, &mut budget, stop)
+            .await
     }
 
     /// Query and compact one exact durable day after an advisory hint.
@@ -431,8 +430,8 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_targeted_candidate_group(key).await?;
-        let target_file_size_bytes = self.table_target_file_size_bytes(binding).await?;
-        self.compact_candidate_rows(lease, binding, rows, target_file_size_bytes, budget, stop)
+        let right_size_policy = self.table_right_size_policy(binding).await?;
+        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, budget, stop)
             .await
     }
 }
@@ -449,7 +448,7 @@ impl Forge {
         lease: &mut ForgeLease,
         binding: &TenantTableBinding,
         rows: Vec<CandidateRow>,
-        target_file_size_bytes: u64,
+        right_size_policy: &ForgeRightSizePolicy,
         budget: &mut ForgeTickBudget,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
@@ -458,7 +457,7 @@ impl Forge {
             outcome.groups_seen += 1;
             let plan = plan_incremental_bins(
                 row.files,
-                target_file_size_bytes,
+                right_size_policy.target_file_size_bytes(),
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
                 Utc::now().date_naive(),
@@ -490,7 +489,7 @@ impl Forge {
                     break 'groups;
                 }
                 let stats = self
-                    .compact_bin(lease, &row.key, binding, &bin, target_file_size_bytes, stop)
+                    .compact_bin(lease, &row.key, binding, &bin, right_size_policy, stop)
                     .await?;
                 outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
                 outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
@@ -756,7 +755,7 @@ impl Forge {
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
         bin: &RewriteBin,
-        target_file_size_bytes: u64,
+        right_size_policy: &ForgeRightSizePolicy,
         stop: &CancellationToken,
     ) -> Result<CompactStats, ForgeError> {
         let operation_id = operation_id(key, bin);
@@ -778,7 +777,7 @@ impl Forge {
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
-                    target_file_size_bytes,
+                    target_file_size_bytes: right_size_policy.target_file_size_bytes(),
                 },
                 stop,
                 lease,

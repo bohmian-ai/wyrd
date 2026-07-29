@@ -327,6 +327,18 @@ impl BifrostCatalog {
         Ok(table_uid)
     }
 
+    /// Verify that a registered table still carries Bifrost's complete physical recipe.
+    ///
+    /// Registration and reconciliation call this before accepting existing
+    /// physical state, preventing a control-plane row from silently pointing
+    /// at a table with a different location, schema, day partition, or Forge
+    /// sort recipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns a metadata mismatch when the location, schema, partition, or
+    /// sort recipe diverges, or an Iceberg error when its schema cannot be
+    /// converted for shape validation.
     fn validate_physical_table(
         &self,
         table: &iceberg::table::Table,

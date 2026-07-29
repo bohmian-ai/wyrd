@@ -5,8 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::array::{
+    FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use async_trait::async_trait;
 use iceberg::table::Table;
 use iceberg::{Catalog, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent};
@@ -15,13 +17,14 @@ use opendal::{
     Buffer, Entry, Error as ObjectStoreError, ErrorKind as ObjectStoreErrorKind, Metadata, Operator,
 };
 use parquet::arrow::ArrowWriter;
-use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding, build_partition_spec};
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef, TenantTableBinding};
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::StagingFilePublisher;
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::schema::with_managed_columns;
 use wyrd_spec::DataTenantId;
 
 use super::super::WyrdTestServer;
@@ -681,15 +684,11 @@ impl ForgeFixture {
         rows: usize,
     ) {
         assert!(rows > 0, "Forge fixture files must contain rows");
-        let schema = ArrowSchema::new(vec![
-            Field::new("value", DataType::Int64, false),
-            Field::new(
-                "wyrd_event_time",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-            Field::new("data_tenant_id", DataType::Utf8, false),
-        ]);
+        let schema = ArrowSchema::new(with_managed_columns(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
         let base = partition_day
             .and_hms_opt(12, 0, 0)
             .expect("Forge fixture timestamp")
@@ -706,11 +705,30 @@ impl ForgeFixture {
             .map(|offset| base + i64::try_from(offset).expect("row offset") * 1_000)
             .collect::<Vec<_>>();
         let tenants = vec![self.tenant.to_string(); rows];
+        let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(rows, 16);
+        for _ in 0..rows {
+            batch_ids
+                .append_value([0_u8; 16])
+                .expect("fixed batch identifier");
+        }
         let batch = RecordBatch::try_new(
             Arc::new(schema.clone()),
             vec![
                 Arc::new(Int64Array::from(values)),
+                Arc::new(StringArray::from(vec![None::<&str>; rows])),
+                Arc::new(StringArray::from(vec![None::<&str>; rows])),
+                Arc::new(StringArray::from(vec![None::<&str>; rows])),
+                Arc::new(StringArray::from(vec!["request"; rows])),
                 Arc::new(TimestampMicrosecondArray::from(times).with_timezone("UTC")),
+                Arc::new(
+                    TimestampMicrosecondArray::from(
+                        (0..rows)
+                            .map(|offset| base + i64::try_from(offset).expect("row offset") * 1_000)
+                            .collect::<Vec<_>>(),
+                    )
+                    .with_timezone("UTC"),
+                ),
+                Arc::new(batch_ids.finish()),
                 Arc::new(StringArray::from(tenants)),
             ],
         )
@@ -878,54 +896,37 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
         .forge()
         .cloned()
         .expect("production server has Forge");
-    let catalog = server
+    let bifrost_catalog = server
         .state()
         .bifrost_redux
         .as_ref()
-        .expect("Bifrost Redux")
-        .iceberg_catalog();
+        .expect("Bifrost Redux");
     let staging = Arc::new(server.state().storage.operator().clone());
     let binding =
         TenantTableBinding::resolve((tenant, TableRef::new(BifrostNamespace::Bifrost, table_name)))
             .expect("Forge fixture table binding");
-    let mut fields = vec![
-        Field::new("value", DataType::Int64, false),
-        Field::new(
-            "wyrd_event_time",
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-            false,
-        ),
-        Field::new("data_tenant_id", DataType::Utf8, false),
-    ];
+    let mut fields = vec![Field::new("value", DataType::Int64, false)];
     if schema_variant {
         fields.push(Field::new("schema_variant", DataType::Int64, false));
     }
-    let schema = ArrowSchema::new(fields);
-    let iceberg_schema =
-        iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(&schema).expect("Iceberg schema");
-    let spec = build_partition_spec(&iceberg_schema, &binding.partition_columns())
-        .expect("Forge fixture partition spec");
-    let warehouse =
-        vala_bifrost::catalog::storage::warehouse_uri(server.state().storage.backend_config());
-    if let Err(error) = catalog
-        .create_namespace(binding.physical_namespace(), HashMap::new())
+    bifrost_catalog
+        .create_table(CreateTableRequest {
+            table: binding.table_ref.clone(),
+            user_fields: fields,
+            tenant,
+            audit: None,
+        })
         .await
-        && error.kind() != iceberg::ErrorKind::NamespaceAlreadyExists
-    {
-        panic!("Forge fixture namespace: {error}");
-    }
-    catalog
-        .create_table(
-            binding.physical_namespace(),
-            TableCreation::builder()
-                .name(binding.table_name.clone())
-                .location(format!("{warehouse}/{}", binding.object_prefix))
-                .schema(iceberg_schema)
-                .partition_spec(spec)
-                .build(),
-        )
-        .await
-        .expect("Forge fixture table");
+        .expect("production Forge fixture table");
+    let catalog = bifrost_catalog.iceberg_catalog();
+    let schema = ArrowSchema::new(with_managed_columns(if schema_variant {
+        vec![
+            Field::new("value", DataType::Int64, false),
+            Field::new("schema_variant", DataType::Int64, false),
+        ]
+    } else {
+        vec![Field::new("value", DataType::Int64, false)]
+    }));
 
     let mut conn = server
         .state()
@@ -946,6 +947,23 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
             let mut columns = vec![
                 Arc::new(Int64Array::from(vec![file_number, file_number + 10]))
                     as Arc<dyn arrow::array::Array>,
+            ];
+            if schema_variant {
+                columns
+                    .push(Arc::new(Int64Array::from(vec![1_i64, 1_i64]))
+                        as Arc<dyn arrow::array::Array>);
+            }
+            let mut batch_ids = FixedSizeBinaryBuilder::with_capacity(2, 16);
+            for _ in 0..2 {
+                batch_ids
+                    .append_value([0_u8; 16])
+                    .expect("fixed batch identifier");
+            }
+            columns.extend([
+                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec![None::<&str>; 2])) as Arc<dyn arrow::array::Array>,
+                Arc::new(StringArray::from(vec!["request"; 2])) as Arc<dyn arrow::array::Array>,
                 Arc::new(
                     TimestampMicrosecondArray::from(vec![
                         base + file_number * 1_000_000,
@@ -953,14 +971,17 @@ pub async fn seed_forge_group_for_tenant_with_schema_and_days(
                     ])
                     .with_timezone("UTC"),
                 ) as Arc<dyn arrow::array::Array>,
+                Arc::new(
+                    TimestampMicrosecondArray::from(vec![
+                        base + file_number * 1_000_000,
+                        base + file_number * 1_000_000 + 1_000,
+                    ])
+                    .with_timezone("UTC"),
+                ) as Arc<dyn arrow::array::Array>,
+                Arc::new(batch_ids.finish()) as Arc<dyn arrow::array::Array>,
                 Arc::new(StringArray::from(vec![tenant.to_string(); 2]))
                     as Arc<dyn arrow::array::Array>,
-            ];
-            if schema_variant {
-                columns
-                    .push(Arc::new(Int64Array::from(vec![1_i64, 1_i64]))
-                        as Arc<dyn arrow::array::Array>);
-            }
+            ]);
             let batch = RecordBatch::try_new(Arc::new(schema.clone()), columns)
                 .expect("Forge fixture batch");
             let mut bytes = Vec::new();

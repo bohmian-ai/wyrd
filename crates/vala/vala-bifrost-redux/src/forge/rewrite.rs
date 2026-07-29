@@ -99,6 +99,8 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) table_location: &'a str,
     /// Destination partition-spec identifier.
     pub(crate) partition_spec_id: i32,
+    /// Destination physical sort-order identifier recorded on every output.
+    pub(crate) sort_order_id: i32,
     /// Output target resolved from this operation's Iceberg table metadata.
     pub(crate) target_file_size_bytes: u64,
 }
@@ -361,6 +363,8 @@ struct OutputMetadataRequest {
     partition_day: chrono::NaiveDate,
     /// Iceberg partition-spec identifier for the destination table.
     partition_spec_id: i32,
+    /// Iceberg sort-order identifier for the destination table.
+    sort_order_id: i32,
 }
 
 /// Bytes and Iceberg metadata derived together from one completed Parquet output.
@@ -391,6 +395,7 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         table_path,
         partition_day,
         partition_spec_id,
+        sort_order_id,
     } = request;
     let bytes = writer.into_inner().map_err(|error| ForgeError::Parquet {
         detail: error.to_string(),
@@ -420,7 +425,8 @@ fn finalize_output_metadata(request: OutputMetadataRequest) -> Result<FinalizedO
         partition_day.num_days_from_ce() - 719_163,
     ))]);
     file.partition(partition)
-        .partition_spec_id(partition_spec_id);
+        .partition_spec_id(partition_spec_id)
+        .sort_order_id(sort_order_id);
     let file = file.build().map_err(|error| ForgeError::Invariant {
         detail: format!("Forge output metadata is incomplete: {error}"),
     })?;
@@ -917,6 +923,7 @@ impl ForgeRewritePipeline {
         );
         let partition_day = request.partition_day;
         let partition_spec_id = request.partition_spec_id;
+        let sort_order_id = request.sort_order_id;
         let iceberg_schema = Arc::clone(&request.iceberg_schema);
         let permit = tokio::select! {
             () = stop.cancelled() => return Err(ForgeError::Shutdown),
@@ -934,6 +941,7 @@ impl ForgeRewritePipeline {
                 table_path,
                 partition_day,
                 partition_spec_id,
+                sort_order_id,
             })
         });
         tokio::pin!(join);

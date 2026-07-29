@@ -845,6 +845,10 @@ impl Forge {
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
+                    sort_order_id: i32::try_from(table.metadata().default_sort_order_id())
+                        .map_err(|_| ForgeError::InvalidConfig {
+                            detail: "Iceberg default sort-order ID exceeds i32".to_owned(),
+                        })?,
                     target_file_size_bytes: right_size_policy.target_file_size_bytes(),
                 },
                 stop,

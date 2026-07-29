@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 import wyrd
-from wyrd.cards import AgentCard, Cards, Prompt, PromptReference
+from wyrd.cards import AgentCard, Cards, Prompt, PromptCard, PromptReference, VersionBump
 
 
 def test_agent_cards_are_not_registerable() -> None:
@@ -26,3 +26,15 @@ def test_registry_stub_documents_patch_default_and_exact_delete() -> None:
     assert "RegisterableCard: TypeAlias = DataCard | ModelCard | PromptCard" in text
     assert "VersionBump.Patch" in text
     assert "name`, and the exact `version`" in text
+
+
+def test_exact_pin_and_explicit_bump_are_rejected_before_network() -> None:
+    """An exact authored pin cannot be combined with a caller bump intent."""
+    card = PromptCard(
+        Prompt.openai_chat("gpt-4o", messages="hello"),
+        space="unit",
+        name="prompt",
+        version="1.2.3",
+    )
+    with pytest.raises(wyrd.WyrdError, match="exact metadata.version pin"):
+        Cards().prompt.register(card, version_bump=VersionBump.Minor)

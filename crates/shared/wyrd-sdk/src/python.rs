@@ -12,7 +12,7 @@ use wyrd_cards::card_ref::{CardRefPy, Kind};
 use wyrd_cards::{agent::PyAgentCard, data::DataCard, model::ModelCard, prompt::PromptCard};
 use wyrd_interfaces::error::{CardPyResult, WyrdPyError};
 use wyrd_registry::{CardSelector, Cards};
-use wyrd_semver::{VersionBlock, VersionBump};
+use wyrd_semver::{VersionBlock, VersionBump, VersionSpec};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::envelope::{Card, CardKind, Metadata};
 use wyrd_spec::error::WyrdError;
@@ -2247,6 +2247,15 @@ struct PythonCardEnvelope {
     spec: serde_json::Value,
 }
 
+/// Save one Python Card holder into a native registration input and await the
+/// server receipt before mutating the caller-owned identity.
+///
+/// Exact metadata pins are mutually exclusive with an explicitly supplied
+/// version bump; omitted bumps use the server-compatible Patch default.
+///
+/// # Errors
+/// Returns holder validation, local save, manifest, transport, or server
+/// completion errors. The holder is stamped only after a successful receipt.
 fn register_python_card(
     py: Python<'_>,
     registry: &Cards,
@@ -2265,11 +2274,12 @@ fn register_python_card(
             kind.wire_name()
         )));
     }
+    let bump_supplied = version_bump.is_some();
     let bump = version_bump
         .map(parse_version_bump)
         .transpose()?
         .unwrap_or(VersionBump::Patch);
-    let prepared = prepare_python_card(py, card, save_args, &kind, bump)?;
+    let prepared = prepare_python_card(py, card, save_args, &kind, bump, bump_supplied)?;
     let receipt = py
         .detach(|| {
             let _keep_alive = &prepared.tempdir;
@@ -2281,12 +2291,19 @@ fn register_python_card(
     Ok(receipt)
 }
 
+/// Build a native registration input while retaining its temporary artifact
+/// workspace for the duration of the detached upload.
+///
+/// # Errors
+/// Returns Python extraction, local save, envelope validation, version-intent,
+/// serialization, or manifest errors. No remote operation is started here.
 fn prepare_python_card(
     py: Python<'_>,
     card: &Bound<'_, PyAny>,
     save_args: Option<&Bound<'_, PyAny>>,
     kind: &CardKind,
     bump: VersionBump,
+    bump_supplied: bool,
 ) -> CardPyResult<PreparedPythonCard> {
     let tempdir = tempdir().map_err(|error| WyrdPyError::Io(error.to_string()))?;
     let root = tempdir.path().to_path_buf();
@@ -2336,6 +2353,17 @@ fn prepare_python_card(
     if envelope.api_version.as_str() != ApiVersion::V1 || &envelope.kind != kind {
         return Err(WyrdPyError::validation(
             "card envelope kind or apiVersion does not match the native holder",
+        ));
+    }
+    if bump_supplied
+        && envelope
+            .metadata
+            .version
+            .as_ref()
+            .is_some_and(VersionSpec::is_pin)
+    {
+        return Err(WyrdPyError::validation(
+            "version_bump cannot be combined with an exact metadata.version pin; use a scope or omit version",
         ));
     }
     envelope.metadata.uid = None;

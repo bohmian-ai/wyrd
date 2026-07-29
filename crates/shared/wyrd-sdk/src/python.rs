@@ -1532,7 +1532,7 @@ impl PyCards {
     ///
     /// # Arguments
     /// * `card` - Native Wyrd card holder to register.
-    /// * `version_bump` - Version intent. Defaults to `VersionBump.Minor`.
+    /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     ///   Use `VersionBump.pre`, `build`, or `pre_build` for version metadata.
     /// * `save_args` - `DataSaveArgs` or `ModelSaveArgs` forwarded to the
     ///   corresponding artifact interface. Prompt cards do not accept it.
@@ -1701,7 +1701,7 @@ impl PyDataCardRegistry {
     ///
     /// # Arguments
     /// * `card` - `DataCard` to register.
-    /// * `version_bump` - Version intent. Defaults to `VersionBump.Minor`.
+    /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     /// * `save_args` - Optional `DataSaveArgs` for the data interface.
     ///
     /// # Returns
@@ -1892,7 +1892,7 @@ impl PyModelCardRegistry {
     ///
     /// # Arguments
     /// * `card` - `ModelCard` to register.
-    /// * `version_bump` - Version intent. Defaults to `VersionBump.Minor`.
+    /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     /// * `save_args` - Optional `ModelSaveArgs` for the model interface.
     ///
     /// # Returns
@@ -2082,7 +2082,7 @@ impl PyPromptCardRegistry {
     ///
     /// # Arguments
     /// * `card` - `PromptCard` to register.
-    /// * `version_bump` - Version intent. Defaults to `VersionBump.Minor`.
+    /// * `version_bump` - Version intent. Defaults to server-compatible `VersionBump.Patch`.
     ///
     /// # Returns
     /// A receipt for the completed registration.
@@ -2260,7 +2260,7 @@ fn register_python_card(
     let bump = version_bump
         .map(parse_version_bump)
         .transpose()?
-        .unwrap_or(VersionBump::Minor);
+        .unwrap_or(VersionBump::Patch);
     let prepared = prepare_python_card(py, card, save_args, &kind, bump)?;
     let receipt = py
         .detach(|| {

@@ -17,8 +17,8 @@ mod composition;
 mod root;
 mod topo;
 
-pub use canonical::canonical_order;
-pub use composition::validate_composition;
+pub use canonical::{canonical_order, relationships_from_spec};
+pub use composition::{publication_validation_errors, validate_composition};
 pub use root::{pick_root, root_last};
 pub use topo::{GraphError, topo_sort};
 

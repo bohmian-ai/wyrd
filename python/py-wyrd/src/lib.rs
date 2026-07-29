@@ -3,8 +3,6 @@
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-mod cli;
-
 /// Native extension entry point mounted as `wyrd._wyrd`.
 ///
 /// The aggregator creates each public submodule and delegates registration to
@@ -19,7 +17,7 @@ mod cli;
 #[pymodule]
 fn _wyrd(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     wyrd_utils::py::register_wyrd_error_exception(m)?;
-    cli::register(m)?;
+    wyrd_cli::python::register(m)?;
 
     let agent = PyModule::new(py, "agent")?;
     skald_agent::python_register(&agent)?;

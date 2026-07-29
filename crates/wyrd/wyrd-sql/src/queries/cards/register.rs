@@ -7,11 +7,11 @@ use sqlx::QueryBuilder;
 use uuid::Uuid;
 use wyrd_runtime::principal::PrincipalId;
 use wyrd_semver::{VersionBlock, VersionSpec};
-use wyrd_spec::envelope::{Card, CardKind, SpecCanonicalizationError};
+use wyrd_spec::envelope::{Card, CardKind};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::registry::{ArtifactManifestEntry, CardSubmission, RegistrationOperationId};
+use wyrd_spec::registry::{CardSubmission, RegistrationOperationId};
 
 use crate::row_types::cards::CardStatus;
 use crate::tenant_conn::TenantConn;
@@ -119,19 +119,6 @@ pub struct RegisteredCardRow {
     pub principal_id: PrincipalId,
     /// Registration operation identifier.
     pub operation_id: RegistrationOperationId,
-}
-
-/// Compute the canonical BLAKE3/JCS hash for a submitted artifact manifest.
-pub fn artifact_manifest_hash(
-    artifacts: &[ArtifactManifestEntry],
-) -> Result<Option<String>, WyrdError> {
-    if artifacts.is_empty() {
-        return Ok(None);
-    }
-    let bytes = serde_jcs::to_vec(artifacts).map_err(|error| {
-        WyrdError::from_spec_canonicalization(SpecCanonicalizationError::Serialize(error))
-    })?;
-    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
 }
 
 /// Compute the canonical request hash from ordered submissions and manifest hashes.

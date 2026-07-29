@@ -5,7 +5,6 @@ use clap::{Parser, Subcommand};
 use crate::audit::AuditCommand;
 use crate::auth::AuthCommand;
 use crate::card::{ApplyArgs, DeleteArgs, GetArgs, LatestArgs, ListArgs, LoadArgs, PlanArgs};
-use crate::dev::DevCommand;
 use crate::eval::run::EvalCommand;
 use crate::principal::PrincipalCommand;
 
@@ -16,6 +15,34 @@ pub struct Cli {
     /// Selected subcommand.
     #[command(subcommand)]
     pub command: Command,
+}
+
+impl Cli {
+    /// Dispatch the selected client command through its owning CLI capability.
+    ///
+    /// The method consumes the parser result so each subcommand receives its
+    /// owned arguments. It is async because command handlers perform client
+    /// HTTP and local runtime IO.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::WyrdCliError`] when parsing-compatible command
+    /// inputs fail local validation or a client/server operation fails.
+    pub async fn dispatch(self) -> Result<std::process::ExitCode, crate::error::WyrdCliError> {
+        match self.command {
+            Command::Plan(args) => crate::card::dispatch_plan(args).await,
+            Command::Apply(args) => crate::card::dispatch_apply(args).await,
+            Command::Get(args) => crate::card::dispatch_get(args).await,
+            Command::Latest(args) => crate::card::dispatch_latest(args).await,
+            Command::List(args) => crate::card::dispatch_list(args).await,
+            Command::Load(args) => crate::card::dispatch_load(args).await,
+            Command::Delete(args) => crate::card::dispatch_delete(args).await,
+            Command::Audit(command) => crate::audit::dispatch(command).await,
+            Command::Auth(command) => crate::auth::dispatch(command).await,
+            Command::Eval(command) => crate::eval::run::dispatch(command).await,
+            Command::Principal(command) => crate::principal::dispatch(command).await,
+        }
+    }
 }
 
 /// Top-level CLI verbs.
@@ -43,9 +70,6 @@ pub enum Command {
     /// Authenticate with a Wyrd server (login, refresh, issue-key).
     #[command(subcommand)]
     Auth(AuthCommand),
-    /// Developer utilities (bootstrap local dev environment).
-    #[command(subcommand)]
-    Dev(DevCommand),
     /// Run, manage, and compare evaluations.
     #[command(subcommand)]
     Eval(EvalCommand),

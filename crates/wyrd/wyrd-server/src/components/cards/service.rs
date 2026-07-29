@@ -18,7 +18,7 @@ use wyrd_spec::envelope::{Card, CardKind, Metadata, Spec, Status};
 use wyrd_spec::error::{WyrdError, storage::WyrdStorageError};
 use wyrd_spec::graph::{
     GraphError, RootPick, TopoOrder, build, canonical_order, graph_ready_submissions, pick_root,
-    topo_sort, validate_composition,
+    publication_validation_errors, relationships_from_spec, topo_sort, validate_composition,
 };
 use wyrd_spec::ids::IdempotencyKey;
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
@@ -28,6 +28,7 @@ use wyrd_spec::registry::{
     CardSummary, CardUploadEntry, CardUploadPlan, CreateCardRequest, CreateCardResponse,
     DeleteCardResponse, GetCardResponse, ListCardsRequest, ListCardsResponse, ListVersionsResponse,
     RegistrationOperationId, RegistrationOutcomeKind, RegistrationReplaySeed, RelativeArtifactPath,
+    canonical_artifact_manifest_hash,
 };
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::storage::{UploadId, UploadInitRequest, UploadPlan};
@@ -39,8 +40,8 @@ use wyrd_sql::queries::cards::{
     CardReconcileClaim, CardRegistrationOperationRow, ListCursor, NewCardRow,
     NewRegistrationOperation, RECONCILE_KIND_BLOB, RECONCILE_KIND_CLEANUP,
     RECONCILE_KIND_FINALIZATION, RECONCILE_KIND_REGISTRATION, Resolution, SubmittedCardIdentity,
-    activate_card, artifact_manifest_hash, commit_registration_operation, fail_card,
-    find_card_by_ref, get_card_by_uid as sql_get_card_by_uid,
+    activate_card, commit_registration_operation, fail_card, find_card_by_ref,
+    get_card_by_uid as sql_get_card_by_uid,
     get_card_for_reconciliation as sql_get_card_for_reconciliation, get_latest_card_by_range,
     inbound_relationships, insert_artifact_manifest_rows, insert_card_row,
     insert_registration_operation, list_versions, lock_card_reconciliation_lease,
@@ -61,9 +62,7 @@ use wyrd_storage::tenant_path;
 
 use crate::audit::{append_on, audit_event, audit_event_unauthenticated, record_audit};
 use crate::components::auth::Caller;
-use crate::components::cards::mapping::{
-    existing_row_to_response, outcome_row_to_response, relationships_from_spec,
-};
+use crate::components::cards::mapping::{existing_row_to_response, outcome_row_to_response};
 use crate::components::cards::resolve::{
     ResolvedRefs, bind_card_references, resolve_card_references,
 };
@@ -384,14 +383,14 @@ pub async fn register_card(
     idempotency_key: &str,
     request: CreateCardRequest,
 ) -> Result<CreateCardResponse, WyrdError> {
-    validate_request(&request)?;
     let request_hash = hash_request(&request)?;
-    let (order, root) = plan_registration_graph(&request.submissions)?;
     if let Some((operation_id, seed)) =
         replay(state, caller, idempotency_key, &request_hash).await?
     {
         return initialize_uploads(state, caller, operation_id, seed, idempotency_key).await;
     }
+    validate_request(&request)?;
+    let (order, root) = plan_registration_graph(&request.submissions)?;
     let external_refs = resolve_external(state, caller, &request.submissions).await?;
     let plan = plan_registration(request, request_hash, external_refs, order, root);
     let (operation_id, seed) = write_registration(state, caller, idempotency_key, plan).await?;
@@ -924,7 +923,7 @@ async fn persist_node(
         .spec
         .canonical_hash()
         .map_err(WyrdError::from_spec_canonicalization)?;
-    let artifact_hash = artifact_manifest_hash(&submission.artifacts)?;
+    let artifact_hash = canonical_artifact_manifest_hash(&submission.artifacts)?;
     let space = card
         .metadata
         .space
@@ -1080,7 +1079,40 @@ fn validate_request(request: &CreateCardRequest) -> Result<(), WyrdError> {
                 submission.api_version
             )));
         }
-        let computed = artifact_manifest_hash(&submission.artifacts)?;
+        let spec = Spec::from_kind_and_value(&submission.kind, submission.spec.clone())
+            .map_err(|error| WyrdError::registry_invalid_card_spec(error.to_string()))?;
+        match &spec {
+            Spec::Agent(agent) => {
+                if let Some(error) =
+                    publication_validation_errors(&agent.publishes_to, "spec.publishes_to")
+                        .into_iter()
+                        .next()
+                {
+                    return Err(error);
+                }
+            }
+            Spec::Service(service) => {
+                if let Some(error) =
+                    publication_validation_errors(&service.publishes_to, "spec.publishes_to")
+                        .into_iter()
+                        .next()
+                {
+                    return Err(error);
+                }
+                for (index, component) in service.components.iter().enumerate() {
+                    let field = format!("spec.components[{index}].publishes_to");
+                    if let Some(error) =
+                        publication_validation_errors(&component.publishes_to, &field)
+                            .into_iter()
+                            .next()
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let computed = canonical_artifact_manifest_hash(&submission.artifacts)?;
         if submission.metadata.artifact_hash.as_deref() != computed.as_deref()
             && submission.metadata.artifact_hash.is_some()
         {
@@ -1104,7 +1136,7 @@ fn hash_request(request: &CreateCardRequest) -> Result<String, WyrdError> {
         .collect::<Vec<_>>();
     let hashes = canonical
         .iter()
-        .map(|submission| artifact_manifest_hash(&submission.artifacts))
+        .map(|submission| canonical_artifact_manifest_hash(&submission.artifacts))
         .collect::<Result<Vec<_>, _>>()?;
     registration_request_hash(&canonical, &hashes)
 }

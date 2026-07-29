@@ -88,7 +88,8 @@ Locked cross-cutting decisions that any contributor must honor:
 - Current approved Python owner crates are `wyrd-interfaces`, `wyrd-cards`,
   `wyrd-utils`, `vala-sdk`, `wyrd-sdk`, `skald-observer`, `skald-prompt`,
   `skald-runtime`, `skald-agent`, `skald-tool`, `skald-workflow`, and
-  `wyrd-testing`. `wyrd-sdk` owns the `WyrdState` runtime handle (hydrated-tree
+  `wyrd-testing`, and `wyrd-cli` for its optional embedded CLI adapter.
+  `wyrd-sdk` owns the `WyrdState` runtime handle (hydrated-tree
   load, CardRef context, observation tying); its PyO3 surface lives behind an
   optional `python` feature, and `python/py-wyrd` stays a thin aggregator that
   registers the submodule without duplicating runtime logic.

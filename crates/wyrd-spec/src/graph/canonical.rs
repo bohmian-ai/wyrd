@@ -1,6 +1,71 @@
 //! Deterministic submission canonicalization.
 
+use std::collections::BTreeMap;
+
+use crate::envelope::{CardRelationship, Relationships, Spec};
+use crate::reference::scope_child_card_refs;
 use crate::registry::CardSubmission;
+
+/// Derive the canonical outbound relationship projection for a resolved Card spec.
+///
+/// The server calls this after it has bound every durable reference to a UID,
+/// and offline bundle readers use the same projector to reject altered
+/// relationship copies. Inbound relationships remain registry-owned and are
+/// intentionally absent from this immutable spec projection.
+#[must_use]
+pub fn relationships_from_spec(spec: &Spec) -> Relationships {
+    let mut refs = scope_child_card_refs(spec);
+    refs.sort_by_key(ToString::to_string);
+    refs.dedup();
+    let aliases = match spec {
+        Spec::Service(service) => service
+            .components
+            .iter()
+            .filter_map(|component| {
+                component
+                    .card_ref
+                    .as_card_ref()
+                    .map(|card_ref| (card_ref.to_string(), component.alias.clone()))
+            })
+            .fold(
+                BTreeMap::<String, Vec<String>>::new(),
+                |mut aliases, (card_ref, alias)| {
+                    aliases.entry(card_ref).or_default().push(alias);
+                    aliases
+                },
+            ),
+        _ => BTreeMap::new(),
+    };
+    let outbound = refs.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let outbound_refs = refs
+        .iter()
+        .flat_map(|card_ref| {
+            aliases.get(&card_ref.to_string()).map_or_else(
+                || {
+                    vec![CardRelationship {
+                        card_ref: card_ref.clone(),
+                        alias: None,
+                    }]
+                },
+                |aliases| {
+                    aliases
+                        .iter()
+                        .map(|alias| CardRelationship {
+                            card_ref: card_ref.clone(),
+                            alias: Some(alias.clone()),
+                        })
+                        .collect()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    Relationships {
+        outbound,
+        outbound_refs,
+        inbound: Vec::new(),
+        inbound_refs: Vec::new(),
+    }
+}
 
 /// Return submission indices sorted by `(kind, space, name, version)`.
 ///
@@ -51,11 +116,42 @@ pub fn canonical_order(submissions: &[CardSubmission]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical_order;
+    use super::{canonical_order, relationships_from_spec};
     use crate::api_version::ApiVersion;
-    use crate::envelope::{CardKind, Metadata};
+    use crate::envelope::{CardKind, Metadata, Spec};
     use crate::registry::CardSubmission;
     use serde_json::json;
+
+    /// Project resolved references into deterministic server-owned relationships.
+    #[test]
+    fn relationships_project_uid_bearing_refs() {
+        let spec = Spec::from_kind_and_value(
+            &CardKind::Agent,
+            json!({
+                "prompt": {
+                    "kind": "Prompt",
+                    "name": "prompt",
+                    "version": "1.0.0",
+                    "space": "default",
+                    "uid": "018f0000-0000-7000-8000-000000000001"
+                }
+            }),
+        )
+        .expect("agent reference fixture decodes");
+
+        let relationships = relationships_from_spec(&spec);
+
+        assert_eq!(
+            relationships.outbound,
+            vec!["default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"]
+        );
+        assert_eq!(relationships.outbound_refs.len(), 1);
+        assert_eq!(
+            relationships.outbound_refs[0].card_ref.to_string(),
+            "default/Prompt/prompt@1.0.0#018f0000-0000-7000-8000-000000000001"
+        );
+        assert!(relationships.inbound.is_empty());
+    }
 
     fn submission(kind: CardKind, space: &str, name: &str) -> CardSubmission {
         CardSubmission {

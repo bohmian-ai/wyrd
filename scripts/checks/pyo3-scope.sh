@@ -9,7 +9,7 @@
 #
 # WHAT IT CHECKS:
 #   - wyrd-spec: zero PyO3 references (no python feature allowed)
-#   - shared crates except wyrd-utils: zero PyO3 references
+#   - shared crates except approved Python owners: zero PyO3 references
 #   - Skald engine crates: PyO3 only in the explicitly allowlisted files
 #   - each approved Skald crate: python feature defined, PyO3 declared optional
 #   - wyrd-utils: python feature defined, PyO3 optional, helpers cfg-gated
@@ -90,6 +90,13 @@ fi
 
 if ! rg -q 'pyo3 = \{ workspace = true, optional = true \}' crates/shared/wyrd-sdk/Cargo.toml; then
   echo 'wyrd-sdk PyO3 dependency must remain optional'
+  exit 1
+fi
+
+if ! rg -q 'python = \[' crates/wyrd/wyrd-cli/Cargo.toml || \
+   ! rg -q 'dep:pyo3' crates/wyrd/wyrd-cli/Cargo.toml || \
+   ! rg -q 'pyo3 = \{ workspace = true, optional = true \}' crates/wyrd/wyrd-cli/Cargo.toml; then
+  echo 'wyrd-cli must gate its optional Python adapter behind its python feature'
   exit 1
 fi
 

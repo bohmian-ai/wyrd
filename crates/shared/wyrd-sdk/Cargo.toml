@@ -12,6 +12,13 @@ description = "Rust-owned Wyrd client SDK projections."
 default = []
 python = [
     "dep:pyo3",
+    "dep:secrecy",
+    "dep:tempfile",
+    "dep:wyrd-interfaces",
+    "dep:wyrd-loader",
+    "dep:wyrd-registry",
+    "dep:wyrd-runtime",
+    "dep:wyrd-utils",
     "wyrd-cards/python",
     "wyrd-utils/python",
 ]
@@ -22,22 +29,23 @@ pyo3 = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-secrecy = { workspace = true }
+secrecy = { workspace = true, optional = true }
 skald-spec = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
-tempfile = { workspace = true }
-wyrd-loader = { workspace = true }
+tempfile = { workspace = true, optional = true }
+wyrd-loader = { workspace = true, optional = true }
 wyrd-semver = { workspace = true }
-wyrd-interfaces = { workspace = true }
+wyrd-interfaces = { workspace = true, optional = true }
 wyrd-cards = { workspace = true }
-wyrd-registry = { workspace = true }
-wyrd-runtime = { workspace = true }
+wyrd-registry = { workspace = true, optional = true }
+wyrd-runtime = { workspace = true, optional = true }
 wyrd-spec = { workspace = true }
-wyrd-utils = { workspace = true }
+wyrd-utils = { workspace = true, optional = true }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
+tempfile = { workspace = true }
 wyrd-semver = { workspace = true }

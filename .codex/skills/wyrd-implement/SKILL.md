@@ -56,6 +56,24 @@ Before editing:
 Do not invent a new architecture until the current Wyrd boundary proves
 wrong for the user workflow.
 
+## Plan Completion Contract
+
+When invoked with an implementation plan, task contract, or plan-file path,
+the entire supplied artifact is the task objective unless the user explicitly
+limits the scope to named phases or tasks.
+
+Before editing, create a live completion ledger that covers every phase,
+required change, test, verification command, dependency, and final completion
+contract. Keep it current in working updates. Complete each phase in dependency
+order; do not treat a coherent phase, a compiling subset, or partial progress
+as delivery.
+
+Do not send a final response while any required ledger item remains open. The
+plan's final completion contract is the sole terminal condition. If an external
+blocker prevents completion, report the exact blocker, affected ledger items,
+and safe next action; otherwise continue from the first incomplete item. On
+resumption, reload the ledger and continue without silently narrowing scope.
+
 ### Mandatory reference gate
 
 Before any edit, identify the applicable files in the reference table below,

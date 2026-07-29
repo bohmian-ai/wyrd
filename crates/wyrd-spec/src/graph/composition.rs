@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 use super::{GraphError, RootPick, identity_key, submission_card_ref};
 use crate::envelope::{CardKind, Spec};
+use crate::error::WyrdError;
 use crate::reference::Ref;
 use crate::registry::CardSubmission;
 
@@ -84,6 +85,45 @@ pub fn validate_composition(
     Ok(())
 }
 
+/// Return every stable validation error for one `publishes_to` binding.
+///
+/// Publication targets are part of the shared Card contract, so loaders and
+/// server registration use this pure projection rather than maintaining
+/// independent kind and duplicate checks. Path and inline forms are resolved
+/// by their owning boundary; only resolved durable references participate.
+#[must_use]
+pub fn publication_validation_errors(publications: &[Ref], field: &str) -> Vec<WyrdError> {
+    let mut seen = BTreeSet::new();
+    let mut errors = Vec::new();
+    for publication in publications {
+        let Some(target) = publication.as_card_ref() else {
+            continue;
+        };
+        if !matches!(target.kind, CardKind::Eval | CardKind::Drift) {
+            errors.push(WyrdError::SpecInvalidPublishTargetKind {
+                message: format!(
+                    "{field} target {} has kind {}",
+                    target.name,
+                    target.kind.wire_name()
+                ),
+                details: serde_json::json!({
+                    "field": field,
+                    "target": target,
+                    "expected_kinds": ["Eval", "Drift"]
+                }),
+            });
+        }
+        let identity = target.to_string();
+        if !seen.insert(identity.clone()) {
+            errors.push(WyrdError::SpecDuplicatePublishTarget {
+                message: format!("duplicate {field} target {identity}"),
+                details: serde_json::json!({ "field": field, "target": target }),
+            });
+        }
+    }
+    errors
+}
+
 /// Return whether a Card kind participates beside a Service instead of inside it.
 fn is_peer_only_component(kind: &CardKind) -> bool {
     matches!(
@@ -135,11 +175,11 @@ mod tests {
     use serde_json::json;
     use wyrd_semver::{VersionBlock, VersionSpec};
 
-    use super::validate_composition;
+    use super::{publication_validation_errors, validate_composition};
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
     use crate::graph::{GraphError, RootPick};
-    use crate::reference::CardRef;
+    use crate::reference::{CardRef, Ref};
     use crate::registry::CardSubmission;
 
     /// Build a stable Card reference for composition fixtures.
@@ -291,5 +331,22 @@ mod tests {
         };
 
         validate_composition(&[eval], &root).expect("standalone Eval remains valid");
+    }
+
+    /// Return the shared duplicate-target error for every client boundary.
+    #[test]
+    fn publication_validation_rejects_duplicate_targets() {
+        let eval = card_ref(CardKind::Eval, "quality");
+
+        let errors = publication_validation_errors(
+            &[Ref::Ref(eval.clone()), Ref::Ref(eval)],
+            "spec.publishes_to",
+        );
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.code() == "WYRD_SPEC_400_DUPLICATE_PUBLISH_TARGET" })
+        );
     }
 }

@@ -1,9 +1,6 @@
 //! Projections from registry rows into composite registration responses.
 
-use std::collections::BTreeMap;
-
-use wyrd_spec::envelope::{CardRelationship, Relationships, Spec};
-use wyrd_spec::reference::{CardRef, scope_child_card_refs};
+use wyrd_spec::reference::CardRef;
 use wyrd_spec::registry::{CardLifecycleStatus, CardRegistrationOutcome, RegistrationOutcomeKind};
 use wyrd_sql::queries::cards::RegisteredCardRow;
 use wyrd_sql::row_types::cards::{CardStatus, ParsedCardRow};
@@ -55,61 +52,6 @@ pub fn existing_row_to_response(
     }
 }
 
-/// Project the normalized outbound Card references from a resolved spec.
-pub(crate) fn relationships_from_spec(spec: &Spec) -> Relationships {
-    let mut refs = scope_child_card_refs(spec);
-    refs.sort_by_key(ToString::to_string);
-    refs.dedup();
-    let aliases = match spec {
-        Spec::Service(service) => service
-            .components
-            .iter()
-            .filter_map(|component| {
-                component
-                    .card_ref
-                    .as_card_ref()
-                    .map(|card_ref| (card_ref.to_string(), component.alias.clone()))
-            })
-            .fold(
-                BTreeMap::<String, Vec<String>>::new(),
-                |mut aliases, (card_ref, alias)| {
-                    aliases.entry(card_ref).or_default().push(alias);
-                    aliases
-                },
-            ),
-        _ => BTreeMap::new(),
-    };
-    let outbound = refs.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let outbound_refs = refs
-        .iter()
-        .flat_map(|card_ref| {
-            aliases.get(&card_ref.to_string()).map_or_else(
-                || {
-                    vec![CardRelationship {
-                        card_ref: card_ref.clone(),
-                        alias: None,
-                    }]
-                },
-                |aliases| {
-                    aliases
-                        .iter()
-                        .map(|alias| CardRelationship {
-                            card_ref: card_ref.clone(),
-                            alias: Some(alias.clone()),
-                        })
-                        .collect()
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    Relationships {
-        outbound,
-        outbound_refs,
-        inbound: Vec::new(),
-        inbound_refs: Vec::new(),
-    }
-}
-
 /// Convert the SQL lifecycle enum without stringly response mapping.
 const fn lifecycle_status(status: CardStatus) -> CardLifecycleStatus {
     match status {
@@ -128,7 +70,8 @@ mod tests {
     use uuid::Uuid;
     use wyrd_runtime::principal::PrincipalId;
     use wyrd_semver::VersionBlock;
-    use wyrd_spec::envelope::{CardKind, Spec};
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::registry::{
         CardLifecycleStatus, RegistrationOperationId, RegistrationOutcomeKind,
@@ -137,7 +80,6 @@ mod tests {
     use wyrd_sql::row_types::cards::CardStatus;
 
     use super::outcome_row_to_response;
-    use super::relationships_from_spec;
 
     /// Project a resolved sibling/external reference into deterministic blob data.
     #[test]

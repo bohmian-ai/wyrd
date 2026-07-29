@@ -10,6 +10,34 @@ use crate::registry::{
     CardLifecycleStatus, CardUploadEntry, RegistrationOutcomeKind, RelativeArtifactPath,
 };
 
+/// Compute the stable BLAKE3 hash for an artifact manifest regardless of its authored order.
+///
+/// Registration treats artifact files as a path-keyed publication. Sorting a
+/// cloned manifest by its validated relative path before JCS serialization
+/// makes equivalent manifests produce the same durable hash without mutating
+/// the caller's request order.
+///
+/// # Errors
+///
+/// Returns [`crate::error::WyrdError`] when JCS cannot serialize a manifest
+/// entry into the canonical request representation.
+pub fn canonical_artifact_manifest_hash(
+    artifacts: &[ArtifactManifestEntry],
+) -> Result<Option<String>, crate::error::WyrdError> {
+    if artifacts.is_empty() {
+        return Ok(None);
+    }
+
+    let mut canonical = artifacts.to_vec();
+    canonical.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let bytes = serde_jcs::to_vec(&canonical).map_err(|error| {
+        crate::error::WyrdError::from_spec_canonicalization(
+            crate::envelope::SpecCanonicalizationError::Serialize(error),
+        )
+    })?;
+    Ok(Some(blake3::hash(&bytes).to_hex().to_string()))
+}
+
 /// One card submitted for registration.
 ///
 /// The server derives relationships, lifecycle status, resolved version, and
@@ -142,11 +170,36 @@ pub struct RegistrationReplaySeed {
 
 #[cfg(test)]
 mod tests {
-    use super::{CardSubmission, CreateCardRequest, CreateCardResponse, RegistrationReceipt};
+    use super::{
+        ArtifactManifestEntry, CardSubmission, CreateCardRequest, CreateCardResponse,
+        RegistrationReceipt, canonical_artifact_manifest_hash,
+    };
     use crate::api_version::ApiVersion;
     use crate::envelope::{CardKind, Metadata};
-    use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind};
+    use crate::registry::{CardLifecycleStatus, RegistrationOutcomeKind, RelativeArtifactPath};
     use serde_json::json;
+
+    /// Build a stable artifact entry for canonical-manifest tests.
+    fn artifact(path: &str) -> ArtifactManifestEntry {
+        ArtifactManifestEntry {
+            relative_path: RelativeArtifactPath::new(path).expect("test artifact path is valid"),
+            sha256: "YWJj".to_owned(),
+            size_bytes: 3,
+            content_type: None,
+        }
+    }
+
+    /// Hash equivalent manifests identically when callers provide opposite file order.
+    #[test]
+    fn canonical_artifact_manifest_hash_ignores_authored_order() {
+        let first = vec![artifact("weights.bin"), artifact("config.json")];
+        let second = vec![artifact("config.json"), artifact("weights.bin")];
+
+        assert_eq!(
+            canonical_artifact_manifest_hash(&first).expect("first manifest hashes"),
+            canonical_artifact_manifest_hash(&second).expect("second manifest hashes"),
+        );
+    }
 
     fn submission() -> CardSubmission {
         CardSubmission {

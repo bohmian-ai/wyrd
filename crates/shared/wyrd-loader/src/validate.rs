@@ -1,9 +1,10 @@
 //! Local validation over fully resolved authored cards.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::error::WyrdError;
+use wyrd_spec::graph::publication_validation_errors;
 use wyrd_spec::reference::Ref;
 use wyrd_spec::refs::{ReferenceSlotVisitor, SlotValue};
 
@@ -108,38 +109,8 @@ fn validate_publications(
     card: &AuthoredCard,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut seen = BTreeSet::new();
-    for publication in publications {
-        let Some(target) = publication.as_card_ref() else {
-            continue;
-        };
-        if !matches!(target.kind, CardKind::Eval | CardKind::Drift) {
-            diagnostics.push(catalog_error(
-                card,
-                &WyrdError::SpecInvalidPublishTargetKind {
-                    message: format!(
-                        "{field} target {} has kind {}",
-                        target.name,
-                        target.kind.wire_name()
-                    ),
-                    details: serde_json::json!({
-                        "field": field,
-                        "target": target,
-                        "expected_kinds": ["Eval", "Drift"]
-                    }),
-                },
-            ));
-        }
-        let identity = target.to_string();
-        if !seen.insert(identity.clone()) {
-            diagnostics.push(catalog_error(
-                card,
-                &WyrdError::SpecDuplicatePublishTarget {
-                    message: format!("duplicate {field} target {identity}"),
-                    details: serde_json::json!({ "field": field, "target": target }),
-                },
-            ));
-        }
+    for error in publication_validation_errors(publications, field) {
+        diagnostics.push(catalog_error(card, &error));
     }
 }
 
@@ -296,23 +267,48 @@ fn check_heavy_artifact_constraint(cards: &[AuthoredCard], diagnostics: &mut Vec
     }
 }
 
-/// Reject artifact manifests that reuse the same relative source path.
+/// Reject artifact manifests whose paths overlap as files and directories.
+///
+/// An artifact publication cannot contain both `a` and `a/b`: the former is a
+/// file target while the latter requires it to be a directory. The check also
+/// rejects exact reuse before a manifest reaches storage materialization.
 fn check_duplicate_artifact_paths(cards: &[AuthoredCard], diagnostics: &mut Vec<Diagnostic>) {
-    let mut seen = HashMap::new();
+    let mut seen = HashMap::<String, &std::path::PathBuf>::new();
     for card in cards {
         for artifact in &card.artifacts {
-            if let Some(first_path) = seen.insert(&artifact.relative_path, &card.source_path) {
+            let path = artifact.relative_path.as_str();
+            if let Some((first_artifact, first_path)) = seen
+                .iter()
+                .find(|(existing, _)| artifact_paths_conflict(existing, path))
+            {
                 diagnostics.push(Diagnostic::invalid_envelope(
                     card.source_path.clone(),
                     format!(
-                        "duplicate artifact path {} (first authored at {})",
+                        "conflicting artifact path {} with {} (first authored at {})",
                         artifact.relative_path,
+                        first_artifact,
                         first_path.display()
                     ),
                 ));
             }
+            seen.insert(path.to_owned(), &card.source_path);
         }
     }
+}
+
+/// Return whether two validated artifact paths are identical or prefix-conflict.
+///
+/// Artifact paths use `/` as their canonical separator, so string boundaries
+/// are sufficient and avoid platform-specific path semantics.
+#[must_use]
+fn artifact_paths_conflict(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// Convert a catalogued specification error into a source-aware diagnostic.

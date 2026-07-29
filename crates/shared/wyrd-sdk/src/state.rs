@@ -14,9 +14,6 @@ use sha2::{Digest, Sha256};
 use wyrd_cards::data::DataCard;
 use wyrd_cards::model::ModelCard;
 use wyrd_cards::prompt::PromptCard;
-use wyrd_registry::{
-    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
-};
 use wyrd_spec::api_version::ApiVersion;
 use wyrd_spec::card::drift::DriftSpec;
 use wyrd_spec::card::workflow::WorkflowCard;
@@ -24,6 +21,9 @@ use wyrd_spec::envelope::{Card, CardKind, Relationships, Spec};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::reference::{
     CardRef, registration_only_sibling_refs, scope_child_card_refs, unresolved_card_ref_paths,
+};
+use wyrd_spec::registry::{
+    HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
 };
 
 /// One verified artifact payload in a local `WyrdState` bundle.
@@ -298,6 +298,35 @@ pub struct WyrdState {
     index: Arc<HydratedStateIndex>,
 }
 
+/// Private filesystem reader for one confined hydrated-bundle root.
+///
+/// `WyrdState` owns the published immutable graph. This reader owns only the
+/// synchronous filesystem assembly context so no bundle path leaks into the
+/// public state API or into declarative Card values.
+#[derive(Debug)]
+struct HydratedBundleReader<'a> {
+    /// User-provided root which is confined before any manifest projection is read.
+    bundle: &'a Path,
+}
+
+impl<'a> HydratedBundleReader<'a> {
+    /// Construct a reader for one candidate hydrated bundle root.
+    #[must_use]
+    fn new(bundle: &'a Path) -> Self {
+        Self { bundle }
+    }
+
+    /// Read the bundle manifest through the fixed confined metadata projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same stable hydration errors as `WyrdState::from_path` when
+    /// metadata is absent, escapes the root, or cannot be decoded.
+    fn read_manifest(&self) -> Result<HydratedBundleManifest, WyrdError> {
+        WyrdState::read_manifest(self.bundle)
+    }
+}
+
 impl WyrdState {
     /// Load and validate a complete hydrated bundle without contacting Wyrd.
     ///
@@ -307,7 +336,8 @@ impl WyrdState {
     /// internally inconsistent, contains an unconfined path, or preserves a
     /// registration-only sibling reference.
     pub fn from_path(path: &Path) -> Result<Self, WyrdError> {
-        let manifest = Self::read_manifest(path)?;
+        let reader = HydratedBundleReader::new(path);
+        let manifest = reader.read_manifest()?;
         Self::validate_manifest_header(&manifest, path)?;
         let index = Self::load_index(path, manifest)?;
         Ok(Self {
@@ -776,6 +806,7 @@ impl WyrdState {
         }
 
         Self::validate_root(&manifest.root, &loaded)?;
+        Self::validate_reachable_from_root(&manifest.root, &loaded)?;
         HydratedStateIndex::assemble(manifest.root, loaded, aliases)
     }
 
@@ -937,6 +968,15 @@ impl WyrdState {
         aliases: &BTreeMap<String, String>,
         known: &BTreeSet<String>,
     ) -> Result<(), WyrdError> {
+        let expected = wyrd_spec::graph::relationships_from_spec(&card.spec);
+        if card.relationships.outbound != expected.outbound
+            || card.relationships.outbound_refs != expected.outbound_refs
+        {
+            return Err(state_bundle_error(
+                "hydrated relationship projection does not match its resolved Card spec",
+                json!({ "owner": exact_card_ref_for_error(card) }),
+            ));
+        }
         for relationship in &card.relationships.outbound_refs {
             let card_ref = &relationship.card_ref;
             if card_ref.uid.is_none() {
@@ -1167,6 +1207,60 @@ impl WyrdState {
             return Err(state_bundle_error(
                 "hydrated bundle root identity or kind does not match its manifest",
                 json!({ "root": root, "actual": item.card_ref, "actual_kind": item.card.kind }),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Require the declared root to reach every Card published in its bundle.
+    ///
+    /// A hydrated state is one immutable Service graph, not a local Card cache.
+    /// Walking canonical outbound relationships from the exact Service root
+    /// rejects an otherwise individually valid orphan before the state becomes
+    /// visible to callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state-bundle error when a published Card is not
+    /// reachable from the declared root through canonical outbound references.
+    fn validate_reachable_from_root(
+        root: &CardRef,
+        loaded: &[LoadedManifestCard],
+    ) -> Result<(), WyrdError> {
+        let cards = loaded
+            .iter()
+            .map(|item| (item.key.as_str(), &item.card))
+            .collect::<BTreeMap<_, _>>();
+        let mut pending = vec![root.to_string()];
+        let mut reachable = BTreeSet::new();
+
+        while let Some(key) = pending.pop() {
+            if !reachable.insert(key.clone()) {
+                continue;
+            }
+            let card = cards.get(key.as_str()).ok_or_else(|| {
+                state_bundle_error(
+                    "hydrated root traversal encountered a missing Card",
+                    json!({ "card_ref_key": key }),
+                )
+            })?;
+            pending.extend(
+                card.relationships
+                    .outbound_refs
+                    .iter()
+                    .map(|relationship| relationship.card_ref.to_string()),
+            );
+        }
+
+        if reachable.len() != cards.len() {
+            let unreachable = cards
+                .keys()
+                .filter(|key| !reachable.contains::<str>(*key))
+                .copied()
+                .collect::<Vec<_>>();
+            return Err(state_bundle_error(
+                "hydrated bundle contains Cards unreachable from its root",
+                json!({ "root": root, "unreachable": unreachable }),
             ));
         }
         Ok(())
@@ -1535,9 +1629,6 @@ mod tests {
     use sha2::{Digest, Sha256};
     use skald_spec::{OpenAiChatRequest, Prompt, ProviderRequest, ResponseType};
     use tempfile::{TempDir, tempdir};
-    use wyrd_registry::{
-        HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
-    };
     use wyrd_semver::{VersionBlock, VersionSpec};
     use wyrd_spec::api_version::ApiVersion;
     use wyrd_spec::card::agent::{AgentRunConfigSpec, AgentSpec};
@@ -1549,8 +1640,12 @@ mod tests {
     use wyrd_spec::card::service::{ServiceComponent, ServiceSpec};
     use wyrd_spec::card::workflow::{WorkflowAction, WorkflowSpec, WorkflowStep};
     use wyrd_spec::envelope::{Card, CardKind, Metadata, Relationships, Spec};
+    use wyrd_spec::graph::relationships_from_spec;
     use wyrd_spec::ids::{CardName, CardUid, SpaceName};
     use wyrd_spec::reference::{CardRef, InlineableRef, Ref};
+    use wyrd_spec::registry::{
+        HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
+    };
 
     use super::WyrdState;
 
@@ -1590,21 +1685,6 @@ mod tests {
             let root_ref = test_ref(CardKind::Service, "service", 1);
             let model_ref = test_ref(CardKind::Model, "model", 2);
             let backup_ref = test_ref(CardKind::Model, "backup", 3);
-            let relationships = Relationships {
-                outbound: Vec::new(),
-                outbound_refs: vec![
-                    wyrd_spec::envelope::CardRelationship {
-                        card_ref: model_ref.clone(),
-                        alias: Some("model".to_owned()),
-                    },
-                    wyrd_spec::envelope::CardRelationship {
-                        card_ref: backup_ref.clone(),
-                        alias: Some("backup".to_owned()),
-                    },
-                ],
-                inbound: Vec::new(),
-                inbound_refs: Vec::new(),
-            };
             let service_spec = ServiceSpec {
                 components: vec![
                     ServiceComponent {
@@ -1645,8 +1725,8 @@ mod tests {
                 card(
                     &root_ref,
                     CardKind::Service,
-                    Spec::Service(service_spec),
-                    relationships,
+                    Spec::Service(service_spec.clone()),
+                    relationships_from_spec(&Spec::Service(service_spec)),
                 ),
                 &[],
             );
@@ -2282,6 +2362,34 @@ mod tests {
         assert_eq!(
             state.card("model").expect("model alias resolves").kind,
             CardKind::Model
+        );
+    }
+
+    #[test]
+    /// Rejects a locally valid Card that is not reachable from the Service root.
+    ///
+    /// # Panics
+    /// Panics if fixture construction fails or root-closure validation accepts
+    /// an orphaned Card.
+    fn rejects_orphaned_card_outside_root_closure() {
+        let mut bundle = TestBundle::complete_service();
+        let orphan_ref = test_ref(CardKind::Model, "orphan", 9);
+        bundle.add_card(
+            "orphan",
+            card(
+                &orphan_ref,
+                CardKind::Model,
+                Spec::Model(model_spec()),
+                Relationships::default(),
+            ),
+            &[],
+        );
+        bundle.write();
+
+        assert_error(
+            WyrdState::from_path(bundle.path()),
+            "WYRD_SDK_400_INVALID_STATE_BUNDLE",
+            "unreachable",
         );
     }
 

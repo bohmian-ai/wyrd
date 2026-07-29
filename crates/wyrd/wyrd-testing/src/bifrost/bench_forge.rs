@@ -204,7 +204,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let convergence = pending == 0;
     let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
     let negative_flows = if scenario.require_negative_flows {
-        let retry = fixture.forge.run_once().await?;
+        let retry = forge.run_once().await?;
         NegativeFlowReport::executed(
             ["completed_forge_tick_is_idempotent"],
             retry.bins_committed == 0 && retry.tables_failed == 0,

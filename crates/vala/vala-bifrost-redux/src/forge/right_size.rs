@@ -278,6 +278,10 @@ mod tests {
             IcebergConvergence::Converged
         );
         assert_eq!(
+            policy.plan(vec![file("healthy", 180, day)]).convergence,
+            IcebergConvergence::Converged
+        );
+        assert_eq!(
             policy.plan(vec![file("large", 181, day)]).groups[0].reason,
             IcebergRewriteReason::Oversized
         );

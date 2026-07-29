@@ -542,7 +542,9 @@ fn plan_staging_bins(
             by_path.insert(file.path.clone(), file.clone());
             IcebergCandidateFile {
                 catalog_path: file.path.clone(),
+                object_path: file.path.clone(),
                 file_size_bytes: file.size,
+                record_count: 0,
                 schema_id: policy.schema_id(),
                 partition_spec_id: policy.partition_spec_id(),
                 partition_day,
@@ -550,6 +552,9 @@ fn plan_staging_bins(
                 writer_recipe_version: Some(BIFROST_WRITER_RECIPE_VERSION.to_owned()),
                 min_event_time: file.min_event_time,
                 max_event_time: file.max_event_time,
+                source_snapshot_id: 0,
+                data_sequence_number: None,
+                file_sequence_number: None,
             }
         })
         .collect();

@@ -46,6 +46,7 @@ use super::binpack::{CandidateFile, RewriteBin};
 use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::path::{catalog_path_to_object_key, validate_table_location};
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::{BIFROST_WRITER_RECIPE_VERSION, bifrost_writer_properties};
 use vala_sql::OperatorPool;
@@ -958,9 +959,12 @@ impl ForgeRewritePipeline {
             finalized.map_err(|error| ForgeError::Invariant {
                 detail: format!("Forge output finalization task failed: {error}"),
             })??;
-        if catalog_path_to_object_key(request.table_location, request.binding, file.file_path())
-            .as_deref()
-            != Some(object_path.as_str())
+        if catalog_path_to_object_key(
+            request.table_location,
+            request.binding,
+            &self.staging,
+            file.file_path(),
+        )? != object_path
         {
             return Err(ForgeError::Invariant {
                 detail: "Forge DataFile path does not map to its exact object key".to_owned(),
@@ -1054,10 +1058,12 @@ impl ForgeRewritePipeline {
     ) -> Result<std::collections::HashSet<String>, ForgeError> {
         let mut live = std::collections::HashSet::new();
         let mut add = |path: &str| {
-            let key = catalog_path_to_object_key(table.metadata().location(), binding, path)
-                .ok_or_else(|| ForgeError::Invariant {
-                    detail: format!("catalog reference escaped table binding: {path}"),
-                })?;
+            let key = catalog_path_to_object_key(
+                table.metadata().location(),
+                binding,
+                &self.staging,
+                path,
+            )?;
             live.insert(key);
             Ok::<(), ForgeError>(())
         };
@@ -1099,29 +1105,7 @@ impl ForgeRewritePipeline {
         binding: &TenantTableBinding,
         table_location: &str,
     ) -> Result<(), ForgeError> {
-        validate_table_location(binding, table_location)?;
-        let info = self.staging.info();
-        let expected_scheme = match info.scheme() {
-            "fs" => "file",
-            scheme => scheme,
-        };
-        if !table_location.starts_with(&format!("{expected_scheme}://")) {
-            return Err(ForgeError::Invariant {
-                detail: format!("catalog scheme does not match staging store: {table_location}"),
-            });
-        }
-        if expected_scheme != "file" {
-            let authority = table_location
-                .strip_prefix(&format!("{expected_scheme}://"))
-                .and_then(|rest| rest.split('/').next())
-                .unwrap_or_default();
-            if authority != info.name() {
-                return Err(ForgeError::Invariant {
-                    detail: "catalog warehouse authority does not match staging store".to_owned(),
-                });
-            }
-        }
-        Ok(())
+        validate_table_location(binding, table_location, &self.staging)
     }
 
     /// Preserve the public spill-ceiling distinction for resource exhaustion.
@@ -1146,52 +1130,6 @@ fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -
         "{}/data/forge/{BIFROST_WRITER_RECIPE_VERSION}/{operation_id}-{ordinal:05}.parquet",
         prefix.trim_end_matches('/')
     )
-}
-
-/// Verify that Iceberg's catalog location names this table's exact object
-/// prefix before any rewrite output side effect occurs.
-///
-/// # Errors
-/// Returns [`ForgeError::Invariant`] when the catalog location is empty or
-/// does not contain the binding-derived table prefix as an exact path segment.
-fn validate_table_location(
-    binding: &TenantTableBinding,
-    table_location: &str,
-) -> Result<(), ForgeError> {
-    let location = table_location.trim_end_matches('/');
-    let prefix = binding.object_prefix.trim_matches('/');
-    let marker = format!("/{prefix}");
-    if location.is_empty()
-        || prefix.is_empty()
-        || !location.ends_with(&marker)
-        || location[..location.len() - marker.len()].ends_with('/')
-    {
-        return Err(ForgeError::Invariant {
-            detail: format!(
-                "catalog table location does not match tenant binding: location={table_location}"
-            ),
-        });
-    }
-    Ok(())
-}
-
-/// Map one catalog URI to the exact relative object key for this binding.
-fn catalog_path_to_object_key(
-    table_location: &str,
-    binding: &TenantTableBinding,
-    path: &str,
-) -> Option<String> {
-    if let Some(path) = binding.validate_object_path(path) {
-        return Some(path);
-    }
-    let location = table_location.trim_end_matches('/');
-    let relative = path.strip_prefix(&format!("{location}/"))?;
-    let key = format!(
-        "{}/{}",
-        binding.object_prefix.trim_end_matches('/'),
-        relative
-    );
-    binding.validate_object_path(&key)
 }
 
 /// `DataFusion` leaf plan that owns bounded staging-file decoding.

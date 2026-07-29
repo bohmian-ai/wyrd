@@ -465,7 +465,7 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
 - Wyrd UI implementors additionally receive
   `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
 - The complete integration review runs the global `review-and-plan` skill; its
-  repo-specific review binding is `.codex/skills/review/SKILL.md`.
+  repo-specific review binding is `.codex/skills/wyrd-review/SKILL.md`.
 
 ## 15. Implementation Rules
 

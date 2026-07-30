@@ -337,6 +337,13 @@ impl IcebergCandidateFile {
         self.file_size_bytes
     }
 
+    /// Return the snapshot that added this candidate for scheduler-fence tests.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn source_snapshot_id_for_test(&self) -> i64 {
+        self.source_snapshot_id
+    }
+
     /// Return the complete planner key used to order test-support inputs.
     #[cfg(feature = "test-support")]
     #[must_use]

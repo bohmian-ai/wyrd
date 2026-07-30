@@ -50,6 +50,8 @@ pub enum IcebergRewriteDisposition {
         input_files: usize,
         /// Exact output file count.
         output_files: usize,
+        /// Exact byte total across committed output files.
+        output_bytes: u64,
         /// Rows read from the exact input set.
         input_rows: u64,
         /// Rows written into the exact output set.
@@ -271,6 +273,18 @@ impl Forge {
         operation: LiveRewrite,
         stop: &CancellationToken,
     ) -> Result<IcebergRewriteDisposition, ForgeError> {
+        let output_bytes = operation
+            .rewrite
+            .files
+            .iter()
+            .try_fold(0_u64, |total, file| {
+                total.checked_add(file.file_size_in_bytes()).ok_or_else(|| {
+                    ForgeError::InvalidConfig {
+                        detail: "live rewrite output bytes overflow the Forge tick outcome"
+                            .to_owned(),
+                    }
+                })
+            })?;
         if stop.is_cancelled() {
             return Err(ForgeError::Shutdown);
         }
@@ -342,6 +356,7 @@ impl Forge {
             snapshot_id,
             input_files: operation.source_files.len(),
             output_files: operation.rewrite.files.len(),
+            output_bytes,
             input_rows: operation.rewrite.input_rows,
             output_rows: operation.rewrite.output_rows,
             spill_bytes: operation.rewrite.spill_bytes,

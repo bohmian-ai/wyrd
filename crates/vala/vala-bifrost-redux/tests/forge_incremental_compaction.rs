@@ -28,8 +28,8 @@ mod pg_tests {
         BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
     };
     use vala_bifrost_redux::forge::{
-        Forge, ForgeBuildConfig, ForgeConfig, ForgeLease, ForgeObjectStore, ForgeRewriteRuntime,
-        IcebergRewriteGroup, forge_lease_key,
+        Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeLease, ForgeObjectStore,
+        ForgeRewriteRuntime, IcebergRewriteGroup, forge_lease_key,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -284,6 +284,7 @@ mod pg_tests {
                 hints,
                 config,
                 maintenance_interval: Duration::from_millis(10),
+                clock: ForgeClock::system(),
             })
             .expect("forge");
             let fixture = Self {
@@ -407,6 +408,31 @@ mod pg_tests {
             }
         }
 
+        /// Delete this fixture table's staging history while preserving its registration.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture-owner test query cannot remove the exact
+        /// tenant/table history needed to exercise a catalog-only roster.
+        async fn delete_file_list_history(&self) -> u64 {
+            sqlx::query(
+                "DELETE FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
+            )
+            .bind(self.tenant.as_uuid())
+            .bind(&self.binding.logical_namespace)
+            .bind(&self.binding.table_name)
+            .execute(
+                &self
+                    .pg
+                    .superuser_pool()
+                    .await
+                    .expect("fixture owner pool"),
+            )
+            .await
+            .expect("delete fixture file-list history")
+            .rows_affected()
+        }
+
         /// Append one existing fixture Parquet object under the table's current schema.
         ///
         /// This bypasses staging eligibility so manifest-schema tests construct
@@ -418,6 +444,31 @@ mod pg_tests {
         /// Panics when fixture metadata cannot form a valid complete Iceberg
         /// data-file entry or the catalog rejects the test append.
         async fn append_seed_manifest(&self, table: &iceberg::table::Table, index: i64) {
+            self.append_seed_manifest_at(
+                table,
+                index,
+                chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                    .expect("fixed event time")
+                    .into(),
+            )
+            .await;
+        }
+
+        /// Append one seed object with an exact event-time partition.
+        ///
+        /// This lets scheduler integration tests add a newer tail snapshot
+        /// without making that tail an eligible historical replacement input.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture metadata cannot form a valid complete Iceberg
+        /// data-file entry or the catalog rejects the test append.
+        async fn append_seed_manifest_at(
+            &self,
+            table: &iceberg::table::Table,
+            index: i64,
+            event_time: chrono::DateTime<chrono::Utc>,
+        ) {
             let object_path = format!("{}/input-{index}.parquet", self.binding.object_prefix);
             let catalog_path = format!(
                 "{}/input-{index}.parquet",
@@ -435,10 +486,8 @@ mod pg_tests {
                 .field_by_name(WYRD_EVENT_TIME)
                 .expect("event time field")
                 .id;
-            let base = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
-                .expect("time")
-                .timestamp_micros();
-            let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("day");
+            let base = event_time.timestamp_micros();
+            let day = event_time.date_naive();
             let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
             let partition_days = i32::try_from(day.signed_duration_since(epoch).num_days())
                 .expect("fixture partition day fits i32");
@@ -477,6 +526,22 @@ mod pg_tests {
                 .commit(self.catalog.as_ref())
                 .await
                 .expect("seed manifest append");
+        }
+
+        /// Set the live right-size target used by a scheduler integration proof.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the catalog cannot commit the fixture-only table-property update.
+        async fn set_live_target_file_size(&self, table: &iceberg::table::Table, bytes: u64) {
+            let action = Transaction::new(table)
+                .update_table_properties()
+                .set("write.target-file-size-bytes".to_owned(), bytes.to_string());
+            ApplyTransactionAction::apply(action, Transaction::new(table))
+                .expect("live target property action")
+                .commit(self.catalog.as_ref())
+                .await
+                .expect("live target property commit");
         }
     }
 
@@ -909,6 +974,13 @@ mod pg_tests {
         );
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
+        assert_eq!(outcome.staging_input_files, 32, "outcome: {outcome:?}");
+        assert_eq!(outcome.staging_input_bytes, 3_200, "outcome: {outcome:?}");
+        assert_eq!(
+            outcome.staging_output_files, outcome.outputs_committed,
+            "outcome: {outcome:?}"
+        );
+        assert!(outcome.staging_output_bytes > 0, "outcome: {outcome:?}");
         assert_eq!(outcome.input_rows, 3_200_000);
         assert_eq!(outcome.output_rows, 3_200_000);
         assert_eq!(fixture.reads.whole_reads.load(Ordering::Relaxed), 0);
@@ -955,6 +1027,198 @@ mod pg_tests {
 
         assert_terminal_family_parity(&fixture, "snapshot_expire").await;
         assert_terminal_family_parity(&fixture, "orphan_gc").await;
+    }
+
+    /// Proves a catalog registration drives planning and every later maintenance stage without staging history.
+    #[tokio::test]
+    async fn registered_table_without_file_list_history_is_still_scheduled() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            false,
+            3,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("empty registered table");
+        fixture.append_seed_manifest(&table, 0).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("first historical snapshot");
+        fixture.append_seed_manifest(&table, 1).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("second historical snapshot");
+        fixture
+            .append_seed_manifest_at(
+                &table,
+                2,
+                chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+                    .expect("tail event time")
+                    .into(),
+            )
+            .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("tail snapshot table");
+        fixture.set_live_target_file_size(&table, 100_000_000).await;
+        assert_eq!(fixture.delete_file_list_history().await, 3);
+
+        let outcome = fixture
+            .forge
+            .run_once()
+            .await
+            .expect("registered-table tick");
+        assert_eq!(outcome.tables_discovered, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.tables_examined, 1, "outcome: {outcome:?}");
+        assert!(outcome.live_groups_planned > 0, "outcome: {outcome:?}");
+        assert!(outcome.expiry_reconciled > 0, "outcome: {outcome:?}");
+        assert!(outcome.gc_reconciled > 0, "outcome: {outcome:?}");
+        assert!(outcome.gc_candidates > 0, "outcome: {outcome:?}");
+        assert!(outcome.tick_complete, "outcome: {outcome:?}");
+        assert_terminal_family_parity(&fixture, "snapshot_expire").await;
+        assert_terminal_family_parity(&fixture, "orphan_gc").await;
+
+        fixture.seed_files(2, true).await;
+        let owner = fixture
+            .pg
+            .superuser_pool()
+            .await
+            .expect("catalog owner pool");
+        sqlx::query(
+            "ALTER TABLE vala.bifrost_tables RENAME TO bifrost_tables_unavailable_for_test",
+        )
+        .execute(&owner)
+        .await
+        .expect("hide catalog roster");
+        let failed_discovery = fixture.forge.run_once().await;
+        sqlx::query(
+            "ALTER TABLE vala.bifrost_tables_unavailable_for_test RENAME TO bifrost_tables",
+        )
+        .execute(&owner)
+        .await
+        .expect("restore catalog roster");
+        assert!(
+            failed_discovery.is_err(),
+            "catalog discovery failure must not fall back to file_list history"
+        );
+    }
+
+    /// Proves the scheduler carries its captured plan base to the committed live-replacement fence.
+    #[tokio::test]
+    async fn scheduler_forwards_plan_base_snapshot_to_live_replacement() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_concurrent_reads: 2,
+                max_bins_per_tick: 1,
+                ..ForgeConfig::default()
+            },
+            true,
+            2,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("empty historical table");
+        fixture.set_live_target_file_size(&table, 100_000_000).await;
+        let first = fixture.forge.run_once().await.expect("first staging fold");
+        assert_eq!(first.bins_committed, 1, "first outcome: {first:?}");
+        fixture.seed_files_at(100, 2, true).await;
+        let second = fixture.forge.run_once().await.expect("second staging fold");
+        assert_eq!(second.bins_committed, 1, "second outcome: {second:?}");
+        fixture.seed_files_at(999, 1, false).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("tail base table");
+        fixture
+            .append_seed_manifest_at(
+                &table,
+                999,
+                chrono::DateTime::parse_from_rfc3339("2026-07-14T23:00:00Z")
+                    .expect("tail event time")
+                    .into(),
+            )
+            .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("base snapshot table");
+        let plan = fixture
+            .forge
+            .discover_live_rewrites_for_test(
+                &fixture.binding,
+                &table,
+                chrono::Utc::now().date_naive(),
+            )
+            .await
+            .expect("historical live plan");
+        let base_snapshot_id = plan.base_snapshot_id_for_test();
+        let selected = plan
+            .groups_for_test()
+            .first()
+            .expect("scheduler must select one historical replacement group first");
+        assert!(
+            selected.files_for_test().len() >= 2,
+            "the first scheduler-selected group must contain the historical additions: {selected:?}"
+        );
+        let candidate_snapshot_ids = selected
+            .files_for_test()
+            .iter()
+            .map(|file| file.source_snapshot_id_for_test())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(candidate_snapshot_ids.len(), 2);
+        assert!(
+            candidate_snapshot_ids
+                .iter()
+                .all(|candidate_snapshot_id| *candidate_snapshot_id != base_snapshot_id),
+            "the newer tail snapshot must make the plan base distinct from its historical additions"
+        );
+        assert_eq!(fixture.delete_file_list_history().await, 5);
+
+        let outcome = fixture
+            .forge
+            .run_once()
+            .await
+            .expect("live replacement handoff");
+        assert_eq!(outcome.live_groups_committed, 1, "outcome: {outcome:?}");
+        assert!(outcome.live_output_bytes > 0, "outcome: {outcome:?}");
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("base fence tenant connection");
+        let fenced_base_snapshot_id: i64 = sqlx::query_scalar(
+            "SELECT (current_detail ->> 'base_snapshot_id')::bigint \
+             FROM vala.forge_operation_state \
+             WHERE data_tenant_id = wyrd.current_tenant() \
+               AND family = 'iceberg_rewrite' AND phase = 'committed'",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("committed live fence detail");
+        assert_eq!(fenced_base_snapshot_id, base_snapshot_id);
+        assert!(outcome.tick_complete, "outcome: {outcome:?}");
     }
 
     /// A projection failure rolls back staging claims and its paired audit.

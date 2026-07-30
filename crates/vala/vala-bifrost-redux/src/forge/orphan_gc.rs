@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use iceberg::spec::TableMetadata;
 use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
@@ -84,8 +85,9 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         live_set: &ProtectedLiveSet,
+        now: DateTime<Utc>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        self.run_orphan_gc_for_table_inner(lease, key, binding, live_set)
+        self.run_orphan_gc_for_table_inner(lease, key, binding, live_set, now)
             .await
     }
 
@@ -111,9 +113,11 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         live_set: &ProtectedLiveSet,
+        now: DateTime<Utc>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        let mut outcome = self.reconcile_gc(lease, key, binding).await?;
-        let candidates = self.list_gc_candidates(binding, live_set).await?;
+        let mut outcome = self.reconcile_gc(lease, key, binding, now).await?;
+        let candidates = self.list_gc_candidates(binding, live_set, now).await?;
+        outcome.candidates = outcome.candidates.saturating_add(candidates.len());
         if candidates.is_empty() {
             return Ok(outcome);
         }
@@ -121,19 +125,24 @@ impl Forge {
         self.append_gc_audit(lease, key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
         let (deleted, skipped) = self
-            .delete_gc_batch(lease, key, binding, &detail, false)
+            .delete_gc_batch(lease, key, binding, &detail, false, now)
             .await?;
-        outcome.recovered += 1;
-        outcome.deleted += deleted;
-        outcome.skipped += skipped;
+        outcome.recovered = outcome.recovered.saturating_add(1);
+        outcome.deleted = outcome.deleted.saturating_add(deleted);
+        outcome.skipped = outcome.skipped.saturating_add(skipped);
         Ok(outcome)
     }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct OrphanGcOutcome {
+    /// Exact candidate paths considered across new and reconciled batches.
+    pub(crate) candidates: usize,
+    /// Prepared batches completed or recovered by this pass.
     pub(crate) recovered: usize,
+    /// Candidate paths deleted or already absent at deletion time.
     pub(crate) deleted: usize,
+    /// Candidate paths retained after a fresh fence or live-set recheck.
     pub(crate) skipped: usize,
 }
 
@@ -227,6 +236,7 @@ impl Forge {
         &self,
         binding: &TenantTableBinding,
         live_set: &ProtectedLiveSet,
+        now: DateTime<Utc>,
     ) -> Result<Vec<String>, ForgeError> {
         let prefix = format!("{}/", binding.object_prefix.trim_end_matches('/'));
         let entries = self
@@ -235,7 +245,11 @@ impl Forge {
             .list(&prefix)
             .await
             .map_err(ForgeError::ObjectList)?;
-        let now = Timestamp::now();
+        let now = Timestamp::from_millisecond(now.timestamp_millis()).map_err(|_| {
+            ForgeError::InvalidConfig {
+                detail: "Forge wall clock cannot represent an object-store timestamp".to_owned(),
+            }
+        })?;
         let mut candidates = entries
             .into_iter()
             .filter(|entry| entry.metadata().mode() == EntryMode::FILE)
@@ -268,6 +282,7 @@ impl Forge {
         binding: &TenantTableBinding,
         detail: &AuditDetail,
         recovered: bool,
+        now: DateTime<Utc>,
     ) -> Result<(usize, usize), ForgeError> {
         let AuditDetail::ForgeOrphanGc {
             candidate_paths,
@@ -294,7 +309,12 @@ impl Forge {
         for path in candidate_paths {
             lease.require_fence(&self.core.operator_pool).await?;
             let table = self.load_table(&binding.table_ident()).await?;
-            let now = Timestamp::now();
+            let now = Timestamp::from_millisecond(now.timestamp_millis()).map_err(|_| {
+                ForgeError::InvalidConfig {
+                    detail: "Forge wall clock cannot represent an object-store timestamp"
+                        .to_owned(),
+                }
+            })?;
             let normalized = catalog_path_to_object_key(
                 table.metadata().location(),
                 binding,
@@ -472,6 +492,7 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
         let (prepared, terminal) = self.load_gc_audits(key).await?;
         let mut outcome = OrphanGcOutcome::default();
@@ -479,12 +500,21 @@ impl Forge {
             if terminal.contains(&operation_id) {
                 continue;
             }
+            let AuditDetail::ForgeOrphanGc {
+                candidate_paths, ..
+            } = &detail
+            else {
+                return Err(ForgeError::Reconciliation {
+                    detail: "orphan-GC prepared audit has the wrong kind".to_owned(),
+                });
+            };
             let (deleted, skipped) = self
-                .delete_gc_batch(lease, key, binding, &detail, true)
+                .delete_gc_batch(lease, key, binding, &detail, true, now)
                 .await?;
-            outcome.recovered += 1;
-            outcome.deleted += deleted;
-            outcome.skipped += skipped;
+            outcome.candidates = outcome.candidates.saturating_add(candidate_paths.len());
+            outcome.recovered = outcome.recovered.saturating_add(1);
+            outcome.deleted = outcome.deleted.saturating_add(deleted);
+            outcome.skipped = outcome.skipped.saturating_add(skipped);
         }
         Ok(outcome)
     }

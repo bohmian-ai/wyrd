@@ -265,6 +265,10 @@ pub struct ForgeTickOutcome {
     pub bins_skipped: usize,
     /// Durable operations recovered from audit state.
     pub reconciled: usize,
+    /// Registrations discovered by the periodic catalog roster.
+    pub tables_discovered: usize,
+    /// Registrations that reached a terminal local classification.
+    pub tables_examined: usize,
     /// Tables whose stages completed successfully.
     pub tables_succeeded: usize,
     /// Tables skipped due to lease contention or cancellation.
@@ -277,6 +281,8 @@ pub struct ForgeTickOutcome {
     pub expiry_reconciled: usize,
     /// Orphan-GC operations recovered.
     pub gc_reconciled: usize,
+    /// Objects considered by orphan GC.
+    pub gc_candidates: usize,
     /// Objects deleted by orphan GC.
     pub gc_deleted: usize,
     /// Objects skipped after a live-set or fence recheck.
@@ -285,6 +291,8 @@ pub struct ForgeTickOutcome {
     pub budget_skips: usize,
     /// Tables skipped because another Forge owner held the lease.
     pub lease_contention: usize,
+    /// Leases obtained by replacing expired owners.
+    pub lease_takeovers: usize,
     /// Operations stopped after losing the table fence.
     pub fence_losses: usize,
     /// Stage-level failures that did not abort discovery of other tables.
@@ -307,6 +315,34 @@ pub struct ForgeTickOutcome {
     pub live_unresolved: usize,
     /// Open-operation pages that exceeded their configured cap.
     pub open_operation_overflows: usize,
+    /// Staging files that remain for a later fold.
+    pub staging_pending_files: usize,
+    /// Current-snapshot live files seen by right-size planning.
+    pub live_candidates: usize,
+    /// Live rewrite groups planned by the tick.
+    pub live_groups_planned: usize,
+    /// Live rewrite groups committed by the tick.
+    pub live_groups_committed: usize,
+    /// Live plans invalidated by snapshot change.
+    pub live_snapshot_changes: usize,
+    /// Staging inputs committed by fold work.
+    pub staging_input_files: usize,
+    /// Staging input bytes committed by fold work.
+    pub staging_input_bytes: u64,
+    /// Staging outputs committed by fold work.
+    pub staging_output_files: usize,
+    /// Staging output bytes committed by fold work.
+    pub staging_output_bytes: u64,
+    /// Live replacement input files committed by the tick.
+    pub live_input_files: usize,
+    /// Live replacement input bytes committed by the tick.
+    pub live_input_bytes: u64,
+    /// Live replacement output files committed by the tick.
+    pub live_output_files: usize,
+    /// Live replacement output bytes committed by the tick.
+    pub live_output_bytes: u64,
+    /// Whether the periodic owner examined its complete roster.
+    pub tick_complete: bool,
     /// Whether conservative work remains after this outcome.
     pub pending_work: bool,
 }
@@ -315,21 +351,31 @@ impl ForgeTickOutcome {
     /// Merge another isolated stage outcome into this aggregate.
     pub(crate) fn merge(&mut self, other: Self) {
         self.groups_seen = self.groups_seen.saturating_add(other.groups_seen);
-        self.bins_committed += other.bins_committed;
-        self.bins_skipped += other.bins_skipped;
-        self.reconciled += other.reconciled;
-        self.tables_succeeded += other.tables_succeeded;
-        self.tables_skipped += other.tables_skipped;
-        self.tables_failed += other.tables_failed;
-        self.reconciliation_recovered += other.reconciliation_recovered;
-        self.expiry_reconciled += other.expiry_reconciled;
-        self.gc_reconciled += other.gc_reconciled;
-        self.gc_deleted += other.gc_deleted;
-        self.gc_skipped += other.gc_skipped;
-        self.budget_skips += other.budget_skips;
-        self.lease_contention += other.lease_contention;
-        self.fence_losses += other.fence_losses;
-        self.stage_failures += other.stage_failures;
+        self.bins_committed = self.bins_committed.saturating_add(other.bins_committed);
+        self.bins_skipped = self.bins_skipped.saturating_add(other.bins_skipped);
+        self.reconciled = self.reconciled.saturating_add(other.reconciled);
+        self.tables_discovered = self
+            .tables_discovered
+            .saturating_add(other.tables_discovered);
+        self.tables_examined = self.tables_examined.saturating_add(other.tables_examined);
+        self.tables_succeeded = self.tables_succeeded.saturating_add(other.tables_succeeded);
+        self.tables_skipped = self.tables_skipped.saturating_add(other.tables_skipped);
+        self.tables_failed = self.tables_failed.saturating_add(other.tables_failed);
+        self.reconciliation_recovered = self
+            .reconciliation_recovered
+            .saturating_add(other.reconciliation_recovered);
+        self.expiry_reconciled = self
+            .expiry_reconciled
+            .saturating_add(other.expiry_reconciled);
+        self.gc_reconciled = self.gc_reconciled.saturating_add(other.gc_reconciled);
+        self.gc_candidates = self.gc_candidates.saturating_add(other.gc_candidates);
+        self.gc_deleted = self.gc_deleted.saturating_add(other.gc_deleted);
+        self.gc_skipped = self.gc_skipped.saturating_add(other.gc_skipped);
+        self.budget_skips = self.budget_skips.saturating_add(other.budget_skips);
+        self.lease_contention = self.lease_contention.saturating_add(other.lease_contention);
+        self.lease_takeovers = self.lease_takeovers.saturating_add(other.lease_takeovers);
+        self.fence_losses = self.fence_losses.saturating_add(other.fence_losses);
+        self.stage_failures = self.stage_failures.saturating_add(other.stage_failures);
         self.spill_bytes = self.spill_bytes.saturating_add(other.spill_bytes);
         self.input_rows = self.input_rows.saturating_add(other.input_rows);
         self.output_rows = self.output_rows.saturating_add(other.output_rows);
@@ -344,6 +390,95 @@ impl ForgeTickOutcome {
             .open_operation_overflows
             .saturating_add(other.open_operation_overflows);
         self.pending_work |= other.pending_work;
+        self.staging_pending_files = self
+            .staging_pending_files
+            .saturating_add(other.staging_pending_files);
+        self.live_candidates = self.live_candidates.saturating_add(other.live_candidates);
+        self.live_groups_planned = self
+            .live_groups_planned
+            .saturating_add(other.live_groups_planned);
+        self.live_groups_committed = self
+            .live_groups_committed
+            .saturating_add(other.live_groups_committed);
+        self.live_snapshot_changes = self
+            .live_snapshot_changes
+            .saturating_add(other.live_snapshot_changes);
+        self.staging_input_files = self
+            .staging_input_files
+            .saturating_add(other.staging_input_files);
+        self.staging_input_bytes = self
+            .staging_input_bytes
+            .saturating_add(other.staging_input_bytes);
+        self.staging_output_files = self
+            .staging_output_files
+            .saturating_add(other.staging_output_files);
+        self.staging_output_bytes = self
+            .staging_output_bytes
+            .saturating_add(other.staging_output_bytes);
+        self.live_input_files = self.live_input_files.saturating_add(other.live_input_files);
+        self.live_input_bytes = self.live_input_bytes.saturating_add(other.live_input_bytes);
+        self.live_output_files = self
+            .live_output_files
+            .saturating_add(other.live_output_files);
+        self.live_output_bytes = self
+            .live_output_bytes
+            .saturating_add(other.live_output_bytes);
+        self.tick_complete &= other.tick_complete;
+    }
+
+    /// Returns true only for a complete, observed no-work periodic pass.
+    #[must_use]
+    pub fn is_converged(&self) -> bool {
+        self.tick_complete
+            && self.tables_examined == self.tables_discovered
+            && !self.pending_work
+            && [
+                self.groups_seen,
+                self.bins_committed,
+                self.bins_skipped,
+                self.reconciled,
+                self.tables_skipped,
+                self.tables_failed,
+                self.reconciliation_recovered,
+                self.expiry_reconciled,
+                self.gc_reconciled,
+                self.gc_candidates,
+                self.gc_deleted,
+                self.gc_skipped,
+                self.budget_skips,
+                self.lease_contention,
+                self.lease_takeovers,
+                self.fence_losses,
+                self.stage_failures,
+                self.staging_pending_files,
+                self.live_candidates,
+                self.live_groups_planned,
+                self.live_groups_committed,
+                self.live_snapshot_changes,
+                self.live_recovered,
+                self.live_reset,
+                self.live_pending,
+                self.live_unresolved,
+                self.open_operation_overflows,
+                self.staging_input_files,
+                self.staging_output_files,
+                self.live_input_files,
+                self.live_output_files,
+                self.outputs_committed,
+            ]
+            .into_iter()
+            .all(|value| value == 0)
+            && [
+                self.staging_input_bytes,
+                self.staging_output_bytes,
+                self.live_input_bytes,
+                self.live_output_bytes,
+                self.spill_bytes,
+                self.input_rows,
+                self.output_rows,
+            ]
+            .into_iter()
+            .all(|value| value == 0)
     }
 }
 
@@ -351,11 +486,11 @@ impl ForgeTickOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct ForgeTickBudget {
     /// Input files already committed by the batch.
-    files: usize,
+    pub(crate) files: usize,
     /// Input bytes already committed by the batch.
-    bytes: u64,
+    pub(crate) bytes: u64,
     /// Rewrite bins already committed by the batch.
-    bins: usize,
+    pub(crate) bins: usize,
 }
 
 /// Reconcile prepared compaction audits for one tenant/table before new work.
@@ -434,13 +569,15 @@ impl Forge {
         lease: &mut ForgeLease,
         table_key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<usize, ForgeError> {
-        let mut reconciled = 0;
+        let mut reconciled: usize = 0;
         for key in self.load_reconciliation_keys().await? {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
-            reconciled += self.reconcile_group(lease, &key, binding).await?;
+            reconciled =
+                reconciled.saturating_add(self.reconcile_group(lease, &key, binding, now).await?);
         }
         Ok(reconciled)
     }
@@ -455,13 +592,22 @@ impl Forge {
         lease: &mut ForgeLease,
         table_key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        budget: &mut ForgeTickBudget,
+        now: DateTime<Utc>,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
-        let rows = self.select_candidate_groups(table_key).await?;
+        let rows = self.select_candidate_groups(table_key, now).await?;
         let right_size_policy = self.table_right_size_policy(binding).await?;
-        let mut budget = ForgeTickBudget::default();
-        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, &mut budget, stop)
-            .await
+        self.compact_candidate_rows(
+            lease,
+            binding,
+            rows,
+            &right_size_policy,
+            budget,
+            now.date_naive(),
+            stop,
+        )
+        .await
     }
 
     /// Query and compact one exact durable day after an advisory hint.
@@ -475,12 +621,21 @@ impl Forge {
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
         budget: &mut ForgeTickBudget,
+        current_day: NaiveDate,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_targeted_candidate_group(key).await?;
         let right_size_policy = self.table_right_size_policy(binding).await?;
-        self.compact_candidate_rows(lease, binding, rows, &right_size_policy, budget, stop)
-            .await
+        self.compact_candidate_rows(
+            lease,
+            binding,
+            rows,
+            &right_size_policy,
+            budget,
+            current_day,
+            stop,
+        )
+        .await
     }
 }
 
@@ -498,23 +653,38 @@ impl Forge {
         rows: Vec<CandidateRow>,
         right_size_policy: &ForgeRightSizePolicy,
         budget: &mut ForgeTickBudget,
+        current_day: NaiveDate,
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let mut outcome = ForgeTickOutcome::default();
         'groups: for row in rows {
-            outcome.groups_seen += 1;
             let bins = plan_staging_bins(
                 right_size_policy,
                 &row.files,
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
-                Utc::now().date_naive(),
+                current_day,
             );
-            for bin in bins {
+            outcome.groups_seen = outcome.groups_seen.saturating_add(bins.len());
+            for (index, bin) in bins.iter().enumerate() {
                 if stop.is_cancelled() {
+                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
+                        bins[index..]
+                            .iter()
+                            .map(|pending| pending.files.len())
+                            .sum::<usize>(),
+                    );
+                    outcome.pending_work = true;
                     return Ok(outcome);
                 }
                 if budget.bins >= self.core.config.max_bins_per_tick {
+                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
+                        bins[index..]
+                            .iter()
+                            .map(|pending| pending.files.len())
+                            .sum::<usize>(),
+                    );
+                    outcome.pending_work = true;
                     break;
                 }
                 if budget.files.saturating_add(bin.files.len())
@@ -522,8 +692,15 @@ impl Forge {
                     || budget.bytes.saturating_add(bin.total_bytes)
                         > self.core.config.max_bytes_per_tick
                 {
-                    outcome.bins_skipped += 1;
-                    outcome.budget_skips += 1;
+                    outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                    outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
+                        bins[index..]
+                            .iter()
+                            .map(|pending| pending.files.len())
+                            .sum::<usize>(),
+                    );
+                    outcome.pending_work = true;
                     break 'groups;
                 }
                 if !lease.renew(&self.core.operator_pool).await? {
@@ -532,8 +709,15 @@ impl Forge {
                     });
                 }
                 if !lease.commit_window_fits(self.core.config.commit_window()) {
-                    outcome.bins_skipped += 1;
-                    outcome.budget_skips += 1;
+                    outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                    outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
+                        bins[index..]
+                            .iter()
+                            .map(|pending| pending.files.len())
+                            .sum::<usize>(),
+                    );
+                    outcome.pending_work = true;
                     break 'groups;
                 }
                 let stats = self
@@ -545,10 +729,22 @@ impl Forge {
                 outcome.outputs_committed = outcome
                     .outputs_committed
                     .saturating_add(stats.outputs_committed);
-                budget.files += bin.files.len();
+                outcome.staging_input_files = outcome
+                    .staging_input_files
+                    .saturating_add(stats.input_files);
+                outcome.staging_input_bytes = outcome
+                    .staging_input_bytes
+                    .saturating_add(stats.input_bytes);
+                outcome.staging_output_files = outcome
+                    .staging_output_files
+                    .saturating_add(stats.outputs_committed);
+                outcome.staging_output_bytes = outcome
+                    .staging_output_bytes
+                    .saturating_add(stats.output_bytes);
+                budget.files = budget.files.saturating_add(bin.files.len());
                 budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
-                budget.bins += 1;
-                outcome.bins_committed += 1;
+                budget.bins = budget.bins.saturating_add(1);
+                outcome.bins_committed = outcome.bins_committed.saturating_add(1);
             }
             if budget.bins >= self.core.config.max_bins_per_tick
                 || budget.files >= self.core.config.max_files_per_tick
@@ -642,6 +838,7 @@ impl Forge {
     async fn select_candidate_groups(
         &self,
         table_key: &ForgeTableKey,
+        now: DateTime<Utc>,
     ) -> Result<Vec<CandidateRow>, ForgeError> {
         let rows = sqlx::query(
             r"
@@ -652,14 +849,15 @@ impl Forge {
            AND namespace = $2
            AND table_name = $3
            AND NOT compacted
-           AND created_at < now() - interval '2 min'
+           AND created_at < $4 - interval '2 min'
          ORDER BY partition_day, min_event_time, max_event_time, id
-         LIMIT $4
+         LIMIT $5
         ",
         )
         .bind(table_key.tenant.as_uuid())
         .bind(table_key.table_ref.namespace.as_str())
         .bind(&table_key.table_ref.name)
+        .bind(now)
         .bind(
             i64::try_from(self.core.config.max_files_per_tick).map_err(|_| {
                 ForgeError::InvalidConfig {
@@ -918,6 +1116,14 @@ impl Forge {
             spill_bytes = rewrite.spill_bytes,
             "Forge streaming rewrite completed"
         );
+        let output_bytes = rewrite.files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.file_size_in_bytes())
+                .ok_or_else(|| ForgeError::InvalidConfig {
+                    detail: "staging rewrite output bytes overflow the Forge tick outcome"
+                        .to_owned(),
+                })
+        })?;
         lease.require_fence(&self.core.operator_pool).await?;
         let prepared = forge_detail(
             key,
@@ -944,7 +1150,10 @@ impl Forge {
             spill_bytes: rewrite.spill_bytes,
             input_rows: rewrite.input_rows,
             output_rows: rewrite.output_rows,
+            input_files: bin.files.len(),
+            input_bytes: bin.total_bytes,
             outputs_committed: rewrite.object_paths.len(),
+            output_bytes,
         })
     }
 }
@@ -958,8 +1167,14 @@ struct CompactStats {
     input_rows: u64,
     /// Rows encoded into outputs.
     output_rows: u64,
+    /// Number of staged source files published by the fenced commit.
+    input_files: usize,
+    /// Exact staged source bytes published by the fenced commit.
+    input_bytes: u64,
     /// Number of non-empty output files committed.
     outputs_committed: usize,
+    /// Exact bytes in committed Iceberg output files.
+    output_bytes: u64,
 }
 
 /// Immutable inputs for one fenced Iceberg commit and its durable bookkeeping.
@@ -1328,10 +1543,11 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<usize, ForgeError> {
         let resource = key.audit_resource();
         let latest = self.load_reconciliation_audits(key, &resource).await?;
-        let mut recovered = 0;
+        let mut recovered: usize = 0;
         for (_operation_id, (detail, created_at)) in latest {
             if !matches!(
                 &detail,
@@ -1371,10 +1587,10 @@ impl Forge {
                 }
                 self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
                     .await?;
-                recovered += 1;
+                recovered = recovered.saturating_add(1);
                 continue;
             }
-            if Utc::now()
+            if now
                 .signed_duration_since(created_at)
                 .to_std()
                 .unwrap_or_default()
@@ -1403,7 +1619,7 @@ impl Forge {
                 }
                 self.reset_reconciled(lease, key, input_file_ids, &detail)
                     .await?;
-                recovered += 1;
+                recovered = recovered.saturating_add(1);
             }
         }
         Ok(recovered)
@@ -2104,5 +2320,32 @@ mod tests {
         assert_eq!(bins.len(), 1);
         assert_eq!(bins[0].files.len(), 2);
         assert_eq!(bins[0].total_bytes, 40);
+    }
+
+    /// An accepted open-partition tail creates no actionable bin or pending work.
+    #[test]
+    fn accepted_open_partition_tail_is_not_pending_work() {
+        let policy = ForgeRightSizePolicy::new(100, 1, 1, 1).expect("policy");
+        let day = NaiveDate::from_ymd_opt(2026, 1, 1).expect("day");
+        let timestamp = DateTime::from_timestamp(1, 0).expect("timestamp");
+        let tail = CandidateFile {
+            id: Uuid::from_u128(1),
+            path: "open-tail".to_owned(),
+            size: 20,
+            min_event_time: timestamp,
+            max_event_time: timestamp,
+        };
+        let bins = plan_staging_bins(&policy, &[tail], 256, day, day);
+        assert!(bins.is_empty());
+        let outcome = ForgeTickOutcome {
+            tables_discovered: 1,
+            tables_examined: 1,
+            tables_succeeded: 1,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        assert_eq!(outcome.staging_pending_files, 0);
+        assert!(!outcome.pending_work);
+        assert!(outcome.is_converged());
     }
 }

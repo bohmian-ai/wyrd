@@ -6,6 +6,7 @@ use secrecy::SecretString;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditDetail, SyncQueryRequest};
 use wyrd_testing::bifrost::BifrostHarness;
+use wyrd_testing::bifrost::forge_harness::seed_forge_group;
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -69,6 +70,33 @@ async fn forge_distributed_writer_matrix_preserves_rows_and_converges_once() {
     }
 }
 
+/// Proves Forge fixture rebuilds retain the server-owned wall clock.
+#[tokio::test]
+#[ignore = "gated journey: real bound Wyrd server, Postgres, and Forge"]
+async fn forge_fixture_rebuilds_retain_manual_forge_clock() {
+    let server = WyrdTestServer::builder()
+        .start_bound()
+        .await
+        .expect("server");
+    let fixture = seed_forge_group(&server, "manual_forge_clock").await;
+    let initial = fixture
+        .forge
+        .clock_for_test()
+        .now()
+        .expect("initial Forge clock");
+    let advanced = server
+        .forge_clock()
+        .advance(chrono::Duration::seconds(1))
+        .expect("advance Forge clock");
+    let catalog = fixture.context_with_catalog(fixture.config.clone(), fixture.catalog.clone());
+    assert!(advanced > initial);
+    assert_eq!(
+        catalog.clock_for_test().now().expect("catalog clock"),
+        advanced
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
 /// Run one deployment shape from authenticated ingest through query readback.
 ///
 /// # Panics
@@ -83,6 +111,7 @@ async fn run_scenario(scenario: Scenario) {
     assert_eq!(servers.len(), scenario.pods, "{} pod count", scenario.name);
     let control = &servers[0];
     let tenants = provision_tenants(control, scenario).await;
+    assert_active_traces_roster(control, &tenants, scenario).await;
 
     for cycle in 0..WRITE_CYCLES {
         write_cycle(servers, &tenants, cycle, scenario).await;
@@ -97,10 +126,17 @@ async fn run_scenario(scenario: Scenario) {
             }
         }
     }
+    for server in servers {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+            .unwrap_or_else(|error| panic!("{} advance Forge clock: {error}", scenario.name));
+    }
 
     let expected_rows = u64::try_from(scenario.pods * WRITE_CYCLES * SPANS_PER_WRITE)
         .expect("bounded journey row count");
     let pending_before = pending_files(control, &tenants).await;
+    assert_pending_files_are_old_enough(control, &tenants, scenario).await;
     assert!(
         pending_before
             .iter()
@@ -131,7 +167,50 @@ async fn run_scenario(scenario: Scenario) {
             .unwrap_or_else(|error| panic!("{} Forge tick: {error}", scenario.name));
     }
 
-    wait_for_compaction(servers, &tenants, scenario).await;
+    let tails = wait_for_compaction(servers, &tenants, scenario).await;
+    let terminal_history_deleted = delete_terminal_file_list_history(control, tenants[0].id).await;
+    assert!(
+        terminal_history_deleted > 0,
+        "{} needs terminal file_list history to prove catalog-roster scheduling",
+        scenario.name
+    );
+    assert_active_traces_roster(control, &tenants, scenario).await;
+    let no_op = wait_for_converged_tick(control, scenario).await;
+    assert!(
+        no_op.is_converged()
+            && no_op.bins_committed == 0
+            && no_op.live_groups_committed == 0
+            && no_op.outputs_committed == 0,
+        "{} converged tick performed additional work: {no_op:?}",
+        scenario.name
+    );
+    assert_eq!(
+        no_op.tables_discovered,
+        tenants.len(),
+        "{} must still schedule every active catalog registration after terminal file_list history is removed: {no_op:?}",
+        scenario.name
+    );
+    assert_eq!(
+        no_op.tables_examined,
+        tenants.len(),
+        "{} must examine every active catalog registration after terminal file_list history is removed: {no_op:?}",
+        scenario.name
+    );
+    for server in servers {
+        let scribe = server.bifrost_scribe().expect("server-owned Scribe");
+        scribe
+            .retire_committed_for_test(std::time::Instant::now() + Duration::from_secs(120))
+            .await
+            .expect("Scribe retirement pass");
+        let inspection = server
+            .scribe_inspection_snapshot()
+            .expect("Scribe inspection after retirement");
+        assert_eq!(
+            inspection.immutable_bucket_count, 0,
+            "{} retained Scribe hot buckets after explicit retirement",
+            scenario.name
+        );
+    }
     for tenant in &tenants {
         assert_eq!(
             wait_for_query_rows(control, &tenant.jwt, expected_rows, scenario).await,
@@ -140,8 +219,15 @@ async fn run_scenario(scenario: Scenario) {
             scenario.name,
             tenant.id
         );
-        assert_terminal_audits(control, tenant.id, scenario).await;
-        assert_snapshot(control, tenant.id, scenario).await;
+        if tails
+            .iter()
+            .any(|(tail_tenant, _, _)| *tail_tenant == tenant.id)
+        {
+            assert_no_compaction_audits(control, tenant.id, scenario).await;
+        } else {
+            assert_terminal_audits(control, tenant.id, scenario).await;
+            assert_snapshot(control, tenant.id, scenario).await;
+        }
     }
     assert_no_forge_leases(control, scenario).await;
 
@@ -177,6 +263,15 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
     }
     let mut tenants = Vec::with_capacity(tenant_ids.len());
     for (index, id) in tenant_ids.into_iter().enumerate() {
+        server
+            .ensure_traces_spans_table_for_test(id)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} provision traces spans table for {id}: {error}",
+                    scenario.name
+                )
+            });
         let bootstrap = if index == 0 {
             server
                 .bootstrap_service(&format!("forge-writer-{index}"), &["admin"])
@@ -201,6 +296,41 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
         tenants.push(TenantWriter { id, jwt });
     }
     tenants
+}
+
+/// Assert the scheduler's operator-visible roster contains every journey tenant.
+///
+/// This journey writes only the canonical traces spans table, so a row for each
+/// tenant proves Forge will discover the intended table independently of
+/// staging-file history.
+///
+/// # Panics
+///
+/// Panics when the operator roster query fails or a canonical tenant table is
+/// missing.
+async fn assert_active_traces_roster(
+    server: &WyrdTestServer,
+    tenants: &[TenantWriter],
+    scenario: Scenario,
+) {
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    let roster = vala_sql::queries::olap_catalog::list_active_tables_for_operator(&operator_pool)
+        .await
+        .expect("active Bifrost table roster");
+    for tenant in tenants {
+        assert!(
+            roster.iter().any(|row| {
+                row.data_tenant_id == tenant.id.as_uuid() && row.fqn == "vala.traces.spans"
+            }),
+            "{} missing active traces roster entry for tenant {}: {roster:?}",
+            scenario.name,
+            tenant.id
+        );
+    }
 }
 
 /// Send one concurrent OTLP write from every pod for every tenant.
@@ -240,7 +370,7 @@ async fn write_cycle(
                     u64::try_from((cycle + 1) * 10_000 + (pod_index + 1) * 100 + tenant_index)
                         .expect("bounded seed");
                 let anchor = u64::try_from(
-                    chrono::Utc::now()
+                    (chrono::Utc::now() - chrono::Duration::days(2))
                         .timestamp_nanos_opt()
                         .expect("timestamp nanos"),
                 )
@@ -301,6 +431,74 @@ async fn pending_files(
     counts
 }
 
+/// Return the remaining logical staging tails for the journey's canonical table.
+///
+/// A tail is the at-most-one uncompacted file for one tenant, table, and
+/// partition day after bounded Forge convergence.
+///
+/// # Panics
+///
+/// Panics when shared Postgres inspection fails.
+async fn pending_tail_groups(
+    server: &WyrdTestServer,
+    tenants: &[TenantWriter],
+) -> Vec<(DataTenantId, chrono::NaiveDate, i64)> {
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    let mut tails = Vec::new();
+    for tenant in tenants {
+        let rows = sqlx::query_as::<_, (chrono::NaiveDate, i64)>(
+            "SELECT partition_day, count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted GROUP BY partition_day ORDER BY partition_day",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_all(operator_pool.pool())
+        .await
+        .expect("pending staging tails");
+        tails.extend(
+            rows.into_iter()
+                .map(|(partition_day, files)| (tenant.id, partition_day, files)),
+        );
+    }
+    tails
+}
+
+/// Assert the manual Forge clock has moved past the staging age guard.
+///
+/// # Panics
+///
+/// Panics when shared Postgres inspection fails or a journey file remains too
+/// new for periodic Forge discovery.
+async fn assert_pending_files_are_old_enough(
+    server: &WyrdTestServer,
+    tenants: &[TenantWriter],
+    scenario: Scenario,
+) {
+    let cutoff = server.forge_clock().now().expect("Forge clock") - chrono::Duration::minutes(2);
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    for tenant in tenants {
+        let newest: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT max(created_at) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_one(operator_pool.pool())
+        .await
+        .expect("pending file age");
+        assert!(
+            newest.is_some_and(|created_at| created_at < cutoff),
+            "{} tenant {} pending files are younger than the Forge cutoff {cutoff}: {newest:?}",
+            scenario.name,
+            tenant.id
+        );
+    }
+}
+
 /// Wait until every tenant's durable files have a committed Forge snapshot.
 ///
 /// # Panics
@@ -311,17 +509,13 @@ async fn wait_for_compaction(
     servers: &[WyrdTestServer],
     tenants: &[TenantWriter],
     scenario: Scenario,
-) {
+) -> Vec<(DataTenantId, chrono::NaiveDate, i64)> {
     let control = servers.first().expect("at least one Forge server");
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let pending = pending_files(control, tenants).await;
-        if pending.iter().all(|(_, count)| *count == 0) {
-            return;
-        }
         assert!(
             Instant::now() < deadline,
-            "{} Forge did not compact every tenant: {pending:?}",
+            "{} Forge did not report a complete converged tick",
             scenario.name
         );
         let ticks = servers
@@ -331,15 +525,115 @@ async fn wait_for_compaction(
                 tokio::spawn(async move { forge.run_once().await })
             })
             .collect::<Vec<_>>();
+        let mut outcomes = Vec::new();
         for tick in ticks {
-            tick.await
-                .expect("Forge convergence task")
-                .unwrap_or_else(|error| {
-                    panic!("{} Forge convergence tick: {error}", scenario.name)
-                });
+            outcomes.push(
+                tick.await
+                    .expect("Forge convergence task")
+                    .unwrap_or_else(|error| {
+                        panic!("{} Forge convergence tick: {error}", scenario.name)
+                    }),
+            );
+        }
+        if outcomes.iter().any(|outcome| outcome.is_converged()) {
+            let tails = pending_tail_groups(control, tenants).await;
+            assert!(
+                tails.iter().all(|(_, _, files)| *files <= 1),
+                "{} has more than one nonterminal file for a tenant/table/day: {tails:?}; outcomes={outcomes:?}",
+                scenario.name,
+            );
+            return tails;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// Wait for one Forge tick that reports complete no-work convergence.
+///
+/// # Panics
+///
+/// Panics when a server-owned Forge tick fails or no complete no-work tick is
+/// observed before the bounded convergence deadline.
+async fn wait_for_converged_tick(
+    server: &WyrdTestServer,
+    scenario: Scenario,
+) -> vala_bifrost_redux::forge::ForgeTickOutcome {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let outcome = server
+            .state()
+            .forge()
+            .expect("server-owned Forge")
+            .run_once()
+            .await
+            .unwrap_or_else(|error| panic!("{} final Forge tick: {error}", scenario.name));
+        if outcome.is_converged() {
+            return outcome;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} Forge did not reach a complete no-work tick: {outcome:?}",
+            scenario.name
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Delete terminal staging history for one still-active canonical registration.
+///
+/// # Panics
+///
+/// Panics when the operator-scoped test cleanup cannot remove compacted
+/// terminal rows for the selected tenant.
+async fn delete_terminal_file_list_history(server: &WyrdTestServer, tenant: DataTenantId) -> u64 {
+    sqlx::query(
+        "DELETE FROM vala.file_list \
+         WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' \
+           AND compacted AND committed_snapshot_id IS NOT NULL",
+    )
+    .bind(tenant.as_uuid())
+    .execute(
+        &server
+            .pg_fixture()
+            .superuser_pool()
+            .await
+            .expect("fixture owner pool"),
+    )
+    .await
+    .expect("delete terminal file-list history")
+    .rows_affected()
+}
+
+/// Assert an accepted open-partition tail has not created durable Forge work.
+///
+/// # Panics
+///
+/// Panics when audit inspection fails or Forge recorded a compaction operation
+/// for a tail that the planner accepted without a rewrite.
+async fn assert_no_compaction_audits(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    scenario: Scenario,
+) {
+    let mut conn = server
+        .state()
+        .postgres
+        .vala()
+        .tenant_conn(tenant)
+        .await
+        .expect("Forge audit tenant connection");
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox WHERE data_tenant_id = $1 AND operation LIKE 'forge.file_compact.%'",
+    )
+    .bind(tenant.as_uuid())
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("Forge audit count");
+    assert_eq!(
+        count, 0,
+        "{} accepted tail for tenant {tenant} recorded Forge compaction work",
+        scenario.name
+    );
 }
 
 /// Send the public same-table query used before and after Forge publication.

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
@@ -438,6 +438,7 @@ async fn build_bifrost_parts_from_boot(
         hints: staging_file_inbox,
         config: forge_config,
         maintenance_interval: DEFAULT_MAINTENANCE_INTERVAL,
+        clock: ForgeClock::system(),
     })?);
 
     let state = AppState::new(postgres, storage, bifrost)
@@ -955,6 +956,7 @@ mod pg_tests {
                 hints: inbox,
                 config,
                 maintenance_interval: Duration::from_millis(10),
+                clock: ForgeClock::system(),
             })
             .expect("Forge"),
         );

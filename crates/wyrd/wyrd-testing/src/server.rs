@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderValue, Request, Response, StatusCode, header};
-use chrono::Duration as ChronoDuration;
+use chrono::{Duration as ChronoDuration, Utc};
 use ed25519_dalek::VerifyingKey;
 use opendal::{Buffer, Entry, Metadata, Operator};
 use secrecy::{ExposeSecret, SecretString};
@@ -20,7 +20,8 @@ use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_bifrost_redux::forge::{
-    Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+    Forge, ForgeBuildConfig, ForgeClock, ForgeClockControl, ForgeConfig, ForgeObjectStore,
+    ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::{StagingFilePublisher, staging_file_channel};
 use vala_bifrost_redux::scribe::ScribeImpl;
@@ -137,6 +138,10 @@ struct WyrdTestServerInner {
     issuing_key: Arc<IssuingKey>,
     api_key: SecretString,
     forge_publisher: StagingFilePublisher,
+    /// Redux catalog retained for narrow test-only built-in provisioning.
+    bifrost_catalog: Arc<BifrostCatalog>,
+    /// Manual wall-clock control shared by every Forge fixture derived from this server.
+    forge_clock: ForgeClockControl,
 }
 
 enum Mode {
@@ -431,6 +436,39 @@ impl WyrdTestServer {
     #[must_use]
     pub fn clock(&self) -> ClockHandle {
         ClockHandle::new()
+    }
+
+    /// Returns the manual Forge wall-clock control, independent of Tokio time.
+    #[must_use]
+    pub fn forge_clock(&self) -> ForgeClockControl {
+        self.inner.forge_clock.clone()
+    }
+
+    /// Provision the canonical traces spans table for one test tenant.
+    ///
+    /// The production catalog keeps built-ins lazy. Integration journeys call
+    /// this narrow harness helper before emitting OTLP so the active-table
+    /// roster contains the real canonical table rather than a test-only
+    /// catalog row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the canonical definition is unavailable or the
+    /// Redux catalog cannot create or load the tenant table.
+    pub async fn ensure_traces_spans_table_for_test(
+        &self,
+        tenant: DataTenantId,
+    ) -> Result<(), WyrdTestServerError> {
+        let definition =
+            vala_bifrost_redux::tables::builtin_table("traces", "spans").ok_or_else(|| {
+                WyrdTestServerError::Start("missing traces spans built-in".to_owned())
+            })?;
+        self.inner
+            .bifrost_catalog
+            .ensure_builtin(tenant, definition)
+            .await
+            .map(|_| ())
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))
     }
 
     /// Advance the virtual clock.
@@ -1396,6 +1434,7 @@ impl WyrdTestServerBuilder {
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
+        let (forge_clock, forge_clock_control) = ForgeClock::manual(Utc::now());
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
                 vala: postgres.vala().clone(),
@@ -1407,6 +1446,7 @@ impl WyrdTestServerBuilder {
                 hints: forge_inbox,
                 config: forge_config,
                 maintenance_interval: self.forge_interval,
+                clock: forge_clock,
             })
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
         );
@@ -1463,7 +1503,7 @@ impl WyrdTestServerBuilder {
             None,
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
-            .with_bifrost_redux(bifrost_redux)
+            .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_forge(forge)
             .with_bifrost_ingest(ingest)
@@ -1497,6 +1537,8 @@ impl WyrdTestServerBuilder {
                 issuing_key,
                 api_key: SecretString::from(String::new()),
                 forge_publisher,
+                bifrost_catalog: bifrost_redux,
+                forge_clock: forge_clock_control,
             },
             mode: Mode::InProcess,
             shutdown_token: None,

@@ -46,3 +46,6 @@ CREATE POLICY tenant_isolation ON vala.refresh_epochs
 GRANT SELECT, INSERT, UPDATE, DELETE
     ON vala.bifrost_tables, vala.refresh_epochs
     TO wyrd_app;
+
+GRANT USAGE ON SCHEMA vala TO wyrd_platform_admin;
+GRANT SELECT ON vala.bifrost_tables TO wyrd_platform_admin;

@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
+use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -12,6 +13,7 @@ use super::compact::{ForgeTableKey, ForgeTickBudget, ForgeTickOutcome};
 use super::error::ForgeError;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::live_reconcile::{DestructiveMaintenance, IcebergReconciliationOutcome};
+use super::live_replace::IcebergRewriteDisposition;
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
 
@@ -152,26 +154,45 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let owner = Uuid::now_v7();
+        let now = self.core.clock.now()?;
         let mut outcome = ForgeTickOutcome::default();
+        let mut budget = ForgeTickBudget::default();
         let (mut tables, discovery_failures) = self.discover_tables().await?;
+        outcome.tables_discovered = tables.len().saturating_add(discovery_failures);
+        outcome.tables_examined = discovery_failures;
         outcome.tables_failed = outcome.tables_failed.saturating_add(discovery_failures);
+        outcome.stage_failures = outcome.stage_failures.saturating_add(discovery_failures);
+        outcome.pending_work |= discovery_failures > 0;
         tables.sort_by(|left, right| {
             left.tenant
                 .cmp(&right.tenant)
                 .then_with(|| left.table_ref.fqn().cmp(&right.table_ref.fqn()))
         });
+        rotate_tables(&mut tables, self.periodic_cursor.load(Ordering::Acquire));
         for key in tables {
             if stop.is_cancelled() {
+                outcome.pending_work = true;
                 break;
             }
             match self
-                .process_periodic_table(&key, owner, stop, &mut outcome)
+                .process_periodic_table(&key, owner, stop, &mut budget, now, &mut outcome)
                 .await
             {
-                TableRunStatus::Succeeded => outcome.tables_succeeded += 1,
-                TableRunStatus::Skipped => outcome.tables_skipped += 1,
-                TableRunStatus::Failed => outcome.tables_failed += 1,
+                TableRunStatus::Succeeded => {
+                    outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1)
+                }
+                TableRunStatus::Skipped => {
+                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1)
+                }
+                TableRunStatus::Failed => {
+                    outcome.tables_failed = outcome.tables_failed.saturating_add(1)
+                }
             }
+            outcome.tables_examined = outcome.tables_examined.saturating_add(1);
+        }
+        if !stop.is_cancelled() && outcome.tables_examined == outcome.tables_discovered {
+            outcome.tick_complete = true;
+            self.periodic_cursor.fetch_add(1, Ordering::AcqRel);
         }
         Ok(outcome)
     }
@@ -193,17 +214,18 @@ impl Forge {
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let keys = self.drain_hint_keys(first).await;
         let _tick = self.tick.lock().await;
+        let now = self.core.clock.now()?;
         let mut aggregate = ForgeTickOutcome::default();
         let mut budget = ForgeTickBudget::default();
         for key in keys {
             if stop.is_cancelled() {
                 break;
             }
-            match self.run_hinted_key(&key, stop, &mut budget).await {
+            match self.run_hinted_key(&key, stop, &mut budget, now).await {
                 Ok(outcome) => aggregate.merge(outcome),
                 Err(error) => {
-                    aggregate.tables_failed += 1;
-                    aggregate.stage_failures += 1;
+                    aggregate.tables_failed = aggregate.tables_failed.saturating_add(1);
+                    aggregate.stage_failures = aggregate.stage_failures.saturating_add(1);
                     aggregate.pending_work = true;
                     tracing::error!(
                         error = %error,
@@ -233,6 +255,7 @@ impl Forge {
         key: &ForgeGroupKey,
         stop: &CancellationToken,
         budget: &mut ForgeTickBudget,
+        now: DateTime<Utc>,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let table_key = ForgeTableKey {
             tenant: key.tenant,
@@ -265,23 +288,23 @@ impl Forge {
         let result = async {
             let mut outcome = ForgeTickOutcome::default();
             let recovered = self
-                .run_compaction_reconciliation_for_table(&mut lease, &table_key, &binding)
+                .run_compaction_reconciliation_for_table(&mut lease, &table_key, &binding, now)
                 .await?;
-            outcome.reconciliation_recovered += recovered;
-            outcome.reconciled += recovered;
+            outcome.reconciliation_recovered =
+                outcome.reconciliation_recovered.saturating_add(recovered);
+            outcome.reconciled = outcome.reconciled.saturating_add(recovered);
             if stop.is_cancelled() {
-                outcome.tables_skipped += 1;
+                outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                 outcome.pending_work = true;
                 return Ok(outcome);
             }
-            let now = chrono::Utc::now();
             let live = match self
                 .reconcile_live_replacements(&mut lease, &table_key, &binding, stop, now)
                 .await
             {
                 Ok(live) => live,
                 Err(ForgeError::Shutdown) => {
-                    outcome.tables_skipped += 1;
+                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                     outcome.pending_work = true;
                     return Ok(outcome);
                 }
@@ -289,12 +312,19 @@ impl Forge {
             };
             record_live_reconciliation(&mut outcome, &live);
             match staging_stage_result(
-                self.run_targeted_compaction_for_table(&mut lease, key, &binding, budget, stop)
-                    .await,
+                self.run_targeted_compaction_for_table(
+                    &mut lease,
+                    key,
+                    &binding,
+                    budget,
+                    now.date_naive(),
+                    stop,
+                )
+                .await,
             )? {
                 StagingStageResult::Completed(staging) => outcome.merge(staging),
                 StagingStageResult::Cancelled => {
-                    outcome.tables_skipped += 1;
+                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                     outcome.pending_work = true;
                     return Ok(outcome);
                 }
@@ -302,11 +332,13 @@ impl Forge {
             if stop.is_cancelled()
                 || live.destructive_maintenance == DestructiveMaintenance::Blocked
             {
-                outcome.tables_skipped += 1;
+                outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                 outcome.pending_work = true;
                 return Ok(outcome);
             }
-            outcome.tables_succeeded += 1;
+            self.run_one_live_replacement(&mut lease, &binding, budget, now, stop, &mut outcome)
+                .await?;
+            outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1);
             Ok(outcome)
         }
         .await;
@@ -358,6 +390,8 @@ impl Forge {
         key: &ForgeTableKey,
         owner: Uuid,
         stop: &CancellationToken,
+        budget: &mut ForgeTickBudget,
+        now: DateTime<Utc>,
         outcome: &mut ForgeTickOutcome,
     ) -> TableRunStatus {
         let binding = match TenantTableBinding::resolve((key.tenant, key.table_ref.clone())) {
@@ -384,7 +418,7 @@ impl Forge {
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                outcome.lease_contention += 1;
+                outcome.lease_contention = outcome.lease_contention.saturating_add(1);
                 return TableRunStatus::Skipped;
             }
             Err(error) => {
@@ -393,7 +427,7 @@ impl Forge {
             }
         };
         let table_result = self
-            .run_periodic_table_stages(&mut lease, key, &binding, stop, outcome)
+            .run_periodic_table_stages(&mut lease, key, &binding, stop, budget, now, outcome)
             .await;
         let release_result = self.release_lease(&lease).await;
         match (table_result, release_result) {
@@ -431,19 +465,23 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         stop: &CancellationToken,
+        budget: &mut ForgeTickBudget,
+        now: DateTime<Utc>,
         outcome: &mut ForgeTickOutcome,
     ) -> Result<TableStageDisposition, ForgeError> {
         let reconciliation = self
-            .run_compaction_reconciliation_for_table(lease, key, binding)
+            .run_compaction_reconciliation_for_table(lease, key, binding, now)
             .await?;
-        outcome.reconciliation_recovered += reconciliation;
-        outcome.reconciled += reconciliation;
+        outcome.reconciliation_recovered = outcome
+            .reconciliation_recovered
+            .saturating_add(reconciliation);
+        outcome.reconciled = outcome.reconciled.saturating_add(reconciliation);
         if stop.is_cancelled() {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
         let live = match self
-            .reconcile_live_replacements(lease, key, binding, stop, chrono::Utc::now())
+            .reconcile_live_replacements(lease, key, binding, stop, now)
             .await
         {
             Ok(live) => live,
@@ -456,7 +494,7 @@ impl Forge {
         record_live_reconciliation(outcome, &live);
 
         let compaction = match staging_stage_result(
-            self.run_compaction_bins_for_table(lease, key, binding, stop)
+            self.run_compaction_bins_for_table(lease, key, binding, budget, now, stop)
                 .await,
         )? {
             StagingStageResult::Completed(compaction) => compaction,
@@ -475,11 +513,18 @@ impl Forge {
             return Ok(TableStageDisposition::Blocked);
         }
 
-        let expiry = self
-            .run_snapshot_expiry_for_table(lease, key, binding)
+        self.run_one_live_replacement(lease, binding, budget, now, stop, outcome)
             .await?;
-        outcome.expiry_reconciled += expiry;
-        outcome.reconciled += expiry;
+        if stop.is_cancelled() {
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Cancelled);
+        }
+
+        let expiry = self
+            .run_snapshot_expiry_for_table(lease, key, binding, now)
+            .await?;
+        outcome.expiry_reconciled = outcome.expiry_reconciled.saturating_add(expiry);
+        outcome.reconciled = outcome.reconciled.saturating_add(expiry);
         if stop.is_cancelled() {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
@@ -492,13 +537,103 @@ impl Forge {
             return Ok(TableStageDisposition::Cancelled);
         }
         let gc = self
-            .run_orphan_gc_for_table(lease, key, binding, &live_set)
+            .run_orphan_gc_for_table(lease, key, binding, &live_set, now)
             .await?;
-        outcome.gc_reconciled += gc.recovered;
-        outcome.gc_deleted += gc.deleted;
-        outcome.gc_skipped += gc.skipped;
-        outcome.reconciled += gc.recovered;
+        outcome.gc_reconciled = outcome.gc_reconciled.saturating_add(gc.recovered);
+        outcome.gc_candidates = outcome.gc_candidates.saturating_add(gc.candidates);
+        outcome.gc_deleted = outcome.gc_deleted.saturating_add(gc.deleted);
+        outcome.gc_skipped = outcome.gc_skipped.saturating_add(gc.skipped);
+        outcome.reconciled = outcome.reconciled.saturating_add(gc.recovered);
         Ok(TableStageDisposition::Completed)
+    }
+
+    /// Attempts at most one current-snapshot live rewrite group for one table.
+    ///
+    /// The selected group retains its plan's base snapshot identity through the
+    /// replacement fence. Committed work alone consumes the caller-owned global
+    /// file, byte, and group budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, discovery, lease, rewrite, or fence failures. A budget
+    /// rejection and snapshot drift are recorded as pending outcome evidence.
+    async fn run_one_live_replacement(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        budget: &mut ForgeTickBudget,
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+        outcome: &mut ForgeTickOutcome,
+    ) -> Result<(), ForgeError> {
+        let table = self.load_table(&binding.table_ident()).await?;
+        let plan = self
+            .discover_live_rewrites(binding, &table, now.date_naive())
+            .await?;
+        outcome.live_candidates = outcome.live_candidates.saturating_add(
+            plan.groups
+                .iter()
+                .map(|group| group.files.len())
+                .sum::<usize>(),
+        );
+        let Some(group) = plan.groups.first() else {
+            return Ok(());
+        };
+        outcome.live_groups_planned = outcome.live_groups_planned.saturating_add(1);
+        let files = group.files.len();
+        let bytes = group.files.iter().try_fold(0_u64, |total, file| {
+            total
+                .checked_add(file.file_size_bytes)
+                .ok_or_else(|| ForgeError::InvalidConfig {
+                    detail: "live rewrite input bytes overflow the Forge tick budget".to_owned(),
+                })
+        })?;
+        let admitted = budget.bins < self.core.config.max_bins_per_tick
+            && budget
+                .files
+                .checked_add(files)
+                .is_some_and(|value| value <= self.core.config.max_files_per_tick)
+            && budget
+                .bytes
+                .checked_add(bytes)
+                .is_some_and(|value| value <= self.core.config.max_bytes_per_tick);
+        if !admitted {
+            outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+            outcome.pending_work = true;
+            return Ok(());
+        }
+        match self
+            .replace_live_group(lease, binding, &table, plan.base_snapshot_id, group, stop)
+            .await?
+        {
+            IcebergRewriteDisposition::Committed {
+                input_files,
+                output_files,
+                output_bytes,
+                input_rows,
+                output_rows,
+                spill_bytes,
+                ..
+            } => {
+                budget.files = budget.files.saturating_add(files);
+                budget.bytes = budget.bytes.saturating_add(bytes);
+                budget.bins = budget.bins.saturating_add(1);
+                outcome.live_groups_committed = outcome.live_groups_committed.saturating_add(1);
+                outcome.live_input_files = outcome.live_input_files.saturating_add(input_files);
+                outcome.live_input_bytes = outcome.live_input_bytes.saturating_add(bytes);
+                outcome.live_output_files = outcome.live_output_files.saturating_add(output_files);
+                outcome.live_output_bytes = outcome.live_output_bytes.saturating_add(output_bytes);
+                outcome.input_rows = outcome.input_rows.saturating_add(input_rows);
+                outcome.output_rows = outcome.output_rows.saturating_add(output_rows);
+                outcome.spill_bytes = outcome.spill_bytes.saturating_add(spill_bytes);
+            }
+            IcebergRewriteDisposition::SnapshotChanged => {
+                outcome.live_snapshot_changes = outcome.live_snapshot_changes.saturating_add(1);
+                outcome.pending_work = true;
+            }
+            IcebergRewriteDisposition::NoWork => {}
+        }
+        Ok(())
     }
 
     /// Conditionally release one table lease through the configured timeout.
@@ -528,9 +663,9 @@ impl Forge {
         outcome: &mut ForgeTickOutcome,
         error: &ForgeError,
     ) {
-        outcome.stage_failures += 1;
+        outcome.stage_failures = outcome.stage_failures.saturating_add(1);
         if matches!(error, ForgeError::FenceLost { .. }) {
-            outcome.fence_losses += 1;
+            outcome.fence_losses = outcome.fence_losses.saturating_add(1);
         }
         tracing::error!(
             tenant = %key.tenant,
@@ -602,6 +737,14 @@ fn order_hint_keys(keys: HashSet<ForgeGroupKey>) -> Vec<ForgeGroupKey> {
             .then_with(|| left.partition_day.cmp(&right.partition_day))
     });
     keys
+}
+
+/// Rotates a sorted periodic roster without changing its stable relative order.
+fn rotate_tables(tables: &mut [ForgeTableKey], cursor: u64) {
+    if !tables.is_empty() {
+        let offset = usize::try_from(cursor).unwrap_or(usize::MAX) % tables.len();
+        tables.rotate_left(offset);
+    }
 }
 
 #[cfg(test)]
@@ -737,5 +880,83 @@ mod tests {
             periodic.find("run_snapshot_expiry_for_table")
                 < periodic.find("run_orphan_gc_for_table")
         );
+    }
+
+    /// Proves one caller-owned budget cannot admit work from a later table.
+    #[test]
+    fn forge_tick_budget_is_global_across_tables() {
+        let mut budget = ForgeTickBudget::default();
+        budget.files = budget.files.saturating_add(2);
+        budget.bytes = budget.bytes.saturating_add(20);
+        budget.bins = budget.bins.saturating_add(1);
+        let fits_second = budget.files.checked_add(2).is_some_and(|value| value <= 3)
+            && budget
+                .bytes
+                .checked_add(20)
+                .is_some_and(|value| value <= 30)
+            && budget.bins < 2;
+        assert!(!fits_second);
+        let fits_third_dimension = budget.files.checked_add(1).is_some_and(|value| value <= 3)
+            && budget.bytes.checked_add(5).is_some_and(|value| value <= 30)
+            && budget.bins < 2;
+        assert!(fits_third_dimension);
+    }
+
+    /// Proves the process-local cursor rotates a stable roster and wraps.
+    #[test]
+    fn forge_scheduler_rotation_is_fair_and_wraps() {
+        let tenant = DataTenantId::try_from(Uuid::now_v7()).expect("tenant ID must be valid");
+        let mut tables = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| ForgeTableKey {
+                tenant,
+                table_ref: TableRef::new(BifrostNamespace::Bifrost, name),
+            })
+            .collect::<Vec<_>>();
+        rotate_tables(&mut tables, 1);
+        assert_eq!(tables[0].table_ref.name, "b");
+        rotate_tables(&mut tables, 2);
+        assert_eq!(tables[0].table_ref.name, "a");
+        rotate_tables(&mut tables, u64::MAX);
+        assert_eq!(tables.len(), 3);
+    }
+
+    /// Proves complete outcome merging is saturating and convergence is strict.
+    #[test]
+    fn forge_tick_outcome_merge_and_convergence_are_complete() {
+        let mut merged = ForgeTickOutcome {
+            groups_seen: usize::MAX,
+            tables_failed: usize::MAX,
+            staging_input_bytes: u64::MAX,
+            live_input_bytes: u64::MAX,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        merged.merge(ForgeTickOutcome {
+            groups_seen: 1,
+            tables_failed: 1,
+            staging_input_bytes: 1,
+            live_input_bytes: 1,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        });
+        assert_eq!(merged.groups_seen, usize::MAX);
+        assert_eq!(merged.tables_failed, usize::MAX);
+        assert_eq!(merged.staging_input_bytes, u64::MAX);
+        assert_eq!(merged.live_input_bytes, u64::MAX);
+        assert!(!merged.is_converged());
+        let converged = ForgeTickOutcome {
+            tables_discovered: 2,
+            tables_examined: 2,
+            tables_succeeded: 2,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        assert!(converged.is_converged());
+        let partial = ForgeTickOutcome {
+            pending_work: true,
+            ..converged
+        };
+        assert!(!partial.is_converged());
     }
 }

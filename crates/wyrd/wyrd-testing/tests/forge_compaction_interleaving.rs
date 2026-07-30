@@ -1689,7 +1689,7 @@ async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs()
 ///
 /// The journey fails when durable lease, SQL, or Iceberg operations diverge
 /// from the production Forge contract.
-async fn forge_incremental_interleaving() {
+async fn periodic_and_hints_serialize_without_false_terminal_audit() {
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
         .start_bound()

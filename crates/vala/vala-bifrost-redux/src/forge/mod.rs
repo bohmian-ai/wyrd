@@ -6,12 +6,13 @@
 //! to recover work after a process or catalog failure.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use iceberg::Catalog;
 
 pub(crate) mod binpack;
+mod clock;
 pub(crate) mod compact;
 mod discovery;
 pub(crate) mod error;
@@ -25,6 +26,9 @@ pub(crate) mod rewrite;
 pub(crate) mod right_size;
 mod scheduler;
 
+pub use clock::ForgeClock;
+#[cfg(feature = "test-support")]
+pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
 pub use rewrite::ForgeRewriteRuntime;
@@ -60,6 +64,8 @@ pub struct ForgeBuildConfig {
     pub config: ForgeConfig,
     /// Delay between complete periodic maintenance ticks.
     pub maintenance_interval: Duration,
+    /// Concrete wall clock captured once by each Forge work batch.
+    pub clock: ForgeClock,
 }
 
 /// The single stateful owner for all Forge maintenance workflows.
@@ -72,6 +78,8 @@ pub struct Forge {
     tick: tokio::sync::Mutex<()>,
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
+    /// Process-local starting offset for complete periodic table passes.
+    periodic_cursor: AtomicU64,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -92,6 +100,8 @@ pub(crate) struct ForgeCore {
     config: ForgeConfig,
     /// Delay between periodic scheduler ticks.
     maintenance_interval: Duration,
+    /// Wall clock shared by periodic and hinted maintenance batches.
+    clock: ForgeClock,
 }
 
 impl Forge {
@@ -130,6 +140,7 @@ impl Forge {
             rewrite,
             config: build.config,
             maintenance_interval: build.maintenance_interval,
+            clock: build.clock,
         };
         debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {
@@ -137,6 +148,14 @@ impl Forge {
             hints: tokio::sync::Mutex::new(build.hints),
             tick: tokio::sync::Mutex::new(()),
             running: AtomicBool::new(false),
+            periodic_cursor: AtomicU64::new(0),
         })
+    }
+
+    /// Returns this Forge clock for test-only fixture reconstruction.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn clock_for_test(&self) -> ForgeClock {
+        self.core.clock.clone()
     }
 }

@@ -29,7 +29,7 @@ impl Forge {
     /// Returns [`ForgeError::Catalog`] for manifest reads and
     /// [`ForgeError::Invariant`] for malformed live manifest identities, bounds,
     /// partition values, or paths. This method performs no catalog or object write.
-    async fn discover_live_rewrites(
+    pub(super) async fn discover_live_rewrites(
         &self,
         binding: &TenantTableBinding,
         table: &Table,

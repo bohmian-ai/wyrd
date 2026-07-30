@@ -911,6 +911,7 @@ impl ForgeFixture {
                 hints: inbox,
                 config,
                 maintenance_interval: std::time::Duration::from_secs(60),
+                clock: self.forge.clock_for_test(),
             })
             .map_err(|_| "invalid Forge fixture config")?,
         );

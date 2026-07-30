@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use sqlx::Row;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
 use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
@@ -18,6 +17,7 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::catalog::{TableRef, TenantTableBinding};
+#[cfg(test)]
 use crate::namespaces::BifrostNamespace;
 
 use super::Forge;
@@ -98,59 +98,38 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<usize, ForgeError> {
-        self.run_snapshot_expiry_for_table_inner(lease, key, binding)
+        self.run_snapshot_expiry_for_table_inner(lease, key, binding, now)
             .await
     }
 }
 
-/// Discover tenant/table pairs represented in the server-owned file list.
+/// Discover tenant/table pairs from active durable catalog registrations.
 ///
 /// Invalid rows are counted and skipped so one malformed table identity does
 /// not prevent maintenance for the remaining tables.
 impl Forge {
     async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        let rows = sqlx::query(
-            r"SELECT DISTINCT data_tenant_id, namespace, table_name
-             FROM vala.file_list
-            ORDER BY data_tenant_id, namespace, table_name",
+        let rows = vala_sql::queries::olap_catalog::list_active_tables_for_operator(
+            &self.core.operator_pool,
         )
-        .fetch_all(self.core.operator_pool.pool())
         .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
+        .map_err(ForgeError::Sql)?;
         let mut failures = 0;
         let mut tables = Vec::new();
         for row in rows {
             let table: Result<ForgeTableKey, ForgeError> = (|| {
-                let tenant_uuid: Uuid =
-                    row.try_get("data_tenant_id")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let tenant = DataTenantId::try_from(tenant_uuid).map_err(|error| {
+                let tenant = DataTenantId::try_from(row.data_tenant_id).map_err(|error| {
                     ForgeError::SnapshotExpiry {
                         detail: error.to_string(),
                     }
                 })?;
-                let namespace: String =
-                    row.try_get("namespace")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let table_name: String =
-                    row.try_get("table_name")
-                        .map_err(|error| ForgeError::SnapshotExpiry {
-                            detail: error.to_string(),
-                        })?;
-                let namespace = BifrostNamespace::from_wire(&namespace).ok_or_else(|| {
-                    ForgeError::SnapshotExpiry {
-                        detail: format!("unknown Bifrost namespace `{namespace}`"),
-                    }
-                })?;
-                Ok(ForgeTableKey {
-                    tenant,
-                    table_ref: TableRef::new(namespace, table_name),
-                })
+                let table_ref =
+                    TableRef::parse_fqn(&row.fqn).ok_or_else(|| ForgeError::SnapshotExpiry {
+                        detail: format!("invalid registered Bifrost FQN `{}`", row.fqn),
+                    })?;
+                Ok(ForgeTableKey { tenant, table_ref })
             })();
             match table {
                 Ok(table) => tables.push(table),
@@ -173,10 +152,11 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<usize, ForgeError> {
-        let mut recovered = self.reconcile_expiry(lease, key, binding).await?;
+        let mut recovered = self.reconcile_expiry(lease, key, binding, now).await?;
         let table = self.load_table(&binding.table_ident()).await?;
-        let cutoff_ms = expiry_cutoff_ms(self.core.config.snapshot_retention)?;
+        let cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
         let selected = select_expirable_snapshots(
             &summaries,
@@ -199,12 +179,16 @@ impl Forge {
 }
 
 /// Convert a retention duration into the UTC millisecond cutoff used by Iceberg.
-fn expiry_cutoff_ms(retention: Duration) -> Result<i64, ForgeError> {
+fn expiry_cutoff_ms(now: DateTime<Utc>, retention: Duration) -> Result<i64, ForgeError> {
     let retention_ms =
         i64::try_from(retention.as_millis()).map_err(|_| ForgeError::InvalidConfig {
             detail: "snapshot_retention exceeds an i64 millisecond timestamp".to_owned(),
         })?;
-    Ok(Utc::now().timestamp_millis().saturating_sub(retention_ms))
+    now.timestamp_millis()
+        .checked_sub(retention_ms)
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "snapshot retention cutoff overflows UTC milliseconds".to_owned(),
+        })
 }
 
 /// Extract snapshot timestamps, parent links, and metadata reference heads.
@@ -404,6 +388,7 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        now: DateTime<Utc>,
     ) -> Result<usize, ForgeError> {
         let (prepared, terminal) = self.load_expiry_audits(key).await?;
         let mut recovered = 0;
@@ -434,7 +419,7 @@ impl Forge {
                 recovered += 1;
                 continue;
             }
-            if Utc::now()
+            if now
                 .signed_duration_since(created_at)
                 .to_std()
                 .unwrap_or_default()

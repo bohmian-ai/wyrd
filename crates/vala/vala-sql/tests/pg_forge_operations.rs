@@ -8,6 +8,12 @@ mod pg_tests {
     //! Run via `mise run test:sql`.
 
     mod forge_operations {
+        //! Exercises the concrete Forge SQL owner against real PostgreSQL.
+        //!
+        //! The tests use tenant transactions for public workflows and the
+        //! migrator fixture only to inspect catalogs or arrange deliberately
+        //! corrupt projection state that ordinary writers cannot create.
+
         use sqlx::PgPool;
         use sqlx::types::Uuid;
         use wyrd_dev_fixtures::pg::PgFixture;
@@ -19,11 +25,11 @@ mod pg_tests {
             ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
         };
 
-        use vala_sql::SqlError;
         use vala_sql::queries::forge_operations::ForgeOperations;
         use vala_sql::row_types::forge_operations::{
             ForgeOperationFamily, ForgeOperationTransition,
         };
+        use vala_sql::{SqlError, TenantConn};
 
         // -----------------------------------------------------------------------
         // Fixture and helpers
@@ -40,6 +46,11 @@ mod pg_tests {
         }
 
         /// Starts an isolated Postgres fixture with a second tenant.
+        ///
+        /// # Panics
+        ///
+        /// Panics when PostgreSQL setup, role-backed pool creation, or tenant
+        /// seeding fails.
         async fn setup() -> TestFixtures {
             let fixture = PgFixture::start().await.expect("fixture");
             let superuser = fixture.superuser_pool().await.expect("superuser pool");
@@ -50,7 +61,7 @@ mod pg_tests {
                     &format!("test-{}", tenant_b.as_uuid().simple()),
                 )
                 .await
-                .unwrap();
+                .expect("seed second tenant");
             TestFixtures {
                 fixture,
                 superuser,
@@ -69,6 +80,10 @@ mod pg_tests {
         }
 
         /// Builds one typed compaction detail for a resource and phase.
+        ///
+        /// # Panics
+        ///
+        /// Panics only if the fixed test storage paths violate `StoragePath`.
         fn compaction_detail(phase: ForgeCompactionPhase, resource: &str) -> AuditDetail {
             AuditDetail::ForgeCompaction {
                 operation_id: Uuid::now_v7(),
@@ -108,12 +123,20 @@ mod pg_tests {
         }
 
         /// Builds a Prepared compaction event with a fresh operation ID.
+        ///
+        /// # Panics
+        ///
+        /// Panics only if the fixed compaction storage paths are invalid.
         fn compact_prepared_event(resource: &str) -> AuditEvent {
             let detail = compaction_detail(ForgeCompactionPhase::Prepared, resource);
             event("forge.file_compact.prepared", resource, Some(detail))
         }
 
         /// Builds a Committed event preserving a Prepared operation identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `prepared_detail` is not a compaction detail.
         fn compact_committed_event(prepared_detail: &AuditDetail, resource: &str) -> AuditEvent {
             let detail = match prepared_detail {
                 AuditDetail::ForgeCompaction {
@@ -138,7 +161,40 @@ mod pg_tests {
             event("forge.file_compact.committed", resource, Some(detail))
         }
 
+        /// Builds a Recovered event preserving a Prepared operation identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `prepared_detail` is not a compaction detail.
+        fn compact_recovered_event(prepared_detail: &AuditDetail, resource: &str) -> AuditEvent {
+            let detail = match prepared_detail {
+                AuditDetail::ForgeCompaction {
+                    operation_id,
+                    input_file_ids,
+                    input_paths,
+                    output_paths,
+                    writer_recipe_version,
+                    ..
+                } => AuditDetail::ForgeCompaction {
+                    operation_id: *operation_id,
+                    phase: ForgeCompactionPhase::Recovered,
+                    group: resource.to_owned(),
+                    input_file_ids: input_file_ids.clone(),
+                    input_paths: input_paths.clone(),
+                    output_paths: output_paths.clone(),
+                    snapshot_id: Some(42),
+                    writer_recipe_version: writer_recipe_version.clone(),
+                },
+                _ => panic!("expected ForgeCompaction"),
+            };
+            event("forge.file_compact.recovered", resource, Some(detail))
+        }
+
         /// Builds a Reset event preserving a Prepared operation identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `prepared_detail` is not a compaction detail.
         fn compact_reset_event(prepared_detail: &AuditDetail, resource: &str) -> AuditEvent {
             let detail = match prepared_detail {
                 AuditDetail::ForgeCompaction {
@@ -164,6 +220,16 @@ mod pg_tests {
         }
 
         /// Runs one Prepared transition and commits successful work.
+        ///
+        /// # Errors
+        ///
+        /// Returns the Forge transition error without committing when the
+        /// public owner rejects the event or PostgreSQL IO fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture cannot acquire or commit its tenant
+        /// transaction, or when the fixed resource cannot construct the owner.
         async fn append_prepared(
             pool: &PgPool,
             tenant: DataTenantId,
@@ -171,16 +237,28 @@ mod pg_tests {
             family: ForgeOperationFamily,
             event: &AuditEvent,
         ) -> Result<ForgeOperationTransition, SqlError> {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
-            let ops = ForgeOperations::new(resource, family).unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for prepared transition");
+            let ops = ForgeOperations::new(resource, family).expect("valid Forge resource");
             let result = ops.append_prepared(&mut conn, event).await;
             if result.is_ok() {
-                conn.commit().await.unwrap();
+                conn.commit().await.expect("prepared transition commit");
             }
             result
         }
 
         /// Runs one terminal transition and commits successful work.
+        ///
+        /// # Errors
+        ///
+        /// Returns the Forge transition error without committing when the
+        /// public owner rejects the event or PostgreSQL IO fails.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture cannot acquire or commit its tenant
+        /// transaction, or when the fixed resource cannot construct the owner.
         async fn append_terminal(
             pool: &PgPool,
             tenant: DataTenantId,
@@ -188,16 +266,27 @@ mod pg_tests {
             family: ForgeOperationFamily,
             event: &AuditEvent,
         ) -> Result<ForgeOperationTransition, SqlError> {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
-            let ops = ForgeOperations::new(resource, family).unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for terminal transition");
+            let ops = ForgeOperations::new(resource, family).expect("valid Forge resource");
             let result = ops.append_terminal(&mut conn, event).await;
             if result.is_ok() {
-                conn.commit().await.unwrap();
+                conn.commit().await.expect("terminal transition commit");
             }
             result
         }
 
         /// Reads one bounded open-operation page and commits the read transaction.
+        ///
+        /// # Errors
+        ///
+        /// Returns the bounded-read error from the public Forge owner.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture cannot acquire or commit its tenant
+        /// transaction, or when the fixed resource cannot construct the owner.
         async fn list_open(
             pool: &PgPool,
             tenant: DataTenantId,
@@ -206,16 +295,23 @@ mod pg_tests {
             cap: usize,
         ) -> Result<vala_sql::row_types::forge_operations::OpenForgeOperationPage, SqlError>
         {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
-            let ops = ForgeOperations::new(resource, family).unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for open read");
+            let ops = ForgeOperations::new(resource, family).expect("valid Forge resource");
             let result = ops.list_open(&mut conn, cap).await;
-            conn.commit().await.unwrap();
+            conn.commit().await.expect("open read commit");
             result
         }
 
         /// Counts projection rows for one tenant through a tenant transaction.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture cannot acquire, query, or commit the tenant
+        /// transaction.
         async fn count_state(pool: &PgPool, tenant: DataTenantId) -> i64 {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            let mut conn = TenantConn::acquire(pool, tenant)
                 .await
                 .expect("tenant connection for state count");
             let row: (i64,) = sqlx::query_as(
@@ -230,8 +326,13 @@ mod pg_tests {
         }
 
         /// Counts audit rows for one tenant through a tenant transaction.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixture cannot acquire, query, or commit the tenant
+        /// transaction.
         async fn count_audit(pool: &PgPool, tenant: DataTenantId) -> i64 {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            let mut conn = TenantConn::acquire(pool, tenant)
                 .await
                 .expect("tenant connection for audit count");
             let row: (i64,) =
@@ -244,11 +345,147 @@ mod pg_tests {
             row.0
         }
 
+        /// Minimal persisted state used to assert transition and rollback effects.
+        #[derive(Debug, PartialEq, Eq)]
+        struct StateSnapshot {
+            /// Current closed phase stored by the projection.
+            phase: String,
+            /// Prepared evidence sequence retained by the projection.
+            prepared_audit_seq: i64,
+            /// Terminal evidence sequence retained after a closing transition.
+            terminal_audit_seq: Option<i64>,
+        }
+
+        /// Reads one operation's persisted phase and evidence sequences.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the tenant transaction or exact-row query fails.
+        async fn state_snapshot(
+            pool: &PgPool,
+            tenant: DataTenantId,
+            family: ForgeOperationFamily,
+            operation_id: Uuid,
+        ) -> StateSnapshot {
+            let mut conn = TenantConn::acquire(pool, tenant)
+                .await
+                .expect("tenant connection for state snapshot");
+            let row: (String, i64, Option<i64>) = sqlx::query_as(
+                r#"
+                SELECT phase, prepared_audit_seq, terminal_audit_seq
+                  FROM vala.forge_operation_state
+                 WHERE data_tenant_id = wyrd.current_tenant()
+                   AND resource = $1
+                   AND family = $2
+                   AND operation_id = $3
+                "#,
+            )
+            .bind(resource())
+            .bind(family.as_str())
+            .bind(operation_id)
+            .fetch_one(&mut **conn.transaction())
+            .await
+            .expect("state snapshot query");
+            conn.commit().await.expect("state snapshot commit");
+            StateSnapshot {
+                phase: row.0,
+                prepared_audit_seq: row.1,
+                terminal_audit_seq: row.2,
+            }
+        }
+
+        /// Extracts the deterministic operation identity from a Forge detail.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `detail` is not one of the four Forge detail variants.
+        fn forge_operation_id(detail: &AuditDetail) -> Uuid {
+            match detail {
+                AuditDetail::ForgeCompaction { operation_id, .. }
+                | AuditDetail::ForgeIcebergRewrite { operation_id, .. }
+                | AuditDetail::ForgeSnapshotExpire { operation_id, .. }
+                | AuditDetail::ForgeOrphanGc { operation_id, .. } => *operation_id,
+                _ => panic!("expected Forge audit detail"),
+            }
+        }
+
+        /// Inserts one deliberately corrupt Prepared projection through the admin pool.
+        ///
+        /// The helper never mutates append-only audit evidence. Its caller
+        /// chooses the prepared sequence so tests can point at absent or
+        /// inconsistent evidence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when detail serialization or the admin insert fails.
+        async fn insert_prepared_projection(
+            superuser: &PgPool,
+            tenant: DataTenantId,
+            resource: &str,
+            family: ForgeOperationFamily,
+            detail: &AuditDetail,
+            prepared_audit_seq: i64,
+        ) {
+            let detail_json = serde_json::to_value(detail).expect("Forge detail JSON");
+            sqlx::query(
+                r#"
+                INSERT INTO vala.forge_operation_state
+                    (data_tenant_id, resource, family, operation_id, phase,
+                     prepared_detail, current_detail, prepared_audit_seq,
+                     terminal_audit_seq, prepared_at, updated_at)
+                VALUES ($1, $2, $3, $4, 'prepared',
+                        $5::jsonb, $5::jsonb, $6, NULL, now(), now())
+                "#,
+            )
+            .bind(tenant.as_uuid())
+            .bind(resource)
+            .bind(family.as_str())
+            .bind(forge_operation_id(detail))
+            .bind(detail_json)
+            .bind(prepared_audit_seq)
+            .execute(superuser)
+            .await
+            .expect("insert corrupt prepared projection");
+        }
+
+        /// Redirects one test-owned projection to another prepared evidence sequence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the admin update does not affect exactly one row.
+        async fn redirect_prepared_evidence(
+            superuser: &PgPool,
+            tenant: DataTenantId,
+            operation_id: Uuid,
+            prepared_audit_seq: i64,
+        ) {
+            let result = sqlx::query(
+                r#"
+                UPDATE vala.forge_operation_state
+                   SET prepared_audit_seq = $3
+                 WHERE data_tenant_id = $1
+                   AND operation_id = $2
+                "#,
+            )
+            .bind(tenant.as_uuid())
+            .bind(operation_id)
+            .bind(prepared_audit_seq)
+            .execute(superuser)
+            .await
+            .expect("redirect prepared evidence");
+            assert_eq!(result.rows_affected(), 1, "one projection redirected");
+        }
+
         // -----------------------------------------------------------------------
         // Schema
         // -----------------------------------------------------------------------
 
-        /// Verifies the projection schema and grants match the task contract.
+        /// Verifies the complete ordered PostgreSQL catalog contract.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture/catalog access fails or any column, primary-key,
+        /// check, index, RLS policy, or grant differs from the migration.
         #[tokio::test]
         async fn migration_schema_is_exact() {
             let TestFixtures {
@@ -292,40 +529,89 @@ mod pg_tests {
                 assert_eq!(nullable, exp_nullable, "nullability for {col_name}");
             }
 
-            // Primary key
-            let pk: (bool,) = sqlx::query_as(
+            let pk_columns: Vec<(String,)> = sqlx::query_as(
                 r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                      ON tc.constraint_name = kcu.constraint_name
-                    WHERE tc.table_schema = 'vala'
-                      AND tc.table_name = 'forge_operation_state'
-                      AND tc.constraint_type = 'PRIMARY KEY'
-                      AND kcu.column_name = 'data_tenant_id'
-                )
+                SELECT attribute.attname
+                  FROM pg_constraint AS catalog_constraint
+                  JOIN pg_class AS relation ON relation.oid = catalog_constraint.conrelid
+                  JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                  CROSS JOIN LATERAL unnest(catalog_constraint.conkey)
+                      WITH ORDINALITY AS key(attnum, ordinal)
+                  JOIN pg_attribute AS attribute
+                    ON attribute.attrelid = relation.oid
+                   AND attribute.attnum = key.attnum
+                 WHERE namespace.nspname = 'vala'
+                   AND relation.relname = 'forge_operation_state'
+                   AND catalog_constraint.contype = 'p'
+                 ORDER BY key.ordinal
                 "#,
             )
-            .fetch_one(&superuser)
+            .fetch_all(&superuser)
             .await
             .expect("pk query");
-            assert!(pk.0, "PRIMARY KEY on data_tenant_id");
+            assert_eq!(
+                pk_columns,
+                vec![
+                    ("data_tenant_id".to_owned(),),
+                    ("resource".to_owned(),),
+                    ("family".to_owned(),),
+                    ("operation_id".to_owned(),),
+                ],
+                "primary-key columns and order"
+            );
 
-            // Partial index for open state
-            let partial_idx: (bool,) = sqlx::query_as(
+            let checks: Vec<(String, String)> = sqlx::query_as(
                 r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_indexes
-                    WHERE schemaname = 'vala'
-                      AND tablename = 'forge_operation_state'
-                      AND indexname = 'forge_operation_state_open'
-                )
+                SELECT catalog_constraint.conname,
+                       pg_get_constraintdef(catalog_constraint.oid, false)
+                  FROM pg_constraint AS catalog_constraint
+                  JOIN pg_class AS relation ON relation.oid = catalog_constraint.conrelid
+                  JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                 WHERE namespace.nspname = 'vala'
+                   AND relation.relname = 'forge_operation_state'
+                   AND catalog_constraint.contype = 'c'
+                 ORDER BY catalog_constraint.conname
+                "#,
+            )
+            .fetch_all(&superuser)
+            .await
+            .expect("check constraint query");
+            assert_eq!(
+                checks,
+                vec![
+                    (
+                        "forge_operation_state_check".to_owned(),
+                        "CHECK ((((phase = 'prepared'::text) AND (terminal_audit_seq IS NULL)) OR ((phase <> 'prepared'::text) AND (terminal_audit_seq IS NOT NULL))))".to_owned(),
+                    ),
+                    (
+                        "forge_operation_state_family_check".to_owned(),
+                        "CHECK ((family = ANY (ARRAY['staging_fold'::text, 'iceberg_rewrite'::text, 'snapshot_expire'::text, 'orphan_gc'::text])))".to_owned(),
+                    ),
+                    (
+                        "forge_operation_state_phase_check".to_owned(),
+                        "CHECK ((phase = ANY (ARRAY['prepared'::text, 'committed'::text, 'recovered'::text, 'reset'::text])))".to_owned(),
+                    ),
+                ],
+                "check names and exact definitions"
+            );
+
+            let partial_index: (String,) = sqlx::query_as(
+                r#"
+                SELECT indexdef
+                  FROM pg_indexes
+                 WHERE schemaname = 'vala'
+                   AND tablename = 'forge_operation_state'
+                   AND indexname = 'forge_operation_state_open'
                 "#,
             )
             .fetch_one(&superuser)
             .await
             .expect("index query");
-            assert!(partial_idx.0, "forge_operation_state_open index exists");
+            assert_eq!(
+                partial_index.0,
+                "CREATE INDEX forge_operation_state_open ON vala.forge_operation_state USING btree (data_tenant_id, resource, family, prepared_at, operation_id) WHERE (phase = 'prepared'::text)",
+                "exact partial-index definition and predicate"
+            );
 
             // RLS enabled and forced
             let rls: (bool, bool) = sqlx::query_as(
@@ -344,56 +630,372 @@ mod pg_tests {
             assert!(rls.0, "RLS is enabled");
             assert!(rls.1, "RLS is forced");
 
-            // Tenant isolation policy
-            let policy: (bool,) = sqlx::query_as(
+            let policies: Vec<(String, String, String, String, String)> = sqlx::query_as(
                 r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM pg_policies
-                    WHERE schemaname = 'vala'
-                      AND tablename = 'forge_operation_state'
-                      AND policyname = 'tenant_isolation'
-                )
+                SELECT policyname, permissive, cmd, qual, with_check
+                  FROM pg_policies
+                 WHERE schemaname = 'vala'
+                   AND tablename = 'forge_operation_state'
+                 ORDER BY policyname
                 "#,
             )
-            .fetch_one(&superuser)
+            .fetch_all(&superuser)
             .await
             .expect("policy query");
-            assert!(policy.0, "tenant_isolation policy exists");
+            assert_eq!(
+                policies,
+                vec![(
+                    "tenant_isolation".to_owned(),
+                    "PERMISSIVE".to_owned(),
+                    "ALL".to_owned(),
+                    "(data_tenant_id = wyrd.current_tenant())".to_owned(),
+                    "(data_tenant_id = wyrd.current_tenant())".to_owned(),
+                )],
+                "exact RLS policy mode, command, USING, and WITH CHECK"
+            );
 
-            // Grants exist for both roles
-            let app_grant: (bool,) = sqlx::query_as(
+            let grants: Vec<(String, String)> = sqlx::query_as(
                 r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.table_privileges
-                    WHERE table_schema = 'vala'
-                      AND table_name = 'forge_operation_state'
-                      AND grantee = 'wyrd_app'
-                      AND privilege_type IN ('SELECT', 'INSERT', 'UPDATE')
-                )
+                SELECT grantee, privilege_type
+                  FROM information_schema.table_privileges
+                 WHERE table_schema = 'vala'
+                   AND table_name = 'forge_operation_state'
+                   AND grantee IN ('wyrd_app', 'wyrd_platform_admin')
+                 ORDER BY grantee, privilege_type
                 "#,
             )
-            .fetch_one(&superuser)
+            .fetch_all(&superuser)
             .await
-            .expect("app grant query");
-            assert!(app_grant.0, "wyrd_app has SELECT, INSERT, UPDATE");
+            .expect("grant query");
+            assert_eq!(
+                grants,
+                vec![
+                    ("wyrd_app".to_owned(), "INSERT".to_owned()),
+                    ("wyrd_app".to_owned(), "SELECT".to_owned()),
+                    ("wyrd_app".to_owned(), "UPDATE".to_owned()),
+                    ("wyrd_platform_admin".to_owned(), "INSERT".to_owned()),
+                    ("wyrd_platform_admin".to_owned(), "SELECT".to_owned()),
+                    ("wyrd_platform_admin".to_owned(), "UPDATE".to_owned()),
+                ],
+                "complete role/privilege set"
+            );
+        }
 
-            let admin_grant: (bool,) = sqlx::query_as(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.table_privileges
-                    WHERE table_schema = 'vala'
-                      AND table_name = 'forge_operation_state'
-                      AND grantee = 'wyrd_platform_admin'
-                      AND privilege_type IN ('SELECT', 'INSERT', 'UPDATE')
-                )
-                "#,
+        // -----------------------------------------------------------------------
+        // Prepared evidence corruption
+        // -----------------------------------------------------------------------
+
+        /// Verifies a transition classifies absent prepared evidence as corruption.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, corruption arrangement, or the exact
+        /// state/audit assertions fail.
+        #[tokio::test]
+        async fn missing_prepared_audit_is_invariant_violation_for_transition() {
+            let TestFixtures {
+                fixture, superuser, ..
+            } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let prepared_detail = compaction_detail(ForgeCompactionPhase::Prepared, resource());
+            let missing_seq = 9_000_000_001_i64;
+            insert_prepared_projection(
+                &superuser,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_detail,
+                missing_seq,
             )
-            .fetch_one(&superuser)
+            .await;
+            let before = state_snapshot(
+                pool,
+                tenant,
+                ForgeOperationFamily::StagingFold,
+                forge_operation_id(&prepared_detail),
+            )
+            .await;
+            let terminal = compact_committed_event(&prepared_detail, resource());
+
+            let result = append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &terminal,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::InvariantViolation { ref detail })
+                    if detail == "missing prepared audit operation at seq 9000000001"
+            ));
+            assert_eq!(count_audit(pool, tenant).await, 0, "no audit appended");
+            assert_eq!(
+                state_snapshot(
+                    pool,
+                    tenant,
+                    ForgeOperationFamily::StagingFold,
+                    forge_operation_id(&prepared_detail),
+                )
+                .await,
+                before,
+                "corrupt state remains unchanged"
+            );
+        }
+
+        /// Verifies the bounded read classifies absent prepared evidence as corruption.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, corruption arrangement, or exact error
+        /// and cardinality assertions fail.
+        #[tokio::test]
+        async fn missing_prepared_audit_is_invariant_violation_for_list_open() {
+            let TestFixtures {
+                fixture, superuser, ..
+            } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let prepared_detail = compaction_detail(ForgeCompactionPhase::Prepared, resource());
+            insert_prepared_projection(
+                &superuser,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_detail,
+                9_000_000_002,
+            )
+            .await;
+
+            let result = list_open(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                10,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::InvariantViolation { ref detail })
+                    if detail == "missing prepared audit operation at seq 9000000002"
+            ));
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 0);
+        }
+
+        /// Verifies a projection pointing at terminal evidence fails operation parity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, public transitions, admin arrangement, or
+        /// exact no-write assertions fail.
+        #[tokio::test]
+        async fn mismatched_prepared_audit_operation_is_invariant_violation() {
+            let TestFixtures {
+                fixture, superuser, ..
+            } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let target = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &target,
+            )
             .await
-            .expect("admin grant query");
-            assert!(
-                admin_grant.0,
-                "wyrd_platform_admin has SELECT, INSERT, UPDATE"
+            .expect("target prepared");
+            let evidence = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &evidence,
+            )
+            .await
+            .expect("evidence prepared");
+            let evidence_terminal = compact_committed_event(
+                evidence.detail.as_ref().expect("evidence detail"),
+                resource(),
+            );
+            let terminal_seq = match append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &evidence_terminal,
+            )
+            .await
+            .expect("evidence committed")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected evidence application, got {other:?}"),
+            };
+            let target_id = forge_operation_id(target.detail.as_ref().expect("target detail"));
+            redirect_prepared_evidence(&superuser, tenant, target_id, terminal_seq).await;
+            let before =
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id).await;
+            let audit_before = count_audit(pool, tenant).await;
+            let terminal =
+                compact_committed_event(target.detail.as_ref().expect("target detail"), resource());
+
+            let result = append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &terminal,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::InvariantViolation { ref detail })
+                    if detail == "prepared audit operation mismatch: expected forge.file_compact.prepared, got forge.file_compact.committed"
+            ));
+            assert_eq!(count_audit(pool, tenant).await, audit_before);
+            assert_eq!(
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id,).await,
+                before
+            );
+        }
+
+        /// Verifies a projection pointing at another resource fails resource parity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, public transitions, admin arrangement, or
+        /// exact no-write assertions fail.
+        #[tokio::test]
+        async fn mismatched_prepared_audit_resource_is_invariant_violation() {
+            let TestFixtures {
+                fixture, superuser, ..
+            } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let target = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &target,
+            )
+            .await
+            .expect("target prepared");
+            let evidence = compact_prepared_event(resource_b());
+            let evidence_seq = match append_prepared(
+                pool,
+                tenant,
+                resource_b(),
+                ForgeOperationFamily::StagingFold,
+                &evidence,
+            )
+            .await
+            .expect("other-resource evidence prepared")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected evidence application, got {other:?}"),
+            };
+            let target_id = forge_operation_id(target.detail.as_ref().expect("target detail"));
+            redirect_prepared_evidence(&superuser, tenant, target_id, evidence_seq).await;
+            let before =
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id).await;
+            let audit_before = count_audit(pool, tenant).await;
+            let terminal =
+                compact_committed_event(target.detail.as_ref().expect("target detail"), resource());
+
+            let result = append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &terminal,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::InvariantViolation { ref detail })
+                    if detail == "prepared audit resource mismatch: expected tenant_a.ns.tbl, got tenant_b.ns.tbl"
+            ));
+            assert_eq!(count_audit(pool, tenant).await, audit_before);
+            assert_eq!(
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id,).await,
+                before
+            );
+        }
+
+        /// Verifies a projection pointing at another Prepared detail fails parity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, public transitions, admin arrangement, or
+        /// exact no-write assertions fail.
+        #[tokio::test]
+        async fn mismatched_prepared_audit_detail_is_invariant_violation() {
+            let TestFixtures {
+                fixture, superuser, ..
+            } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let target = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &target,
+            )
+            .await
+            .expect("target prepared");
+            let evidence = compact_prepared_event(resource());
+            let evidence_seq = match append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &evidence,
+            )
+            .await
+            .expect("other-detail evidence prepared")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected evidence application, got {other:?}"),
+            };
+            let target_id = forge_operation_id(target.detail.as_ref().expect("target detail"));
+            redirect_prepared_evidence(&superuser, tenant, target_id, evidence_seq).await;
+            let before =
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id).await;
+            let audit_before = count_audit(pool, tenant).await;
+            let terminal =
+                compact_committed_event(target.detail.as_ref().expect("target detail"), resource());
+
+            let result = append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &terminal,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::InvariantViolation { ref detail })
+                    if detail == "prepared state detail and joined audit detail do not match"
+            ));
+            assert_eq!(count_audit(pool, tenant).await, audit_before);
+            assert_eq!(
+                state_snapshot(pool, tenant, ForgeOperationFamily::StagingFold, target_id,).await,
+                before
             );
         }
 
@@ -402,6 +1004,10 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies the first Prepared transition creates audit and state.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transition execution, or state assertions fail.
         #[tokio::test]
         async fn first_prepared_applies_and_returns_applied() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -429,6 +1035,10 @@ mod pg_tests {
         }
 
         /// Verifies identical Prepared replay is idempotent.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, either transition, or replay assertions fail.
         #[tokio::test]
         async fn identical_prepared_replay_is_idempotent() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -473,11 +1083,71 @@ mod pg_tests {
             assert_eq!(count_state(pool, tenant).await, 1);
         }
 
+        /// Verifies a same-ID Prepared event with changed canonical detail conflicts.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, fixture detail extraction, or exact no-write
+        /// assertions fail.
+        #[tokio::test]
+        async fn changed_prepared_detail_for_same_operation_is_conflict_without_write() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let prepared = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared,
+            )
+            .await
+            .expect("first prepared");
+            let operation_id =
+                forge_operation_id(prepared.detail.as_ref().expect("prepared detail"));
+            let changed = AuditDetail::ForgeCompaction {
+                operation_id,
+                phase: ForgeCompactionPhase::Prepared,
+                group: resource().to_owned(),
+                input_file_ids: vec![Uuid::now_v7()],
+                input_paths: vec![StoragePath::new("table/changed.parquet").expect("valid path")],
+                output_paths: vec![
+                    StoragePath::new("table/changed-output.parquet").expect("valid path"),
+                ],
+                snapshot_id: None,
+                writer_recipe_version: "bifrost-writer-v1".to_owned(),
+            };
+            let collision = event("forge.file_compact.prepared", resource(), Some(changed));
+
+            let result = append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &collision,
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(SqlError::Conflict { ref detail })
+                    if detail == "prepared detail does not match stored prepared detail"
+            ));
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 1);
+        }
+
         // -----------------------------------------------------------------------
         // Terminal transitions
         // -----------------------------------------------------------------------
 
-        /// Verifies a Prepared operation can transition to Committed.
+        /// Verifies staging-fold Prepared-to-Committed state and audit persistence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, either transition, or exact persisted
+        /// phase/sequence/cardinality assertions fail.
         #[tokio::test]
         async fn prepared_then_committed_flow() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -517,9 +1187,31 @@ mod pg_tests {
                 _ => panic!("expected Applied"),
             };
             assert!(terminal_seq > prepared_seq, "terminal seq > prepared seq");
+            let operation_id =
+                forge_operation_id(prepared_event.detail.as_ref().expect("prepared detail"));
+            assert_eq!(
+                state_snapshot(
+                    pool,
+                    tenant,
+                    ForgeOperationFamily::StagingFold,
+                    operation_id,
+                )
+                .await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
         /// Verifies identical terminal replay is idempotent.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture setup, transitions, or replay sequence assertions fail.
         #[tokio::test]
         async fn same_terminal_replay_is_idempotent() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -570,7 +1262,125 @@ mod pg_tests {
             }
         }
 
+        /// Verifies Prepared replay after Committed returns the terminal sequence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transitions, or exact no-write assertions fail.
+        #[tokio::test]
+        async fn prepared_replay_after_committed_is_already_applied_without_write() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let prepared_event = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_event,
+            )
+            .await
+            .expect("prepared");
+            let committed_event = compact_committed_event(
+                prepared_event.detail.as_ref().expect("prepared detail"),
+                resource(),
+            );
+            let terminal_seq = match append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &committed_event,
+            )
+            .await
+            .expect("committed")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected committed application, got {other:?}"),
+            };
+
+            let replay = append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_event,
+            )
+            .await
+            .expect("Prepared replay after Committed");
+
+            assert!(matches!(
+                replay,
+                ForgeOperationTransition::AlreadyApplied { audit_seq }
+                    if audit_seq == terminal_seq
+            ));
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
+        }
+
+        /// Verifies Prepared replay after Recovered returns the terminal sequence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transitions, or exact no-write assertions fail.
+        #[tokio::test]
+        async fn prepared_replay_after_recovered_is_already_applied_without_write() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let prepared_event = compact_prepared_event(resource());
+            append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_event,
+            )
+            .await
+            .expect("prepared");
+            let recovered_event = compact_recovered_event(
+                prepared_event.detail.as_ref().expect("prepared detail"),
+                resource(),
+            );
+            let terminal_seq = match append_terminal(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &recovered_event,
+            )
+            .await
+            .expect("recovered")
+            {
+                ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                other => panic!("expected recovered application, got {other:?}"),
+            };
+
+            let replay = append_prepared(
+                pool,
+                tenant,
+                resource(),
+                ForgeOperationFamily::StagingFold,
+                &prepared_event,
+            )
+            .await
+            .expect("Prepared replay after Recovered");
+
+            assert!(matches!(
+                replay,
+                ForgeOperationTransition::AlreadyApplied { audit_seq }
+                    if audit_seq == terminal_seq
+            ));
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
+        }
+
         /// Verifies terminal transitions require an existing Prepared row.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup or the exact conflict assertion fails.
         #[tokio::test]
         async fn terminal_without_prepared_is_conflict() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -603,6 +1413,10 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies Reset followed by Prepared reopens the operation.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, any transition, or exact state/audit assertions fail.
         #[tokio::test]
         async fn reset_retry_reopens_exact_deterministic_operation() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -679,6 +1493,11 @@ mod pg_tests {
         }
 
         /// Verifies a changed detail cannot reopen a reset operation.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, fixed path construction, transition setup, or
+        /// rejection assertions fail.
         #[tokio::test]
         async fn changed_detail_after_reset_rolls_back() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -748,6 +1567,10 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies a page smaller than the cap returns no overflow sentinel.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, Prepared transitions, or page assertions fail.
         #[tokio::test]
         async fn list_open_returns_exact_cap_without_overflow() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -782,6 +1605,10 @@ mod pg_tests {
         }
 
         /// Verifies list_open returns a cap-sized page with overflow metadata.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, Prepared transitions, or page assertions fail.
         #[tokio::test]
         async fn list_open_reports_overflow_and_returns_cap() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -815,13 +1642,17 @@ mod pg_tests {
         }
 
         /// Verifies zero-cap reads fail with a conflict.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transaction lifecycle, or conflict assertions fail.
         #[tokio::test]
         async fn list_open_zero_cap_returns_conflict() {
             let TestFixtures { fixture, .. } = setup().await;
             let pool = fixture.app_pool();
             let tenant = fixture.data_tenant_id();
 
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
             let ops = ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold).unwrap();
             let result = ops.list_open(&mut conn, 0).await;
             conn.commit().await.unwrap();
@@ -833,6 +1664,10 @@ mod pg_tests {
         }
 
         /// Verifies an empty projection returns an empty bounded page.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, bounded read, or empty-page assertions fail.
         #[tokio::test]
         async fn list_open_empty_returns_empty_page() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -857,6 +1692,10 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies tenant RLS hides another tenant's projection rows.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transitions, bounded reads, or isolation assertions fail.
         #[tokio::test]
         async fn rls_blocks_cross_tenant_access() {
             let TestFixtures {
@@ -893,6 +1732,11 @@ mod pg_tests {
         }
 
         /// Verifies RLS rejects inserting a row for another current tenant.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, fixture detail extraction, transaction
+        /// acquisition, or RLS assertions fail.
         #[tokio::test]
         async fn rls_rejects_cross_tenant_insert() {
             let TestFixtures {
@@ -902,7 +1746,7 @@ mod pg_tests {
             let tenant_a = fixture.data_tenant_id();
 
             let event = compact_prepared_event(resource());
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant_b).await.unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant_b).await.unwrap();
             let detail = event.detail.as_ref().expect("prepared detail");
             let detail_json = serde_json::to_string(detail).expect("detail json");
             let operation_id = match detail {
@@ -933,6 +1777,11 @@ mod pg_tests {
         }
 
         /// Verifies RLS prevents a tenant from updating another tenant's row.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transition execution, transaction lifecycle, or
+        /// exact isolation assertions fail.
         #[tokio::test]
         async fn rls_rejects_cross_tenant_update() {
             let TestFixtures {
@@ -951,7 +1800,7 @@ mod pg_tests {
             .await
             .expect("tenant A prepared row");
 
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant_b).await.unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant_b).await.unwrap();
             let result = sqlx::query(
                 "UPDATE vala.forge_operation_state SET phase = 'committed' WHERE data_tenant_id = $1",
             )
@@ -975,6 +1824,11 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies the advisory lock serializes concurrent first Prepared calls.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, either concurrent transaction, or exact
+        /// state/audit cardinality assertions fail.
         #[tokio::test]
         async fn concurrent_first_prepared_serializes_without_duplicate_audit() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -990,7 +1844,7 @@ mod pg_tests {
             // so the advisory lock serializes them at the database level.
             let (result1, result2) = tokio::join!(
                 async {
-                    let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+                    let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
                     let ops = ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold)
                         .unwrap();
                     let result = ops.append_prepared(&mut conn, &event).await;
@@ -1000,7 +1854,7 @@ mod pg_tests {
                     result
                 },
                 async {
-                    let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+                    let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
                     let ops = ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold)
                         .unwrap();
                     let result = ops.append_prepared(&mut conn, &event).await;
@@ -1041,6 +1895,10 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Verifies tenant and resource scopes remain independent.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transitions, bounded reads, or scope assertions fail.
         #[tokio::test]
         async fn multiple_tenants_and_resources_are_independent() {
             let TestFixtures {
@@ -1114,6 +1972,11 @@ mod pg_tests {
         // -----------------------------------------------------------------------
 
         /// Proves an insert failure rolls back its preceding audit append.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, temporary trigger management, or rollback
+        /// cardinality assertions fail.
         #[tokio::test]
         async fn audit_append_failure_rolls_back_prepared_insert() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1148,7 +2011,7 @@ mod pg_tests {
 
             let event = compact_prepared_event(resource());
             let result = {
-                let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+                let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
                 let ops =
                     ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold).unwrap();
                 ops.append_prepared(&mut conn, &event).await
@@ -1183,6 +2046,11 @@ mod pg_tests {
         }
 
         /// Proves a terminal state-update failure rolls back its audit append.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, temporary trigger management, or exact rollback
+        /// state/audit assertions fail.
         #[tokio::test]
         async fn state_update_failure_rolls_back_terminal_append() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1230,7 +2098,7 @@ mod pg_tests {
             .expect("create update failure trigger");
 
             let result = {
-                let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+                let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
                 let ops =
                     ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold).unwrap();
                 ops.append_terminal(&mut conn, &terminal_event).await
@@ -1274,7 +2142,16 @@ mod pg_tests {
         // Scale: constant open set with large terminal history
         // -----------------------------------------------------------------------
 
-        /// Proves the open-state query remains bounded as terminal history grows.
+        /// Proves the open-state query remains bounded after a large terminal history.
+        ///
+        /// This test is excluded from the normal SQL lane and runs as a
+        /// dedicated required GitHub Actions check for pull requests targeting
+        /// `main`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, bulk transitions, PostgreSQL plan collection, or
+        /// bounded-work assertions fail.
         #[tokio::test]
         async fn open_set_scan_remains_bounded_after_terminal_growth() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1318,9 +2195,9 @@ mod pg_tests {
             // Get baseline explain analyze
             let baseline_explain = get_explain_analyze(pool, tenant, 9).await;
 
-            // Add 10,000 terminal state identities. The original eight remain
+            // Add terminal state identities. The original eight remain
             // Prepared and therefore remain visible through the partial index.
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant).await.unwrap();
+            let mut conn = TenantConn::acquire(pool, tenant).await.unwrap();
             let ops = ForgeOperations::new(resource(), ForgeOperationFamily::StagingFold).unwrap();
 
             for _ in 0..10_000 {
@@ -1389,7 +2266,7 @@ mod pg_tests {
         /// # Panics
         /// Panics when the fixture connection or explain query cannot be run.
         async fn get_explain_analyze(pool: &PgPool, tenant: DataTenantId, limit: i64) -> String {
-            let mut conn = vala_sql::TenantConn::acquire(pool, tenant)
+            let mut conn = TenantConn::acquire(pool, tenant)
                 .await
                 .expect("tenant conn for explain");
 
@@ -1443,6 +2320,11 @@ mod pg_tests {
         }
 
         /// Validates the bounded state and point-audit access plan.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `explain` is not the expected JSON plan shape or when
+        /// state/audit access exceeds the `cap + 1` proof bounds.
         fn assert_plan_bounds(explain: &str, label: &str) {
             let document: serde_json::Value = serde_json::from_str(explain).expect("plan json");
             let root = document
@@ -1517,6 +2399,10 @@ mod pg_tests {
         }
 
         /// Sums the shared buffer hits and reads reported by plan nodes.
+        ///
+        /// # Panics
+        ///
+        /// Panics when `explain` is not the expected JSON plan shape.
         fn total_shared_blocks(explain: &str) -> u64 {
             let document: serde_json::Value = serde_json::from_str(explain).expect("plan json");
             let root = document
@@ -1544,7 +2430,12 @@ mod pg_tests {
         // Iceberg rewrite family
         // -----------------------------------------------------------------------
 
-        /// Verifies Iceberg rewrite operations use the shared transition owner.
+        /// Verifies Iceberg rewrite Prepared-to-Committed persistence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, typed detail construction, transitions, or exact
+        /// persisted phase/sequence/cardinality assertions fail.
         #[tokio::test]
         async fn iceberg_rewrite_prepare_and_commit() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1569,17 +2460,77 @@ mod pg_tests {
             };
             let prepared_event = event("forge.iceberg_rewrite.prepared", resource(), Some(detail));
 
-            let result = append_prepared(pool, tenant, resource(), family, &prepared_event)
-                .await
-                .expect("iceberg prepared");
-            assert!(matches!(result, ForgeOperationTransition::Applied { .. }));
+            let prepared_seq =
+                match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("iceberg prepared")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected prepared application, got {other:?}"),
+                };
+            let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
+            let operation_id = forge_operation_id(prepared_detail);
+            let committed_detail = match prepared_detail {
+                AuditDetail::ForgeIcebergRewrite {
+                    base_snapshot_id,
+                    partition_spec_id,
+                    partition_day,
+                    target_file_size_bytes,
+                    input_paths,
+                    output_paths,
+                    writer_recipe_version,
+                    ..
+                } => AuditDetail::ForgeIcebergRewrite {
+                    operation_id,
+                    phase: ForgeIcebergRewritePhase::Committed,
+                    group: resource().to_owned(),
+                    base_snapshot_id: *base_snapshot_id,
+                    committed_snapshot_id: Some(101),
+                    partition_spec_id: *partition_spec_id,
+                    partition_day: partition_day.clone(),
+                    target_file_size_bytes: *target_file_size_bytes,
+                    input_paths: input_paths.clone(),
+                    output_paths: output_paths.clone(),
+                    writer_recipe_version: writer_recipe_version.clone(),
+                },
+                _ => panic!("expected Iceberg rewrite detail"),
+            };
+            let committed_event = event(
+                "forge.iceberg_rewrite.committed",
+                resource(),
+                Some(committed_detail),
+            );
+            let terminal_seq =
+                match append_terminal(pool, tenant, resource(), family, &committed_event)
+                    .await
+                    .expect("iceberg committed")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected terminal application, got {other:?}"),
+                };
+
+            assert_eq!(
+                state_snapshot(pool, tenant, family, operation_id).await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
         // -----------------------------------------------------------------------
         // Snapshot expire family
         // -----------------------------------------------------------------------
 
-        /// Verifies snapshot-expiry operations use the shared transition owner.
+        /// Verifies snapshot-expiry Prepared-to-Committed persistence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, typed detail construction, transitions, or exact
+        /// persisted phase/sequence/cardinality assertions fail.
         #[tokio::test]
         async fn snapshot_expire_prepare_and_commit() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1600,17 +2551,72 @@ mod pg_tests {
             };
             let prepared_event = event("forge.snapshot_expire.prepared", resource(), Some(detail));
 
-            let result = append_prepared(pool, tenant, resource(), family, &prepared_event)
-                .await
-                .expect("snapshot_expire prepared");
-            assert!(matches!(result, ForgeOperationTransition::Applied { .. }));
+            let prepared_seq =
+                match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("snapshot_expire prepared")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected prepared application, got {other:?}"),
+                };
+            let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
+            let operation_id = forge_operation_id(prepared_detail);
+            let committed_detail = match prepared_detail {
+                AuditDetail::ForgeSnapshotExpire {
+                    base_metadata_location,
+                    current_snapshot_id,
+                    retained_ref_heads,
+                    cutoff_ms,
+                    selected_snapshot_ids,
+                    ..
+                } => AuditDetail::ForgeSnapshotExpire {
+                    operation_id,
+                    phase: ForgeSnapshotExpirePhase::Committed,
+                    group: resource().to_owned(),
+                    base_metadata_location: base_metadata_location.clone(),
+                    current_snapshot_id: *current_snapshot_id,
+                    retained_ref_heads: retained_ref_heads.clone(),
+                    cutoff_ms: *cutoff_ms,
+                    selected_snapshot_ids: selected_snapshot_ids.clone(),
+                },
+                _ => panic!("expected snapshot-expiry detail"),
+            };
+            let committed_event = event(
+                "forge.snapshot_expire.committed",
+                resource(),
+                Some(committed_detail),
+            );
+            let terminal_seq =
+                match append_terminal(pool, tenant, resource(), family, &committed_event)
+                    .await
+                    .expect("snapshot_expire committed")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected terminal application, got {other:?}"),
+                };
+
+            assert_eq!(
+                state_snapshot(pool, tenant, family, operation_id).await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
         // -----------------------------------------------------------------------
         // Orphan GC family
         // -----------------------------------------------------------------------
 
-        /// Verifies orphan-GC operations use the shared transition owner.
+        /// Verifies orphan-GC Prepared-to-Committed persistence.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, typed detail construction, transitions, or exact
+        /// persisted phase/sequence/cardinality assertions fail.
         #[tokio::test]
         async fn orphan_gc_prepare_and_commit() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1630,17 +2636,131 @@ mod pg_tests {
             };
             let prepared_event = event("forge.orphan_gc.prepared", resource(), Some(detail));
 
-            let result = append_prepared(pool, tenant, resource(), family, &prepared_event)
-                .await
-                .expect("orphan_gc prepared");
-            assert!(matches!(result, ForgeOperationTransition::Applied { .. }));
+            let prepared_seq =
+                match append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("orphan_gc prepared")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected prepared application, got {other:?}"),
+                };
+            let prepared_detail = prepared_event.detail.as_ref().expect("prepared detail");
+            let operation_id = forge_operation_id(prepared_detail);
+            let committed_detail = match prepared_detail {
+                AuditDetail::ForgeOrphanGc {
+                    candidate_paths, ..
+                } => AuditDetail::ForgeOrphanGc {
+                    operation_id,
+                    phase: ForgeOrphanGcPhase::Committed,
+                    group: resource().to_owned(),
+                    candidate_paths: candidate_paths.clone(),
+                    deleted_paths: candidate_paths.clone(),
+                    skipped_paths: vec![],
+                },
+                _ => panic!("expected orphan-GC detail"),
+            };
+            let committed_event = event(
+                "forge.orphan_gc.committed",
+                resource(),
+                Some(committed_detail),
+            );
+            let terminal_seq =
+                match append_terminal(pool, tenant, resource(), family, &committed_event)
+                    .await
+                    .expect("orphan_gc committed")
+                {
+                    ForgeOperationTransition::Applied { audit_seq } => audit_seq,
+                    other => panic!("expected terminal application, got {other:?}"),
+                };
+
+            assert_eq!(
+                state_snapshot(pool, tenant, family, operation_id).await,
+                StateSnapshot {
+                    phase: "committed".to_owned(),
+                    prepared_audit_seq: prepared_seq,
+                    terminal_audit_seq: Some(terminal_seq),
+                }
+            );
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
         // -----------------------------------------------------------------------
         // Invalid operations
         // -----------------------------------------------------------------------
 
+        /// Verifies Reset is rejected for expiry and orphan-GC families without writes.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, Prepared transitions, or exact conflict and
+        /// cardinality assertions fail.
+        #[tokio::test]
+        async fn reset_is_conflict_for_snapshot_expire_and_orphan_gc() {
+            let TestFixtures { fixture, .. } = setup().await;
+            let pool = fixture.app_pool();
+            let tenant = fixture.data_tenant_id();
+            let cases = [
+                (
+                    ForgeOperationFamily::SnapshotExpire,
+                    "forge.snapshot_expire.prepared",
+                    "forge.snapshot_expire.reset",
+                    AuditDetail::ForgeSnapshotExpire {
+                        operation_id: Uuid::now_v7(),
+                        phase: ForgeSnapshotExpirePhase::Prepared,
+                        group: resource().to_owned(),
+                        base_metadata_location: StoragePath::new(
+                            "table/iceberg/metadata/reset-expiry.json",
+                        )
+                        .expect("valid path"),
+                        current_snapshot_id: Some(42),
+                        retained_ref_heads: vec![42],
+                        cutoff_ms: 1_700_000_000_000,
+                        selected_snapshot_ids: vec![1],
+                    },
+                    "Reset transition is not valid for family snapshot_expire",
+                ),
+                (
+                    ForgeOperationFamily::OrphanGc,
+                    "forge.orphan_gc.prepared",
+                    "forge.orphan_gc.reset",
+                    AuditDetail::ForgeOrphanGc {
+                        operation_id: Uuid::now_v7(),
+                        phase: ForgeOrphanGcPhase::Prepared,
+                        group: resource().to_owned(),
+                        candidate_paths: vec![
+                            StoragePath::new("table/orphans/reset.parquet").expect("valid path"),
+                        ],
+                        deleted_paths: vec![],
+                        skipped_paths: vec![],
+                    },
+                    "Reset transition is not valid for family orphan_gc",
+                ),
+            ];
+
+            for (family, prepared_operation, reset_operation, detail, expected) in cases {
+                let prepared_event = event(prepared_operation, resource(), Some(detail.clone()));
+                append_prepared(pool, tenant, resource(), family, &prepared_event)
+                    .await
+                    .expect("family prepared");
+                let reset_event = event(reset_operation, resource(), Some(detail));
+
+                let result = append_terminal(pool, tenant, resource(), family, &reset_event).await;
+
+                assert!(matches!(
+                    result,
+                    Err(SqlError::Conflict { ref detail }) if detail == expected
+                ));
+            }
+            assert_eq!(count_state(pool, tenant).await, 2);
+            assert_eq!(count_audit(pool, tenant).await, 2);
+        }
+
         /// Verifies a wrong family operation prefix is rejected.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, fixed path construction, or rejection assertions fail.
         #[tokio::test]
         async fn mismatched_operation_prefix_is_rejected() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1668,10 +2788,20 @@ mod pg_tests {
                 &bad_event,
             )
             .await;
-            assert!(result.is_err(), "mismatched operation prefix must fail");
+            assert!(matches!(
+                result,
+                Err(SqlError::Conflict { ref detail })
+                    if detail == "operation forge.iceberg_rewrite.prepared does not match family prefix forge.file_compact"
+            ));
+            assert_eq!(count_state(pool, tenant).await, 0);
+            assert_eq!(count_audit(pool, tenant).await, 0);
         }
 
         /// Verifies events without typed detail are rejected.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup or the exact rejection assertion fails.
         #[tokio::test]
         async fn event_without_detail_is_rejected() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1687,10 +2817,21 @@ mod pg_tests {
                 &no_detail_event,
             )
             .await;
-            assert!(result.is_err(), "event without detail must fail");
+            assert!(matches!(
+                result,
+                Err(SqlError::Conflict { ref detail })
+                    if detail == "event must carry a typed audit detail"
+            ));
+            assert_eq!(count_state(pool, tenant).await, 0);
+            assert_eq!(count_audit(pool, tenant).await, 0);
         }
 
         /// Verifies unsupported terminal ordering is rejected.
+        ///
+        /// # Panics
+        ///
+        /// Panics when setup, transitions, detail conversion, or conflict
+        /// assertions fail.
         #[tokio::test]
         async fn wrong_terminal_phase_is_rejected() {
             let TestFixtures { fixture, .. } = setup().await;
@@ -1754,12 +2895,22 @@ mod pg_tests {
             )
             .await;
             assert!(
-                result.is_err(),
-                "skipping from Prepared directly to Recovered must fail"
+                matches!(
+                    result,
+                    Err(SqlError::Conflict { ref detail })
+                        if detail == "cannot append terminal: operation is in Committed state"
+                ),
+                "a distinct terminal phase after Committed must conflict"
             );
+            assert_eq!(count_state(pool, tenant).await, 1);
+            assert_eq!(count_audit(pool, tenant).await, 2);
         }
 
         /// Verifies construction rejects an empty resource identity.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the constructor does not return the exact conflict class.
         #[tokio::test]
         async fn empty_resource_is_rejected() {
             let result = ForgeOperations::new("", ForgeOperationFamily::StagingFold);

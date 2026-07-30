@@ -25,14 +25,13 @@ use wyrd_spec::vala::api::{
     AuditDetail, AuditEvent, ForgeCompactionPhase, ForgeIcebergRewritePhase, ForgeOrphanGcPhase,
     ForgeSnapshotExpirePhase, audit_detail_canonical_json,
 };
-use wyrd_sql::TenantConn;
 
-use crate::SqlError;
 use crate::queries::audit_outbox::append_audit;
 use crate::row_types::forge_operations::{
     ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationStateSqlRow,
     ForgeOperationTransition, OpenForgeOperationPage,
 };
+use crate::{SqlError, TenantConn};
 
 /// Scoped Forge operation state handle for one `(resource, family)`.
 ///
@@ -58,6 +57,7 @@ impl<'resource> ForgeOperations<'resource> {
     /// lifetime of every method call.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError::Conflict`] when `resource` is empty.
     pub fn new(resource: &'resource str, family: ForgeOperationFamily) -> Result<Self, SqlError> {
         if resource.is_empty() {
@@ -88,9 +88,21 @@ impl<'resource> ForgeOperations<'resource> {
     /// make the audit and state durable.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError::Conflict`] on invalid event identity, transition
     /// collision, or detail mismatch.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
+    /// Returns [`SqlError::Query`] when locking, audit append, or projection IO
+    /// fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The caller owns the transaction and its transaction-scoped advisory
+    /// lock. Cancellation drops this future without committing; dropping the
+    /// caller transaction rolls back any audit append or projection mutation
+    /// and releases the lock. Retrying the same canonical event is idempotent,
+    /// returning the existing sequence after a prior commit or applying the
+    /// transition after a rollback.
     pub async fn append_prepared(
         &self,
         conn: &mut TenantConn<'_>,
@@ -172,9 +184,20 @@ impl<'resource> ForgeOperations<'resource> {
     /// | Absent, Reset, different terminal, or conflict | Any | `Conflict` |
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError::Conflict`] when the state row is absent, not
     /// Prepared, or the detail mismatches.
     /// Returns [`SqlError::InvariantViolation`] when stored data is malformed.
+    /// Returns [`SqlError::Query`] when locking, audit append, or projection IO
+    /// fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The caller owns the transaction and its transaction-scoped advisory
+    /// lock. Cancellation cannot commit partial progress: dropping the caller
+    /// transaction rolls back both the terminal audit append and state update
+    /// and releases the lock. Retrying an identical committed transition is
+    /// idempotent and returns its existing terminal sequence.
     pub async fn append_terminal(
         &self,
         conn: &mut TenantConn<'_>,
@@ -277,9 +300,18 @@ impl<'resource> ForgeOperations<'resource> {
     /// the resource/family scope or paginate.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError::Conflict`] when `cap` is zero.
     /// Returns [`SqlError::InvariantViolation`] when stored state or audit
     /// evidence fails decoding/parity validation.
+    /// Returns [`SqlError::Query`] when the bounded state or point-evidence
+    /// query fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The read performs no durable writes and never acquires the Forge
+    /// advisory lock. Cancellation leaves only the caller-owned read
+    /// transaction to roll back or drop; retrying the same read is safe.
     pub async fn list_open(
         &self,
         conn: &mut TenantConn<'_>,
@@ -358,7 +390,14 @@ impl<'resource> ForgeOperations<'resource> {
     /// so exactly one writer sees the absent row.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError::Query`] when the lock query fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation before acquisition leaves no lock. After acquisition the
+    /// lock belongs to the caller's transaction and releases only when that
+    /// transaction commits, rolls back, or is dropped.
     async fn acquire_operation_lock(
         &self,
         conn: &mut TenantConn<'_>,
@@ -392,7 +431,13 @@ impl<'resource> ForgeOperations<'resource> {
     /// transaction-level lock, or returns `None` when no row exists.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError`] when the query fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation performs no writes. The caller-owned transaction retains
+    /// any advisory lock until its own commit, rollback, or drop boundary.
     async fn select_state_for_update(
         &self,
         conn: &mut TenantConn<'_>,
@@ -434,7 +479,14 @@ impl<'resource> ForgeOperations<'resource> {
     /// in the same transaction.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError`] when the insert fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The insert participates in the caller's transaction. Cancellation
+    /// cannot commit the preceding audit append; dropping the transaction
+    /// rolls back both, and an identical retry can safely start again.
     async fn insert_prepared(
         &self,
         conn: &mut TenantConn<'_>,
@@ -481,7 +533,14 @@ impl<'resource> ForgeOperations<'resource> {
     /// `prepared`. The `updated_at` timestamp is advanced.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError`] when the update fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The update participates in the caller's transaction. Cancellation
+    /// cannot commit only the new Prepared audit; dropping the transaction
+    /// rolls back audit and reopen state together.
     async fn reopen_prepared(
         &self,
         conn: &mut TenantConn<'_>,
@@ -531,7 +590,14 @@ impl<'resource> ForgeOperations<'resource> {
     /// unchanged.
     ///
     /// # Errors
+    ///
     /// Returns [`SqlError`] when the update fails.
+    ///
+    /// # Cancellation
+    ///
+    /// The update participates in the caller's transaction. Cancellation
+    /// cannot commit only the terminal audit; dropping the transaction rolls
+    /// back audit and terminal projection state together.
     async fn apply_terminal(
         &self,
         conn: &mut TenantConn<'_>,

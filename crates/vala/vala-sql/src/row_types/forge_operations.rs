@@ -221,15 +221,16 @@ pub(crate) struct ForgeOperationStateSqlRow {
     pub(crate) prepared_at: DateTime<Utc>,
     /// Wall-clock time of the most recent update.
     pub(crate) updated_at: DateTime<Utc>,
-    /// Operation column from the joined prepared audit row.
-    pub(crate) prepared_audit_operation: String,
-    /// Resource column from the joined prepared audit row.
-    pub(crate) prepared_audit_resource: String,
-    /// Detail text from the joined prepared audit row.
+    /// Operation column from the optional joined prepared audit row.
+    pub(crate) prepared_audit_operation: Option<String>,
+    /// Resource column from the optional joined prepared audit row.
+    pub(crate) prepared_audit_resource: Option<String>,
+    /// Detail text from the optional joined prepared audit row.
     pub(crate) prepared_audit_detail: Option<String>,
 }
 
 impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
+    /// Error returned when persisted state or its prepared evidence violates an invariant.
     type Error = SqlError;
 
     /// Converts a raw SQL row into a validated public domain row.
@@ -260,24 +261,39 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
 
         let prepared_detail = decode_detail_value(row.prepared_detail, "prepared_detail")?;
         let current_detail = decode_detail_value(row.current_detail, "current_detail")?;
+        let prepared_audit_operation = require_prepared_audit_field(
+            row.prepared_audit_operation,
+            "operation",
+            row.prepared_audit_seq,
+        )?;
+        let prepared_audit_resource = require_prepared_audit_field(
+            row.prepared_audit_resource,
+            "resource",
+            row.prepared_audit_seq,
+        )?;
+        let prepared_audit_detail = require_prepared_audit_field(
+            row.prepared_audit_detail,
+            "detail",
+            row.prepared_audit_seq,
+        )?;
         let audit_detail =
-            decode_audit_detail_text(row.prepared_audit_detail.as_deref(), row.prepared_audit_seq)?;
+            decode_audit_detail_text(&prepared_audit_detail, row.prepared_audit_seq)?;
 
         // Validate the joined audit operation is the exact Prepared operation for this family.
         let expected_prepared_operation = format!("{}.prepared", family.operation_prefix());
-        if row.prepared_audit_operation != expected_prepared_operation {
+        if prepared_audit_operation != expected_prepared_operation {
             return Err(SqlError::InvariantViolation {
                 detail: format!(
                     "prepared audit operation mismatch: expected {expected_prepared_operation}, got {}",
-                    row.prepared_audit_operation
+                    prepared_audit_operation
                 ),
             });
         }
-        if row.prepared_audit_resource != row.resource {
+        if prepared_audit_resource != row.resource {
             return Err(SqlError::InvariantViolation {
                 detail: format!(
                     "prepared audit resource mismatch: expected {}, got {}",
-                    row.resource, row.prepared_audit_resource
+                    row.resource, prepared_audit_resource
                 ),
             });
         }
@@ -344,6 +360,26 @@ impl TryFrom<ForgeOperationStateSqlRow> for ForgeOperationStateRow {
 // Private decoding helpers
 // ---------------------------------------------------------------------------
 
+/// Requires one column from the optional prepared-audit join.
+///
+/// The state queries deliberately use a `LEFT JOIN` so missing immutable
+/// evidence reaches this conversion boundary instead of becoming a SQLx
+/// null-decoding failure.
+///
+/// # Errors
+///
+/// Returns [`SqlError::InvariantViolation`] naming `field` and `audit_seq`
+/// when the joined value is absent.
+fn require_prepared_audit_field<T>(
+    value: Option<T>,
+    field: &'static str,
+    audit_seq: i64,
+) -> Result<T, SqlError> {
+    value.ok_or_else(|| SqlError::InvariantViolation {
+        detail: format!("missing prepared audit {field} at seq {audit_seq}"),
+    })
+}
+
 /// Decodes a `serde_json::Value` stored in a JSONB column into a typed
 /// [`AuditDetail`].
 ///
@@ -359,20 +395,15 @@ fn decode_detail_value(
     })
 }
 
-/// Decodes an optional text value from a prepared audit row into a typed
-/// [`AuditDetail`].
+/// Decodes prepared audit text into a typed [`AuditDetail`].
 ///
-/// The value is stored as `text` in `vala.audit_outbox.detail`. A `None`
-/// value is treated as a missing-evidence invariant violation.
+/// The caller first establishes that the optional join produced a value. This
+/// helper owns only JSON decoding of `vala.audit_outbox.detail`.
 ///
 /// # Errors
-/// Returns [`SqlError::InvariantViolation`] when `value` is `None` or cannot
-/// be parsed.
-fn decode_audit_detail_text(value: Option<&str>, audit_seq: i64) -> Result<AuditDetail, SqlError> {
-    let text = value.ok_or_else(|| SqlError::InvariantViolation {
-        detail: format!("missing prepared audit detail at seq {audit_seq}"),
-    })?;
-    serde_json::from_str(text).map_err(|e| SqlError::InvariantViolation {
+/// Returns [`SqlError::InvariantViolation`] when `value` cannot be parsed.
+fn decode_audit_detail_text(value: &str, audit_seq: i64) -> Result<AuditDetail, SqlError> {
+    serde_json::from_str(value).map_err(|e| SqlError::InvariantViolation {
         detail: format!("failed to decode prepared audit detail at seq {audit_seq}: {e}"),
     })
 }

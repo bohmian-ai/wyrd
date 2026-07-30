@@ -383,7 +383,7 @@ impl Forge {
     /// Returns [`ForgeError`] when lease renewal, tenant transaction creation,
     /// operation-state transition, audit append, fence assertion, or transaction
     /// commit fails. The caller-owned transaction rolls back both durable rows.
-    async fn append_live_audit(
+    pub(super) async fn append_live_audit(
         &self,
         lease: &mut ForgeLease,
         key: &ForgeGroupKey,

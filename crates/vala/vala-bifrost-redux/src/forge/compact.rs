@@ -46,6 +46,8 @@ use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 
 const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
+const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -87,6 +89,10 @@ pub struct ForgeConfig {
     pub spill_limit_bytes: u64,
     /// Maximum staging hints drained by one wake-up.
     pub max_hints_per_wake: usize,
+    /// Maximum bounded open operations classified for one table and family.
+    pub max_open_operations_per_table: usize,
+    /// Maximum retained snapshots traversed by one reconciliation observation.
+    pub max_retained_snapshots_per_table: usize,
 }
 
 impl Default for ForgeConfig {
@@ -111,6 +117,8 @@ impl Default for ForgeConfig {
             max_concurrent_reads: DEFAULT_MAX_CONCURRENT_READS,
             spill_limit_bytes: DEFAULT_SPILL_LIMIT_BYTES,
             max_hints_per_wake: 256,
+            max_open_operations_per_table: DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE,
+            max_retained_snapshots_per_table: DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE,
         }
     }
 }
@@ -142,6 +150,8 @@ impl ForgeConfig {
             || self.max_concurrent_reads == 0
             || self.spill_limit_bytes == 0
             || self.max_hints_per_wake == 0
+            || self.max_open_operations_per_table == 0
+            || self.max_retained_snapshots_per_table == 0
         {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
@@ -280,12 +290,24 @@ pub struct ForgeTickOutcome {
     pub output_rows: u64,
     /// Number of rotated output files committed to Iceberg.
     pub outputs_committed: usize,
+    /// Prepared live replacements proven committed by fresh manifest evidence.
+    pub live_recovered: usize,
+    /// Prepared live replacements proven abandoned and safely reset.
+    pub live_reset: usize,
+    /// Prepared live replacements still inside the uncertainty window.
+    pub live_pending: usize,
+    /// Prepared live replacements lacking terminal proof.
+    pub live_unresolved: usize,
+    /// Open-operation pages that exceeded their configured cap.
+    pub open_operation_overflows: usize,
+    /// Whether conservative work remains after this outcome.
+    pub pending_work: bool,
 }
 
 impl ForgeTickOutcome {
     /// Merge another isolated stage outcome into this aggregate.
     pub(crate) fn merge(&mut self, other: Self) {
-        self.groups_seen += other.groups_seen;
+        self.groups_seen = self.groups_seen.saturating_add(other.groups_seen);
         self.bins_committed += other.bins_committed;
         self.bins_skipped += other.bins_skipped;
         self.reconciled += other.reconciled;
@@ -307,6 +329,14 @@ impl ForgeTickOutcome {
         self.outputs_committed = self
             .outputs_committed
             .saturating_add(other.outputs_committed);
+        self.live_recovered = self.live_recovered.saturating_add(other.live_recovered);
+        self.live_reset = self.live_reset.saturating_add(other.live_reset);
+        self.live_pending = self.live_pending.saturating_add(other.live_pending);
+        self.live_unresolved = self.live_unresolved.saturating_add(other.live_unresolved);
+        self.open_operation_overflows = self
+            .open_operation_overflows
+            .saturating_add(other.open_operation_overflows);
+        self.pending_work |= other.pending_work;
     }
 }
 
@@ -1897,6 +1927,48 @@ mod tests {
         let _ = Transaction::new;
         let config = ForgeConfig::default();
         assert!(config.validate().is_ok());
+    }
+
+    /// Both reconciliation caps default to 256 and reject zero independently.
+    #[test]
+    fn forge_reconciliation_default_caps_are_256_and_zero_is_invalid() {
+        let config = ForgeConfig::default();
+        assert_eq!(config.max_open_operations_per_table, 256);
+        assert_eq!(config.max_retained_snapshots_per_table, 256);
+        let mut invalid_open = config.clone();
+        invalid_open.max_open_operations_per_table = 0;
+        assert!(invalid_open.validate().is_err());
+        let mut invalid_snapshots = config;
+        invalid_snapshots.max_retained_snapshots_per_table = 0;
+        assert!(invalid_snapshots.validate().is_err());
+    }
+
+    /// Interim live counters saturate and pending state merges by logical OR.
+    #[test]
+    fn forge_tick_outcome_merge_saturates_live_reconciliation_counters() {
+        let mut aggregate = ForgeTickOutcome {
+            live_recovered: usize::MAX,
+            live_reset: usize::MAX,
+            live_pending: usize::MAX,
+            live_unresolved: usize::MAX,
+            open_operation_overflows: usize::MAX,
+            ..ForgeTickOutcome::default()
+        };
+        aggregate.merge(ForgeTickOutcome {
+            live_recovered: 1,
+            live_reset: 1,
+            live_pending: 1,
+            live_unresolved: 1,
+            open_operation_overflows: 1,
+            pending_work: true,
+            ..ForgeTickOutcome::default()
+        });
+        assert_eq!(aggregate.live_recovered, usize::MAX);
+        assert_eq!(aggregate.live_reset, usize::MAX);
+        assert_eq!(aggregate.live_pending, usize::MAX);
+        assert_eq!(aggregate.live_unresolved, usize::MAX);
+        assert_eq!(aggregate.open_operation_overflows, usize::MAX);
+        assert!(aggregate.pending_work);
     }
 
     /// The staging seam consumes the right-size policy's selected groups.

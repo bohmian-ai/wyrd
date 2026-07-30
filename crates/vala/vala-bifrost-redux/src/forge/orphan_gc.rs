@@ -36,9 +36,19 @@ pub struct ProtectedLiveSet {
 }
 
 impl ProtectedLiveSet {
+    /// Insert one object key already validated against its table binding.
+    pub(crate) fn insert_validated(&mut self, object_key: String) {
+        self.extend_validated([object_key]);
+    }
+
+    /// Extend the set with object keys already validated against their table binding.
+    pub(crate) fn extend_validated(&mut self, object_keys: impl IntoIterator<Item = String>) {
+        self.paths.extend(object_keys);
+    }
+
     /// Add a path to the protected set.
     pub fn insert(&mut self, path: impl Into<String>) {
-        self.paths.insert(path.into());
+        self.insert_validated(path.into());
     }
 
     /// Check whether an object path is protected.
@@ -712,7 +722,7 @@ impl Forge {
     ///
     /// Returns [`ForgeError::Invariant`] when the catalog location escapes the
     /// binding or does not match the configured object-store endpoint.
-    fn assert_table_location(
+    pub(super) fn assert_table_location(
         &self,
         metadata: &TableMetadata,
         binding: &TenantTableBinding,

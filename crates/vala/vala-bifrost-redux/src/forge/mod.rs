@@ -17,6 +17,7 @@ mod discovery;
 pub(crate) mod error;
 pub(crate) mod expire;
 pub(crate) mod lease;
+mod live_reconcile;
 mod live_replace;
 pub(crate) mod orphan_gc;
 mod path;
@@ -30,6 +31,8 @@ pub use rewrite::ForgeRewriteRuntime;
 
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
+#[cfg(feature = "test-support")]
+pub use live_reconcile::LiveReconciliationTestOutcome;
 #[cfg(feature = "test-support")]
 pub use live_replace::IcebergRewriteDisposition;
 #[cfg(feature = "test-support")]

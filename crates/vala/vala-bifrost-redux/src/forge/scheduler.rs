@@ -11,8 +11,28 @@ use super::binpack::ForgeGroupKey;
 use super::compact::{ForgeTableKey, ForgeTickBudget, ForgeTickOutcome};
 use super::error::ForgeError;
 use super::lease::{ForgeLease, forge_lease_key};
+use super::live_reconcile::{DestructiveMaintenance, IcebergReconciliationOutcome};
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
+
+/// Interim result of one table-local maintenance pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableStageDisposition {
+    /// Every enabled stage completed.
+    Completed,
+    /// Live reconciliation requires destructive stages to remain skipped.
+    Blocked,
+    /// Global cancellation stopped work at a safe stage boundary.
+    Cancelled,
+}
+
+/// Cancellation-aware result of one staging-fold call.
+enum StagingStageResult<T> {
+    /// Staging fold completed with its ordinary outcome.
+    Completed(T),
+    /// Staging fold observed global shutdown.
+    Cancelled,
+}
 
 impl Forge {
     /// Run periodic and advisory-hint maintenance until cancellation.
@@ -184,6 +204,7 @@ impl Forge {
                 Err(error) => {
                     aggregate.tables_failed += 1;
                     aggregate.stage_failures += 1;
+                    aggregate.pending_work = true;
                     tracing::error!(
                         error = %error,
                         tenant = %key.tenant,
@@ -250,12 +271,41 @@ impl Forge {
             outcome.reconciled += recovered;
             if stop.is_cancelled() {
                 outcome.tables_skipped += 1;
+                outcome.pending_work = true;
                 return Ok(outcome);
             }
-            outcome.merge(
+            let now = chrono::Utc::now();
+            let live = match self
+                .reconcile_live_replacements(&mut lease, &table_key, &binding, stop, now)
+                .await
+            {
+                Ok(live) => live,
+                Err(ForgeError::Shutdown) => {
+                    outcome.tables_skipped += 1;
+                    outcome.pending_work = true;
+                    return Ok(outcome);
+                }
+                Err(error) => return Err(error),
+            };
+            record_live_reconciliation(&mut outcome, &live);
+            match staging_stage_result(
                 self.run_targeted_compaction_for_table(&mut lease, key, &binding, budget, stop)
-                    .await?,
-            );
+                    .await,
+            )? {
+                StagingStageResult::Completed(staging) => outcome.merge(staging),
+                StagingStageResult::Cancelled => {
+                    outcome.tables_skipped += 1;
+                    outcome.pending_work = true;
+                    return Ok(outcome);
+                }
+            }
+            if stop.is_cancelled()
+                || live.destructive_maintenance == DestructiveMaintenance::Blocked
+            {
+                outcome.tables_skipped += 1;
+                outcome.pending_work = true;
+                return Ok(outcome);
+            }
             outcome.tables_succeeded += 1;
             Ok(outcome)
         }
@@ -347,9 +397,12 @@ impl Forge {
             .await;
         let release_result = self.release_lease(&lease).await;
         match (table_result, release_result) {
-            (Ok(cancelled), Ok(())) if cancelled => TableRunStatus::Skipped,
-            (Ok(_), Ok(())) => TableRunStatus::Succeeded,
+            (Ok(TableStageDisposition::Completed), Ok(())) => TableRunStatus::Succeeded,
+            (Ok(TableStageDisposition::Blocked | TableStageDisposition::Cancelled), Ok(())) => {
+                TableRunStatus::Skipped
+            }
             (Err(error), Ok(())) | (Ok(_), Err(error)) => {
+                outcome.pending_work = true;
                 Self::record_table_failure(key, outcome, &error);
                 TableRunStatus::Failed
             }
@@ -359,6 +412,7 @@ impl Forge {
                     lease_key = %lease.lease_key,
                     "Forge stage failed and lease release also failed"
                 );
+                outcome.pending_work = true;
                 Self::record_table_failure(key, outcome, &error);
                 TableRunStatus::Failed
             }
@@ -378,22 +432,47 @@ impl Forge {
         binding: &TenantTableBinding,
         stop: &CancellationToken,
         outcome: &mut ForgeTickOutcome,
-    ) -> Result<bool, ForgeError> {
+    ) -> Result<TableStageDisposition, ForgeError> {
         let reconciliation = self
             .run_compaction_reconciliation_for_table(lease, key, binding)
             .await?;
         outcome.reconciliation_recovered += reconciliation;
         outcome.reconciled += reconciliation;
         if stop.is_cancelled() {
-            return Ok(true);
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Cancelled);
         }
+        let live = match self
+            .reconcile_live_replacements(lease, key, binding, stop, chrono::Utc::now())
+            .await
+        {
+            Ok(live) => live,
+            Err(ForgeError::Shutdown) => {
+                outcome.pending_work = true;
+                return Ok(TableStageDisposition::Cancelled);
+            }
+            Err(error) => return Err(error),
+        };
+        record_live_reconciliation(outcome, &live);
 
-        let compaction = self
-            .run_compaction_bins_for_table(lease, key, binding, stop)
-            .await?;
+        let compaction = match staging_stage_result(
+            self.run_compaction_bins_for_table(lease, key, binding, stop)
+                .await,
+        )? {
+            StagingStageResult::Completed(compaction) => compaction,
+            StagingStageResult::Cancelled => {
+                outcome.pending_work = true;
+                return Ok(TableStageDisposition::Cancelled);
+            }
+        };
         outcome.merge(compaction);
         if stop.is_cancelled() {
-            return Ok(true);
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Cancelled);
+        }
+        if live.destructive_maintenance == DestructiveMaintenance::Blocked {
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Blocked);
         }
 
         let expiry = self
@@ -402,13 +481,15 @@ impl Forge {
         outcome.expiry_reconciled += expiry;
         outcome.reconciled += expiry;
         if stop.is_cancelled() {
-            return Ok(true);
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Cancelled);
         }
 
         let table = self.load_table(&binding.table_ident()).await?;
         let live_set = self.build_live_set(key, binding, &table).await?;
         if stop.is_cancelled() {
-            return Ok(true);
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Cancelled);
         }
         let gc = self
             .run_orphan_gc_for_table(lease, key, binding, &live_set)
@@ -417,7 +498,7 @@ impl Forge {
         outcome.gc_deleted += gc.deleted;
         outcome.gc_skipped += gc.skipped;
         outcome.reconciled += gc.recovered;
-        Ok(false)
+        Ok(TableStageDisposition::Completed)
     }
 
     /// Conditionally release one table lease through the configured timeout.
@@ -457,6 +538,33 @@ impl Forge {
             error = %error,
             "Forge table maintenance failed; continuing"
         );
+    }
+}
+
+/// Merge exact live-reconciliation counters and conservative pending state.
+fn record_live_reconciliation(tick: &mut ForgeTickOutcome, live: &IcebergReconciliationOutcome) {
+    tick.live_recovered = tick.live_recovered.saturating_add(live.recovered);
+    tick.live_reset = tick.live_reset.saturating_add(live.reset);
+    tick.live_pending = tick.live_pending.saturating_add(live.pending);
+    tick.live_unresolved = tick.live_unresolved.saturating_add(live.unresolved);
+    tick.open_operation_overflows = tick
+        .open_operation_overflows
+        .saturating_add(usize::from(live.overflowed));
+    tick.pending_work |= live.overflowed || live.pending > 0 || live.unresolved > 0;
+}
+
+/// Convert only shutdown into a non-error cancelled staging disposition.
+///
+/// # Errors
+///
+/// Returns every non-shutdown staging error unchanged.
+fn staging_stage_result<T>(
+    result: Result<T, ForgeError>,
+) -> Result<StagingStageResult<T>, ForgeError> {
+    match result {
+        Ok(value) => Ok(StagingStageResult::Completed(value)),
+        Err(ForgeError::Shutdown) => Ok(StagingStageResult::Cancelled),
+        Err(error) => Err(error),
     }
 }
 
@@ -570,5 +678,64 @@ mod tests {
                 || (pair[0].tenant == pair[1].tenant
                     && pair[0].table_ref.fqn() <= pair[1].table_ref.fqn())
         }));
+    }
+
+    /// Periodic and hinted staging calls share exact shutdown-only cancellation mapping.
+    #[test]
+    fn staging_fold_shutdown_maps_to_cancelled_without_hiding_failures() {
+        assert!(matches!(
+            staging_stage_result::<()>(Err(ForgeError::Shutdown))
+                .expect("shutdown is a disposition"),
+            StagingStageResult::Cancelled
+        ));
+        assert!(matches!(
+            staging_stage_result(Ok(7)).expect("success remains completed"),
+            StagingStageResult::Completed(7)
+        ));
+        assert!(
+            staging_stage_result::<()>(Err(ForgeError::Invariant {
+                detail: "test failure".to_owned(),
+            }))
+            .is_err()
+        );
+    }
+
+    /// Both scheduler paths fold staging before consuming the blocked gate,
+    /// while periodic expiry and GC remain reachable only after that gate.
+    #[test]
+    fn blocked_live_reconciliation_preserves_stage_order() {
+        let source = include_str!("scheduler.rs");
+        let hinted_start = source
+            .find("async fn run_hinted_key")
+            .expect("hinted owner");
+        let periodic_start = source
+            .find("async fn run_periodic_table_stages")
+            .expect("periodic owner");
+        let hinted = &source[hinted_start..periodic_start];
+        assert!(
+            hinted.find("reconcile_live_replacements")
+                < hinted.find("run_targeted_compaction_for_table")
+        );
+        assert!(
+            hinted.find("run_targeted_compaction_for_table")
+                < hinted.find("DestructiveMaintenance::Blocked")
+        );
+        let periodic = &source[periodic_start..];
+        assert!(
+            periodic.find("reconcile_live_replacements")
+                < periodic.find("run_compaction_bins_for_table")
+        );
+        assert!(
+            periodic.find("run_compaction_bins_for_table")
+                < periodic.find("DestructiveMaintenance::Blocked")
+        );
+        assert!(
+            periodic.find("DestructiveMaintenance::Blocked")
+                < periodic.find("run_snapshot_expiry_for_table")
+        );
+        assert!(
+            periodic.find("run_snapshot_expiry_for_table")
+                < periodic.find("run_orphan_gc_for_table")
+        );
     }
 }

@@ -44,7 +44,7 @@ mod pg_tests {
     use wyrd_spec::vala::WYRD_EVENT_TIME;
     use wyrd_spec::vala::api::{
         AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeCompactionPhase,
-        ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
+        ForgeIcebergRewritePhase, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
     };
     use wyrd_storage::BackendConfig;
 
@@ -1670,6 +1670,155 @@ mod pg_tests {
             committed_counts,
             "replay must not duplicate state or audit"
         );
+    }
+
+    /// Aged abandoned live outputs are rechecked, deleted, and reset exactly once.
+    #[tokio::test]
+    async fn live_reconciliation_deletes_abandoned_output_and_replays_reset() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_concurrent_reads: 2,
+                uncertainty_bound: Duration::from_nanos(1),
+                ..ForgeConfig::default()
+            },
+            true,
+            2,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let (mut lease, output_key) = prepare_abandoned_live_operation(&fixture).await;
+
+        let outcome = fixture
+            .forge
+            .reconcile_live_replacements_for_test(
+                &mut lease,
+                &fixture.binding,
+                &CancellationToken::new(),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("aged abandoned replacement resets");
+        assert_eq!(outcome.reset, 1);
+        assert!(!outcome.blocked);
+        assert!(
+            !fixture
+                .staging
+                .exists(&output_key)
+                .await
+                .expect("reset output existence check")
+        );
+        let replay = fixture
+            .forge
+            .reconcile_live_replacements_for_test(
+                &mut lease,
+                &fixture.binding,
+                &CancellationToken::new(),
+                chrono::Utc::now(),
+            )
+            .await
+            .expect("closed reset has no open replay");
+        assert_eq!(replay.reset, 0);
+        assert_eq!(
+            family_transition_counts(&fixture, "iceberg_rewrite", "forge.iceberg_rewrite.").await,
+            (1, 2)
+        );
+    }
+
+    /// Prepare one aged abandoned operation whose output is absent from manifests.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup, catalog inspection, storage, lease acquisition,
+    /// or operation persistence fails.
+    async fn prepare_abandoned_live_operation(fixture: &Fixture) -> (ForgeLease, String) {
+        fixture
+            .forge
+            .run_once()
+            .await
+            .expect("one staging snapshot");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("staging table");
+        let snapshot = table
+            .metadata()
+            .current_snapshot()
+            .expect("current snapshot");
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("current manifest list");
+        let mut input_paths = Vec::new();
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("current manifest");
+            input_paths.extend(
+                manifest
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.is_alive())
+                    .map(|entry| {
+                        StoragePath::new(entry.file_path()).expect("catalog input path is valid")
+                    }),
+            );
+        }
+        assert!(!input_paths.is_empty());
+        let base_snapshot_id = snapshot.snapshot_id();
+        let partition_spec_id = table.metadata().default_partition_spec_id();
+        let lease = ForgeLease::acquire(
+            &fixture.operator_pool,
+            forge_lease_key(
+                fixture.tenant,
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            ),
+            uuid::Uuid::now_v7(),
+            ForgeConfig::default().lease_ttl,
+        )
+        .await
+        .expect("reset lease query")
+        .expect("reset lease");
+        let operation_id = uuid::Uuid::now_v7();
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+        );
+        let output_key = format!(
+            "{}/data/reset-{}.parquet",
+            fixture.binding.object_prefix, operation_id
+        );
+        fixture
+            .staging
+            .write(&output_key, Buffer::from("prepared-output"))
+            .await
+            .expect("prepared output exists before reset");
+        let detail = AuditDetail::ForgeIcebergRewrite {
+            operation_id,
+            phase: ForgeIcebergRewritePhase::Prepared,
+            group: resource.clone(),
+            base_snapshot_id,
+            committed_snapshot_id: None,
+            partition_spec_id,
+            partition_day: "2026-07-14".to_owned(),
+            target_file_size_bytes: 3_000_000,
+            input_paths,
+            output_paths: vec![
+                StoragePath::new(output_key.clone()).expect("prepared output path is valid"),
+            ],
+            writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        };
+        append_operation(
+            fixture,
+            ForgeOperationFamily::IcebergRewrite,
+            &operation_event("forge.iceberg_rewrite.prepared", &resource, detail),
+            true,
+        )
+        .await;
+        (lease, output_key)
     }
 
     /// Clone one complete manifest data-file identity for a distinct fixture path.

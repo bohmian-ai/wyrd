@@ -376,14 +376,18 @@ class DataCardRegistry:
         name: str | None = ...,
         version: str | None = ...,
         interface: DataInterface | type[DataInterface] | None = ...,
+        eager_load: bool = ...,
+        load_kwargs: DataLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> DataCard:
         """Retrieve and validate one complete `DataCard` envelope.
 
         Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
         required, and omitting `version` selects the server's latest resolved
         version. A custom data interface must be supplied here when the
-        serialized Card uses one. `get` returns the hydrated card holder;
-        artifact bytes are loaded later by `DataCard.load`.
+        serialized Card uses one. Set `eager_load` to download verified
+        artifacts and load the holder before return. `load_kwargs` is forwarded
+        only to that eager holder load; otherwise artifact bytes are loaded
+        later by `DataCard.load`.
 
         Args:
             uid: Exact server-assigned Card UID. When present, it takes
@@ -394,6 +398,10 @@ class DataCardRegistry:
             version: Exact version. Omit it to resolve the latest version.
             interface: Built-in or custom `DataInterface` instance/class used
                 to rebuild the Python interface from Card metadata.
+            eager_load: Whether to download verified artifacts and load the
+                data holder before returning.
+            load_kwargs: Optional `DataLoadArgs` or JSON-compatible mapping
+                forwarded only to the eager data holder load.
 
         Returns:
             A native `DataCard` populated from the server-stored Card JSON.
@@ -514,14 +522,18 @@ class ModelCardRegistry:
         name: str | None = ...,
         version: str | None = ...,
         interface: ModelInterface | type[ModelInterface] | None = ...,
+        eager_load: bool = ...,
+        load_kwargs: ModelLoadArgs | Mapping[str, JsonValue] | None = ...,
     ) -> ModelCard:
         """Retrieve and validate one complete `ModelCard` envelope.
 
         Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
         required, and omitting `version` selects the latest resolved version.
         Supply a custom model interface here when the serialized Card cannot
-        rebuild its interface from built-in metadata. Artifact bytes are not
-        downloaded by `get`; call `ModelCard.load` afterward.
+        rebuild its interface from built-in metadata. Set `eager_load` to
+        download verified artifacts and load the holder before return.
+        `load_kwargs` is forwarded only to that eager holder load; otherwise
+        call `ModelCard.load` afterward.
 
         Args:
             uid: Exact server-assigned Card UID. When present, it takes
@@ -531,6 +543,10 @@ class ModelCardRegistry:
             version: Exact version. Omit it to resolve the latest version.
             interface: Built-in or custom `ModelInterface` instance/class used
                 to rebuild the Python interface from Card metadata.
+            eager_load: Whether to download verified artifacts and load the
+                model holder before returning.
+            load_kwargs: Optional `ModelLoadArgs` or JSON-compatible mapping
+                forwarded only to the eager model holder load.
 
         Returns:
             A native `ModelCard` populated from the server-stored Card JSON.

@@ -10865,6 +10865,7 @@ dependencies = [
  "blake3",
  "chrono",
  "futures-util",
+ "indicatif",
  "reqwest 0.12.28",
  "secrecy",
  "serde",

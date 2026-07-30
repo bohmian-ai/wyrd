@@ -182,7 +182,7 @@ def test_data_card_custom_interface_get_requires_interface_and_loads_artifacts(w
         uid=card.uid,
         interface=JsonDataInterface,
         eager_load=True,
-        load_args=DataLoadArgs({"strict": True}),
+        load_kwargs=DataLoadArgs({"strict": True}),
     )
     assert loaded.uid == card.uid
     assert loaded.interface.value == {"rows": 2}
@@ -268,7 +268,7 @@ def test_model_card_custom_interface_get_requires_interface_and_loads_artifacts(
         uid=card.uid,
         interface=TextModelInterface,
         eager_load=True,
-        load_args=ModelLoadArgs({"strict": True}),
+        load_kwargs=ModelLoadArgs({"strict": True}),
     )
     assert loaded.interface.value == "model-bytes"
     assert loaded.interface.loaded_kwargs == {"strict": True}

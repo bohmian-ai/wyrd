@@ -9,16 +9,22 @@ use wyrd_client::WyrdClient;
 use wyrd_spec::storage::DownloadPlan;
 
 use super::{DownloadOutcome, DownloadVerification};
-use crate::error::StorageClientError;
+use crate::{DownloadProgressSink, error::StorageClientError};
 
 /// Downloads an artifact via presigned or SAS GET URL.
 ///
 /// External request with no Wyrd auth headers.
+///
+/// # Errors
+/// Returns transport, backend, or local filesystem errors.
+///
+/// # Cancellation
+/// Cancellation can leave a partial destination file for the caller to
+/// discard.
 pub(crate) async fn download(
     client: &WyrdClient,
     plan: &DownloadPlan,
     dest: &Path,
-    verification: Option<DownloadVerification<'_>>,
 ) -> Result<DownloadOutcome, StorageClientError> {
     let response = client
         .request_external_stream(reqwest::Method::GET, &plan.get_url, None, &[])
@@ -26,14 +32,48 @@ pub(crate) async fn download(
         .map_err(|_| StorageClientError::Transport {
             operation: "download",
         })?;
-    write_response(response, dest, verification).await
+    write_response(response, dest, None, None).await
+}
+
+/// Downloads and verifies an artifact via a presigned or SAS GET URL.
+///
+/// # Errors
+/// Returns a transport, backend, filesystem, or verification error. The
+/// progress sink observes only chunks successfully written before a failure.
+///
+/// # Cancellation
+/// Cancellation can leave a partial destination after reporting its
+/// successfully written bytes.
+pub(crate) async fn download_verified(
+    client: &WyrdClient,
+    plan: &DownloadPlan,
+    dest: &Path,
+    verification: DownloadVerification<'_>,
+    progress: &DownloadProgressSink,
+) -> Result<DownloadOutcome, StorageClientError> {
+    let response = client
+        .request_external_stream(reqwest::Method::GET, &plan.get_url, None, &[])
+        .await
+        .map_err(|_| StorageClientError::Transport {
+            operation: "download",
+        })?;
+    write_response(response, dest, Some(verification), Some(progress)).await
 }
 
 /// Writes a successful HTTP response body to a file, tracking bytes written.
+///
+/// # Errors
+/// Returns a backend, transport, filesystem, or verification error. When a
+/// sink is present, it reports only chunks written successfully before an error.
+///
+/// # Cancellation
+/// Cancellation can leave the destination partially written after reporting
+/// its committed bytes.
 pub(crate) async fn write_response(
     response: reqwest::Response,
     dest: &Path,
     verification: Option<DownloadVerification<'_>>,
+    progress: Option<&DownloadProgressSink>,
 ) -> Result<DownloadOutcome, StorageClientError> {
     if !response.status().is_success() {
         return Err(crate::error::map_backend_response(response).await);
@@ -49,6 +89,12 @@ pub(crate) async fn write_response(
         tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
         digest.update(&chunk);
         bytes_written += chunk.len() as u64;
+        if let Some(progress) = progress {
+            progress(
+                bytes_written,
+                verification.map(|value| value.expected_size_bytes),
+            );
+        }
     }
     if let Some(verification) = verification {
         let actual_sha256 = base64::engine::general_purpose::STANDARD.encode(digest.finalize());

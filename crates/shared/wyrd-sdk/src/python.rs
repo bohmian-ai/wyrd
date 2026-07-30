@@ -1726,8 +1726,8 @@ struct RegistryGetQuery {
     interface: Option<Py<PyAny>>,
     /// Whether verified artifacts must load before return.
     eager_load: bool,
-    /// Optional typed or mapping loader arguments.
-    load_args: Option<Py<PyAny>>,
+    /// Optional typed or mapping loader keyword arguments.
+    load_kwargs: Option<Py<PyAny>>,
 }
 
 /// Normalizes the public Python get boundary before registry access.
@@ -1738,18 +1738,23 @@ impl RegistryGetQuery {
     ///
     /// Returns a Python type error for unknown keywords or values that do not
     /// match the public string, boolean, or object shapes.
-    fn from_kwargs(kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<Self> {
+    fn from_kwargs(kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Self> {
         if let Some(kwargs) = kwargs {
             for (key, _) in kwargs {
                 let key = key.extract::<String>()?;
                 if !matches!(
                     key.as_str(),
-                    "uid" | "space" | "name" | "version" | "interface" | "eager_load" | "load_args"
+                    "uid"
+                        | "space"
+                        | "name"
+                        | "version"
+                        | "interface"
+                        | "eager_load"
+                        | "load_kwargs"
                 ) {
                     return Err(pyo3::exceptions::PyTypeError::new_err(format!(
                         "get() got an unexpected keyword argument '{key}'"
-                    ))
-                    .into());
+                    )));
                 }
             }
         }
@@ -1760,7 +1765,7 @@ impl RegistryGetQuery {
             version: Self::optional_string(kwargs, "version")?,
             interface: Self::optional_object(kwargs, "interface")?,
             eager_load: Self::optional_bool(kwargs, "eager_load")?.unwrap_or(false),
-            load_args: Self::optional_object(kwargs, "load_args")?,
+            load_kwargs: Self::optional_object(kwargs, "load_kwargs")?,
         })
     }
 
@@ -1770,10 +1775,7 @@ impl RegistryGetQuery {
     ///
     /// Returns a Python extraction error when a present non-`None` value is
     /// not a string.
-    fn optional_string(
-        kwargs: Option<&Bound<'_, PyDict>>,
-        name: &str,
-    ) -> CardPyResult<Option<String>> {
+    fn optional_string(kwargs: Option<&Bound<'_, PyDict>>, name: &str) -> PyResult<Option<String>> {
         let Some(value) = kwargs
             .map(|values| values.get_item(name))
             .transpose()?
@@ -1784,7 +1786,7 @@ impl RegistryGetQuery {
         if value.is_none() {
             return Ok(None);
         }
-        value.extract().map(Some).map_err(Into::into)
+        value.extract().map(Some)
     }
 
     /// Extract an optional boolean keyword.
@@ -1793,7 +1795,7 @@ impl RegistryGetQuery {
     ///
     /// Returns a Python extraction error when a present non-`None` value is
     /// not a boolean.
-    fn optional_bool(kwargs: Option<&Bound<'_, PyDict>>, name: &str) -> CardPyResult<Option<bool>> {
+    fn optional_bool(kwargs: Option<&Bound<'_, PyDict>>, name: &str) -> PyResult<Option<bool>> {
         let Some(value) = kwargs
             .map(|values| values.get_item(name))
             .transpose()?
@@ -1804,7 +1806,7 @@ impl RegistryGetQuery {
         if value.is_none() {
             return Ok(None);
         }
-        value.extract().map(Some).map_err(Into::into)
+        value.extract().map(Some)
     }
 
     /// Retain an optional arbitrary Python object beyond the dictionary borrow.
@@ -1816,7 +1818,7 @@ impl RegistryGetQuery {
     fn optional_object(
         kwargs: Option<&Bound<'_, PyDict>>,
         name: &str,
-    ) -> CardPyResult<Option<Py<PyAny>>> {
+    ) -> PyResult<Option<Py<PyAny>>> {
         let Some(value) = kwargs
             .map(|values| values.get_item(name))
             .transpose()?
@@ -2021,8 +2023,9 @@ impl PyDataCardRegistry {
     /// Pass `uid` for an exact lookup. Without `uid`, `space` and `name` are
     /// required; omitting `version` selects the latest resolved version. A
     /// custom data interface must be supplied when the serialized Card uses
-    /// one. `get` retains verified artifacts on the holder but does not invoke
-    /// the interface unless `eager_load=True`; call `DataCard.load` afterward.
+    /// one. With `eager_load=True`, `get` downloads verified artifacts and
+    /// forwards `load_kwargs` only to the Data holder load operation. Otherwise
+    /// it returns the hydrated holder without loading artifacts.
     ///
     /// # Arguments
     /// * `uid` - Exact server-assigned UID. It takes precedence over the named
@@ -2032,6 +2035,10 @@ impl PyDataCardRegistry {
     /// * `version` - Exact version, or latest when omitted.
     /// * `interface` - Built-in or custom `DataInterface` instance/class used
     ///   to rebuild the Python interface from Card metadata.
+    /// * `eager_load` - Whether to download verified artifacts and load the
+    ///   Data holder before returning.
+    /// * `load_kwargs` - Optional typed or mapping arguments forwarded only to
+    ///   the eager Data holder load operation.
     ///
     /// # Returns
     /// A native `DataCard` populated from server-stored Card JSON.
@@ -2041,7 +2048,7 @@ impl PyDataCardRegistry {
     /// found, the envelope fails validation, or a required custom interface is
     /// missing.
     #[pyo3(signature = (**kwargs))]
-    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<DataCard> {
+    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<DataCard> {
         let query = RegistryGetQuery::from_kwargs(kwargs)?;
         let selector = selector_for_kind(
             CardKind::Data,
@@ -2051,15 +2058,19 @@ impl PyDataCardRegistry {
             query.version.as_deref(),
         )?;
         let envelope = download_card(py, &self.inner, selector)?;
-        let mut card = DataCard::from_card(envelope)?;
+        let mut card = DataCard::from_card(envelope).map_err(WyrdPyError::from)?;
         card.hydrate_interface(
             py,
             query.interface.as_ref().map(|interface| interface.bind(py)),
         )?;
         if query.eager_load {
-            let uid = card.as_card_ref()?.uid.ok_or_else(|| {
-                WyrdPyError::validation("server DataCard response requires a Card UID")
-            })?;
+            let uid = card
+                .as_card_ref()
+                .map_err(WyrdPyError::from)?
+                .uid
+                .ok_or_else(|| {
+                    WyrdPyError::validation("server DataCard response requires a Card UID")
+                })?;
             let workspace = tempfile::Builder::new()
                 .prefix("wyrd-data-")
                 .tempdir()
@@ -2074,7 +2085,7 @@ impl PyDataCardRegistry {
             card.load(
                 py,
                 Some(path),
-                query.load_args.as_ref().map(|args| args.bind(py)),
+                query.load_kwargs.as_ref().map(|args| args.bind(py)),
             )?;
             card.artifact_workspace = Some(workspace);
         }
@@ -2195,7 +2206,9 @@ impl PyModelCardRegistry {
     /// required; omitting `version` selects the latest resolved version. A
     /// custom model interface must be supplied when the serialized Card
     /// cannot rebuild one from built-in metadata. Artifact download and local
-    /// interface loading occur only when `eager_load=True`.
+    /// interface loading occur only when `eager_load=True`. When eager loading
+    /// is enabled, `load_kwargs` is forwarded only to the Model holder load
+    /// operation.
     ///
     /// # Arguments
     /// * `uid` - Exact server-assigned UID. It takes precedence over the named
@@ -2205,6 +2218,10 @@ impl PyModelCardRegistry {
     /// * `version` - Exact version, or latest when omitted.
     /// * `interface` - Built-in or custom `ModelInterface` instance/class used
     ///   to rebuild the Python interface from Card metadata.
+    /// * `eager_load` - Whether to download verified artifacts and load the
+    ///   Model holder before returning.
+    /// * `load_kwargs` - Optional typed or mapping arguments forwarded only to
+    ///   the eager Model holder load operation.
     ///
     /// # Returns
     /// A native `ModelCard` populated from server-stored Card JSON.
@@ -2215,7 +2232,7 @@ impl PyModelCardRegistry {
     /// missing. With `eager_load=True`, `get` retains verified artifacts on
     /// the holder after the interface loads successfully.
     #[pyo3(signature = (**kwargs))]
-    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> CardPyResult<ModelCard> {
+    fn get(&self, py: Python<'_>, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<ModelCard> {
         let query = RegistryGetQuery::from_kwargs(kwargs)?;
         let selector = selector_for_kind(
             CardKind::Model,
@@ -2225,15 +2242,19 @@ impl PyModelCardRegistry {
             query.version.as_deref(),
         )?;
         let envelope = download_card(py, &self.inner, selector)?;
-        let mut card = ModelCard::from_card(envelope)?;
+        let mut card = ModelCard::from_card(envelope).map_err(WyrdPyError::from)?;
         card.hydrate_interface(
             py,
             query.interface.as_ref().map(|interface| interface.bind(py)),
         )?;
         if query.eager_load {
-            let uid = card.as_card_ref()?.uid.ok_or_else(|| {
-                WyrdPyError::model_validation("server ModelCard response requires a Card UID")
-            })?;
+            let uid = card
+                .as_card_ref()
+                .map_err(WyrdPyError::from)?
+                .uid
+                .ok_or_else(|| {
+                    WyrdPyError::model_validation("server ModelCard response requires a Card UID")
+                })?;
             let workspace = tempfile::Builder::new()
                 .prefix("wyrd-model-")
                 .tempdir()
@@ -2248,7 +2269,7 @@ impl PyModelCardRegistry {
             card.load(
                 py,
                 Some(path),
-                query.load_args.as_ref().map(|args| args.bind(py)),
+                query.load_kwargs.as_ref().map(|args| args.bind(py)),
             )?;
             card.artifact_workspace = Some(workspace);
         }

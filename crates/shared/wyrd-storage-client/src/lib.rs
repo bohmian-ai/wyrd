@@ -28,6 +28,13 @@ pub use download::DownloadOutcome;
 pub use error::StorageClientError;
 pub use upload::{ArtifactSource, FileSource, UploadProgress, UploadProgressSink};
 
+/// Receives the cumulative bytes durably written by one verified download.
+///
+/// The optional total is supplied by the transfer plan when known. Verified
+/// download callers provide this sink because the storage client owns the
+/// streaming write boundary while callers own presentation.
+pub type DownloadProgressSink = Arc<dyn Fn(u64, Option<u64>) + Send + Sync + 'static>;
+
 /// Storage transfer handle that dispatches every HTTP call through a shared
 /// [`WyrdClient`].
 ///
@@ -232,13 +239,13 @@ impl WyrdStorageClient {
     /// Download an artifact and verify it against the server-declared digest
     /// and byte length.
     ///
-    /// This is an internal-capability seam for registry loading. The public
-    /// registry handle owns artifact selection; this client owns transfer and
-    /// byte verification.
-    ///
     /// # Errors
     /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes
     /// do not match either declared value.
+    ///
+    /// # Cancellation
+    /// Cancellation can leave a partial destination file for the caller to
+    /// discard.
     pub async fn download_verified(
         &self,
         plan: &DownloadPlan,
@@ -246,12 +253,45 @@ impl WyrdStorageClient {
         expected_sha256: &str,
         expected_size_bytes: u64,
     ) -> Result<DownloadOutcome, StorageClientError> {
+        self.download_verified_with_progress(
+            plan,
+            dest,
+            expected_sha256,
+            expected_size_bytes,
+            Arc::new(|_, _| {}),
+        )
+        .await
+    }
+
+    /// Download and verify an artifact while reporting each successful local write.
+    ///
+    /// This internal-capability seam lets registry loading own artifact
+    /// presentation while this client reports cumulative bytes at its streaming
+    /// write boundary.
+    ///
+    /// # Errors
+    /// Returns [`StorageClientError::VerifyFailed`] when the downloaded bytes
+    /// do not match either declared value, or another storage-client error for
+    /// transport or local writes.
+    ///
+    /// # Cancellation
+    /// Cancellation can leave a partial destination after reporting the bytes
+    /// already committed locally.
+    pub async fn download_verified_with_progress(
+        &self,
+        plan: &DownloadPlan,
+        dest: &Path,
+        expected_sha256: &str,
+        expected_size_bytes: u64,
+        progress: DownloadProgressSink,
+    ) -> Result<DownloadOutcome, StorageClientError> {
         download::dispatch_verified(
             &self.client,
             plan,
             dest,
             expected_sha256,
             expected_size_bytes,
+            progress,
         )
         .await
     }

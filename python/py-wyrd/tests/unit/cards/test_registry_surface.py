@@ -44,3 +44,21 @@ def test_exact_pin_and_explicit_bump_are_rejected_before_network() -> None:
     )
     with pytest.raises(wyrd.WyrdError, match="exact metadata.version pin"):
         _offline_cards().prompt.register(card, version_bump=VersionBump.Minor)
+
+
+def test_data_get_rejects_legacy_load_args_before_network() -> None:
+    """The Data registry rejects the retired eager-load keyword locally."""
+    with pytest.raises(
+        TypeError,
+        match="get\\(\\) got an unexpected keyword argument 'load_args'",
+    ):
+        _offline_cards().data.get(load_args={})
+
+
+def test_model_get_rejects_legacy_load_args_before_network() -> None:
+    """The Model registry rejects the retired eager-load keyword locally."""
+    with pytest.raises(
+        TypeError,
+        match="get\\(\\) got an unexpected keyword argument 'load_args'",
+    ):
+        _offline_cards().model.get(load_args={})

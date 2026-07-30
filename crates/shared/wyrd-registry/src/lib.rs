@@ -5,6 +5,7 @@
 
 mod config;
 mod download;
+mod download_progress;
 mod engine;
 mod error;
 mod handle;

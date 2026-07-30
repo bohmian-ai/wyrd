@@ -1,7 +1,7 @@
 //! Façade tests for the real storage-client transfer boundary.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -16,7 +16,7 @@ use wyrd_client::transport::HttpTransport;
 use wyrd_client::transport::config::HttpConfig;
 use wyrd_client::transport::credential::ResolvedCredential;
 use wyrd_spec::storage::{HeaderPair, UploadId, UploadPlan};
-use wyrd_storage_client::{StorageClientError, WyrdStorageClient};
+use wyrd_storage_client::{DownloadProgressSink, StorageClientError, WyrdStorageClient};
 
 #[derive(Clone, Debug)]
 struct Request {
@@ -413,20 +413,29 @@ async fn high_level_upload_dispatches_gcs_and_azure_protocols() {
     assert_eq!(requests[4].method, "POST");
 }
 
+/// Verifies streamed download bytes, digest checks, and monotonic progress reports.
 #[tokio::test]
 async fn download_and_download_verified_stream_bytes_and_check_digest_and_size() {
+    let content = vec![b'x'; 256 * 1024];
     let server = TestServer::start(vec![Response {
         status: 200,
-        body: b"verified".to_vec(),
+        body: content.clone(),
         headers: Vec::new(),
     }])
     .await;
-    let content = b"verified";
     let storage = WyrdStorageClient::new(&client(server.uri()));
     let destination = NamedTempFile::new().expect("destination");
-    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(content));
+    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(&content));
+    let positions = Arc::new(StdMutex::new(Vec::new()));
+    let observed_positions = Arc::clone(&positions);
+    let progress: DownloadProgressSink = Arc::new(move |written, total| {
+        observed_positions
+            .lock()
+            .expect("test progress mutex is not poisoned")
+            .push((written, total));
+    });
     storage
-        .download_verified(
+        .download_verified_with_progress(
             &wyrd_spec::storage::DownloadPlan {
                 get_url: format!("{}/download", server.uri()),
                 ttl_secs: 60,
@@ -434,6 +443,7 @@ async fn download_and_download_verified_stream_bytes_and_check_digest_and_size()
             Path::new(destination.path()),
             &digest,
             content.len() as u64,
+            progress,
         )
         .await
         .expect("verified download succeeds");
@@ -441,11 +451,23 @@ async fn download_and_download_verified_stream_bytes_and_check_digest_and_size()
         tokio::fs::read(destination.path())
             .await
             .expect("read destination"),
-        content
+        content.as_slice()
     );
     let requests = server.requests().await;
     assert_eq!(requests[0].method, "GET");
     assert_eq!(requests[0].target, "/download");
+    let positions = positions
+        .lock()
+        .expect("test progress mutex is not poisoned");
+    assert_eq!(
+        positions.last(),
+        Some(&(content.len() as u64, Some(content.len() as u64)))
+    );
+    assert!(
+        positions.len() > 1,
+        "response must stream in multiple chunks"
+    );
+    assert!(positions.windows(2).all(|window| window[0].0 < window[1].0));
 }
 
 #[tokio::test]
@@ -478,6 +500,7 @@ async fn façade_rejects_invalid_provider_plans_before_transfer() {
     assert!(server.requests().await.is_empty());
 }
 
+/// Preserves backend and verification errors without reporting false completion.
 #[tokio::test]
 async fn façade_preserves_backend_failure_and_download_verification_errors() {
     let server = TestServer::start(vec![
@@ -507,8 +530,10 @@ async fn façade_preserves_backend_failure_and_download_verification_errors() {
     assert_eq!(error.code(), "WYRD_STORAGE_503_BACKEND_UNAVAILABLE");
 
     let destination = NamedTempFile::new().expect("destination");
+    let positions = Arc::new(StdMutex::new(Vec::new()));
+    let observed_positions = Arc::clone(&positions);
     let error = storage
-        .download_verified(
+        .download_verified_with_progress(
             &wyrd_spec::storage::DownloadPlan {
                 get_url: format!("{}/download", server.uri()),
                 ttl_secs: 60,
@@ -516,8 +541,21 @@ async fn façade_preserves_backend_failure_and_download_verification_errors() {
             destination.path(),
             &sha256_b64(b"expected"),
             8,
+            Arc::new(move |written, total| {
+                observed_positions
+                    .lock()
+                    .expect("test progress mutex is not poisoned")
+                    .push((written, total));
+            }),
         )
         .await
         .expect_err("download verification failure is returned");
     assert!(matches!(error, StorageClientError::VerifyFailed { .. }));
+    assert_eq!(
+        positions
+            .lock()
+            .expect("test progress mutex is not poisoned")
+            .last(),
+        Some(&(b"wrong".len() as u64, Some(8)))
+    );
 }

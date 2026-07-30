@@ -19,6 +19,7 @@ use wyrd_spec::storage::{DownloadInitRequest, DownloadInitResponse};
 
 use crate::config;
 use crate::download;
+use crate::download_progress::DownloadProgressDisplay;
 use crate::engine::{RegistryContext, RegistryEngine};
 use crate::error::RegistryEngineError;
 use crate::progress::RegistrationProgressSink;
@@ -425,7 +426,13 @@ impl<'a> ArtifactMaterializer<'a> {
     /// Returns a Wyrd error when inventory planning, staging creation, any
     /// transfer, digest verification, or final publication fails. On transfer
     /// failure the staging directory is dropped and the destination is not
-    /// modified.
+    /// modified. The workflow clears its stdout transfer display before either
+    /// a result or error becomes visible to its caller.
+    ///
+    /// # Cancellation
+    /// Cancellation drops the unpublished staging directory and may remove the
+    /// active display without completing its bars. The prior destination
+    /// remains unchanged.
     async fn materialize(&self) -> Result<(), WyrdError> {
         let inventory = reads::list_artifacts(&self.engine.client, self.card_uid)
             .await
@@ -451,11 +458,13 @@ impl<'a> ArtifactMaterializer<'a> {
             .await
             .map_err(RegistryEngineError::from)
             .map_err(WyrdError::from)?;
+        let display = Arc::new(DownloadProgressDisplay::stdout());
         let downloads =
             futures_util::stream::iter(inventory.artifacts.into_iter().map(|artifact| {
                 let engine = Arc::clone(self.engine);
                 let card_uid = self.card_uid.clone();
                 let staging_root = staging_root.clone();
+                let display = Arc::clone(&display);
                 async move {
                     let path = staging_root.join(artifact.relative_path.as_str());
                     if let Some(parent) = path.parent() {
@@ -469,6 +478,7 @@ impl<'a> ArtifactMaterializer<'a> {
                         &card_uid,
                         &artifact.relative_path,
                         &path,
+                        display,
                     )
                     .await
                 }
@@ -476,10 +486,12 @@ impl<'a> ArtifactMaterializer<'a> {
             .buffer_unordered(4)
             .collect::<Vec<_>>()
             .await;
-        for result in downloads {
-            result.map_err(WyrdError::from)?;
-        }
-        self.publish(&staging_root, staging.path()).await
+        let result = match downloads.into_iter().find_map(Result::err) {
+            Some(error) => Err(WyrdError::from(error)),
+            None => self.publish(&staging_root, staging.path()).await,
+        };
+        display.clear();
+        result
     }
 
     /// Replace the destination only after the complete staging tree verifies.

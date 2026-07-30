@@ -16,6 +16,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 futures-util = { workspace = true }
+indicatif = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 secrecy = { workspace = true }

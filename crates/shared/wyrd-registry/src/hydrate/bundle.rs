@@ -1,11 +1,14 @@
 //! Staged bundle materialization for a resolved Card graph.
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use serde::Serialize;
 use wyrd_spec::{error::WyrdError, reference::CardRef};
 
-use crate::{RegistryContext, download::download_artifact, error::RegistryEngineError};
+use crate::{
+    RegistryContext, download::download_artifact, download_progress::DownloadProgressDisplay,
+    error::RegistryEngineError,
+};
 
 use super::{
     HydratedArtifactManifest, HydratedBundleManifest, HydratedCardManifest, HydrationMode,
@@ -62,42 +65,59 @@ impl<'a> HydrationBundleWriter<'a> {
     /// Returns an error when a path or alias is unsafe, local materialization fails, an
     /// artifact-bearing Card lacks a UID, serialization fails, or an artifact transfer fails.
     ///
-    /// Cancellation during artifact transfer can leave partial files inside staging. The owning
-    /// hydrator removes staging when an awaited operation returns an error.
+    /// # Cancellation
+    ///
+    /// Cancellation during artifact transfer can leave partial files inside
+    /// staging. The owning hydrator removes its unpublished staging bundle.
     pub(super) async fn write(&self, graph: &ResolvedGraph) -> Result<BundleStats, WyrdError> {
-        let mut manifests = Vec::with_capacity(graph.cards.len());
-        let mut downloaded_artifact_count = 0;
-        for card in &graph.cards {
-            let (manifest, downloaded) = self.write_card(card).await?;
-            manifests.push(manifest);
-            downloaded_artifact_count += downloaded;
+        let display = matches!(self.mode, HydrationMode::Complete)
+            .then(|| Arc::new(DownloadProgressDisplay::stdout()));
+        let result = async {
+            let mut manifests = Vec::with_capacity(graph.cards.len());
+            let mut downloaded_artifact_count = 0;
+            for card in &graph.cards {
+                let (manifest, downloaded) = self.write_card(card, display.as_ref()).await?;
+                manifests.push(manifest);
+                downloaded_artifact_count += downloaded;
+            }
+            let artifact_count = manifests.iter().map(|card| card.artifacts.len()).sum();
+            let manifest = HydratedBundleManifest {
+                api_version: "wyrd/hydrated-bundle/v1".to_owned(),
+                hydration: self.mode,
+                root: graph.root.clone(),
+                card_count: manifests.len(),
+                artifact_count,
+                downloaded_artifact_count,
+                cards: manifests,
+            };
+            write_yaml(&self.staging.join("metadata.yaml"), &manifest)?;
+            Ok(BundleStats {
+                artifact_count,
+                downloaded_artifact_count,
+            })
         }
-        let artifact_count = manifests.iter().map(|card| card.artifacts.len()).sum();
-        let manifest = HydratedBundleManifest {
-            api_version: "wyrd/hydrated-bundle/v1".to_owned(),
-            hydration: self.mode,
-            root: graph.root.clone(),
-            card_count: manifests.len(),
-            artifact_count,
-            downloaded_artifact_count,
-            cards: manifests,
-        };
-        write_yaml(&self.staging.join("metadata.yaml"), &manifest)?;
-        Ok(BundleStats {
-            artifact_count,
-            downloaded_artifact_count,
-        })
+        .await;
+        if let Some(display) = display {
+            display.clear();
+        }
+        result
     }
 
     /// Writes one Card's documents, artifacts, aliases, and manifest projection.
     ///
     /// # Errors
     ///
-    /// Returns an error when the Card has no alias, a local path or write is invalid, or an
-    /// artifact download fails.
+    /// Returns an error when the Card has no alias, a local path or write is invalid, the
+    /// workflow display invariant is missing, or an artifact download fails.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation during artifact transfer leaves only unpublished staging
+    /// content for the owning hydrator to remove.
     async fn write_card(
         &self,
         card: &ResolvedCard,
+        display: Option<&Arc<DownloadProgressDisplay>>,
     ) -> Result<(HydratedCardManifest, usize), WyrdError> {
         let canonical_alias = card
             .aliases
@@ -117,7 +137,7 @@ impl<'a> HydrationBundleWriter<'a> {
             },
         )?;
 
-        let (artifacts, downloaded) = self.materialize_artifacts(card, &card_dir).await?;
+        let (artifacts, downloaded) = self.materialize_artifacts(card, &card_dir, display).await?;
         write_yaml(&inventory_path, &artifacts)?;
         let aliases = self.write_aliases(card, &card_path)?;
         Ok((
@@ -155,18 +175,30 @@ impl<'a> HydrationBundleWriter<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error for unsafe paths, missing Card UIDs, local directory failures, or failed
-    /// and unverifiable artifact transfers.
+    /// Returns an error for unsafe paths, missing Card UIDs, a missing complete-hydration
+    /// display, local directory failures, or failed and unverifiable artifact transfers.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation can leave the current artifact partially written inside
+    /// the unpublished staging bundle.
     async fn materialize_artifacts(
         &self,
         card: &ResolvedCard,
         card_dir: &Path,
+        display: Option<&Arc<DownloadProgressDisplay>>,
     ) -> Result<(Vec<HydratedArtifactManifest>, usize), WyrdError> {
         let mut artifacts = Vec::with_capacity(card.inventory.artifacts.len());
         let mut downloaded = 0;
         for entry in &card.inventory.artifacts {
             validate_artifact_path(entry.relative_path.as_str(), &card.card_ref)?;
             let local_path = if matches!(self.mode, HydrationMode::Complete) {
+                let display = display.ok_or_else(|| {
+                    graph_error(
+                        "complete hydration is missing its download display",
+                        &card.card_ref,
+                    )
+                })?;
                 let path = card_dir
                     .join("artifacts")
                     .join(entry.relative_path.as_str());
@@ -190,6 +222,7 @@ impl<'a> HydrationBundleWriter<'a> {
                     uid,
                     &entry.relative_path,
                     &path,
+                    Arc::clone(display),
                 )
                 .await
                 .map_err(WyrdError::from)?;

@@ -1962,4 +1962,183 @@ mod pg_tests {
         );
         stop_cli_server(server, shutdown, serve_handle).await;
     }
+
+    /// Prove a real `wyrd load` transfer clears stdout progress before its final JSON receipt.
+    ///
+    /// # Panics
+    /// Panics when the embedded server, public CLI registration/load workflow,
+    /// JSON receipt, or verified artifact bytes fail their expected contract.
+    ///
+    /// # Cancellation
+    /// Cancellation can leave the isolated test server awaiting shutdown, but
+    /// the registry materializer keeps an incomplete destination unpublished.
+    #[tokio::test]
+    #[ignore = "requires embedded Postgres WyrdTestServer"]
+    async fn cli_load_renders_download_progress() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let destination = temp.path().join("loaded");
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-load-progress", &["writer"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+        let receipt = run_cli_json(
+            vec![
+                "apply".to_owned(),
+                path.to_str().expect("prompt path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("CLI apply succeeds");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("apply receipt has Card UID");
+        let loaded = run_cli_owned_with_token(
+            vec![
+                "load".to_owned(),
+                "--kind".to_owned(),
+                "Prompt".to_owned(),
+                "--uid".to_owned(),
+                uid.to_owned(),
+                "--path".to_owned(),
+                destination
+                    .to_str()
+                    .expect("load destination is UTF-8")
+                    .to_owned(),
+                "--server".to_owned(),
+                base_url,
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            Some(jwt),
+        )
+        .await;
+        assert!(
+            loaded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&loaded.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&loaded.stdout)
+            .expect("load stdout remains JSON after progress clears");
+        assert_eq!(summary["materialized"], true);
+        assert_eq!(
+            std::fs::read(destination.join("prompt.txt")).expect("loaded artifact reads"),
+            b"cli-card-artifact"
+        );
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
+
+    /// Prove complete `wyrd get` clears stdout progress before its final JSON summary.
+    ///
+    /// # Panics
+    /// Panics when the embedded server, public CLI registration/get workflow,
+    /// JSON summary, metadata-only read, or verified artifact bytes fail their
+    /// expected contract.
+    ///
+    /// # Cancellation
+    /// Cancellation can leave the isolated test server awaiting shutdown, but
+    /// the graph hydrator removes its unpublished staging bundle on failure.
+    #[tokio::test]
+    #[ignore = "requires embedded Postgres WyrdTestServer"]
+    async fn cli_get_renders_download_progress() {
+        let temp = tempfile::tempdir().expect("tempdir creates");
+        let path = write_prompt(&temp);
+        let destination = temp.path().join("hydrated");
+        let metadata_only = temp.path().join("metadata-only");
+        let (server, base_url, _storage_root, shutdown, serve_handle) = start_cli_server().await;
+        let Bootstrap::User { jwt, .. } = server
+            .bootstrap_user("cli-get-progress", &["writer"])
+            .await
+            .expect("writer bootstraps")
+        else {
+            panic!("writer bootstrap returned a non-user principal");
+        };
+        let receipt = run_cli_json(
+            vec![
+                "apply".to_owned(),
+                path.to_str().expect("prompt path is UTF-8").to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("CLI apply succeeds");
+        let uid = receipt["root"]["uid"]
+            .as_str()
+            .expect("apply receipt has Card UID");
+        let output = run_cli_owned_with_token(
+            vec![
+                "get".to_owned(),
+                "--kind".to_owned(),
+                "Prompt".to_owned(),
+                "--uid".to_owned(),
+                uid.to_owned(),
+                "--output-dir".to_owned(),
+                destination
+                    .to_str()
+                    .expect("hydration destination is UTF-8")
+                    .to_owned(),
+                "--server".to_owned(),
+                base_url.clone(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            Some(jwt.clone()),
+        )
+        .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let summary: Value = serde_json::from_slice(&output.stdout)
+            .expect("get stdout remains JSON after progress clears");
+        assert_eq!(summary["mode"], "complete");
+        assert_eq!(
+            std::fs::read(destination.join("cards/root/artifacts/prompt.txt"))
+                .expect("hydrated artifact reads"),
+            b"cli-card-artifact"
+        );
+        let metadata = run_cli_json(
+            vec![
+                "get".to_owned(),
+                "--kind".to_owned(),
+                "Prompt".to_owned(),
+                "--uid".to_owned(),
+                uid.to_owned(),
+                "--output-dir".to_owned(),
+                metadata_only
+                    .to_str()
+                    .expect("metadata destination is UTF-8")
+                    .to_owned(),
+                "--metadata-only".to_owned(),
+                "--server".to_owned(),
+                base_url,
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            &jwt,
+        )
+        .await
+        .expect("metadata-only get succeeds without artifact download");
+        assert_eq!(metadata["mode"], "metadata");
+        assert!(
+            !metadata_only
+                .join("cards/root/artifacts/prompt.txt")
+                .exists()
+        );
+        stop_cli_server(server, shutdown, serve_handle).await;
+    }
 }

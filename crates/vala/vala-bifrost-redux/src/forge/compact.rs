@@ -199,6 +199,13 @@ pub trait ForgeObjectStore: std::fmt::Debug + Send + Sync {
         Ok(())
     }
 
+    /// Notifies test-support wrappers after one rewrite output is durable.
+    ///
+    /// Production implementations use this infallible default no-op.
+    /// Implementations may delay return for deterministic tests but cannot
+    /// reject the already successful write or mutate its ownership.
+    async fn after_output_put(&self, _path: &str) {}
+
     /// Read one staged or Iceberg-owned object.
     ///
     /// # Errors
@@ -1910,6 +1917,50 @@ fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Minimal object-store implementation used to exercise trait defaults.
+    #[derive(Debug)]
+    struct DefaultHookObjectStore;
+
+    #[async_trait]
+    impl ForgeObjectStore for DefaultHookObjectStore {
+        /// Reject reads because this unit exercises only the default notification.
+        async fn read(&self, _path: &str) -> opendal::Result<Buffer> {
+            unreachable!("default hook unit does not read objects")
+        }
+
+        /// Reject ranged reads because this unit exercises only the default notification.
+        async fn read_range(
+            &self,
+            _path: &str,
+            _range: std::ops::Range<u64>,
+        ) -> opendal::Result<Buffer> {
+            unreachable!("default hook unit does not read object ranges")
+        }
+
+        /// Reject listings because this unit exercises only the default notification.
+        async fn list(&self, _prefix: &str) -> opendal::Result<Vec<Entry>> {
+            unreachable!("default hook unit does not list objects")
+        }
+
+        /// Reject metadata reads because this unit exercises only the default notification.
+        async fn stat(&self, _path: &str) -> opendal::Result<Metadata> {
+            unreachable!("default hook unit does not inspect objects")
+        }
+
+        /// Reject deletes because this unit exercises only the default notification.
+        async fn delete(&self, _path: &str) -> opendal::Result<()> {
+            unreachable!("default hook unit does not delete objects")
+        }
+    }
+
+    /// The production default post-PUT notification completes without failure or side effects.
+    #[tokio::test]
+    async fn after_output_put_default_is_infallible_noop() {
+        DefaultHookObjectStore
+            .after_output_put("durable/output.parquet")
+            .await;
+    }
 
     /// Forge output encoding uses the shared Bifrost Parquet recipe.
     #[test]

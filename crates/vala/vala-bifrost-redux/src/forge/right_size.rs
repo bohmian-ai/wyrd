@@ -330,6 +330,13 @@ impl IcebergCandidateFile {
         &self.catalog_path
     }
 
+    /// Return the compressed physical size used by right-size planning.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn file_size_bytes_for_test(&self) -> u64 {
+        self.file_size_bytes
+    }
+
     /// Return the complete planner key used to order test-support inputs.
     #[cfg(feature = "test-support")]
     #[must_use]

@@ -989,6 +989,7 @@ impl ForgeRewritePipeline {
             .write(&object_path, Buffer::from(bytes))
             .await
             .map_err(ForgeError::ObjectStore)?;
+        self.object_store.after_output_put(&object_path).await;
         Ok((file, object_path))
     }
 

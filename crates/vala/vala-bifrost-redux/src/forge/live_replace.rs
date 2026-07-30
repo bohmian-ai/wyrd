@@ -29,6 +29,10 @@ use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
 /// Injects one pre-`Prepared` audit failure for the real catalog integration seam.
 static FAIL_NEXT_PREPARED_LIVE_AUDIT: AtomicBool = AtomicBool::new(false);
 
+#[cfg(feature = "test-support")]
+/// Injects one terminal live-rewrite audit failure before its transaction becomes durable.
+static FAIL_NEXT_TERMINAL_LIVE_AUDIT: AtomicBool = AtomicBool::new(false);
+
 /// Result of attempting one plan-fenced live Iceberg replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IcebergRewriteDisposition {
@@ -376,6 +380,15 @@ impl Forge {
         FAIL_NEXT_PREPARED_LIVE_AUDIT.store(true, Ordering::Release);
     }
 
+    /// Fail the next test-support terminal live-replacement audit append.
+    ///
+    /// This single-use integration seam rejects the transaction before either
+    /// the terminal audit or operation-state transition becomes durable.
+    #[cfg(feature = "test-support")]
+    pub fn fail_next_terminal_live_audit_for_test(&self) {
+        FAIL_NEXT_TERMINAL_LIVE_AUDIT.store(true, Ordering::Release);
+    }
+
     /// Append one live-replacement audit and projection transition atomically.
     ///
     /// # Errors
@@ -408,6 +421,14 @@ impl Forge {
         {
             return Err(ForgeError::Invariant {
                 detail: "injected Prepared audit append failure".to_owned(),
+            });
+        }
+        #[cfg(feature = "test-support")]
+        if operation != "forge.iceberg_rewrite.prepared"
+            && FAIL_NEXT_TERMINAL_LIVE_AUDIT.swap(false, Ordering::AcqRel)
+        {
+            return Err(ForgeError::Invariant {
+                detail: "injected live terminal audit append failure".to_owned(),
             });
         }
         let resource = key.audit_resource();

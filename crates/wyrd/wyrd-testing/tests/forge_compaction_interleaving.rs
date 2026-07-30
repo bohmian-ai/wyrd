@@ -5,9 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use arrow::util::display::array_value_to_string;
 use async_trait::async_trait;
 use iceberg::Catalog;
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::{Buffer, Entry, Metadata};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::forge::{
     ForgeLease, ForgeObjectStore, IcebergRewriteDisposition, forge_lease_key,
@@ -250,6 +253,47 @@ async fn current_live_paths(table: &iceberg::table::Table) -> BTreeSet<String> {
     paths
 }
 
+/// Read the exact logical row multiset from every current-snapshot Parquet file.
+async fn current_logical_rows(
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+    table: &iceberg::table::Table,
+) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for catalog_path in current_live_paths(table).await {
+        let object_path = catalog_path
+            .find(&fixture.binding.object_prefix)
+            .map(|offset| &catalog_path[offset..])
+            .expect("live catalog path belongs to the fixture table");
+        let bytes = fixture
+            .staging
+            .read(object_path)
+            .await
+            .expect("live Parquet object")
+            .to_bytes();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .expect("live Parquet reader")
+            .build()
+            .expect("live Parquet batch reader");
+        for batch in reader {
+            let batch = batch.expect("live Parquet batch");
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            array_value_to_string(column.as_ref(), row)
+                                .expect("logical row value formatting")
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
+    rows.sort();
+    rows
+}
+
 /// Assert that one replacement snapshot directly advances the selected plan base.
 fn assert_single_snapshot_advance(table: &iceberg::table::Table, base_snapshot_id: i64) {
     let current = table
@@ -287,6 +331,651 @@ async fn live_rewrite_details(
         .into_iter()
         .map(|detail| serde_json::from_str(&detail).expect("typed live replacement audit JSON"))
         .collect()
+}
+
+/// Read every durable live-rewrite state row in deterministic operation order.
+async fn live_rewrite_state_rows(
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+) -> Vec<(String, uuid::Uuid, serde_json::Value, serde_json::Value)> {
+    let mut conn = fixture
+        .vala
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("live replacement state tenant connection");
+    sqlx::query_as(
+        "SELECT phase, operation_id, prepared_detail, current_detail \
+         FROM vala.forge_operation_state \
+         WHERE data_tenant_id = wyrd.current_tenant() \
+           AND resource = $1 AND family = 'iceberg_rewrite' \
+         ORDER BY operation_id",
+    )
+    .bind(format!(
+        "bifrost://{}/{}/{}",
+        fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+    ))
+    .fetch_all(&mut **conn.transaction())
+    .await
+    .expect("live replacement state rows")
+}
+
+/// Read the phase only when the fixture has exactly one live-rewrite state row.
+async fn live_rewrite_state_phase(fixture: &wyrd_testing::bifrost::ForgeFixture) -> Option<String> {
+    let rows = live_rewrite_state_rows(fixture).await;
+    match rows.as_slice() {
+        [(phase, _, _, _)] => Some(phase.clone()),
+        [] => None,
+        _ => panic!("fixture must not contain multiple live-rewrite operations: {rows:?}"),
+    }
+}
+
+/// Produce one durable Prepared live rewrite by cancelling at the successful PUT boundary.
+async fn prepare_cancelled_live_rewrite(
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+) -> (Arc<ForgeObjectStoreControl>, BTreeSet<String>) {
+    fixture.forge.run_once().await.expect("first staging fold");
+    fixture.append_forge_file(2).await;
+    fixture.append_forge_file(3).await;
+    fixture.forge.run_once().await.expect("second staging fold");
+
+    let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
+    let context = fixture.context_with_object_store(fixture.config.clone(), Arc::clone(&control));
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("live rewrite table");
+    let action = Transaction::new(&table).update_table_properties().set(
+        "write.target-file-size-bytes".to_owned(),
+        (16 * 1024 * 1024).to_string(),
+    );
+    ApplyTransactionAction::apply(action, Transaction::new(&table))
+        .expect("target-size property update")
+        .commit(fixture.catalog.as_ref())
+        .await
+        .expect("target-size property commit");
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("target-sized live rewrite table");
+    let before_paths = current_live_paths(&table).await;
+    let plan = context
+        .discover_live_rewrites_for_test(
+            &fixture.binding,
+            &table,
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("current day"),
+        )
+        .await
+        .expect("live rewrite discovery");
+    assert_eq!(plan.groups_for_test().len(), 1, "exactly one rewrite group");
+    let group = plan.groups_for_test()[0].clone();
+    assert_eq!(group.files_for_test().len(), 2, "exactly two inputs");
+    let input_bytes: u64 = group
+        .files_for_test()
+        .iter()
+        .map(|file| file.file_size_bytes_for_test())
+        .sum();
+    assert!(
+        input_bytes < 1024 * 1024,
+        "fixture inputs must stay below 1 MiB"
+    );
+    assert_eq!(
+        table
+            .metadata()
+            .table_properties()
+            .expect("Iceberg table properties")
+            .write_target_file_size_bytes,
+        16 * 1024 * 1024
+    );
+    let base = plan.base_snapshot_id_for_test();
+    let mut lease = ForgeLease::acquire(
+        &fixture.operator_pool,
+        forge_lease_key(
+            fixture.tenant,
+            &fixture.binding.logical_namespace,
+            &fixture.binding.table_name,
+        ),
+        uuid::Uuid::now_v7(),
+        fixture.config.lease_ttl,
+    )
+    .await
+    .expect("post-PUT lease query")
+    .expect("post-PUT lease");
+    control.pause_after_next_output_put();
+    let stop = CancellationToken::new();
+    let operator_pool = fixture.operator_pool.clone();
+    let old_context = Arc::downgrade(&context);
+    let task = tokio::spawn({
+        let binding = fixture.binding.clone();
+        let stop = stop.clone();
+        async move {
+            let result = context
+                .replace_live_group_for_test(&mut lease, &binding, &table, base, &group, &stop)
+                .await;
+            let release = lease.release(&operator_pool).await;
+            (result, release)
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(30), control.wait_for_output_put())
+        .await
+        .expect("successful output PUT boundary");
+    let output = control
+        .last_output_path()
+        .expect("armed output PUT records its exact path");
+    fixture
+        .staging
+        .stat(&output)
+        .await
+        .expect("output is durable while notification is paused");
+    stop.cancel();
+    control.release_output_put();
+    let (result, release) = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("cancelled replacement shutdown bound")
+        .expect("cancelled replacement task");
+    assert!(
+        matches!(result, Err(vala_bifrost_redux::forge::ForgeError::Shutdown)),
+        "post-PUT cancellation must stop after Prepared: {result:?}"
+    );
+    assert!(release.expect("cancelled replacement lease release"));
+    assert!(
+        old_context.upgrade().is_none(),
+        "the first-process Forge allocation must be dropped after bounded shutdown"
+    );
+    assert_eq!(control.output_put_calls(), 1);
+    assert_eq!(
+        live_rewrite_state_phase(fixture).await.as_deref(),
+        Some("prepared")
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.prepared")
+            .await,
+        1
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.committed")
+            .await,
+        0
+    );
+    let details = live_rewrite_details(fixture).await;
+    assert_eq!(details.len(), 1, "Prepared is the only durable phase");
+    assert_eq!(
+        details[0]["output_paths"]
+            .as_array()
+            .expect("Prepared output paths")
+            .len(),
+        1,
+        "the forced replacement produces exactly one durable output"
+    );
+    (control, before_paths)
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Cancellation after the real output PUT persists Prepared before bounded shutdown.
+async fn live_rewrite_post_put_cancellation_persists_prepared_before_shutdown() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_post_put_cancel").await;
+    let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
+    assert_eq!(control.output_put_calls(), 1);
+    let retained = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("unchanged base table");
+    assert_eq!(current_live_paths(&retained).await, before_paths);
+    assert_prepared_live_outputs_exist(&fixture).await;
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// A fresh Forge resets one abandoned output and preserves the original live set.
+async fn restart_resets_abandoned_live_output_exactly_once() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_restart_reset").await;
+    let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
+    let prepared_rows = live_rewrite_state_rows(&fixture).await;
+    assert_eq!(prepared_rows.len(), 1);
+    assert_eq!(prepared_rows[0].0, "prepared");
+    assert_eq!(prepared_rows[0].2, prepared_rows[0].3);
+    let base_table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("pre-reset logical table");
+    let expected_rows = current_logical_rows(&fixture, &base_table).await;
+    assert!(!expected_rows.is_empty());
+    let output = control.last_output_path().expect("prepared output path");
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let restarted = fixture.context_with_object_store(config, Arc::clone(&control));
+    let restart_task = tokio::spawn({
+        let restarted = Arc::clone(&restarted);
+        async move { restarted.run_once().await }
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(30), restart_task)
+        .await
+        .expect("fresh reset tick completion bound")
+        .expect("fresh reset tick task")
+        .expect("fresh reset tick");
+    assert_eq!(outcome.tables_succeeded, 1);
+    assert_eq!(outcome.live_reset, 1);
+    assert_eq!(outcome.live_recovered, 0);
+    assert_eq!(outcome.live_pending, 0);
+    assert_eq!(outcome.live_unresolved, 0);
+    assert_eq!(outcome.open_operation_overflows, 0);
+    let rows = live_rewrite_state_rows(&fixture).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "reset");
+    assert_eq!(rows[0].1, prepared_rows[0].1);
+    assert_eq!(rows[0].2, prepared_rows[0].2);
+    assert_eq!(rows[0].3["operation_id"], prepared_rows[0].1.to_string());
+    assert_eq!(rows[0].3["phase"], "reset");
+    assert_eq!(rows[0].3["input_paths"], prepared_rows[0].2["input_paths"]);
+    assert_eq!(
+        rows[0].3["output_paths"],
+        prepared_rows[0].2["output_paths"]
+    );
+    assert_eq!(rows[0].3["committed_snapshot_id"], serde_json::Value::Null);
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        1
+    );
+    assert!(fixture.staging.stat(&output).await.is_err());
+    let retained = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("reset table");
+    assert_eq!(current_live_paths(&retained).await, before_paths);
+    assert_eq!(
+        current_logical_rows(&fixture, &retained).await,
+        expected_rows
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Replaying a fresh Forge after Reset does not append a second terminal transition.
+async fn restart_replay_does_not_duplicate_live_terminal_transition() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_restart_replay").await;
+    let (control, _) = prepare_cancelled_live_rewrite(&fixture).await;
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let restarted = fixture.context_with_object_store(config, control);
+    assert_eq!(
+        {
+            let first = restarted.run_once().await.expect("first replay tick");
+            assert_eq!(first.live_recovered, 0);
+            assert_eq!(first.live_pending, 0);
+            assert_eq!(first.live_unresolved, 0);
+            assert_eq!(first.open_operation_overflows, 0);
+            assert_eq!(first.tables_succeeded, 1);
+            first.live_reset
+        },
+        1
+    );
+    let replay = restarted.run_once().await.expect("second replay tick");
+    assert_eq!(replay.live_reset, 0);
+    assert_eq!(replay.live_recovered, 0);
+    assert_eq!(replay.live_pending, 0);
+    assert_eq!(replay.live_unresolved, 0);
+    assert_eq!(replay.open_operation_overflows, 0);
+    assert_eq!(replay.tables_succeeded, 1);
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        1
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// A fresh Forge recovers one catalog-accepted uncertain replacement exactly once.
+async fn restart_recovers_catalog_accepted_live_rewrite_exactly_once() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_restart_recovered").await;
+    let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
+    let (context, table, plan, mut lease) =
+        live_replacement_context(&fixture, Arc::clone(&control)).await;
+    let old_context = Arc::downgrade(&context);
+    let base = plan.base_snapshot_id_for_test();
+    assert_eq!(
+        plan.groups_for_test().len(),
+        1,
+        "recovered restart fixture must discover exactly one group"
+    );
+    let group = plan.groups_for_test()[0].clone();
+    assert_eq!(
+        group.files_for_test().len(),
+        2,
+        "recovered restart fixture must rewrite exactly two inputs"
+    );
+    let expected_rows = current_logical_rows(&fixture, &table).await;
+    assert!(!expected_rows.is_empty());
+    let mut expected_paths = current_live_paths(&table).await;
+    for input in group.files_for_test() {
+        assert!(expected_paths.remove(input.catalog_path_for_test()));
+    }
+    control.fail_after_next_commit();
+    let error = context
+        .replace_live_group_for_test(
+            &mut lease,
+            &fixture.binding,
+            &table,
+            base,
+            &group,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("accepted commit response remains uncertain");
+    assert!(
+        error
+            .to_string()
+            .contains("injected post-commit uncertainty"),
+        "unexpected uncertainty error: {error}"
+    );
+    assert!(
+        lease
+            .release(&fixture.operator_pool)
+            .await
+            .expect("uncertain replacement lease release")
+    );
+    drop(context);
+    assert!(
+        old_context.upgrade().is_none(),
+        "the uncertain first-process Forge must be dropped before restart"
+    );
+    let outputs = assert_prepared_live_outputs_exist(&fixture).await;
+    assert_eq!(
+        outputs.len(),
+        1,
+        "recovered restart fixture must persist exactly one output"
+    );
+    expected_paths.extend(outputs);
+    let prepared_rows = live_rewrite_state_rows(&fixture).await;
+    assert_eq!(prepared_rows.len(), 1);
+    assert_eq!(prepared_rows[0].0, "prepared");
+    assert_eq!(prepared_rows[0].2, prepared_rows[0].3);
+
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let restarted = fixture.context_with_catalog(config, control);
+    let restart_task = tokio::spawn({
+        let restarted = Arc::clone(&restarted);
+        async move { restarted.run_once().await }
+    });
+    let outcome = tokio::time::timeout(Duration::from_secs(30), restart_task)
+        .await
+        .expect("fresh recovered tick completion bound")
+        .expect("fresh recovered tick task")
+        .expect("fresh recovered tick");
+    assert_eq!(outcome.tables_succeeded, 1);
+    assert_eq!(outcome.live_recovered, 1);
+    assert_eq!(outcome.live_reset, 0);
+    assert_eq!(outcome.live_pending, 0);
+    assert_eq!(outcome.live_unresolved, 0);
+    assert_eq!(outcome.open_operation_overflows, 0);
+    let rows = live_rewrite_state_rows(&fixture).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "recovered");
+    assert_eq!(rows[0].1, prepared_rows[0].1);
+    assert_eq!(rows[0].2, prepared_rows[0].2);
+    assert_eq!(rows[0].3["operation_id"], prepared_rows[0].1.to_string());
+    assert_eq!(rows[0].3["phase"], "recovered");
+    assert_eq!(rows[0].3["input_paths"], prepared_rows[0].2["input_paths"]);
+    assert_eq!(
+        rows[0].3["output_paths"],
+        prepared_rows[0].2["output_paths"]
+    );
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.recovered")
+            .await,
+        1
+    );
+    let replaced = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("recovered table");
+    assert_single_snapshot_advance(&replaced, base);
+    assert_eq!(
+        rows[0].3["committed_snapshot_id"],
+        replaced
+            .metadata()
+            .current_snapshot_id()
+            .expect("recovered current snapshot")
+    );
+    assert_eq!(current_live_paths(&replaced).await, expected_paths);
+    assert_eq!(
+        current_logical_rows(&fixture, &replaced).await,
+        expected_rows
+    );
+    let operation_id = rows[0].1.to_string();
+    let summary = replaced
+        .metadata()
+        .current_snapshot()
+        .expect("recovered current snapshot")
+        .summary();
+    assert_eq!(
+        summary.additional_properties.get("forge.workflow"),
+        Some(&"iceberg-rewrite".to_owned())
+    );
+    assert_eq!(
+        summary.additional_properties.get("forge.operation_id"),
+        Some(&operation_id)
+    );
+    let replay = restarted.run_once().await.expect("recovered replay tick");
+    assert_eq!(replay.live_recovered, 0);
+    assert_eq!(replay.live_reset, 0);
+    assert_eq!(replay.live_pending, 0);
+    assert_eq!(replay.live_unresolved, 0);
+    assert_eq!(replay.open_operation_overflows, 0);
+    assert_eq!(replay.tables_succeeded, 1);
+    assert_eq!(
+        fixture
+            .operation_count("forge.iceberg_rewrite.recovered")
+            .await,
+        1
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Fence loss at the Reset delete boundary leaves Prepared and its output protected.
+async fn fence_loss_before_reset_delete_keeps_prepared_and_protected() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_reset_fence").await;
+    let (control, _) = prepare_cancelled_live_rewrite(&fixture).await;
+    let output = control.last_output_path().expect("prepared output path");
+    control.pause_next_delete();
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let restarted = fixture.context_with_object_store(config, Arc::clone(&control));
+    let task = tokio::spawn(async move { restarted.run_once().await });
+    tokio::time::timeout(Duration::from_secs(30), control.wait_for_delete())
+        .await
+        .expect("Reset reached delete boundary");
+    let (owner, token) = steal_forge_lease(&fixture).await;
+    control.reject_paused_delete();
+    let outcome = tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("stale Reset task bound")
+        .expect("stale Reset task")
+        .expect("stale Reset tick reports a table failure");
+    assert_eq!(outcome.tables_failed, 1);
+    assert_eq!(
+        live_rewrite_state_phase(&fixture).await.as_deref(),
+        Some("prepared")
+    );
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        0
+    );
+    fixture
+        .staging
+        .stat(&output)
+        .await
+        .expect("Prepared output remains protected");
+    assert!(
+        vala_sql::queries::maintenance_leases::release_lease_fenced(
+            &fixture.operator_pool,
+            &forge_lease_key(
+                fixture.tenant,
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            ),
+            owner,
+            token,
+        )
+        .await
+        .expect("successor reset lease release")
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Cancellation at the Reset delete boundary cannot append a false terminal.
+async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_reset_cancel").await;
+    let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
+    let output = control.last_output_path().expect("prepared output path");
+    control.pause_next_delete();
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let (restarted, publisher) =
+        fixture.context_with_object_store_and_publisher(config, Arc::clone(&control));
+    let old_context = Arc::downgrade(&restarted);
+    let stop = CancellationToken::new();
+    let task = tokio::spawn({
+        let stop = stop.clone();
+        async move { restarted.run(stop).await }
+    });
+    assert_eq!(
+        publisher.try_publish(StagingFileCommitted::new(
+            fixture.binding.clone(),
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("partition day"),
+        )),
+        StagingPublishOutcome::Published
+    );
+    tokio::time::timeout(Duration::from_secs(30), control.wait_for_delete())
+        .await
+        .expect("Reset reached delete boundary");
+    stop.cancel();
+    control.release_paused_delete();
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("cancelled Reset scheduler bound")
+        .expect("cancelled Reset scheduler task")
+        .expect("cancelled Reset scheduler shutdown");
+    assert!(
+        old_context.upgrade().is_none(),
+        "cancelled Reset Forge must be dropped after scheduler shutdown"
+    );
+    let rows = live_rewrite_state_rows(&fixture).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "prepared");
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        0
+    );
+    assert!(
+        fixture.staging.stat(&output).await.is_err(),
+        "delete may finish, but cancellation must prevent terminal state"
+    );
+    let retained = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("cancelled Reset table");
+    assert_eq!(current_live_paths(&retained).await, before_paths);
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// A failed terminal append cannot falsely close Prepared after Reset deletion.
+async fn live_rewrite_terminal_append_failure_leaves_prepared() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "live_rewrite_terminal_failure").await;
+    let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
+    let output = control.last_output_path().expect("prepared output path");
+    let mut config = fixture.config.clone();
+    config.uncertainty_bound = Duration::from_micros(1);
+    let restarted = fixture.context_with_object_store(config, control);
+    restarted.fail_next_terminal_live_audit_for_test();
+    let failed = restarted
+        .run_once()
+        .await
+        .expect("terminal failure is isolated to the table");
+    assert_eq!(failed.tables_failed, 1);
+    assert_eq!(
+        live_rewrite_state_phase(&fixture).await.as_deref(),
+        Some("prepared")
+    );
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        0
+    );
+    assert!(
+        fixture.staging.stat(&output).await.is_err(),
+        "the delete may complete, but terminal state must not be fabricated"
+    );
+
+    let replay = restarted.run_once().await.expect("terminal replay tick");
+    assert_eq!(replay.live_reset, 1);
+    assert_eq!(
+        live_rewrite_state_phase(&fixture).await.as_deref(),
+        Some("reset")
+    );
+    assert_eq!(
+        fixture.operation_count("forge.iceberg_rewrite.reset").await,
+        1
+    );
+    let retained = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("terminal replay table");
+    assert_eq!(current_live_paths(&retained).await, before_paths);
+    server.shutdown().await.expect("server shutdown");
 }
 
 #[tokio::test]
@@ -796,6 +1485,11 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
             .await,
         0
     );
+    assert_eq!(
+        live_rewrite_state_phase(&fixture).await,
+        None,
+        "pre-PUT cancellation must not fabricate an open live operation"
+    );
     assert!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND committed_snapshot_id IS NULL",
@@ -941,6 +1635,10 @@ async fn forge_compaction_lease_theft_before_output_put_cleans_rewrite_outputs()
             .operation_count("forge.file_compact.committed")
             .await,
         0
+    );
+    assert!(
+        live_rewrite_state_rows(&fixture).await.is_empty(),
+        "pre-PUT lease loss must not create an iceberg-rewrite operation-state row"
     );
 
     let lease_key = format!(

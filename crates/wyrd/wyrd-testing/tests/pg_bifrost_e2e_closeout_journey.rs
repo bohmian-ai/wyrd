@@ -91,7 +91,7 @@ async fn fresh_boot_provisions_redux_before_first_write() {
     )
     .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
-    .fetch_one(cluster.pg_fixture().platform_admin_pool())
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
     .await
     .expect("first Redux file-list read");
     assert_eq!(rows, 1);
@@ -219,7 +219,7 @@ async fn run_closeout_journey(
     )
     .bind(tenant.as_uuid())
     .bind(TABLE_NAME)
-    .fetch_one(cluster.pg_fixture().platform_admin_pool())
+    .fetch_one(cluster.pg_fixture().operator_pool().pool())
     .await?;
     assert_eq!(
         rows, 8,

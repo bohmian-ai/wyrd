@@ -1,7 +1,0 @@
-interface:
-  display_name: "Wyrd Review"
-  short_description: "Review Wyrd conformance or supply terminal review policy"
-  default_prompt: "Use $wyrd-review to validate this Wyrd implementation. When a terminal review-and-plan workflow loads it as repository policy, return static candidates and coverage without writing a second review or invoking planning."
-
-policy:
-  allow_implicit_invocation: true

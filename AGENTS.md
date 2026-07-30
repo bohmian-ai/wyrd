@@ -464,6 +464,10 @@ Code in this repo lands one session at a time, via dialogue-locked decisions.
   task packet.
 - Wyrd UI implementors additionally receive
   `.codex/skills/wyrd-ui/SKILL.md` when their write set enters the UI tree.
+- Complete-plan execution uses the global `wyrd-implement-plan` controller in
+  a dedicated clean worktree. It dispatches one serial task at a time through
+  the surface-appropriate implementation skill and repo-local
+  `.codex/skills/wyrd-review/SKILL.md`, then owns integrated verification.
 - The complete integration review runs the global `review-and-plan` skill; its
   repo-specific review binding is `.codex/skills/wyrd-review/SKILL.md`.
 

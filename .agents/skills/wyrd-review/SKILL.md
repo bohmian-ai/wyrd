@@ -1,13 +1,13 @@
 ---
 name: wyrd-review
-description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, or as the repository integration policy loaded by terminal review-and-plan branch reviews. In integration-binding mode, return static candidates and coverage to the root orchestrator without writing another artifact, assigning a verdict, running verification, or invoking planning.
+description: Review Wyrd implementations against approved wyrd-plan plans and task packets, living-task execution updates, architecture, ownership, contracts, repository rules, tests, and verification evidence. Use standalone after or during wyrd-implement, as the static task and final-plan reviewer controlled by $wyrd-implement-plan, or as the repository integration policy loaded by terminal review-and-plan branch reviews. Binding modes return static findings and evidence to their root orchestrator without writing another artifact, running verification, or routing work.
 ---
 
 # Wyrd Review
 
 Independently review implementation conformance and proof. Preserve the
 boundary used by `$wyrd-implement`: reversible mechanics remain implementation
-work; only material decisions return to planning.
+work; material decisions return to the applicable plan authority.
 
 Use one fixed loop:
 
@@ -18,6 +18,40 @@ resolve diff -> map requirements/ACs -> inspect source/tests
 
 Do not modify implementation source, tests, generated artifacts, or the
 reviewed plan/task. Writing the durable review is the only default mutation.
+
+## Plan-execution binding mode
+
+When `$wyrd-implement-plan` dispatches this skill for one task or the final
+integrated plan, this mode overrides conflicting standalone instructions:
+
+- Review the orchestrator-provided task delta from the last accepted commit,
+  or the complete execution-baseline-through-branch delta for final review.
+- Read the canonical plan, active tasks, implementation reports, recorded
+  verification evidence, and applicable repository authorities completely.
+- Perform static source, contract, caller, consumer, manifest, generated
+  surface, and test analysis. Audit recorded verification semantically.
+- Do not run tests, builds, lints, formatters, generators, migrations,
+  services, plan validators, repository gates, or independent verification.
+- Load the progressive references required by the affected surface.
+- Return a requirement/acceptance traceability matrix, findings, evidence
+  audit, inspected surfaces, and material static-analysis limits.
+- Use only these verdicts:
+  - `APPROVE`: implementation and proof satisfy the reviewed task or plan.
+  - `RESUME_IMPLEMENTATION`: reversible implementation or evidence work
+    remains.
+  - `ORCHESTRATOR_DECISION_REQUIRED`: a material plan, product, security,
+    contract, migration, dependency, ownership, or acceptance decision must be
+    resolved by the plan orchestrator.
+  - `REVIEW_BLOCKED`: the review target or mandatory evidence cannot be
+    resolved well enough for static review.
+- Do not write `review.md`, modify source or plan artifacts, assign task
+  status, invoke another skill, create a remediation plan, or communicate with
+  the user.
+
+For first review, operate as a fresh independent agent. For focused re-review,
+verify prior findings first and inspect affected seams without reopening
+accepted decisions absent new evidence. The `$wyrd-implement-plan`
+orchestrator is the only controller, writer, committer, and router.
 
 ## Terminal integration-binding mode
 
@@ -135,7 +169,7 @@ Classify every difference between the task recipe and repository reality:
 |---|---|
 | Local mechanic | Accept when behavior, ownership, and proof remain intact |
 | Bounded correction | Validate its evidence; do not call it an unapproved deviation |
-| Material deviation | Require replanning before the material change |
+| Material deviation | Standalone: require replanning. Plan-execution binding: return `ORCHESTRATOR_DECISION_REQUIRED` |
 
 Expected private paths, helpers, and fixture layouts are guidance rather than a
 strict whitelist. Public/wire/generated/persisted contracts, migrations,

@@ -2,8 +2,8 @@
 
 Use this exact ordered format for every task saved under
 `.dev/plan/<slug>/tasks/<NN>-<task-slug>.md`. A task is a bounded compilation
-target for Terra/Luna and a direct assignment for its declared
-surface-appropriate execution skill or skill set.
+target for its assigned Luna, Terra, or Sol model and a direct assignment for
+its declared surface-appropriate execution skill or skill set.
 
 ## Contents
 
@@ -28,7 +28,7 @@ Milestone: <ID or none>
 Requirements: <R IDs>
 Decisions: <D IDs>
 Depends on: <task IDs or none>
-Assigned model: Terra | Luna
+Assigned model: Luna | Terra | Sol
 Execution skill: $wyrd-implement | $wyrd-ui | $wyrd-implement + $wyrd-ui
 
 ## Objective
@@ -127,6 +127,15 @@ Select execution skills from the write set:
 
 Do not assign a skill whose trigger or exclusions reject part of the write set.
 
+Assign models by risk:
+
+- Luna for mechanical, low-risk tasks with one established repository pattern;
+- Terra for ordinary implementation and review work;
+- Sol for security, public or persisted contracts, migrations, concurrency,
+  cross-owner or cross-language work, and other materially high-risk tasks.
+
+Reasoning effort never exceeds `high`.
+
 ## Detail rules
 
 - Name likely files and exact existing symbols after verifying them from live
@@ -135,8 +144,8 @@ Do not assign a skill whose trigger or exclusions reject part of the write set.
   guidance, not a strict whitelist. Permit adjacent private implementation and
   test-support files inside the established owner when acceptance requires
   them.
-- Define new and materially changed symbols. Do not ask Terra/Luna to “add the
-  necessary types” or “wire up the handler.”
+- Define new and materially changed symbols. Do not ask the assigned model to
+  “add the necessary types” or “wire up the handler.”
 - State function and method responsibilities, not just names.
 - Include typed stubs when shape matters. Allow naming adaptation only to match
   an identified local convention.
@@ -399,5 +408,6 @@ Before marking `Ready`, verify:
 - broad closeout commands have an explicit exclusion section;
 - escalation conditions catch material divergence;
 - completion evidence is structured;
-- Terra/Luna can execute without choosing architecture, contracts, persistence,
-  scope, public errors, feature sets, or verification.
+- The assigned Luna, Terra, or Sol model can execute without choosing
+  architecture, contracts, persistence, scope, public errors, feature sets, or
+  verification.

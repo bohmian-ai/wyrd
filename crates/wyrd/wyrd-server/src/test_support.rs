@@ -14,6 +14,7 @@ use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
 use vala_sql::{OperatorPool, ValaPostgres};
 use wyrd_dev_fixtures::pg::PgFixture;
+use wyrd_sql::WyrdPostgres;
 use wyrd_storage::StorageHandle;
 use wyrd_storage::settings::{BackendConfig, StorageSettings};
 
@@ -25,6 +26,18 @@ struct SharedCatalog {
     catalog: Arc<WyrdCatalog>,
     redux_catalog: Arc<BifrostCatalog>,
     storage: Arc<StorageHandle>,
+}
+
+impl SharedCatalog {
+    /// Borrow the fixture's Wyrd Postgres handle for typed SQL capabilities.
+    fn wyrd_postgres(&self) -> &WyrdPostgres {
+        self._fixture.wyrd_postgres()
+    }
+
+    /// Borrow the fixture's Vala Postgres handle used by the Redux catalog.
+    fn vala_postgres(&self) -> &ValaPostgres {
+        self._fixture.vala_postgres()
+    }
 }
 
 static SHARED: OnceLock<SharedCatalog> = OnceLock::new();
@@ -105,12 +118,15 @@ pub async fn test_redux_catalog() -> Arc<BifrostCatalog> {
 
 /// Return the shared Vala Postgres handle used by the Redux catalog.
 pub(crate) async fn test_vala_postgres() -> ValaPostgres {
-    shared()._fixture.vala_postgres().clone()
+    shared().vala_postgres().clone()
 }
 
 /// Return the shared cross-tenant operator pool used by Forge leases.
 pub(crate) async fn test_operator_pool() -> OperatorPool {
-    OperatorPool::from(shared()._fixture.platform_admin_pool().clone())
+    shared()
+        .wyrd_postgres()
+        .operator_pool()
+        .expect("shared PgFixture always configures the platform-admin operator pool")
 }
 
 /// Return the process-lifetime local storage handle used by the test catalog.

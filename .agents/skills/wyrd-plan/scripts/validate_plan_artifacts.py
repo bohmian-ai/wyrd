@@ -79,7 +79,9 @@ PLAN_METADATA_VALUES = {
     "Status": re.compile(r"Draft|Review Required|Approved"),
     "Repository": re.compile(r"wyrd"),
     "Planner": re.compile(r"Sol"),
-    "Implementation models": re.compile(r"Terra, Luna"),
+    "Implementation models": re.compile(
+        r"(?:Luna|Terra|Sol)(?:, (?:Luna|Terra|Sol)){0,2}"
+    ),
     "Plan version": re.compile(r"[1-9][0-9]*"),
     "Evidence snapshot": re.compile(r".+ at [0-9a-f]{7,40}; .+"),
     "Review": re.compile(r"not required|required|\.dev/review/[^/]+/review\.md"),
@@ -95,7 +97,7 @@ TASK_METADATA_VALUES = {
     "Requirements": re.compile(r"R[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)R?[1-9][0-9]*)*"),
     "Decisions": re.compile(r"None|D[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)D?[1-9][0-9]*)*"),
     "Depends on": re.compile(r"None|T[1-9][0-9]*(?:,\s*T[1-9][0-9]*)*"),
-    "Assigned model": re.compile(r"Terra|Luna"),
+    "Assigned model": re.compile(r"Luna|Terra|Sol"),
     "Execution skill": re.compile(
         r"\$wyrd-implement|\$wyrd-ui|\$wyrd-implement \+ \$wyrd-ui"
     ),
@@ -188,6 +190,14 @@ def _validate_document(
         value = metadata.get(key)
         if value and pattern.fullmatch(value) is None:
             errors.append(f"{path}: invalid `{key}: {value}`")
+
+    implementation_models = metadata.get("Implementation models")
+    if implementation_models:
+        selected_models = implementation_models.split(", ")
+        if len(selected_models) != len(set(selected_models)):
+            errors.append(
+                f"{path}: `Implementation models` must not contain duplicates"
+            )
 
     for key in ("Created", "Last updated"):
         value = metadata.get(key)
@@ -407,6 +417,63 @@ def self_test() -> int:
                 )
                 return 1
             plan_path.write_text(_valid_plan_text(), encoding="utf-8")
+            task_path.write_text(_valid_task_text(), encoding="utf-8")
+
+        for implementation_models in (
+            "Luna",
+            "Terra",
+            "Sol",
+            "Terra, Luna",
+            "Terra, Sol",
+            "Luna, Sol",
+            "Terra, Luna, Sol",
+            "Luna, Terra, Sol",
+            "Sol, Terra",
+        ):
+            plan_with_models = _replace_metadata(
+                plan_path.read_text(encoding="utf-8"),
+                "Implementation models",
+                "Terra, Luna",
+                implementation_models,
+            )
+            plan_path.write_text(plan_with_models, encoding="utf-8")
+            if validate_plan_directory(plan_dir):
+                print(
+                    f"self-test failed: `{implementation_models}` was rejected",
+                    file=sys.stderr,
+                )
+                return 1
+            plan_path.write_text(_valid_plan_text(), encoding="utf-8")
+
+        duplicate_models = _replace_metadata(
+            plan_path.read_text(encoding="utf-8"),
+            "Implementation models",
+            "Terra, Luna",
+            "Terra, Terra",
+        )
+        plan_path.write_text(duplicate_models, encoding="utf-8")
+        if not validate_plan_directory(plan_dir):
+            print(
+                "self-test failed: duplicate implementation models were accepted",
+                file=sys.stderr,
+            )
+            return 1
+        plan_path.write_text(_valid_plan_text(), encoding="utf-8")
+
+        for assigned_model in ("Luna", "Terra", "Sol"):
+            task_with_model = _replace_metadata(
+                task_path.read_text(encoding="utf-8"),
+                "Assigned model",
+                "Terra",
+                assigned_model,
+            )
+            task_path.write_text(task_with_model, encoding="utf-8")
+            if validate_plan_directory(plan_dir):
+                print(
+                    f"self-test failed: `{assigned_model}` task was rejected",
+                    file=sys.stderr,
+                )
+                return 1
             task_path.write_text(_valid_task_text(), encoding="utf-8")
 
         references = Path(__file__).resolve().parent.parent / "references"

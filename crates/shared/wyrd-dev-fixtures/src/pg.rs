@@ -15,19 +15,27 @@ use vala_sql::ValaPostgres;
 use wyrd_spec::DataTenantId;
 use wyrd_sql::dsn::ResolvedDsns;
 use wyrd_sql::pool::build_pool;
-use wyrd_sql::{PoolConfig, SqlError, TenantConn, WyrdPostgres};
+use wyrd_sql::{OperatorPool, PoolConfig, SqlError, TenantConn, WyrdPostgres};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-test Postgres fixture backed by a fixture-owned database.
 pub struct PgFixture {
+    /// Runtime Wyrd handle that opens RLS-bound tenant transactions.
     wyrd: WyrdPostgres,
+    /// Runtime Vala handle that opens tenant transactions for analytical state.
     vala: ValaPostgres,
-    platform_admin_pool: PgPool,
+    /// Cross-tenant handle used only for fixture setup and operator assertions.
+    operator_pool: OperatorPool,
+    /// Catalog-role DSN used by embedded Iceberg catalog fixtures.
     catalog_dsn: SecretString,
+    /// Migrator-role DSN reserved for schema-level fixture assertions.
     migrator_dsn: SecretString,
+    /// Tenant seeded when this fixture starts.
     data_tenant_id: DataTenantId,
+    /// Human-readable slug associated with the seeded tenant.
     tenant_slug: String,
+    /// Database owner whose drop implementation cleans up the isolated database.
     _test_db: TestDatabase,
 }
 
@@ -99,10 +107,10 @@ impl PgFixture {
         self.wyrd.app_pool()
     }
 
-    /// Borrow the audited `wyrd_platform_admin` pool.
+    /// Borrow the audited cross-tenant operator handle.
     #[must_use]
-    pub fn platform_admin_pool(&self) -> &PgPool {
-        &self.platform_admin_pool
+    pub fn operator_pool(&self) -> &OperatorPool {
+        &self.operator_pool
     }
 
     /// Borrow the fixture database's Bifrost catalog DSN.
@@ -132,7 +140,7 @@ impl PgFixture {
     /// Returns [`SqlError`] when the tenant insert fails.
     pub async fn seed_additional_tenant(&self, slug: &str) -> Result<DataTenantId, SqlError> {
         let data_tenant_id = DataTenantId::new_v7();
-        seed_tenant(&self.platform_admin_pool, data_tenant_id, slug).await?;
+        seed_tenant(&self.operator_pool, data_tenant_id, slug).await?;
         Ok(data_tenant_id)
     }
 
@@ -171,7 +179,7 @@ impl PgFixture {
         data_tenant_id: DataTenantId,
         slug: &str,
     ) -> Result<(), SqlError> {
-        seed_tenant(&self.platform_admin_pool, data_tenant_id, slug).await
+        seed_tenant(&self.operator_pool, data_tenant_id, slug).await
     }
 
     /// Open a pool connected as the `wyrd_migrator` (table-owner) role.
@@ -196,6 +204,11 @@ impl PgFixture {
         .map_err(FixtureError::Sql)
     }
 
+    /// Start an isolated fixture and seed the requested tenant identity.
+    ///
+    /// # Errors
+    /// Returns [`FixtureError`] when database creation, migration, role-handle
+    /// construction, or tenant seeding fails.
     async fn start_seeded(
         data_tenant_id: DataTenantId,
         tenant_slug: String,
@@ -205,10 +218,10 @@ impl PgFixture {
         let resolved = test_db.resolved_dsns()?;
         let catalog_dsn = resolved.catalog_app;
         let migrator_dsn = resolved.migrator;
-        seed_tenant(&handles.platform_admin, data_tenant_id, &tenant_slug).await?;
+        seed_tenant(&handles.operator_pool, data_tenant_id, &tenant_slug).await?;
 
         Ok(Self {
-            platform_admin_pool: handles.platform_admin,
+            operator_pool: handles.operator_pool,
             wyrd: handles.wyrd,
             vala: handles.vala,
             catalog_dsn,
@@ -226,9 +239,12 @@ struct TestDatabase {
 }
 
 struct TestDbHandles {
+    /// Runtime Wyrd handle for tenant-scoped fixture operations.
     wyrd: WyrdPostgres,
+    /// Runtime Vala handle for tenant-scoped analytical fixture operations.
     vala: ValaPostgres,
-    platform_admin: PgPool,
+    /// Cross-tenant operator capability required during fixture seeding.
+    operator_pool: OperatorPool,
 }
 
 impl TestDatabase {
@@ -259,20 +275,24 @@ impl TestDatabase {
         Ok(test_db)
     }
 
+    /// Connect the typed runtime handles used by a migrated fixture database.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when DSN resolution, pool construction, or the
+    /// required operator capability is unavailable.
     async fn connect_handles(&self) -> Result<TestDbHandles, SqlError> {
         let dsns = self.resolved_dsns()?;
         let wyrd = WyrdPostgres::connect_from_dsns(&dsns).await?;
         let vala = ValaPostgres::connect_after_wyrd(&dsns).await?;
-        let platform_admin = wyrd
-            .platform_admin_pool()
-            .cloned()
+        let operator_pool = wyrd
+            .operator_pool()
             .ok_or_else(|| SqlError::InvariantViolation {
                 detail: "test DB env unset (WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD); platform-admin pool is required for tenant seeding".to_owned(),
             })?;
         Ok(TestDbHandles {
             wyrd,
             vala,
-            platform_admin,
+            operator_pool,
         })
     }
 
@@ -396,8 +416,12 @@ fn unique_database_name() -> String {
     raw.chars().take(63).collect()
 }
 
+/// Insert one platform tenant through the fixture's operator capability.
+///
+/// # Errors
+/// Returns [`SqlError`] when Postgres rejects the tenant insert.
 async fn seed_tenant(
-    platform_admin_pool: &PgPool,
+    operator_pool: &OperatorPool,
     data_tenant_id: DataTenantId,
     tenant_slug: &str,
 ) -> Result<(), SqlError> {
@@ -408,7 +432,7 @@ async fn seed_tenant(
     .bind(data_tenant_id.as_uuid())
     .bind(tenant_slug)
     .bind("Test Tenant")
-    .execute(platform_admin_pool)
+    .execute(operator_pool.pool())
     .await
     .map_err(SqlError::from)?;
 
@@ -448,7 +472,7 @@ mod pg_tests {
             let exists: (bool,) =
                 sqlx::query_as("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
                     .bind(schema)
-                    .fetch_one(fixture.platform_admin_pool())
+                    .fetch_one(fixture.operator_pool().pool())
                     .await
                     .expect("schema query succeeds");
             assert!(exists.0, "{schema} schema exists");
@@ -462,7 +486,7 @@ mod pg_tests {
              WHERE rolname IN ('wyrd_app', 'wyrd_migrator', 'wyrd_platform_admin')
              ORDER BY rolname",
         )
-        .fetch_all(fixture.platform_admin_pool())
+        .fetch_all(fixture.operator_pool().pool())
         .await
         .expect("role metadata query succeeds");
 
@@ -483,7 +507,7 @@ mod pg_tests {
         let count: (i64,) =
             sqlx::query_as("SELECT count(*) FROM platform.tenants WHERE data_tenant_id <> $1")
                 .bind(DataTenantId::SYSTEM_OWNER.as_uuid())
-                .fetch_one(fixture.platform_admin_pool())
+                .fetch_one(fixture.operator_pool().pool())
                 .await
                 .expect("tenant count query succeeds");
 
@@ -497,7 +521,7 @@ mod pg_tests {
              WHERE data_tenant_id = $1",
         )
         .bind(fixture.data_tenant_id().as_uuid())
-        .fetch_all(fixture.platform_admin_pool())
+        .fetch_all(fixture.operator_pool().pool())
         .await
         .expect("tenant query succeeds");
 

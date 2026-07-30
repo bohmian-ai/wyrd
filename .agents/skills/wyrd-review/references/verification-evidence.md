@@ -3,6 +3,11 @@
 Use this reference to judge command results, equivalent proof, environment
 recovery, and verification failures.
 
+In `$wyrd-implement-plan` or terminal integration-binding mode, audit only
+recorded evidence and source-visible command/test definitions. Do not execute
+commands or perform independent verification; the controlling orchestrator
+owns any required rerun.
+
 ## Evidence hierarchy
 
 Prefer, in order:

@@ -905,14 +905,10 @@ mod pg_tests {
 
     async fn tenant_b(fixture: &PgFixture) -> DataTenantId {
         let tenant_b = DataTenantId::new_v7();
-        sqlx::query(
-            "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
-             VALUES ($1, 'workload-tenant-b', 'Workload Tenant B', 'active')",
-        )
-        .bind(tenant_b.as_uuid())
-        .execute(fixture.platform_admin_pool())
-        .await
-        .expect("tenant B inserts");
+        fixture
+            .seed_additional_tenant_with_uuid(tenant_b, "workload-tenant-b")
+            .await
+            .expect("tenant B inserts");
         tenant_b
     }
 

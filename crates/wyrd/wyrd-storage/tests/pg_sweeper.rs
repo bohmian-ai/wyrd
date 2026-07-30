@@ -13,14 +13,14 @@ mod pg_tests {
     #[tokio::test]
     async fn tick_sweeps_expired_uploads_and_reaps_idempotency_rows() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let admin_pool = fixture.platform_admin_pool().clone();
+        let operator_pool = fixture.operator_pool().clone();
         let tenant = fixture.data_tenant_id();
         let handle = local_storage_handle().await;
         let shutdown_rx = CancellationToken::new();
         let sweeper = Sweeper::new(
             handle,
-            admin_pool.clone(),
-            fixture.app_pool().clone(),
+            operator_pool.clone(),
+            fixture.wyrd_postgres().clone(),
             SweeperConfig {
                 enabled: true,
                 tick: Duration::from_mins(1),
@@ -40,7 +40,7 @@ mod pg_tests {
             -60,
         )
         .await;
-        let mut leader_conn = admin_pool.acquire().await.expect("leader conn");
+        let mut leader_conn = operator_pool.pool().acquire().await.expect("leader conn");
         let acquired =
             wyrd_sql::queries::storage::admin::multipart_uploads::try_acquire_leader_lock(
                 leader_conn.as_mut(),
@@ -52,7 +52,7 @@ mod pg_tests {
         leader_conn.close_on_drop();
 
         sweeper.tick().await.expect("non-leader tick skips");
-        assert_upload_status(&admin_pool, blocked_upload, "pending").await;
+        assert_upload_status(operator_pool.pool(), blocked_upload, "pending").await;
         drop(leader_conn);
 
         let expired_pending = insert_upload(
@@ -80,26 +80,26 @@ mod pg_tests {
 
         sweeper.tick().await.expect("leader tick sweeps");
 
-        assert_upload_status(&admin_pool, blocked_upload, "aborted").await;
-        assert_upload_status(&admin_pool, expired_pending, "aborted").await;
-        assert_upload_status(&admin_pool, orphan_initiating, "aborted").await;
-        assert_upload_status(&admin_pool, live_pending, "pending").await;
+        assert_upload_status(operator_pool.pool(), blocked_upload, "aborted").await;
+        assert_upload_status(operator_pool.pool(), expired_pending, "aborted").await;
+        assert_upload_status(operator_pool.pool(), orphan_initiating, "aborted").await;
+        assert_upload_status(operator_pool.pool(), live_pending, "pending").await;
         assert_audit_count(fixture.app_pool(), tenant, 3).await;
-        assert_idempotency_count(&admin_pool, "expired-key", 0).await;
-        assert_idempotency_count(&admin_pool, "live-key", 1).await;
+        assert_idempotency_count(operator_pool.pool(), "expired-key", 0).await;
+        assert_idempotency_count(operator_pool.pool(), "live-key", 1).await;
     }
 
     #[tokio::test]
     async fn sweeper_skips_audit_when_upload_already_completed() {
         let fixture = PgFixture::start().await.expect("fixture starts");
-        let admin_pool = fixture.platform_admin_pool().clone();
+        let operator_pool = fixture.operator_pool().clone();
         let tenant = fixture.data_tenant_id();
         let handle = local_storage_handle().await;
         let shutdown_rx = CancellationToken::new();
         let sweeper = Sweeper::new(
             handle,
-            admin_pool.clone(),
-            fixture.app_pool().clone(),
+            operator_pool.clone(),
+            fixture.wyrd_postgres().clone(),
             SweeperConfig {
                 enabled: true,
                 tick: Duration::from_mins(1),
@@ -122,7 +122,7 @@ mod pg_tests {
 
         sqlx::query("UPDATE wyrd.storage_multipart_uploads SET status = 'completed' WHERE id = $1")
             .bind(upload_id)
-            .execute(&admin_pool)
+            .execute(operator_pool.pool())
             .await
             .expect("force-complete upload");
 

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Wyrd Review"
+  short_description: "Review Wyrd conformance or supply static review policy"
+  default_prompt: "Use $wyrd-review to validate this Wyrd implementation. In an orchestrated binding mode, return static conformance and evidence findings without writing another artifact, running verification, or routing work."
+
+policy:
+  allow_implicit_invocation: true

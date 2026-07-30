@@ -1,8 +1,9 @@
 # Decision-Complete Planning
 
 Use this reference to convert repository evidence and product intent into an
-implementation specification for Terra/Luna. Decision-complete means the
-implementation model performs coding and local adaptation, not design.
+implementation specification for the assigned Luna, Terra, or Sol model.
+Decision-complete means the implementation model performs coding and local
+adaptation, not design.
 
 ## Contents
 
@@ -54,9 +55,9 @@ A choice is material when different reasonable answers change:
 - performance or operational behavior at the stated scale;
 - build features, dependencies, or the verification needed for correctness.
 
-Resolve material choices in the plan. Terra/Luna may choose reversible local
-mechanics such as variable names, a small private helper, and exact syntax
-already determined by the nearest repository pattern.
+Resolve material choices in the plan. The assigned implementation model may
+choose reversible local mechanics such as variable names, a small private
+helper, and exact syntax already determined by the nearest repository pattern.
 
 ## Controlled implementation adaptation
 

@@ -75,12 +75,6 @@ impl WyrdPostgres {
         &self.app
     }
 
-    /// Borrow the optional audited platform-admin pool.
-    #[must_use]
-    pub fn platform_admin_pool(&self) -> Option<&PgPool> {
-        self.platform_admin.as_ref()
-    }
-
     /// Build an `OperatorPool` from the optional platform-admin pool.
     ///
     /// Returns `None` when no cross-tenant role is configured. Production boot

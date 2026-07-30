@@ -116,7 +116,7 @@ async fn run(cluster: &WyrdTestCluster) -> Result<(), Box<dyn std::error::Error 
         )
         .bind(tenant.as_uuid())
         .bind(TABLE_PREFIX)
-        .fetch_one(cluster.pg_fixture().platform_admin_pool())
+        .fetch_one(cluster.pg_fixture().operator_pool().pool())
         .await?;
         assert_eq!(
             rows, 8,

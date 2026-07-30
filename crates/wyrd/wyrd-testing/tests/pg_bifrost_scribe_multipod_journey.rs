@@ -67,14 +67,14 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
     harness.force_seal_all().await?;
     assert!(harness.is_drained()?);
 
-    let pool = harness.cluster().pg_fixture().platform_admin_pool();
+    let operator_pool = harness.cluster().pg_fixture().operator_pool();
     let (file_count, row_count): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*)::bigint, COALESCE(SUM(row_count), 0)::bigint
            FROM vala.file_list
           WHERE namespace = 'vala.bifrost' AND table_name = $1",
     )
     .bind(TABLE_NAME)
-    .fetch_one(pool)
+    .fetch_one(operator_pool.pool())
     .await?;
     assert_eq!(row_count, i64::try_from(3 * 3 * ROWS_PER_APPEND)?);
     assert_eq!(file_count, 9);
@@ -84,7 +84,7 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
           WHERE namespace = 'vala.bifrost' AND table_name = $1",
     )
     .bind(TABLE_NAME)
-    .fetch_all(pool)
+    .fetch_all(operator_pool.pool())
     .await?;
     for path in paths {
         harness.cluster().storage_operator().stat(&path).await?;

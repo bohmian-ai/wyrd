@@ -89,12 +89,6 @@ impl ServerPostgres {
         self.wyrd.app_pool()
     }
 
-    /// Borrow the optional platform-admin pool.
-    #[must_use]
-    pub fn platform_admin_pool(&self) -> Option<&PgPool> {
-        self.wyrd.platform_admin_pool()
-    }
-
     /// Borrow the dedicated Vala/Bifrost pool.
     #[must_use]
     pub fn vala_pool(&self) -> &PgPool {

@@ -22,7 +22,7 @@ decisions and compiles them into separate executable task packets.
 Status: Draft | Review Required | Approved
 Repository: wyrd
 Planner: Sol
-Implementation models: Terra, Luna
+Implementation models: <comma-separated subset of Terra, Luna, Sol>
 Created: YYYY-MM-DD
 Last updated: YYYY-MM-DD
 Plan version: 1
@@ -145,9 +145,11 @@ evidence-backed note immediately after the graph.
 
 ## Execution handoff
 
-- Ordered task sequence, allowed parallel groups, surface-appropriate
-  `$wyrd-implement` / `$wyrd-ui` invocation contract, and the conditions that
-  return work to planning.
+- Ordered task sequence, any parallel hints for execution surfaces that support
+  them, surface-appropriate `$wyrd-implement` / `$wyrd-ui` invocation
+  contract, and the conditions that return work to plan-level authority.
+- State that `$wyrd-implement-plan` serializes implementation and review even
+  when independent tasks carry a parallel hint.
 ````
 
 For a small localized change, use
@@ -372,7 +374,8 @@ Before presenting or approving:
 - [ ] Required types, interfaces, responsibilities, and invariants are stubbed.
 - [ ] Consequential control flow and failures are explicit.
 - [ ] Every plan has at least one complete separate task packet.
-- [ ] Every task fits its assigned Terra/Luna model.
+- [ ] Every task fits its assigned Luna, Terra, or Sol model and never requires
+      reasoning above `high`.
 - [ ] Every task names scope, symbols, tests, commands, features, exclusions,
       escalation, and evidence.
 - [ ] Task dependencies leave coherent integration boundaries.
@@ -404,6 +407,8 @@ unless its state helps execution.
   and bounded task updates under the task's `Completion evidence`.
 - Keep requirements, public or persisted contracts, security and tenancy
   semantics, data-loss behavior, material architecture, and acceptance
-  outcomes stable; return for authority only when one must change.
+  outcomes stable within one bounded task. Return to plan-level authority when
+  one must change; `$wyrd-implement-plan` may revise them under its autonomous
+  orchestrator contract.
 - Do not create progress ledgers, run directories, duplicate specs, or
   completion sentinels.

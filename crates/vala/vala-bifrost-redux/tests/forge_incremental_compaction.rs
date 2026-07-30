@@ -218,7 +218,7 @@ mod pg_tests {
                     .finish(),
             );
             let catalog = Self::build_catalog(&pg, &root, &binding).await;
-            let operator_pool = OperatorPool::from(pg.platform_admin_pool().clone());
+            let operator_pool = pg.operator_pool().clone();
             let whole_reads = Arc::new(AtomicUsize::new(0));
             let reads = Arc::new(InstrumentedStore {
                 operator: Arc::clone(&staging),

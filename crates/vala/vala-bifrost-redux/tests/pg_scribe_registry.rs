@@ -27,7 +27,7 @@ mod pg_tests {
 
     async fn setup() -> (PgFixture, OperatorPool) {
         let fixture = PgFixture::start().await.expect("fixture");
-        let pool = OperatorPool::from(fixture.platform_admin_pool().clone());
+        let pool = fixture.operator_pool().clone();
         (fixture, pool)
     }
 

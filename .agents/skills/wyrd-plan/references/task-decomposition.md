@@ -1,7 +1,8 @@
 # Task Decomposition
 
-Compile the implementation specification into bounded Terra/Luna tasks. Task
-packetization and separate task files are mandatory for every plan.
+Compile the implementation specification into bounded, risk-routed Luna,
+Terra, or Sol tasks. Task packetization and separate task files are mandatory
+for every plan.
 
 ## Contents
 
@@ -90,6 +91,12 @@ or target directory, regardless of source-task parallelism.
 If a task discovers a missing material decision, it stops and returns to Sol.
 It does not expand scope or invent a contract.
 
+Assign Luna to mechanical, low-risk work with one established repository
+pattern. Assign Terra to ordinary implementation and review work. Assign Sol
+to security, public or persisted contracts, migrations, concurrency,
+cross-owner or cross-language changes, and other materially high-risk work.
+Reasoning effort never exceeds `high`.
+
 ## Cold implementation rehearsal
 
 Before marking a task `Ready`, run a read-only cold rehearsal. Use a fresh
@@ -152,7 +159,7 @@ Before finalizing:
 - every requirement maps to one or more tasks;
 - every task has one cohesive outcome;
 - task order follows contract and migration dependencies;
-- every task fits its assigned Terra/Luna context and reasoning level;
+- every task fits its assigned Luna, Terra, or Sol context and reasoning level;
 - every task passed a documented cold read-only implementation rehearsal,
   fresh-agent when available;
 - no task must reconstruct the full plan;

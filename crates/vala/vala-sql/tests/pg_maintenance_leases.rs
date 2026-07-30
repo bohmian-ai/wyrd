@@ -13,7 +13,7 @@ mod pg_tests {
     use wyrd_dev_fixtures::pg::PgFixture;
 
     async fn operator(fixture: &PgFixture) -> OperatorPool {
-        OperatorPool::from(fixture.platform_admin_pool().clone())
+        fixture.operator_pool().clone()
     }
 
     #[tokio::test]

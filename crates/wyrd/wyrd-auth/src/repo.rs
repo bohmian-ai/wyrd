@@ -77,14 +77,10 @@ mod pg_tests {
         let fixture = PgFixture::start().await.expect("fixture starts");
         let tenant_a = fixture.data_tenant_id();
         let tenant_b = DataTenantId::new_v7();
-        sqlx::query(
-            "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status)
-             VALUES ($1, 'test-tenant-2', 'Test Tenant 2', 'active')",
-        )
-        .bind(tenant_b.as_uuid())
-        .execute(fixture.platform_admin_pool())
-        .await
-        .expect("tenant B inserts");
+        fixture
+            .seed_additional_tenant_with_uuid(tenant_b, "test-tenant-2")
+            .await
+            .expect("tenant B inserts");
         let principal_id = PrincipalId::new(uuid::Uuid::new_v4());
         insert_user(
             &fixture,

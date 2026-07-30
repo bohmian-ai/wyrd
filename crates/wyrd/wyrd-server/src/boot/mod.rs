@@ -775,9 +775,9 @@ fn build_binding_card_ref(
     })
 }
 
-/// Spawn the storage sweeper if enabled and the platform admin pool is available.
+/// Spawn the storage sweeper if enabled and the operator pool is available.
 ///
-/// Returns `None` when the sweeper is disabled or the platform admin pool is absent.
+/// Returns `None` when the sweeper is disabled or the operator pool is absent.
 ///
 /// # Errors
 /// Returns [`wyrd_storage::StorageError`] when the sweeper config cannot be read
@@ -792,15 +792,15 @@ pub fn spawn_storage_sweeper(
         return Ok(None);
     }
 
-    let Some(admin_pool) = state.postgres.platform_admin_pool().cloned() else {
-        tracing::warn!("storage sweeper skipped because platform admin pool is unavailable");
+    let Some(operator_pool) = state.postgres.operator_pool() else {
+        tracing::warn!("storage sweeper skipped because operator pool is unavailable");
         return Ok(None);
     };
 
     let sweeper = wyrd_storage::sweeper::Sweeper::new(
         Arc::clone(&state.storage),
-        admin_pool,
-        state.postgres.app_pool().clone(),
+        operator_pool,
+        state.postgres.wyrd().clone(),
         cfg,
         shutdown,
     );
@@ -938,12 +938,9 @@ mod pg_tests {
             ..ForgeConfig::default()
         };
         let spill = Box::leak(Box::new(tempdir().expect("spill directory")));
-        let rewrite_runtime = ForgeRewriteRuntime::new(
-            Arc::clone(&query_memory),
-            spill.path(),
-            config.spill_limit_bytes,
-        )
-        .expect("rewrite runtime");
+        let rewrite_runtime =
+            ForgeRewriteRuntime::new(query_memory.clone(), spill.path(), config.spill_limit_bytes)
+                .expect("rewrite runtime");
         let staging = Arc::new(storage.operator().clone());
         let object_store: Arc<dyn ForgeObjectStore> =
             Arc::new(OpenDalForgeObjectStore::new(Arc::clone(&staging)));
@@ -1144,7 +1141,7 @@ mod pg_tests {
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         let state = AppState::new(postgres, storage, crate::test_support::test_catalog().await);
 
-        assert!(state.postgres.platform_admin_pool().is_some());
+        assert!(state.postgres.operator_pool().is_some());
         assert_eq!(
             state.storage.backend(),
             wyrd_spec::storage::StorageBackendKind::Local

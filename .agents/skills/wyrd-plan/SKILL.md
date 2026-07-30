@@ -1,6 +1,6 @@
 ---
 name: wyrd-plan
-description: Plan Wyrd feature, refactor, migration, API, SDK, CLI, MCP, UI, Skald, Vala/Bifrost, storage, testing, and architecture work as a decision-complete, execution-grounded specification with rehearsed Terra/Luna task packets. Use when Codex must investigate, design, scope, sequence, decompose, or prepare Wyrd coding work before execution by $wyrd-implement. Do not use to implement the plan or review completed code.
+description: Plan Wyrd feature, refactor, migration, API, SDK, CLI, MCP, UI, Skald, Vala/Bifrost, storage, testing, and architecture work as a decision-complete, execution-grounded specification with rehearsed, risk-routed Luna/Terra/Sol task packets. Use when Codex must investigate, design, scope, sequence, decompose, or prepare Wyrd coding work before execution by $wyrd-implement or $wyrd-implement-plan. Do not use to implement the plan or review completed code.
 ---
 
 # Wyrd Plan
@@ -141,13 +141,16 @@ Treat task generation as compilation:
 
 ```text
 intent + repository evidence + impact graph + decisions + executable proof
-    -> rehearsed Terra/Luna task packets
+    -> rehearsed risk-routed implementation task packets
 ```
 
 Every plan has at least one separate task. Prefer two through five
 dependency-ordered vertical tasks for medium work. Split on cohesive outcomes,
 stable prerequisites, ownership, risk, or useful context boundaries—not files
-or layers. Keep plan-level integration and closeout in the parent plan.
+or layers. Assign Luna to mechanical tasks, Terra to ordinary implementation,
+and Sol to security, public/persisted contracts, migrations, concurrency,
+cross-owner work, and other materially high-risk tasks. Keep plan-level
+integration and closeout in the parent plan.
 
 ## Hand off a controlled living plan
 

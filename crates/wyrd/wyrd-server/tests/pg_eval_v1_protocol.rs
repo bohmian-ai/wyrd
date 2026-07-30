@@ -141,17 +141,12 @@ mod pg_tests {
         conn.commit().await.expect("commit roles");
     }
 
-    async fn seed_tenant(admin_pool: &PgPool, tenant: DataTenantId, slug: &str) {
-        sqlx::query(
-            "INSERT INTO platform.tenants (data_tenant_id, slug, display_name, status) \
-         VALUES ($1, $2, $3, 'active')",
-        )
-        .bind(tenant.as_uuid())
-        .bind(slug)
-        .bind(slug)
-        .execute(admin_pool)
-        .await
-        .expect("seed tenant");
+    /// Seed an additional tenant through the fixture's typed operator boundary.
+    async fn seed_tenant(fixture: &PgFixture, tenant: DataTenantId, slug: &str) {
+        fixture
+            .seed_additional_tenant_with_uuid(tenant, slug)
+            .await
+            .expect("seed tenant");
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -553,7 +548,7 @@ mod pg_tests {
         let (state, _root) = build_state(&fixture).await;
 
         let tenant_b = DataTenantId::new_v7();
-        seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
+        seed_tenant(&fixture, tenant_b, "tenant-b").await;
         // The eval only exists in tenant B, at a colliding space/name.
         let eval_ref = seed_eval(&state, tenant_b, "shared", "collide").await;
 
@@ -591,7 +586,7 @@ mod pg_tests {
         let (state, _root) = build_state(&fixture).await;
 
         let tenant_b = DataTenantId::new_v7();
-        seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
+        seed_tenant(&fixture, tenant_b, "tenant-b").await;
 
         // Data card lives only in tenant B (colliding identity).
         let data_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
@@ -656,7 +651,7 @@ mod pg_tests {
         let (state, _root) = build_state(&fixture).await;
 
         let tenant_b = DataTenantId::new_v7();
-        seed_tenant(fixture.platform_admin_pool(), tenant_b, "tenant-b").await;
+        seed_tenant(&fixture, tenant_b, "tenant-b").await;
         // A Prompt (judge) card exists only in tenant B.
         let prompt_uid = CardUid::new(uuid::Uuid::now_v7()).expect("uid");
         let prompt_spec = Spec::from_kind_and_value(

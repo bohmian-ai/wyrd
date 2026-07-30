@@ -193,7 +193,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
                 AND table_name LIKE 'bifrost_bench_events_%'",
         )
         .bind(tenant.as_uuid())
-        .fetch_one(harness.cluster().pg_fixture().platform_admin_pool())
+        .fetch_one(harness.cluster().pg_fixture().operator_pool().pool())
         .await?;
         published_rows = published_rows.saturating_add(u64::try_from(rows).unwrap_or(0));
     }
@@ -283,7 +283,7 @@ async fn run_qualification_evidence(
             AND table_name = 'bifrost_bench_events_0'",
     )
     .bind(tenant.as_uuid())
-    .fetch_one(harness.cluster().pg_fixture().platform_admin_pool())
+    .fetch_one(harness.cluster().pg_fixture().operator_pool().pool())
     .await?;
     harness.shutdown().await?;
     Ok((

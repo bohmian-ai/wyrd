@@ -645,7 +645,7 @@ async fn verify_run(
                 AND table_name = 'spans'",
         )
         .bind(tenant.as_uuid())
-        .fetch_one(cluster.pg_fixture().platform_admin_pool())
+        .fetch_one(cluster.pg_fixture().operator_pool().pool())
         .await?;
         let rows: i64 = row.try_get("rows")?;
         file_list_rows = file_list_rows.saturating_add(u64::try_from(rows).unwrap_or(0));

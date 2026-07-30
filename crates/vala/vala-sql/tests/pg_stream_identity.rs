@@ -27,7 +27,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 started_at = now(),
                 heartbeat_at = now()
@@ -56,7 +56,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 started_at = now(),
                 heartbeat_at = now()
@@ -77,7 +77,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 started_at = now(),
                 heartbeat_at = now()
@@ -107,7 +107,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 started_at = now(),
                 heartbeat_at = now()
@@ -126,7 +126,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50052', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 started_at = now(),
                 heartbeat_at = now()

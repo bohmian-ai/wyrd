@@ -263,6 +263,9 @@ mod pg_tests {
             ("started_at", "timestamp with time zone", "NO"),
             ("heartbeat_at", "timestamp with time zone", "NO"),
             ("meta", "jsonb", "NO"),
+            ("capability_version", "smallint", "NO"),
+            ("capabilities", "jsonb", "NO"),
+            ("ready", "boolean", "NO"),
         ];
 
         assert_eq!(
@@ -396,7 +399,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token
@@ -414,7 +417,7 @@ mod pg_tests {
                 node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
             ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id) DO UPDATE
+            ON CONFLICT (node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token

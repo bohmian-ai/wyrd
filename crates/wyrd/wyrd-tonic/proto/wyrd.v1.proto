@@ -8,6 +8,88 @@ service BifrostIngestService {
   rpc InsertBatch(InsertBatchRequest) returns (InsertBatchResponse);
 }
 
+service BifrostQueryService {
+  rpc Query(BifrostQueryRequest) returns (stream QueryStreamFrame);
+}
+
+enum VisibilityMode { VISIBILITY_MODE_UNSPECIFIED = 0; VISIBILITY_MODE_PUBLISHED_ONLY = 1; VISIBILITY_MODE_FUSED = 2; }
+enum FreshnessPolicy { FRESHNESS_POLICY_UNSPECIFIED = 0; FRESHNESS_POLICY_STRICT = 1; FRESHNESS_POLICY_ALLOW_DEGRADED = 2; }
+enum QueryTerminalOutcome { QUERY_TERMINAL_OUTCOME_UNSPECIFIED = 0; QUERY_TERMINAL_OUTCOME_SUCCESS = 1; QUERY_TERMINAL_OUTCOME_DEGRADED = 2; QUERY_TERMINAL_OUTCOME_FAILED = 3; }
+enum QueryFreshness { QUERY_FRESHNESS_UNSPECIFIED = 0; QUERY_FRESHNESS_COMPLETE = 1; QUERY_FRESHNESS_DEGRADED = 2; }
+enum QuerySource { QUERY_SOURCE_UNSPECIFIED = 0; QUERY_SOURCE_ICEBERG = 1; QUERY_SOURCE_HOT_SEALED = 2; QUERY_SOURCE_LIVE_TAIL = 3; }
+enum SourceCompletionOutcome { SOURCE_COMPLETION_OUTCOME_UNSPECIFIED = 0; SOURCE_COMPLETION_OUTCOME_COMPLETE = 1; SOURCE_COMPLETION_OUTCOME_UNAVAILABLE = 2; }
+enum QueryWarning { QUERY_WARNING_UNSPECIFIED = 0; QUERY_WARNING_LIVE_TAIL_UNAVAILABLE = 1; QUERY_WARNING_STALE_CUT_REPLANNED = 2; }
+enum QueryTerminalErrorCode {
+  QUERY_TERMINAL_ERROR_CODE_UNSPECIFIED = 0;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_TIMEOUT = 1;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_VISIBILITY_UNAVAILABLE = 2;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_TENANT_INVARIANT = 3;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_RECONCILIATION_INVARIANT = 4;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_PEER_SECURITY = 5;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_AUDIT_UNAVAILABLE = 6;
+  QUERY_TERMINAL_ERROR_CODE_CATALOG_UNREACHABLE = 7;
+  QUERY_TERMINAL_ERROR_CODE_STORAGE_UNREACHABLE = 8;
+  QUERY_TERMINAL_ERROR_CODE_QUERY_EXECUTION_FAILED = 9;
+}
+message BifrostQueryRequest { string sql = 1; VisibilityMode visibility = 2; FreshnessPolicy freshness = 3; optional uint64 deadline_ms = 4; }
+message QuerySchemaFrame { string schema_fingerprint = 1; bytes arrow_ipc_schema = 2; }
+message QueryBatchFrame { bytes arrow_ipc_batch = 1; }
+message SourceCompletion { QuerySource source = 1; SourceCompletionOutcome outcome = 2; }
+message QueryTerminalError { QueryTerminalErrorCode code = 1; optional string detail = 2; }
+message QueryTerminalFrame {
+  QueryTerminalOutcome outcome = 1; QueryFreshness freshness = 2;
+  uint64 row_count = 3; repeated QueryWarning warnings = 4;
+  repeated SourceCompletion source_completion = 5; optional QueryTerminalError error = 6;
+}
+message QueryStreamFrame {
+  oneof frame { QuerySchemaFrame schema = 1; QueryBatchFrame batch = 2; QueryTerminalFrame terminal = 3; }
+}
+
+service ScribeTailService {
+  rpc AcquireFence(AcquireTailFenceRequest) returns (TailReadFence);
+  rpc ReadFencePage(TailPageRequest) returns (TailPage);
+  rpc ReleaseFence(ReleaseTailFenceRequest) returns (ReleaseTailFenceResponse);
+}
+service OraclePeerService {
+  rpc ReserveSlots(ReserveNodeSlotsRequest) returns (ReserveNodeSlotsResponse);
+  rpc ReleaseSlots(ReleaseNodeSlotsRequest) returns (ReleaseNodeSlotsResponse);
+  rpc ExecuteFragment(ExecuteFragmentRequest) returns (stream WorkerAttemptFrame);
+}
+message TenantTableBinding { string tenant_id = 1; string namespace = 2; string table = 3; }
+message TailCursor { uint64 writer_epoch = 1; uint64 wal_lsn = 2; bytes batch_id = 3; uint32 row_ordinal = 4; }
+message TailStreamIdentity { string node_id = 1; uint64 writer_epoch = 2; }
+message AcquireTailFenceRequest {
+  TenantTableBinding binding = 1; string event_day = 2; TailCursor exclusive_sealed = 3;
+  uint64 deadline_unix_ms = 4; string schema_fingerprint = 5; uint32 tail_protocol_version = 6;
+}
+message TailReadFence {
+  bytes fence_id = 1; TenantTableBinding binding = 2; string event_day = 3;
+  TailStreamIdentity stream = 4; TailCursor exclusive_sealed = 5;
+  TailCursor inclusive_live = 6; string schema_fingerprint = 7;
+  uint32 tail_protocol_version = 8; uint64 expires_at_unix_ms = 9;
+}
+message TailPageRequest { bytes fence_id = 1; oneof after_cursor { TailCursor after = 2; } uint32 max_rows = 3; uint32 max_encoded_bytes = 4; }
+message TailPage { repeated bytes arrow_ipc_batches = 1; oneof next_cursor { TailCursor next = 2; } bool complete = 3; }
+message ReleaseTailFenceRequest { bytes fence_id = 1; }
+message ReleaseTailFenceResponse {}
+enum QueryClass { QUERY_CLASS_UNSPECIFIED = 0; QUERY_CLASS_INTERACTIVE = 1; QUERY_CLASS_ANALYTICAL = 2; }
+message ReserveNodeSlotsRequest {
+  bytes query_id = 1; string leader_node_id = 2; uint64 leader_fencing_token = 3;
+  QueryClass query_class = 4; uint32 slot_units = 5; uint64 expires_at_unix_ms = 6;
+}
+message ReserveNodeSlotsResponse { oneof outcome { PendingNodeReservation pending = 1; ReservationRejected rejected = 2; } }
+message PendingNodeReservation { bytes reservation_id = 1; uint64 expires_at_unix_ms = 2; }
+message ReservationRejected { uint32 retry_after_ms = 1; }
+message ReleaseNodeSlotsRequest { bytes reservation_id = 1; bytes query_id = 2; string leader_node_id = 3; uint64 leader_fencing_token = 4; }
+message ReleaseNodeSlotsResponse {}
+message SignedPeerTicket { string key_id = 1; bytes claims_bytes = 2; bytes signature = 3; }
+message ExecuteFragmentRequest { SignedPeerTicket ticket = 1; bytes fragment_bytes = 2; bytes reservation_id = 3; }
+message WorkerAttemptFrame { oneof frame { bytes arrow_ipc_schema = 1; bytes arrow_ipc_batch = 2; WorkerFooter footer = 3; } }
+message WorkerFooter {
+  string fragment_id = 1; string manifest_digest = 2; uint64 row_count = 3;
+  uint64 encoded_bytes = 4; string payload_digest = 5; bool completed = 6;
+}
+
 message InsertBatchRequest {
   string table          = 1;   // fqn "namespace.name"
   bytes  arrow_ipc      = 2;   // one sealed Arrow IPC payload

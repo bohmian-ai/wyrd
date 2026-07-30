@@ -47,4 +47,7 @@ name = "pg_migration"
 name = "pg_olap_query_jobs"
 
 [[test]]
+name = "pg_oracle_coordination"
+
+[[test]]
 name = "pg_schema_usage"

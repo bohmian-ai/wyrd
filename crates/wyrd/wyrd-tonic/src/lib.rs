@@ -27,6 +27,9 @@ pub mod wyrd {
 }
 
 pub mod error;
+pub mod frame_codec;
+pub mod private_conversion;
+pub mod query_conversion;
 
 // `health` impls `tonic::server::NamedService`, which only exists under tonic's
 // `server` feature — keep the module (and its re-export) behind `server` so the

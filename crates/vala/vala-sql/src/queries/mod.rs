@@ -10,11 +10,13 @@
 pub mod alerts;
 pub mod anchors;
 pub mod audit_outbox;
+pub mod cluster_nodes;
 pub mod drift_alerts;
 pub mod forge_operations;
 pub mod maintenance_leases;
 pub mod monitor;
 pub mod olap_catalog;
 pub mod olap_query_jobs;
+pub mod oracle_admission;
 pub mod profiles;
 pub mod queues;

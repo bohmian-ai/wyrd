@@ -131,6 +131,156 @@
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
         {
+          "description": "Immutable, scrubbed Bifrost visibility-cut read decision.",
+          "type": "object",
+          "required": [
+            "binding_digests",
+            "deadline_ms",
+            "execution",
+            "kind",
+            "manifest_digest",
+            "permission_digest",
+            "projection_digest",
+            "query_class",
+            "query_digest",
+            "retry_ordinal",
+            "selected_node_count",
+            "slot_units",
+            "snapshot_digest",
+            "visibility",
+            "worker_count"
+          ],
+          "properties": {
+            "binding_digests": {
+              "description": "Sorted tenant-table binding digests.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "deadline_ms": {
+              "description": "Settled deadline in milliseconds.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "execution": {
+              "description": "Local or distributed execution decision.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/QueryExecutionMode"
+                }
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bifrost_query_read_decision"
+              ]
+            },
+            "manifest_digest": {
+              "description": "Hot manifest summary digest.",
+              "type": "string"
+            },
+            "permission_digest": {
+              "description": "Permission decision digest.",
+              "type": "string"
+            },
+            "projection_digest": {
+              "description": "Authorized projection digest.",
+              "type": "string"
+            },
+            "query_class": {
+              "description": "Server-derived admission class.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/QueryClass"
+                }
+              ]
+            },
+            "query_digest": {
+              "description": "Digest of the normalized query.",
+              "type": "string"
+            },
+            "retry_ordinal": {
+              "description": "Whole-cut retry ordinal, zero or one.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "selected_node_count": {
+              "description": "Selected execution nodes including leader.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            },
+            "slot_units": {
+              "description": "Total admission slot demand.",
+              "type": "integer",
+              "format": "uint32",
+              "minimum": 0.0
+            },
+            "snapshot_digest": {
+              "description": "Pinned snapshot summary digest.",
+              "type": "string"
+            },
+            "visibility": {
+              "description": "Visibility mode committed by the cut.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/VisibilityMode"
+                }
+              ]
+            },
+            "worker_count": {
+              "description": "Selected workers excluding leader.",
+              "type": "integer",
+              "format": "uint8",
+              "minimum": 0.0
+            }
+          }
+        },
+        {
+          "description": "Scrubbed tenant or peer security violation.",
+          "type": "object",
+          "required": [
+            "kind",
+            "phase",
+            "violation"
+          ],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": [
+                "bifrost_security_violation"
+              ]
+            },
+            "phase": {
+              "description": "Boundary where validation failed.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/BifrostSecurityPhase"
+                }
+              ]
+            },
+            "query_digest": {
+              "description": "Trusted query digest when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "violation": {
+              "description": "Closed violation class.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/BifrostSecurityViolationKind"
+                }
+              ]
+            }
+          }
+        },
+        {
           "description": "A live Iceberg file replacement and its recoverable external boundary.\n\nThe ordered paths are the exact current-snapshot inputs and the exact rewrite outputs. `base_snapshot_id` is the plan fence, never an input file's addition snapshot.",
           "type": "object",
           "required": [
@@ -948,6 +1098,114 @@
         }
       ]
     },
+    "BifrostSecurityPhase": {
+      "description": "Closed phase where a Bifrost security invariant failed.",
+      "oneOf": [
+        {
+          "description": "Query planning and binding.",
+          "type": "string",
+          "enum": [
+            "planning"
+          ]
+        },
+        {
+          "description": "Source access or tenant tripwire.",
+          "type": "string",
+          "enum": [
+            "source"
+          ]
+        },
+        {
+          "description": "Private peer authentication and execution.",
+          "type": "string",
+          "enum": [
+            "peer"
+          ]
+        }
+      ]
+    },
+    "BifrostSecurityViolationKind": {
+      "description": "Closed Bifrost security violation classes.",
+      "oneOf": [
+        {
+          "description": "Authenticated tenant binding mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_binding"
+          ]
+        },
+        {
+          "description": "Tenant-scoped object path mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_path"
+          ]
+        },
+        {
+          "description": "Runtime row tenant mismatch.",
+          "type": "string",
+          "enum": [
+            "tenant_row"
+          ]
+        },
+        {
+          "description": "Invalid peer signature.",
+          "type": "string",
+          "enum": [
+            "peer_signature"
+          ]
+        },
+        {
+          "description": "Unknown peer key identifier.",
+          "type": "string",
+          "enum": [
+            "peer_unknown_key"
+          ]
+        },
+        {
+          "description": "Replayed peer nonce.",
+          "type": "string",
+          "enum": [
+            "peer_replay"
+          ]
+        },
+        {
+          "description": "Wrong peer audience.",
+          "type": "string",
+          "enum": [
+            "peer_audience"
+          ]
+        },
+        {
+          "description": "Stale peer fence.",
+          "type": "string",
+          "enum": [
+            "peer_fence"
+          ]
+        },
+        {
+          "description": "Verified peer tenant mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_tenant"
+          ]
+        },
+        {
+          "description": "Peer manifest digest mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_manifest"
+          ]
+        },
+        {
+          "description": "Peer fragment digest mismatch.",
+          "type": "string",
+          "enum": [
+            "peer_fragment"
+          ]
+        }
+      ]
+    },
     "CardKind": {
       "title": "CardKind",
       "description": "Wyrd Card kind.",
@@ -1302,6 +1560,44 @@
         }
       ]
     },
+    "QueryClass": {
+      "description": "Server-derived admission class.",
+      "oneOf": [
+        {
+          "description": "Latency-sensitive bounded work.",
+          "type": "string",
+          "enum": [
+            "interactive"
+          ]
+        },
+        {
+          "description": "Larger analytical work.",
+          "type": "string",
+          "enum": [
+            "analytical"
+          ]
+        }
+      ]
+    },
+    "QueryExecutionMode": {
+      "description": "Closed execution topology recorded by a Bifrost read decision.",
+      "oneOf": [
+        {
+          "description": "The leader executes every scan locally.",
+          "type": "string",
+          "enum": [
+            "local"
+          ]
+        },
+        {
+          "description": "The leader delegates immutable sealed scan leaves.",
+          "type": "string",
+          "enum": [
+            "distributed"
+          ]
+        }
+      ]
+    },
     "RequestId": {
       "description": "Request correlation ID; required to be a UUID v7.",
       "type": "string"
@@ -1400,6 +1696,25 @@
     "VersionBlock": {
       "description": "Semver-compatible version string.",
       "type": "string"
+    },
+    "VisibilityMode": {
+      "description": "Visibility tiers included in one immutable Oracle query cut.",
+      "oneOf": [
+        {
+          "description": "Read pinned Iceberg and hot sealed files.",
+          "type": "string",
+          "enum": [
+            "published_only"
+          ]
+        },
+        {
+          "description": "Also read the exact fenced live-tail interval.",
+          "type": "string",
+          "enum": [
+            "fused"
+          ]
+        }
+      ]
     }
   }
 }

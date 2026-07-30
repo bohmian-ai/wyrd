@@ -9,6 +9,7 @@ use crate::ids::CardUid;
 use crate::origin::Origin;
 use crate::reference::CardRef;
 use crate::vala::api::AuditDecision;
+use crate::vala::api::{QueryClass, VisibilityMode};
 
 /// Error returned when an audit-detail identifier is empty, malformed, or
 /// contains a value that must never enter an audit record.
@@ -32,6 +33,18 @@ pub enum AuditDetailValueError {
         /// The audit-detail field being validated.
         field: &'static str,
     },
+    /// The value exceeds the scrubbed audit-detail byte ceiling.
+    #[error("{field} exceeds 1024 UTF-8 bytes")]
+    TooLong {
+        /// The audit-detail field being validated.
+        field: &'static str,
+    },
+    /// Related audit fields violate a closed contract invariant.
+    #[error("audit detail fields violate the {invariant} invariant")]
+    InvalidCombination {
+        /// Name of the violated invariant.
+        invariant: &'static str,
+    },
 }
 
 macro_rules! audit_detail_value {
@@ -40,7 +53,10 @@ macro_rules! audit_detail_value {
         #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, schemars::JsonSchema)]
         #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
         #[serde(transparent)]
-        pub struct $name(String);
+        pub struct $name(
+            /// Validated normalized audit-safe text.
+            String,
+        );
 
         impl $name {
             /// Construct a normalized, non-secret audit-detail value.
@@ -56,6 +72,9 @@ macro_rules! audit_detail_value {
                 }
                 if value.chars().any(char::is_control) {
                     return Err(AuditDetailValueError::ControlCharacter { field: $field });
+                }
+                if value.len() > 1_024 {
+                    return Err(AuditDetailValueError::TooLong { field: $field });
                 }
                 if is_secret_like(value) {
                     return Err(AuditDetailValueError::SecretLike { field: $field });
@@ -109,6 +128,64 @@ audit_detail_value!(
     "batch_id",
     "Idempotent, non-secret identifier for an ingest batch."
 );
+audit_detail_value!(
+    QueryAuditDigest,
+    "query_audit_digest",
+    "Stable non-secret digest used by a Bifrost query audit decision."
+);
+
+/// Closed execution topology recorded by a Bifrost read decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryExecutionMode {
+    /// The leader executes every scan locally.
+    Local,
+    /// The leader delegates immutable sealed scan leaves.
+    Distributed,
+}
+
+/// Closed phase where a Bifrost security invariant failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostSecurityPhase {
+    /// Query planning and binding.
+    Planning,
+    /// Source access or tenant tripwire.
+    Source,
+    /// Private peer authentication and execution.
+    Peer,
+}
+
+/// Closed Bifrost security violation classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum BifrostSecurityViolationKind {
+    /// Authenticated tenant binding mismatch.
+    TenantBinding,
+    /// Tenant-scoped object path mismatch.
+    TenantPath,
+    /// Runtime row tenant mismatch.
+    TenantRow,
+    /// Invalid peer signature.
+    PeerSignature,
+    /// Unknown peer key identifier.
+    PeerUnknownKey,
+    /// Replayed peer nonce.
+    PeerReplay,
+    /// Wrong peer audience.
+    PeerAudience,
+    /// Stale peer fence.
+    PeerFence,
+    /// Verified peer tenant mismatch.
+    PeerTenant,
+    /// Peer manifest digest mismatch.
+    PeerManifest,
+    /// Peer fragment digest mismatch.
+    PeerFragment,
+}
 
 fn is_secret_like(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
@@ -212,6 +289,46 @@ pub enum CardScopeMintKind {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditDetail {
+    /// Immutable, scrubbed Bifrost visibility-cut read decision.
+    BifrostQueryReadDecision {
+        /// Digest of the normalized query.
+        query_digest: QueryAuditDigest,
+        /// Server-derived admission class.
+        query_class: QueryClass,
+        /// Visibility mode committed by the cut.
+        visibility: VisibilityMode,
+        /// Sorted tenant-table binding digests.
+        binding_digests: Vec<QueryAuditDigest>,
+        /// Pinned snapshot summary digest.
+        snapshot_digest: QueryAuditDigest,
+        /// Hot manifest summary digest.
+        manifest_digest: QueryAuditDigest,
+        /// Authorized projection digest.
+        projection_digest: QueryAuditDigest,
+        /// Permission decision digest.
+        permission_digest: QueryAuditDigest,
+        /// Local or distributed execution decision.
+        execution: QueryExecutionMode,
+        /// Selected execution nodes including leader.
+        selected_node_count: u8,
+        /// Selected workers excluding leader.
+        worker_count: u8,
+        /// Total admission slot demand.
+        slot_units: u32,
+        /// Whole-cut retry ordinal, zero or one.
+        retry_ordinal: u8,
+        /// Settled deadline in milliseconds.
+        deadline_ms: u64,
+    },
+    /// Scrubbed tenant or peer security violation.
+    BifrostSecurityViolation {
+        /// Closed violation class.
+        violation: BifrostSecurityViolationKind,
+        /// Boundary where validation failed.
+        phase: BifrostSecurityPhase,
+        /// Trusted query digest when one exists.
+        query_digest: Option<QueryAuditDigest>,
+    },
     /// A live Iceberg file replacement and its recoverable external boundary.
     ///
     /// The ordered paths are the exact current-snapshot inputs and the exact
@@ -409,6 +526,63 @@ pub enum AuditDetail {
     },
 }
 
+impl AuditDetail {
+    /// Validates bounded Bifrost audit collection and topology invariants.
+    ///
+    /// Other variants contain their own constructor-validated scalar values.
+    ///
+    /// # Errors
+    /// Returns [`AuditDetailValueError`] when a Bifrost read decision exceeds
+    /// 64 bindings/nodes or carries inconsistent execution/retry/deadline data.
+    pub fn validate(&self) -> Result<(), AuditDetailValueError> {
+        let Self::BifrostQueryReadDecision {
+            binding_digests,
+            execution,
+            selected_node_count,
+            worker_count,
+            slot_units,
+            retry_ordinal,
+            deadline_ms,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if binding_digests.is_empty() || binding_digests.len() > 64 {
+            return Err(AuditDetailValueError::InvalidCombination {
+                invariant: "binding count",
+            });
+        }
+        if binding_digests
+            .windows(2)
+            .any(|pair| pair[0].as_str() >= pair[1].as_str())
+        {
+            return Err(AuditDetailValueError::InvalidCombination {
+                invariant: "binding digest order",
+            });
+        }
+        if !(1..=64).contains(selected_node_count)
+            || *retry_ordinal > 1
+            || *slot_units == 0
+            || *deadline_ms == 0
+        {
+            return Err(AuditDetailValueError::InvalidCombination {
+                invariant: "Bifrost read bounds",
+            });
+        }
+        let expected_workers = match execution {
+            QueryExecutionMode::Local => 0,
+            QueryExecutionMode::Distributed => selected_node_count - 1,
+        };
+        if *worker_count != expected_workers {
+            return Err(AuditDetailValueError::InvalidCombination {
+                invariant: "execution topology",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Durable phase recorded for a Forge compaction operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -489,13 +663,15 @@ pub fn audit_detail_canonical_json(detail: &AuditDetail) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuditDetail, AuditDetailValueError, AuditErrorCode, BatchId, ScopeHash,
-        StorageAuditOperation, StoragePath, audit_detail_canonical_json,
+        AuditDetail, AuditDetailValueError, AuditErrorCode, BatchId, QueryAuditDigest,
+        QueryExecutionMode, ScopeHash, StorageAuditOperation, StoragePath,
+        audit_detail_canonical_json,
     };
     use crate::auth::{PrincipalId, PrincipalKindTag};
     use crate::origin::{CommitSha, Origin};
     use crate::request_id::RequestId;
     use crate::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostTableName};
+    use crate::vala::api::{QueryClass, VisibilityMode};
 
     #[test]
     fn canonical_json_is_compact_and_stable() {
@@ -584,6 +760,99 @@ mod tests {
             BatchId::new("token=plaintext"),
             Err(AuditDetailValueError::SecretLike { field: "batch_id" })
         ));
+    }
+
+    /// Bifrost read details serialize only digests and enforce topology bounds.
+    #[test]
+    fn bifrost_read_detail_is_scrubbed_and_bounded() {
+        let digest = || QueryAuditDigest::new("sha256:abc").expect("valid digest");
+        let detail = AuditDetail::BifrostQueryReadDecision {
+            query_digest: digest(),
+            query_class: QueryClass::Interactive,
+            visibility: VisibilityMode::PublishedOnly,
+            binding_digests: vec![digest()],
+            snapshot_digest: digest(),
+            manifest_digest: digest(),
+            projection_digest: digest(),
+            permission_digest: digest(),
+            execution: QueryExecutionMode::Local,
+            selected_node_count: 1,
+            worker_count: 0,
+            slot_units: 1,
+            retry_ordinal: 0,
+            deadline_ms: 100,
+        };
+        detail.validate().expect("bounded detail validates");
+        let json = audit_detail_canonical_json(&detail);
+        assert!(!json.contains("SELECT"));
+        assert!(!json.contains("/var/"));
+
+        let invalid = AuditDetail::BifrostQueryReadDecision {
+            query_digest: digest(),
+            query_class: QueryClass::Interactive,
+            visibility: VisibilityMode::PublishedOnly,
+            binding_digests: (0..65).map(|_| digest()).collect(),
+            snapshot_digest: digest(),
+            manifest_digest: digest(),
+            projection_digest: digest(),
+            permission_digest: digest(),
+            execution: QueryExecutionMode::Local,
+            selected_node_count: 1,
+            worker_count: 0,
+            slot_units: 1,
+            retry_ordinal: 0,
+            deadline_ms: 100,
+        };
+        assert!(matches!(
+            invalid.validate(),
+            Err(AuditDetailValueError::InvalidCombination {
+                invariant: "binding count"
+            })
+        ));
+
+        let duplicate = AuditDetail::BifrostQueryReadDecision {
+            query_digest: digest(),
+            query_class: QueryClass::Interactive,
+            visibility: VisibilityMode::PublishedOnly,
+            binding_digests: vec![digest(), digest()],
+            snapshot_digest: digest(),
+            manifest_digest: digest(),
+            projection_digest: digest(),
+            permission_digest: digest(),
+            execution: QueryExecutionMode::Local,
+            selected_node_count: 1,
+            worker_count: 0,
+            slot_units: 1,
+            retry_ordinal: 0,
+            deadline_ms: 100,
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(AuditDetailValueError::InvalidCombination {
+                invariant: "binding digest order"
+            })
+        ));
+
+        let unsorted = AuditDetail::BifrostQueryReadDecision {
+            query_digest: digest(),
+            query_class: QueryClass::Interactive,
+            visibility: VisibilityMode::PublishedOnly,
+            binding_digests: vec![
+                QueryAuditDigest::new("sha256:z").expect("valid digest"),
+                QueryAuditDigest::new("sha256:a").expect("valid digest"),
+            ],
+            snapshot_digest: digest(),
+            manifest_digest: digest(),
+            projection_digest: digest(),
+            permission_digest: digest(),
+            execution: QueryExecutionMode::Local,
+            selected_node_count: 1,
+            worker_count: 0,
+            slot_units: 1,
+            retry_ordinal: 0,
+            deadline_ms: 100,
+        };
+        assert!(unsorted.validate().is_err());
     }
 
     #[test]

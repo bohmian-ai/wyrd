@@ -19,6 +19,116 @@ use crate::error::derive::WyrdError;
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "variant", content = "data", rename_all = "snake_case")]
 pub enum BifrostError {
+    /// This server has no ready local Oracle role.
+    #[error("Oracle role unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_ORACLE_ROLE_UNAVAILABLE",
+        status = 503,
+        title = "Oracle role unavailable",
+        remediation = "Retry through an Oracle-ready query endpoint."
+    )]
+    OracleRoleUnavailable,
+
+    /// This server has no WAL-ready local Scribe role.
+    #[error("Scribe role unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_SCRIBE_ROLE_UNAVAILABLE",
+        status = 503,
+        title = "Scribe role unavailable",
+        remediation = "Retry ingest through a WAL-ready Scribe endpoint."
+    )]
+    ScribeRoleUnavailable,
+
+    /// Query admission capacity was unavailable.
+    #[error("query admission rejected")]
+    #[wyrd_error(
+        code = "WYRD_VALA_429_QUERY_ADMISSION_REJECTED",
+        status = 429,
+        title = "Query admission rejected",
+        remediation = "Retry after the supplied bounded delay or reduce demand."
+    )]
+    QueryAdmissionRejected,
+
+    /// The requested sealed or live visibility cut could not be acquired.
+    #[error("query visibility unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_VISIBILITY_UNAVAILABLE",
+        status = 503,
+        title = "Query visibility unavailable",
+        remediation = "Retry when the sealed/live source is available or select an allowed weaker freshness."
+    )]
+    QueryVisibilityUnavailable,
+
+    /// A row violated the authenticated tenant boundary.
+    #[error("query tenant invariant violated")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_TENANT_INVARIANT",
+        status = 500,
+        title = "Query tenant invariant violated",
+        remediation = "Stop and investigate tenant isolation; never retry as caller input."
+    )]
+    QueryTenantInvariant,
+
+    /// Cross-tier rows with one identity contained inconsistent values.
+    #[error("query reconciliation invariant violated")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_RECONCILIATION_INVARIANT",
+        status = 500,
+        title = "Query reconciliation invariant violated",
+        remediation = "Stop and investigate cross-tier row corruption."
+    )]
+    QueryReconciliationInvariant,
+
+    /// A peer credential, fence, or replay check failed.
+    #[error("query peer security validation failed")]
+    #[wyrd_error(
+        code = "WYRD_VALA_403_QUERY_PEER_SECURITY",
+        status = 403,
+        title = "Query peer security validation failed",
+        remediation = "Reject the peer attempt and investigate credential/fence/replay state."
+    )]
+    QueryPeerSecurity,
+
+    /// A query stream violated the closed frame protocol.
+    #[error("query stream protocol violation")]
+    #[wyrd_error(
+        code = "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+        status = 502,
+        title = "Query stream protocol violation",
+        remediation = "Discard partial output and retry through a healthy server."
+    )]
+    QueryStreamProtocol,
+
+    /// A query stream ended without a terminal frame.
+    #[error("query stream incomplete")]
+    #[wyrd_error(
+        code = "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+        status = 502,
+        title = "Query stream incomplete",
+        remediation = "Discard partial output; retry because no terminal was observed."
+    )]
+    QueryStreamIncomplete,
+
+    /// The transactional query read-decision audit could not be committed.
+    #[error("query audit unavailable")]
+    #[wyrd_error(
+        code = "WYRD_VALA_503_QUERY_AUDIT_UNAVAILABLE",
+        status = 503,
+        title = "Query audit unavailable",
+        remediation = "Restore the audit/SQL dependency before retrying."
+    )]
+    QueryAuditUnavailable,
+
+    /// Query execution failed after the public stream began.
+    #[error("query execution failed")]
+    #[wyrd_error(
+        code = "WYRD_VALA_500_QUERY_EXECUTION_FAILED",
+        status = 500,
+        title = "Query execution failed",
+        remediation = "Inspect the scrubbed terminal error and server diagnostics before retrying."
+    )]
+    QueryExecutionFailed,
+
     /// The ingest authentication credentials were missing or rejected.
     #[error("ingest authentication failed: {message}")]
     #[wyrd_error(

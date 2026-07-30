@@ -120,7 +120,7 @@ pub async fn acquire_on_boot(
     sqlx::query(
  "INSERT INTO vala.cluster_nodes (node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at)
  VALUES ($1, $2, $3, 1, now(), now())
- ON CONFLICT (node_id) DO NOTHING",
+ ON CONFLICT (node_id, role) DO NOTHING",
  )
  .bind(node_uuid)
  .bind(role)

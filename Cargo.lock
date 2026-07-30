@@ -11134,6 +11134,7 @@ name = "wyrd-tonic"
 version = "0.0.1"
 dependencies = [
  "arc-swap",
+ "chrono",
  "opentelemetry-proto",
  "prost",
  "serde_json",
@@ -11146,6 +11147,7 @@ dependencies = [
  "tonic-reflection",
  "tonic-types",
  "tracing",
+ "uuid",
  "wyrd-spec",
 ]
 

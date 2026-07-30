@@ -16,9 +16,10 @@ use crate::auth::{PrincipalId, PrincipalKindTag};
 use crate::reference::CardRef;
 use crate::request_id::RequestId;
 pub use crate::vala::audit_detail::{
-    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ForgeIcebergRewritePhase,
-    ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, ScopeHash, StoragePath,
-    audit_detail_canonical_json,
+    AuditDetail, AuditDetailValueError, BatchId, BifrostSecurityPhase,
+    BifrostSecurityViolationKind, ForgeCompactionPhase, ForgeIcebergRewritePhase,
+    ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, QueryAuditDigest, QueryExecutionMode, ScopeHash,
+    StoragePath, audit_detail_canonical_json,
 };
 
 /// Bifrost table-identifier newtype.
@@ -58,7 +59,7 @@ fn default_true() -> bool {
 // ── Table registration / describe wire types ────────────────────────────────
 
 /// Lifecycle status of a registered Bifrost table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 pub enum TableStatus {
     /// Table is active and writable.
@@ -939,6 +940,1246 @@ pub struct SyncQueryRequest {
     pub params: Vec<QueryParam>,
 }
 
+/// Maximum number of warnings carried by a terminal frame.
+pub const MAX_QUERY_TERMINAL_WARNINGS: usize = 16;
+/// Maximum number of closed source-completion entries.
+pub const MAX_QUERY_SOURCE_COMPLETIONS: usize = 3;
+/// Maximum byte length of scrubbed terminal error detail.
+pub const MAX_QUERY_ERROR_DETAIL_BYTES: usize = 1_024;
+
+/// Error returned when an Oracle query contract violates its closed protocol.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum QueryContractError {
+    /// A required string is empty.
+    #[error("{field} must not be empty")]
+    Empty {
+        /// Invalid field.
+        field: &'static str,
+    },
+    /// A bounded collection exceeds its protocol maximum.
+    #[error("{field} exceeds its maximum of {maximum}")]
+    TooMany {
+        /// Invalid collection field.
+        field: &'static str,
+        /// Protocol maximum.
+        maximum: usize,
+    },
+    /// A bounded scrubbed value is invalid.
+    #[error("{field} is not a valid scrubbed value")]
+    InvalidDetail {
+        /// Invalid scrubbed field.
+        field: &'static str,
+    },
+    /// Terminal fields form an invalid state.
+    #[error("invalid query terminal: {reason}")]
+    InvalidTerminal {
+        /// Closed validation reason.
+        reason: &'static str,
+    },
+}
+
+/// Visibility tiers included in one immutable Oracle query cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum VisibilityMode {
+    /// Read pinned Iceberg and hot sealed files.
+    PublishedOnly,
+    /// Also read the exact fenced live-tail interval.
+    Fused,
+}
+
+/// Behavior when a requested live source cannot complete.
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum FreshnessPolicy {
+    /// Fail when every requested source cannot complete.
+    Strict,
+    /// Retain a bounded degraded result when live data is unavailable.
+    #[default]
+    AllowDegraded,
+}
+
+/// Public synchronous Oracle query request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct BifrostQueryRequest {
+    /// SELECT-only SQL text.
+    pub sql: String,
+    /// Visibility tiers requested by the caller.
+    pub visibility: VisibilityMode,
+    /// Required freshness behavior.
+    #[serde(default)]
+    pub freshness: FreshnessPolicy,
+    /// Optional caller deadline in milliseconds.
+    pub deadline_ms: Option<u64>,
+}
+
+impl BifrostQueryRequest {
+    /// Validates request fields whose limits are part of the pure protocol.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] when SQL is empty or the deadline is zero.
+    pub fn validate(&self) -> Result<(), QueryContractError> {
+        if self.sql.trim().is_empty() {
+            return Err(QueryContractError::Empty { field: "sql" });
+        }
+        if self.deadline_ms == Some(0) {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "deadline_ms must be positive",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Server-derived admission class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryClass {
+    /// Latency-sensitive bounded work.
+    Interactive,
+    /// Larger analytical work.
+    Analytical,
+}
+
+/// One logical frame in the public query stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+pub enum QueryStreamFrame {
+    /// Stream schema, emitted exactly once.
+    Schema(QuerySchemaFrame),
+    /// Arrow IPC record batch bytes.
+    Batch(QueryBatchFrame),
+    /// Required terminal state.
+    Terminal(QueryTerminalFrame),
+}
+
+/// Schema frame for a query stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct QuerySchemaFrame {
+    /// Stable schema fingerprint.
+    pub schema_fingerprint: String,
+    /// Arrow IPC schema bytes.
+    pub arrow_ipc_schema: Vec<u8>,
+}
+
+/// Data frame for a query stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct QueryBatchFrame {
+    /// Exact Arrow IPC batch bytes.
+    pub arrow_ipc_batch: Vec<u8>,
+}
+
+/// Final stream outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryTerminalOutcome {
+    /// Query completed with its full cut.
+    Success,
+    /// Query completed with an explicitly degraded cut.
+    Degraded,
+    /// Query failed after framing began.
+    Failed,
+}
+
+/// Freshness achieved by the admitted visibility cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryFreshness {
+    /// Every selected source was available.
+    Complete,
+    /// The admitted cut omitted an unavailable live source.
+    Degraded,
+}
+
+/// Closed source tiers represented in terminal metadata.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QuerySource {
+    /// Published Iceberg snapshot.
+    Iceberg,
+    /// Sealed files not yet published into Iceberg.
+    HotSealed,
+    /// Fenced Scribe live-tail interval.
+    LiveTail,
+}
+
+/// Closed warnings emitted by the Oracle protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryWarning {
+    /// A Fused query omitted unavailable live-tail data.
+    LiveTailUnavailable,
+    /// A stale sealed cut was replaced once before output.
+    StaleCutReplanned,
+}
+
+/// Completion state for one source tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCompletionOutcome {
+    /// The source completed.
+    Complete,
+    /// The live source was unavailable under degraded freshness.
+    Unavailable,
+}
+
+/// Completion metadata for one source tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SourceCompletion {
+    /// Closed source tier.
+    pub source: QuerySource,
+    /// Source outcome.
+    pub outcome: SourceCompletionOutcome,
+}
+
+/// Closed stable codes allowed in late failed terminals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum QueryTerminalErrorCode {
+    /// The query deadline elapsed.
+    QueryTimeout,
+    /// A required visibility source was unavailable.
+    QueryVisibilityUnavailable,
+    /// A tenant isolation invariant failed.
+    QueryTenantInvariant,
+    /// Equal row identities contained unequal values.
+    QueryReconciliationInvariant,
+    /// Peer authentication, fencing, or replay validation failed.
+    QueryPeerSecurity,
+    /// The read-decision audit dependency failed.
+    QueryAuditUnavailable,
+    /// The table catalog was unavailable.
+    CatalogUnreachable,
+    /// Object storage was unavailable.
+    StorageUnreachable,
+    /// Query execution failed after framing began.
+    QueryExecutionFailed,
+}
+
+/// Scrubbed detail attached to a failed terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct QueryErrorDetail(
+    /// Normalized bounded detail text.
+    String,
+);
+
+impl QueryErrorDetail {
+    /// Constructs bounded, control-free terminal detail.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] for empty, overlong, control-bearing, or
+    /// secret-like input.
+    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
+        let value = value.into();
+        let value = value.trim();
+        let lower = value.to_ascii_lowercase();
+        if value.is_empty()
+            || value.len() > MAX_QUERY_ERROR_DETAIL_BYTES
+            || value.chars().any(char::is_control)
+            || lower.contains("bearer ")
+            || lower.contains("token=")
+            || lower.contains("password=")
+            || lower.contains("secret=")
+            || lower.contains("-----begin ")
+        {
+            return Err(QueryContractError::InvalidDetail { field: "detail" });
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Borrows the scrubbed detail.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for QueryErrorDetail {
+    /// Deserializes diagnostic text while reapplying redaction invariants.
+    ///
+    /// # Errors
+    /// Returns a deserializer error when the input is not text or contains
+    /// forbidden secret-bearing material.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Stable late-stream error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct QueryTerminalError {
+    /// Closed stable error code.
+    pub code: QueryTerminalErrorCode,
+    /// Optional scrubbed diagnostic.
+    pub detail: Option<QueryErrorDetail>,
+}
+
+/// Terminal frame retaining immutable cut metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct QueryTerminalFrame {
+    /// Stream outcome.
+    pub outcome: QueryTerminalOutcome,
+    /// Admitted-cut freshness.
+    pub freshness: QueryFreshness,
+    /// Rows already emitted in batch frames.
+    pub row_count: u64,
+    /// Closed bounded warnings.
+    pub warnings: Vec<QueryWarning>,
+    /// Exactly one entry for each source present in the cut.
+    pub source_completion: Vec<SourceCompletion>,
+    /// Required only for failed terminals.
+    pub error: Option<QueryTerminalError>,
+}
+
+impl QueryTerminalFrame {
+    /// Validates closed terminal combinations for the selected visibility.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] for invalid cardinality, duplicate or
+    /// missing sources, or inconsistent outcome/freshness/error fields.
+    pub fn validate(&self, visibility: VisibilityMode) -> Result<(), QueryContractError> {
+        if self.warnings.len() > MAX_QUERY_TERMINAL_WARNINGS {
+            return Err(QueryContractError::TooMany {
+                field: "warnings",
+                maximum: MAX_QUERY_TERMINAL_WARNINGS,
+            });
+        }
+        let expected = if visibility == VisibilityMode::Fused {
+            3
+        } else {
+            2
+        };
+        if self.source_completion.len() != expected {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "source completion does not match visibility",
+            });
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if self
+            .source_completion
+            .iter()
+            .any(|entry| !seen.insert(entry.source))
+        {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "source completion contains duplicates",
+            });
+        }
+        for source in [QuerySource::Iceberg, QuerySource::HotSealed] {
+            if !self.source_completion.iter().any(|entry| {
+                entry.source == source && entry.outcome == SourceCompletionOutcome::Complete
+            }) {
+                return Err(QueryContractError::InvalidTerminal {
+                    reason: "sealed sources must be complete",
+                });
+            }
+        }
+        let degraded_live = self.source_completion.iter().any(|entry| {
+            entry.source == QuerySource::LiveTail
+                && entry.outcome == SourceCompletionOutcome::Unavailable
+        });
+        let failed = self.outcome == QueryTerminalOutcome::Failed;
+        if failed != self.error.is_some() {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "error presence must match failed outcome",
+            });
+        }
+        if self.outcome == QueryTerminalOutcome::Success
+            && self.freshness != QueryFreshness::Complete
+        {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "success must be complete",
+            });
+        }
+        if self.outcome == QueryTerminalOutcome::Degraded
+            && (!degraded_live || self.freshness != QueryFreshness::Degraded)
+        {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "degraded requires unavailable live source",
+            });
+        }
+        if degraded_live != (self.freshness == QueryFreshness::Degraded) {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "freshness must match live-tail source completion",
+            });
+        }
+        if self.warnings.contains(&QueryWarning::LiveTailUnavailable) != degraded_live {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "live-tail warning must match unavailable source",
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates the terminal against the rows actually emitted before it.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] when terminal `row_count` does not equal
+    /// the accumulated rows from preceding batch frames.
+    pub fn validate_emitted_rows(&self, emitted_rows: u64) -> Result<(), QueryContractError> {
+        if self.row_count != emitted_rows {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "terminal row count does not match emitted rows",
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod query_terminal_tests {
+    use super::*;
+
+    /// Builds the required closed source set for one visibility mode.
+    fn complete_sources(visibility: VisibilityMode) -> Vec<SourceCompletion> {
+        let mut sources = vec![
+            SourceCompletion {
+                source: QuerySource::Iceberg,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+        ];
+        if visibility == VisibilityMode::Fused {
+            sources.push(SourceCompletion {
+                source: QuerySource::LiveTail,
+                outcome: SourceCompletionOutcome::Complete,
+            });
+        }
+        sources
+    }
+
+    /// Success, degraded, and partial-row failed terminals preserve their cut.
+    #[test]
+    fn closed_terminal_matrix_validates() {
+        let success = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Success,
+            freshness: QueryFreshness::Complete,
+            row_count: 2,
+            warnings: vec![],
+            source_completion: complete_sources(VisibilityMode::PublishedOnly),
+            error: None,
+        };
+        success
+            .validate(VisibilityMode::PublishedOnly)
+            .expect("success terminal validates");
+        success
+            .validate_emitted_rows(2)
+            .expect("success row count validates");
+
+        let mut degraded_sources = complete_sources(VisibilityMode::Fused);
+        degraded_sources[2].outcome = SourceCompletionOutcome::Unavailable;
+        let degraded = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Degraded,
+            freshness: QueryFreshness::Degraded,
+            row_count: 1,
+            warnings: vec![QueryWarning::LiveTailUnavailable],
+            source_completion: degraded_sources.clone(),
+            error: None,
+        };
+        degraded
+            .validate(VisibilityMode::Fused)
+            .expect("degraded terminal validates");
+
+        let failed = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Degraded,
+            row_count: 1,
+            warnings: vec![QueryWarning::LiveTailUnavailable],
+            source_completion: degraded_sources,
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: None,
+            }),
+        };
+        failed
+            .validate(VisibilityMode::Fused)
+            .expect("partial-row failure validates");
+        failed
+            .validate_emitted_rows(1)
+            .expect("partial-row count validates");
+    }
+
+    /// Failed terminals require an error and exact emitted-row count.
+    #[test]
+    fn invalid_failed_terminal_is_rejected() {
+        let failed_without_error = QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Complete,
+            row_count: 3,
+            warnings: vec![],
+            source_completion: complete_sources(VisibilityMode::PublishedOnly),
+            error: None,
+        };
+        assert!(
+            failed_without_error
+                .validate(VisibilityMode::PublishedOnly)
+                .is_err()
+        );
+
+        let failed = QueryTerminalFrame {
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: None,
+            }),
+            ..failed_without_error
+        };
+        assert!(failed.validate_emitted_rows(2).is_err());
+    }
+
+    /// Query requests default to degraded freshness and reject empty/zero input.
+    #[test]
+    fn query_request_defaults_and_validation_are_closed() {
+        let request: BifrostQueryRequest = serde_json::from_value(serde_json::json!({
+            "sql": "SELECT 1",
+            "visibility": "published_only",
+            "deadline_ms": null
+        }))
+        .expect("request deserializes");
+        assert_eq!(request.freshness, FreshnessPolicy::AllowDegraded);
+        request.validate().expect("defaulted request validates");
+
+        let invalid = BifrostQueryRequest {
+            sql: " ".into(),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: Some(0),
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    /// Failed terminals still obey settled freshness and source consistency.
+    #[test]
+    fn failed_terminal_rejects_inconsistent_freshness() {
+        let failed = |freshness, source_completion| QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness,
+            row_count: 0,
+            warnings: vec![],
+            source_completion,
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: None,
+            }),
+        };
+        let degraded_without_live = failed(
+            QueryFreshness::Degraded,
+            complete_sources(VisibilityMode::Fused),
+        );
+        assert!(
+            degraded_without_live
+                .validate(VisibilityMode::Fused)
+                .is_err()
+        );
+
+        let mut unavailable_live = complete_sources(VisibilityMode::Fused);
+        unavailable_live[2].outcome = SourceCompletionOutcome::Unavailable;
+        let complete_with_unavailable_live = failed(QueryFreshness::Complete, unavailable_live);
+        assert!(
+            complete_with_unavailable_live
+                .validate(VisibilityMode::Fused)
+                .is_err()
+        );
+    }
+
+    /// Oracle admission rejects empty and oversized execution-node selections.
+    #[test]
+    fn oracle_admission_selected_nodes_are_bounded() {
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let lease = |selected_node_ids| OracleAdmissionLease {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            data_tenant_id: crate::DataTenantId::new_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            selected_node_ids,
+            leader_node_id: leader,
+            leader_fencing_token: 1,
+            acquired_at: Utc::now(),
+            expires_at: Utc::now() + chrono::Duration::minutes(1),
+        };
+        assert!(lease(vec![]).validate().is_err());
+        assert!(
+            lease((0..65).map(|_| NodeId::new(uuid::Uuid::now_v7())).collect())
+                .validate()
+                .is_err()
+        );
+    }
+}
+
+/// Stable cluster node identifier.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct NodeId(
+    /// Physical cluster node UUID.
+    uuid::Uuid,
+);
+
+impl NodeId {
+    /// Wraps one UUID node identity.
+    #[must_use]
+    pub const fn new(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+    /// Returns the underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+}
+impl From<NodeId> for uuid::Uuid {
+    /// Unwraps the physical node identity for database and wire boundaries.
+    fn from(value: NodeId) -> Self {
+        value.0
+    }
+}
+impl From<uuid::Uuid> for NodeId {
+    /// Wraps a UUID as a typed physical cluster-node identity.
+    fn from(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+/// Monotonic role fencing token.
+pub type FencingToken = u64;
+/// Stable admitted query identifier.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct QueryId(
+    /// Stable admitted-query UUID.
+    uuid::Uuid,
+);
+impl QueryId {
+    /// Wraps one UUID query identity.
+    #[must_use]
+    pub const fn new(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+    /// Returns the underlying UUID.
+    #[must_use]
+    pub const fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+}
+impl From<QueryId> for uuid::Uuid {
+    /// Unwraps the admitted query identity for database and wire boundaries.
+    fn from(value: QueryId) -> Self {
+        value.0
+    }
+}
+impl From<uuid::Uuid> for QueryId {
+    /// Wraps a UUID as a typed admitted-query identity.
+    fn from(value: uuid::Uuid) -> Self {
+        Self(value)
+    }
+}
+
+/// Closed Bifrost runtime roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterRole {
+    /// WAL and live-tail owner.
+    Scribe,
+    /// Query leader and sealed-scan worker.
+    Oracle,
+}
+
+/// Composite membership identity for one node role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ClusterNodeKey {
+    /// Physical node identity.
+    pub node_id: NodeId,
+    /// Independently fenced role.
+    pub role: ClusterRole,
+}
+
+/// Scribe v1 private-tail capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ScribeCapabilitiesV1 {
+    /// Tail protocol version, exactly one in v1.
+    pub tail_protocol_version: u16,
+}
+
+/// Oracle v1 placement and capacity capability.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct OracleCapabilitiesV1 {
+    /// Peer execution protocol version.
+    pub peer_protocol_version: u16,
+    /// Shared storage protocol version.
+    pub storage_protocol_version: u16,
+    /// CPU cores available to Oracle work.
+    pub cpu_cores: f64,
+    /// Memory available to Oracle work.
+    pub memory_budget_bytes: u64,
+    /// CPU represented by one slot.
+    pub cpu_cores_per_slot: f64,
+    /// Memory represented by one slot.
+    pub memory_bytes_per_slot: u64,
+    /// Computed total slot count.
+    pub raw_slots: u32,
+    /// Slots exposed after reservations.
+    pub usable_slots: u32,
+    /// Supported admission classes.
+    pub supported_classes: Vec<QueryClass>,
+    /// Maximum accepted worker fanout.
+    pub max_workers_per_query: u32,
+}
+
+/// Closed tagged role capability document persisted in membership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClusterCapabilities {
+    /// Scribe v1 tail capability.
+    ScribeV1(ScribeCapabilitiesV1),
+    /// Oracle v1 capacity capability.
+    OracleV1(OracleCapabilitiesV1),
+}
+
+impl ClusterCapabilities {
+    /// Validates the role match and all v1 protocol/capacity invariants.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] for mismatched roles, unsupported
+    /// versions, non-finite/zero capacity, or invalid slot/fanout bounds.
+    pub fn validate_for_role(&self, role: ClusterRole) -> Result<(), QueryContractError> {
+        match (role, self) {
+            (ClusterRole::Scribe, Self::ScribeV1(value)) if value.tail_protocol_version == 1 => {
+                Ok(())
+            }
+            (ClusterRole::Oracle, Self::OracleV1(value))
+                if value.peer_protocol_version == 1
+                    && value.storage_protocol_version == 1
+                    && value.cpu_cores.is_finite()
+                    && value.cpu_cores > 0.0
+                    && value.cpu_cores_per_slot.is_finite()
+                    && value.cpu_cores_per_slot > 0.0
+                    && value.memory_budget_bytes > 0
+                    && value.memory_bytes_per_slot > 0
+                    && value.raw_slots > 0
+                    && value.usable_slots > 0
+                    && value.usable_slots <= value.raw_slots
+                    && value.max_workers_per_query <= 63
+                    && !value.supported_classes.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(QueryContractError::InvalidTerminal {
+                reason: "invalid role capability document",
+            }),
+        }
+    }
+}
+
+/// One live role lease projected from cluster membership.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ClusterRoleLease {
+    /// Composite membership identity.
+    pub key: ClusterNodeKey,
+    /// Private service address.
+    pub address: String,
+    /// Current role fence.
+    pub fencing_token: FencingToken,
+    /// Capability schema version.
+    pub capability_version: u16,
+    /// Typed capability document.
+    pub capabilities: ClusterCapabilities,
+    /// Whether the role may receive new work.
+    pub ready: bool,
+    /// Role boot time.
+    pub started_at: DateTime<Utc>,
+    /// Latest fenced heartbeat.
+    pub heartbeat_at: DateTime<Utc>,
+}
+
+/// Durable Oracle admission lease.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct OracleAdmissionLease {
+    /// Query identity.
+    pub query_id: QueryId,
+    /// Authenticated data tenant.
+    pub data_tenant_id: crate::DataTenantId,
+    /// Server-derived class.
+    pub query_class: QueryClass,
+    /// Total demanded slots.
+    pub slot_units: u32,
+    /// Selected execution nodes.
+    pub selected_node_ids: Vec<NodeId>,
+    /// Leader node identity.
+    pub leader_node_id: NodeId,
+    /// Leader role fence.
+    pub leader_fencing_token: FencingToken,
+    /// Admission timestamp.
+    pub acquired_at: DateTime<Utc>,
+    /// Lease expiry.
+    pub expires_at: DateTime<Utc>,
+}
+
+impl OracleAdmissionLease {
+    /// Validates the pure admitted-node and lease bounds before persistence.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] when selected nodes are outside `1..=64`,
+    /// contain duplicates or omit the leader, slot demand is zero, or expiry
+    /// does not follow acquisition.
+    pub fn validate(&self) -> Result<(), QueryContractError> {
+        if self.selected_node_ids.is_empty() || self.selected_node_ids.len() > 64 {
+            return Err(QueryContractError::TooMany {
+                field: "selected_node_ids",
+                maximum: 64,
+            });
+        }
+        let mut nodes = self.selected_node_ids.clone();
+        nodes.sort();
+        nodes.dedup();
+        if nodes.len() != self.selected_node_ids.len()
+            || !nodes.contains(&self.leader_node_id)
+            || self.slot_units == 0
+            || self.acquired_at >= self.expires_at
+        {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "invalid Oracle admission lease",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Canonical admission accounting scope that rejected a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionScope {
+    /// Deployment-wide slot ceiling.
+    Cluster,
+    /// Query-class slot ceiling.
+    Class,
+    /// Tenant and query-class slot ceiling.
+    Tenant,
+}
+
+/// Monotonic Scribe writer boot epoch.
+pub type WriterEpoch = u64;
+/// Monotonic write-ahead-log sequence within one writer epoch.
+pub type WalLsn = u64;
+
+macro_rules! private_uuid_id {
+    ($name:ident, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(
+            Debug,
+            Clone,
+            Copy,
+            PartialEq,
+            Eq,
+            PartialOrd,
+            Ord,
+            Hash,
+            Serialize,
+            Deserialize,
+            schemars::JsonSchema,
+        )]
+        #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+        #[serde(transparent)]
+        pub struct $name(
+            /// Opaque UUID carried by the private control-plane contract.
+            uuid::Uuid,
+        );
+
+        impl $name {
+            /// Wraps one validated UUID identity.
+            #[must_use]
+            pub const fn new(value: uuid::Uuid) -> Self {
+                Self(value)
+            }
+
+            /// Returns the underlying UUID.
+            #[must_use]
+            pub const fn as_uuid(self) -> uuid::Uuid {
+                self.0
+            }
+        }
+    };
+}
+
+private_uuid_id!(TailFenceId, "Opaque identity for one Scribe tail fence.");
+private_uuid_id!(
+    ReservationId,
+    "Opaque identity for one pending Oracle worker reservation."
+);
+
+/// Validated UTC event-day carried by private tail contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct EventDay(
+    /// Canonical validated `YYYY-MM-DD` text.
+    String,
+);
+
+impl EventDay {
+    /// Parses one canonical `YYYY-MM-DD` UTC event day.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] when the value is not a calendar date.
+    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
+        let value = value.into();
+        chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|_| {
+            QueryContractError::InvalidTerminal {
+                reason: "event_day must be YYYY-MM-DD",
+            }
+        })?;
+        Ok(Self(value))
+    }
+
+    /// Borrows the canonical event day.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for EventDay {
+    /// Deserializes an event-day string while enforcing its canonical date form.
+    ///
+    /// # Errors
+    /// Returns a deserializer error when the input is not text or is not a
+    /// calendar date formatted as `YYYY-MM-DD`.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated non-empty schema fingerprint used by private tail contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct SchemaFingerprint(
+    /// Validated bounded fingerprint text.
+    String,
+);
+
+impl SchemaFingerprint {
+    /// Constructs one bounded schema fingerprint.
+    ///
+    /// # Errors
+    /// Returns [`QueryContractError`] when empty or over 1,024 bytes.
+    pub fn new(value: impl Into<String>) -> Result<Self, QueryContractError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > 1_024 {
+            return Err(QueryContractError::InvalidTerminal {
+                reason: "invalid schema fingerprint",
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// Borrows the fingerprint.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaFingerprint {
+    /// Deserializes a schema fingerprint while restoring its size invariants.
+    ///
+    /// # Errors
+    /// Returns a deserializer error when the input is not text, empty, or
+    /// exceeds the contract's maximum fingerprint length.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Exact tenant and table binding for private tail access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TenantTableBinding {
+    /// Authenticated data tenant.
+    pub tenant_id: crate::DataTenantId,
+    /// Non-empty table namespace.
+    pub namespace: String,
+    /// Non-empty table name.
+    pub table: String,
+}
+
+/// Stable position within one Scribe writer stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TailCursor {
+    /// Writer boot epoch.
+    pub writer_epoch: WriterEpoch,
+    /// WAL sequence within the epoch.
+    pub wal_lsn: WalLsn,
+    /// Exact UUID batch identity.
+    pub batch_id: uuid::Uuid,
+    /// Stable row ordinal within the batch.
+    pub row_ordinal: u32,
+}
+
+/// Identity of the fenced stream; cursors intentionally carry no node ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TailStreamIdentity {
+    /// Scribe node identity.
+    pub node_id: NodeId,
+    /// Writer boot epoch.
+    pub writer_epoch: WriterEpoch,
+}
+
+/// Request to acquire one immutable Scribe tail fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct AcquireTailFenceRequest {
+    /// Tenant/table binding.
+    pub binding: TenantTableBinding,
+    /// UTC event-day string.
+    pub event_day: EventDay,
+    /// Exclusive sealed cursor.
+    pub exclusive_sealed: TailCursor,
+    /// Absolute execution deadline.
+    pub deadline: DateTime<Utc>,
+    /// Expected schema fingerprint.
+    pub schema_fingerprint: SchemaFingerprint,
+    /// Required tail protocol version.
+    pub tail_protocol_version: u16,
+}
+
+/// Immutable interval and stream identity returned by Scribe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TailReadFence {
+    /// Fence identity.
+    pub fence_id: TailFenceId,
+    /// Tenant/table binding.
+    pub binding: TenantTableBinding,
+    /// UTC event-day string.
+    pub event_day: EventDay,
+    /// Fenced stream identity.
+    pub stream: TailStreamIdentity,
+    /// Exclusive sealed cursor.
+    pub exclusive_sealed: TailCursor,
+    /// Inclusive live cursor.
+    pub inclusive_live: TailCursor,
+    /// Exact schema fingerprint.
+    pub schema_fingerprint: SchemaFingerprint,
+    /// Tail protocol version.
+    pub tail_protocol_version: u16,
+    /// Fence expiry.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Request for one bounded page inside a tail fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TailPageRequest {
+    /// Fence identity.
+    pub fence_id: TailFenceId,
+    /// Cursor after which reading resumes.
+    pub after: Option<TailCursor>,
+    /// Maximum returned rows.
+    pub max_rows: u32,
+    /// Maximum encoded response bytes.
+    pub max_encoded_bytes: u32,
+}
+
+/// One transport-owned Arrow IPC batch in a tail page.
+pub type TailBatch = Vec<u8>;
+
+/// One bounded page from an immutable tail fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct TailPage {
+    /// Owned Arrow IPC batches.
+    pub batches: Vec<TailBatch>,
+    /// Last included cursor when more data may follow.
+    pub next: Option<TailCursor>,
+    /// Whether the fence interval is exhausted.
+    pub complete: bool,
+}
+
+/// Idempotent request to release one tail fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReleaseTailFenceRequest {
+    /// Fence identity.
+    pub fence_id: TailFenceId,
+}
+
+/// Fenced request to reserve worker slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReserveNodeSlotsRequest {
+    /// Query identity.
+    pub query_id: QueryId,
+    /// Leader node identity.
+    pub leader_node_id: NodeId,
+    /// Leader Oracle-role fence.
+    pub leader_fencing_token: FencingToken,
+    /// Required admission class.
+    pub query_class: QueryClass,
+    /// Requested worker slots.
+    pub slot_units: u32,
+    /// Reservation expiry.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Accepted pending worker reservation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct PendingNodeReservation {
+    /// Reservation identity.
+    pub reservation_id: ReservationId,
+    /// Reservation expiry.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Capacity rejection with bounded caller backoff.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReservationRejected {
+    /// Retry delay in milliseconds.
+    pub retry_after_ms: u32,
+}
+
+/// Closed reservation outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum ReserveNodeSlotsResponse {
+    /// Slots are pending ticket-bound execution.
+    Pending(PendingNodeReservation),
+    /// Node lacked capacity.
+    Rejected(ReservationRejected),
+}
+
+/// Idempotent fenced reservation-release request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ReleaseNodeSlotsRequest {
+    /// Reservation identity.
+    pub reservation_id: ReservationId,
+    /// Query identity.
+    pub query_id: QueryId,
+    /// Leader node identity.
+    pub leader_node_id: NodeId,
+    /// Leader Oracle-role fence.
+    pub leader_fencing_token: FencingToken,
+}
+
+/// Signed opaque peer ticket verified before claims decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct SignedPeerTicket {
+    /// ASCII signing-key identifier, at most 64 bytes.
+    pub key_id: String,
+    /// Opaque signed claims, at most 16 KiB.
+    pub claims_bytes: Vec<u8>,
+    /// Exact 64-byte signature.
+    pub signature: Vec<u8>,
+}
+
+/// Ticket-bound worker fragment execution request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct ExecuteFragmentRequest {
+    /// Opaque signed ticket.
+    pub ticket: SignedPeerTicket,
+    /// Runtime-bounded fragment bytes.
+    pub fragment_bytes: Vec<u8>,
+    /// Pending reservation identity.
+    pub reservation_id: ReservationId,
+}
+
+/// Verified worker footer for one completed attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub struct WorkerFooter {
+    /// Fragment identity.
+    pub fragment_id: String,
+    /// Manifest digest.
+    pub manifest_digest: QueryAuditDigest,
+    /// Emitted row count.
+    pub row_count: u64,
+    /// Emitted encoded bytes.
+    pub encoded_bytes: u64,
+    /// Payload digest.
+    pub payload_digest: QueryAuditDigest,
+    /// Required completion marker.
+    pub completed: bool,
+}
+
+/// Closed worker-attempt stream frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+pub enum WorkerAttemptFrame {
+    /// Arrow IPC schema bytes.
+    Schema(Vec<u8>),
+    /// Arrow IPC record-batch bytes.
+    Batch(Vec<u8>),
+    /// Required terminal worker footer.
+    Footer(WorkerFooter),
+}
+
 /// Asynchronous SQL query submission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -1581,5 +2822,19 @@ mod bifrost_wire_tests {
         let _ = schema_for!(AsyncQueryStatus);
         let _ = schema_for!(QueryParam);
         let _ = schema_for!(JobUid);
+    }
+
+    /// Private tail and peer DTOs remain schema-generatable pure contracts.
+    #[test]
+    fn private_query_schema_types_do_not_panic() {
+        let _ = schema_for!(super::AcquireTailFenceRequest);
+        let _ = schema_for!(super::TailReadFence);
+        let _ = schema_for!(super::TailPageRequest);
+        let _ = schema_for!(super::TailPage);
+        let _ = schema_for!(super::ReserveNodeSlotsRequest);
+        let _ = schema_for!(super::ReserveNodeSlotsResponse);
+        let _ = schema_for!(super::ReleaseNodeSlotsRequest);
+        let _ = schema_for!(super::ExecuteFragmentRequest);
+        let _ = schema_for!(super::WorkerAttemptFrame);
     }
 }

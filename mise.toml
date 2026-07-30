@@ -130,8 +130,8 @@ description = "Run shared family tests (unit tests only — pg_tests skipped wit
 run = "bash scripts/run-family-tests.sh shared"
 
 [tasks."test:bifrost"]
-description = "Run the current Bifrost Oracle/catalog unit tests"
-run = "cargo test --locked -p vala-bifrost"
+description = "Run Redux Bifrost default-feature tests"
+run = "cargo test --locked -p vala-bifrost-redux"
 
 [tasks."test:vala:integration"]
 hide = true

@@ -131,7 +131,95 @@
       "description": "Structured detail for one auditable operation.",
       "oneOf": [
         {
-          "description": "A Forge compaction operation and its external Iceberg boundary.",
+          "description": "A live Iceberg file replacement and its recoverable external boundary.\n\nThe ordered paths are the exact current-snapshot inputs and the exact rewrite outputs. `base_snapshot_id` is the plan fence, never an input file's addition snapshot.",
+          "type": "object",
+          "required": [
+            "base_snapshot_id",
+            "group",
+            "input_paths",
+            "kind",
+            "operation_id",
+            "output_paths",
+            "partition_day",
+            "partition_spec_id",
+            "phase",
+            "target_file_size_bytes",
+            "writer_recipe_version"
+          ],
+          "properties": {
+            "base_snapshot_id": {
+              "description": "Snapshot observed by the table plan before discovery.",
+              "type": "integer",
+              "format": "int64"
+            },
+            "committed_snapshot_id": {
+              "description": "Snapshot returned after a proven replacement commit.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            },
+            "group": {
+              "description": "Canonical tenant/table resource identity.",
+              "type": "string"
+            },
+            "input_paths": {
+              "description": "Exact ordered catalog paths deleted by the Iceberg action.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "forge_iceberg_rewrite"
+              ]
+            },
+            "operation_id": {
+              "description": "Stable identity shared by output names, Iceberg, and audit rows.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "output_paths": {
+              "description": "Exact ordered rewritten object paths added by the Iceberg action.",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "partition_day": {
+              "description": "Shared day partition for every exact input.",
+              "type": "string"
+            },
+            "partition_spec_id": {
+              "description": "Destination partition specification identity.",
+              "type": "integer",
+              "format": "int32"
+            },
+            "phase": {
+              "description": "Durable lifecycle transition represented by this row.",
+              "allOf": [
+                {
+                  "$ref": "#/definitions/ForgeIcebergRewritePhase"
+                }
+              ]
+            },
+            "target_file_size_bytes": {
+              "description": "Target output size captured from the table metadata.",
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0.0
+            },
+            "writer_recipe_version": {
+              "description": "Physical recipe used to produce the outputs.",
+              "type": "string"
+            }
+          }
+        },
+        {
+          "description": "A Forge compaction operation and its external Iceberg boundary.\n\nThe ordered `output_paths` list is the sole greenfield output shape; prepared and terminal audit rows preserve writer-rotation order and do not expose a scalar compatibility form.",
           "type": "object",
           "required": [
             "group",
@@ -175,7 +263,7 @@
               "format": "uuid"
             },
             "output_paths": {
-              "description": "Deterministic compacted output paths in writer-rotation order.",
+              "description": "Deterministic compacted output paths in writer-rotation order.\n\nThis ordered collection is the only output representation for greenfield Forge audit rows, shared by prepared and terminal phases without a scalar compatibility field.",
               "type": "array",
               "items": {
                 "type": "string"
@@ -1063,6 +1151,39 @@
         },
         {
           "description": "Reconciliation made the exact inputs visible again after expiry.",
+          "type": "string",
+          "enum": [
+            "reset"
+          ]
+        }
+      ]
+    },
+    "ForgeIcebergRewritePhase": {
+      "description": "Durable phase recorded for a live Iceberg replacement operation.",
+      "oneOf": [
+        {
+          "description": "Rewritten outputs were persisted before the external catalog commit.",
+          "type": "string",
+          "enum": [
+            "prepared"
+          ]
+        },
+        {
+          "description": "The exact Iceberg replacement commit completed.",
+          "type": "string",
+          "enum": [
+            "committed"
+          ]
+        },
+        {
+          "description": "Reconciliation proved a previously uncertain commit completed.",
+          "type": "string",
+          "enum": [
+            "recovered"
+          ]
+        },
+        {
+          "description": "Reconciliation proved the prepared operation was not committed.",
           "type": "string",
           "enum": [
             "reset"

@@ -94,11 +94,66 @@ pub struct CommitUncertaintyCatalog {
     reject_after_commit: AtomicBool,
     commit_ready: tokio::sync::Notify,
     commit_release: tokio::sync::Notify,
+    after_commit_dropped: AtomicBool,
+    after_commit_drop_ready: tokio::sync::Notify,
     pause_before_commit: AtomicBool,
     before_commit_reached: AtomicBool,
     reject_before_commit: AtomicBool,
     before_commit_ready: tokio::sync::Notify,
     before_commit_release: tokio::sync::Notify,
+    before_commit_dropped: AtomicBool,
+    before_commit_drop_ready: tokio::sync::Notify,
+}
+
+/// Acknowledges that cancellation dropped a paused catalog call.
+///
+/// The guard remains armed only while `update_table` awaits the fixture's
+/// release notification. Normal fixture release disarms it before returning to
+/// the wrapped catalog; cancellation drops it and wakes the test that must
+/// prove the cancellation branch won.
+struct PausedCatalogCallDropAck<'a> {
+    /// Atomic state that makes an acknowledgement observable before a waiter registers.
+    dropped: &'a AtomicBool,
+    /// Wakeup for waiters that are already suspended when cancellation drops the call.
+    ready: &'a tokio::sync::Notify,
+    /// Whether dropping this guard must publish cancellation acknowledgement.
+    armed: bool,
+}
+
+impl<'a> PausedCatalogCallDropAck<'a> {
+    /// Arm acknowledgement for one paused catalog call.
+    fn new(dropped: &'a AtomicBool, ready: &'a tokio::sync::Notify) -> Self {
+        Self {
+            dropped,
+            ready,
+            armed: true,
+        }
+    }
+
+    /// Disarm acknowledgement after the fixture deliberately releases the call.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PausedCatalogCallDropAck<'_> {
+    /// Publish cancellation acknowledgement only while the catalog call is paused.
+    fn drop(&mut self) {
+        if self.armed {
+            self.dropped.store(true, Ordering::Release);
+            self.ready.notify_waiters();
+        }
+    }
+}
+
+/// Wait until a paused catalog call records that cancellation dropped it.
+///
+/// The atomic check precedes each notification wait so callers cannot miss an
+/// acknowledgement that was published before they registered.
+async fn wait_for_paused_catalog_call_drop(dropped: &AtomicBool, ready: &tokio::sync::Notify) {
+    while !dropped.load(Ordering::Acquire) {
+        ready.notified().await;
+    }
 }
 
 impl CommitUncertaintyCatalog {
@@ -114,11 +169,15 @@ impl CommitUncertaintyCatalog {
             reject_after_commit: AtomicBool::new(false),
             commit_ready: tokio::sync::Notify::new(),
             commit_release: tokio::sync::Notify::new(),
+            after_commit_dropped: AtomicBool::new(false),
+            after_commit_drop_ready: tokio::sync::Notify::new(),
             pause_before_commit: AtomicBool::new(false),
             before_commit_reached: AtomicBool::new(false),
             reject_before_commit: AtomicBool::new(false),
             before_commit_ready: tokio::sync::Notify::new(),
             before_commit_release: tokio::sync::Notify::new(),
+            before_commit_dropped: AtomicBool::new(false),
+            before_commit_drop_ready: tokio::sync::Notify::new(),
         })
     }
 
@@ -131,6 +190,7 @@ impl CommitUncertaintyCatalog {
     pub fn pause_after_commit(&self) {
         self.commit_reached.store(false, Ordering::Release);
         self.reject_after_commit.store(false, Ordering::Release);
+        self.after_commit_dropped.store(false, Ordering::Release);
         self.pause_after_commit.store(true, Ordering::Release);
     }
 
@@ -140,6 +200,18 @@ impl CommitUncertaintyCatalog {
         while !self.commit_reached.load(Ordering::Acquire) {
             self.commit_ready.notified().await;
         }
+    }
+
+    /// Wait until cancellation drops the paused post-acceptance catalog call.
+    ///
+    /// The caller supplies its own timeout so the surrounding integration test
+    /// controls the complete scheduler-bound assertion.
+    pub async fn wait_for_after_commit_drop(&self) {
+        wait_for_paused_catalog_call_drop(
+            &self.after_commit_dropped,
+            &self.after_commit_drop_ready,
+        )
+        .await;
     }
 
     /// Mark the paused caller stale and let it observe the injected response.
@@ -152,6 +224,7 @@ impl CommitUncertaintyCatalog {
     pub fn pause_before_commit(&self) {
         self.before_commit_reached.store(false, Ordering::Release);
         self.reject_before_commit.store(false, Ordering::Release);
+        self.before_commit_dropped.store(false, Ordering::Release);
         self.pause_before_commit.store(true, Ordering::Release);
     }
 
@@ -160,6 +233,18 @@ impl CommitUncertaintyCatalog {
         while !self.before_commit_reached.load(Ordering::Acquire) {
             self.before_commit_ready.notified().await;
         }
+    }
+
+    /// Wait until cancellation drops the paused pre-acceptance catalog call.
+    ///
+    /// The caller supplies its own timeout so the surrounding integration test
+    /// controls the complete scheduler-bound assertion.
+    pub async fn wait_for_before_commit_drop(&self) {
+        wait_for_paused_catalog_call_drop(
+            &self.before_commit_dropped,
+            &self.before_commit_drop_ready,
+        )
+        .await;
     }
 
     /// Reject the paused commit as stale and resume the caller.
@@ -255,9 +340,14 @@ impl Catalog for CommitUncertaintyCatalog {
             .with_retryable(true));
         }
         if self.pause_before_commit.swap(false, Ordering::AcqRel) {
+            let mut drop_ack = PausedCatalogCallDropAck::new(
+                &self.before_commit_dropped,
+                &self.before_commit_drop_ready,
+            );
             self.before_commit_reached.store(true, Ordering::Release);
             self.before_commit_ready.notify_waiters();
             self.before_commit_release.notified().await;
+            drop_ack.disarm();
             if self.reject_before_commit.load(Ordering::Acquire) {
                 return Err(IcebergError::new(
                     IcebergErrorKind::Unexpected,
@@ -268,9 +358,14 @@ impl Catalog for CommitUncertaintyCatalog {
         }
         let table = self.inner.update_table(commit).await?;
         if self.pause_after_commit.swap(false, Ordering::AcqRel) {
+            let mut drop_ack = PausedCatalogCallDropAck::new(
+                &self.after_commit_dropped,
+                &self.after_commit_drop_ready,
+            );
             self.commit_reached.store(true, Ordering::Release);
             self.commit_ready.notify_waiters();
             self.commit_release.notified().await;
+            drop_ack.disarm();
             if self.reject_after_commit.load(Ordering::Acquire) {
                 return Err(IcebergError::new(
                     IcebergErrorKind::Unexpected,
@@ -288,6 +383,42 @@ impl Catalog for CommitUncertaintyCatalog {
             .with_retryable(true));
         }
         Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{
+        AtomicBool, Ordering, PausedCatalogCallDropAck, wait_for_paused_catalog_call_drop,
+    };
+
+    /// Dropping an armed paused-call guard publishes an acknowledgement even before waiting starts.
+    #[tokio::test]
+    async fn paused_catalog_call_drop_acknowledges_without_a_lost_notification() {
+        let dropped = AtomicBool::new(false);
+        let ready = tokio::sync::Notify::new();
+        drop(PausedCatalogCallDropAck::new(&dropped, &ready));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_paused_catalog_call_drop(&dropped, &ready),
+        )
+        .await
+        .expect("drop acknowledgement must remain observable");
+    }
+
+    /// Normal fixture release disarms the paused-call guard without publishing cancellation.
+    #[test]
+    fn paused_catalog_call_normal_release_disarms_drop_acknowledgement() {
+        let dropped = AtomicBool::new(false);
+        let ready = tokio::sync::Notify::new();
+        let mut acknowledgement = PausedCatalogCallDropAck::new(&dropped, &ready);
+        acknowledgement.disarm();
+        drop(acknowledgement);
+
+        assert!(!dropped.load(Ordering::Acquire));
     }
 }
 

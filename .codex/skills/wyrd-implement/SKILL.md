@@ -1,297 +1,202 @@
 ---
 name: wyrd-implement
-description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task through verified completion or a genuine escalation blocker in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Do not use to plan, decompose, or close an entire implementation plan; use wyrd-implement-plan instead. Do not use for Svelte UI work; use wyrd-ui instead.
+description: Execute or resume exactly one active, decision-complete non-UI Wyrd implementation task through verified completion or a genuine material-authority blocker in Rust, Python, TypeScript, PyO3, contracts, SDKs, server, CLI, MCP, registry, storage, Skald, Vala/Bifrost, codegen, or cross-language tests. Use when a current user instruction or approved task assigns one bounded change. Persist through compile, lint, test, fixture, command, and repository-managed local-environment failures. Do not use to plan, decompose, close an entire implementation plan, or implement Svelte UI work.
 ---
 
 # Wyrd Implement
 
-Implement exactly one approved task as written. Optimize for faithful
-execution, the smallest reviewable diff, repository consistency, objective
-verification, and clear escalation. Do not act as a secondary planner.
-Every execution rule below is mandatory; do not trade it for speed,
-convenience, or agent autonomy.
+Execute exactly one approved task through `COMPLETE` or a genuine material
+`BLOCKED` condition. Own reversible implementation mechanics. Do not redesign
+requirements or material boundaries.
 
-Execution is an autonomous completion loop, not a partial-work handoff. Keep
-working until the task is verified `COMPLETE` or an escalation condition makes
-correct completion `BLOCKED`.
+Use one fixed loop:
 
-## Enforce the task boundary
+```text
+orient -> localize -> implement -> validate -> refine
+             ^                                  |
+             +----------------------------------+
+```
 
-Treat the current user instruction or named task file as the single active
-task. Do not implement later tasks, adjacent milestones, or whole-plan
-closeout. Do not alter the task or plan to match the implementation.
+Test, compiler, formatter, Clippy, rustdoc, command, fixture, and local
+environment failures are refinement inputs. They are not terminal conditions
+by themselves.
 
-Use this authority order when instructions conflict:
-
-1. current user instructions;
-2. active task;
-3. approved plan;
-4. applicable `AGENTS.md` files;
-5. repository architecture and conventions;
-6. local implementation preferences.
-
-The task's behavior, acceptance criteria, non-goals, prohibited changes,
-interfaces, feature requirements, verification, and escalation conditions are
-authoritative.
-
-An approved task may intentionally improve Wyrd design. When it explicitly
-replaces a decision, name the superseded decision and update
-`architecture/wyrd-design.md` before or with the implementation. Update
-`architecture/wyrd-doctrine.mdx` when the principle changes. Otherwise follow
-current design over implementation drift. Stop when the conflict is implicit,
-ambiguous, unsafe, or outside the approved task.
-
-## Load complete instructions
+## Load the task and repository
 
 Before editing:
 
-1. Read the active task to EOF. Never rely on a partial excerpt or
-   conversational summary. Prove the read reached the file's final line. When
-   tool output is truncated, paginated, or line-bounded, determine the total
-   line count and continue from the last returned line until EOF. Never infer
-   that a section is absent from an incomplete read.
-2. When the task was produced by `$wyrd-plan`, read
-   `.codex/skills/wyrd-plan/references/task-packet-format.md` to EOF and
-   run `.codex/skills/wyrd-plan/scripts/validate_plan_artifacts.py` against the
-   task's parent plan directory. Every required heading must exist in order; an
-   inapplicable section must use
-   `Not applicable: <one-sentence reason>`. Stop before source inspection when
-   validation fails or the packet is not marked `Ready`. A successful validator
-   result is authoritative for structural heading presence, order, and
-   non-empty sections. Do not report a structural omission after validation
-   passes. If a manual read appears to disagree, rerun the validator and an
-   exact level-two-heading scan against the same resolved task path, then read
-   the missing range through EOF; block on structure only when the validator
-   reports an error.
-3. Read the referenced plan sections and all applicable `AGENTS.md` files to
-   EOF.
-4. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md` to EOF.
-5. Read `architecture/wyrd-doctrine.mdx` to EOF before changing contracts,
-   APIs, SDKs, CLI, MCP, docs, generated schemas, or behavior.
-6. Read
-   `architecture/references/languages/implementation-execution.md` to EOF; it
-   is the mandatory detailed execution contract for every task.
-7. Extract every standardized task field: metadata, objective, context,
-   required changes, non-goals, allowed and prohibited scope, target paths and
-   symbols, required types and interfaces, implementation guidance, control
-   flow, failure cases, acceptance criteria, required tests and features,
-   focused verification, excluded commands, escalation conditions, and
-   completion evidence.
-8. Inspect Git status and preserve unrelated user changes.
-9. Inspect `mise.toml`, manifests, `pyproject.toml`, and lockfiles before
-   relying on commands, dependencies, or feature behavior.
+1. Read the active task, referenced approved-plan context, and applicable
+   `AGENTS.md` files completely.
+2. For a standardized Wyrd task, read
+   `.codex/skills/wyrd-plan/references/task-packet-format.md` and validate its
+   parent plan directory. The task must be `Ready`.
+3. Read `architecture/agent-rules.md` and `architecture/wyrd-design.md`. Read
+   `architecture/wyrd-doctrine.mdx` before changing Wyrd contracts, APIs,
+   SDKs, CLI, MCP, docs, generated artifacts, or behavior.
+4. Read
+   `architecture/references/languages/implementation-execution.md`; it defines
+   material boundaries, verification equivalence, local-environment recovery,
+   living-task updates, test integrity, and completion evidence.
+5. Read `architecture/references/README.md`, then load only the other
+   architecture references required by the affected surface using the routing
+   table below. Read every selected reference completely and state the
+   decision it governs before editing.
+6. Inspect Git status and preserve unrelated user changes.
+7. Inspect `mise.toml`, manifests, package configuration, and lockfiles before
+   relying on commands, features, dependencies, or environment.
+8. When `.codegraph/` exists, use CodeGraph before grep, find, or manual source
+   discovery.
 
-Load only applicable architecture references, but read every selected file to
-EOF and report the reference plus the decision it governs before editing:
+Build a checklist from required changes, acceptance criteria, required tests,
+focused commands, and completion evidence. Continue until every item is
+checked or a material boundary prevents it.
+
+### Architecture reference routing
 
 | Reference | Load when the task touches |
 |---|---|
-| `architecture/references/languages/implementation-execution.md` | every task; mandatory contract, escalation, verification, diff audit, completion report |
-| `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, deleted concepts |
-| `architecture/references/doctrine/architecture-constraints.md` | tier boundaries, deployment, observation identity |
-| `architecture/references/architecture/patterns.md` | crate placement and server/client/storage/provider/audit patterns |
-| `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, idioms |
-| `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, registration |
-| `architecture/references/languages/errors.md` | stable errors and boundary mappings |
-| `architecture/references/languages/python-api-and-stubs.md` | Python exports, stubs, package layout, tests |
-| `architecture/references/languages/testing-workflows.md` | test tiers, verification levels, boundary checks |
-| `architecture/references/languages/agent-harness.md` | MCP and agent-facing contracts |
+| `architecture/references/languages/implementation-execution.md` | Every task: authority boundaries, verification recovery, test integrity, diff audit, and completion evidence |
+| `architecture/references/doctrine/positioning-and-vocabulary.md` | Card vocabulary, `CardRef`, v1 kinds, or removed concepts |
+| `architecture/references/doctrine/architecture-constraints.md` | Tier boundaries, deployment, or observation identity |
+| `architecture/references/architecture/patterns.md` | Crate placement and server/client/storage/provider/audit patterns |
+| `architecture/references/languages/rust-core.md` | Rust ownership, traits, async, allocation, and idioms |
+| `architecture/references/languages/pyo3-boundaries.md` | PyO3 classes, GIL, lifetimes, conversions, and registration |
+| `architecture/references/languages/errors.md` | Stable errors and boundary mappings |
+| `architecture/references/languages/python-api-and-stubs.md` | Python exports, stubs, package layout, and tests |
+| `architecture/references/languages/testing-workflows.md` | Test tiers, verification levels, and boundary checks |
+| `architecture/references/languages/agent-harness.md` | MCP and other agent-facing contracts |
 | `architecture/references/languages/typescript-guide.md` | `@wyrd/sdk` and napi conventions |
-| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, object storage |
+| `architecture/references/domain/iceberg-bifrost.md` | Bifrost, Iceberg, DataFusion, and object storage |
 
-## Inspect focused repository reality
+When an approved task explicitly supersedes a Wyrd design decision, update the
+named design authority with the implementation and update doctrine when the
+principle changes. Otherwise follow current design and classify an implicit
+conflict as material.
 
-When `.codegraph/` exists, use `codegraph_explore` before grep, find, or manual
-file-reading loops. Inspect only the affected implementation:
+## Enforce the material boundary
 
-- locate current code paths, callers, and tests;
-- confirm named files, crates, types, and commands exist;
-- confirm required interfaces or types do not already exist;
-- identify naming, ownership, and structural precedents;
-- inspect default and optional Cargo features;
-- inspect what every proposed `mise` task executes;
-- identify contradictions between the task and current source.
+Classify every mismatch before deciding whether to continue:
 
-Do not turn task inspection into a repository-wide architecture review.
+| Class | Examples | Authority |
+|---|---|---|
+| Local and reversible | Private helpers, rustdoc, formatting, diff-caused Clippy, mechanical callers, existing fixtures | Implement, fix, and rerun |
+| Bounded correction | Equivalent command/filter, current private symbol, adjacent fixture inside the owner, repository-managed local environment, small touched-file lint | Proceed, record in the task, and continue |
+| Material | Public/wire/persisted contract, migration or destructive behavior, dependency or Cargo feature, auth/tenancy/policy/audit semantics, ownership redesign, changed acceptance outcome | Stop before the change and request authority |
 
-Before editing Rust, report the owning concrete struct, enum, or newtype; its
-state, dependencies, identity, and invariants; its public methods and private
-workflow stages; justified pure free functions; sync and earned async
-boundaries; rustdoc coverage for every touched item; and the nearest
-struct-centered Wyrd precedent. Do not edit Rust until this gate is complete.
+Expected paths and private symbol names are not a strict whitelist. Add an
+adjacent private implementation or test-support file inside the established
+owner when it is the smallest way to satisfy acceptance. Do not cross a
+prohibited material boundary.
 
-## Validate executability
+Exact verification commands are recipes unless the task explicitly makes the
+exact lane, feature set, or environment normative. A defective recipe may be
+replaced with equivalent non-weaker proof.
 
-Proceed only when the behavior is clear, the architectural owner exists, the
-contracts fit the approved design, dependencies and features are available,
-and acceptance criteria fit the allowed scope.
+## Execute the loop
 
-For a standardized `$wyrd-plan` task, report a concise pre-edit contract check:
+### Orient
 
-- schema: valid or invalid;
-- task status and dependency readiness;
-- objective and mapped requirement/decision IDs;
-- allowed and prohibited write scope;
-- target owners, symbols, required interfaces, and normative pseudocode;
-- acceptance criteria, required tests/features, focused commands, and excluded
-  commands;
-- escalation conditions and completion evidence.
+- Confirm objective, requirements, non-goals, allowed and prohibited scope,
+  material contracts, acceptance criteria, tests, features, and commands.
+- Reconstruct prior progress from the task, current diff, and verification
+  evidence after any interruption or context compaction.
 
-Derive `schema: valid or invalid` from the canonical validator result, not from
-an independent reinterpretation of a partial task read. A structurally valid
-packet may still be substantively ambiguous or inconsistent; report that
-specific executability blocker without relabeling the schema invalid.
+### Localize
 
-Do not repair, reinterpret, or silently complete a malformed task. Return it to
-planning.
+- Locate current owners, callers, consumers, dispatch, fixtures, and tests.
+- Prefer current repository reality over stale private paths or helper names.
+- Reuse existing owners, abstractions, errors, fixtures, and support exports.
 
-Stop before editing and report a blocker when:
+Before editing Rust, identify the owning concrete struct or domain type,
+earned async boundaries, nearest structural precedent, and rustdoc obligations
+for every touched item.
 
-- a required owner, type, command, or feature is missing and adding it changes
-  architecture or task scope;
-- a public contract, migration, security boundary, test, or acceptance
-  criterion conflicts with the task;
-- a new or modified dependency or undocumented feature is required;
-- prohibited files must change;
-- focused verification must expand materially;
-- later tasks must change to complete this task;
-- repository behavior materially contradicts an approved decision.
+### Implement
 
-Do not silently reinterpret the task. Follow the full deviation protocol in
-`architecture/references/languages/implementation-execution.md`; stop before
-implementation and wait for replanning or explicit approval. Do not escalate
-minor local choices that preserve semantics and established patterns.
+- Make the smallest cohesive in-scope change for the task at hand.
+- Preserve normative behavior, operation order, transactions, concurrency,
+  cancellation, side effects, error mapping, and invariants.
+- Follow `AGENTS.md`; do not duplicate its language, ownership, or test rules
+  here.
+- Write required tests with the implementation.
+- Do not implement later tasks, speculative cleanup, new architecture, or
+  unapproved material changes.
 
-## Execute until a terminal outcome
+### Validate
 
-Build a live checklist from the active task's required changes, acceptance
-criteria, required tests, focused commands, and completion evidence. Derive
-the checklist only from approved scope. Do not invent remaining work from
-later tasks, non-goals, or adjacent milestones.
+Run focused verification sequentially over the smallest complete affected
+surface. Inspect `mise` tasks before using them. Prefer the repository task
+that owns setup; use direct Cargo only for a narrow pure test or exact focused
+filter that needs no missing repository setup.
 
-Run this loop autonomously:
+### Refine
 
-```text
-inspect -> implement -> test -> diagnose -> fix -> verify -> diff audit
-   ^                                                          |
-   +---------- while approved actionable work remains --------+
-```
+Route every failure:
 
-After every edit or command result, update the checklist and perform the next
-action that advances an unchecked item. Continue through implementation,
-tests, failure diagnosis, repairs, reruns, and final audit without waiting for
-another user prompt.
+1. **Caused by the diff:** diagnose, fix, and rerun.
+2. **Small defect in touched code:** fix and report as incidental.
+3. **Defective command, filter, feature, or lane:** derive equivalent
+   non-weaker proof, update the task evidence, and rerun.
+4. **Missing private plumbing or fixture:** add the smallest adjacent support
+   inside the established owner and continue.
+5. **Missing repository-managed local setup:** inspect `mise.toml` and setup
+   scripts, start services, run migrations, use checked-in local test values,
+   and rerun.
+6. **Proven unrelated baseline failure:** record the proof and continue every
+   unaffected implementation and verification item. Fix if instructed.
+7. **Material change required:** stop before it and return `BLOCKED` with
+   repository evidence and the authority needed.
+8. **Uncertain classification:** gather more source and command evidence; do
+   not stop merely because diagnosis is incomplete.
 
-Classify failures instead of treating them as handoff points:
+Do not create a remediation plan for classes 1–6.
 
-1. If the implementation caused the failure, fix it and rerun the affected
-   check.
-2. If the command, filter, feature selection, or test lane was wrong, correct
-   it to the task-prescribed invocation and rerun it.
-3. If a failure is proven unrelated and does not prevent required proof,
-   record it under risks and continue every remaining task check.
-4. If a proven external or pre-existing condition prevents required proof and
-   no approved alternative can establish it, report `BLOCKED` with the command,
-   evidence, and authority needed to resume.
+## Recover repository-managed test environments
 
-Remaining in-scope work, elapsed time, task difficulty, context length,
-context compaction, a convenient handoff point, partial implementation, tests
-not yet written, or a recoverable tool failure are never terminal conditions.
-After compaction or a recoverable interruption, reconstruct the checklist from
-the complete task, current diff, and verification evidence, then resume from
-the first unchecked item. A progress or status update is an interim
-checkpoint; provide it and continue unless the user explicitly stops or
-changes the task.
+Missing local test variables or services are mechanical when the repository
+defines them.
 
-The only voluntary terminal states are:
+1. Inspect the relevant `mise` task, its `depends`, `env`, and invoked scripts.
+2. Run canonical setup and migration tasks.
+3. Invoke the owning `mise` task, or apply its checked-in local-only test
+   values to an equivalent focused command.
+4. Retry the intended test.
 
-- `COMPLETE`: every approved checklist item and acceptance criterion is
-  satisfied and verified.
-- `BLOCKED`: a documented escalation condition or unavailable required
-  authority prevents correct completion.
+Never invent, print, or persist production credentials. A genuinely
+unavailable external credential or protected service may block its mandatory
+proof only after all remaining work and verification complete.
 
-Never voluntarily return partial work as `INCOMPLETE`. If no escalation
-condition applies, continue the loop.
+## Update the living task
 
-## Implement the required design
+Record bounded corrections in the active task:
 
-Treat behavioral semantics as normative. Treat pseudocode according to its
-declared status:
+- corrected repository facts, private paths, or symbol names;
+- existing or added private fixtures and support files;
+- equivalent commands and why their proof is not weaker;
+- progress, diagnoses, and verification evidence.
 
-- preserve normative semantics;
-- adapt exact names only when the task permits repository alignment;
-- adapt illustrative structure without changing behavior;
-- never change a public interface without explicit permission.
+Do not edit requirements, public or persisted contracts, security semantics,
+material architecture, data-loss behavior, or acceptance outcomes. A required
+change to those fields is `BLOCKED`, not a task rewrite.
 
-Preserve operation order, validation boundaries, transactions, concurrency,
-cancellation, side-effect order, error mapping, and data invariants.
+## Protect test integrity
 
-Prefer existing owners, abstractions, helpers, errors, fixtures, dependencies,
-and repository patterns. Do not add architectural layers, generic frameworks,
-broad abstractions, feature flags, dependencies, helpers, extension points, or
-refactors not required by acceptance criteria.
+Never pass a gate by weakening assertions, adding sleeps for synchronization,
+ignoring tests, adding unjustified lint allowances, mocking away required
+behavior, swallowing errors, or changing production semantics to satisfy an
+incorrect test. Fix the cause or identify a material conflict.
 
-Map every changed file to a task requirement or necessary verification support.
-Do not reformat, rename, upgrade, clean up, or modify tests outside that map.
-Never hand-edit generated artifacts; change the source or generator and
-regenerate.
+## Finish only at a terminal outcome
 
-Keep Wyrd ownership aligned with `AGENTS.md`:
+Elapsed time, difficulty, partial progress, context length, recoverable tool
+failure, missing local setup, an invalid command, or remaining in-scope work
+are not terminal.
 
-- `wyrd-spec` owns pure contracts and remains IO-, async-, SQL-, and PyO3-free;
-- `crates/shared/*` owns reusable client, runtime, auth, telemetry, registry,
-  and testing foundations;
-- Skald owns provider and reusable agent runtime behavior;
-- Vala owns observability, evaluation, drift, and analytical data-plane work;
-- `crates/wyrd/*` owns server, CLI, MCP, storage, testing, and application
-  integration;
-- language bindings and `python/py-wyrd` remain thin projections.
+- `COMPLETE`: every acceptance criterion and required proof is satisfied.
+- `BLOCKED`: no in-scope solution remains without a material change or
+  genuinely unavailable authority.
 
-Apply every risk-specific rule in
-`architecture/references/languages/implementation-execution.md`. Load the
-conditional language and domain references above for the task's affected
-surfaces; they refine the general contract without weakening it.
-
-## Prove behavior with tests
-
-Write tests alongside behavior. Map every new or changed test to an acceptance
-criterion and cover required success, regression, failure, boundary, error,
-state-transition, concurrency, compatibility, and Wyrd user-journey behavior.
-Do not add tests solely for line coverage.
-
-Never make a test pass by removing or broadening assertions, adding sleeps
-instead of synchronization, ignoring or disabling cases, mocking away the
-behavior under test, swallowing errors, changing production behavior to match
-an incorrect test, or replacing precise assertions with snapshots or existence
-checks. Report conflicts between existing tests and the approved task.
-
-## Run focused verification
-
-Follow task-provided commands and the ordered verification contract in
+Before reporting, inspect tracked and untracked changes, map every changed file
+to acceptance, remove accidental artifacts, and run `git diff --check`.
+Use the structured completion report in
 `architecture/references/languages/implementation-execution.md`.
-
-- Run only focused verification over the smallest complete affected surface.
-- Inspect every `mise` task before use; never invent a task name.
-- Run Rust-related commands sequentially across every agent sharing the
-  checkout or target directory.
-- Use default features unless the task earns exact optional features.
-- Never use `--all-features` for bounded implementation unless the task
-  explicitly requires and justifies it.
-- Leave workspace-wide and all-feature verification to
-  `$wyrd-implement-plan` closeout.
-
-## Inspect the complete diff
-
-Apply the final diff audit in
-`architecture/references/languages/implementation-execution.md` to tracked and
-untracked changes. Remove accidental or unrelated changes. Update only task
-fields or logs the task explicitly permits.
-
-## Report evidence
-
-Apply the exact completion standard and structured report in
-`architecture/references/languages/implementation-execution.md`. Do not report
-`COMPLETE` while any acceptance criterion is failed or unverified. Do not
-return a final report while approved actionable work remains. Use `BLOCKED`
-only when escalation or unavailable required authority prevents correct
-completion.

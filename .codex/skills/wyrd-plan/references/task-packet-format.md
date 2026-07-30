@@ -2,13 +2,14 @@
 
 Use this exact ordered format for every task saved under
 `.dev/plan/<slug>/tasks/<NN>-<task-slug>.md`. A task is a bounded compilation
-target for Terra/Luna and a direct bounded-mode assignment for
-`$wyrd-implement`.
+target for Terra/Luna and a direct assignment for its declared
+surface-appropriate execution skill or skill set.
 
 ## Contents
 
 - [Required structure](#required-structure)
 - [Detail rules](#detail-rules)
+- [Controlled execution updates](#controlled-execution-updates)
 - [Complete example](#complete-example)
 - [Task readiness audit](#task-readiness-audit)
 
@@ -21,14 +22,14 @@ When a section is inapplicable, write
 ```markdown
 # T<N>: <Outcome-oriented title>
 
-Status: Planned | Ready | Blocked
+Status: Planned | Ready | Complete | Blocked
 Plan: <canonical plan path>
 Milestone: <ID or none>
 Requirements: <R IDs>
 Decisions: <D IDs>
 Depends on: <task IDs or none>
 Assigned model: Terra | Luna
-Execution skill: $wyrd-implement
+Execution skill: $wyrd-implement | $wyrd-ui | $wyrd-implement + $wyrd-ui
 
 ## Objective
 
@@ -117,10 +118,23 @@ Required structured report from the implementation agent.
 A pure synchronous refactor may state “Not applicable: control flow and
 failure state are unchanged” rather than inventing a failure matrix.
 
+Select execution skills from the write set:
+
+- `$wyrd-implement` for non-UI Wyrd implementation;
+- `$wyrd-ui` for Svelte/UI-only implementation;
+- `$wyrd-implement + $wyrd-ui` for one cohesive task that crosses non-UI and
+  UI surfaces.
+
+Do not assign a skill whose trigger or exclusions reject part of the write set.
+
 ## Detail rules
 
 - Name likely files and exact existing symbols after verifying them from live
   source. Use globs only when a generated or migration family is truly open.
+- Treat expected paths and private symbol names as repository-verified
+  guidance, not a strict whitelist. Permit adjacent private implementation and
+  test-support files inside the established owner when acceptance requires
+  them.
 - Define new and materially changed symbols. Do not ask Terra/Luna to “add the
   necessary types” or “wire up the handler.”
 - State function and method responsibilities, not just names.
@@ -130,10 +144,36 @@ failure state are unchanged” rather than inventing a failure matrix.
   side effects matter.
 - Turn edge cases into acceptance criteria and required tests.
 - Name exact current `mise` commands and required feature sets.
+- Mark an exact command normative only when its lane, feature set, or
+  environment is part of the behavior being proved. Otherwise permit an
+  equivalent non-weaker command when the prescribed recipe is defective.
 - Explicitly exclude broad gates from bounded tasks when they belong to
   closeout.
 - Escalate unexpected dependency, feature, migration, public contract, scope,
   ownership, or verification expansion.
+
+## Controlled execution updates
+
+An executing agent may append corrections under `Completion evidence` and
+update factual mechanics in `Context`, `Target paths and symbols`,
+`Implementation guidance`, or `Focused verification` when current repository
+evidence establishes:
+
+- a corrected internal path or private symbol name;
+- an existing equivalent helper, fixture, or support export;
+- a required adjacent private helper or test fixture within the established
+  owner;
+- an equivalent non-weaker verification command;
+- progress, failure diagnosis, and verification results.
+
+Record each correction with its evidence and classify it as `local` or
+`bounded correction`. Do not create a remediation plan for these changes.
+
+Do not modify the objective, requirement or decision IDs, required behavioral
+outcomes, public or persisted contracts, security or tenancy semantics,
+data-loss behavior, prohibited material boundaries, or acceptance criteria.
+When one must change, set the task to `Blocked`, preserve the conflict
+evidence, and request authority before implementation.
 
 ## Complete example
 
@@ -329,11 +369,11 @@ The parent plan owns the all-feature closeout.
 
 Return:
 
-- Status: COMPLETE, BLOCKED, or INCOMPLETE.
+- Status: COMPLETE or BLOCKED.
 - AC1–AC4 as PASS, FAIL, or UNVERIFIED with source/test evidence.
 - Files changed and tests added or modified.
 - Commands executed in order, exact outcomes, and features used.
-- Deviations, risks, and unresolved work.
+- Execution updates, bounded corrections, risks, and unresolved work.
 - Final diff or commit reference.
 ```
 
@@ -353,6 +393,9 @@ Before marking `Ready`, verify:
 - required tests name setup, action, and assertions;
 - required features are explicit and justified;
 - focused commands match live repository tasks;
+- command/setup execution was checked and a documented cold read-only
+  implementation rehearsal passed, using a fresh agent when available;
+- mutable factual mechanics and immutable material decisions are explicit;
 - broad closeout commands have an explicit exclusion section;
 - escalation conditions catch material divergence;
 - completion evidence is structured;

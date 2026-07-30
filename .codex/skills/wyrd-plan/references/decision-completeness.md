@@ -9,6 +9,7 @@ implementation model performs coding and local adaptation, not design.
 - [Evidence and intent](#evidence-and-intent)
 - [Material decision test](#material-decision-test)
 - [Required implementation detail](#required-implementation-detail)
+- [Controlled implementation adaptation](#controlled-implementation-adaptation)
 - [Contracts and code shape](#contracts-and-code-shape)
 - [Control flow and failures](#control-flow-and-failures)
 - [Example](#example)
@@ -56,6 +57,33 @@ A choice is material when different reasonable answers change:
 Resolve material choices in the plan. Terra/Luna may choose reversible local
 mechanics such as variable names, a small private helper, and exact syntax
 already determined by the nearest repository pattern.
+
+## Controlled implementation adaptation
+
+Decision-complete does not mean mechanically immutable. The plan locks
+consequential behavior and gives the implementer explicit authority over
+reversible repository alignment.
+
+The implementer may update the active task when current source establishes:
+
+- a corrected internal path or private symbol name;
+- an equivalent existing helper, fixture, or test-support seam;
+- a small adjacent private helper or fixture inside the established owner;
+- an equivalent verification command that proves the same acceptance outcome
+  without weaker coverage;
+- progress, diagnostic evidence, and verification results.
+
+The implementer must not independently change:
+
+- requirements or acceptance outcomes;
+- public, wire, generated, cross-owner, or persisted contracts;
+- migrations, destructive behavior, or data-loss semantics;
+- authentication, authorization, tenancy, policy, audit, or secret semantics;
+- dependencies, Cargo features, or ownership boundaries.
+
+Classify the former as local mechanics or bounded corrections and record them.
+Classify the latter as material and return for authority before implementation.
+Do not create a remediation plan for a bounded correction.
 
 ## Required implementation detail
 
@@ -210,6 +238,8 @@ Before approval, confirm:
 - required types, interfaces, responsibilities, and invariants are explicit;
 - consequential control flow and failure behavior are specified;
 - tests and verification prove each acceptance criterion;
+- reversible mechanics and material decisions have an explicit authority
+  boundary;
 - assumptions do not conceal missing design;
 - `$wyrd-implement` can execute every task without making a material decision.
 

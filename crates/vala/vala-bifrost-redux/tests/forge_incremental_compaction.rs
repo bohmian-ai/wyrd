@@ -577,11 +577,38 @@ mod pg_tests {
         );
     }
 
-    /// Discovers one real current snapshot through manifests and preserves its
-    /// complete candidate identity in a deterministic table plan.
-    #[tokio::test]
-    async fn current_snapshot_preserves_manifest_writer_schema_identity() {
-        let fixture = Fixture::new().await;
+    /// Evolve the fixture table and return its reloaded current schema identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the schema action or catalog reload fails.
+    async fn evolve_table_schema(
+        fixture: &Fixture,
+        old_table: &iceberg::table::Table,
+    ) -> (iceberg::table::Table, i32) {
+        let schema_action =
+            Transaction::new(old_table)
+                .update_schema()
+                .add_column(AddColumn::optional(
+                    "evolved_value",
+                    Type::Primitive(PrimitiveType::String),
+                ));
+        ApplyTransactionAction::apply(schema_action, Transaction::new(old_table))
+            .expect("schema action")
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("schema evolution");
+        let evolved_table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("evolved table");
+        let current_schema_id = evolved_table.metadata().current_schema_id();
+        (evolved_table, current_schema_id)
+    }
+
+    /// Builds a current snapshot containing both original and evolved-schema manifest files.
+    async fn mixed_schema_current_table(fixture: &Fixture) -> (iceberg::table::Table, i32, i32) {
         let table = fixture
             .catalog
             .load_table(&fixture.binding.table_ident())
@@ -598,24 +625,7 @@ mod pg_tests {
             .current_snapshot()
             .expect("old-schema snapshot");
         let old_schema_id = old_snapshot.schema_id().expect("old schema");
-        let schema_action =
-            Transaction::new(&old_table)
-                .update_schema()
-                .add_column(AddColumn::optional(
-                    "evolved_value",
-                    Type::Primitive(PrimitiveType::String),
-                ));
-        ApplyTransactionAction::apply(schema_action, Transaction::new(&old_table))
-            .expect("schema action")
-            .commit(fixture.catalog.as_ref())
-            .await
-            .expect("schema evolution");
-        let evolved_table = fixture
-            .catalog
-            .load_table(&fixture.binding.table_ident())
-            .await
-            .expect("evolved table");
-        let current_schema_id = evolved_table.metadata().current_schema_id();
+        let (evolved_table, current_schema_id) = evolve_table_schema(fixture, &old_table).await;
         assert_ne!(
             old_schema_id, current_schema_id,
             "schema update must commit"
@@ -684,6 +694,15 @@ mod pg_tests {
             current_schema_id,
             "new manifest must use the evolved current schema"
         );
+        (table, old_schema_id, current_schema_id)
+    }
+
+    /// Discovers one real current snapshot through manifests and preserves its
+    /// complete candidate identity in a deterministic table plan.
+    #[tokio::test]
+    async fn current_snapshot_preserves_manifest_writer_schema_identity() {
+        let fixture = Fixture::new().await;
+        let (table, old_schema_id, current_schema_id) = mixed_schema_current_table(&fixture).await;
         let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
 
         let first = fixture
@@ -701,7 +720,7 @@ mod pg_tests {
         let groups = first.groups_for_test();
         let ordered_files = groups
             .iter()
-            .flat_map(|group| group.files_for_test())
+            .flat_map(vala_bifrost_redux::forge::IcebergRewriteGroup::files_for_test)
             .collect::<Vec<_>>();
         let schema_ids = ordered_files
             .iter()
@@ -725,9 +744,7 @@ mod pg_tests {
             "the appended manifest keeps its evolved writer schema"
         );
         assert!(
-            schema_ids
-                .iter()
-                .any(|&schema_id| schema_id == old_schema_id),
+            schema_ids.contains(&old_schema_id),
             "the current snapshot retains at least one old-schema manifest file"
         );
         for group in groups {

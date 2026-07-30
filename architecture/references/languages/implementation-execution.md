@@ -1,24 +1,23 @@
 # Bounded Implementation Execution
 
-This reference defines the mandatory execution contract for an agent
-implementing one approved Wyrd task. It is a reference document: use it to
-check exact inputs, escalation conditions, verification rules, and completion
-evidence. Whole-plan ordering and integrated closeout belong to
-`wyrd-implement-plan`.
+This reference defines the detailed execution contract for one approved Wyrd
+task. The main `$wyrd-implement` skill owns the fixed loop. This document owns
+authority classification, controlled adaptation, verification recovery, test
+integrity, diff audit, and completion evidence.
 
 ## Contents
 
 - [Authority](#authority)
-- [Required Task Contract](#required-task-contract)
-- [Repository Preflight](#repository-preflight)
-- [Autonomous Execution Loop](#autonomous-execution-loop)
-- [Escalation and Deviations](#escalation-and-deviations)
-- [Implementation Rules](#implementation-rules)
-- [Risk-Specific Rules](#risk-specific-rules)
-- [Test Integrity](#test-integrity)
-- [Focused Verification](#focused-verification)
-- [Final Diff Audit](#final-diff-audit)
-- [Completion Standard](#completion-standard)
+- [Task contract](#task-contract)
+- [Three execution classes](#three-execution-classes)
+- [Living task updates](#living-task-updates)
+- [Failure routing](#failure-routing)
+- [Repository-managed environments](#repository-managed-environments)
+- [Equivalent verification](#equivalent-verification)
+- [Implementation and test integrity](#implementation-and-test-integrity)
+- [Focused verification](#focused-verification)
+- [Final diff audit](#final-diff-audit)
+- [Completion standard](#completion-standard)
 
 ## Authority
 
@@ -31,268 +30,244 @@ Apply instructions in this order:
 5. repository architecture and conventions;
 6. local implementation preferences.
 
-The task's behavior, acceptance criteria, non-goals, prohibited changes,
-interfaces, feature requirements, focused verification, and escalation
-conditions are authoritative.
+The task fixes required behavior, acceptance outcomes, public and persisted
+contracts, material architecture, prohibited changes, and safety boundaries.
+Repository reality fixes private mechanics unless the task explicitly marks
+them normative.
 
-An implementation agent executes the approved solution. It does not redesign
-the solution, broaden scope, silently reinterpret requirements, or substitute
-its preferred architecture. An approved task may explicitly replace a current
-design decision; the implementor updates the named authority with the code. It
-does not decide independently that a redesign is better.
+## Task contract
 
-## Required Task Contract
+Before editing, establish:
 
-Do not edit until the active task defines:
+- objective, requirements, non-goals, and acceptance criteria;
+- allowed and prohibited material scope;
+- owners, interfaces, invariants, and normative control flow;
+- dependencies and exact required features;
+- tests, focused verification, and completion evidence;
+- material stop conditions.
 
-- objective and observable outcome;
-- requirements and non-goals;
-- allowed scope and prohibited changes;
-- interfaces, contracts, invariants, and public behavior;
-- pseudocode or implementation structure and whether it is normative or
-  illustrative;
-- dependencies and exact feature requirements;
-- acceptance criteria and required tests;
-- focused verification commands and affected surface;
-- escalation conditions;
-- completion evidence.
+For a standardized task, run the canonical structural validator. A structural
+failure blocks editing until corrected. A stale private name, defective command
+recipe, or missing local test setup does not make an otherwise clear behavioral
+contract malformed.
 
-Read the entire task, referenced plan context, applicable `AGENTS.md` files,
-and required architecture references. Do not rely on a summary or partial
-excerpt.
+Build a live checklist. The task remains active while any approved actionable
+item remains.
 
-## Repository Preflight
+## Three execution classes
 
-Inspect only the task's affected surface:
+### Local and reversible
 
-- current implementation paths and callers;
-- existing tests and fixtures;
-- naming, ownership, and structural precedents;
-- whether named files, crates, interfaces, and types exist;
-- whether required interfaces or types already exist;
-- default and optional Cargo features;
-- relevant `mise` tasks and their actual commands;
-- contradictions between the task and current source.
+Implement autonomously:
 
-Proceed only when the approved behavior is clear, its owner exists, contracts
-fit the approved design, dependencies and features are available, and the
-acceptance criteria fit the allowed scope.
+- private helpers and local structure;
+- rustdoc, formatting, and diff-caused lint repairs;
+- mechanical caller and test updates;
+- current equivalents of private names and paths;
+- existing fixtures and test-support seams;
+- in-scope compile and test repairs.
 
-## Autonomous Execution Loop
+These changes preserve behavior and remain inside the established owner.
 
-One bounded task is one autonomous execution loop. Before editing, build a live
-checklist containing every required change, acceptance criterion, required
-test, focused verification command, and completion-evidence item. The checklist
-must come only from the approved task; non-goals, later tasks, and adjacent
-milestones are not remaining work.
+### Bounded correction
 
-Run:
+Proceed, record, and continue:
+
+- replacing a defective command or filter with equivalent non-weaker proof;
+- adding a narrow adjacent private fixture or support file within the owner;
+- repairing a small pre-existing defect in touched code;
+- provisioning repository-managed local services, migrations, and test
+  environment;
+- recording a proven unrelated baseline failure while continuing unaffected
+  proof;
+- appending repository discoveries to the living task.
+
+The expected file list is not a strict whitelist for adjacent private
+implementation and verification support. Explicit prohibited material paths
+remain prohibited.
+
+### Material
+
+Stop before implementation when correctness requires:
+
+- changing a public, wire, generated, or persisted contract;
+- adding or changing a migration or destructive data behavior;
+- adding a dependency or Cargo feature;
+- changing authentication, authorization, tenancy, policy, audit, secret, or
+  data-loss semantics;
+- redesigning ownership or dependency direction;
+- changing requirements or acceptance outcomes.
+
+Report repository evidence, why no in-scope solution remains, and the exact
+authority required to resume.
+
+## Living task updates
+
+The executing agent may append or correct:
+
+- current repository facts;
+- internal paths and private symbol names;
+- existing or added private implementation/test-support seams;
+- equivalent verification commands;
+- progress, failures, and evidence.
+
+Record:
 
 ```text
-inspect -> implement -> test -> diagnose -> fix -> verify -> diff audit
-   ^                                                          |
-   +---------- while approved actionable work remains --------+
+date/attempt
+classification: local | bounded correction
+discovery and repository evidence
+task section or command affected
+action and verification result
 ```
 
-Update the checklist after each material result and take the next action that
-advances an unchecked item. Do not pause for another prompt between coding,
-test creation, diagnosis, repairs, verification reruns, and final audit.
+Do not rewrite the objective, requirement or decision IDs, required behavior,
+public or persisted contracts, security semantics, material architecture or
+ownership boundaries, prohibited material boundaries, or acceptance criteria.
+Set the task to `Blocked` when one must change.
 
-Route every failure deliberately:
+## Failure routing
 
-1. An implementation-caused failure returns to implementation and repair.
-2. An incorrect command, filter, feature set, or test lane is corrected to the
-   task-prescribed invocation and rerun.
-3. A proven unrelated failure that does not prevent required proof is recorded
-   and does not stop remaining checks.
-4. A proven external or pre-existing failure that prevents required proof and
-   has no approved alternative is `BLOCKED`; report the evidence and authority
-   or environmental change required to resume.
+Use this order:
 
-Elapsed time, difficulty, context length, context compaction, partial progress,
-a convenient handoff point, unwritten tests, remaining approved work, or a
-recoverable tool failure do not end the loop. After compaction or recoverable
-interruption, reconstruct state from the complete task, current diff, and
-verification evidence and resume at the first unchecked item. Status updates
-are interim checkpoints and do not terminate execution unless the user
-explicitly stops or replaces the task.
+1. If the diff caused the failure, fix it and rerun.
+2. If the defect is small and in touched code, fix and report it.
+3. If the command or filter is defective, establish equivalent proof and
+   rerun.
+4. If private plumbing or test support is missing, add the smallest in-owner
+   support and continue.
+5. If local repository setup is missing, provision it and rerun.
+6. If the failure is unrelated, prove that classification and continue all
+   unaffected work and checks.
+7. If a material change or unavailable external authority is required, finish
+   unaffected work and return `BLOCKED`.
+8. Otherwise continue localization and diagnosis.
 
-The only voluntary terminal outcomes are:
+Compiler, test, formatter, Clippy, rustdoc, process, or tool failures are
+diagnostic results. They do not terminate execution by category.
 
-- `COMPLETE`: every checklist item and acceptance criterion is satisfied and
-  verified.
-- `BLOCKED`: an escalation condition or unavailable required authority
-  prevents correct completion.
+Do not return partial work, create a remediation plan, or wait for another
+prompt while an in-scope recovery path remains.
 
-Never voluntarily return partial work as `INCOMPLETE`. If actionable approved
-work remains and no escalation condition applies, continue the loop.
+## Repository-managed environments
 
-## Escalation and Deviations
+Missing local services and local test variables are reversible mechanics when
+the repository defines them.
 
-Stop before editing when:
+Inspect:
 
-- a required owner, type, module, command, or feature is missing and adding it
-  changes architecture or scope;
-- a public contract, migration, security boundary, existing test, or
-  acceptance criterion conflicts with the task;
-- a new dependency or undocumented feature is required;
-- prohibited paths must change;
-- verification must expand materially;
-- later tasks must change to complete the active task;
-- repository behavior materially contradicts an approved decision.
+- the relevant `mise.toml` task body;
+- its `depends` setup and migration tasks;
+- its checked-in `env` values;
+- invoked scripts and documented local emulators.
 
-Do not escalate minor local choices that preserve semantics and existing
-patterns.
+Then start the service, run migrations, invoke the owning task, or supply the
+same checked-in local-only values to an equivalent focused command.
 
-A deviation is any unapproved difference in behavior, architecture, interface,
-dependency use, feature selection, scope, verification, compatibility, error
-semantics, or data model. When one is required:
+For example, a focused Postgres test must not stop merely because
+`WYRD_DATABASE_URL` is absent from the current shell when its canonical `mise`
+task defines the value and depends on Postgres setup.
 
-1. stop before implementing it;
-2. describe the conflict;
-3. cite repository evidence;
-4. explain why the approved approach cannot work;
-5. present the smallest viable alternatives;
-6. identify effects on requirements, tasks, tests, and closeout;
-7. wait for replanning or explicit approval.
+Never invent or expose production secrets. An external credential, protected
+service, or user-only permission is unavailable authority only when the
+repository provides no local substitute and required proof cannot be
+established otherwise.
 
-Never implement a preferred alternative first and disclose it afterward.
+## Equivalent verification
 
-## Implementation Rules
+A corrected command is equivalent only when it:
 
-Treat task behavior as normative. Preserve operation order, validation
-boundaries, transaction boundaries, error mapping, concurrency, cancellation,
-side-effect order, and data invariants.
+- proves the same acceptance criterion;
+- exercises the same relevant code, feature, and target;
+- preserves required negative, integration, and environment behavior;
+- is no weaker in assertions or dependency coverage;
+- records why the original recipe was defective.
 
-Interpret task pseudocode according to its declared status:
+Examples:
 
-- preserve normative semantics;
-- adapt exact names only when the task permits repository alignment;
-- adapt illustrative structure without changing behavior;
-- never change a public interface without explicit permission.
+- add `--lib` when an unrelated explicit integration target is invalid under
+  the intended default-feature proof;
+- correct a stale test filter to the current test name;
+- invoke the canonical `mise` task that supplies Postgres setup instead of a
+  raw Cargo command missing its environment.
 
-Prefer existing owners, abstractions, helpers, errors, fixtures, dependencies,
-and repository patterns. Do not add architectural layers, generic frameworks,
-broad abstractions, dependencies, feature flags, helpers, extension points, or
-refactors not required by acceptance criteria.
+Do not call a unit test equivalent to a required integration or user-journey
+test. Do not silently drop features, assertions, negative flows, or consumers.
 
-Implement only the active task. Do not:
+## Implementation and test integrity
 
-- implement later tasks or adjacent milestones;
-- reformat, rename, or rewrite unrelated code;
-- upgrade or replace dependencies;
-- modify unrelated tests;
-- change requirements or acceptance criteria;
-- alter the task or plan to match the implementation;
-- perform speculative cleanup.
+Follow `AGENTS.md` and the applicable language references. In particular:
 
-Every changed file must map to a requirement or necessary verification support.
+- preserve operation order, validation, transactions, concurrency,
+  cancellation, side effects, errors, and invariants;
+- prefer existing concrete owners and repository patterns;
+- avoid speculative abstractions, dependencies, features, and cleanup;
+- write tests alongside changed behavior;
+- map every test to an acceptance criterion;
+- preserve the repository's required rustdoc and struct-centered Rust style.
 
-## Risk-Specific Rules
+Never pass a check by:
 
-| Surface | Mandatory behavior |
-|---|---|
-| Dependencies and features | Use only approved dependencies and exact features. Preserve version conventions, update lockfiles only as required, verify actual use, and record the change. Escalate unexpected transitive requirements or unrelated-crate effects. |
-| Database migrations | Follow existing conventions and the approved rollout strategy. Keep migrations deterministic and deployment-order compatible. Do not make destructive changes without approval or modify prior committed migrations unless repository policy permits it. Add migration-focused validation. |
-| Errors | Preserve structured errors and exact mappings. Do not collapse states, expose internals, swallow errors, convert recoverable errors into panics, add unspecified retries, log secrets, or change out-of-scope semantics. |
-| Concurrency and transactions | Preserve synchronization, atomicity, cancellation, and transaction boundaries. Use existing primitives, avoid time-based synchronization, and test required races or state transitions. |
-| Security | Reuse vetted auth, authorization, validation, secret, permission, and cryptographic primitives. Never design custom cryptography or log credentials. Preserve constant-time behavior where applicable. Test negative and replay behavior. Escalate ambiguity. |
-| Documentation and comments | Add only task-required, repository-required, or behavior-critical documentation. Explain invariants, safety, transactions, concurrency, compatibility, or unusual choices. Do not narrate obvious code or update unrelated docs. |
-
-## Test Integrity
-
-Write tests alongside behavior. Map every new or changed test to an acceptance
-criterion. Cover required success, regression, failure, boundary, error,
-state-transition, concurrency, compatibility, and Wyrd user-journey behavior.
-Do not add tests solely for line coverage.
-
-Never make tests pass by:
-
-- removing or broadly weakening assertions;
+- removing or weakening assertions;
+- ignoring, disabling, or deleting a required test;
 - adding sleeps instead of deterministic synchronization;
-- ignoring or disabling cases;
-- mocking away the behavior under test;
-- swallowing errors;
-- changing production behavior to match an incorrect test;
-- replacing precise assertions with snapshots or existence checks.
+- mocking away required behavior;
+- swallowing errors or changing semantics to fit an incorrect test;
+- adding an unjustified lint allowance;
+- editing generated artifacts instead of their source.
 
-Report a conflict when an existing test contradicts the approved task.
+An actual conflict between a required test and an approved material contract
+is a material blocker.
 
-## Focused Verification
+## Focused verification
 
-The task implementor proves the bounded task. The plan closeout agent proves
-the integrated feature.
+Run the smallest complete affected surface sequentially:
 
-Run only the task's focused verification over the smallest complete affected
-surface. Include consumers, integration tests, shared fixtures, generated
-artifacts, schemas, migrations, and feature-gated code only when directly
-affected. Escalate instead of silently broadening verification beyond the
-approved task.
+1. narrow test or reproduction;
+2. broader affected owner or package task;
+3. applicable integration, contract, codegen, typing, migration, docs, or
+   boundary checks;
+4. repository-required format and lint checks;
+5. `git diff --check`;
+6. final diff inspection.
 
-Follow task-provided commands exactly. Otherwise run:
+Prefer repository `mise` tasks after inspecting their implementation and setup.
+Use direct Cargo for a narrow pure test or focused filter when no suitable task
+exists. Run Cargo-backed work sequentially across agents sharing a target.
 
-1. repository-standard formatting for affected code;
-2. formatting validation when required;
-3. the narrowest relevant test;
-4. the broader affected test target;
-5. linting for affected crates;
-6. task-specific integration, contract, codegen, or boundary checks;
-7. `git diff --check`;
-8. final diff inspection.
+Use default features unless the task explicitly earns exact optional features.
+Do not use `--all-features` for a bounded task unless the task requires it.
+Whole-plan gates belong to integrated closeout.
 
-Fix a task-caused failing command before starting later commands. Correct and
-rerun a command that used the wrong filter, feature set, or test lane. When a
-failure is proven unrelated, continue if it does not prevent the task's
-required proof; otherwise report `BLOCKED` with evidence rather than returning
-partial work.
+When a failure is proven unrelated, continue if it does not prevent required
+proof. If it prevents a mandatory acceptance outcome and no equivalent proof
+exists, return `BLOCKED` only after every unaffected item is complete.
 
-Prefer a repository `mise` task after confirming it exists, its implementation
-and feature selection match the task, and it does not duplicate a later
-required command. Use direct Cargo only when no suitable task exists, the task
-would otherwise exceed allowed scope, a focused filter is needed, or the task
-explicitly supplies the command. Never invent a `mise` task name.
+## Final diff audit
 
-Run all Rust-related commands sequentially across agents sharing a checkout or
-target directory. Do not start background verification or continue
-implementation while Cargo-backed verification runs.
+Inspect tracked and untracked changes. For every changed file, confirm:
 
-Use default Cargo features unless the task explicitly earns exact optional
-features. Never use `--all-features` for bounded implementation unless the
-active task explicitly requires and justifies it. Full workspace and
-all-feature validation belong to integrated plan closeout.
+- the requirement or verification need that requires it;
+- it is inside the established owner or explicitly approved scope;
+- no unrelated formatting or cleanup entered the diff;
+- public-contract, dependency, feature, migration, and security effects are
+  unchanged unless explicitly approved;
+- generated outputs came from their source;
+- tests prove behavior without weakened integrity;
+- no debug artifacts, real secrets, or machine-specific values remain.
 
-Keep formatting scoped where tooling permits. If a formatter touches unrelated
-content, inspect the diff, restore unrelated changes when safe, and report
-unavoidable broad formatting.
+Task-document updates must follow [Living task updates](#living-task-updates).
 
-## Final Diff Audit
+## Completion standard
 
-Inspect tracked and untracked changes. For every changed file, verify:
+`COMPLETE` requires every acceptance criterion and required proof to pass, no
+prohibited change, sequential verification, a clean diff audit, and recorded
+bounded corrections.
 
-- the requirement and acceptance criterion requiring it;
-- necessity and absence of unrelated formatting;
-- public-contract, dependency, and feature effects;
-- generated output provenance;
-- test strength;
-- absence of debug code, temporary files, secrets, and environment-specific
-  values.
-
-Update only task status fields or logs the task explicitly permits. Never edit
-the objective, requirements, non-goals, architecture decisions, acceptance
-criteria, approved interfaces, or closeout requirements.
-
-## Completion Standard
-
-Report `COMPLETE` only when every acceptance criterion is satisfied and
-verified; required tests, lints, and formatting pass; commands ran
-sequentially; required `mise` tasks and only approved features were used; no
-prohibited or unrelated change remains; and every deviation has explicit
-approval.
-
-Report `BLOCKED` only when an escalation condition or unavailable required
-authority prevents correct completion. Do not return a final report while
-approved actionable work remains, and do not report `COMPLETE` with a failed
-or unverified acceptance criterion.
+`BLOCKED` requires evidence that no in-scope solution remains without a
+material decision or genuinely unavailable authority. Difficulty, elapsed
+time, partial progress, context compaction, a recoverable command failure,
+missing repository-managed setup, or a convenient handoff point do not qualify.
 
 Use this report:
 
@@ -320,14 +295,17 @@ Commands executed sequentially:
 Features enabled:
 - `crate`: default | `<exact features>`
 
-### Deviations
-- None | <deviation, approval, and impact>
+### Execution Updates
+- None | <local or bounded correction, evidence, and result>
+
+### Material Deviations
+- None | <approved deviation and impact>
 
 ### Remaining Work
-- None | <blocked item and exact condition required to resume>
+- None | <blocked item and exact authority required>
 
 ### Risks and Notes
-- None | <unresolved non-blocking observation>
+- None | <non-blocking evidence>
 
 ### Diff or Commit
 - <reference when available>

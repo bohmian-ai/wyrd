@@ -38,8 +38,9 @@ pub mod observation;
 pub mod trace;
 
 pub use audit_detail::{
-    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ForgeOrphanGcPhase,
-    ForgeSnapshotExpirePhase, ScopeHash, StoragePath, audit_detail_canonical_json,
+    AuditDetail, AuditDetailValueError, BatchId, ForgeCompactionPhase, ForgeIcebergRewritePhase,
+    ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, ScopeHash, StoragePath,
+    audit_detail_canonical_json,
 };
 pub use correlation::{CorrelationColumns, CorrelationContext};
 pub use error::BifrostError;

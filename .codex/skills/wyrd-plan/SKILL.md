@@ -1,199 +1,196 @@
 ---
 name: wyrd-plan
-description: Plan Wyrd feature, refactor, migration, API, SDK, CLI, MCP, UI, Skald, Vala/Bifrost, storage, testing, and architecture work as a decision-complete implementation specification with executable Terra/Luna task packets. Use when Codex must investigate, design, scope, sequence, decompose, or prepare Wyrd coding work before execution by $wyrd-implement. Do not use to implement the plan or review completed code.
+description: Plan Wyrd feature, refactor, migration, API, SDK, CLI, MCP, UI, Skald, Vala/Bifrost, storage, testing, and architecture work as a decision-complete, execution-grounded specification with rehearsed Terra/Luna task packets. Use when Codex must investigate, design, scope, sequence, decompose, or prepare Wyrd coding work before execution by $wyrd-implement. Do not use to implement the plan or review completed code.
 ---
 
 # Wyrd Plan
 
-Act as the high-reasoning planning model. Convert ambiguous intent and live
-repository evidence into the smallest complete implementation specification
-that transfers consequential reasoning from Sol to Terra/Luna.
+Convert user intent and live repository evidence into the smallest
+decision-complete plan that an implementation agent can execute without
+redesign. Lock material behavior and boundaries. Leave reversible mechanics to
+`$wyrd-implement`.
 
-Plan so that `$wyrd-implement` can execute each task without redesigning the
-solution, reconstructing architecture, choosing among material alternatives,
-or reinterpreting the product request. Terra/Luna may choose syntax, local
-variable names, small helper extraction, and other reversible mechanics already
-fixed by repository conventions.
+Planning is complete only when the proposed implementation is executable, not
+when the document merely looks complete.
 
 ## Establish authority
 
-Use the active Wyrd repository or worktree. Before planning:
+Before planning:
 
-1. Read `AGENTS.md` and `architecture/agent-rules.md` to EOF.
-2. Read `architecture/wyrd-design.md` and
-   `architecture/wyrd-doctrine.mdx` to EOF.
-3. Read the applicable repo-local execution skills:
-   `.codex/skills/wyrd-implement/SKILL.md` for non-UI work and
-   `.codex/skills/wyrd-ui/SKILL.md` when the write set enters the UI.
-4. Read `architecture/references/README.md`, then load only the Wyrd doctrine,
-   architecture, language, testing, agent, or domain references relevant to
-   the request.
-5. Inspect `mise.toml`, affected manifests, `pyproject.toml`, and lockfiles
-   before naming commands, dependencies, or feature sets.
+1. Read `AGENTS.md`, `architecture/agent-rules.md`,
+   `architecture/wyrd-design.md`, and `architecture/wyrd-doctrine.mdx`.
+2. Read the applicable repo-local execution skills:
+   `.codex/skills/wyrd-implement/SKILL.md` and, for UI scope,
+   `.codex/skills/wyrd-ui/SKILL.md`.
+3. Read `architecture/references/README.md`, then only the references relevant
+   to the affected surfaces.
+4. Inspect `mise.toml`, affected manifests, `pyproject.toml`, and lockfiles
+   before naming commands, dependencies, or features.
+5. When `.codegraph/` exists, use CodeGraph before grep, find, or manual
+   source-reading loops.
 
-When `.codegraph/` exists, use CodeGraph before grep, find, or manual
-source-reading loops. Hydrate the current owners, seams, callers, data flow,
-tests, and generated artifacts from source. Do not infer repository shape from
-the request or an old plan.
+Current design is authority, not immutable history. A requested change may
+replace an existing decision only when the plan names the superseded authority
+and includes its update. Otherwise treat the conflict as unresolved.
 
-Current Wyrd design is authority, not immutable history. When the requested
-workflow proves a current decision wrong, name the superseded decision and
-include the owning design and doctrine updates. Treat an implicit, unsafe, or
-out-of-scope conflict as unresolved.
+## Load planning references progressively
 
-## Load planning guidance progressively
-
-Read each selected reference completely when its stage begins. All references
-are direct children of this skill.
+Read each selected reference completely when its stage begins:
 
 | Reference | Load when |
 |---|---|
-| `references/decision-completeness.md` | After initial investigation, before resolving requirements, contracts, control flow, failures, or architecture. Always load for an implementation plan. |
-| `references/verification-planning.md` | After affected surfaces are known, before defining task or closeout verification. Always load for an executable plan. |
-| `references/task-decomposition.md` | After decisions and verification topology are known, before choosing task count, dependencies, or parallelism. Always load when work will be handed to Terra/Luna. |
-| `references/plan-format.md` | When drafting, auditing, presenting, or materializing the canonical plan. |
-| `references/task-packet-format.md` | When drafting each separate implementation task under the canonical plan directory. |
+| `references/decision-completeness.md` | Resolving requirements, contracts, material boundaries, or allowed adaptation |
+| `references/verification-planning.md` | Inspecting commands, features, fixtures, setup, and proof |
+| `references/task-decomposition.md` | Creating tasks and running implementation rehearsal |
+| `references/plan-format.md` | Drafting, auditing, presenting, or saving the plan |
+| `references/task-packet-format.md` | Drafting or updating task packets |
 
-Use the examples in the references as detail and structure standards. Adapt
-their Wyrd nouns, owners, commands, and test tiers to current source; never
-copy an example as repository evidence.
+Examples establish density and structure, not repository facts.
 
-## Investigate before deciding
+## Investigate the repository
 
-Trace the current workflow and nearest precedent. Establish:
+Trace the primary workflow and nearest precedent. Establish:
 
-- the user or agent outcome and primary persona;
-- verified current behavior, limitations, and source evidence;
-- affected public and internal surfaces;
-- owning crates, packages, services, stores, and dependency direction;
-- target paths, symbols, callers, tests, and generated artifacts;
-- security, tenancy, audit, migration, concurrency, and recovery boundaries;
-- existing `mise` tasks, feature gates, and relevant test lanes;
-- assumptions, unknowns, and unresolved product preferences.
+- user or agent outcome and entry point;
+- current behavior, owners, source seams, callers, and tests;
+- public, internal, generated, persisted, and language-projected surfaces;
+- crate, package, service, store, and dependency ownership;
+- security, tenancy, audit, lifecycle, deployment, concurrency, and recovery;
+- manifests, features, explicit targets, fixtures, support exports, and setup;
+- verification commands affected by the dependency cone.
 
-Run non-mutating checks when they materially reduce uncertainty. Separate
-verified facts, assumptions, and unknowns. Resolve discoverable facts from the
-repository before asking the user. Ask one high-impact question at a time only
-when its answer changes the implementation specification.
+Separate verified facts, assumptions, unknowns, and unresolved choices.
+Discover repository facts before asking the user.
 
-## Resolve the implementation specification
+## Build the change-impact graph
 
-Lock the objective, success criteria, stable requirements, non-goals,
-constraints, compatibility, and rollout expectations before task generation.
-Resolve every choice whose alternatives could change behavior, architecture,
-security, data integrity, performance, build features, operations, or proof of
-correctness.
+Every implementation plan includes a repository-specific Mermaid graph under
+`Current state and evidence`. Start at each seed change and trace labelled
+edges through:
 
-Define the code shape required to carry those decisions:
+- owners, callers, consumers, traits, implementations, and dispatch;
+- manifests, Cargo features, explicit test targets, fixtures, and support
+  exports;
+- generated contracts and Rust, Python, TypeScript, HTTP, CLI, MCP, and UI
+  projections;
+- persistence, audit, tenancy, lifecycle, deployment, and recovery;
+- verification commands and their environment or service dependencies.
 
-- owning paths, modules, crates, packages, and existing symbols;
-- new or materially changed structs, enums, traits, methods, functions,
-  request/response shapes, migrations, and generated contracts;
-- responsibilities, inputs, outputs, invariants, visibility, and dependency
-  direction;
-- validation, authorization, ordering, atomicity, error mapping, side effects,
-  retries, idempotency, cancellation, partial progress, and recovery;
-- positive, negative, concurrency, migration, and user-journey behavior.
+Use concrete repository nodes. A prose checklist may explain evidence but does
+not replace the graph. Mark a category `no impact` when repository evidence
+shows it is inapplicable.
 
-Provide typed stubs for new or materially changed interfaces and data
-structures. Provide pseudocode for consequential orchestration, transactions,
-state transitions, side-effect order, and error mapping. Mark behavioral
-semantics as normative and incidental syntax or layout as illustrative.
+## Resolve material decisions
 
-Do not reproduce full source bodies or prescribe inconsequential syntax. Do
-name expected files, symbols, test locations, and implementation stages when
-they constrain scope or reduce Terra/Luna inference.
+Lock objective, requirements, non-goals, constraints, compatibility, rollout,
+owners, interfaces, state transitions, failure behavior, and proof.
+
+A choice is material when alternatives change public or durable behavior,
+cross-owner contracts, dependencies or features, security or tenancy,
+persistence or migration, data-loss behavior, acceptance outcomes, or required
+verification. Resolve it in the plan.
+
+Leave local, reversible mechanics adaptable: private helper extraction,
+repository-aligned private names and paths, incidental local structure,
+mechanical caller changes, existing fixture use, and equivalent non-weaker
+verification commands.
+
+Define typed stubs for new or materially changed interfaces. Provide normative
+pseudocode when ordering, transactions, state transitions, side effects,
+concurrency, cancellation, or error mapping affect correctness.
+
+## Prove task executability
+
+Before marking a task `Ready`:
+
+1. Inspect every proposed `mise`, Cargo, package, or script command.
+2. Confirm the named task, package, feature, target, filter, fixture, support
+   export, and repository setup exist.
+3. Run the narrow command when feasible. At minimum compile the exact target
+   and feature selection and prove the filter selects the intended tests.
+4. Identify repository-provided services, migrations, environment, and
+   checked-in local test configuration required at execution time.
+5. Record unavailable external infrastructure without presenting runtime proof
+   as passed.
+
+Do not substitute a nearby command without recording the corrected command in
+the task. See `references/verification-planning.md`.
+
+## Rehearse implementation cold
+
+After drafting a task, run a read-only cold rehearsal using only the task
+packet, repository, and normal repository authorities. Use a fresh agent when
+the environment supports it. When fresh-agent delegation is unavailable,
+perform and document the same cold pass yourself rather than blocking task
+readiness. The rehearsal must:
+
+- locate every target owner and symbol;
+- trace callers, consumers, dispatch, and test seams;
+- inspect every verification command and its setup;
+- walk the first implementation and test steps;
+- identify missing dependencies, unreachable fixtures, or material decisions.
+
+Do not give a fresh rehearsal agent the intended answer or planning
+conclusions. Revise and repeat until the rehearsal can begin implementation
+without making a material decision. Document-only architecture review does not
+replace this gate.
 
 ## Compile decisions into tasks
 
 Treat task generation as compilation:
 
 ```text
-intent + repository evidence + decisions + constraints + verification
-    -> executable Terra/Luna task packets
+intent + repository evidence + impact graph + decisions + executable proof
+    -> rehearsed Terra/Luna task packets
 ```
 
-Every plan contains at least one complete implementation task.
+Every plan has at least one separate task. Prefer two through five
+dependency-ordered vertical tasks for medium work. Split on cohesive outcomes,
+stable prerequisites, ownership, risk, or useful context boundaries—not files
+or layers. Keep plan-level integration and closeout in the parent plan.
 
-- Create one separate `T1` packet for a small cohesive change.
-- Default medium work to two through five dependency-ordered vertical tasks.
-- Use more tasks only when scale, risk, context size, or independently
-  verifiable outcomes justify them.
-- Materialize every task as a separate file under the canonical plan
-  directory.
-- Allow sequential tasks to touch the same files when dependencies require it.
-  Require non-overlapping write sets only for parallel execution.
+## Hand off a controlled living plan
 
-Use `$wyrd-implement` for execution and validation. Each task must be directly
-usable as a bounded-mode assignment. The parent plan owns feature-wide
-decisions, task ordering, requirement traceability, and closeout.
+Requirements, public or persisted contracts, security and tenancy semantics,
+data-loss behavior, material architecture, and acceptance outcomes remain
+immutable without user or planning authority.
 
-## Design verification before handoff
+During execution, `$wyrd-implement` may append or correct:
 
-Map every requirement to implementation tasks and objective proof. For every
-task, define the affected dependency surface, required tests, exact focused
-commands, feature sets, excluded broad commands, and structured completion
-evidence. Distinguish task completion from feature completion.
+- discovered repository facts;
+- internal paths and private symbol names;
+- equivalent non-weaker verification commands;
+- incidental private implementation structure;
+- progress, failures, and evidence.
 
-Use current `mise.toml` task names. Keep Cargo-backed commands sequential
-across agents sharing a checkout or target directory. Use default or exact
-features for tasks and milestones. Reserve the all-feature workspace gate for
-integrated closeout. Require a real client-to-server journey for every new
-user- or agent-facing capability.
+Record these updates in the active task using
+`references/task-packet-format.md`. A bounded correction does not require a new
+remediation plan. A material conflict sets the task to `Blocked` and returns it
+for authority.
 
-## Audit readiness
+## Audit and emit artifacts
 
-Load the plan and task formats and audit the complete handoff. A plan is ready
-only when:
+Load both format references and confirm:
 
-- every requirement maps to at least one task and objective verification;
-- every task is small enough for its assigned Terra/Luna execution model;
-- every task names exact scope, target owners, code structure, acceptance
-  criteria, tests, commands, features, exclusions, escalation, and evidence;
-- required interfaces, stubs, pseudocode, control flow, failures, and edge
-  cases remove material implementation choices;
-- dependencies and execution order leave the repository coherent;
-- focused checks and closeout gates match live repository commands;
-- `$wyrd-implement` can execute each task without returning to design.
+- every requirement maps to implementation and objective proof;
+- the impact graph covers the affected dependency cone;
+- all material choices have one answer;
+- every command and setup requirement was execution-checked;
+- every task passed a documented cold rehearsal, fresh-agent when available;
+- task dependencies leave coherent repository states;
+- required independent review passed for risk-gated changes.
 
-Use a risk-tiered independent review:
-
-- Require `$wyrd-plan-reviewer` for wire or persisted contracts, migrations,
-  tenant/auth/policy/audit boundaries, cross-store correctness,
-  distributed/background behavior, broad ownership changes, or public
-  workflows spanning multiple first-class surfaces.
-- Use the complete readiness self-audit for lower-risk plans unless the user
-  requests independent review.
-
-Do not mark a risk-gated plan `Approved` until the reviewer returns `Approve`.
-Revise the canonical artifact and re-review blocking findings.
-
-For a materialized plan, run:
+Run the structural validator for materialized plans:
 
 ```bash
 python .codex/skills/wyrd-plan/scripts/validate_plan_artifacts.py \
   .dev/plan/<slug>
 ```
 
-Do not hand off artifacts until the schema validator passes.
+The validator proves structure, not semantic readiness.
 
-## Present or materialize
-
-Follow the active collaboration mode.
-
-- In a non-mutating context, return one `<proposed_plan>` block with explicit
-  `<!-- artifact: implementation-plan.md -->` and
-  `<!-- artifact: tasks/<NN>-<task-slug>.md -->` markers. Include the complete
-  contents of every artifact after its marker.
-- When the user authorizes a durable plan, save it to
-  `.dev/plan/<slug>/implementation-plan.md`.
-- Save every task under
-  `.dev/plan/<slug>/tasks/<NN>-<task-slug>.md`.
-
-Use `Draft`, `Review Required`, or `Approved` for plans and `Blocked`,
-`Planned`, or `Ready` for tasks. Only tasks compiled from an approved plan may
-be marked `Ready`.
-
-Do not create `tasks.yaml`, duplicate specs, implementation ledgers, run
-directories, or completion sentinels. Finish with the artifact paths, approval
-status, task inventory, and any genuinely unresolved blocker.
+In non-mutating contexts, return one `<proposed_plan>` block with complete
+artifact markers. When authorized, save the plan under
+`.dev/plan/<slug>/implementation-plan.md` and each task under `tasks/`.
+Use `Approved` only after readiness and required review; use `Ready` only for
+tasks in an approved plan that passed executable preflight and cold rehearsal.

@@ -34,7 +34,7 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::rewrite::{RewriteOutput, RewriteRequest};
+use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
     validate_supported_layout,
@@ -833,6 +833,16 @@ impl Forge {
     ) -> Result<CompactStats, ForgeError> {
         let operation_id = operation_id(key, bin);
         let table = self.load_table(&binding.table_ident()).await?;
+        let source_files = bin
+            .files
+            .iter()
+            .map(|file| RewriteSourceFile {
+                catalog_path: file.path.clone(),
+                object_path: file.path.clone(),
+                file_size_bytes: file.size,
+                record_count: 0,
+            })
+            .collect::<Vec<_>>();
         let schema = Arc::new(
             iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())
                 .map_err(ForgeError::Catalog)?,
@@ -846,7 +856,7 @@ impl Forge {
                     binding,
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
-                    bin,
+                    source_files: &source_files,
                     partition_day: key.partition_day,
                     table_location: table.metadata().location(),
                     partition_spec_id: table.metadata().default_partition_spec_id(),
@@ -963,6 +973,7 @@ impl Forge {
         }
         let table = self.load_table(&binding.table_ident()).await?;
         let mut properties = HashMap::new();
+        properties.insert("forge.workflow".to_owned(), "staging-fold".to_owned());
         properties.insert("forge.operation_id".to_owned(), operation_id.to_string());
         properties.insert("forge.group".to_owned(), key.audit_resource());
         let tx = Transaction::new(&table);
@@ -1666,7 +1677,7 @@ impl Forge {
     }
 
     /// Append a system-owned Forge audit event to the caller's tenant transaction.
-    async fn append_system_audit(
+    pub(super) async fn append_system_audit(
         &self,
         conn: &mut vala_sql::TenantConn<'_>,
         key: &ForgeGroupKey,

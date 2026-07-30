@@ -42,7 +42,6 @@ use parquet::arrow::async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuil
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::binpack::{CandidateFile, RewriteBin};
 use super::compact::{ForgeObjectStore, project_by_name, validate_tenant_column};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
@@ -92,9 +91,9 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) schema: SchemaRef,
     /// Iceberg schema carrying field IDs required for complete file metrics.
     pub(crate) iceberg_schema: IcebergSchemaRef,
-    /// Ordered candidate files assigned to this rewrite bin.
-    pub(crate) bin: &'a RewriteBin,
-    /// Physical day partition shared by every candidate in the bin.
+    /// Ordered source files read through the shared bounded rewrite contract.
+    pub(crate) source_files: &'a [RewriteSourceFile],
+    /// Physical day partition shared by every source file.
     pub(crate) partition_day: chrono::NaiveDate,
     /// Destination Iceberg table location used in `DataFile` paths.
     pub(crate) table_location: &'a str,
@@ -104,6 +103,19 @@ pub(crate) struct RewriteRequest<'a> {
     pub(crate) sort_order_id: i32,
     /// Output target resolved from this operation's Iceberg table metadata.
     pub(crate) target_file_size_bytes: u64,
+}
+
+/// Immutable source identity consumed by one bounded rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RewriteSourceFile {
+    /// Catalog-owned path used by live replacement's exact delete set.
+    pub(crate) catalog_path: String,
+    /// Binding-validated object path used for bounded Parquet reads.
+    pub(crate) object_path: String,
+    /// Manifest or staging metadata size retained for audit and diagnostics.
+    pub(crate) file_size_bytes: u64,
+    /// Manifest or staging metadata row count retained for validation.
+    pub(crate) record_count: u64,
 }
 
 /// Complete multi-file result returned after rewrite-owned cleanup transfers.
@@ -811,7 +823,7 @@ impl ForgeRewritePipeline {
         request: &RewriteRequest<'_>,
     ) -> Result<(SendableRecordBatchStream, MetricsSet), ForgeError> {
         let source = Arc::new(StagingParquetExec::new(
-            request.bin.files.clone(),
+            request.source_files.to_vec(),
             request.binding.clone(),
             Arc::clone(&request.schema),
             Arc::clone(&self.object_store),
@@ -1045,6 +1057,25 @@ impl ForgeRewritePipeline {
         }
     }
 
+    /// Reclaim outputs written before a live replacement reaches its durable
+    /// `Prepared` audit transition.
+    ///
+    /// The caller uses this only while the output set is still rewrite-owned.
+    /// It delegates to the established live-set and fence-checked cleanup path,
+    /// so uncertain catalog state, cancellation, or lost ownership retains the
+    /// objects for orphan reconciliation instead of risking a committed file.
+    pub(crate) async fn cleanup_unprepared_outputs(
+        &self,
+        paths: &[String],
+        binding: &TenantTableBinding,
+        stop: &CancellationToken,
+        lease: &mut ForgeLease,
+        operator_pool: &OperatorPool,
+    ) {
+        self.cleanup_paths(paths, binding, stop, lease, operator_pool)
+            .await;
+    }
+
     /// Load the current catalog and control-plane references as object keys.
     ///
     /// # Errors
@@ -1136,7 +1167,7 @@ fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -
 #[derive(Debug)]
 struct StagingParquetExec {
     /// Ordered durable candidate files.
-    files: Vec<CandidateFile>,
+    files: Vec<RewriteSourceFile>,
     /// Validated tenant/table binding for path and tenant checks.
     binding: TenantTableBinding,
     /// Destination physical schema yielded to `DataFusion`.
@@ -1154,7 +1185,7 @@ struct StagingParquetExec {
 impl StagingParquetExec {
     /// Build one bounded source plan for a deterministic candidate sequence.
     fn new(
-        files: Vec<CandidateFile>,
+        files: Vec<RewriteSourceFile>,
         binding: TenantTableBinding,
         schema: SchemaRef,
         object_store: Arc<dyn ForgeObjectStore>,
@@ -1188,18 +1219,18 @@ impl StagingParquetExec {
     /// permit acquisition, Parquet construction, or batch decoding fails.
     async fn open_staging_stream_with_permits(
         &self,
-        file: CandidateFile,
+        file: RewriteSourceFile,
         permits: Arc<tokio::sync::Semaphore>,
     ) -> datafusion::error::Result<
         BoxStream<'static, datafusion::error::Result<arrow::record_batch::RecordBatch>>,
     > {
         let path = self
             .binding
-            .validate_object_path(&file.path)
+            .validate_object_path(&file.object_path)
             .ok_or_else(|| {
                 datafusion::error::DataFusionError::Execution(format!(
                     "Forge staging input escaped table prefix: {}",
-                    file.path
+                    file.object_path
                 ))
             })?;
         let permit = permits

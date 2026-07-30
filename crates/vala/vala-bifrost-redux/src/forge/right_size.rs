@@ -411,6 +411,13 @@ pub struct IcebergTablePlan {
 }
 
 impl IcebergTablePlan {
+    /// Return the table snapshot explicitly captured before live-file discovery.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub const fn base_snapshot_id_for_test(&self) -> i64 {
+        self.base_snapshot_id
+    }
+
     /// Return the ordered rewrite groups for catalog integration assertions.
     #[cfg(feature = "test-support")]
     #[must_use]

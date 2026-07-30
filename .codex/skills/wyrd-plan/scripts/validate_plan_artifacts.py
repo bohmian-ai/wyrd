@@ -83,18 +83,22 @@ PLAN_METADATA_VALUES = {
     "Plan version": re.compile(r"[1-9][0-9]*"),
     "Evidence snapshot": re.compile(r".+ at [0-9a-f]{7,40}; .+"),
     "Review": re.compile(r"not required|required|\.dev/review/[^/]+/review\.md"),
-    "Execution skill": re.compile(r"\$wyrd-implement"),
+    "Execution skill": re.compile(
+        r"\$wyrd-implement|\$wyrd-ui|\$wyrd-implement \+ \$wyrd-ui"
+    ),
 }
 
 TASK_METADATA_VALUES = {
-    "Status": re.compile(r"Planned|Ready|Blocked"),
+    "Status": re.compile(r"Planned|Ready|Complete|Blocked"),
     "Plan": re.compile(r"\.dev/plan/[a-z0-9][a-z0-9-]*/implementation-plan\.md"),
     "Milestone": re.compile(r"None|M[1-9][0-9]*"),
     "Requirements": re.compile(r"R[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)R?[1-9][0-9]*)*"),
     "Decisions": re.compile(r"None|D[1-9][0-9]*(?:(?:,\s*|\s*[-–]\s*)D?[1-9][0-9]*)*"),
     "Depends on": re.compile(r"None|T[1-9][0-9]*(?:,\s*T[1-9][0-9]*)*"),
     "Assigned model": re.compile(r"Terra|Luna"),
-    "Execution skill": re.compile(r"\$wyrd-implement"),
+    "Execution skill": re.compile(
+        r"\$wyrd-implement|\$wyrd-ui|\$wyrd-implement \+ \$wyrd-ui"
+    ),
 }
 
 PLAN_METADATA_EXAMPLE = {
@@ -333,10 +337,14 @@ def _published_example(reference: Path, section: str) -> str:
 
     text = reference.read_text(encoding="utf-8")
     _, section_text = text.split(f"## {section}", 1)
-    match = re.search(r"```markdown\n(.*?)\n```", section_text, re.DOTALL)
+    match = re.search(
+        r"(?P<fence>`{3,})markdown\n(?P<body>.*?)\n(?P=fence)",
+        section_text,
+        re.DOTALL,
+    )
     if match is None:
         raise ValidationError(f"{reference}: missing Markdown example in `{section}`")
-    return match.group(1) + "\n"
+    return match.group("body") + "\n"
 
 
 def self_test() -> int:
@@ -356,8 +364,50 @@ def self_test() -> int:
             print("self-test failed: valid fixture was rejected", file=sys.stderr)
             return 1
 
-        plan_path = plan_dir / "implementation-plan.md"
         task_path = task_dir / "01-example.md"
+        ready_task = task_path.read_text(encoding="utf-8")
+        for status in ("Planned", "Ready", "Complete", "Blocked"):
+            task_path.write_text(
+                _replace_metadata(ready_task, "Status", "Ready", status),
+                encoding="utf-8",
+            )
+            if validate_plan_directory(plan_dir):
+                print(
+                    f"self-test failed: `{status}` task fixture was rejected",
+                    file=sys.stderr,
+                )
+                return 1
+        task_path.write_text(ready_task, encoding="utf-8")
+
+        plan_path = plan_dir / "implementation-plan.md"
+
+        for execution_skill in (
+            "$wyrd-implement",
+            "$wyrd-ui",
+            "$wyrd-implement + $wyrd-ui",
+        ):
+            plan_with_skill = _replace_metadata(
+                plan_path.read_text(encoding="utf-8"),
+                "Execution skill",
+                "$wyrd-implement",
+                execution_skill,
+            )
+            task_with_skill = _replace_metadata(
+                task_path.read_text(encoding="utf-8"),
+                "Execution skill",
+                "$wyrd-implement",
+                execution_skill,
+            )
+            plan_path.write_text(plan_with_skill, encoding="utf-8")
+            task_path.write_text(task_with_skill, encoding="utf-8")
+            if validate_plan_directory(plan_dir):
+                print(
+                    f"self-test failed: `{execution_skill}` was rejected",
+                    file=sys.stderr,
+                )
+                return 1
+            plan_path.write_text(_valid_plan_text(), encoding="utf-8")
+            task_path.write_text(_valid_task_text(), encoding="utf-8")
 
         references = Path(__file__).resolve().parent.parent / "references"
         plan_path.write_text(

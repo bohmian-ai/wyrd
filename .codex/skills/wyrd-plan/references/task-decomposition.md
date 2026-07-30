@@ -9,6 +9,7 @@ packetization and separate task files are mandatory for every plan.
 - [Choose boundaries](#choose-boundaries)
 - [Plan and task ownership](#plan-and-task-ownership)
 - [Dependencies and parallelism](#dependencies-and-parallelism)
+- [Cold implementation rehearsal](#cold-implementation-rehearsal)
 - [Example decomposition](#example-decomposition)
 - [Decomposition audit](#decomposition-audit)
 
@@ -89,6 +90,30 @@ or target directory, regardless of source-task parallelism.
 If a task discovers a missing material decision, it stops and returns to Sol.
 It does not expand scope or invent a contract.
 
+## Cold implementation rehearsal
+
+Before marking a task `Ready`, run a read-only cold rehearsal. Use a fresh
+agent when the environment supports it and give that agent only the task
+packet, repository, and normal repository authorities. Do not provide the
+intended solution, suspected omissions, or prior planning conclusions.
+
+When fresh-agent delegation is unavailable, perform the same cold pass
+yourself from the task packet and document why an independent agent was
+unavailable. Unavailable delegation does not by itself block `Ready`.
+
+Require the rehearsal to:
+
+- locate every owner, target symbol, caller, and consumer;
+- trace trait and runtime dispatch where applicable;
+- confirm named fixtures, support exports, features, and explicit test targets;
+- inspect proposed commands and repository-managed setup;
+- walk the first implementation and test steps;
+- report any decision it would have to make while coding.
+
+Revise and repeat when the rehearsal finds a nonexistent seam, invalid command,
+missing impacted surface, or material choice. A document-only architecture
+review does not satisfy this gate.
+
 ## Example decomposition
 
 This example demonstrates structure only:
@@ -128,6 +153,8 @@ Before finalizing:
 - every task has one cohesive outcome;
 - task order follows contract and migration dependencies;
 - every task fits its assigned Terra/Luna context and reasoning level;
+- every task passed a documented cold read-only implementation rehearsal,
+  fresh-agent when available;
 - no task must reconstruct the full plan;
 - sequential overlap is explicit;
 - parallel tasks have non-overlapping write sets;

@@ -23,6 +23,22 @@ artifacts, external services, and test tier.
 Prefer repository `mise` tasks when they cover the required surface. Use raw
 Cargo only for a narrower pure test that needs no repository setup.
 
+Before a task becomes `Ready`, execution-check every proposed command:
+
+1. inspect the actual task or script body;
+2. confirm package, feature, explicit target, filter, fixture, and support
+   export names against current source and manifests;
+3. run the narrow command when feasible;
+4. at minimum compile the exact target with the exact feature selection;
+5. prove the filter selects the intended tests rather than zero or an
+   unrelated target;
+6. identify required repository setup, services, migrations, and checked-in
+   local test environment.
+
+Record the exact command that worked. If an external service is unavailable,
+separate proven command/setup shape from unexecuted runtime behavior. Do not
+mark unavailable runtime evidence as passed.
+
 ## Map requirements to proof
 
 For every requirement, identify:
@@ -51,6 +67,12 @@ For every task packet state:
 4. exact commands in sequential order;
 5. broad or unrelated commands the task must not run;
 6. evidence the implementer must return.
+
+Exact commands are executable recipes, not immutable user requirements. Mark a
+command normative only when its exact lane, feature set, or environment is
+itself part of the acceptance contract. Otherwise permit `$wyrd-implement` to
+replace a defective command with equivalent non-weaker proof and record the
+correction in the task.
 
 Select the smallest complete dependency surface:
 

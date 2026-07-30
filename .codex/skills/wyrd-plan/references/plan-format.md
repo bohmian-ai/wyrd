@@ -16,7 +16,7 @@ decisions and compiles them into separate executable task packets.
 
 ## Metadata
 
-```markdown
+````markdown
 # <Outcome-oriented title>
 
 Status: Draft | Review Required | Approved
@@ -28,12 +28,13 @@ Last updated: YYYY-MM-DD
 Plan version: 1
 Evidence snapshot: <branch> at <7-40 hex HEAD>; <relevant working-tree state>
 Review: <not required | required | .dev/review/<review-id>/review.md>
-Execution skill: $wyrd-implement
+Execution skill: $wyrd-implement | $wyrd-ui | $wyrd-implement + $wyrd-ui
 ```
 
 Use `Draft` while intent or material design is open. Use `Review Required`
 when the risk gate applies. Use `Approved` only after the readiness audit and
-required independent review.
+required independent review. List the execution skill or skill set required by
+the plan's task write sets.
 
 ## Required plan body
 
@@ -51,11 +52,30 @@ State the user or agent outcome and observable success.
 ### Verified
 - Current behavior, owners, source seams, callers, and tests.
 
+### Change-impact graph
+
+```mermaid
+flowchart LR
+    Seed[Seed change] -->|calls| Owner[Owning symbol]
+    Owner -->|consumed by| Consumer[Downstream consumer]
+    Owner -->|verified by| Check[Exact verification]
+```
+
+Use concrete repository nodes and labelled edges. Cover owners, callers,
+dispatch, manifests/features/targets, generated or language surfaces,
+persistence/audit/tenancy/lifecycle/deployment, and verification dependencies.
+Represent an inapplicable category with an explicit `no impact` node or an
+evidence-backed note immediately after the graph.
+
 ### Assumptions
 - Safe assumptions visible to implementation.
 
 ### Unknowns
 - Must be empty or explicitly non-material before approval.
+
+### Execution discoveries
+- Append implementation-time factual corrections and bounded mechanical
+  adaptations. Do not rewrite requirements or material decisions.
 
 ## Requirements
 
@@ -125,9 +145,10 @@ State the user or agent outcome and observable success.
 
 ## Execution handoff
 
-- Ordered task sequence, allowed parallel groups, `$wyrd-implement` invocation
-  contract, and the conditions that return work to planning.
-```
+- Ordered task sequence, allowed parallel groups, surface-appropriate
+  `$wyrd-implement` / `$wyrd-ui` invocation contract, and the conditions that
+  return work to planning.
+````
 
 For a small localized change, use
 `Not applicable: <one-sentence reason>` in sections such as migration or
@@ -148,6 +169,8 @@ Link every task file from the inventory. Task files inherit the approved plan
 but remain directly executable without the planning conversation.
 
 Do not mark a task `Ready` until the plan is `Approved`.
+Before marking it `Ready`, execution-check its commands and pass a cold
+read-only implementation rehearsal as defined by the planner skill.
 
 ## Verification and closeout
 
@@ -178,7 +201,7 @@ For the complete plan, define:
 
 This example is illustrative, not current Wyrd authority:
 
-```markdown
+````markdown
 # Return typed hydration conflicts
 
 Status: Approved
@@ -205,6 +228,16 @@ versions of the same exact Card identity, without changing successful hydration.
 - Duplicate insertion currently maps through the generic registry error.
 - Existing tests cover successful multi-card hydration but not conflicts.
 
+### Change-impact graph
+
+```mermaid
+flowchart LR
+    Hydrate[WorkspaceHydrator::hydrate] -->|reads| Identity[Exact identity and spec hash]
+    Hydrate -->|returns| Error[Existing registry conflict]
+    Hydrate -->|verified by| Tests[Hydration unit tests]
+    Hydrate -->|no public impact| Public[Public schemas and SDKs unchanged]
+```
+
 ### Assumptions
 
 - The existing public error catalog has an appropriate conflict family.
@@ -212,6 +245,10 @@ versions of the same exact Card identity, without changing successful hydration.
 ### Unknowns
 
 - None.
+
+### Execution discoveries
+
+- None at approval.
 
 ## Requirements
 
@@ -314,7 +351,7 @@ durable migration or deployment transition.
 
 Execute `tasks/01-hydration-conflict.md` with `$wyrd-implement`. Return to
 planning if the existing identity/hash seam or typed conflict does not exist.
-```
+````
 
 `tasks/01-hydration-conflict.md` must include the complete task structure,
 concrete paths and symbols, stubs or pseudocode, acceptance criteria, required
@@ -326,6 +363,9 @@ Before presenting or approving:
 
 - [ ] Objective and primary workflow are unambiguous.
 - [ ] Verified facts, assumptions, and unknowns are separated.
+- [ ] A concrete change-impact graph traces the seed change through owners,
+      callers/dispatch, build/test surfaces, generated or language projections,
+      operational concerns, and verification.
 - [ ] Every requirement maps to implementation and objective verification.
 - [ ] Non-goals and constraints prevent plausible scope expansion.
 - [ ] Architecture, owners, dependency direction, and compatibility are fixed.
@@ -338,7 +378,12 @@ Before presenting or approving:
 - [ ] Task dependencies leave coherent integration boundaries.
 - [ ] User journeys cover every shipped public surface.
 - [ ] Closeout uses current repository commands without unjustified repetition.
-- [ ] `$wyrd-implement` can execute every task without a material design choice.
+- [ ] Every task command, target, feature, filter, fixture, support export, and
+      repository-managed setup was execution-checked.
+- [ ] Every `Ready` task passed documented cold read-only implementation
+      rehearsal, using a fresh agent when available.
+- [ ] Each task's selected `$wyrd-implement` / `$wyrd-ui` skill set accepts its
+      write set and can execute without a material design choice.
 - [ ] Any required independent review returned `Approve`.
 
 The plan content is the evidence; do not copy the checklist into the artifact
@@ -355,7 +400,10 @@ unless its state helps execution.
   `.dev/plan/<slug>/implementation-plan.md`.
 - Save every packet under `.dev/plan/<slug>/tasks/`.
 - Update the canonical plan on revision instead of appending a competing plan.
-- Keep approved requirements and decisions stable during execution; return to
-  planning when an escalation condition invalidates them.
+- During execution, append factual discoveries under `Execution discoveries`
+  and bounded task updates under the task's `Completion evidence`.
+- Keep requirements, public or persisted contracts, security and tenancy
+  semantics, data-loss behavior, material architecture, and acceptance
+  outcomes stable; return for authority only when one must change.
 - Do not create progress ledgers, run directories, duplicate specs, or
   completion sentinels.

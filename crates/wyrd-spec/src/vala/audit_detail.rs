@@ -212,6 +212,35 @@ pub enum CardScopeMintKind {
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuditDetail {
+    /// A live Iceberg file replacement and its recoverable external boundary.
+    ///
+    /// The ordered paths are the exact current-snapshot inputs and the exact
+    /// rewrite outputs. `base_snapshot_id` is the plan fence, never an input
+    /// file's addition snapshot.
+    ForgeIcebergRewrite {
+        /// Stable identity shared by output names, Iceberg, and audit rows.
+        operation_id: uuid::Uuid,
+        /// Durable lifecycle transition represented by this row.
+        phase: ForgeIcebergRewritePhase,
+        /// Canonical tenant/table resource identity.
+        group: String,
+        /// Snapshot observed by the table plan before discovery.
+        base_snapshot_id: i64,
+        /// Snapshot returned after a proven replacement commit.
+        committed_snapshot_id: Option<i64>,
+        /// Destination partition specification identity.
+        partition_spec_id: i32,
+        /// Shared day partition for every exact input.
+        partition_day: String,
+        /// Target output size captured from the table metadata.
+        target_file_size_bytes: u64,
+        /// Exact ordered catalog paths deleted by the Iceberg action.
+        input_paths: Vec<StoragePath>,
+        /// Exact ordered rewritten object paths added by the Iceberg action.
+        output_paths: Vec<StoragePath>,
+        /// Physical recipe used to produce the outputs.
+        writer_recipe_version: String,
+    },
     /// A Forge compaction operation and its external Iceberg boundary.
     ///
     /// The ordered `output_paths` list is the sole greenfield output shape;
@@ -395,6 +424,21 @@ pub enum ForgeCompactionPhase {
     Reset,
 }
 
+/// Durable phase recorded for a live Iceberg replacement operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeIcebergRewritePhase {
+    /// Rewritten outputs were persisted before the external catalog commit.
+    Prepared,
+    /// The exact Iceberg replacement commit completed.
+    Committed,
+    /// Reconciliation proved a previously uncertain commit completed.
+    Recovered,
+    /// Reconciliation proved the prepared operation was not committed.
+    Reset,
+}
+
 /// Durable phase recorded for a Forge snapshot-expiry operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
@@ -468,6 +512,31 @@ mod tests {
             r#"{"backend":"s3","error_code":"STORAGE_BACKEND_FAILURE","kind":"storage","operation":"backend_failed","status_code":503,"storage_path":"cards/a","upload_id":null}"#
         );
         assert!(!audit_detail_canonical_json(&detail).contains(' '));
+    }
+
+    /// Preserves the live replacement audit shape across its persisted JSON boundary.
+    #[test]
+    fn forge_iceberg_rewrite_round_trips_with_explicit_plan_base() {
+        let detail = AuditDetail::ForgeIcebergRewrite {
+            operation_id: uuid::Uuid::from_u128(7),
+            phase: super::ForgeIcebergRewritePhase::Prepared,
+            group: "bifrost://tenant/vala/table".to_owned(),
+            base_snapshot_id: 41,
+            committed_snapshot_id: None,
+            partition_spec_id: 3,
+            partition_day: "2026-09-01".to_owned(),
+            target_file_size_bytes: 1024,
+            input_paths: vec![StoragePath::new("table/live-a.parquet").expect("valid input")],
+            output_paths: vec![StoragePath::new("table/rewrite-a.parquet").expect("valid output")],
+            writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        };
+        let json = serde_json::to_value(&detail).expect("serialize detail");
+        assert_eq!(json["kind"], "forge_iceberg_rewrite");
+        assert_eq!(json["base_snapshot_id"], 41);
+        assert_eq!(
+            serde_json::from_value::<AuditDetail>(json).expect("deserialize detail"),
+            detail
+        );
     }
 
     #[test]

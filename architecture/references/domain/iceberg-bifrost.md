@@ -162,8 +162,12 @@ boundaries.
 - Prefer append-oriented writes with bounded batching. Avoid
   one-file-per-event or one-Iceberg-commit-per-record paths.
 - Stamp reserved Bifrost system columns at the engine boundary, not in
-  user payloads: event time, ingested-at time, batch ID, and the
-  server-authenticated organization tenant ID on every physical table.
+  user payloads: event time, ingested-at time, batch ID, zero-based immutable
+  batch-local row ordinal, and the server-authenticated organization tenant ID
+  on every physical table. Stamp the non-null Iceberg `int` / Arrow `Int32`
+  ordinal before WAL append, reject batches at or above `i32::MAX` rows, and
+  preserve it unchanged through memory, Parquet, file-list, Forge, and Iceberg
+  paths.
 - Reject user writes to reserved system columns with a typed Wyrd error.
 - Use deterministic batch IDs or idempotency keys so retries can be
   detected.

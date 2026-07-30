@@ -1262,6 +1262,10 @@ impl StagingParquetExec {
                 let batch = batch.map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
                 validate_tenant_column(&batch, tenant)
                     .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
+                crate::schema::managed_columns::row_ordinals(&batch)
+                    .map_err(|error| datafusion::error::DataFusionError::Execution(
+                        format!("Forge row identity invariant failed: {error}")
+                    ))?;
                 let projected = project_by_name(&batch, Arc::clone(&schema))
                     .map_err(|error| datafusion::error::DataFusionError::External(Box::new(error)))?;
                 if projected.num_rows() > 0 {

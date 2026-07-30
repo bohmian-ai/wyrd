@@ -3,15 +3,16 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::tables::CorrelationPolicy;
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT,
+    WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
 };
 
 /// Append the Bifrost system columns (and policy-gated correlation columns)
 /// to the user fields of a pre-declared domain table.
 ///
 /// Column order: policy correlation columns first, then system timestamp
-/// columns, then `wyrd_batch_id`, then `data_tenant_id` (always present on
-/// domain tables, which are all `SystemShared`).
+/// columns, then `wyrd_batch_id`, immutable `wyrd_row_ordinal`, and
+/// `data_tenant_id` (always present on domain tables, which are all
+/// `SystemShared`).
 ///
 /// This is the single source of truth for what gets appended per policy.
 /// The appended columns here are excluded from `schema_fingerprint()`, which
@@ -50,6 +51,7 @@ pub fn ensure_managed_columns(
         DataType::FixedSizeBinary(16),
         false,
     ));
+    user_fields.push(Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false));
     // All domain tables are SystemShared — data_tenant_id is always present.
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
 
@@ -77,6 +79,7 @@ mod tests {
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
+                WYRD_ROW_ORDINAL,
                 DATA_TENANT_ID
             ]
         );

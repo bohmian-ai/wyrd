@@ -2,7 +2,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
 };
 
 /// Extend the user fields with the physical Bifrost columns for a dynamically-created
@@ -37,6 +37,7 @@ pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
         DataType::FixedSizeBinary(16),
         false,
     ));
+    user_fields.push(Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false));
     user_fields.push(Field::new(DATA_TENANT_ID, DataType::Utf8, false));
     user_fields
 }
@@ -63,6 +64,7 @@ mod tests {
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
+                WYRD_ROW_ORDINAL,
                 DATA_TENANT_ID,
             ]
         );

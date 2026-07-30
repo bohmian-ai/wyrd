@@ -1103,8 +1103,13 @@ internal surfaces — it would collide with the external `sql_warehouse` Source
 semantics.
 
 **Everything is a Bifrost table.** One table shape underlies every internal
-analytical table, with four reserved system columns: `wyrd_event_time`,
-`wyrd_ingested_at`, `wyrd_batch_id`, and `data_tenant_id`. The physical identity
+analytical table, with five reserved system columns: `wyrd_event_time`,
+`wyrd_ingested_at`, `wyrd_batch_id`, `wyrd_row_ordinal`, and
+`data_tenant_id`. `wyrd_row_ordinal` is the required non-null Iceberg `int` /
+Arrow `Int32` zero-based position within one immutable `wyrd_batch_id`. Scribe
+stamps it before WAL append, rejects batches at or above `i32::MAX` rows, and
+WAL, memory, Parquet, `vala.file_list`, Forge, and Iceberg preserve it without
+reassignment. The physical identity
 is always the authenticated organization plus the logical table:
 
 ```text

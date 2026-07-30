@@ -8,9 +8,10 @@ mod pg_tests {
     use std::time::Duration;
 
     use arrow::array::{
-        FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+        FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray,
     };
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::execution::memory_pool::GreedyMemoryPool;
     use iceberg::Catalog;
     use iceberg::spec::{
@@ -21,21 +22,33 @@ mod pg_tests {
     use opendal::services::Fs;
     use opendal::{Buffer, Operator};
     use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
     use vala_bifrost_redux::catalog::{
         BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
     };
+    use vala_bifrost_redux::contracts::{Scribe, ScribeAppend};
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
-    use vala_bifrost_redux::schema::with_managed_columns;
+    use vala_bifrost_redux::schema::{SchemaFingerprint, with_managed_columns};
+    use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
+    use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
+    use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
+    use vala_bifrost_redux::scribe::{
+        ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
+        ScribeLaneConfig, ScribePersistenceConfig, ScribePersistenceCpuPool, ScribeWalIoPool,
+    };
     use vala_sql::OperatorPool;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
     use wyrd_spec::DataTenantId;
-    use wyrd_spec::vala::WYRD_EVENT_TIME;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::{RUN_ID, WYRD_EVENT_TIME};
     use wyrd_storage::BackendConfig;
 
     /// Counts ranged source reads while delegating bytes to a local operator.
@@ -180,6 +193,14 @@ mod pg_tests {
                 .field_by_name("data_tenant_id")
                 .expect("tenant field")
                 .id;
+            let row_ordinal = schema
+                .field_by_name("wyrd_row_ordinal")
+                .expect("row identity field");
+            assert_eq!(
+                row_ordinal.field_type,
+                Box::new(Type::Primitive(PrimitiveType::Int))
+            );
+            assert!(row_ordinal.required);
             let partition_fields = table.metadata().default_partition_spec().fields();
             assert_eq!(partition_fields.len(), 1);
             assert_eq!(partition_fields[0].source_id, event_time_id);
@@ -196,13 +217,13 @@ mod pg_tests {
             }
         }
 
-        /// Build a real catalog, staging store, and Forge owner.
+        /// Build a real catalog, staging store, and Forge owner without source files.
         ///
         /// # Panics
         ///
         /// Panics when the embedded database, catalog, or fixture storage
         /// cannot be initialized; these are test-environment invariants.
-        async fn new() -> Self {
+        async fn new_unseeded() -> Self {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let tenant = pg.data_tenant_id();
             let table_name = format!("incremental_rows_{}", uuid::Uuid::now_v7().simple());
@@ -253,7 +274,7 @@ mod pg_tests {
                 maintenance_interval: Duration::from_millis(10),
             })
             .expect("forge");
-            let fixture = Self {
+            Self {
                 pg,
                 tenant,
                 binding,
@@ -263,7 +284,16 @@ mod pg_tests {
                 _root: root,
                 reads,
                 forge,
-            };
+            }
+        }
+
+        /// Build the standard Forge fixture with four staged source files.
+        ///
+        /// # Panics
+        ///
+        /// Panics when fixture construction or source seeding fails.
+        async fn new() -> Self {
+            let fixture = Self::new_unseeded().await;
             fixture.seed_files(4, false).await;
             fixture
         }
@@ -275,6 +305,218 @@ mod pg_tests {
                 DataType::Int64,
                 false,
             )]))
+        }
+
+        /// Writes four generations through Scribe's WAL, memtable, seal, and Parquet path.
+        ///
+        /// Returns the exact logical value and batch-local ordinal pairs expected
+        /// after Forge rewrites the sealed files.
+        ///
+        /// # Panics
+        ///
+        /// Panics when Scribe construction, admission, persistence, or fixture
+        /// SQL cannot establish the sealed input state.
+        async fn seal_row_identity_generations(&self) -> Vec<(i64, i32)> {
+            let wal_root = tempfile::tempdir().expect("WAL root");
+            let node_id = uuid::Uuid::now_v7();
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node_id.as_bytes(),
+                    1,
+                    WalConfig::default(),
+                )
+                .expect("WAL writer"),
+            );
+            let memory = BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("memory governor");
+            let lane_config = ScribeLaneConfig {
+                ingress_cpu_threads: 1,
+                persistence_cpu_threads: 1,
+                wal_io_threads: 1,
+            };
+            let pools = ScribeExecutionPools::new(
+                ScribeIngressCpuPool::new_with_capacity(lane_config.ingress_cpu_threads, 16),
+                ScribePersistenceCpuPool::new_with_capacity(
+                    lane_config.persistence_cpu_threads,
+                    16,
+                ),
+                ScribeWalIoPool::new_with_capacity(lane_config.wal_io_threads, 16),
+            );
+            let (publisher, _inbox) = staging_file_channel(16).expect("Scribe hint channel");
+            let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
+                operator: Arc::clone(&self.staging),
+                wal,
+                stream: StreamIdentity::new(NodeId::new(node_id), WriterEpoch::new(1)),
+                admission: vala_bifrost_redux::scribe::admission::AdmissionConfig::default(),
+                coordination_runtime: tokio::runtime::Handle::current(),
+                execution_pools: pools,
+                persistence: Some(ScribePersistenceConfig::new(
+                    Arc::new(self.pg.vala_postgres().clone()),
+                    16,
+                    1,
+                )),
+                memory_budget: Some(memory.scribe_budget()),
+                staging_file_publisher: Some(publisher),
+            }));
+            scribe.replay_wal_async().await.expect("empty replay");
+            let principal = Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                self.tenant,
+                Vec::new(),
+                PermissionSet::new(),
+            );
+            let event_time = chrono::DateTime::parse_from_rfc3339("2026-07-14T12:00:00Z")
+                .expect("event time")
+                .timestamp_micros();
+            let mut expected = Vec::new();
+            for generation in 0_i64..4 {
+                let values = (0_i64..3)
+                    .map(|row| generation * 10 + row)
+                    .collect::<Vec<_>>();
+                let row_count = values.len();
+                expected.extend(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, value)| (*value, ordinal as i32)),
+                );
+                let schema = Arc::new(Schema::new(vec![
+                    Field::new(
+                        WYRD_EVENT_TIME,
+                        DataType::Timestamp(TimeUnit::Microsecond, None),
+                        false,
+                    ),
+                    Field::new("value", DataType::Int64, false),
+                    Field::new(RUN_ID, DataType::Utf8, true),
+                ]));
+                let rows = RecordBatch::try_new(
+                    schema,
+                    vec![
+                        Arc::new(TimestampMicrosecondArray::from(vec![
+                            event_time + generation;
+                            row_count
+                        ])),
+                        Arc::new(Int64Array::from(values)),
+                        Arc::new(StringArray::from(vec![None::<String>; row_count])),
+                    ],
+                )
+                .expect("Scribe source batch");
+                scribe
+                    .append_durable(ScribeAppend {
+                        principal: principal.clone(),
+                        table: self.binding.table_ref.clone(),
+                        schema_fingerprint: SchemaFingerprint::from_arrow_schema(
+                            rows.schema().as_ref(),
+                        ),
+                        request_id: RequestId::now_v7(),
+                        batch_id: uuid::Uuid::now_v7(),
+                        measured_wire_bytes: rows.get_array_memory_size(),
+                        rows,
+                    })
+                    .await
+                    .expect("Scribe append");
+                scribe
+                    .flush_writable_for_test()
+                    .await
+                    .expect("generation flush");
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                loop {
+                    let stats = scribe.memtable_stats().expect("memtable stats");
+                    if scribe.persistence_queue_depth_for_test() == 0
+                        && stats.pending_generations == 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "sealed generation did not publish"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            scribe.shutdown().await;
+            sqlx::query(
+                "UPDATE vala.file_list
+                    SET created_at = now() - interval '3 minutes'
+                  WHERE data_tenant_id = $1
+                    AND namespace = $2
+                    AND table_name = $3",
+            )
+            .bind(self.tenant.as_uuid())
+            .bind(&self.binding.logical_namespace)
+            .bind(&self.binding.table_name)
+            .execute(self.operator_pool.pool())
+            .await
+            .expect("sealed inputs age for Forge");
+            expected
+        }
+
+        /// Reads every live Iceberg output and returns its logical value/ordinal pairs.
+        ///
+        /// # Panics
+        ///
+        /// Panics when manifest or Parquet output cannot be decoded through the
+        /// fixture's production catalog and object store.
+        async fn live_row_identity(&self) -> Vec<(i64, i32)> {
+            let table = self
+                .catalog
+                .load_table(&self.binding.table_ident())
+                .await
+                .expect("committed table");
+            let location = table.metadata().location().trim_end_matches('/');
+            let snapshot = table.metadata().current_snapshot().expect("snapshot");
+            let manifests = table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await
+                .expect("manifest list");
+            let mut identity = Vec::new();
+            for manifest_file in manifests.entries() {
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .expect("manifest");
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    let catalog_path = entry.data_file().file_path();
+                    let relative = catalog_path
+                        .strip_prefix(&format!("{location}/"))
+                        .expect("catalog path remains below table location");
+                    let object_path = format!(
+                        "{}/{relative}",
+                        self.binding.object_prefix.trim_end_matches('/')
+                    );
+                    let bytes = self
+                        .staging
+                        .read(&object_path)
+                        .await
+                        .expect("Forge output reads");
+                    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes.to_bytes())
+                        .expect("Parquet reader")
+                        .build()
+                        .expect("Parquet batches");
+                    for batch in reader {
+                        let batch = batch.expect("Parquet batch");
+                        let values = batch
+                            .column_by_name("value")
+                            .expect("logical value persists")
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("value remains Int64");
+                        let ordinals = batch
+                            .column_by_name("wyrd_row_ordinal")
+                            .expect("row identity persists")
+                            .as_any()
+                            .downcast_ref::<Int32Array>()
+                            .expect("row identity remains Int32");
+                        identity.extend(
+                            (0..batch.num_rows())
+                                .map(|row| (values.value(row), ordinals.value(row))),
+                        );
+                    }
+                }
+            }
+            identity
         }
 
         /// Seed Parquet objects and durable file-list rows, optionally aged.
@@ -343,6 +585,7 @@ mod pg_tests {
                             .with_timezone("UTC"),
                         ),
                         Arc::new(batch_ids.finish()),
+                        Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
                         Arc::new(StringArray::from(vec![
                             self.tenant.to_string();
                             row_count_usize
@@ -575,6 +818,22 @@ mod pg_tests {
             output_rows, 3_200_000,
             "rewrite must conserve every input row"
         );
+    }
+
+    /// Preserves logical values and immutable batch ordinals from Scribe seal through Forge.
+    #[tokio::test]
+    async fn seal_and_forge_preserve_row_identity() {
+        let fixture = Fixture::new_unseeded().await;
+        let mut expected = fixture.seal_row_identity_generations().await;
+        let outcome = fixture.forge.run_once().await.expect("Forge rewrite");
+        assert_eq!(outcome.bins_committed, 1, "outcome: {outcome:?}");
+        assert_eq!(outcome.input_rows, expected.len() as u64);
+        assert_eq!(outcome.output_rows, expected.len() as u64);
+
+        let mut actual = fixture.live_row_identity().await;
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     /// Evolve the fixture table and return its reloaded current schema identity.

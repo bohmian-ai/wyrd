@@ -20,7 +20,15 @@ use crate::catalog::{TableRef, TenantTableBinding};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::stream_identity::StreamIdentity;
 
-fn projected_source_schema_fingerprint(schema: &arrow::datatypes::Schema) -> SchemaFingerprint {
+/// Computes the user-visible fingerprint from a physical Scribe Arrow schema.
+///
+/// Tail planning and fenced reads use this same projection as ingest admission:
+/// server-owned correlation and `wyrd_*` fields never change a table's user
+/// schema identity.
+#[must_use]
+pub(crate) fn projected_source_schema_fingerprint(
+    schema: &arrow::datatypes::Schema,
+) -> SchemaFingerprint {
     let fields = schema
         .fields()
         .iter()

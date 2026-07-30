@@ -12,13 +12,14 @@ use secrecy::ExposeSecret;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
-use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
+use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalWriter};
 use vala_bifrost_redux::scribe::{
     ScribeBuildConfig, ScribeExecutionPools, ScribeImpl, ScribeIngressCpuPool,
@@ -32,6 +33,7 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
+use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
@@ -136,6 +138,10 @@ struct BifrostIngestParts {
     scribe: Arc<ScribeImpl>,
     /// Dedicated runtime that owns Scribe coordination tasks.
     coordination_runtime: Arc<tokio::runtime::Runtime>,
+    /// Role-fenced membership owner shared with the runtime shutdown path.
+    cluster_registry: Arc<ClusterRegistry>,
+    /// Independently fenced Scribe role registered during this boot.
+    scribe_role: RegisteredRole,
 }
 
 /// Errors raised while assembling server state.
@@ -318,9 +324,29 @@ async fn build_bifrost_parts_from_boot(
     let node_id = NodeId::generate();
     let advertise_addr =
         std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-    let stream = acquire_on_boot(&operator_pool, node_id, "scribe", &advertise_addr)
+    let cluster_registry = Arc::new(ClusterRegistry::new(
+        operator_pool.clone(),
+        ClusterNodeId::new(node_id.as_uuid()),
+    ));
+    let scribe_role = cluster_registry
+        .register_scribe(
+            &advertise_addr,
+            ScribeCapabilitiesV1 {
+                tail_protocol_version: vala_bifrost_redux::scribe::tail_rpc::TAIL_PROTOCOL_VERSION,
+            },
+        )
         .await
         .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    cluster_registry
+        .refresh_snapshot()
+        .await
+        .map_err(|error| ServerBootError::Scribe(error.to_string()))?;
+    let stream = StreamIdentity::new(
+        node_id,
+        WriterEpoch::new(i64::try_from(scribe_role.fencing_token).map_err(|_| {
+            ServerBootError::Scribe("Scribe role fence exceeds the WAL epoch range".to_owned())
+        })?),
+    );
     let wal_dir = std::env::var_os("WYRD_SCRIBE_WAL_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(".wyrd/scribe-wal"));
@@ -448,6 +474,8 @@ async fn build_bifrost_parts_from_boot(
         state,
         scribe,
         coordination_runtime,
+        cluster_registry,
+        scribe_role,
     })
 }
 
@@ -510,7 +538,8 @@ pub async fn build_state(
         verifier,
         vala_bifrost_redux::gate::limits::IngestLimits::default(),
         Some(bifrost_parts.coordination_runtime),
-    ));
+    )
+    .with_scribe_role(bifrost_parts.cluster_registry, bifrost_parts.scribe_role));
     let state = state.with_bifrost_ingest(ingest);
     seed_federation(&state, config, sealing_key.as_deref()).await?;
 

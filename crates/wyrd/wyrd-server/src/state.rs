@@ -7,12 +7,14 @@ use datafusion::execution::memory_pool::MemoryPool;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::Forge;
 use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
+use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
@@ -46,10 +48,25 @@ pub type ServerGate =
 pub struct BifrostIngestRuntime {
     /// Durable Scribe implementation used by every Gate dispatch and lifecycle path.
     scribe: Arc<ScribeImpl>,
+    /// One fence registry shared by every local and authenticated tonic tail read.
+    tail_reader: Arc<ScribeTailReader>,
     /// Protocol and policy boundary built around [`Self::scribe`].
     gate: Arc<ServerGate>,
     /// Optional dedicated runtime that owns Scribe coordination tasks in production.
     coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    /// Optional production Scribe role lifecycle; embedded/test writers need no SQL membership.
+    scribe_role: Option<ScribeRoleRuntime>,
+}
+
+/// Owns the independently fenced Scribe membership lifecycle for one server process.
+#[derive(Clone)]
+struct ScribeRoleRuntime {
+    /// Shared durable role registry used by heartbeat, discovery, and shutdown.
+    registry: Arc<ClusterRegistry>,
+    /// Exact Scribe fence registered during this boot.
+    registered: RegisteredRole,
+    /// Cancels the recurring heartbeat and snapshot tasks before role removal.
+    shutdown: CancellationToken,
 }
 
 impl BifrostIngestRuntime {
@@ -65,6 +82,11 @@ impl BifrostIngestRuntime {
         limits: IngestLimits,
         coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
     ) -> Self {
+        let tail_reader = Arc::new(
+            scribe
+                .tail_reader()
+                .expect("constructed Scribe must retain a valid UUID stream identity"),
+        );
         let gate_scribe: Arc<dyn Scribe> = scribe.clone();
         let gate = Arc::new(ServerGate::with_scribe_and_projection(
             catalog,
@@ -75,9 +97,35 @@ impl BifrostIngestRuntime {
         ));
         Self {
             scribe,
+            tail_reader,
             gate,
             coordination_runtime,
+            scribe_role: None,
         }
+    }
+
+    /// Starts the independently fenced Scribe role lifecycle on the active server runtime.
+    ///
+    /// The registry owns durable role mutations. The runtime retains only the
+    /// cancellation edge so shutdown can stop both recurring tasks before it
+    /// removes exactly the role fence created at boot.
+    #[must_use]
+    pub fn with_scribe_role(
+        mut self,
+        registry: Arc<ClusterRegistry>,
+        registered: RegisteredRole,
+    ) -> Self {
+        let shutdown = CancellationToken::new();
+        std::mem::drop(
+            Arc::clone(&registry).start_heartbeat(registered.clone(), shutdown.clone()),
+        );
+        std::mem::drop(Arc::clone(&registry).start_snapshot_poller(shutdown.clone()));
+        self.scribe_role = Some(ScribeRoleRuntime {
+            registry,
+            registered,
+            shutdown,
+        });
+        self
     }
 
     /// Returns the Gate mounted by gRPC and HTTP ingest routes.
@@ -90,6 +138,12 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn scribe(&self) -> &Arc<ScribeImpl> {
         &self.scribe
+    }
+
+    /// Returns the shared Scribe-owned tail reader mounted only on private paths.
+    #[must_use]
+    pub fn tail_reader(&self) -> Arc<ScribeTailReader> {
+        Arc::clone(&self.tail_reader)
     }
 
     /// Reports whether the ingest writer has completed recovery and can accept work.
@@ -107,6 +161,12 @@ impl BifrostIngestRuntime {
     pub async fn shutdown(&self) {
         self.gate.close();
         self.scribe.shutdown().await;
+        if let Some(role) = &self.scribe_role {
+            role.shutdown.cancel();
+            if let Err(error) = role.registry.shutdown_role(role.registered.clone()).await {
+                tracing::warn!(%error, "failed to unregister the Scribe role during shutdown");
+            }
+        }
     }
 
     /// Returns whether this runtime retains a dedicated coordination executor.

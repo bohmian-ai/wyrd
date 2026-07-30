@@ -4,6 +4,8 @@ pub const WYRD_EVENT_TIME: &str = "wyrd_event_time";
 pub const WYRD_INGESTED_AT: &str = "wyrd_ingested_at";
 /// Arrow column name for the 16-byte batch idempotency key.
 pub const WYRD_BATCH_ID: &str = "wyrd_batch_id";
+/// Arrow column name for the zero-based immutable row identity within a batch.
+pub const WYRD_ROW_ORDINAL: &str = "wyrd_row_ordinal";
 /// Arrow column name for the server-minted request correlation id.
 pub const WYRD_REQUEST_ID: &str = "wyrd_request_id";
 /// Arrow column name for the tenant isolation key on every physical table.
@@ -14,6 +16,7 @@ pub const RESERVED_MANAGED_COLUMNS: &[&str] = &[
     WYRD_EVENT_TIME,
     WYRD_INGESTED_AT,
     WYRD_BATCH_ID,
+    WYRD_ROW_ORDINAL,
     WYRD_REQUEST_ID,
     DATA_TENANT_ID,
 ];
@@ -40,6 +43,8 @@ pub struct ManagedColumnSet {
     pub ingested_at: &'static str,
     /// Column name for the batch idempotency key.
     pub batch_id: &'static str,
+    /// Column name for the immutable row ordinal within the batch.
+    pub row_ordinal: &'static str,
     /// Column name for the tenant isolation key.
     pub tenant_id: &'static str,
 }
@@ -51,6 +56,7 @@ impl ManagedColumnSet {
             event_time: WYRD_EVENT_TIME,
             ingested_at: WYRD_INGESTED_AT,
             batch_id: WYRD_BATCH_ID,
+            row_ordinal: WYRD_ROW_ORDINAL,
             tenant_id: DATA_TENANT_ID,
         }
     }

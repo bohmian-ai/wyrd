@@ -4,11 +4,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arrow::array::{
-    FixedSizeBinaryBuilder, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    FixedSizeBinaryBuilder, Int32Array, Int64Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::StreamWriter;
 use opendal::services::Memory;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use secrecy::ExposeSecret;
 use tempfile::TempDir;
 use vala_bifrost_redux::catalog::{BifrostCatalog, CreateTableRequest, TableRef};
@@ -373,6 +375,7 @@ fn managed_batch_bytes(
             false,
         ),
         Field::new("wyrd_batch_id", DataType::FixedSizeBinary(16), false),
+        Field::new("wyrd_row_ordinal", DataType::Int32, false),
         Field::new("data_tenant_id", DataType::Utf8, false),
     ]));
     let timestamp = chrono::Utc::now().timestamp_micros();
@@ -402,6 +405,7 @@ fn managed_batch_bytes(
                 TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"),
             ),
             Arc::new(batch_builder.finish()),
+            Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
             Arc::new(StringArray::from(vec![tenant.to_string(); row_count])),
         ],
     )
@@ -857,6 +861,45 @@ async fn replayed_generation_publishes_durably_after_restart() {
     );
     assert_eq!(audit_count(&fixture).await, 3);
     assert_eq!(object_paths(&fixture).await.len(), 3);
+    fixture.stop().await;
+}
+
+/// Preserves immutable row identity from a replayed WAL Arrow batch into Parquet publication.
+#[tokio::test]
+async fn wal_replay_preserves_row_identity() {
+    let fixture = PersistenceFixture::start_after_wal_restart(false).await;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let path = loop {
+        let persisted = rows(&fixture).await;
+        if fixture.scribe.persistence_queue_depth_for_test() == 0 && !persisted.is_empty() {
+            break persisted[0].2.clone();
+        }
+        assert!(Instant::now() < deadline, "replay publication stalled");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let bytes = fixture.operator.read(&path).await.expect("published parquet reads");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
+        .expect("published object is parquet");
+    let reader = builder.build().expect("parquet reader builds");
+    let ordinals = reader
+        .map(|batch| {
+            let batch = batch.expect("parquet batch decodes");
+            batch
+                .column_by_name("wyrd_row_ordinal")
+                .expect("row identity column persists")
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("row identity remains Int32")
+                .values()
+                .to_vec()
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals.len(), 50_000);
+    assert!(ordinals
+        .iter()
+        .enumerate()
+        .all(|(index, ordinal)| *ordinal == index as i32));
     fixture.stop().await;
 }
 

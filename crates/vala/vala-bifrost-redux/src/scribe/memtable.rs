@@ -241,6 +241,11 @@ impl Memtable {
                     detail: format!("replayed Arrow batch merge failed: {error}"),
                 }
             })?;
+            crate::schema::managed_columns::row_ordinals(&batch).map_err(|error| {
+                ScribeError::Internal {
+                    detail: format!("replayed row identity invariant failed: {error}"),
+                }
+            })?;
             let rows_accepted = batch.num_rows();
             batches.push(batch);
             metas.push(ScribeAppendMeta {
@@ -1095,10 +1100,13 @@ mod tests {
     use super::*;
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
+    use crate::scribe::preprocess::AppendSliceId;
+    use crate::scribe::replay::{ReplayedAppendMeta, ReplayedSealKey};
     use crate::scribe::seal_key::EventDay;
     use crate::scribe::wal::WalLsn;
-    use arrow::array::Int64Array;
+    use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::StreamWriter;
     use chrono::NaiveDate;
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -1156,6 +1164,63 @@ mod tests {
             wal_lsn_min: i64::try_from(min).expect("test lsn"),
             wal_lsn_max: i64::try_from(max).expect("test lsn"),
         }
+    }
+
+    /// Encodes one replay handoff carrying caller-selected persisted ordinals.
+    fn replayed_ordinals(values: Vec<i32>) -> ReplayedSealKey {
+        let rows_accepted = values.len();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            wyrd_spec::vala::WYRD_ROW_ORDINAL,
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(values))])
+            .expect("ordinal batch");
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &schema).expect("IPC writer");
+        writer.write(&batch).expect("IPC batch");
+        writer.finish().expect("IPC finish");
+        let seal_key = make_test_seal_key();
+        let batch_id = uuid::Uuid::now_v7();
+        ReplayedSealKey {
+            seal_key: seal_key.clone(),
+            audit_events: vec![make_test_event()],
+            data_records: vec![bytes],
+            append_metas: vec![ReplayedAppendMeta {
+                batch_id: *batch_id.as_bytes(),
+                wal_lsn: WalLsn::new(1),
+                rows_accepted,
+                append_slice_id: AppendSliceId { batch_id, seal_key },
+                schema_fingerprint: [0; 32],
+            }],
+            wal_segments: Vec::new(),
+        }
+    }
+
+    /// Fails replay before state mutation when persisted row identity is negative.
+    #[test]
+    fn negative_persisted_ordinal_fails_invariant() {
+        let error = Memtable::decode_replayed(&replayed_ordinals(vec![-1]))
+            .expect_err("negative row identity cannot enter replayed state");
+        assert!(matches!(
+            error,
+            ScribeError::Internal { detail }
+                if detail.contains("row identity invariant") && detail.contains("negative")
+        ));
+    }
+
+    /// Preserves a valid non-zero slice ordinal instead of assigning from replay position.
+    #[test]
+    fn replayed_batch_does_not_reassign_ordinal() {
+        let frozen = Memtable::decode_replayed(&replayed_ordinals(vec![2, 3]))
+            .expect("valid replayed ordinals decode");
+        let ordinals = frozen.batches[0]
+            .column_by_name(wyrd_spec::vala::WYRD_ROW_ORDINAL)
+            .expect("ordinal column persists")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("ordinal remains Int32");
+        assert_eq!(ordinals.values(), &[2, 3]);
     }
 
     #[test]

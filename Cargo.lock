@@ -9807,6 +9807,7 @@ dependencies = [
 name = "vala-bifrost-redux"
 version = "0.0.1"
 dependencies = [
+ "arc-swap",
  "arrow",
  "async-stream",
  "async-trait",

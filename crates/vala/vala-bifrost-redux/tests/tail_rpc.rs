@@ -1,18 +1,28 @@
 use std::sync::Arc;
+use std::time::{Duration as StdDuration, Instant};
 
-use arrow::array::{RecordBatch, StringArray, TimestampMicrosecondArray};
+use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use chrono::NaiveDate;
+use chrono::{Duration, NaiveDate, Utc};
 use uuid::Uuid;
 use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::schema::fingerprint::SchemaFingerprint;
+use vala_bifrost_redux::scribe::file_list_writer::FileListCommitKey;
 use vala_bifrost_redux::scribe::memtable::Memtable;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
+use vala_bifrost_redux::scribe::tail_rpc::{
+    FetchLiveTailRequest, FetchLiveTailService, LocalTailPage, ScribeTailReader, TailFenceConfig,
+    TailFrame, TailReadError,
+};
 use vala_bifrost_redux::scribe::wal::{ScribeAppendMeta, WalLsn};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult, AuthMethod};
+use wyrd_spec::vala::api::{
+    AcquireTailFenceRequest, AuditDecision, AuditEvent, AuditResult, AuthMethod,
+    EventDay as WireEventDay, SchemaFingerprint as WireSchemaFingerprint, TailCursor,
+    TailPageRequest, TenantTableBinding as WireBinding,
+};
 
 fn batch(tenant: DataTenantId, value: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -22,6 +32,7 @@ fn batch(tenant: DataTenantId, value: i64) -> RecordBatch {
             DataType::Timestamp(TimeUnit::Microsecond, None),
             false,
         ),
+        Field::new("wyrd_row_ordinal", DataType::Int32, false),
         Field::new("value", DataType::Int64, false),
     ]));
     RecordBatch::try_new(
@@ -29,6 +40,7 @@ fn batch(tenant: DataTenantId, value: i64) -> RecordBatch {
         vec![
             Arc::new(StringArray::from(vec![tenant.to_string()])),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000i64])),
+            Arc::new(Int32Array::from(vec![0])),
             Arc::new(arrow::array::Int64Array::from(vec![value])),
         ],
     )
@@ -82,6 +94,33 @@ fn request(
     }
 }
 
+/// Builds one typed private-fence request matching the in-memory tail fixture.
+fn fence_request(binding: TenantTableBinding, stream: StreamIdentity) -> AcquireTailFenceRequest {
+    let expected = SchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
+        "value",
+        DataType::Int64,
+        false,
+    )]));
+    AcquireTailFenceRequest {
+        binding: WireBinding {
+            tenant_id: binding.tenant,
+            namespace: "bifrost".to_owned(),
+            table: binding.table_ref.name.clone(),
+        },
+        event_day: WireEventDay::new("2026-07-14").expect("fixture event day"),
+        exclusive_sealed: TailCursor {
+            writer_epoch: u64::try_from(stream.writer_epoch.as_i64()).expect("positive epoch"),
+            wal_lsn: 0,
+            batch_id: Uuid::nil(),
+            row_ordinal: 0,
+        },
+        deadline: Utc::now() + Duration::seconds(5),
+        schema_fingerprint: WireSchemaFingerprint::new(hex::encode(expected.0))
+            .expect("fixture fingerprint"),
+        tail_protocol_version: 1,
+    }
+}
+
 fn append(memtable: &Memtable, tenant: DataTenantId, table: &TableRef, lsn: u64, value: i64) {
     let key = SealKey::new(
         tenant,
@@ -102,6 +141,25 @@ fn append(memtable: &Memtable, tenant: DataTenantId, table: &TableRef, lsn: u64,
             batch(tenant, value),
         )
         .expect("append");
+}
+
+/// Extracts logical values from shallow one-row tail batches for lifecycle assertions.
+fn page_values(page: &LocalTailPage) -> Vec<i64> {
+    page.batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("value")
+                .expect("tail page retains the logical value column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("tail value column remains Int64")
+                .values()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn append_without_tenant(memtable: &Memtable, tenant: DataTenantId, table: &TableRef) {
@@ -211,6 +269,212 @@ async fn empty_tail_has_exactly_one_complete_frame() {
         .await
         .expect("empty tail");
     assert_eq!(frames, vec![TailFrame::Complete]);
+}
+
+/// Returns row-precise pages that resume strictly after the last cursor.
+#[tokio::test]
+async fn page_continuation_is_row_precise() {
+    let (memtable, stream, tenant, table, binding) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    append(&memtable, tenant, &table, 2, 2);
+    let reader = ScribeTailReader::new(
+        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        TailFenceConfig::default(),
+    );
+    let fence = reader
+        .acquire_fence(fence_request(binding, stream))
+        .await
+        .expect("acquires metadata only");
+    let first = reader
+        .read_page(TailPageRequest {
+            fence_id: fence.fence_id,
+            after: None,
+            max_rows: 1,
+            max_encoded_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("first row page");
+    assert_eq!(first.batches.len(), 1);
+    assert!(!first.complete);
+    let second = reader
+        .read_page(TailPageRequest {
+            fence_id: fence.fence_id,
+            after: first.next,
+            max_rows: 1,
+            max_encoded_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("second row page");
+    assert_eq!(second.batches.len(), 1);
+    assert!(second.complete);
+}
+
+/// Refuses a full registry without reserving capacity for the rejected fence.
+#[tokio::test]
+async fn capacity_rejection_leaves_no_fence() {
+    let (memtable, stream, tenant, table, binding) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    let reader = ScribeTailReader::new(
+        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        TailFenceConfig {
+            max_fences: 1,
+            ..TailFenceConfig::default()
+        },
+    );
+    let first = reader
+        .acquire_fence(fence_request(binding.clone(), stream))
+        .await
+        .expect("first fence reserves capacity");
+    let error = reader
+        .acquire_fence(fence_request(binding.clone(), stream))
+        .await
+        .expect_err("second fence exceeds the configured capacity");
+    assert!(matches!(
+        error,
+        vala_bifrost_redux::scribe::tail_rpc::TailReadError::Capacity
+    ));
+    assert!(
+        reader
+            .release_fence(first.fence_id)
+            .expect("release succeeds")
+            .released
+    );
+    reader
+        .acquire_fence(fence_request(binding, stream))
+        .await
+        .expect("rejected acquisition left no partial capacity charge");
+}
+
+/// Reclaims expiry once and makes a racing idempotent release a harmless no-op.
+#[tokio::test]
+async fn release_and_expiry_race_reclaims_once() {
+    let (memtable, stream, tenant, table, binding) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    let reader = ScribeTailReader::new(
+        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        TailFenceConfig {
+            ttl: StdDuration::from_millis(1),
+            ..TailFenceConfig::default()
+        },
+    );
+    let fence = reader
+        .acquire_fence(fence_request(binding, stream))
+        .await
+        .expect("fence acquires");
+    let expiry = reader.expire_due(Instant::now() + StdDuration::from_secs(1), 1);
+    assert_eq!(expiry.released, 1);
+    assert!(
+        !reader
+            .release_fence(fence.fence_id)
+            .expect("racing release is idempotent")
+            .released
+    );
+}
+
+/// Rejects one encoded row that cannot fit without returning a partial page.
+#[tokio::test]
+async fn single_oversize_row_fails_empty() {
+    let (memtable, stream, tenant, table, binding) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    let reader = ScribeTailReader::new(
+        Arc::new(FetchLiveTailService::new(stream, memtable)),
+        TailFenceConfig {
+            max_page_encoded_bytes: 1,
+            ..TailFenceConfig::default()
+        },
+    );
+    let fence = reader
+        .acquire_fence(fence_request(binding, stream))
+        .await
+        .expect("fence acquires before paging");
+    let error = reader
+        .read_page(TailPageRequest {
+            fence_id: fence.fence_id,
+            after: None,
+            max_rows: 1,
+            max_encoded_bytes: u32::MAX,
+        })
+        .await
+        .expect_err("one row cannot fit the configured encoded-byte ceiling");
+    assert!(matches!(error, TailReadError::OversizeRow));
+    assert!(
+        reader
+            .release_fence(fence.fence_id)
+            .expect("oversize failure leaves the fence releasable")
+            .released
+    );
+}
+
+/// Preserves one acquired interval while its source generation seals, rotates, and retires.
+#[tokio::test]
+async fn seal_and_rotation_preserve_fence() {
+    let (memtable, stream, tenant, table, binding) = setup();
+    append(&memtable, tenant, &table, 1, 1);
+    append(&memtable, tenant, &table, 2, 2);
+    let reader = ScribeTailReader::new(
+        Arc::new(FetchLiveTailService::new(stream, Arc::clone(&memtable))),
+        TailFenceConfig::default(),
+    );
+    let fence = reader
+        .acquire_fence(fence_request(binding, stream))
+        .await
+        .expect("fence freezes the writable interval");
+    let key = SealKey::new(
+        tenant,
+        table.clone(),
+        EventDay::new(NaiveDate::from_ymd_opt(2026, 7, 14).expect("date")),
+    );
+    let frozen = memtable.freeze(&key).expect("active generation seals");
+    let first = reader
+        .read_page(TailPageRequest {
+            fence_id: fence.fence_id,
+            after: None,
+            max_rows: 1,
+            max_encoded_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("first retained row remains readable after seal");
+    assert_eq!(page_values(&first), vec![1]);
+    assert!(!first.complete);
+
+    append(&memtable, tenant, &table, 3, 3);
+    memtable
+        .complete_post_commit(
+            frozen.seal_id,
+            FileListCommitKey {
+                data_tenant_id: tenant,
+                namespace: "vala.bifrost".to_owned(),
+                table_name: table.name.clone(),
+                node_id: stream.node_id.as_uuid(),
+                writer_epoch: stream.writer_epoch.as_i64(),
+                wal_lsn_min: 1,
+                wal_lsn_max: 2,
+            },
+        )
+        .expect("sealed generation commits");
+    let retired = memtable
+        .sweep_once_at(Instant::now() + StdDuration::from_secs(120))
+        .expect("committed generation retires from the memtable");
+    assert_eq!(retired.len(), 1);
+
+    let second = reader
+        .read_page(TailPageRequest {
+            fence_id: fence.fence_id,
+            after: first.next,
+            max_rows: 1,
+            max_encoded_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("continuation retains the sealed generation after retirement");
+    assert_eq!(page_values(&second), vec![2]);
+    assert!(second.complete);
+    assert_eq!(second.next, Some(fence.inclusive_live));
+    assert!(
+        reader
+            .release_fence(fence.fence_id)
+            .expect("release reclaims retained shallow handles")
+            .released
+    );
 }
 
 #[tokio::test]

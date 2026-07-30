@@ -10,6 +10,7 @@
 #[cfg(feature = "bench-support")]
 pub mod bench_support;
 pub mod catalog;
+pub mod cluster;
 pub mod contracts;
 pub mod forge;
 pub mod gate;

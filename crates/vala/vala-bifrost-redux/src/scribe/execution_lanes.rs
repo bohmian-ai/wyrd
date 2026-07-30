@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use arrow::array::{
-    Array, ArrayRef, FixedSizeBinaryBuilder, StringArray, TimestampMicrosecondArray,
+    Array, ArrayRef, FixedSizeBinaryBuilder, Int32Builder, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -34,7 +34,7 @@ use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
     CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_REQUEST_ID,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
 };
 
 #[cfg(test)]
@@ -315,10 +315,16 @@ fn decode(
     } else {
         arrow::compute::concat_batches(&schema, &batches).map_err(|_| ScribeError::InvalidFrame)?
     };
+    if rows.num_rows() >= i32::MAX as usize {
+        return Err(ScribeError::TooManyRows {
+            rows: rows.num_rows() as u64,
+            limit: (i32::MAX - 1) as u64,
+        });
+    }
     for field in rows.schema().fields() {
         let reserved = match field.name().as_str() {
             CARD_UID | PRINCIPAL_ID | "run_id" | DATA_TENANT_ID | WYRD_BATCH_ID
-            | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
+            | WYRD_ROW_ORDINAL | WYRD_INGESTED_AT | WYRD_REQUEST_ID => true,
             WYRD_EVENT_TIME => native_payload,
             _ => false,
         };
@@ -419,6 +425,7 @@ fn server_owned_columns(native_payload: bool) -> Vec<&'static str> {
         WYRD_REQUEST_ID,
         WYRD_INGESTED_AT,
         WYRD_BATCH_ID,
+        WYRD_ROW_ORDINAL,
         DATA_TENANT_ID,
     ];
     if native_payload {
@@ -506,6 +513,7 @@ fn append_managed_columns(
             false,
         ),
         Field::new(WYRD_BATCH_ID, DataType::FixedSizeBinary(16), false),
+        Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false),
         Field::new(DATA_TENANT_ID, DataType::Utf8, false),
     ]);
     let timestamp: i64 = std::time::SystemTime::now()
@@ -534,6 +542,16 @@ fn append_managed_columns(
             })?;
     }
     columns.push(Arc::new(batch_id_builder.finish()));
+    let mut ordinal_builder = Int32Builder::with_capacity(row_count);
+    for ordinal in 0..row_count {
+        ordinal_builder.append_value(i32::try_from(ordinal).map_err(|_| {
+            ScribeError::TooManyRows {
+                rows: row_count as u64,
+                limit: (i32::MAX - 1) as u64,
+            }
+        })?);
+    }
+    columns.push(Arc::new(ordinal_builder.finish()));
     columns.push(Arc::new(StringArray::from(vec![
         principal
             .tenant_id
@@ -1077,7 +1095,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use arrow::array::{ArrayRef, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Int32Array, Int64Array, NullArray, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::StreamWriter;
     use arrow::record_batch::RecordBatch;
@@ -1088,14 +1106,14 @@ mod tests {
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::managed_columns::{
         CARD_REF, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME, WYRD_INGESTED_AT,
-        WYRD_REQUEST_ID,
+        WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
     };
 
     use super::{
         ScribeIngressCpuPool, ScribePersistenceCpuPool, ScribeWalIoPool, decode,
         source_schema_fingerprint, stamp_correlation_columns,
     };
-    use crate::contracts::IngressPayload;
+    use crate::contracts::{IngressPayload, ScribeError};
 
     fn principal() -> Principal {
         Principal::new(
@@ -1319,5 +1337,92 @@ mod tests {
         assert!(decoded.schema().index_of(WYRD_EVENT_TIME).is_ok());
         assert!(decoded.schema().index_of(WYRD_INGESTED_AT).is_ok());
         assert!(decoded.schema().index_of(WYRD_REQUEST_ID).is_ok());
+    }
+
+    /// Assigns one stable zero-based physical ordinal to every row in an admitted batch.
+    #[test]
+    fn row_ordinal_is_zero_based_within_batch() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64, 3_i64]))],
+        );
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("schema is valid");
+        let ordinal = decoded
+            .column_by_name(WYRD_ROW_ORDINAL)
+            .expect("row ordinal is stamped")
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("row ordinal uses Int32");
+        assert_eq!(ordinal.values(), &[0, 1, 2]);
+    }
+
+    /// Carries the row identity as the required non-null Arrow `Int32` field.
+    #[test]
+    fn row_ordinal_uses_int32_physical_schema() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+        );
+        let decoded = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect("schema is valid");
+        let schema = decoded.schema();
+        let field = schema
+            .field_with_name(WYRD_ROW_ORDINAL)
+            .expect("physical row ordinal exists");
+        assert_eq!(field.data_type(), &DataType::Int32);
+        assert!(!field.is_nullable());
+    }
+
+    /// Rejects an unrepresentable batch in the ingress CPU lane before WAL dispatch.
+    #[test]
+    fn oversized_batch_rejected_before_wal_append() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Null, true)],
+            vec![Arc::new(NullArray::new(i32::MAX as usize))],
+        );
+        let error = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("unrepresentable ordinal range fails before WAL dispatch");
+        assert!(matches!(
+            error,
+            ScribeError::TooManyRows { rows, limit }
+                if rows == i32::MAX as u64 && limit == (i32::MAX - 1) as u64
+        ));
+    }
+
+    /// Refuses a caller-supplied row ordinal before server preprocessing reaches WAL.
+    #[test]
+    fn caller_supplied_row_ordinal_is_rejected() {
+        let rows = batch(
+            vec![Field::new(WYRD_ROW_ORDINAL, DataType::Int32, false)],
+            vec![Arc::new(Int32Array::from(vec![0_i32]))],
+        );
+        let error = decode(
+            IngressPayload::ProjectedArrow(vec![rows.clone()]),
+            &principal(),
+            source_schema_fingerprint(rows.schema().as_ref()),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+        )
+        .expect_err("row identity is server-owned");
+        assert!(matches!(error, ScribeError::InvalidFrame));
     }
 }

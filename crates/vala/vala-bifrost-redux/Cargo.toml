@@ -29,6 +29,7 @@ vala-sql = { workspace = true }
 
 async-trait = { workspace = true }
 async-stream = { workspace = true }
+arc-swap = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -52,7 +53,7 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
-wyrd-tonic = { workspace = true, features = ["server"] }
+wyrd-tonic = { workspace = true, features = ["server", "client"] }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }

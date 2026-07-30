@@ -32,6 +32,10 @@ pub use crate::scribe::execution_lanes::{
 };
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
+pub use crate::scribe::tail_rpc::{
+    LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
+    TonicTailReadTransport,
+};
 use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
@@ -1151,6 +1155,23 @@ impl ScribeImpl {
             stream,
             Arc::clone(&self.shards),
             crate::scribe::tail_rpc::TailConfig::default(),
+        ))
+    }
+
+    /// Construct the bounded, fence-owning Scribe tail reader for new Oracle paths.
+    ///
+    /// The returned reader retains only shallow Arrow snapshots from this Scribe's
+    /// shard runtime. Legacy callers must keep using [`Self::tail_service`] until
+    /// their temporary compatibility adapter is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScribeError`] when this Scribe's node identity cannot produce a
+    /// typed stream identity for the reader.
+    pub fn tail_reader(&self) -> Result<ScribeTailReader, ScribeError> {
+        Ok(ScribeTailReader::new(
+            Arc::new(self.tail_service()?),
+            TailFenceConfig::default(),
         ))
     }
 

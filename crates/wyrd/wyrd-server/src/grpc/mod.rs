@@ -8,6 +8,8 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
+mod scribe_tail;
+
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
 use wyrd_tonic::tonic_health::pb::health_server::{Health, HealthServer};
 
@@ -36,11 +38,11 @@ where
     if state.auth.token_verifier.is_none() {
         return Err(GrpcError::MissingTokenVerifier);
     }
-    let ingest = state
+    let ingest_runtime = state
         .bifrost_ingest
         .as_ref()
-        .map(|runtime| runtime.gate())
         .ok_or(GrpcError::MissingScribe)?;
+    let ingest = ingest_runtime.gate();
     let traces = wyrd_tonic::otlp::trace_service::trace_service_server::TraceServiceServer::new(
         (*ingest).clone(),
     );
@@ -52,11 +54,13 @@ where
         (*ingest).clone(),
     );
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
+    let tail = scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     Ok(router
         .add_service((*ingest).clone().into_server())
         .add_service(traces)
         .add_service(metrics)
         .add_service(logs)
-        .add_service(query.into_server()))
+        .add_service(query.into_server())
+        .add_service(tail.into_server()))
 }

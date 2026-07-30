@@ -7,6 +7,8 @@ use chrono::{DateTime, Utc};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sqlx::Row;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -518,7 +520,13 @@ impl Forge {
         Ok((prepared, terminal))
     }
 
-    /// Append a fenced snapshot-expiry audit event in the tenant transaction.
+    /// Append a fenced snapshot-expiry audit and projection transition atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a detail-validation, lease, SQL, operation-state, audit, fence,
+    /// or commit error. The caller-owned transaction rolls back both durable
+    /// rows.
     async fn append_expiry_audit(
         &self,
         lease: &mut ForgeLease,
@@ -556,11 +564,39 @@ impl Forge {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
-            .await
-            .map_err(ForgeError::Sql)?;
+        let operations =
+            ForgeOperations::new(&event.resource, ForgeOperationFamily::SnapshotExpire)
+                .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.snapshot_expire.prepared" {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Drive the production expiry transition writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, lease, SQL, transition, audit, fence, and
+    /// commit errors as the production expiry and reconciliation paths.
+    #[cfg(feature = "test-support")]
+    pub async fn append_expiry_transition_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        detail: &AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        self.append_expiry_audit(lease, tenant, detail, operation)
+            .await
     }
 }
 

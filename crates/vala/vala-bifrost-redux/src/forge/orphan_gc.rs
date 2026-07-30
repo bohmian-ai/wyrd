@@ -8,6 +8,8 @@ use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
 use sqlx::Row;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -608,10 +610,12 @@ impl Forge {
             .collect()
     }
 
-    /// Appends one fenced orphan-GC audit event in a tenant transaction.
+    /// Appends one fenced orphan-GC audit and projection transition atomically.
     ///
     /// # Errors
-    /// Returns lease, SQL, or audit append failures.
+    /// Returns detail-validation, lease, SQL, operation-state, audit, fence, or
+    /// commit failures. The caller-owned transaction rolls back both durable
+    /// rows.
     async fn append_gc_audit(
         &self,
         lease: &mut ForgeLease,
@@ -649,11 +653,37 @@ impl Forge {
             .tenant_conn(tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        vala_sql::queries::audit_outbox::append_audit(&mut conn, &event)
-            .await
+        let operations = ForgeOperations::new(&event.resource, ForgeOperationFamily::OrphanGc)
             .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.orphan_gc.prepared" {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Drive the production orphan-GC transition writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation, lease, SQL, transition, audit, fence, and
+    /// commit errors as the production GC and reconciliation paths.
+    #[cfg(feature = "test-support")]
+    pub async fn append_gc_transition_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        tenant: DataTenantId,
+        detail: &AuditDetail,
+        operation: &str,
+    ) -> Result<(), ForgeError> {
+        self.append_gc_audit(lease, tenant, detail, operation).await
     }
 
     /// Insert one catalog-owned reference after converting it through Forge's

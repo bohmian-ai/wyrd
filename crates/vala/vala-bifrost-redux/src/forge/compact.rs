@@ -22,6 +22,8 @@ use opendal::{Buffer, Entry, Metadata};
 use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -1107,6 +1109,11 @@ impl Forge {
     ///
     /// The SQL transition and audit append share one tenant transaction, which is
     /// fenced immediately before commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn prepare_inputs(
         &self,
         lease: &mut ForgeLease,
@@ -1130,7 +1137,8 @@ impl Forge {
             r"UPDATE vala.file_list
               SET compacted = true
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5) AND NOT compacted",
+              AND partition_day = $4 AND id = ANY($5)
+              AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
@@ -1155,6 +1163,11 @@ impl Forge {
 
 impl Forge {
     /// Stamp the Iceberg snapshot ID on prepared input rows and audit the commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn stamp_committed(
         &self,
         lease: &mut ForgeLease,
@@ -1177,7 +1190,8 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND compacted
+              AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
         .bind(key.tenant.as_uuid())
@@ -1210,6 +1224,11 @@ impl Forge {
 
     /// Restore prepared input rows to the uncompacted state after a definite
     /// Iceberg failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn reset_inputs(
         &self,
         lease: &mut ForgeLease,
@@ -1230,7 +1249,7 @@ impl Forge {
             r"UPDATE vala.file_list
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-              AND partition_day = $4 AND id = ANY($5) AND compacted
+              AND partition_day = $4 AND id = ANY($5)
               AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
@@ -1554,6 +1573,11 @@ impl Forge {
 
     /// Stamp a recovered compaction with the snapshot that already contains its
     /// output.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn stamp_reconciled(
         &self,
         lease: &mut ForgeLease,
@@ -1574,7 +1598,8 @@ impl Forge {
               SET committed_snapshot_id = $1
             WHERE data_tenant_id = $2 AND namespace = $3 AND table_name = $4
               AND partition_day = $5 AND id = ANY($6)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND compacted
+              AND (committed_snapshot_id IS NULL OR committed_snapshot_id = $1)",
         )
         .bind(snapshot_id)
         .bind(key.tenant.as_uuid())
@@ -1602,6 +1627,11 @@ impl Forge {
     }
 
     /// Reset a recovered compaction whose output was never committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lease, SQL, reconciliation, operation-state, audit, or fence
+    /// error. Dropping the caller-owned transaction rolls back every mutation.
     async fn reset_reconciled(
         &self,
         lease: &mut ForgeLease,
@@ -1621,7 +1651,7 @@ impl Forge {
               SET compacted = false, committed_snapshot_id = NULL
             WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
               AND partition_day = $4 AND id = ANY($5)
-              AND compacted AND committed_snapshot_id IS NULL",
+              AND committed_snapshot_id IS NULL",
         )
         .bind(key.tenant.as_uuid())
         .bind(key.table_ref.namespace.as_str())
@@ -1645,6 +1675,55 @@ impl Forge {
         .await?;
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
+    }
+
+    /// Drive the production recovered-stamping writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, reconciliation, transition, audit, fence,
+    /// and commit errors as the production recovery path.
+    #[cfg(feature = "test-support")]
+    pub async fn stamp_reconciled_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+        snapshot_id: i64,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        self.stamp_reconciled(lease, &key, input_file_ids, detail, snapshot_id)
+            .await
+    }
+
+    /// Drive the production reconciliation-reset writer from DB integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same lease, SQL, reconciliation, transition, audit, fence,
+    /// and commit errors as the production reset path.
+    #[cfg(feature = "test-support")]
+    pub async fn reset_reconciled_for_test(
+        &self,
+        lease: &mut ForgeLease,
+        binding: &TenantTableBinding,
+        partition_day: NaiveDate,
+        input_file_ids: &[Uuid],
+        detail: &AuditDetail,
+    ) -> Result<(), ForgeError> {
+        let key = ForgeGroupKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+            partition_day,
+        };
+        self.reset_reconciled(lease, &key, input_file_ids, detail)
+            .await
     }
 
     /// Convert a prepared compaction detail into a terminal audit phase.
@@ -1676,33 +1755,59 @@ impl Forge {
         }
     }
 
-    /// Append a system-owned Forge audit event to the caller's tenant transaction.
-    pub(super) async fn append_system_audit(
+    /// Append one staging-fold transition to audit and projection in the caller's transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Sql`] when event validation, audit persistence, or
+    /// the bounded operation-state transition fails.
+    async fn append_system_audit(
         &self,
         conn: &mut vala_sql::TenantConn<'_>,
         key: &ForgeGroupKey,
         operation: &str,
         detail: AuditDetail,
     ) -> Result<(), ForgeError> {
-        let event = AuditEvent {
-            request_id: RequestId::now_v7(),
-            trace_id: None,
-            operation: operation.to_owned(),
-            resource: key.audit_resource(),
-            card_ref: None,
-            principal_id: SYSTEM_PRINCIPAL,
-            principal_kind: PrincipalKindTag::Service,
-            auth_method: AuthMethod::Internal,
-            permission: "bifrost:forge".to_owned(),
-            decision: AuditDecision::Allow,
-            result: AuditResult::Success,
-            payload_summary: operation.to_owned(),
-            detail: Some(detail),
-        };
-        vala_sql::queries::audit_outbox::append_audit(conn, &event)
-            .await
-            .map(|_| ())
-            .map_err(ForgeError::Sql)
+        let resource = key.audit_resource();
+        let event = forge_transition_event(operation, resource.clone(), detail);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)
+            .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.file_compact.prepared" {
+            operations.append_prepared(conn, &event).await
+        } else {
+            operations.append_terminal(conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => Ok(()),
+        }
+    }
+}
+
+/// Construct system-owned metadata for one Forge transition event.
+///
+/// Family and phase validation remain owned by [`ForgeOperations`]; this pure
+/// helper only preserves the established event envelope.
+pub(super) fn forge_transition_event(
+    operation: &str,
+    resource: String,
+    detail: AuditDetail,
+) -> AuditEvent {
+    AuditEvent {
+        request_id: RequestId::now_v7(),
+        trace_id: None,
+        operation: operation.to_owned(),
+        resource,
+        card_ref: None,
+        principal_id: SYSTEM_PRINCIPAL,
+        principal_kind: PrincipalKindTag::Service,
+        auth_method: AuthMethod::Internal,
+        permission: "bifrost:forge".to_owned(),
+        decision: AuditDecision::Allow,
+        result: AuditResult::Success,
+        payload_summary: operation.to_owned(),
+        detail: Some(detail),
     }
 }
 
@@ -1827,6 +1932,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["small-a", "small-b"]
         );
+    }
+
+    /// Forge transition writers cannot bypass the operation-state owner.
+    ///
+    /// The history readers may continue to call the audit query module until
+    /// state-backed reconciliation replaces them, but none of the four
+    /// transition modules may append an audit event directly.
+    #[test]
+    fn forge_transition_writers_do_not_append_audit_directly() {
+        let modules = [
+            ("compact.rs", include_str!("compact.rs")),
+            ("live_replace.rs", include_str!("live_replace.rs")),
+            ("expire.rs", include_str!("expire.rs")),
+            ("orphan_gc.rs", include_str!("orphan_gc.rs")),
+        ];
+        let forbidden_call = ["audit_outbox::append_", "audit"].concat();
+
+        for (module, source) in modules {
+            assert!(
+                !source.contains(&forbidden_call),
+                "{module} bypasses ForgeOperations"
+            );
+        }
     }
 
     /// A bounded undersized group never leaves a singleton remainder for a

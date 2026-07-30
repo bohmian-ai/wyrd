@@ -23,19 +23,29 @@ mod pg_tests {
     use parquet::arrow::ArrowWriter;
     use secrecy::ExposeSecret;
     use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
     use vala_bifrost_redux::catalog::{
         BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
     };
     use vala_bifrost_redux::forge::{
-        Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
+        Forge, ForgeBuildConfig, ForgeConfig, ForgeLease, ForgeObjectStore, ForgeRewriteRuntime,
+        IcebergRewriteGroup, forge_lease_key,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
     use vala_bifrost_redux::schema::with_managed_columns;
     use vala_sql::OperatorPool;
+    use vala_sql::queries::forge_operations::ForgeOperations;
+    use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
+    use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
+    use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::WYRD_EVENT_TIME;
+    use wyrd_spec::vala::api::{
+        AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeCompactionPhase,
+        ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
+    };
     use wyrd_storage::BackendConfig;
 
     /// Counts ranged source reads while delegating bytes to a local operator.
@@ -115,6 +125,9 @@ mod pg_tests {
         /// Forge handle under test.
         forge: Forge,
     }
+
+    /// SQL projection and audit parity columns for one staging operation.
+    type StagingParityRow = (String, i64, Option<i64>, bool, Option<bool>);
 
     impl Fixture {
         /// Register the Forge table through the production Bifrost catalog.
@@ -203,6 +216,30 @@ mod pg_tests {
         /// Panics when the embedded database, catalog, or fixture storage
         /// cannot be initialized; these are test-environment invariants.
         async fn new() -> Self {
+            Self::new_with_config(
+                ForgeConfig {
+                    max_concurrent_reads: 2,
+                    ..ForgeConfig::default()
+                },
+                false,
+                4,
+                16 * 1024 * 1024,
+            )
+            .await
+        }
+
+        /// Build a real fixture with caller-selected maintenance thresholds.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the embedded database, catalog, storage, or Forge owner
+        /// cannot be initialized; these are test-environment invariants.
+        async fn new_with_config(
+            config: ForgeConfig,
+            aged_inputs: bool,
+            initial_file_count: usize,
+            memory_pool_bytes: usize,
+        ) -> Self {
             let pg = PgFixture::start().await.expect("postgres fixture");
             let tenant = pg.data_tenant_id();
             let table_name = format!("incremental_rows_{}", uuid::Uuid::now_v7().simple());
@@ -228,15 +265,11 @@ mod pg_tests {
                 peak_reads: Arc::new(AtomicUsize::new(0)),
             });
             let (_publisher, hints) = staging_file_channel(16).expect("hint channel");
-            let config = ForgeConfig {
-                max_concurrent_reads: 2,
-                ..ForgeConfig::default()
-            };
             let runtime = ForgeRewriteRuntime::new(
                 // DataFusion 53 reserves 10 MiB for an external-sort merge.
                 // Leave that reservation available, then make the fixture
                 // exceed the remaining bounded pool with real Arrow batches.
-                Arc::new(GreedyMemoryPool::new(16 * 1024 * 1024)),
+                Arc::new(GreedyMemoryPool::new(memory_pool_bytes)),
                 &root.path().join("spill"),
                 config.spill_limit_bytes,
             )
@@ -264,7 +297,7 @@ mod pg_tests {
                 reads,
                 forge,
             };
-            fixture.seed_files(4, false).await;
+            fixture.seed_files(initial_file_count, aged_inputs).await;
             fixture
         }
 
@@ -548,6 +581,318 @@ mod pg_tests {
         (files, rows)
     }
 
+    /// Assert the staging-fold projection references the exact prepared and terminal audits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant query fails or the completed fixture operation
+    /// does not have one parity-valid projection row.
+    async fn assert_staging_transition_parity(fixture: &Fixture) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("staging parity tenant connection");
+        let rows: Vec<StagingParityRow> = sqlx::query_as(
+            r"SELECT state.phase,
+                     state.prepared_audit_seq,
+                     state.terminal_audit_seq,
+                     state.prepared_detail = prepared.detail::jsonb,
+                     state.current_detail = terminal.detail::jsonb
+                FROM vala.forge_operation_state AS state
+                JOIN vala.audit_outbox AS prepared
+                  ON prepared.data_tenant_id = state.data_tenant_id
+                 AND prepared.seq = state.prepared_audit_seq
+                LEFT JOIN vala.audit_outbox AS terminal
+                  ON terminal.data_tenant_id = state.data_tenant_id
+                 AND terminal.seq = state.terminal_audit_seq
+               WHERE state.data_tenant_id = wyrd.current_tenant()
+                 AND state.family = 'staging_fold'",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("staging projection parity query");
+
+        assert_eq!(rows.len(), 1, "one staging operation must be projected");
+        let (phase, prepared_seq, terminal_seq, prepared_matches, terminal_matches) = &rows[0];
+        assert_eq!(phase, "committed");
+        assert!(*prepared_seq > 0);
+        assert!(terminal_seq.is_some());
+        assert!(*prepared_matches);
+        assert_eq!(*terminal_matches, Some(true));
+    }
+
+    /// Assert every projected operation in one family references exact audit details.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant query fails, the family has no terminal row, or
+    /// any projection sequence/detail differs from its audit evidence.
+    async fn assert_terminal_family_parity(fixture: &Fixture, family: &str) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("family parity tenant connection");
+        let rows: Vec<(String, bool, Option<bool>)> = sqlx::query_as(
+            r"SELECT state.phase,
+                     state.prepared_detail = prepared.detail::jsonb,
+                     state.current_detail = terminal.detail::jsonb
+                FROM vala.forge_operation_state AS state
+                JOIN vala.audit_outbox AS prepared
+                  ON prepared.data_tenant_id = state.data_tenant_id
+                 AND prepared.seq = state.prepared_audit_seq
+                LEFT JOIN vala.audit_outbox AS terminal
+                  ON terminal.data_tenant_id = state.data_tenant_id
+                 AND terminal.seq = state.terminal_audit_seq
+               WHERE state.data_tenant_id = wyrd.current_tenant()
+                 AND state.family = $1",
+        )
+        .bind(family)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("family projection parity query");
+
+        assert!(
+            !rows.is_empty(),
+            "{family} must project a terminal operation"
+        );
+        for (phase, prepared_matches, terminal_matches) in rows {
+            assert!(
+                matches!(phase.as_str(), "committed" | "recovered"),
+                "{family} remained nonterminal: {phase}"
+            );
+            assert!(prepared_matches, "{family} prepared detail drifted");
+            assert_eq!(
+                terminal_matches,
+                Some(true),
+                "{family} terminal detail drifted"
+            );
+        }
+    }
+
+    /// Count one family projection and its operation-prefix audits.
+    ///
+    /// # Panics
+    ///
+    /// Panics when either tenant-scoped count query fails.
+    async fn family_transition_counts(
+        fixture: &Fixture,
+        family: &str,
+        operation_prefix: &str,
+    ) -> (i64, i64) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("family count tenant connection");
+        let state_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.forge_operation_state \
+             WHERE data_tenant_id = wyrd.current_tenant() AND family = $1",
+        )
+        .bind(family)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("family state count");
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.audit_outbox \
+             WHERE data_tenant_id = wyrd.current_tenant() AND operation LIKE $1",
+        )
+        .bind(format!("{operation_prefix}%"))
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("family audit count");
+        (state_count, audit_count)
+    }
+
+    /// Construct the established system-owned envelope for a transition test.
+    fn operation_event(operation: &str, resource: &str, detail: AuditDetail) -> AuditEvent {
+        AuditEvent {
+            request_id: RequestId::now_v7(),
+            trace_id: None,
+            operation: operation.to_owned(),
+            resource: resource.to_owned(),
+            card_ref: None,
+            principal_id: PrincipalId::new(uuid::Uuid::now_v7()),
+            principal_kind: PrincipalKindTag::Service,
+            auth_method: AuthMethod::Internal,
+            permission: "bifrost:forge".to_owned(),
+            decision: AuditDecision::Allow,
+            result: AuditResult::Success,
+            payload_summary: operation.to_owned(),
+            detail: Some(detail),
+        }
+    }
+
+    /// Append and commit one prepared or terminal transition through the SQL owner.
+    ///
+    /// # Panics
+    ///
+    /// Panics when tenant acquisition, transition validation, persistence, or
+    /// commit fails because successful transition setup is a test invariant.
+    async fn append_operation(
+        fixture: &Fixture,
+        family: ForgeOperationFamily,
+        event: &AuditEvent,
+        prepared: bool,
+    ) -> ForgeOperationTransition {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("operation tenant connection");
+        let operations =
+            ForgeOperations::new(&event.resource, family).expect("operation family owner");
+        let transition = if prepared {
+            operations.append_prepared(&mut conn, event).await
+        } else {
+            operations.append_terminal(&mut conn, event).await
+        }
+        .expect("operation transition");
+        conn.commit().await.expect("operation transition commit");
+        transition
+    }
+
+    /// Assert one exact terminal phase has two parity-valid audit events.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant query fails or phase, cardinality, or canonical
+    /// detail parity differs from the expected terminal transition.
+    async fn assert_exact_terminal(fixture: &Fixture, resource: &str, expected_phase: &str) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("exact terminal tenant connection");
+        let row: (String, i64, bool, bool) = sqlx::query_as(
+            r"SELECT state.phase,
+                     (SELECT count(*) FROM vala.audit_outbox AS audit
+                       WHERE audit.data_tenant_id = state.data_tenant_id
+                         AND audit.resource = state.resource),
+                     state.prepared_detail = prepared.detail::jsonb,
+                     state.current_detail = terminal.detail::jsonb
+                FROM vala.forge_operation_state AS state
+                JOIN vala.audit_outbox AS prepared
+                  ON prepared.data_tenant_id = state.data_tenant_id
+                 AND prepared.seq = state.prepared_audit_seq
+                JOIN vala.audit_outbox AS terminal
+                  ON terminal.data_tenant_id = state.data_tenant_id
+                 AND terminal.seq = state.terminal_audit_seq
+               WHERE state.data_tenant_id = wyrd.current_tenant()
+                 AND state.resource = $1",
+        )
+        .bind(resource)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("exact terminal parity");
+        assert_eq!(row, (expected_phase.to_owned(), 2, true, true));
+    }
+
+    /// Build one deterministic staging-fold detail for an exact phase.
+    fn staging_detail(
+        operation_id: uuid::Uuid,
+        resource: &str,
+        phase: ForgeCompactionPhase,
+    ) -> AuditDetail {
+        staging_detail_for_inputs(
+            operation_id,
+            resource,
+            phase,
+            vec![uuid::Uuid::now_v7()],
+            vec![StoragePath::new("staging/input.parquet").expect("input path")],
+        )
+    }
+
+    /// Build one staging-fold detail with exact fixture input identities.
+    fn staging_detail_for_inputs(
+        operation_id: uuid::Uuid,
+        resource: &str,
+        phase: ForgeCompactionPhase,
+        input_file_ids: Vec<uuid::Uuid>,
+        input_paths: Vec<StoragePath>,
+    ) -> AuditDetail {
+        AuditDetail::ForgeCompaction {
+            operation_id,
+            phase,
+            group: resource.to_owned(),
+            input_file_ids,
+            input_paths,
+            output_paths: vec![StoragePath::new("data/output.parquet").expect("output path")],
+            snapshot_id: matches!(
+                phase,
+                ForgeCompactionPhase::Committed | ForgeCompactionPhase::Recovered
+            )
+            .then_some(7),
+            writer_recipe_version: "bifrost-writer-v1".to_owned(),
+        }
+    }
+
+    /// Build one deterministic snapshot-expiry detail for an exact phase.
+    fn expiry_transition_detail(
+        operation_id: uuid::Uuid,
+        resource: &str,
+        phase: ForgeSnapshotExpirePhase,
+    ) -> AuditDetail {
+        AuditDetail::ForgeSnapshotExpire {
+            operation_id,
+            phase,
+            group: resource.to_owned(),
+            base_metadata_location: StoragePath::new("metadata/v1.metadata.json")
+                .expect("metadata path"),
+            current_snapshot_id: Some(11),
+            retained_ref_heads: vec![11],
+            cutoff_ms: 10,
+            selected_snapshot_ids: vec![3, 7],
+        }
+    }
+
+    /// Build one deterministic orphan-GC detail for an exact phase.
+    fn gc_transition_detail(
+        operation_id: uuid::Uuid,
+        resource: &str,
+        phase: ForgeOrphanGcPhase,
+    ) -> AuditDetail {
+        let candidate = StoragePath::new("data/orphan.parquet").expect("candidate path");
+        AuditDetail::ForgeOrphanGc {
+            operation_id,
+            phase,
+            group: resource.to_owned(),
+            candidate_paths: vec![candidate.clone()],
+            deleted_paths: (!matches!(phase, ForgeOrphanGcPhase::Prepared))
+                .then_some(vec![candidate])
+                .unwrap_or_default(),
+            skipped_paths: Vec::new(),
+        }
+    }
+
+    /// Acquire the production table lease for one fixture.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the lease query fails or another owner unexpectedly holds
+    /// the isolated fixture lease.
+    async fn acquire_fixture_lease(fixture: &Fixture) -> ForgeLease {
+        ForgeLease::acquire(
+            &fixture.operator_pool,
+            forge_lease_key(
+                fixture.tenant,
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            ),
+            uuid::Uuid::now_v7(),
+            ForgeConfig::default().lease_ttl,
+        )
+        .await
+        .expect("fixture lease query")
+        .expect("fixture lease")
+    }
+
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
     #[tokio::test]
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
@@ -574,6 +919,434 @@ mod pg_tests {
         assert_eq!(
             output_rows, 3_200_000,
             "rewrite must conserve every input row"
+        );
+        assert_staging_transition_parity(&fixture).await;
+    }
+
+    /// Periodic expiry and orphan collection write exact state/audit parity.
+    #[tokio::test]
+    async fn destructive_maintenance_transitions_preserve_audit_projection_parity() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                snapshot_retention: Duration::from_nanos(1),
+                orphan_gc_ttl: Duration::from_nanos(1),
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            true,
+            4,
+            16 * 1024 * 1024,
+        )
+        .await;
+
+        let first = fixture
+            .forge
+            .run_once()
+            .await
+            .expect("first maintenance tick");
+        assert_eq!(first.bins_committed, 1, "first outcome: {first:?}");
+        fixture.seed_files_at(100, 4, true).await;
+        let second = fixture
+            .forge
+            .run_once()
+            .await
+            .expect("second maintenance tick");
+        assert_eq!(second.bins_committed, 1, "second outcome: {second:?}");
+
+        assert_terminal_family_parity(&fixture, "snapshot_expire").await;
+        assert_terminal_family_parity(&fixture, "orphan_gc").await;
+    }
+
+    /// A projection failure rolls back staging claims and its paired audit.
+    #[tokio::test]
+    async fn staging_projection_failure_rolls_back_claim_state_and_audit() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            true,
+            2,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+        sqlx::query(
+            r"CREATE FUNCTION vala.reject_forge_operation_state_for_test()
+                 RETURNS trigger LANGUAGE plpgsql AS $$
+               BEGIN
+                 RAISE EXCEPTION 'injected forge operation-state failure';
+               END
+               $$",
+        )
+        .execute(&owner)
+        .await
+        .expect("projection failure function");
+        sqlx::query(
+            r"CREATE TRIGGER reject_forge_operation_state_for_test
+                 BEFORE INSERT ON vala.forge_operation_state
+                 FOR EACH ROW
+                 EXECUTE FUNCTION vala.reject_forge_operation_state_for_test()",
+        )
+        .execute(&owner)
+        .await
+        .expect("projection failure trigger");
+
+        let outcome = fixture.forge.run_once().await.expect("isolated table tick");
+        assert_eq!(outcome.tables_failed, 1, "outcome: {outcome:?}");
+
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("rollback tenant connection");
+        let claimed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() AND compacted",
+        )
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .expect("claimed file count");
+        assert_eq!(claimed, 0);
+        assert_eq!(
+            family_transition_counts(&fixture, "staging_fold", "forge.file_compact.").await,
+            (0, 0)
+        );
+
+        sqlx::query(
+            r"DROP TRIGGER reject_forge_operation_state_for_test
+                 ON vala.forge_operation_state",
+        )
+        .execute(&owner)
+        .await
+        .expect("remove projection failure trigger");
+        sqlx::query("DROP FUNCTION vala.reject_forge_operation_state_for_test()")
+            .execute(&owner)
+            .await
+            .expect("remove projection failure function");
+    }
+
+    /// Staging Recovered and Reset each preserve parity under terminal replay.
+    #[tokio::test]
+    async fn staging_recovered_and_reset_terminal_replays_are_exactly_idempotent() {
+        let fixture = Fixture::new().await;
+        for (suffix, terminal_phase, expected_phase) in [
+            ("recovered", ForgeCompactionPhase::Recovered, "recovered"),
+            ("reset", ForgeCompactionPhase::Reset, "reset"),
+        ] {
+            let resource = format!("bifrost://{}/tests/staging-{suffix}", fixture.tenant);
+            let operation_id = uuid::Uuid::now_v7();
+            let prepared = operation_event(
+                "forge.file_compact.prepared",
+                &resource,
+                staging_detail(operation_id, &resource, ForgeCompactionPhase::Prepared),
+            );
+            assert!(matches!(
+                append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true)
+                    .await,
+                ForgeOperationTransition::Applied { .. }
+            ));
+            let terminal = operation_event(
+                &format!("forge.file_compact.{suffix}"),
+                &resource,
+                staging_detail(operation_id, &resource, terminal_phase),
+            );
+            assert!(matches!(
+                append_operation(
+                    &fixture,
+                    ForgeOperationFamily::StagingFold,
+                    &terminal,
+                    false
+                )
+                .await,
+                ForgeOperationTransition::Applied { .. }
+            ));
+            assert!(matches!(
+                append_operation(
+                    &fixture,
+                    ForgeOperationFamily::StagingFold,
+                    &terminal,
+                    false
+                )
+                .await,
+                ForgeOperationTransition::AlreadyApplied { .. }
+            ));
+            assert_exact_terminal(&fixture, &resource, expected_phase).await;
+        }
+    }
+
+    /// Invoke one production staging reconciliation writer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the selected production writer returns an error.
+    async fn invoke_staging_reconciliation_writer(
+        fixture: &Fixture,
+        lease: &mut ForgeLease,
+        phase: ForgeCompactionPhase,
+        ids: &[uuid::Uuid],
+        detail: &AuditDetail,
+    ) {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 14).expect("fixture day");
+        match phase {
+            ForgeCompactionPhase::Recovered => fixture
+                .forge
+                .stamp_reconciled_for_test(lease, &fixture.binding, day, ids, detail, 7)
+                .await
+                .expect("production recovered writer"),
+            ForgeCompactionPhase::Reset => fixture
+                .forge
+                .reset_reconciled_for_test(lease, &fixture.binding, day, ids, detail)
+                .await
+                .expect("production reset writer"),
+            _ => panic!("test helper accepts only recovered or reset"),
+        }
+    }
+
+    /// Assert the production staging writer's exact `file_list` result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the tenant query fails or row state differs from the phase.
+    async fn assert_staging_writer_rows(
+        fixture: &Fixture,
+        ids: &[uuid::Uuid],
+        phase: ForgeCompactionPhase,
+    ) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("staging result tenant connection");
+        let states: Vec<(bool, Option<i64>)> = sqlx::query_as(
+            "SELECT compacted, committed_snapshot_id FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() AND id = ANY($1)",
+        )
+        .bind(ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("staging writer row effects");
+        let expected = match phase {
+            ForgeCompactionPhase::Recovered => (true, Some(7)),
+            ForgeCompactionPhase::Reset => (false, None),
+            _ => panic!("test helper accepts only recovered or reset"),
+        };
+        assert_eq!(states, vec![expected; ids.len()]);
+    }
+
+    /// Drive one production staging reconciliation writer and assert row effects.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture SQL, lease acquisition, or the production writer
+    /// fails, or when replay changes file-list or audit cardinality.
+    async fn drive_staging_reconciliation_writer(fixture: &Fixture, phase: ForgeCompactionPhase) {
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("staging writer tenant connection");
+        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT id, file_path FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() ORDER BY id LIMIT 2",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("staging writer inputs");
+        let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let paths = rows
+            .iter()
+            .map(|(_, path)| StoragePath::new(path.clone()).expect("fixture input path"))
+            .collect::<Vec<_>>();
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = true \
+             WHERE data_tenant_id = wyrd.current_tenant() AND id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("prepare staging rows");
+        conn.commit().await.expect("prepare staging rows commit");
+
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+        );
+        let operation_id = uuid::Uuid::now_v7();
+        let detail = staging_detail_for_inputs(
+            operation_id,
+            &resource,
+            ForgeCompactionPhase::Prepared,
+            ids.clone(),
+            paths,
+        );
+        let prepared = operation_event("forge.file_compact.prepared", &resource, detail.clone());
+        append_operation(fixture, ForgeOperationFamily::StagingFold, &prepared, true).await;
+        let mut lease = acquire_fixture_lease(fixture).await;
+        invoke_staging_reconciliation_writer(fixture, &mut lease, phase, &ids, &detail).await;
+        let before_replay =
+            family_transition_counts(fixture, "staging_fold", "forge.file_compact.").await;
+        invoke_staging_reconciliation_writer(fixture, &mut lease, phase, &ids, &detail).await;
+        assert_eq!(
+            family_transition_counts(fixture, "staging_fold", "forge.file_compact.").await,
+            before_replay
+        );
+        assert_staging_writer_rows(fixture, &ids, phase).await;
+        assert_exact_terminal(
+            fixture,
+            &resource,
+            match phase {
+                ForgeCompactionPhase::Recovered => "recovered",
+                ForgeCompactionPhase::Reset => "reset",
+                _ => unreachable!("phase checked above"),
+            },
+        )
+        .await;
+    }
+
+    /// The production staging recovery writer stamps rows and replays once.
+    #[tokio::test]
+    async fn staging_recovered_writer_stamps_rows_with_exact_parity() {
+        drive_staging_reconciliation_writer(&Fixture::new().await, ForgeCompactionPhase::Recovered)
+            .await;
+    }
+
+    /// The production staging reset writer restores rows and replays once.
+    #[tokio::test]
+    async fn staging_reset_writer_restores_rows_with_exact_parity() {
+        drive_staging_reconciliation_writer(&Fixture::new().await, ForgeCompactionPhase::Reset)
+            .await;
+    }
+
+    /// Snapshot-expiry Recovered replay leaves one state row and two audits.
+    #[tokio::test]
+    async fn expiry_recovered_terminal_replay_is_exactly_idempotent() {
+        let fixture = Fixture::new().await;
+        let resource = format!("bifrost://{}/tests/expiry-recovered", fixture.tenant);
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.snapshot_expire.prepared",
+            &resource,
+            expiry_transition_detail(operation_id, &resource, ForgeSnapshotExpirePhase::Prepared),
+        );
+        append_operation(
+            &fixture,
+            ForgeOperationFamily::SnapshotExpire,
+            &prepared,
+            true,
+        )
+        .await;
+        let recovered = operation_event(
+            "forge.snapshot_expire.recovered",
+            &resource,
+            expiry_transition_detail(operation_id, &resource, ForgeSnapshotExpirePhase::Recovered),
+        );
+        let mut lease = acquire_fixture_lease(&fixture).await;
+        fixture
+            .forge
+            .append_expiry_transition_for_test(
+                &mut lease,
+                fixture.tenant,
+                recovered.detail.as_ref().expect("recovered detail"),
+                "forge.snapshot_expire.recovered",
+            )
+            .await
+            .expect("production expiry recovery writer");
+        let before_replay =
+            family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.").await;
+        fixture
+            .forge
+            .append_expiry_transition_for_test(
+                &mut lease,
+                fixture.tenant,
+                recovered.detail.as_ref().expect("recovered detail"),
+                "forge.snapshot_expire.recovered",
+            )
+            .await
+            .expect("production expiry recovery replay");
+        assert_eq!(
+            family_transition_counts(&fixture, "snapshot_expire", "forge.snapshot_expire.").await,
+            before_replay
+        );
+        assert_exact_terminal(&fixture, &resource, "recovered").await;
+    }
+
+    /// Orphan-GC Recovered replay is idempotent and wrong-family input is atomic.
+    #[tokio::test]
+    async fn gc_recovered_replay_and_wrong_family_conflict_are_atomic() {
+        let fixture = Fixture::new().await;
+        let resource = format!("bifrost://{}/tests/gc-recovered", fixture.tenant);
+        let operation_id = uuid::Uuid::now_v7();
+        let prepared = operation_event(
+            "forge.orphan_gc.prepared",
+            &resource,
+            gc_transition_detail(operation_id, &resource, ForgeOrphanGcPhase::Prepared),
+        );
+        append_operation(&fixture, ForgeOperationFamily::OrphanGc, &prepared, true).await;
+        let recovered = operation_event(
+            "forge.orphan_gc.recovered",
+            &resource,
+            gc_transition_detail(operation_id, &resource, ForgeOrphanGcPhase::Recovered),
+        );
+        let mut lease = acquire_fixture_lease(&fixture).await;
+        fixture
+            .forge
+            .append_gc_transition_for_test(
+                &mut lease,
+                fixture.tenant,
+                recovered.detail.as_ref().expect("recovered detail"),
+                "forge.orphan_gc.recovered",
+            )
+            .await
+            .expect("production GC recovery writer");
+        let before_replay =
+            family_transition_counts(&fixture, "orphan_gc", "forge.orphan_gc.").await;
+        fixture
+            .forge
+            .append_gc_transition_for_test(
+                &mut lease,
+                fixture.tenant,
+                recovered.detail.as_ref().expect("recovered detail"),
+                "forge.orphan_gc.recovered",
+            )
+            .await
+            .expect("production GC recovery replay");
+        assert_eq!(
+            family_transition_counts(&fixture, "orphan_gc", "forge.orphan_gc.").await,
+            before_replay
+        );
+        assert_exact_terminal(&fixture, &resource, "recovered").await;
+
+        let wrong_resource = format!("bifrost://{}/tests/wrong-family", fixture.tenant);
+        let wrong_event = operation_event(
+            "forge.snapshot_expire.prepared",
+            &wrong_resource,
+            expiry_transition_detail(
+                uuid::Uuid::now_v7(),
+                &wrong_resource,
+                ForgeSnapshotExpirePhase::Prepared,
+            ),
+        );
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("wrong-family tenant connection");
+        let owner = ForgeOperations::new(&wrong_resource, ForgeOperationFamily::OrphanGc)
+            .expect("wrong-family owner");
+        owner
+            .append_prepared(&mut conn, &wrong_event)
+            .await
+            .expect_err("wrong family must conflict");
+        drop(conn);
+        assert_eq!(
+            family_transition_counts(&fixture, "orphan_gc", "forge.snapshot_expire.").await,
+            (1, 0),
+            "wrong-family event must add no state or audit"
         );
     }
 
@@ -620,6 +1393,12 @@ mod pg_tests {
             .load_table(&fixture.binding.table_ident())
             .await
             .expect("old-schema table");
+        fixture.append_seed_manifest(&old_table, 1).await;
+        let old_table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("two-file old-schema table");
         let old_snapshot = old_table
             .metadata()
             .current_snapshot()
@@ -763,6 +1542,134 @@ mod pg_tests {
                 );
             }
         }
+    }
+
+    /// Build two staging outputs and return one executable live-rewrite plan.
+    ///
+    /// # Panics
+    ///
+    /// Panics when staging, catalog configuration, discovery, or lease
+    /// acquisition fails because each is a fixture invariant.
+    async fn prepare_live_transition(
+        fixture: &Fixture,
+    ) -> (iceberg::table::Table, i64, IcebergRewriteGroup, ForgeLease) {
+        fixture.forge.run_once().await.expect("first staging fold");
+        fixture.seed_files_at(100, 2, true).await;
+        fixture.forge.run_once().await.expect("second staging fold");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("two-output live table");
+        let action = Transaction::new(&table).update_table_properties().set(
+            "write.target-file-size-bytes".to_owned(),
+            "3000000".to_owned(),
+        );
+        ApplyTransactionAction::apply(action, Transaction::new(&table))
+            .expect("live target property action")
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("live target property commit");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("live target table");
+        let current_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 15).expect("fixed day");
+        let plan = fixture
+            .forge
+            .discover_live_rewrites_for_test(&fixture.binding, &table, current_day)
+            .await
+            .expect("live replacement plan");
+        let group = plan
+            .groups_for_test()
+            .iter()
+            .find(|group| group.files_for_test().len() >= 2)
+            .expect("eligible two-file live group")
+            .clone();
+        let lease = ForgeLease::acquire(
+            &fixture.operator_pool,
+            forge_lease_key(
+                fixture.tenant,
+                &fixture.binding.logical_namespace,
+                &fixture.binding.table_name,
+            ),
+            uuid::Uuid::now_v7(),
+            ForgeConfig::default().lease_ttl,
+        )
+        .await
+        .expect("live lease query")
+        .expect("live lease");
+        (table, plan.base_snapshot_id_for_test(), group, lease)
+    }
+
+    /// Live Prepared failure is atomic, while retry commits exact state/audit parity once.
+    #[tokio::test]
+    async fn live_replacement_injection_and_replay_preserve_transition_parity() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            true,
+            2,
+            64 * 1024 * 1024,
+        )
+        .await;
+        let (table, base_snapshot_id, group, mut lease) = prepare_live_transition(&fixture).await;
+
+        fixture.forge.fail_next_prepared_live_audit_for_test();
+        fixture
+            .forge
+            .replace_live_group_for_test(
+                &mut lease,
+                &fixture.binding,
+                &table,
+                base_snapshot_id,
+                &group,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("Prepared injection must fail");
+        assert_eq!(
+            family_transition_counts(&fixture, "iceberg_rewrite", "forge.iceberg_rewrite.").await,
+            (0, 0)
+        );
+
+        fixture
+            .forge
+            .replace_live_group_for_test(
+                &mut lease,
+                &fixture.binding,
+                &table,
+                base_snapshot_id,
+                &group,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("live replacement retry");
+        assert_terminal_family_parity(&fixture, "iceberg_rewrite").await;
+        let committed_counts =
+            family_transition_counts(&fixture, "iceberg_rewrite", "forge.iceberg_rewrite.").await;
+        assert_eq!(committed_counts, (1, 2));
+
+        fixture
+            .forge
+            .replace_live_group_for_test(
+                &mut lease,
+                &fixture.binding,
+                &table,
+                base_snapshot_id,
+                &group,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("stale replay disposition");
+        assert_eq!(
+            family_transition_counts(&fixture, "iceberg_rewrite", "forge.iceberg_rewrite.").await,
+            committed_counts,
+            "replay must not duplicate state or audit"
+        );
     }
 
     /// Clone one complete manifest data-file identity for a distinct fixture path.

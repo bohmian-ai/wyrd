@@ -11,10 +11,13 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::forge_operations::ForgeOperations;
+use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
 use wyrd_spec::vala::api::{AuditDetail, ForgeIcebergRewritePhase, StoragePath};
 
 use super::Forge;
 use super::binpack::ForgeGroupKey;
+use super::compact::forge_transition_event;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
@@ -373,12 +376,13 @@ impl Forge {
         FAIL_NEXT_PREPARED_LIVE_AUDIT.store(true, Ordering::Release);
     }
 
-    /// Append one live-replacement audit transition in its own fenced tenant transaction.
+    /// Append one live-replacement audit and projection transition atomically.
     ///
     /// # Errors
     ///
     /// Returns [`ForgeError`] when lease renewal, tenant transaction creation,
-    /// audit append, or transaction commit fails.
+    /// operation-state transition, audit append, fence assertion, or transaction
+    /// commit fails. The caller-owned transaction rolls back both durable rows.
     async fn append_live_audit(
         &self,
         lease: &mut ForgeLease,
@@ -406,8 +410,20 @@ impl Forge {
                 detail: "injected Prepared audit append failure".to_owned(),
             });
         }
-        self.append_system_audit(&mut conn, key, operation, detail)
-            .await?;
+        let resource = key.audit_resource();
+        let event = forge_transition_event(operation, resource.clone(), detail);
+        let operations = ForgeOperations::new(&resource, ForgeOperationFamily::IcebergRewrite)
+            .map_err(ForgeError::Sql)?;
+        let transition = if operation == "forge.iceberg_rewrite.prepared" {
+            operations.append_prepared(&mut conn, &event).await
+        } else {
+            operations.append_terminal(&mut conn, &event).await
+        }
+        .map_err(ForgeError::Sql)?;
+        match transition {
+            ForgeOperationTransition::Applied { .. }
+            | ForgeOperationTransition::AlreadyApplied { .. } => {}
+        }
         lease.assert_transaction_fence(&mut conn).await?;
         conn.commit().await.map_err(ForgeError::Sql)
     }

@@ -38,6 +38,9 @@ name = "pg_audit_outbox"
 name = "pg_drift_alerts"
 
 [[test]]
+name = "pg_forge_operations"
+
+[[test]]
 name = "pg_migration"
 
 [[test]]

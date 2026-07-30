@@ -8,7 +8,7 @@
 #                        answer to "make sure everything passes" (Rust + Python +
 #                        codegen + docs + every boundary invariant).
 #
-#   mise run test:unit   All Rust tests except Bifrost and real-cloud storage.
+#   mise run test:unit   All Rust tests except Bifrost, Forge SQL scale, and real-cloud storage.
 #   mise run test:bifrost   DataFusion/Postgres Rust tests (separate CI job).
 #   mise run test:wyrd/skald/vala/shared   Family lanes (skip pg_tests, no docker needed).
 #   mise run py:test:unit   Python suite (builds the extension, then pytest).
@@ -1175,16 +1175,23 @@ run = "cargo test --locked -p wyrd-sql --test pg_migration -- migrations_apply_a
 [tasks."test:sql"]
 hide = true
 description = """Run live Postgres SQL integration tests against docker-compose Postgres.
-Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites.
+Brings up Postgres, provisions roles, then runs the SQL migration, reset, fixture, Vala SQL, and registry e2e suites. The 10,000-row Forge scale regression runs through test:sql:forge-scale.
 """
 depends = ["dev:pg:nuke", "setup:postgres"]
 env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw" }
 run = """
 cargo test --locked -p wyrd-sql -- --nocapture --test-threads=1
 cargo test --locked -p wyrd-dev-fixtures -- --test-threads=1
-cargo test --locked -p vala-sql -- --test-threads=1
+cargo test --locked -p vala-sql -- --skip open_set_scan_remains_bounded_after_terminal_growth --test-threads=1
 cargo test --locked -p wyrd-storage --test pg_sweeper -- --test-threads=1
 """
+
+[tasks."test:sql:forge-scale"]
+hide = true
+description = "Run the 10,000-row Forge SQL bounded-plan regression."
+depends = ["dev:pg:nuke", "setup:postgres"]
+env = { WYRD_REG_E2E = "1", WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw" }
+run = "cargo test --locked -p vala-sql --test pg_forge_operations 'pg_tests::forge_operations::open_set_scan_remains_bounded_after_terminal_growth' -- --exact --nocapture --test-threads=1"
 
 [tasks."db:migrate:all"]
 hide = true

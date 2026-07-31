@@ -22,6 +22,20 @@ use sqlx::PgPool;
 pub struct OperatorPool(PgPool);
 
 impl OperatorPool {
+    /// Opens one operator-owned transaction for a bounded cross-tenant operation.
+    ///
+    /// The transaction remains borrowed from this handle and is owned by the
+    /// caller until commit or rollback. Query modules use this boundary rather
+    /// than reaching through to the underlying pool and constructing a raw
+    /// transaction themselves.
+    ///
+    /// # Errors
+    /// Returns the database error when PostgreSQL cannot acquire a connection
+    /// or begin the transaction.
+    pub async fn begin(&self) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, sqlx::Error> {
+        self.0.begin().await
+    }
+
     /// Borrow the underlying BYPASSRLS pool.
     ///
     /// Pass the returned reference directly to `query!` / `query_as!` as the

@@ -31,6 +31,36 @@ impl ClusterNodes {
         &self.postgres
     }
 
+    /// Validates one ready, fresh fenced Oracle role identity.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the query fails or the exact row is absent.
+    pub async fn validate_live_oracle(
+        &self,
+        conn: &mut TenantConn<'_>,
+        node_id: wyrd_spec::vala::api::NodeId,
+        fencing_token: FencingToken,
+        heartbeat_after: DateTime<Utc>,
+    ) -> Result<(), SqlError> {
+        let found: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM vala.cluster_nodes \
+             WHERE data_tenant_id=$1 AND node_id=$2 AND role='oracle' \
+             AND fencing_token=$3 AND ready=true AND heartbeat_at >= $4)",
+        )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
+        .bind(node_id.as_uuid())
+        .bind(i64::try_from(fencing_token).map_err(|_| invariant("fence exceeds i64"))?)
+        .bind(heartbeat_after)
+        .fetch_one(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+        if found {
+            Ok(())
+        } else {
+            Err(invariant("Oracle peer membership is not live"))
+        }
+    }
+
     /// Registers one role and atomically advances only its composite fence.
     ///
     /// # Errors

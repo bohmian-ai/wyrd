@@ -6,6 +6,8 @@
 //! composed around these small owners.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -1010,6 +1012,8 @@ pub struct OracleBuildConfig {
     pub vala: ValaPostgres,
     /// Durable admission lease owner.
     pub admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases,
+    /// Platform-admin pool used for cross-tenant startup recovery.
+    pub operator_pool: vala_sql::OperatorPool,
     /// Immutable membership registry.
     pub cluster: Arc<ClusterRegistry>,
     /// Fenced local Oracle role.
@@ -1191,9 +1195,14 @@ pub struct Oracle {
     shutdown: CancellationToken,
     /// Whether startup reconciliation completed.
     ready: Arc<AtomicBool>,
+    /// One-shot startup recovery result consumed by the server activation boundary.
+    startup_result: Mutex<Option<StartupResultReceiver>>,
     /// Cancellation-bound admission maintenance task.
     maintenance: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// One-shot startup recovery result consumed exactly once by activation.
+type StartupResultReceiver = tokio::sync::oneshot::Receiver<Result<(), BifrostError>>;
 
 impl std::fmt::Debug for Oracle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1255,10 +1264,12 @@ impl Oracle {
             Arc::new(config.admission_leases),
             config.local_role,
             config.config,
+            config.operator_pool,
         ));
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
-        let maintenance = admission.start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
+        let (maintenance, startup_result) =
+            admission.start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
         let fragment_dispatcher = config.peer_transports.map(|transports| {
             dispatcher::FragmentDispatcher::new(Arc::clone(&config.peer_ticket_minter), transports)
                 .with_memory_governor(config.memory.governor.clone())
@@ -1275,6 +1286,7 @@ impl Oracle {
             telemetry,
             shutdown,
             ready,
+            startup_result: Mutex::new(Some(startup_result)),
             maintenance: Mutex::new(Some(maintenance)),
         })
     }
@@ -1721,6 +1733,26 @@ impl Oracle {
         self.ready.load(Ordering::Acquire) && !self.shutdown.is_cancelled()
     }
 
+    /// Awaits the exact startup recovery result before role activation.
+    ///
+    /// # Errors
+    /// Returns the recovery failure, a duplicate-wait invariant, or task loss.
+    pub async fn await_startup(&self) -> Result<(), BifrostError> {
+        let receiver = self
+            .startup_result
+            .lock()
+            .map_err(|_| BifrostError::Internal {
+                detail: "Oracle startup result lock is poisoned".to_owned(),
+            })?
+            .take()
+            .ok_or_else(|| BifrostError::Internal {
+                detail: "Oracle startup result was already consumed".to_owned(),
+            })?;
+        receiver.await.map_err(|_| BifrostError::Internal {
+            detail: "Oracle startup recovery task ended without a result".to_owned(),
+        })?
+    }
+
     /// Borrows the tenant SQL root retained by the Oracle composition boundary.
     #[must_use]
     pub fn tenant_sql(&self) -> &ValaPostgres {
@@ -1931,6 +1963,12 @@ impl Oracle {
         let leader = input.admitted.leader.node_id;
         let prepared = self.prepare_sealed_dispatch(input)?;
         let mut output = Vec::new();
+        let siblings = prepared.context.cancellation.child_token();
+        let parallelism = dispatch_parallelism(
+            prepared.selected.len(),
+            self.planner.config.max_workers_per_query,
+        );
+        let mut attempts: Vec<SealedFragmentFuture<'_>> = Vec::new();
         for fragment in prepared.fragments {
             let primary = prepared
                 .assignment
@@ -1956,12 +1994,16 @@ impl Oracle {
                     })
                 })
                 .collect::<Vec<_>>();
-            let attempt = dispatcher
-                .execute(&prepared.context, fragment, &candidates)
-                .await
-                .map_err(|error| map_dispatch_error(&error))?;
-            decode_attempt_batches(attempt, &mut output)?;
+            let mut dispatch_context = prepared.context.clone();
+            dispatch_context.cancellation = siblings.clone();
+            attempts.push(Box::pin(async move {
+                dispatcher
+                    .execute(&dispatch_context, fragment, &candidates)
+                    .await
+                    .map_err(|error| map_dispatch_error(&error))
+            }));
         }
+        dispatch_fragment_attempts(attempts, parallelism, &siblings, &mut output).await?;
         Ok(output)
     }
 
@@ -2051,6 +2093,8 @@ impl Oracle {
             permission_digest,
             attempt_bytes: self.planner.config.attempt_max_bytes,
             attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
+            cancellation: input.admitted.cancellation.clone(),
+            deadline: input.deadline.into(),
         };
         Ok(PreparedSealedDispatch {
             fragments,
@@ -2109,6 +2153,62 @@ impl Oracle {
             .map_err(|error| map_datafusion_error(&error))?
             .into_optimized_plan()
             .map_err(|error| map_datafusion_error(&error))
+    }
+}
+
+/// Computes the exact active sealed-fragment bound from selected and admitted capacity.
+fn dispatch_parallelism(selected_peer_count: usize, admitted_query_parallelism: usize) -> usize {
+    selected_peer_count
+        .min(admitted_query_parallelism.max(1))
+        .max(1)
+}
+
+/// One lazily polled production fragment attempt owned by bounded query dispatch.
+type SealedFragmentFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<attempt::ValidatedAttempt, OracleExecutionError>> + Send + 'a>,
+>;
+
+/// Polls actual fragment attempts under the admitted bound and drains siblings on failure.
+///
+/// Bytes are decoded only after a complete attempt validates. A terminal or
+/// decode failure cancels the shared token and awaits every active sibling so
+/// reservation guards release before this operation returns.
+///
+/// # Errors
+///
+/// Returns the first transport, terminal, or decode failure after sibling cleanup.
+async fn dispatch_fragment_attempts(
+    attempts: Vec<SealedFragmentFuture<'_>>,
+    parallelism: usize,
+    siblings: &CancellationToken,
+    output: &mut Vec<RecordBatch>,
+) -> Result<(), OracleExecutionError> {
+    let mut attempts = attempts.into_iter();
+    let mut pending = FuturesUnordered::new();
+    loop {
+        while pending.len() < parallelism {
+            let Some(attempt) = attempts.next() else {
+                break;
+            };
+            pending.push(attempt);
+        }
+        let Some(attempt) = pending.next().await else {
+            return Ok(());
+        };
+        match attempt {
+            Ok(attempt) => {
+                if let Err(error) = decode_attempt_batches(attempt, output) {
+                    siblings.cancel();
+                    while pending.next().await.is_some() {}
+                    return Err(error.into());
+                }
+            }
+            Err(error) => {
+                siblings.cancel();
+                while pending.next().await.is_some() {}
+                return Err(error);
+            }
+        }
     }
 }
 
@@ -2281,6 +2381,8 @@ pub struct OracleAdmission {
     slots: Arc<OracleSlotManager>,
     /// Durable cluster/class/tenant lease transaction owner.
     leases: Arc<vala_sql::queries::oracle_admission::OracleAdmissionLeases>,
+    /// Platform-admin pool used only during startup recovery.
+    operator_pool: vala_sql::OperatorPool,
     /// Local role identity and fence authorizing lease mutation.
     local_role: RegisteredRole,
     /// Validated tenant ceilings and lifecycle configuration.
@@ -2583,6 +2685,13 @@ impl OracleAdmission {
         conn.commit().await
     }
 
+    /// Reclaims expired shared admission state before this role advertises readiness.
+    async fn recover_startup(&self) -> Result<(), vala_sql::SqlError> {
+        self.leases
+            .recover_shared_scopes(&self.operator_pool, chrono::Utc::now())
+            .await
+    }
+
     /// Starts cancellation-bound renewal for one acquired durable lease.
     fn start_lease_renewal(
         self: &Arc<Self>,
@@ -2643,11 +2752,13 @@ impl OracleAdmission {
         leases: Arc<vala_sql::queries::oracle_admission::OracleAdmissionLeases>,
         local_role: RegisteredRole,
         config: OracleConfig,
+        operator_pool: vala_sql::OperatorPool,
     ) -> Self {
         Self {
             cluster,
             slots,
             leases,
+            operator_pool,
             local_role,
             config,
             tenant_reconcile_queue: Arc::new(Mutex::new(TenantReconcileQueue::default())),
@@ -2663,7 +2774,7 @@ impl OracleAdmission {
         self: &Arc<Self>,
         shutdown: CancellationToken,
         ready: Arc<AtomicBool>,
-    ) -> Result<JoinHandle<()>, BifrostError> {
+    ) -> Result<(JoinHandle<()>, StartupResultReceiver), BifrostError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| BifrostError::Internal {
                 detail: "Oracle construction requires an active Tokio runtime".to_owned(),
@@ -2671,8 +2782,17 @@ impl OracleAdmission {
         let admission = Arc::clone(self);
         let queue = Arc::clone(&self.tenant_reconcile_queue);
         let maintenance_interval = self.config.maintenance_interval;
-        Ok(runtime.spawn(async move {
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let task = runtime.spawn(async move {
+            if let Err(error) = admission.recover_startup().await {
+                tracing::error!(error = %error, "Oracle startup admission recovery failed");
+                let _ = startup_tx.send(Err(BifrostError::Internal {
+                    detail: format!("Oracle startup admission recovery failed: {error}"),
+                }));
+                return;
+            }
             ready.store(true, Ordering::Release);
+            let _ = startup_tx.send(Ok(()));
             let mut interval = tokio::time::interval(maintenance_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
@@ -2708,7 +2828,8 @@ impl OracleAdmission {
                 }
             }
             ready.store(false, Ordering::Release);
-        }))
+        });
+        Ok((task, startup_rx))
     }
 
     /// Reports whether at least one Oracle role and local slot are available.
@@ -3050,10 +3171,19 @@ impl TailFenceDrainer<'_> {
             }
         }
         if let Some(error) = failure {
-            drop(acquired);
+            self.release_acquired(acquired).await;
             Err(error)
         } else {
             Ok(acquired)
+        }
+    }
+
+    /// Releases every completed acquisition before returning from a partial failure.
+    async fn release_acquired(&self, acquired: Vec<AcquiredTailFence>) {
+        for mut fence in acquired {
+            if !self.release_one(&mut fence).await {
+                tracing::warn!("Oracle live-tail fence release was not confirmed");
+            }
         }
     }
 
@@ -3302,13 +3432,14 @@ impl TailFenceDrainer<'_> {
         let mut batches = Vec::new();
         let mut reservations = Vec::new();
         loop {
-            let remaining = self
-                .deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| (table.clone(), BifrostError::QueryTimeout))?;
+            let Some(remaining) = self.deadline.checked_duration_since(Instant::now()) else {
+                self.release_one(&mut acquired).await;
+                return Err((table, BifrostError::QueryTimeout));
+            };
             let page_started = Instant::now();
             let page_result = tokio::select! {
                 () = self.cancellation.cancelled() => {
+                    self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryExecutionFailed));
                 }
                 result = tokio::time::timeout(
@@ -3342,18 +3473,23 @@ impl TailFenceDrainer<'_> {
                 Ok(Ok(page)) => page,
                 Ok(Err(error)) => {
                     tracing::warn!(error = %error, "Oracle live-tail drain failed");
+                    self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryVisibilityUnavailable));
                 }
                 Err(_) => {
+                    self.release_one(&mut acquired).await;
                     return Err((table, BifrostError::QueryTimeout));
                 }
             };
             for batch in page.batches {
-                let reservation = self
+                let Ok(reservation) = self
                     .memory
                     .governor
                     .try_reserve_parent(batch.get_array_memory_size())
-                    .map_err(|_| (table.clone(), BifrostError::QueryVisibilityUnavailable))?;
+                else {
+                    self.release_one(&mut acquired).await;
+                    return Err((table, BifrostError::QueryVisibilityUnavailable));
+                };
                 reservations.push(self.telemetry.account_memory(
                     reservation,
                     self.query_class,
@@ -3366,8 +3502,14 @@ impl TailFenceDrainer<'_> {
                 break;
             }
             if after.is_none() {
+                self.release_one(&mut acquired).await;
                 return Err((table, BifrostError::QueryVisibilityUnavailable));
             }
+        }
+        let released = self.release_one(&mut acquired).await;
+        if !released {
+            tracing::warn!("Oracle live-tail fence release was not confirmed");
+            return Err((table, BifrostError::QueryVisibilityUnavailable));
         }
         acquired.drain_succeeded = true;
         Ok(DrainedTailFence {
@@ -3376,13 +3518,30 @@ impl TailFenceDrainer<'_> {
             reservations,
         })
     }
+
+    /// Awaits one fence release and updates hold telemetry truthfully.
+    async fn release_one(&self, acquired: &mut AcquiredTailFence) -> bool {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        let released = tokio::time::timeout(
+            remaining,
+            acquired
+                .transport
+                .release_fence_async(acquired.fence.fence_id),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok_and(|response| response.released));
+        acquired.drain_succeeded = released;
+        released
+    }
 }
 
 impl Drop for AcquiredTailFence {
-    /// Releases the retained interval on success, failure, or query cancellation.
+    /// Records hold duration; abandoned intervals rely on Scribe TTL recovery.
     fn drop(&mut self) {
-        let released = self.transport.release_fence(self.fence.fence_id);
-        let outcome = if self.drain_succeeded && released.is_ok() {
+        let outcome = if self.drain_succeeded {
             "success"
         } else {
             "failed"
@@ -3393,9 +3552,6 @@ impl Drop for AcquiredTailFence {
             "outcome" => outcome
         )
         .record(self.acquired_at.elapsed().as_secs_f64());
-        if let Err(error) = released {
-            tracing::error!(error = %error, "Oracle tail fence cleanup failed");
-        }
     }
 }
 
@@ -4162,6 +4318,7 @@ mod tests {
     use super::*;
     use arrow::array::{StringArray, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::atomic::AtomicUsize;
 
     /// The synchronous floor rejects empty, multi-statement, and non-SELECT SQL.
     #[test]
@@ -4352,6 +4509,254 @@ mod tests {
         assert_eq!(
             queue.enqueue(tenants[0], QueryClass::Analytical),
             TenantReconcileInsert::Queued
+        );
+    }
+
+    /// Barrier-controlled transport probe used by the real dispatcher fan-out proof.
+    struct BoundedDispatchTransport {
+        /// Synchronizes the first two execute attempts so the bound is observable.
+        barrier: Arc<tokio::sync::Barrier>,
+        /// Number of execute calls that entered the transport.
+        execute_calls: AtomicU64,
+        /// Number of execute calls still holding their attempt guard.
+        active: Arc<AtomicU64>,
+        /// Highest number of simultaneous execute calls observed.
+        maximum: Arc<AtomicU64>,
+        /// Number of tuple-bound releases received after attempt cleanup.
+        releases: Arc<AtomicU64>,
+        /// Number of in-flight attempt guards dropped during sibling draining.
+        drained: Arc<AtomicU64>,
+    }
+
+    /// Drops one in-flight transport attempt and records its cleanup.
+    struct BoundedAttemptGuard {
+        /// Shared active-attempt count.
+        active: Arc<AtomicU64>,
+        /// Shared drained-attempt count.
+        drained: Arc<AtomicU64>,
+    }
+
+    impl Drop for BoundedAttemptGuard {
+        /// Decrements in-flight work when cancellation or terminal failure drains it.
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.drained.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl dispatcher::OraclePeerTransport for BoundedDispatchTransport {
+        /// Accepts every reservation so only the dispatch bound controls fan-out.
+        async fn reserve(
+            &self,
+            _worker: wyrd_spec::vala::api::NodeId,
+            request: wyrd_spec::vala::api::ReserveNodeSlotsRequest,
+        ) -> Result<wyrd_spec::vala::api::ReserveNodeSlotsResponse, dispatcher::DispatchError>
+        {
+            Ok(wyrd_spec::vala::api::ReserveNodeSlotsResponse::Pending(
+                wyrd_spec::vala::api::PendingNodeReservation {
+                    reservation_id: wyrd_spec::vala::api::ReservationId::new(uuid::Uuid::now_v7()),
+                    expires_at: request.expires_at,
+                },
+            ))
+        }
+
+        /// Records every tuple-bound cleanup issued by failed attempts.
+        async fn release(
+            &self,
+            _worker: wyrd_spec::vala::api::NodeId,
+            _request: wyrd_spec::vala::api::ReleaseNodeSlotsRequest,
+        ) -> Result<(), dispatcher::DispatchError> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        /// Blocks siblings behind a barrier, then terminates one and waits on cancellation in the other.
+        async fn execute(
+            &self,
+            _worker: wyrd_spec::vala::api::NodeId,
+            _request: wyrd_spec::vala::api::ExecuteFragmentRequest,
+        ) -> Result<dispatcher::WorkerAttemptStream, dispatcher::DispatchError> {
+            let ordinal = self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(active, Ordering::SeqCst);
+            let guard = BoundedAttemptGuard {
+                active: Arc::clone(&self.active),
+                drained: Arc::clone(&self.drained),
+            };
+            self.barrier.wait().await;
+            if ordinal == 0 {
+                let stream = async_stream::stream! {
+                    let _guard = guard;
+                    yield Ok(wyrd_spec::vala::api::WorkerAttemptFrame::Schema(vec![1]));
+                    yield Err(dispatcher::DispatchError::Terminal);
+                };
+                return Ok(Box::pin(stream));
+            }
+            let _guard = guard;
+            std::future::pending::<
+                Result<dispatcher::WorkerAttemptStream, dispatcher::DispatchError>,
+            >()
+            .await
+        }
+    }
+
+    /// Actual bounded fragment orchestration overlaps real dispatcher work, cancels failure siblings, and drains.
+    #[tokio::test]
+    async fn fragment_dispatch_respects_bound() {
+        let leader = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+        let transport = Arc::new(BoundedDispatchTransport {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+            execute_calls: AtomicU64::new(0),
+            active: Arc::new(AtomicU64::new(0)),
+            maximum: Arc::new(AtomicU64::new(0)),
+            releases: Arc::new(AtomicU64::new(0)),
+            drained: Arc::new(AtomicU64::new(0)),
+        });
+        let dispatcher = dispatcher::FragmentDispatcher::new(
+            Arc::new(peer::DeterministicTestSigner {
+                key_id: "test".to_owned(),
+            }),
+            dispatcher::OraclePeerTransportDirectory::new_for_test(
+                leader,
+                Arc::clone(&transport) as Arc<dyn dispatcher::OraclePeerTransport>,
+                Arc::clone(&transport) as Arc<dyn dispatcher::OraclePeerTransport>,
+            ),
+        );
+        let context = dispatcher::DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: leader,
+            leader_fence: 1,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 1_024,
+            attempt_memory_bytes: 1_024,
+            cancellation: CancellationToken::new(),
+            deadline: (Instant::now() + Duration::from_secs(5)).into(),
+        };
+        let siblings = CancellationToken::new();
+        let mut attempts: Vec<SealedFragmentFuture<'_>> = Vec::new();
+        for ordinal in 0..3_u8 {
+            let dispatcher = &dispatcher;
+            let mut context = context.clone();
+            context.cancellation = siblings.clone();
+            let fragment = fragment::SealedScanFragment {
+                fragment_id: format!("fragment-{ordinal}"),
+                binding: "binding".to_owned(),
+                tier: fragment::SealedSourceTier::HotSealed,
+                pinned_digest: "manifest".to_owned(),
+                files: vec![fragment::SealedScanFile {
+                    location: format!("binding/{ordinal}.parquet"),
+                    row_groups: Vec::new(),
+                    size_bytes: 1,
+                    estimated_rows: 1,
+                }],
+                projection: Vec::new(),
+                predicates: Vec::new(),
+                schema_fingerprint: "schema".to_owned(),
+                estimated_rows: 1,
+                estimated_bytes: 1,
+                deadline_unix_ms: i64::MAX,
+            };
+            let candidate = dispatcher::DispatchCandidate {
+                node_id: leader,
+                worker_fence: 1,
+            };
+            attempts.push(Box::pin(async move {
+                dispatcher
+                    .execute(&context, fragment, &[candidate])
+                    .await
+                    .map_err(|_error| {
+                        OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
+                    })
+            }));
+        }
+        let mut output = Vec::new();
+        let error = dispatch_fragment_attempts(attempts, 2, &siblings, &mut output)
+            .await
+            .expect_err("terminal fragment failure");
+        assert!(matches!(
+            error,
+            OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
+        ));
+        assert_eq!(transport.maximum.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.active.load(Ordering::SeqCst), 0);
+        assert_eq!(transport.releases.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.drained.load(Ordering::SeqCst), 2);
+        assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            output.is_empty(),
+            "failed-attempt bytes must stay invisible"
+        );
+        assert!(siblings.is_cancelled());
+    }
+
+    /// Drops one sibling guard when decode failure drains the active attempt.
+    struct DecodeSiblingGuard {
+        /// Shared count of sibling cleanup completions.
+        drained: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DecodeSiblingGuard {
+        /// Records that the sibling was dropped after cancellation.
+        fn drop(&mut self) {
+            self.drained.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A validated attempt whose batch decode fails cancels and drains siblings.
+    #[tokio::test]
+    async fn fragment_dispatch_decode_failure_drains_sibling() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let siblings = CancellationToken::new();
+        let drained = Arc::new(AtomicUsize::new(0));
+        let first_barrier = Arc::clone(&barrier);
+        let first = Box::pin(async move {
+            first_barrier.wait().await;
+            Ok(attempt::ValidatedAttempt {
+                schema: vec![1],
+                batches: attempt::AttemptBatchReader::Memory {
+                    batches: vec![vec![0]].into_iter(),
+                    memory_reservation: None,
+                },
+                footer: wyrd_spec::vala::api::WorkerFooter {
+                    fragment_id: "decode-failure".to_owned(),
+                    manifest_digest: QueryAuditDigest::new("manifest").expect("digest"),
+                    row_count: 0,
+                    encoded_bytes: 0,
+                    payload_digest: QueryAuditDigest::new("payload").expect("digest"),
+                    completed: true,
+                },
+            })
+        });
+        let sibling_barrier = Arc::clone(&barrier);
+        let sibling_token = siblings.clone();
+        let sibling_drained = Arc::clone(&drained);
+        let sibling = Box::pin(async move {
+            let _guard = DecodeSiblingGuard {
+                drained: sibling_drained,
+            };
+            sibling_barrier.wait().await;
+            sibling_token.cancelled().await;
+            Err(OracleExecutionError::Public(
+                BifrostError::QueryExecutionFailed,
+            ))
+        });
+        let mut output = Vec::new();
+        let error = dispatch_fragment_attempts(vec![first, sibling], 2, &siblings, &mut output)
+            .await
+            .expect_err("invalid decoded batch fails the whole dispatch");
+        assert!(matches!(
+            error,
+            OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
+        ));
+        assert!(siblings.is_cancelled());
+        assert_eq!(drained.load(Ordering::SeqCst), 1);
+        assert!(
+            output.is_empty(),
+            "decode failure cannot expose partial batches"
         );
     }
 }

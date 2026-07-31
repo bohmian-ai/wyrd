@@ -35,7 +35,7 @@ use wyrd_spec::auth::{
 };
 use wyrd_spec::envelope::{CardKind, Spec};
 use wyrd_spec::ids::{CardName, CardUid, SpaceName};
-use wyrd_spec::reference::CardRef;
+use wyrd_spec::reference::{CardRef, CardRefScope};
 use wyrd_spec::request_id::RequestId;
 use wyrd_sql::TenantConn;
 use wyrd_sql::queries::auth::{
@@ -524,6 +524,126 @@ impl WyrdTestEnv {
     #[must_use]
     pub fn state(&self) -> &AppState {
         &self.inner.state
+    }
+
+    /// Opens the production tenant transaction wrapper for an explicit test tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture cannot acquire or bind the transaction.
+    pub async fn tenant_conn_for(
+        &self,
+        tenant_id: DataTenantId,
+    ) -> Result<TenantConn<'_>, WyrdTestError> {
+        self.inner
+            .fixture
+            .tenant_conn_for(tenant_id)
+            .await
+            .map_err(sql)
+    }
+
+    /// Mints a signed Service token while retaining production verification and SQL resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a role or token cannot be encoded.
+    pub fn issue_service_access_token_for_test(
+        &self,
+        principal_id: PrincipalId,
+        tenant_id: DataTenantId,
+        card_ref: CardRef,
+        roles: &[&str],
+    ) -> Result<String, WyrdTestError> {
+        self.inner
+            .issuing_key
+            .issue_service_access_token(
+                principal_id,
+                tenant_id,
+                card_ref.clone(),
+                CardRefScope::own(&card_ref),
+                role_refs(roles)?,
+                chrono::Duration::minutes(15),
+            )
+            .map_err(|error| WyrdTestError::Auth(error.to_string()))
+    }
+
+    /// Mints a signed User token while retaining production verification and SQL resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a role or token cannot be encoded.
+    pub fn issue_user_access_token_for_test(
+        &self,
+        principal_id: PrincipalId,
+        tenant_id: DataTenantId,
+        roles: &[&str],
+    ) -> Result<String, WyrdTestError> {
+        self.inner
+            .issuing_key
+            .issue_user_access_token(
+                TokenPrincipalRef {
+                    id: principal_id,
+                    kind: PrincipalKindTag::User,
+                    tenant_id,
+                    card_ref: None,
+                    card_ref_scope: Default::default(),
+                },
+                role_refs(roles)?,
+                chrono::Duration::minutes(15),
+            )
+            .map_err(|error| WyrdTestError::Auth(error.to_string()))
+    }
+
+    /// Seeds one real Service principal and role membership under an explicit tenant.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the card is not a Service or SQL persistence fails.
+    pub async fn seed_service_principal_for_test(
+        &self,
+        tenant_id: DataTenantId,
+        card_ref: &CardRef,
+        roles: &[&str],
+    ) -> Result<PrincipalId, WyrdTestError> {
+        if card_ref.kind != CardKind::Service {
+            return Err(WyrdTestError::Unsupported(
+                "test principal card must be Service".to_owned(),
+            ));
+        }
+        let principal_id = Uuid::now_v7();
+        let creator_id = Uuid::now_v7();
+        let mut conn = self.tenant_conn_for(tenant_id).await?;
+        insert_user(
+            &mut conn,
+            creator_id,
+            Some(&format!("{creator_id}@test.wyrd")),
+            "password",
+            None,
+        )
+        .await
+        .map_err(sql)?;
+        insert_service_account(
+            &mut conn,
+            principal_id,
+            "service",
+            card_ref,
+            card_ref.name.as_str(),
+            None,
+            creator_id,
+        )
+        .await
+        .map_err(sql)?;
+        for role in roles {
+            grant_role(
+                &mut conn,
+                principal_id,
+                PrincipalTable::ServiceAccount,
+                role,
+            )
+            .await?;
+        }
+        conn.commit().await.map_err(sql)?;
+        Ok(PrincipalId::new(principal_id))
     }
 
     async fn bootstrap_machine(

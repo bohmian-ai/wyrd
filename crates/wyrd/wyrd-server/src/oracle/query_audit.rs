@@ -300,6 +300,7 @@ mod tests {
         let oracle = Oracle::new(OracleBuildConfig {
             catalog: crate::test_support::test_redux_catalog().await,
             admission_leases: OracleAdmissionLeases::new(vala.clone()),
+            operator_pool: vala_sql::OperatorPool::from(vala.pool().clone()),
             vala,
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),

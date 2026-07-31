@@ -105,6 +105,15 @@ pub trait TailReadTransport: Send + Sync {
     /// Returns [`TailReadError::State`] when the local registry cannot be safely
     /// accessed.
     fn release_fence(&self, fence_id: tail::TailFenceId) -> Result<FenceRelease, TailReadError>;
+
+    /// Awaits release completion when the transport has an asynchronous
+    /// lifecycle (for example, an authenticated remote RPC).
+    async fn release_fence_async(
+        &self,
+        fence_id: tail::TailFenceId,
+    ) -> Result<FenceRelease, TailReadError> {
+        self.release_fence(fence_id)
+    }
 }
 
 /// In-process transport that preserves Scribe's shallow Arrow ownership.
@@ -282,18 +291,22 @@ impl TailReadTransport for TonicTailReadTransport {
         TonicTailReadTransport::read_page(self, request).await
     }
 
-    /// Schedule idempotent remote release from the synchronous drop boundary.
+    /// Declines synchronous remote release from a drop boundary.
     ///
-    /// The fence owner also expires abandoned intervals at its bounded TTL. A
-    /// transport error is logged by the spawned cleanup task and never blocks
-    /// an async executor thread during query cancellation.
+    /// Lifecycle owners call [`Self::release_fence_async`] while they can await
+    /// the authenticated RPC. Abandoned intervals rely on the bounded Scribe
+    /// TTL instead of spawning detached cleanup from `Drop`.
     fn release_fence(&self, fence_id: tail::TailFenceId) -> Result<FenceRelease, TailReadError> {
-        let transport = self.clone();
-        tokio::spawn(async move {
-            if let Err(error) = TonicTailReadTransport::release_fence(&transport, fence_id).await {
-                tracing::error!(error = %error, "remote Oracle tail fence cleanup failed");
-            }
-        });
+        let _ = fence_id;
+        Ok(FenceRelease { released: false })
+    }
+
+    /// Awaits the authenticated remote release RPC; no detached cleanup task is created.
+    async fn release_fence_async(
+        &self,
+        fence_id: tail::TailFenceId,
+    ) -> Result<FenceRelease, TailReadError> {
+        TonicTailReadTransport::release_fence(self, fence_id).await?;
         Ok(FenceRelease { released: true })
     }
 }

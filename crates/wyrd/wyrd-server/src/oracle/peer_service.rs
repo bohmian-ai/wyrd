@@ -4,8 +4,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::{Stream, StreamExt};
+use vala_bifrost_redux::cluster::ClusterRegistry;
 use vala_bifrost_redux::oracle::dispatcher::{DispatchError, OraclePeerWorker, WorkerExecution};
-use wyrd_runtime::PrincipalKind;
+use vala_bifrost_redux::oracle::peer::PeerSecurityAudit;
+use wyrd_runtime::{Permission, Principal, PrincipalKind};
+use wyrd_spec::vala::api::BifrostSecurityViolationKind;
 use wyrd_tonic::private_conversion::PrivateConversionError;
 use wyrd_tonic::tonic::{Request, Response, Status};
 use wyrd_tonic::wyrd::v1::oracle_peer_service_server::{
@@ -23,13 +26,27 @@ pub struct OraclePeerGrpc {
     state: AppState,
     /// Redux worker owner shared with the local transport.
     worker: Arc<OraclePeerWorker>,
+    /// Authoritative membership owner used before reservation mutation.
+    cluster: Arc<ClusterRegistry>,
+    /// Scrubbed durable audit used for rejected peer authority.
+    security_audit: Arc<dyn PeerSecurityAudit>,
 }
 
 impl OraclePeerGrpc {
     /// Creates the adapter around the retained worker runtime.
     #[must_use]
-    pub fn new(state: AppState, worker: Arc<OraclePeerWorker>) -> Self {
-        Self { state, worker }
+    pub fn new(
+        state: AppState,
+        worker: Arc<OraclePeerWorker>,
+        cluster: Arc<ClusterRegistry>,
+        security_audit: Arc<dyn PeerSecurityAudit>,
+    ) -> Self {
+        Self {
+            state,
+            worker,
+            cluster,
+            security_audit,
+        }
     }
 
     /// Returns the generated tonic server wrapper.
@@ -45,23 +62,50 @@ impl OraclePeerGrpc {
     async fn authenticate(
         &self,
         metadata: &wyrd_tonic::tonic::metadata::MetadataMap,
-    ) -> Result<(), Status> {
+    ) -> Result<Principal, Status> {
         let verifier = self
             .state
             .auth
             .token_verifier
             .as_ref()
             .ok_or_else(|| Status::unavailable("auth backend not configured"))?;
-        let auth = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata)
-            .await
-            .map_err(|error| Status::unauthenticated(error.to_string()))?;
-        if !matches!(auth.principal.kind, PrincipalKind::Service { .. }) {
-            return Err(Status::permission_denied(
-                "private Oracle peer requires a workload service identity",
-            ));
+        let auth =
+            match vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), metadata).await {
+                Ok(auth) => auth,
+                Err(error) => {
+                    self.audit_denial(BifrostSecurityViolationKind::PeerAudience)
+                        .await?;
+                    return Err(Status::unauthenticated(error.to_string()));
+                }
+            };
+        if let Some(violation) = peer_authority_violation(&auth.principal) {
+            self.audit_denial(violation).await?;
+            return Err(Status::permission_denied("Oracle peer authority denied"));
         }
-        Ok(())
+        Ok(auth.principal)
     }
+
+    /// Appends one scrubbed denial and fails closed if audit storage is unavailable.
+    async fn audit_denial(&self, violation: BifrostSecurityViolationKind) -> Result<(), Status> {
+        self.security_audit
+            .append_unverified_ticket_rejection(violation)
+            .await
+            .map_err(|_| Status::unavailable("Oracle peer security audit unavailable"))
+    }
+}
+
+/// Classifies platform-service peer authority without exposing identity detail.
+fn peer_authority_violation(principal: &Principal) -> Option<BifrostSecurityViolationKind> {
+    if !matches!(principal.kind, PrincipalKind::Service { .. }) {
+        return Some(BifrostSecurityViolationKind::PeerAudience);
+    }
+    if principal.tenant_id != wyrd_spec::DataTenantId::SYSTEM_OWNER {
+        return Some(BifrostSecurityViolationKind::PeerTenant);
+    }
+    (!principal
+        .effective_permissions
+        .contains(&Permission::bifrost_oracle_peer_invoke()))
+    .then_some(BifrostSecurityViolationKind::PeerAudience)
 }
 
 #[wyrd_tonic::tonic::async_trait]
@@ -81,6 +125,16 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authenticate(request.metadata()).await?;
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
+        if self
+            .cluster
+            .validate_live_oracle(request.leader_node_id, request.leader_fencing_token)
+            .await
+            .is_err()
+        {
+            self.audit_denial(BifrostSecurityViolationKind::PeerFence)
+                .await?;
+            return Err(Status::permission_denied("Oracle peer fence is not live"));
+        }
         Ok(Response::new(self.worker.reserve(&request).into()))
     }
 
@@ -142,6 +196,12 @@ fn dispatch_status(error: DispatchError) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wyrd_runtime::permission::PermissionSet;
+    use wyrd_semver::VersionBlock;
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::envelope::CardKind;
+    use wyrd_spec::ids::{CardName, SpaceName};
+    use wyrd_spec::reference::{CardRef, CardRefScope};
 
     /// Proves the private tonic boundary preserves only stale-object failures as not-found.
     #[test]
@@ -151,5 +211,60 @@ mod tests {
 
         assert_eq!(stale.code(), wyrd_tonic::tonic::Code::NotFound);
         assert_eq!(outage.code(), wyrd_tonic::tonic::Code::Unavailable);
+    }
+
+    /// Peer authority rejects users, tenant mismatch, and missing permission before mutation.
+    #[test]
+    fn reserve_requires_oracle_peer_authority() {
+        let card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new("oracle-peer").expect("name"),
+            version: VersionBlock::parse("1.0.0").expect("version"),
+            space: SpaceName::new("system").expect("space"),
+            uid: None,
+        };
+        let service_kind = PrincipalKind::Service {
+            card_ref: card_ref.clone(),
+            card_ref_scope: CardRefScope::own(&card_ref),
+        };
+        let principal = |kind, tenant_id, permissions| Principal {
+            id: PrincipalId::new(uuid::Uuid::now_v7()),
+            kind,
+            tenant_id,
+            roles: Vec::new(),
+            effective_permissions: permissions,
+        };
+        assert_eq!(
+            peer_authority_violation(&principal(
+                PrincipalKind::User,
+                wyrd_spec::DataTenantId::SYSTEM_OWNER,
+                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            )),
+            Some(BifrostSecurityViolationKind::PeerAudience)
+        );
+        assert_eq!(
+            peer_authority_violation(&principal(
+                service_kind.clone(),
+                wyrd_spec::DataTenantId::new_v7(),
+                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            )),
+            Some(BifrostSecurityViolationKind::PeerTenant)
+        );
+        assert_eq!(
+            peer_authority_violation(&principal(
+                service_kind.clone(),
+                wyrd_spec::DataTenantId::SYSTEM_OWNER,
+                PermissionSet::new(),
+            )),
+            Some(BifrostSecurityViolationKind::PeerAudience)
+        );
+        assert_eq!(
+            peer_authority_violation(&principal(
+                service_kind,
+                wyrd_spec::DataTenantId::SYSTEM_OWNER,
+                PermissionSet::from_iter([Permission::bifrost_oracle_peer_invoke()]),
+            )),
+            None
+        );
     }
 }

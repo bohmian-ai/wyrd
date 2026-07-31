@@ -561,6 +561,7 @@ impl OracleFixture {
             catalog: Arc::clone(&self.catalog),
             vala: self.pg.vala_postgres().clone(),
             admission_leases: OracleAdmissionLeases::new(self.pg.vala_postgres().clone()),
+            operator_pool: self.pg.operator_pool().clone(),
             cluster: Arc::clone(&self.cluster),
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
@@ -900,6 +901,8 @@ struct FenceProbeTransport {
     node_id: wyrd_spec::vala::api::NodeId,
     /// Whether acquisition fails with capacity exhaustion.
     fail_acquire: bool,
+    /// Whether the awaited release reports a transport failure.
+    fail_release: bool,
     /// Shared successful-release count.
     releases: Arc<AtomicUsize>,
     /// Physical batches returned by every complete page.
@@ -957,6 +960,11 @@ impl TailReadTransport for FenceProbeTransport {
         _fence_id: wyrd_spec::vala::api::TailFenceId,
     ) -> Result<FenceRelease, TailReadError> {
         self.releases.fetch_add(1, Ordering::SeqCst);
+        if self.fail_release {
+            return Err(TailReadError::State {
+                detail: "injected release failure".to_owned(),
+            });
+        }
         Ok(FenceRelease { released: true })
     }
 }
@@ -1834,6 +1842,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
     let transport: Arc<dyn TailReadTransport> = Arc::new(FenceProbeTransport {
         node_id,
         fail_acquire: false,
+        fail_release: false,
         releases: Arc::clone(&releases),
         batches: vec![seeded.batch.slice(0, 1)],
         page_reads: Arc::new(AtomicUsize::new(0)),
@@ -2342,6 +2351,7 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
             Arc::new(FenceProbeTransport {
                 node_id,
                 fail_acquire,
+                fail_release: false,
                 releases: Arc::clone(&releases),
                 batches: Vec::new(),
                 page_reads: Arc::new(AtomicUsize::new(0)),
@@ -2376,10 +2386,64 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
         .await;
 }
 
-/// Startup avoids cross-tenant reconciliation and tenant SQL still fails closed.
+/// Remote-style release failure is awaited and `Drop` schedules no second release.
+#[tokio::test]
+async fn remote_fence_release_failure_is_observed_without_drop_spawn() {
+    let fixture = OracleFixture::new("oracle_release_failure").await;
+    let tails = Arc::new(TailTransportDirectory::default());
+    let releases = Arc::new(AtomicUsize::new(0));
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    tails.insert_live_stream(
+        fixture.table.fqn(),
+        node_id,
+        1,
+        wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
+        Arc::new(FenceProbeTransport {
+            node_id,
+            fail_acquire: false,
+            fail_release: true,
+            releases: Arc::clone(&releases),
+            batches: Vec::new(),
+            page_reads: Arc::new(AtomicUsize::new(0)),
+        }),
+    );
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+
+    let error = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT value FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::Fused,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect_err("failed release is observed before query returns");
+    assert_eq!(error, BifrostError::QueryVisibilityUnavailable);
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    tokio::task::yield_now().await;
+    assert_eq!(releases.load(Ordering::SeqCst), 1);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// Startup recovery failure keeps readiness false and rejects query work.
 #[tokio::test]
 async fn pg_bifrost_oracle_multitenant_admission_journey_startup_avoids_tenant_scan() {
     let fixture = OracleFixture::new("oracle_not_ready").await;
+    let spans = SpanProbe::default();
+    let _span_guard = tracing::subscriber::set_default(spans.clone());
     let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
     sqlx::query(
         "CREATE FUNCTION vala.test_fail_oracle_reconcile() RETURNS trigger \
@@ -2406,8 +2470,16 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_startup_avoids_tenant_s
         OracleConfig::default(),
         64 * 1024 * 1024,
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(oracle.is_ready());
+    let startup_error = oracle
+        .await_startup()
+        .await
+        .expect_err("startup recovery error propagates");
+    assert!(
+        startup_error
+            .to_string()
+            .contains("Oracle startup admission recovery failed")
+    );
+    assert!(!oracle.is_ready());
     let error = oracle
         .query_sql(
             fixture.context(),
@@ -2419,11 +2491,43 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_startup_avoids_tenant_s
             },
         )
         .await
-        .expect_err("tenant admission failure refuses the query");
-    assert_eq!(error, BifrostError::QueryExecutionFailed);
+        .expect_err("startup recovery failure refuses the query");
+    assert_eq!(error, BifrostError::OracleRoleUnavailable);
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
+    let captured = spans.snapshot();
+    assert!(
+        captured.iter().all(|span| {
+            !matches!(
+                span.name.as_str(),
+                "bifrost.oracle.plan"
+                    | "bifrost.oracle.audit"
+                    | "bifrost.oracle.source"
+                    | "bifrost.oracle.slot_reservation"
+                    | "bifrost.oracle.stream"
+            )
+        }),
+        "startup recovery failure must not plan, read, or audit: {captured:?}"
+    );
+    let mut conn = fixture
+        .pg
+        .tenant_conn_for(fixture.tenant)
+        .await
+        .expect("tenant conn");
+    let audit_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.audit_outbox
+         WHERE data_tenant_id = wyrd.current_tenant()
+           AND operation IN ('bifrost.query.read_decision', 'bifrost.query.security_violation')",
+    )
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("startup audit count");
+    conn.commit().await.expect("audit count commit");
+    assert_eq!(
+        audit_rows, 0,
+        "startup recovery failure must not append audit"
+    );
 }
 
 /// The durable expiry owner accepts 128 and rejects every larger batch.

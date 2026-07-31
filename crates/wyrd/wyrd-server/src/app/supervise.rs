@@ -89,11 +89,14 @@ where
     if let Some(joined) = set.join_next().await {
         classify_first(joined, &mut terminal);
     }
-    before_cancel().await;
+    let deadline = Instant::now() + drain;
+    match timeout_at(deadline, before_cancel()).await {
+        Ok(()) => {}
+        Err(_) => tracing::warn!("readiness removal hook exceeded shutdown deadline"),
+    }
     shutdown.cancel();
 
     // Phase 2 — drain within budget, then abort.
-    let deadline = Instant::now() + drain;
     loop {
         match timeout_at(deadline, set.join_next()).await {
             Ok(Some(joined)) => log_drain(joined),
@@ -201,6 +204,27 @@ mod tests {
 
         assert!(terminal.is_none());
         assert_eq!(state.load(Ordering::Acquire), 2);
+    }
+
+    /// Proves a hung readiness hook cannot consume more than the original shutdown budget.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_progresses_when_readiness_hook_never_completes() {
+        let shutdown = CancellationToken::new();
+        let mut set: JoinSet<TaskExit> = JoinSet::new();
+        set.spawn(worker_task(TaskId::Signal, async {}));
+        let worker_shutdown = shutdown.clone();
+        set.spawn(worker_task(TaskId::Worker("hung_hook_probe"), async move {
+            worker_shutdown.cancelled().await;
+        }));
+        let assertion_shutdown = shutdown.clone();
+
+        let terminal = supervise_with_shutdown(set, shutdown, Duration::from_secs(1), || {
+            std::future::pending::<()>()
+        })
+        .await;
+
+        assert!(terminal.is_none());
+        assert!(assertion_shutdown.is_cancelled());
     }
 
     #[tokio::test]

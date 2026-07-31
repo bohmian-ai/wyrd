@@ -57,6 +57,8 @@ pub enum Resource {
     BifrostGenAiPayload,
     /// Agent-trace captured payload columns (sensitive).
     BifrostAgentTracePayload,
+    /// Private Oracle peer reservation and execution.
+    BifrostOraclePeer,
     /// One of several resources.
     AnyOf(Vec<Resource>),
     /// All resources.
@@ -123,6 +125,7 @@ impl Resource {
             Self::BifrostLogPayload => "bifrost_log_payload",
             Self::BifrostGenAiPayload => "bifrost_genai_payload",
             Self::BifrostAgentTracePayload => "bifrost_agent_trace_payload",
+            Self::BifrostOraclePeer => "bifrost_oracle_peer",
             Self::Wildcard => "wildcard",
             Self::AnyOf(_) => return None,
         })
@@ -298,6 +301,15 @@ impl Permission {
         }
     }
 
+    /// Invoke the private Oracle peer protocol.
+    #[must_use]
+    pub const fn bifrost_oracle_peer_invoke() -> Self {
+        Self {
+            resource: Resource::BifrostOraclePeer,
+            action: Action::Invoke,
+        }
+    }
+
     /// Read Bifrost table definitions.
     #[must_use]
     pub const fn bifrost_table_read() -> Self {
@@ -387,6 +399,7 @@ fn parse_resource(value: &str) -> Result<Resource, PermissionParseError> {
         "delegation" => Resource::Delegation,
         "bifrost_table" => Resource::BifrostTable,
         "bifrost_record" => Resource::BifrostRecord,
+        "bifrost_oracle_peer" => Resource::BifrostOraclePeer,
         "bifrost_query" => Resource::BifrostQuery,
         "bifrost_trace_payload" => Resource::BifrostTracePayload,
         "bifrost_log_payload" => Resource::BifrostLogPayload,
@@ -523,6 +536,10 @@ mod tests {
             (Permission::bifrost_table_read(), "bifrost_table:read"),
             (Permission::bifrost_table_write(), "bifrost_table:write"),
             (Permission::bifrost_query_read(), "bifrost_query:read"),
+            (
+                Permission::bifrost_oracle_peer_invoke(),
+                "bifrost_oracle_peer:invoke",
+            ),
         ] {
             assert_eq!(permission.to_string(), wire);
             assert_eq!(wire.parse::<Permission>().expect("wire parses"), permission);

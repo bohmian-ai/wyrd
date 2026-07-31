@@ -17,7 +17,7 @@ use std::sync::Arc;
 use base64::Engine;
 use secrecy::{ExposeSecret, SecretString};
 use wyrd_auth_oidc::IssuerConfigResolver;
-use wyrd_auth_verify::{AccessTokenClaims, PermissionResolver, TokenVerifier};
+use wyrd_auth_verify::{PermissionResolver, TokenVerifier};
 use wyrd_runtime::Principal;
 use wyrd_spec::ids::DataTenantId;
 use wyrd_spec::request_id::RequestId;
@@ -67,9 +67,20 @@ fn tenant_from_unverified_access_token(token: &str) -> Result<DataTenantId, Inge
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(payload)
         .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    let claims: AccessTokenClaims = serde_json::from_slice(&bytes)
+    let claims: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
-    Ok(claims.principal.tenant_id)
+    let tenant = claims
+        .pointer("/principal/tenant_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    let uuid = uuid::Uuid::parse_str(tenant)
+        .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))?;
+    if uuid.is_nil() {
+        Ok(DataTenantId::SYSTEM_OWNER)
+    } else {
+        DataTenantId::new(uuid)
+            .map_err(|_| IngestError::Unauthenticated("token does not name a tenant".to_owned()))
+    }
 }
 
 /// Read `wyrd-request-id` from the inbound metadata, or mint a `UUIDv7` when it is

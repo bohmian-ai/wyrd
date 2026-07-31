@@ -10,6 +10,8 @@ use futures_util::{Stream, StreamExt};
 use prost::Message;
 use thiserror::Error;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     BifrostSecurityViolationKind, ExecuteFragmentRequest, FencingToken, NodeId,
@@ -404,6 +406,13 @@ impl OraclePeerWorker {
         let _released = self.reservations.release(request, Utc::now());
     }
 
+    /// Returns live pending reservations for integration-only capacity assertions.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn pending_reservations(&self) -> usize {
+        self.reservations.cleanup_expired(Utc::now())
+    }
+
     /// Verifies and executes one ticket-bound fragment.
     ///
     /// Signature, configured key ID, audience, worker fence, and replay are
@@ -720,7 +729,43 @@ pub struct TonicOraclePeerTransport {
     /// Frozen worker-address snapshot keyed by node identity.
     addresses: HashMap<NodeId, String>,
     /// Optional authenticated service credential attached to private calls.
-    authorization: Option<MetadataValue<wyrd_tonic::tonic::metadata::Ascii>>,
+    credentials: Arc<dyn OraclePeerCredentials>,
+}
+
+/// Supplies short-lived authorization for private Oracle peer RPCs.
+///
+/// The server implementation owns durable credentials and refresh policy; the
+/// Redux transport only requests a current bearer at the network boundary.
+#[async_trait]
+pub trait OraclePeerCredentials: Send + Sync {
+    /// Returns a current access bearer, refreshing when `force_refresh` is true.
+    ///
+    /// # Errors
+    /// Returns a terminal dispatch failure when credentials cannot be exchanged.
+    async fn bearer(&self, force_refresh: bool) -> Result<String, DispatchError>;
+}
+
+/// Deterministic credential provider used by local and transport tests.
+#[derive(Debug)]
+pub struct StaticOraclePeerCredentials {
+    /// Redacted bearer value retained only for deterministic private calls.
+    bearer: secrecy::SecretString,
+}
+
+impl StaticOraclePeerCredentials {
+    /// Creates deterministic credentials from one bearer.
+    #[must_use]
+    pub fn new(bearer: secrecy::SecretString) -> Self {
+        Self { bearer }
+    }
+}
+
+#[async_trait]
+impl OraclePeerCredentials for StaticOraclePeerCredentials {
+    async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+        use secrecy::ExposeSecret;
+        Ok(self.bearer.expose_secret().to_owned())
+    }
 }
 
 impl TonicOraclePeerTransport {
@@ -732,14 +777,25 @@ impl TonicOraclePeerTransport {
         addresses: HashMap<NodeId, String>,
         bearer: Option<&str>,
     ) -> Result<Self, DispatchError> {
-        let authorization = bearer
-            .map(|token| format!("Bearer {token}").parse())
-            .transpose()
-            .map_err(|_| DispatchError::Terminal)?;
+        let bearer = bearer.unwrap_or_default();
         Ok(Self {
             addresses,
-            authorization,
+            credentials: Arc::new(StaticOraclePeerCredentials::new(
+                secrecy::SecretString::from(bearer.to_owned()),
+            )),
         })
+    }
+
+    /// Creates a production transport backed by a refreshing credential owner.
+    #[must_use]
+    pub fn with_credentials(
+        addresses: HashMap<NodeId, String>,
+        credentials: Arc<dyn OraclePeerCredentials>,
+    ) -> Self {
+        Self {
+            addresses,
+            credentials,
+        }
     }
 
     /// Connects to the exact selected worker from the frozen snapshot.
@@ -764,14 +820,18 @@ impl TonicOraclePeerTransport {
     }
 
     /// Adds workload authorization metadata when configured.
-    fn authenticated<T>(&self, value: T) -> Request<T> {
+    async fn authenticated<T>(
+        &self,
+        value: T,
+        force_refresh: bool,
+    ) -> Result<Request<T>, DispatchError> {
         let mut request = Request::new(value);
-        if let Some(value) = &self.authorization {
-            request
-                .metadata_mut()
-                .insert("authorization", value.clone());
-        }
-        request
+        let bearer = self.credentials.bearer(force_refresh).await?;
+        let value: MetadataValue<wyrd_tonic::tonic::metadata::Ascii> = format!("Bearer {bearer}")
+            .parse()
+            .map_err(|_| DispatchError::Terminal)?;
+        request.metadata_mut().insert("x-wyrd-access-token", value);
+        Ok(request)
     }
 }
 
@@ -786,12 +846,19 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         worker: NodeId,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+        let wire: wyrd_tonic::wyrd::v1::ReserveNodeSlotsRequest = request.into();
         let mut client = self.client(worker).await?;
-        let response = client
-            .reserve_slots(self.authenticated(request.into()))
+        let response = match client
+            .reserve_slots(self.authenticated(wire.clone(), false).await?)
             .await
-            .map_err(|status| status_error(&status))?
-            .into_inner();
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .reserve_slots(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        }
+        .into_inner();
         response.try_into().map_err(|_| DispatchError::Terminal)
     }
 
@@ -805,10 +872,17 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         request: ReleaseNodeSlotsRequest,
     ) -> Result<(), DispatchError> {
         let mut client = self.client(worker).await?;
-        client
-            .release_slots(self.authenticated(request.into()))
+        let wire: wyrd_tonic::wyrd::v1::ReleaseNodeSlotsRequest = request.into();
+        match client
+            .release_slots(self.authenticated(wire.clone(), false).await?)
             .await
-            .map_err(|status| status_error(&status))?;
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .release_slots(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        };
         Ok(())
     }
 
@@ -822,11 +896,18 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
         let mut client = self.client(worker).await?;
-        let mut stream = client
-            .execute_fragment(self.authenticated(request.into()))
+        let wire: wyrd_tonic::wyrd::v1::ExecuteFragmentRequest = request.into();
+        let response = match client
+            .execute_fragment(self.authenticated(wire.clone(), false).await?)
             .await
-            .map_err(|status| status_error(&status))?
-            .into_inner();
+        {
+            Err(status) if status.code() == wyrd_tonic::tonic::Code::Unauthenticated => client
+                .execute_fragment(self.authenticated(wire, true).await?)
+                .await
+                .map_err(|status| status_error(&status))?,
+            result => result.map_err(|status| status_error(&status))?,
+        };
+        let mut stream = response.into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
                 yield frame
@@ -866,7 +947,7 @@ impl OraclePeerTransportDirectory {
     /// Creates a directory from injectable transports for isolated owner tests.
     #[cfg(test)]
     #[must_use]
-    fn new_for_test(
+    pub(super) fn new_for_test(
         local_node_id: NodeId,
         local: Arc<dyn OraclePeerTransport>,
         remote: Arc<dyn OraclePeerTransport>,
@@ -975,6 +1056,10 @@ pub struct DispatchContext {
     pub attempt_bytes: usize,
     /// In-memory threshold before query-scoped spill.
     pub attempt_memory_bytes: usize,
+    /// Admission-owned cancellation propagated to every attempt await.
+    pub cancellation: CancellationToken,
+    /// Absolute deadline shared by reserve, execute, reads, and cleanup.
+    pub deadline: Instant,
 }
 
 /// Owns claims construction, reserve/execute/release, and distinct-worker retry.
@@ -1044,7 +1129,15 @@ impl FragmentDispatcher {
                 slot_units: context.slot_units,
                 expires_at,
             };
-            let pending = match self.transports.reserve(candidate.node_id, reserve).await {
+            let remaining = context
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(DispatchError::Retryable)?;
+            let pending = match tokio::select! {
+                () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
+                result = tokio::time::timeout(remaining, self.transports.reserve(candidate.node_id, reserve)) =>
+                    result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
+            } {
                 Err(DispatchError::Retryable) | Ok(ReserveNodeSlotsResponse::Rejected(_)) => {
                     continue;
                 }
@@ -1077,7 +1170,8 @@ impl FragmentDispatcher {
                 permission_digest: context.permission_digest.clone(),
             };
             let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
-                self.release_pending(candidate.node_id, release).await;
+                self.release_pending(candidate.node_id, release, context)
+                    .await;
                 return Err(DispatchError::Terminal);
             };
             let request = ExecuteFragmentRequest {
@@ -1091,7 +1185,8 @@ impl FragmentDispatcher {
             if result.is_ok() {
                 return result;
             }
-            self.release_pending(candidate.node_id, release).await;
+            self.release_pending(candidate.node_id, release, context)
+                .await;
             if matches!(
                 result,
                 Err(DispatchError::Terminal | DispatchError::StaleObject)
@@ -1103,8 +1198,18 @@ impl FragmentDispatcher {
     }
 
     /// Attempts immediate tuple-bound cleanup after any accepted-attempt failure.
-    async fn release_pending(&self, worker: NodeId, release: ReleaseNodeSlotsRequest) {
-        if let Err(error) = self.transports.release(worker, release).await {
+    async fn release_pending(
+        &self,
+        worker: NodeId,
+        release: ReleaseNodeSlotsRequest,
+        context: &DispatchContext,
+    ) {
+        let result = tokio::select! {
+            biased;
+            result = self.transports.release(worker, release) => result,
+            () = tokio::time::sleep_until(context.deadline) => Err(DispatchError::Retryable),
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 worker = %worker.as_uuid(),
                 ?error,
@@ -1146,7 +1251,15 @@ impl FragmentDispatcher {
                 AttemptBuffer::with_spill_limit(context.attempt_bytes, context.attempt_memory_bytes)
             }
         };
-        let mut frames = match self.transports.execute(worker, request).await {
+        let remaining = context
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(DispatchError::Retryable)?;
+        let mut frames = match tokio::select! {
+            () = context.cancellation.cancelled() => Err(DispatchError::Retryable),
+            result = tokio::time::timeout(remaining, self.transports.execute(worker, request)) =>
+                result.map_err(|_| DispatchError::Retryable).and_then(std::convert::identity),
+        } {
             Ok(frames) => frames,
             Err(error) => {
                 record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(&error));
@@ -1154,7 +1267,11 @@ impl FragmentDispatcher {
                 return Err(error);
             }
         };
-        while let Some(frame) = frames.next().await {
+        while let Some(frame) = tokio::select! {
+            () = context.cancellation.cancelled() => Some(Err(DispatchError::Retryable)),
+            () = tokio::time::sleep_until(context.deadline) => Some(Err(DispatchError::Retryable)),
+            frame = frames.next() => frame.map(|result| result.map_err(|_| DispatchError::Retryable)),
+        } {
             buffer
                 .push(frame.inspect_err(|error| {
                     record_peer_attempt(FragmentOutcome::Failed, dispatch_error_label(error));
@@ -1233,6 +1350,43 @@ mod tests {
         release_calls: AtomicUsize,
         /// Number of execute calls, which must remain zero when minting fails.
         execute_calls: AtomicUsize,
+    }
+
+    /// Transport that accepts capacity and then stalls its execute stream forever.
+    struct StalledExecuteTransport {
+        /// Number of releases observed after the shared deadline expires.
+        release_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl OraclePeerTransport for StalledExecuteTransport {
+        async fn reserve(
+            &self,
+            _worker: NodeId,
+            request: ReserveNodeSlotsRequest,
+        ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
+            Ok(ReserveNodeSlotsResponse::Pending(PendingNodeReservation {
+                reservation_id: ReservationId::new(uuid::Uuid::now_v7()),
+                expires_at: request.expires_at,
+            }))
+        }
+
+        async fn release(
+            &self,
+            _worker: NodeId,
+            _request: ReleaseNodeSlotsRequest,
+        ) -> Result<(), DispatchError> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _worker: NodeId,
+            _request: ExecuteFragmentRequest,
+        ) -> Result<WorkerAttemptStream, DispatchError> {
+            Ok(Box::pin(futures_util::stream::pending()))
+        }
     }
 
     #[async_trait]
@@ -1483,6 +1637,8 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
         let error = dispatcher
             .execute(
@@ -1549,6 +1705,8 @@ mod tests {
             permission_digest: "permission".to_owned(),
             attempt_bytes: 1_024,
             attempt_memory_bytes: 1_024,
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
         };
 
         let error = dispatcher
@@ -1566,6 +1724,70 @@ mod tests {
         assert!(matches!(error, DispatchError::Terminal));
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A peer that never emits a frame is bounded by the admitted deadline and released.
+    #[tokio::test]
+    async fn stalled_peer_honors_deadline_and_releases_slot() {
+        let leader = NodeId::new(uuid::Uuid::from_u128(21));
+        let transport = Arc::new(StalledExecuteTransport {
+            release_calls: AtomicUsize::new(0),
+        });
+        let dispatcher = FragmentDispatcher::new(
+            Arc::new(DeterministicTestSigner {
+                key_id: "test".to_owned(),
+            }),
+            OraclePeerTransportDirectory::new_for_test(
+                leader,
+                transport.clone(),
+                transport.clone(),
+            ),
+        );
+        let fragment = SealedScanFragment {
+            fragment_id: "stalled".to_owned(),
+            binding: "binding".to_owned(),
+            tier: SealedSourceTier::HotSealed,
+            pinned_digest: "manifest".to_owned(),
+            files: vec![SealedScanFile {
+                location: "binding/data.parquet".to_owned(),
+                row_groups: Vec::new(),
+                size_bytes: 1,
+                estimated_rows: 1,
+            }],
+            projection: Vec::new(),
+            predicates: Vec::new(),
+            schema_fingerprint: "schema".to_owned(),
+            estimated_rows: 1,
+            estimated_bytes: 1,
+            deadline_unix_ms: i64::MAX,
+        };
+        let context = DispatchContext {
+            query_id: QueryId::new(uuid::Uuid::now_v7()),
+            leader_node_id: leader,
+            leader_fence: 1,
+            tenant_id: uuid::Uuid::now_v7(),
+            query_class: QueryClass::Interactive,
+            slot_units: 1,
+            permission_digest: "permission".to_owned(),
+            attempt_bytes: 1_024,
+            attempt_memory_bytes: 1_024,
+            cancellation: CancellationToken::new(),
+            deadline: Instant::now() + std::time::Duration::from_millis(10),
+        };
+
+        let error = dispatcher
+            .execute(
+                &context,
+                fragment,
+                &[DispatchCandidate {
+                    node_id: leader,
+                    worker_fence: 1,
+                }],
+            )
+            .await
+            .expect_err("stalled peer times out");
+        assert!(matches!(error, DispatchError::Exhausted));
+        assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Tonic not-found preserves the stale-object signal while outages stay retryable.

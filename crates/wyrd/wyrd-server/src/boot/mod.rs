@@ -37,6 +37,7 @@ use vala_bifrost_redux::scribe::{
 };
 use wyrd_auth_oidc::WorkloadBinding;
 use wyrd_crypt::SecretKey;
+use wyrd_runtime::{Permission, PrincipalKind};
 use wyrd_semver::VersionBlock;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::IssuerUrl;
@@ -56,6 +57,7 @@ use crate::components::eval::EvalAuditWriter;
 use crate::config::{BifrostRuntimeRole, WorkloadBindingEntry};
 use crate::oracle::{
     OraclePeerAuthority, OraclePeerRuntime, PostgresPeerSecurityAudit, ServerOracleAudit,
+    ServerOraclePeerCredentials,
 };
 use crate::postgres::ServerPostgres;
 use crate::state::{
@@ -853,10 +855,42 @@ async fn build_oracle_role(
         .into_iter()
         .map(|lease| (lease.key.node_id, lease.address.clone()))
         .collect::<HashMap<_, _>>();
-    let remote_transport = Arc::new(
-        TonicOraclePeerTransport::new(addresses, None)
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
+    let peer_credentials =
+        Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
+    let initial_bearer = peer_credentials
+        .initialize()
+        .await
+        .map_err(ServerBootError::OraclePeer)?;
+    let verifier = state
+        .auth
+        .token_verifier
+        .as_ref()
+        .ok_or_else(|| ServerBootError::OraclePeer("auth backend not configured".to_owned()))?;
+    let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
+    let bearer = format!("Bearer {initial_bearer}").parse().map_err(|_| {
+        ServerBootError::OraclePeer("Oracle peer access token is invalid".to_owned())
+    })?;
+    metadata.insert("x-wyrd-access-token", bearer);
+    let authenticated = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), &metadata)
+        .await
+        .map_err(|_| {
+            ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
+        })?;
+    if !matches!(authenticated.principal.kind, PrincipalKind::Service { .. })
+        || authenticated.principal.tenant_id != DataTenantId::SYSTEM_OWNER
+        || !authenticated
+            .principal
+            .effective_permissions
+            .contains(&Permission::bifrost_oracle_peer_invoke())
+    {
+        return Err(ServerBootError::OraclePeer(
+            "Oracle peer credential lacks platform service authority".to_owned(),
+        ));
+    }
+    let remote_transport = Arc::new(TonicOraclePeerTransport::with_credentials(
+        addresses,
+        peer_credentials,
+    ));
     let reconciliation_limit_bytes = memory_budget
         .checked_div(4)
         .filter(|limit| *limit > 0)
@@ -881,6 +915,7 @@ async fn build_oracle_role(
     let peer = Arc::new(OraclePeerRuntime::new(
         Arc::clone(&worker),
         Arc::clone(&security_audit),
+        Arc::clone(&cluster),
     ));
     let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
     let peer_transports =
@@ -891,6 +926,10 @@ async fn build_oracle_role(
         admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases::new(
             state.postgres.vala().clone(),
         ),
+        operator_pool: state
+            .postgres
+            .operator_pool()
+            .ok_or_else(|| ServerBootError::OraclePeer("operator pool unavailable".to_owned()))?,
         cluster: Arc::clone(&cluster),
         local_role: role.clone(),
         local_slots: slots,
@@ -916,19 +955,20 @@ async fn build_oracle_role(
             return Err(ServerBootError::OraclePeer(error.to_string()));
         }
     };
-    if tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, async {
-        while !oracle.startup_reconciled() {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
+            return Err(ServerBootError::OraclePeer(error.to_string()));
         }
-    })
-    .await
-    .is_err()
-    {
-        oracle.shutdown(std::time::Instant::now()).await;
-        release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
-        return Err(ServerBootError::OraclePeer(
-            "Oracle startup admission reconciliation timed out".to_owned(),
-        ));
+        Err(_) => {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
+            return Err(ServerBootError::OraclePeer(
+                "Oracle startup admission reconciliation timed out".to_owned(),
+            ));
+        }
     }
     if let Err(error) = cluster.activate(&role).await {
         oracle.shutdown(std::time::Instant::now()).await;

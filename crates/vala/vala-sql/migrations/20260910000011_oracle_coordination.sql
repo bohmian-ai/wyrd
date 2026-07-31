@@ -119,3 +119,6 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON
     vala.oracle_admission_nodes,
     vala.oracle_admission_accounting
 TO wyrd_app;
+
+GRANT SELECT, DELETE ON vala.oracle_admission_leases TO wyrd_platform_admin;
+GRANT SELECT, INSERT, UPDATE ON vala.oracle_admission_accounting TO wyrd_platform_admin;

@@ -73,7 +73,13 @@ where
     };
     let router = if let Some(peer) = &state.oracle_peer {
         router.add_service(
-            crate::oracle::OraclePeerGrpc::new(state.clone(), peer.worker()).into_server(),
+            crate::oracle::OraclePeerGrpc::new(
+                state.clone(),
+                peer.worker(),
+                peer.cluster(),
+                peer.security_audit(),
+            )
+            .into_server(),
         )
     } else {
         router

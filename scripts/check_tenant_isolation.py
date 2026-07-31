@@ -51,6 +51,12 @@ VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
 }
 
+# Mixed-scope Vala query modules keep their normal TenantConn checks for every
+# operation except the named operator-owned control-plane function.
+VALA_OPERATOR_FUNCTION_ALLOWLIST = {
+    "crates/vala/vala-sql/src/queries/oracle_admission.rs": {"recover_shared_scopes"},
+}
+
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no
 # tenant column and NO RLS (accessed only via the OperatorPool). They are
 # exempt from the RLS-triple requirement because there is no `data_tenant_id`
@@ -245,16 +251,36 @@ def check_vala_query_modules(failures: list[str]) -> None:
                 failures.append(f"{relative}: operator public async fn must take PgPool or OperatorPool")
             continue
 
-        check_tenant_query_file(relative, body, code, failures)
+        check_tenant_query_file(
+            relative,
+            body,
+            code,
+            failures,
+            exempt_public_async_fns=VALA_OPERATOR_FUNCTION_ALLOWLIST.get(relative, set()),
+        )
 
 
-def check_tenant_query_file(relative: str, body: str, code: str, failures: list[str]) -> None:
+def check_tenant_query_file(
+    relative: str,
+    body: str,
+    code: str,
+    failures: list[str],
+    exempt_public_async_fns: set[str] | None = None,
+) -> None:
+    exempt_public_async_fns = exempt_public_async_fns or set()
     if re.search(r"&\s*PgPool\b|\bPgPool\s*,|Transaction\s*<\s*'_", code):
         failures.append(f"{relative}: tenant query module must not take raw PgPool/Transaction")
-    if re.search(r"\.begin\s*\(", code):
-        failures.append(f"{relative}: tenant query module must not open transactions")
+    for begin in re.finditer(r"\.begin\s*\(", code):
+        if not any(
+            function_start <= begin.start() < function_end
+            for function_name in exempt_public_async_fns
+            for function_start, function_end in function_body_spans(code, function_name)
+        ):
+            failures.append(f"{relative}: tenant query module must not open transactions")
 
     for fn_name, params in public_async_fns(code):
+        if fn_name in exempt_public_async_fns:
+            continue
         if "TenantConn<'_" not in params and "TenantConn < '_" not in params:
             failures.append(f"{relative}: public async fn {fn_name} must take &mut TenantConn<'_>")
 
@@ -409,6 +435,29 @@ def public_async_fns(code: str) -> list[tuple[str, str]]:
         re.DOTALL,
     )
     return pattern.findall(code)
+
+
+def function_body_spans(code: str, function_name: str) -> list[tuple[int, int]]:
+    """Return balanced-brace spans for one named public async function."""
+    signature = re.search(
+        rf"pub\s+async\s+fn\s+{re.escape(function_name)}\s*\([^)]*\)",
+        code,
+        re.DOTALL,
+    )
+    if signature is None:
+        return []
+    body_start = code.find("{", signature.end())
+    if body_start < 0:
+        return []
+    depth = 0
+    for index in range(body_start, len(code)):
+        if code[index] == "{":
+            depth += 1
+        elif code[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return [(body_start, index + 1)]
+    return []
 
 
 def has_platform_executor(code: str) -> bool:

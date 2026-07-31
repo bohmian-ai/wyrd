@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
+use chrono::{Duration as ChronoDuration, Utc};
 use num_traits::ToPrimitive;
 use thiserror::Error;
 use tokio::task::JoinHandle;
@@ -139,6 +139,37 @@ impl ClusterRegistry {
             node_id,
             snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
         }
+    }
+
+    /// Validates a peer's exact durable Oracle role fence before mutation.
+    ///
+    /// # Errors
+    /// Returns [`ClusterError`] when the system-tenant membership query fails
+    /// or the claimed node/fence is absent, stale, or not ready.
+    pub async fn validate_live_oracle(
+        &self,
+        node_id: NodeId,
+        fencing_token: u64,
+    ) -> Result<(), ClusterError> {
+        let mut conn = self
+            .nodes
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        self.nodes
+            .validate_live_oracle(
+                &mut conn,
+                node_id,
+                fencing_token,
+                Utc::now()
+                    - ChronoDuration::from_std(ROLE_LIVENESS_CUTOFF).map_err(|_| {
+                        SqlError::InvariantViolation {
+                            detail: "invalid liveness cutoff".to_owned(),
+                        }
+                    })?,
+            )
+            .await?;
+        conn.commit().await.map_err(ClusterError::Sql)
     }
 
     /// Registers one Scribe role and advances only the Scribe fence for this node.

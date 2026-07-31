@@ -729,6 +729,83 @@ async fn reconciliation_repairs_interrupted_counter() {
     assert_eq!(used, 2);
 }
 
+/// Proves startup recovery atomically expires crash leftovers and rebuilds all shared scopes.
+#[tokio::test]
+async fn pg_oracle_startup_reconciles_shared_scopes() {
+    let (fixture, tenant) = setup().await;
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let now = Utc::now();
+    let mut interactive = request(
+        tenant,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        2,
+        now + Duration::minutes(5),
+    );
+    interactive.cluster_limit = 20;
+    interactive.class_limit = 20;
+    interactive.tenant_limit = 20;
+    owner
+        .acquire(&interactive)
+        .await
+        .expect("interactive lease");
+    let mut analytical = request(
+        tenant,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        3,
+        now + Duration::minutes(5),
+    );
+    analytical.lease.query_class = QueryClass::Analytical;
+    analytical.cluster_limit = 20;
+    analytical.class_limit = 20;
+    analytical.tenant_limit = 20;
+    owner.acquire(&analytical).await.expect("analytical lease");
+    let mut expired = request(
+        tenant,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        4,
+        now + Duration::seconds(1),
+    );
+    expired.cluster_limit = 20;
+    expired.class_limit = 20;
+    expired.tenant_limit = 20;
+    owner.acquire(&expired).await.expect("crash-leftover lease");
+    let recovery_now = now + Duration::seconds(2);
+
+    owner
+        .inner
+        .recover_shared_scopes(fixture.operator_pool(), recovery_now)
+        .await
+        .expect("startup recovery");
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT scope_kind, accounting_class, used_slots \
+         FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_key='global' ORDER BY scope_kind, accounting_class",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_all(fixture.operator_pool().pool())
+    .await
+    .expect("shared counters read");
+    assert!(rows.contains(&("cluster".to_owned(), "all".to_owned(), 5)));
+    assert!(rows.contains(&("class".to_owned(), "interactive".to_owned(), 2)));
+    assert!(rows.contains(&("class".to_owned(), "analytical".to_owned(), 3)));
+    let expired_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_leases WHERE expires_at <= $1",
+    )
+    .bind(recovery_now)
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("expired leases count");
+    assert_eq!(expired_count, 0);
+}
+
 /// Proves reconciliation and acquisition serialize on the canonical counter.
 #[tokio::test]
 async fn concurrent_reconcile_and_acquire_preserve_accounting() {
@@ -787,6 +864,117 @@ async fn concurrent_reconcile_and_acquire_preserve_accounting() {
     .expect("counter reads");
     conn.commit().await.expect("counter read commits");
     assert_eq!(used, 2);
+}
+
+/// Shared startup recovery serializes with acquisition on canonical counters.
+#[tokio::test]
+async fn concurrent_recover_shared_scopes_and_acquire_preserve_accounting() {
+    let (fixture, tenant) = setup().await;
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    for expected in 1_i64..=16 {
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut next = request(
+            tenant,
+            QueryId::new(uuid::Uuid::now_v7()),
+            leader,
+            1,
+            1,
+            Utc::now() + Duration::minutes(5),
+        );
+        next.cluster_limit = 64;
+        next.class_limit = 64;
+        next.tenant_limit = 64;
+        let acquiring = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+        let acquire_barrier = std::sync::Arc::clone(&barrier);
+        let acquire = async move {
+            acquire_barrier.wait().await;
+            acquiring.acquire(&next).await
+        };
+        let recover_barrier = std::sync::Arc::clone(&barrier);
+        let recover = async {
+            recover_barrier.wait().await;
+            owner
+                .inner
+                .recover_shared_scopes(fixture.operator_pool(), Utc::now())
+                .await
+        };
+        let (acquired, recovered) = tokio::join!(acquire, recover);
+        assert!(matches!(
+            acquired.expect("acquire"),
+            AdmissionAcquire::Acquired(_)
+        ));
+        recovered.expect("shared recovery");
+        let used: i64 = sqlx::query_scalar(
+            "SELECT used_slots FROM vala.oracle_admission_accounting \
+             WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+             AND accounting_class='all'",
+        )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+        .fetch_one(fixture.operator_pool().pool())
+        .await
+        .expect("counter");
+        assert_eq!(used, expected);
+    }
+}
+
+/// Recovery waits for an in-flight acquire lock, then snapshots its committed lease.
+#[tokio::test]
+async fn recover_shared_scopes_snapshots_after_acquire_commit() {
+    let (fixture, tenant) = setup().await;
+    let owner = SqlOracleAdmissionLeases::new(fixture.vala_postgres().clone());
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let mut request = request(
+        tenant,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        Utc::now() + Duration::minutes(5),
+    );
+    request.cluster_limit = 64;
+    request.class_limit = 64;
+    request.tenant_limit = 64;
+    let mut acquire_conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("acquire connection");
+    owner
+        .acquire(&mut acquire_conn, &request)
+        .await
+        .expect("acquire holds canonical counter lock");
+
+    let recovery_owner = SqlOracleAdmissionLeases::new(fixture.vala_postgres().clone());
+    let operator = fixture.operator_pool().clone();
+    let mut recovery = tokio::spawn(async move {
+        recovery_owner
+            .recover_shared_scopes(&operator, Utc::now())
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut recovery)
+            .await
+            .is_err(),
+        "recovery must wait for the acquire lock"
+    );
+    acquire_conn.commit().await.expect("commit acquire");
+    recovery
+        .await
+        .expect("recovery task")
+        .expect("recovery after acquire commit");
+
+    let used: i64 = sqlx::query_scalar(
+        "SELECT used_slots FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+         AND accounting_class='all'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(fixture.operator_pool().pool())
+    .await
+    .expect("shared counter");
+    assert_eq!(used, 1);
 }
 
 /// Proves admission hints and bounded maintenance inputs remain closed.

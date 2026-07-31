@@ -66,6 +66,152 @@ struct ForgeBenchmarkReport {
     gc_retained_paths_protected: bool,
 }
 
+/// Exact bounded-GC evidence collected before rewrite outputs can become orphans.
+struct GcBenchmarkEvidence {
+    /// Five bounded-GC sample durations, in microseconds.
+    samples_us: Vec<u64>,
+    /// Nearest-rank p99 across the five samples.
+    p99_us: u64,
+    /// Exact candidates enumerated across all samples.
+    candidates: u64,
+    /// Exact candidates deleted across all samples.
+    deleted: u64,
+}
+
+/// Runs the five isolated GC samples before the main rewrite creates stale outputs.
+///
+/// Each sample fixture's seeded inputs remain protected by nonterminal
+/// `file_list` rows. Therefore the only eligible objects across the shared
+/// scheduler roster are the 32 explicit deterministic orphan paths.
+///
+/// # Errors
+///
+/// Returns fixture, clock, object-store, Forge, conversion, or SLO failures.
+async fn run_gc_samples(
+    server: &crate::WyrdTestServer,
+    tenant: wyrd_spec::DataTenantId,
+) -> Result<GcBenchmarkEvidence, BenchError> {
+    let mut samples_us = Vec::with_capacity(5);
+    let mut candidates = 0_u64;
+    let mut deleted = 0_u64;
+    for sample in 0..5 {
+        let fixture =
+            seed_forge_group_for_tenant(server, tenant, &format!("gc_sample_{sample}")).await;
+        let mut conn = server.state().postgres.vala().tenant_conn(tenant).await?;
+        let seeded_paths: Vec<String> = sqlx::query_scalar(
+            "SELECT file_path FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() \
+               AND namespace = $1 AND table_name = $2",
+        )
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .fetch_all(&mut **conn.transaction())
+        .await?;
+        conn.commit().await?;
+        for path in seeded_paths {
+            let fixture_path = format!("{path}.fixture");
+            fixture.staging.rename(&path, &fixture_path).await?;
+            sqlx::query(
+                "UPDATE vala.file_list SET file_path = $1 \
+                 WHERE data_tenant_id = $2 AND namespace = $3 \
+                   AND table_name = $4 AND file_path = $5",
+            )
+            .bind(&fixture_path)
+            .bind(tenant.as_uuid())
+            .bind(&fixture.binding.logical_namespace)
+            .bind(&fixture.binding.table_name)
+            .bind(&path)
+            .execute(fixture.operator_pool.pool())
+            .await?;
+        }
+        let retained_control = fixture
+            .object_store
+            .list(&fixture.binding.object_prefix)
+            .await?
+            .into_iter()
+            .find(|entry| entry.path().contains("/metadata/") && entry.metadata().is_file())
+            .map(|entry| entry.path().to_owned())
+            .ok_or("GC sample needs one retained Iceberg metadata object")?;
+        let mut newest_modified_ms = i64::MIN;
+        let mut orphan_paths = Vec::with_capacity(32);
+        for candidate in 0..32 {
+            let operation_id = uuid::Uuid::from_u128(
+                u128::try_from(sample * 32 + candidate + 1)
+                    .map_err(|_| "benchmark GC operation identity overflow")?,
+            );
+            let orphan = deterministic_output_path_for_test(
+                &fixture.binding.object_prefix,
+                operation_id,
+                candidate,
+            );
+            if !Forge::known_iceberg_object_for_test(&orphan) {
+                return Err(
+                    format!("GC benchmark candidate is not an Iceberg object: {orphan}").into(),
+                );
+            }
+            fixture
+                .staging
+                .write(&orphan, Buffer::from(vec![1_u8]))
+                .await?;
+            newest_modified_ms = newest_modified_ms.max(
+                fixture
+                    .staging
+                    .stat(&orphan)
+                    .await?
+                    .last_modified()
+                    .ok_or("benchmark orphan lacks age evidence")?
+                    .into_inner()
+                    .as_millisecond(),
+            );
+            orphan_paths.push(orphan);
+        }
+        let clock = server.forge_clock();
+        let age_target = newest_modified_ms.checked_add(2).ok_or("GC age overflow")?;
+        if age_target > clock.now()?.timestamp_millis() {
+            clock.set(
+                chrono::DateTime::from_timestamp_millis(age_target)
+                    .ok_or("benchmark object timestamp is outside UTC")?,
+            )?;
+        }
+        let mut config = fixture.config.clone();
+        config.min_files = i64::MAX;
+        config.orphan_gc_ttl = std::time::Duration::from_millis(1);
+        config.max_gc_candidates_per_batch = 32;
+        let forge = fixture.context_with_config(config);
+        let sample_started = Instant::now();
+        let gc = forge.run_once().await?;
+        samples_us.push(u64::try_from(sample_started.elapsed().as_micros())?);
+        if gc.gc_candidates != 32 || gc.gc_deleted != 32 {
+            return Err(format!(
+                "GC sample {sample} expected 32 candidates/deletes, got {}/{}; tick={gc:?}",
+                gc.gc_candidates, gc.gc_deleted,
+            )
+            .into());
+        }
+        for orphan in orphan_paths {
+            if fixture.staging.stat(&orphan).await.is_ok() {
+                return Err(format!("GC sample retained orphan {orphan}").into());
+            }
+        }
+        if fixture.staging.stat(&retained_control).await.is_err() {
+            return Err(format!("GC sample deleted retained object {retained_control}").into());
+        }
+        candidates = candidates.saturating_add(u64::try_from(gc.gc_candidates)?);
+        deleted = deleted.saturating_add(u64::try_from(gc.gc_deleted)?);
+    }
+    let mut ordered = samples_us.clone();
+    ordered.sort_unstable();
+    let p99_us = *ordered
+        .get(4)
+        .ok_or("GC benchmark needs exactly five samples")?;
+    Ok(GcBenchmarkEvidence {
+        samples_us,
+        p99_us,
+        candidates,
+        deleted,
+    })
+}
+
 /// Return the repository report location used by the canonical benchmark lanes.
 fn report_path() -> std::path::PathBuf {
     std::env::var_os("WYRD_BIFROST_REPORT").map_or_else(
@@ -153,6 +299,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         .servers()
         .first()
         .ok_or("Forge needs one server")?;
+    let gc_evidence = run_gc_samples(server, tenant).await?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
     sqlx::query(
         "UPDATE vala.file_list SET compacted = true WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3",
@@ -215,92 +362,12 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         outcome.input_rows == outcome.output_rows && outcome.input_rows == expected_rows;
     let convergence = pending == 0;
     let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
-    let mut gc_samples_us = Vec::with_capacity(5);
-    let mut gc_candidates = 0_u64;
-    let mut gc_deleted = 0_u64;
-    for sample in 0..5 {
-        let gc_fixture =
-            seed_forge_group_for_tenant(server, tenant, &format!("gc_sample_{sample}")).await;
-        let retained_control = gc_fixture
-            .object_store
-            .list(&gc_fixture.binding.object_prefix)
-            .await?
-            .into_iter()
-            .find(|entry| entry.path().contains("/metadata/") && entry.metadata().is_file())
-            .map(|entry| entry.path().to_owned())
-            .ok_or("GC sample needs one retained Iceberg metadata object")?;
-        let mut newest_modified_ms = i64::MIN;
-        let mut orphan_paths = Vec::with_capacity(32);
-        for candidate in 0..32 {
-            let operation_id = uuid::Uuid::from_u128(
-                u128::try_from(sample * 32 + candidate + 1)
-                    .map_err(|_| "benchmark GC operation identity overflow")?,
-            );
-            let orphan = deterministic_output_path_for_test(
-                &gc_fixture.binding.object_prefix,
-                operation_id,
-                candidate,
-            );
-            if !Forge::known_iceberg_object_for_test(&orphan) {
-                return Err(
-                    format!("GC benchmark candidate is not an Iceberg object: {orphan}").into(),
-                );
-            }
-            gc_fixture
-                .staging
-                .write(&orphan, Buffer::from(vec![1_u8]))
-                .await?;
-            newest_modified_ms = newest_modified_ms.max(
-                gc_fixture
-                    .staging
-                    .stat(&orphan)
-                    .await?
-                    .last_modified()
-                    .ok_or("benchmark orphan lacks age evidence")?
-                    .into_inner()
-                    .as_millisecond(),
-            );
-            orphan_paths.push(orphan);
-        }
-        let clock = server.forge_clock();
-        let age_target = newest_modified_ms.checked_add(2).ok_or("GC age overflow")?;
-        if age_target > clock.now()?.timestamp_millis() {
-            clock.set(
-                chrono::DateTime::from_timestamp_millis(age_target)
-                    .ok_or("benchmark object timestamp is outside UTC")?,
-            )?;
-        }
-        let mut gc_config = gc_fixture.config.clone();
-        gc_config.min_files = i64::MAX;
-        gc_config.orphan_gc_ttl = std::time::Duration::from_millis(1);
-        gc_config.max_gc_candidates_per_batch = 32;
-        let gc_forge = gc_fixture.context_with_config(gc_config);
-        let sample_started = Instant::now();
-        let gc = gc_forge.run_once().await?;
-        gc_samples_us.push(u64::try_from(sample_started.elapsed().as_micros())?);
-        if gc.gc_candidates != 32 || gc.gc_deleted != 32 {
-            return Err(format!(
-                "GC sample {sample} expected 32 candidates/deletes, got {}/{}",
-                gc.gc_candidates, gc.gc_deleted
-            )
-            .into());
-        }
-        for orphan in orphan_paths {
-            if gc_fixture.staging.stat(&orphan).await.is_ok() {
-                return Err(format!("GC sample retained orphan {orphan}").into());
-            }
-        }
-        if gc_fixture.staging.stat(&retained_control).await.is_err() {
-            return Err(format!("GC sample deleted retained object {retained_control}").into());
-        }
-        gc_candidates = gc_candidates.saturating_add(u64::try_from(gc.gc_candidates)?);
-        gc_deleted = gc_deleted.saturating_add(u64::try_from(gc.gc_deleted)?);
-    }
-    let mut ordered_gc_samples = gc_samples_us.clone();
-    ordered_gc_samples.sort_unstable();
-    let gc_p99_us = *ordered_gc_samples
-        .get(4)
-        .ok_or("five GC samples are required for nearest-rank p99")?;
+    let GcBenchmarkEvidence {
+        samples_us: gc_samples_us,
+        p99_us: gc_p99_us,
+        candidates: gc_candidates,
+        deleted: gc_deleted,
+    } = gc_evidence;
     let gc_slo_passed = SloGate::from_default_path()?
         .check_value("bench.bifrost.forge_slo", gc_p99_us as f64)
         .is_ok();

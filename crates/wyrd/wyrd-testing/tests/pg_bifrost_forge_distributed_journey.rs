@@ -484,9 +484,10 @@ async fn assert_active_traces_roster(
         .postgres
         .operator_pool()
         .expect("operator pool");
-    let roster = vala_sql::queries::olap_catalog::list_active_tables_for_operator(&operator_pool)
-        .await
-        .expect("active Bifrost table roster");
+    let roster =
+        vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator(&operator_pool)
+            .await
+            .expect("active Bifrost table roster");
     for tenant in tenants {
         assert!(
             roster.iter().any(|row| {

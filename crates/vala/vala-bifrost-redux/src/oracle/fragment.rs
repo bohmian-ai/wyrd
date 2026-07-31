@@ -353,21 +353,21 @@ mod tests {
     fn oracle_fragment_identity_is_deterministic_and_deadline_independent() {
         let planner = FragmentPlanner;
         let mut first = leaf();
-        let planned = planner
+        let fragments = planner
             .plan(&first, &FragmentConfig { max_files: 1 })
             .expect("fragment plan");
         first.deadline_unix_ms -= 1;
         let repeated = planner
             .plan(&first, &FragmentConfig { max_files: 1 })
             .expect("fragment plan");
-        assert_eq!(planned[0].fragment_id, repeated[0].fragment_id);
-        let encoded = planned[0].encode().expect("fragment encode");
+        assert_eq!(fragments[0].fragment_id, repeated[0].fragment_id);
+        let encoded = fragments[0].encode().expect("fragment encode");
         assert_eq!(
             SealedScanFragment::decode(&encoded).expect("fragment decode"),
-            planned[0]
+            fragments[0]
         );
-        assert_eq!(planned[0].estimated_bytes, 10);
-        assert_eq!(planned[0].estimated_rows, 2);
+        assert_eq!(fragments[0].estimated_bytes, 10);
+        assert_eq!(fragments[0].estimated_rows, 2);
     }
 
     /// Empty work and a zero file bound fail before producing a fragment.

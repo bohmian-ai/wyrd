@@ -15,7 +15,7 @@ use vala_bifrost_redux::scribe::ScribeAppend;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
-use vala_bifrost_redux::scribe::tail_rpc::{FetchLiveTailRequest, TailFrame};
+use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
 use vala_bifrost_redux::scribe::wal::{WalConfig, WalLsn, WalWriter};
 use wyrd_runtime::{PermissionSet, Principal, PrincipalKind};
 use wyrd_spec::auth::PrincipalId;
@@ -131,19 +131,6 @@ async fn production_shard_snapshot_serves_exact_projection_and_lsn_range() {
     assert_eq!(hot[0].batch_id, *batch_id.as_bytes());
     assert_eq!(hot[0].rows.schema().fields().len(), 1);
     assert_eq!(hot[0].rows.schema().field(0).name(), "value");
-
-    let mut encoded_request = request;
-    encoded_request
-        .required_columns
-        .push("data_tenant_id".to_owned());
-    let frames = scribe
-        .fetch_live_tail(encoded_request)
-        .await
-        .expect("encoded tail");
-    assert!(matches!(frames.last(), Some(TailFrame::Complete)));
-    assert!(
-        matches!(frames.first(), Some(TailFrame::Batch(frame)) if frame.batch_id == *batch_id.as_bytes())
-    );
 
     scribe.shutdown().await;
 }

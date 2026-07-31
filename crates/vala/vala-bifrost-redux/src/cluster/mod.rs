@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::Utc;
+use num_traits::ToPrimitive;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -237,10 +238,20 @@ impl ClusterRegistry {
         self.snapshot.store(Arc::new(ClusterSnapshot::new(
             scribes.into_iter().chain(oracles).collect(),
         )));
-        metrics::gauge!("bifrost_cluster_roles_live", "role" => "scribe")
-            .set(self.snapshot().live_scribes().len() as f64);
-        metrics::gauge!("bifrost_cluster_roles_live", "role" => "oracle")
-            .set(self.snapshot().live_oracles().len() as f64);
+        metrics::gauge!("bifrost_cluster_roles_live", "role" => "scribe").set(
+            self.snapshot()
+                .live_scribes()
+                .len()
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
+        metrics::gauge!("bifrost_cluster_roles_live", "role" => "oracle").set(
+            self.snapshot()
+                .live_oracles()
+                .len()
+                .to_f64()
+                .unwrap_or(f64::MAX),
+        );
         Ok(())
     }
 
@@ -275,7 +286,7 @@ impl ClusterRegistry {
             interval.tick().await;
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => return,
+                    () = shutdown.cancelled() => return,
                     _ = interval.tick() => match self.set_readiness(
                         &registered,
                         ready.load(Ordering::Acquire),
@@ -303,7 +314,7 @@ impl ClusterRegistry {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
-                    _ = shutdown.cancelled() => return,
+                    () = shutdown.cancelled() => return,
                     _ = interval.tick() => {
                         if let Err(error) = self.refresh_snapshot().await {
                             tracing::warn!(%error, "cluster membership snapshot refresh failed");

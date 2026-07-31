@@ -405,7 +405,9 @@ fn managed_batch_bytes(
                 TimestampMicrosecondArray::from(vec![timestamp; row_count]).with_timezone("UTC"),
             ),
             Arc::new(batch_builder.finish()),
-            Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
+            Arc::new(Int32Array::from_iter_values(
+                0..i32::try_from(row_count).expect("test row count fits i32"),
+            )),
             Arc::new(StringArray::from(vec![tenant.to_string(); row_count])),
         ],
     )
@@ -886,7 +888,7 @@ async fn wal_replay_preserves_row_identity() {
         .expect("published object is parquet");
     let reader = builder.build().expect("parquet reader builds");
     let ordinals = reader
-        .map(|batch| {
+        .flat_map(|batch| {
             let batch = batch.expect("parquet batch decodes");
             batch
                 .column_by_name("wyrd_row_ordinal")
@@ -897,15 +899,11 @@ async fn wal_replay_preserves_row_identity() {
                 .values()
                 .to_vec()
         })
-        .flatten()
         .collect::<Vec<_>>();
     assert_eq!(ordinals.len(), 50_000);
-    assert!(
-        ordinals
-            .iter()
-            .enumerate()
-            .all(|(index, ordinal)| *ordinal == index as i32)
-    );
+    assert!(ordinals.iter().enumerate().all(|(index, ordinal)| {
+        *ordinal == i32::try_from(index).expect("test ordinal fits i32")
+    }));
     fixture.stop().await;
 }
 

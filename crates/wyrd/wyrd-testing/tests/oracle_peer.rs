@@ -116,7 +116,7 @@ impl OraclePeerService for PeerTestService {
     ) -> Result<Response<proto::ReserveNodeSlotsResponse>, Status> {
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
             .map_err(|error| Status::invalid_argument(error.to_string()))?;
-        Ok(Response::new(self.worker.reserve(request).into()))
+        Ok(Response::new(self.worker.reserve(&request).into()))
     }
 
     /// Releases through the production tuple-bound registry.

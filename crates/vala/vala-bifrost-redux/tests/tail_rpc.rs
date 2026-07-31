@@ -95,7 +95,7 @@ fn request(
 }
 
 /// Builds one typed private-fence request matching the in-memory tail fixture.
-fn fence_request(binding: TenantTableBinding, stream: StreamIdentity) -> AcquireTailFenceRequest {
+fn fence_request(binding: &TenantTableBinding, stream: StreamIdentity) -> AcquireTailFenceRequest {
     let expected = SchemaFingerprint::from_arrow_schema(&Schema::new(vec![Field::new(
         "value",
         DataType::Int64,
@@ -282,28 +282,26 @@ async fn page_continuation_is_row_precise() {
         TailFenceConfig::default(),
     );
     let fence = reader
-        .acquire_fence(fence_request(binding, stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("acquires metadata only");
     let first = reader
-        .read_page(TailPageRequest {
+        .read_page(&TailPageRequest {
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
             max_encoded_bytes: 1024 * 1024,
         })
-        .await
         .expect("first row page");
     assert_eq!(first.batches.len(), 1);
     assert!(!first.complete);
     let second = reader
-        .read_page(TailPageRequest {
+        .read_page(&TailPageRequest {
             fence_id: fence.fence_id,
             after: first.next,
             max_rows: 1,
             max_encoded_bytes: 1024 * 1024,
         })
-        .await
         .expect("second row page");
     assert_eq!(second.batches.len(), 1);
     assert!(second.complete);
@@ -322,11 +320,11 @@ async fn capacity_rejection_leaves_no_fence() {
         },
     );
     let first = reader
-        .acquire_fence(fence_request(binding.clone(), stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("first fence reserves capacity");
     let error = reader
-        .acquire_fence(fence_request(binding.clone(), stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect_err("second fence exceeds the configured capacity");
     assert!(matches!(
@@ -340,7 +338,7 @@ async fn capacity_rejection_leaves_no_fence() {
             .released
     );
     reader
-        .acquire_fence(fence_request(binding, stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("rejected acquisition left no partial capacity charge");
 }
@@ -358,7 +356,7 @@ async fn release_and_expiry_race_reclaims_once() {
         },
     );
     let fence = reader
-        .acquire_fence(fence_request(binding, stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("fence acquires");
     let expiry = reader.expire_due(Instant::now() + StdDuration::from_secs(1), 1);
@@ -384,17 +382,16 @@ async fn single_oversize_row_fails_empty() {
         },
     );
     let fence = reader
-        .acquire_fence(fence_request(binding, stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("fence acquires before paging");
     let error = reader
-        .read_page(TailPageRequest {
+        .read_page(&TailPageRequest {
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
             max_encoded_bytes: u32::MAX,
         })
-        .await
         .expect_err("one row cannot fit the configured encoded-byte ceiling");
     assert!(matches!(error, TailReadError::OversizeRow));
     assert!(
@@ -416,7 +413,7 @@ async fn seal_and_rotation_preserve_fence() {
         TailFenceConfig::default(),
     );
     let fence = reader
-        .acquire_fence(fence_request(binding, stream))
+        .acquire_fence(fence_request(&binding, stream))
         .await
         .expect("fence freezes the writable interval");
     let key = SealKey::new(
@@ -426,13 +423,12 @@ async fn seal_and_rotation_preserve_fence() {
     );
     let frozen = memtable.freeze(&key).expect("active generation seals");
     let first = reader
-        .read_page(TailPageRequest {
+        .read_page(&TailPageRequest {
             fence_id: fence.fence_id,
             after: None,
             max_rows: 1,
             max_encoded_bytes: 1024 * 1024,
         })
-        .await
         .expect("first retained row remains readable after seal");
     assert_eq!(page_values(&first), vec![1]);
     assert!(!first.complete);
@@ -453,18 +449,17 @@ async fn seal_and_rotation_preserve_fence() {
         )
         .expect("sealed generation commits");
     let retired = memtable
-        .sweep_once_at(Instant::now() + StdDuration::from_secs(120))
+        .sweep_once_at(Instant::now() + StdDuration::from_mins(2))
         .expect("committed generation retires from the memtable");
     assert_eq!(retired.len(), 1);
 
     let second = reader
-        .read_page(TailPageRequest {
+        .read_page(&TailPageRequest {
             fence_id: fence.fence_id,
             after: first.next,
             max_rows: 1,
             max_encoded_bytes: 1024 * 1024,
         })
-        .await
         .expect("continuation retains the sealed generation after retirement");
     assert_eq!(page_values(&second), vec![2]);
     assert!(second.complete);

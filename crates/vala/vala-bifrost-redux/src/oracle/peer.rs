@@ -184,11 +184,14 @@ pub trait PeerTicketVerifier: Send + Sync {
     ) -> Result<VerifiedClaimsBytes, PeerSecurityError>;
 }
 
+/// One key identifier and nonce pair retained until ticket expiry.
+type ReplayIdentity = (String, Vec<u8>);
+
 /// Bounded worker-local nonce cache.
 #[derive(Debug)]
 pub struct PeerReplayCache {
     /// Unexpired key-and-nonce identities consumed by this worker role.
-    entries: Mutex<HashMap<(String, Vec<u8>), DateTime<Utc>>>,
+    entries: Mutex<HashMap<ReplayIdentity, DateTime<Utc>>>,
     /// Hard maximum number of unexpired identities retained.
     capacity: usize,
 }
@@ -232,6 +235,14 @@ impl PeerReplayCache {
         self.entries
             .lock()
             .map_or(self.capacity, |entries| entries.len())
+    }
+
+    /// Returns whether no replay identities are currently retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries
+            .lock()
+            .map_or(self.capacity == 0, |entries| entries.is_empty())
     }
 }
 

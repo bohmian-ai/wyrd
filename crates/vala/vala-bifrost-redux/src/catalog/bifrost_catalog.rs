@@ -142,6 +142,18 @@ pub struct PinnedIcebergFile {
     pub row_count: u64,
 }
 
+/// Immutable Iceberg snapshot metadata collected before hot-manifest reconciliation.
+struct PinnedIcebergState {
+    /// Current snapshot identity, when the table has committed data.
+    snapshot_id: Option<i64>,
+    /// Canonical paths used to exclude hot-manifest overlap.
+    file_paths: BTreeSet<String>,
+    /// Exact immutable metadata keyed by canonical path.
+    files: BTreeMap<String, PinnedIcebergFile>,
+    /// Checked sum of immutable object bytes.
+    estimated_bytes: u64,
+}
+
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
 #[derive(Clone)]
 pub struct BifrostCatalog {
@@ -169,52 +181,11 @@ impl BifrostCatalog {
         let binding = TenantTableBinding::resolve((tenant, table.clone()))
             .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
-        let snapshot_id = iceberg_table.metadata().current_snapshot_id();
-        let mut iceberg_file_paths = BTreeSet::new();
-        let mut iceberg_files = BTreeMap::new();
-        let mut estimated_bytes = 0_u64;
-        if let Some(snapshot) = iceberg_table.metadata().current_snapshot() {
-            let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
-            for manifest_file in manifests.entries() {
-                let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
-                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
-                    let path = entry.data_file().file_path().to_owned();
-                    let canonical = path
-                        .strip_prefix(iceberg_table.metadata().location())
-                        .and_then(|suffix| suffix.strip_prefix('/'))
-                        .map(|suffix| format!("{}/{suffix}", binding.object_prefix))
-                        .unwrap_or(path);
-                    if binding.validate_object_path(&canonical).is_none() {
-                        return Err(BifrostCatalogError::MetadataMismatch(
-                            "pinned snapshot contains a path outside the tenant/table binding"
-                                .to_owned(),
-                        ));
-                    }
-                    estimated_bytes = estimated_bytes
-                        .checked_add(entry.data_file().file_size_in_bytes())
-                        .ok_or_else(|| {
-                            BifrostCatalogError::MetadataMismatch(
-                                "sealed byte estimate overflow".to_owned(),
-                            )
-                        })?;
-                    let pinned = PinnedIcebergFile {
-                        file_path: canonical.clone(),
-                        file_size: entry.data_file().file_size_in_bytes(),
-                        row_count: entry.data_file().record_count(),
-                    };
-                    if iceberg_files
-                        .insert(canonical.clone(), pinned.clone())
-                        .is_some_and(|existing| existing != pinned)
-                    {
-                        return Err(BifrostCatalogError::MetadataMismatch(
-                            "pinned snapshot repeats a data path with conflicting metadata"
-                                .to_owned(),
-                        ));
-                    }
-                    iceberg_file_paths.insert(canonical);
-                }
-            }
-        }
+        let pinned = self.pin_iceberg_snapshot(&iceberg_table, &binding).await?;
+        let snapshot_id = pinned.snapshot_id;
+        let iceberg_file_paths = pinned.file_paths;
+        let iceberg_files = pinned.files;
+        let mut estimated_bytes = pinned.estimated_bytes;
         let mut hot_files = HotFileCatalog::new(self.postgres.clone())
             .active_files(tenant, &binding.logical_namespace, &binding.table_name)
             .await?;
@@ -274,6 +245,76 @@ impl BifrostCatalog {
             iceberg_files: iceberg_files.into_values().collect(),
             hot_files,
             hot_manifest_digest,
+            estimated_bytes,
+        })
+    }
+
+    /// Collects and validates the immutable files of one current Iceberg snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a catalog error when manifests cannot be read, a path escapes the
+    /// tenant binding, file metadata conflicts, or byte accounting overflows.
+    async fn pin_iceberg_snapshot(
+        &self,
+        iceberg_table: &iceberg::table::Table,
+        binding: &TenantTableBinding,
+    ) -> Result<PinnedIcebergState, BifrostCatalogError> {
+        let snapshot_id = iceberg_table.metadata().current_snapshot_id();
+        let mut file_paths = BTreeSet::new();
+        let mut files = BTreeMap::new();
+        let mut estimated_bytes = 0_u64;
+        let Some(snapshot) = iceberg_table.metadata().current_snapshot() else {
+            return Ok(PinnedIcebergState {
+                snapshot_id,
+                file_paths,
+                files,
+                estimated_bytes,
+            });
+        };
+        let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let path = entry.data_file().file_path().to_owned();
+                let canonical = path
+                    .strip_prefix(iceberg_table.metadata().location())
+                    .and_then(|suffix| suffix.strip_prefix('/'))
+                    .map(|suffix| format!("{}/{suffix}", binding.object_prefix))
+                    .unwrap_or(path);
+                if binding.validate_object_path(&canonical).is_none() {
+                    return Err(BifrostCatalogError::MetadataMismatch(
+                        "pinned snapshot contains a path outside the tenant/table binding"
+                            .to_owned(),
+                    ));
+                }
+                estimated_bytes = estimated_bytes
+                    .checked_add(entry.data_file().file_size_in_bytes())
+                    .ok_or_else(|| {
+                        BifrostCatalogError::MetadataMismatch(
+                            "sealed byte estimate overflow".to_owned(),
+                        )
+                    })?;
+                let pinned = PinnedIcebergFile {
+                    file_path: canonical.clone(),
+                    file_size: entry.data_file().file_size_in_bytes(),
+                    row_count: entry.data_file().record_count(),
+                };
+                if files
+                    .insert(canonical.clone(), pinned.clone())
+                    .is_some_and(|existing| existing != pinned)
+                {
+                    return Err(BifrostCatalogError::MetadataMismatch(
+                        "pinned snapshot repeats a data path with conflicting metadata".to_owned(),
+                    ));
+                }
+                file_paths.insert(canonical);
+            }
+        }
+        Ok(PinnedIcebergState {
+            snapshot_id,
+            file_paths,
+            files,
             estimated_bytes,
         })
     }

@@ -6,10 +6,14 @@
 //! LSNs are meaningful only within one stream — never across pods or epochs.
 
 use uuid::Uuid;
+#[cfg(feature = "test-support")]
 use vala_sql::OperatorPool;
+#[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
 
+#[cfg(feature = "test-support")]
 use crate::cluster::ClusterRegistry;
+#[cfg(feature = "test-support")]
 use crate::contracts::ScribeError;
 
 /// Stable pod identifier (UUID).
@@ -111,9 +115,7 @@ impl std::fmt::Display for StreamIdentity {
 /// Returns [`ScribeError::Internal`] when the compatibility role is not
 /// Scribe, membership registration fails, or its fence cannot fit the WAL
 /// epoch representation.
-#[deprecated(
-    note = "server boot uses ClusterRegistry directly; retained only for legacy focused tests"
-)]
+#[cfg(feature = "test-support")]
 pub async fn acquire_on_boot(
     pool: &OperatorPool,
     node_id: NodeId,

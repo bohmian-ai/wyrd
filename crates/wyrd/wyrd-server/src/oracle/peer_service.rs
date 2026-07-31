@@ -81,7 +81,7 @@ impl OraclePeerService for OraclePeerGrpc {
         self.authenticate(request.metadata()).await?;
         let request = wyrd_spec::vala::api::ReserveNodeSlotsRequest::try_from(request.into_inner())
             .map_err(conversion_status)?;
-        Ok(Response::new(self.worker.reserve(request).into()))
+        Ok(Response::new(self.worker.reserve(&request).into()))
     }
 
     /// Releases one matching reservation idempotently after workload authentication.

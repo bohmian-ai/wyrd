@@ -26,6 +26,7 @@ use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
+use num_traits::ToPrimitive;
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -64,7 +65,7 @@ pub mod fragment;
 pub mod peer;
 pub mod telemetry;
 
-use exec::{HotFileSource, OracleTableProvider};
+use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
 pub use exec::{ReconcileExec, TenantTripwireExec};
 
 /// Default maximum SQL request size accepted by the synchronous query floor.
@@ -82,7 +83,7 @@ pub struct AuthorizedQueryContext {
     pub principal: Principal,
     /// Tenant selected by authentication and authorization.
     pub data_tenant_id: DataTenantId,
-    /// UUIDv7 correlator retained by the mandatory audit event.
+    /// `UUIDv7` correlator retained by the mandatory audit event.
     pub request_id: RequestId,
     /// Distributed trace identifier, when one was verified at the request boundary.
     pub trace_id: Option<String>,
@@ -90,6 +91,39 @@ pub struct AuthorizedQueryContext {
     pub auth_method: AuthMethod,
     /// Effective permission checked before the query entered Oracle.
     pub permission: String,
+}
+
+/// Maps private dispatch failures to the only public/stale execution classes.
+fn map_dispatch_error(error: &dispatcher::DispatchError) -> OracleExecutionError {
+    match error {
+        dispatcher::DispatchError::StaleObject => OracleExecutionError::StaleObject,
+        dispatcher::DispatchError::Terminal => {
+            OracleExecutionError::Public(BifrostError::QueryPeerSecurity)
+        }
+        dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
+            OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
+        }
+    }
+}
+
+/// Decodes footer-validated attempt payloads into Arrow batches.
+///
+/// # Errors
+///
+/// Returns execution failure when an attempt payload or Arrow IPC stream is invalid.
+fn decode_attempt_batches(
+    attempt: attempt::ValidatedAttempt,
+    output: &mut Vec<RecordBatch>,
+) -> Result<(), BifrostError> {
+    for bytes in attempt.batches {
+        let bytes = bytes.map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        for batch in reader {
+            output.push(batch.map_err(|_| BifrostError::QueryExecutionFailed)?);
+        }
+    }
+    Ok(())
 }
 
 impl AuthorizedQueryContext {
@@ -183,9 +217,9 @@ impl OracleTelemetry {
         visibility: VisibilityMode,
         query_class: QueryClass,
     ) -> QueryTelemetryGuard {
-        self.register_sparse_series(query_class);
+        Self::register_sparse_series(query_class);
         metrics::gauge!("bifrost_oracle_slots_total", "role" => "leader")
-            .set(self.slots.running_capacity() as f64);
+            .set(self.slots.running_capacity().to_f64().unwrap_or(f64::MAX));
         metrics::gauge!(
             "bifrost_oracle_in_flight",
             "visibility" => visibility_label(visibility),
@@ -208,7 +242,7 @@ impl OracleTelemetry {
     /// detect a security violation. Registering those families at real query
     /// entry keeps the production scrape contract discoverable without
     /// fabricating an event or changing subsequent counter values.
-    fn register_sparse_series(&self, query_class: QueryClass) {
+    fn register_sparse_series(query_class: QueryClass) {
         metrics::counter!(
             "bifrost_oracle_admission_rejections_total",
             "scope" => "cluster",
@@ -243,7 +277,7 @@ impl OracleTelemetry {
     }
 
     /// Records one classification decision and its predicted scan duration.
-    fn record_classification(&self, classification: OracleClassification) {
+    fn record_classification(classification: OracleClassification) {
         metrics::counter!(
             "bifrost_oracle_classification_total",
             "query_class" => query_class_label(classification.query_class),
@@ -259,10 +293,7 @@ impl OracleTelemetry {
 
     /// Starts a bounded admission-waiter gauge and duration observation.
     #[must_use]
-    fn start_admission_waiter(
-        self: &Arc<Self>,
-        query_class: QueryClass,
-    ) -> AdmissionWaitTelemetryGuard {
+    fn start_admission_waiter(query_class: QueryClass) -> AdmissionWaitTelemetryGuard {
         metrics::gauge!(
             "bifrost_oracle_admission_waiters",
             "query_class" => query_class_label(query_class)
@@ -276,7 +307,7 @@ impl OracleTelemetry {
     }
 
     /// Records one canonical admission rejection.
-    fn record_admission_rejection(&self, scope: &'static str, query_class: QueryClass) {
+    fn record_admission_rejection(scope: &'static str, query_class: QueryClass) {
         metrics::counter!(
             "bifrost_oracle_admission_rejections_total",
             "scope" => scope,
@@ -286,7 +317,7 @@ impl OracleTelemetry {
     }
 
     /// Records one local slot reservation result.
-    fn record_slot_reservation(&self, query_class: QueryClass, outcome: &'static str) {
+    fn record_slot_reservation(query_class: QueryClass, outcome: &'static str) {
         metrics::counter!(
             "bifrost_oracle_slot_reservations_total",
             "role" => "leader",
@@ -298,11 +329,7 @@ impl OracleTelemetry {
 
     /// Begins gauge accounting for one acquired local slot reservation.
     #[must_use]
-    fn start_slot_use(
-        self: &Arc<Self>,
-        query_class: QueryClass,
-        demand: u32,
-    ) -> SlotTelemetryGuard {
+    fn start_slot_use(query_class: QueryClass, demand: u32) -> SlotTelemetryGuard {
         metrics::gauge!(
             "bifrost_oracle_slots_in_use",
             "role" => "leader",
@@ -328,13 +355,14 @@ impl OracleTelemetry {
             .memory_bytes
             .fetch_add(bytes as u64, Ordering::AcqRel)
             .saturating_add(bytes as u64);
-        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader").set(total as f64);
+        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader")
+            .set(total.to_f64().unwrap_or(f64::MAX));
         metrics::gauge!(
             "bifrost_oracle_class_memory_bytes",
             "query_class" => query_class_label(query_class),
             "memory_kind" => memory_kind.label()
         )
-        .increment(bytes as f64);
+        .increment(bytes.to_f64().unwrap_or(f64::MAX));
         AccountedMemoryReservation {
             reservation: Some(reservation),
             owner: Arc::clone(self),
@@ -350,13 +378,14 @@ impl OracleTelemetry {
             .memory_bytes
             .fetch_sub(bytes as u64, Ordering::AcqRel)
             .saturating_sub(bytes as u64);
-        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader").set(total as f64);
+        metrics::gauge!("bifrost_oracle_memory_bytes", "role" => "leader")
+            .set(total.to_f64().unwrap_or(f64::MAX));
         metrics::gauge!(
             "bifrost_oracle_class_memory_bytes",
             "query_class" => query_class_label(query_class),
             "memory_kind" => memory_kind.label()
         )
-        .decrement(bytes as f64);
+        .decrement(bytes.to_f64().unwrap_or(f64::MAX));
     }
 }
 
@@ -599,15 +628,19 @@ impl OracleSlotManager {
     }
 }
 
+/// Canonical key for one table and optional Scribe stream identity.
+type TailTransportKey = (String, Option<uuid::Uuid>, Option<uuid::Uuid>);
+
+/// Canonical key for independently discovered live streams by table and node.
+type LiveStreamKey = (String, Option<uuid::Uuid>);
+
 /// Transport lookup for table-local live-tail fences.
 #[derive(Default)]
 pub struct TailTransportDirectory {
     /// Canonical table-to-transport map owned by the serving composition root.
-    transports: RwLock<
-        HashMap<(String, Option<uuid::Uuid>, Option<uuid::Uuid>), Arc<dyn TailReadTransport>>,
-    >,
+    transports: RwLock<HashMap<TailTransportKey, Arc<dyn TailReadTransport>>>,
     /// Independently discovered live streams, including tables with no sealed file.
-    live_streams: RwLock<HashMap<(String, Option<uuid::Uuid>), Vec<LiveTailRoute>>>,
+    live_streams: RwLock<HashMap<LiveStreamKey, Vec<LiveTailRoute>>>,
 }
 
 /// One independently discovered live Scribe stream for a table/day.
@@ -1034,7 +1067,7 @@ impl Default for OracleConfig {
             planning_permits: 16,
             tenant_interactive_slots: 8,
             tenant_analytical_slots: 4,
-            lease_ttl: Duration::from_secs(60),
+            lease_ttl: Duration::from_mins(1),
             lease_renew_interval: Duration::from_secs(20),
             maintenance_interval: Duration::from_secs(5),
             max_workers_per_query: 2,
@@ -1054,6 +1087,84 @@ enum OracleExecutionError {
     /// A stable public failure that must cross the transport boundary unchanged.
     #[error(transparent)]
     Public(#[from] BifrostError),
+}
+
+/// Complete inputs for one sealed-tier peer dispatch.
+struct SealedDispatchInput<'a> {
+    /// Authenticated request context.
+    context: &'a AuthorizedQueryContext,
+    /// Pinned table cut.
+    cut: &'a PinnedSealedTable,
+    /// Admitted leader identity and lease.
+    admitted: &'a AdmittedQueryGuard,
+    /// Immutable query class.
+    query_class: QueryClass,
+    /// Absolute execution deadline.
+    deadline: Instant,
+    /// Sealed source tier.
+    tier: fragment::SealedSourceTier,
+    /// Digest pinning the source manifest.
+    pinned_digest: String,
+    /// Exact immutable file work.
+    files: Vec<fragment::SealedScanFile>,
+}
+
+/// Planned fragments, assignment, fences, and authorization for execution.
+struct PreparedSealedDispatch {
+    /// Deterministic micro-fragments.
+    fragments: Vec<fragment::SealedScanFragment>,
+    /// Primary node assignment by fragment.
+    assignment: HashMap<wyrd_spec::vala::api::NodeId, Vec<fragment::SealedScanFragment>>,
+    /// Stable distinct retry candidates.
+    selected: Vec<wyrd_spec::vala::api::NodeId>,
+    /// Snapshot role fences by candidate.
+    fences: HashMap<wyrd_spec::vala::api::NodeId, u64>,
+    /// Immutable ticket and attempt context.
+    context: dispatcher::DispatchContext,
+}
+
+/// Complete inputs for lowering one pinned SQL visibility cut.
+struct SqlCutInput<'a> {
+    /// Authenticated request context.
+    context: &'a AuthorizedQueryContext,
+    /// Validated SQL statement.
+    sql: &'a str,
+    /// Exact pinned table cuts.
+    cuts: Vec<PinnedSealedTable>,
+    /// Drained live batches keyed by canonical table name.
+    live_batches: HashMap<String, Vec<RecordBatch>>,
+    /// Immutable admission class.
+    query_class: QueryClass,
+    /// Admitted durable/local query owner.
+    admitted: &'a AdmittedQueryGuard,
+    /// Absolute execution deadline.
+    deadline: Instant,
+}
+
+/// Pinned tables and class selected during one retry's planning phase.
+struct PlannedSqlCut {
+    /// Exact immutable table cuts.
+    cuts: Vec<PinnedSealedTable>,
+    /// Server-derived admission class.
+    query_class: QueryClass,
+}
+
+/// Inputs for live-fence acquisition, mandatory audit, and bounded drain.
+struct CutAuditInput<'a> {
+    /// Authenticated request context.
+    context: &'a AuthorizedQueryContext,
+    /// Original validated query request.
+    request: &'a BifrostQueryRequest,
+    /// Pinned tables being authorized.
+    cuts: &'a [PinnedSealedTable],
+    /// Server-derived query class.
+    query_class: QueryClass,
+    /// Whole-query retry ordinal.
+    retry_ordinal: u8,
+    /// Absolute query deadline.
+    deadline: Instant,
+    /// Admission lifecycle cancellation shared with lease renewal and streaming.
+    cancellation: &'a CancellationToken,
 }
 
 /// Retained local query engine owner.
@@ -1144,7 +1255,6 @@ impl Oracle {
             Arc::new(config.admission_leases),
             config.local_role,
             config.config,
-            Arc::clone(&telemetry),
         );
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
@@ -1178,16 +1288,16 @@ impl Oracle {
         self.planner.validate_query(request)
     }
 
-    /// Resolves one tenant-qualified published table into a typed-plan DataFrame.
+    /// Resolves one tenant-qualified published table into a typed-plan `DataFrame`.
     ///
-    /// This keeps catalog provider and DataFusion session construction inside
+    /// This keeps catalog provider and `DataFusion` session construction inside
     /// retained Oracle. Server adapters may add bound expressions to the
     /// returned frame, but cannot bypass Oracle for source resolution.
     ///
     /// # Errors
     ///
     /// Returns a stable catalog or execution failure when the table namespace,
-    /// provider, empty builtin fallback, or DataFrame cannot be constructed.
+    /// provider, empty builtin fallback, or `DataFrame` cannot be constructed.
     pub async fn typed_dataframe(
         &self,
         tenant: DataTenantId,
@@ -1212,18 +1322,18 @@ impl Oracle {
                     .ok_or(BifrostError::QueryExecutionFailed)?;
                 Arc::new(
                     MemTable::try_new((definition.schema)(), vec![vec![]])
-                        .map_err(map_datafusion_error)?,
+                        .map_err(|error| map_datafusion_error(&error))?,
                 )
             }
             Err(error) => return Err(error.into_public()),
         };
         session
             .register_table(TableReference::bare(fqn), provider)
-            .map_err(map_datafusion_error)?;
+            .map_err(|error| map_datafusion_error(&error))?;
         session
             .table(TableReference::bare(fqn))
             .await
-            .map_err(map_datafusion_error)
+            .map_err(|error| map_datafusion_error(&error))
     }
 
     /// Starts a query through the retained owner.
@@ -1254,55 +1364,20 @@ impl Oracle {
         }
         let deadline = request
             .deadline_ms
-            .map(Duration::from_millis)
-            .unwrap_or(self.planner.config.default_deadline);
+            .map_or(self.planner.config.default_deadline, Duration::from_millis);
         let deadline = Instant::now()
             .checked_add(deadline)
             .ok_or(BifrostError::QueryTimeout)?;
         let tables = parse_select_tables(&request.sql)?;
         let mut query_telemetry = None;
         for retry_ordinal in 0_u8..=1 {
-            let planning = self.planner.try_planning()?;
-            let mut cuts = Vec::with_capacity(tables.len());
-            let mut estimated_bytes = 0_u64;
-            for table in &tables {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(BifrostError::QueryTimeout)?;
-                let cut = tokio::time::timeout(
-                    remaining,
-                    self.catalog.pin_sealed_table(table, context.data_tenant_id),
-                )
-                .await
-                .map_err(|_| BifrostError::QueryTimeout)?
-                .map_err(|error| error.into_public())?;
-                estimated_bytes = estimated_bytes
-                    .checked_add(cut.estimated_bytes)
-                    .ok_or(BifrostError::QueryAdmissionRejected)?;
-                cuts.push(cut);
-            }
-            let optimized_plan = self.prepare_optimized_sql_plan(&request.sql, &cuts).await?;
-            let snapshot = self.admission.cluster.snapshot();
-            let live_cpu = snapshot
-                .live_oracles()
-                .iter()
-                .filter_map(|role| match &role.capabilities {
-                    ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
-                    ClusterCapabilities::ScribeV1(_) => None,
-                })
-                .sum::<f64>();
-            let classification = OraclePlanner::classification(
-                estimated_bytes,
-                live_cpu,
-                optimized_plan_is_complex(&optimized_plan),
-            );
-            let query_class = classification.query_class;
-            tracing::Span::current().record("query_class", query_class_label(query_class));
-            self.telemetry.record_classification(classification);
+            let planned = self
+                .pin_and_classify(&context, &request.sql, &tables, deadline)
+                .await?;
+            let query_class = planned.query_class;
             if query_telemetry.is_none() {
                 query_telemetry = Some(self.telemetry.start_query(request.visibility, query_class));
             }
-            drop(planning);
             let mut admitted = self
                 .admission
                 .admit(
@@ -1312,109 +1387,34 @@ impl Oracle {
                     self.shutdown.child_token(),
                 )
                 .await?;
-            let mut degraded = false;
-            let acquired_fences = if request.visibility == VisibilityMode::Fused {
-                match TailFenceDrainer::acquire(&cuts, &self.tails, deadline).await {
-                    Ok(fences) => fences,
-                    Err(error)
-                        if request.freshness
-                            == wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded =>
-                    {
-                        tracing::warn!(error = %error, "Oracle Fused cut omits unavailable live tail");
-                        degraded = true;
-                        Vec::new()
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                Vec::new()
-            };
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
-            let _audit_span = tracing::info_span!(
-                "bifrost.oracle.audit",
-                audit_kind = "read_decision",
-                query_class = query_class_label(query_class)
-            );
-            let audit_started = Instant::now();
-            let audit_result = tokio::time::timeout(
-                remaining,
-                self.audit.append_read_decision(
-                    &context,
-                    read_decision(
-                        &context,
-                        &request.sql,
-                        &cuts,
-                        request.visibility,
-                        query_class,
-                        retry_ordinal,
-                        deadline,
-                    )?,
-                ),
-            )
-            .await;
-            if let Err(error) = audit_result
-                .map_err(|_| BifrostError::QueryTimeout)
-                .and_then(|result| result)
-            {
-                release_tail_fences(&acquired_fences);
-                metrics::histogram!(
-                    "bifrost_oracle_audit_seconds",
-                    "audit_kind" => "read_decision",
-                    "outcome" => "failed"
-                )
-                .record(audit_started.elapsed().as_secs_f64());
-                tracing::error!(error = %error, "Oracle read-decision audit failed");
-                return Err(if error == BifrostError::QueryTimeout {
-                    error
-                } else {
-                    BifrostError::QueryAuditUnavailable
-                });
-            }
-            metrics::histogram!(
-                "bifrost_oracle_audit_seconds",
-                "audit_kind" => "read_decision",
-                "outcome" => "success"
-            )
-            .record(audit_started.elapsed().as_secs_f64());
-            let drained = if acquired_fences.is_empty() {
-                DrainedTails {
-                    degraded,
-                    ..DrainedTails::default()
-                }
-            } else {
-                TailFenceDrainer::drain(
-                    acquired_fences,
-                    &self.memory,
-                    Arc::clone(&self.telemetry),
+            let drained = self
+                .audit_and_drain_cut(CutAuditInput {
+                    context: &context,
+                    request: &request,
+                    cuts: &planned.cuts,
                     query_class,
+                    retry_ordinal,
                     deadline,
-                    request.freshness,
-                )
-                .await?
-            };
-            degraded |= drained.degraded;
+                    cancellation: &admitted.cancellation,
+                })
+                .await?;
+            let degraded = drained.degraded;
             admitted.live_reservations = drained.reservations;
             let execution = self
-                .execute_sql_cut(
-                    &context,
-                    &request.sql,
-                    cuts,
-                    drained.batches,
+                .execute_sql_cut(SqlCutInput {
+                    context: &context,
+                    sql: &request.sql,
+                    cuts: planned.cuts,
+                    live_batches: drained.batches,
                     query_class,
-                    &admitted,
+                    admitted: &admitted,
                     deadline,
-                )
+                })
                 .await;
             let (schema, mut batches) = match execution {
                 Ok(execution) => execution,
                 Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
-                    metrics::counter!(
-                        "bifrost_oracle_stale_replans_total",
-                        "outcome" => "retried"
-                    )
-                    .increment(1);
+                    record_stale_replan();
                     drop(admitted);
                     continue;
                 }
@@ -1431,33 +1431,171 @@ impl Oracle {
                 .map_err(|_| BifrostError::QueryTimeout)?
             {
                 Some(Err(error)) if retry_ordinal == 0 && is_stale_file_error(&error) => {
-                    metrics::counter!(
-                        "bifrost_oracle_stale_replans_total",
-                        "outcome" => "retried"
-                    )
-                    .increment(1);
+                    record_stale_replan();
                     drop(admitted);
-                    continue;
                 }
                 first => {
-                    return Ok(build_query_stream(
+                    let query_telemetry = query_telemetry
+                        .take()
+                        .ok_or(BifrostError::QueryExecutionFailed)?;
+                    return build_query_stream(QueryStreamInput {
                         schema,
                         batches,
                         first,
                         admitted,
                         deadline,
-                        request.visibility,
+                        visibility: request.visibility,
                         query_class,
                         degraded,
-                        retry_ordinal == 1,
-                        query_telemetry
-                            .take()
-                            .expect("classified Oracle query owns telemetry"),
-                    )?);
+                        stale_replanned: retry_ordinal == 1,
+                        query_telemetry,
+                    });
                 }
             }
         }
         Err(BifrostError::QueryExecutionFailed)
+    }
+
+    /// Pins table metadata and derives the immutable class for one retry attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout, catalog, planning, or byte-accounting failures.
+    async fn pin_and_classify(
+        &self,
+        context: &AuthorizedQueryContext,
+        sql: &str,
+        tables: &[TableRef],
+        deadline: Instant,
+    ) -> Result<PlannedSqlCut, BifrostError> {
+        let planning = self.planner.try_planning()?;
+        let mut cuts = Vec::with_capacity(tables.len());
+        let mut estimated_bytes = 0_u64;
+        for table in tables {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryTimeout)?;
+            let cut = tokio::time::timeout(
+                remaining,
+                self.catalog.pin_sealed_table(table, context.data_tenant_id),
+            )
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)?
+            .map_err(BifrostCatalogError::into_public)?;
+            estimated_bytes = estimated_bytes
+                .checked_add(cut.estimated_bytes)
+                .ok_or(BifrostError::QueryAdmissionRejected)?;
+            cuts.push(cut);
+        }
+        let optimized_plan = self.prepare_optimized_sql_plan(sql, &cuts).await?;
+        let live_cpu = self
+            .admission
+            .cluster
+            .snapshot()
+            .live_oracles()
+            .iter()
+            .filter_map(|role| match &role.capabilities {
+                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
+                ClusterCapabilities::ScribeV1(_) => None,
+            })
+            .sum::<f64>();
+        let classification = OraclePlanner::classification(
+            estimated_bytes,
+            live_cpu,
+            optimized_plan_is_complex(&optimized_plan),
+        );
+        tracing::Span::current()
+            .record("query_class", query_class_label(classification.query_class));
+        OracleTelemetry::record_classification(classification);
+        drop(planning);
+        Ok(PlannedSqlCut {
+            cuts,
+            query_class: classification.query_class,
+        })
+    }
+
+    /// Acquires live fences, commits the read decision, and drains authorized tails.
+    ///
+    /// # Errors
+    ///
+    /// Returns timeout, visibility, audit, or parent-memory failures after
+    /// releasing every fence acquired before the failure.
+    async fn audit_and_drain_cut(
+        &self,
+        input: CutAuditInput<'_>,
+    ) -> Result<DrainedTails, BifrostError> {
+        let drainer = TailFenceDrainer::new(
+            &self.tails,
+            &self.memory,
+            Arc::clone(&self.telemetry),
+            input.query_class,
+            input.deadline,
+            input.cancellation.clone(),
+            input.request.freshness,
+        );
+        let mut degraded = false;
+        let acquired = if input.request.visibility == VisibilityMode::Fused {
+            match drainer.acquire(input.cuts).await {
+                Ok(fences) => fences,
+                Err(error)
+                    if input.request.freshness
+                        == wyrd_spec::vala::api::FreshnessPolicy::AllowDegraded =>
+                {
+                    tracing::warn!(error = %error, "Oracle Fused cut omits unavailable live tail");
+                    degraded = true;
+                    Vec::new()
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            Vec::new()
+        };
+        let remaining = input
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BifrostError::QueryTimeout)?;
+        let audit_started = Instant::now();
+        let decision = read_decision(
+            input.context,
+            &input.request.sql,
+            input.cuts,
+            input.request.visibility,
+            input.query_class,
+            input.retry_ordinal,
+            input.deadline,
+        )?;
+        let result = tokio::time::timeout(
+            remaining,
+            self.audit.append_read_decision(input.context, decision),
+        )
+        .await
+        .map_err(|_| BifrostError::QueryTimeout)
+        .and_then(|result| result);
+        let outcome = if result.is_ok() { "success" } else { "failed" };
+        metrics::histogram!(
+            "bifrost_oracle_audit_seconds",
+            "audit_kind" => "read_decision",
+            "outcome" => outcome
+        )
+        .record(audit_started.elapsed().as_secs_f64());
+        if let Err(error) = result {
+            tracing::error!(error = %error, "Oracle read-decision audit failed");
+            return Err(if error == BifrostError::QueryTimeout {
+                error
+            } else {
+                BifrostError::QueryAuditUnavailable
+            });
+        }
+        if acquired.is_empty() {
+            Ok(DrainedTails {
+                degraded,
+                ..DrainedTails::default()
+            })
+        } else {
+            let mut tail_data = drainer.drain(acquired).await?;
+            tail_data.degraded |= degraded;
+            Ok(tail_data)
+        }
     }
 
     /// Accepts a typed lowered plan after validating its deadline.
@@ -1491,7 +1629,7 @@ impl Oracle {
         }
         let class = QueryClass::Analytical;
         let query_telemetry = self.telemetry.start_query(options.visibility, class);
-        self.telemetry.record_classification(OracleClassification {
+        OracleTelemetry::record_classification(OracleClassification {
             query_class: class,
             reason: "typed_plan",
             predicted_scan_seconds: 0.0,
@@ -1538,14 +1676,14 @@ impl Oracle {
             .state()
             .create_physical_plan(&plan)
             .await
-            .map_err(map_datafusion_error)?;
+            .map_err(|error| map_datafusion_error(&error))?;
         let schema = physical.schema();
         let _source_span = tracing::info_span!(
             "bifrost.oracle.source",
             query_class = query_class_label(class)
         );
-        let mut batches =
-            execute_stream(physical, session.task_ctx()).map_err(map_datafusion_error)?;
+        let mut batches = execute_stream(physical, session.task_ctx())
+            .map_err(|error| map_datafusion_error(&error))?;
         let remaining = options
             .deadline
             .checked_duration_since(Instant::now())
@@ -1553,18 +1691,18 @@ impl Oracle {
         let first = tokio::time::timeout(remaining, batches.next())
             .await
             .map_err(|_| BifrostError::QueryTimeout)?;
-        build_query_stream(
+        build_query_stream(QueryStreamInput {
             schema,
             batches,
             first,
             admitted,
-            options.deadline,
-            options.visibility,
-            class,
-            false,
-            false,
+            deadline: options.deadline,
+            visibility: options.visibility,
+            query_class: class,
+            degraded: false,
+            stale_replanned: false,
             query_telemetry,
-        )
+        })
     }
 
     /// Returns whether startup reconciliation completed and queries may enter admission.
@@ -1621,39 +1759,16 @@ impl Oracle {
     /// provider, logical plan, optimization, or physical stream cannot be built.
     async fn execute_sql_cut(
         &self,
-        context: &AuthorizedQueryContext,
-        sql: &str,
-        cuts: Vec<PinnedSealedTable>,
-        mut live_batches: HashMap<String, Vec<RecordBatch>>,
-        query_class: QueryClass,
-        admitted: &AdmittedQueryGuard,
-        deadline: Instant,
+        mut input: SqlCutInput<'_>,
     ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
         let _source_span = tracing::info_span!(
             "bifrost.oracle.source",
-            query_class = query_class_label(query_class)
+            query_class = query_class_label(input.query_class)
         );
         let session = SessionContext::new();
-        for cut in cuts {
+        for cut in input.cuts {
             let table_name = cut.binding.table_ref.fqn();
-            let mut hot_files = cut
-                .hot_files
-                .iter()
-                .map(|file| {
-                    let size_bytes = usize::try_from(file.file_size).map_err(|_| {
-                        BifrostError::MetadataMismatch {
-                            detail: "hot file size exceeds process bounds".to_owned(),
-                        }
-                    })?;
-                    Ok(HotFileSource {
-                        location: self
-                            .catalog
-                            .object_location(&cut.binding, &file.file_path)
-                            .map_err(|error| error.into_public())?,
-                        size_bytes,
-                    })
-                })
-                .collect::<Result<Vec<_>, BifrostError>>()?;
+            let mut hot_files = self.local_hot_sources(&cut)?;
             let distributed_iceberg_batches =
                 if self.fragment_dispatcher.is_some() && !cut.iceberg_files.is_empty() {
                     let files = cut
@@ -1664,7 +1779,7 @@ impl Oracle {
                                 location: self
                                     .catalog
                                     .object_location(&cut.binding, &file.file_path)
-                                    .map_err(|error| error.into_public())?,
+                                    .map_err(BifrostCatalogError::into_public)?,
                                 row_groups: Vec::new(),
                                 size_bytes: file.file_size,
                                 estimated_rows: file.row_count,
@@ -1672,16 +1787,16 @@ impl Oracle {
                         })
                         .collect::<Result<Vec<_>, BifrostError>>()?;
                     Some(
-                        self.dispatch_sealed_fragments(
-                            context,
-                            &cut,
-                            admitted,
-                            query_class,
-                            deadline,
-                            fragment::SealedSourceTier::Iceberg,
-                            cut.snapshot_digest.clone(),
+                        self.dispatch_sealed_fragments(SealedDispatchInput {
+                            context: input.context,
+                            cut: &cut,
+                            admitted: input.admitted,
+                            query_class: input.query_class,
+                            deadline: input.deadline,
+                            tier: fragment::SealedSourceTier::Iceberg,
+                            pinned_digest: cut.snapshot_digest.clone(),
                             files,
-                        )
+                        })
                         .await?,
                     )
                 } else {
@@ -1698,7 +1813,7 @@ impl Oracle {
                                 location: self
                                     .catalog
                                     .object_location(&cut.binding, &file.file_path)
-                                    .map_err(|error| error.into_public())?,
+                                    .map_err(BifrostCatalogError::into_public)?,
                                 row_groups: Vec::new(),
                                 size_bytes: u64::try_from(file.file_size)
                                     .map_err(|_| BifrostError::QueryExecutionFailed)?,
@@ -1707,48 +1822,93 @@ impl Oracle {
                             })
                         })
                         .collect::<Result<Vec<_>, BifrostError>>()?;
-                    self.dispatch_sealed_fragments(
-                        context,
-                        &cut,
-                        admitted,
-                        query_class,
-                        deadline,
-                        fragment::SealedSourceTier::HotSealed,
-                        cut.hot_manifest_digest.clone(),
+                    self.dispatch_sealed_fragments(SealedDispatchInput {
+                        context: input.context,
+                        cut: &cut,
+                        admitted: input.admitted,
+                        query_class: input.query_class,
+                        deadline: input.deadline,
+                        tier: fragment::SealedSourceTier::HotSealed,
+                        pinned_digest: cut.hot_manifest_digest.clone(),
                         files,
-                    )
+                    })
                     .await?
                 } else {
                     Vec::new()
                 };
-            let provider = OracleTableProvider::try_new(
-                cut.iceberg_table,
+            let provider = OracleTableProvider::try_new(OracleTableInputs {
+                table: cut.iceberg_table,
                 distributed_iceberg_batches,
                 hot_files,
                 distributed_hot_batches,
-                live_batches.remove(&table_name).unwrap_or_default(),
-                context.clone(),
-                table_name.clone(),
-                Arc::clone(&self.audit),
-                self.memory.clone(),
-                Arc::clone(&self.telemetry),
-                query_class,
-            )
+                live_batches: input.live_batches.remove(&table_name).unwrap_or_default(),
+                context: input.context.clone(),
+                table_name: table_name.clone(),
+                audit: Arc::clone(&self.audit),
+                memory: self.memory.clone(),
+                telemetry: Arc::clone(&self.telemetry),
+                query_class: input.query_class,
+            })
             .await
-            .map_err(map_datafusion_error)?;
+            .map_err(|error| map_datafusion_error(&error))?;
             register_session_table(
                 &session,
                 &cut.binding,
                 Arc::new(provider) as Arc<dyn TableProvider>,
             )?;
         }
-        let frame = session.sql(sql).await.map_err(map_datafusion_error)?;
+        self.execute_session(&session, input.sql).await
+    }
+
+    /// Resolves leader-local hot file locations for one pinned cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns metadata mismatch for process-size overflow or an invalid bound path.
+    fn local_hot_sources(
+        &self,
+        cut: &PinnedSealedTable,
+    ) -> Result<Vec<HotFileSource>, BifrostError> {
+        cut.hot_files
+            .iter()
+            .map(|file| {
+                let size_bytes = usize::try_from(file.file_size).map_err(|_| {
+                    BifrostError::MetadataMismatch {
+                        detail: "hot file size exceeds process bounds".to_owned(),
+                    }
+                })?;
+                Ok(HotFileSource {
+                    location: self
+                        .catalog
+                        .object_location(&cut.binding, &file.file_path)
+                        .map_err(BifrostCatalogError::into_public)?,
+                    size_bytes,
+                })
+            })
+            .collect()
+    }
+
+    /// Builds and starts one physical plan after all pinned providers are registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable execution failure when `DataFusion` cannot lower or start the plan.
+    async fn execute_session(
+        &self,
+        session: &SessionContext,
+        sql: &str,
+    ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
+        let frame = session
+            .sql(sql)
+            .await
+            .map_err(|error| map_datafusion_error(&error))?;
         let physical = frame
             .create_physical_plan()
             .await
-            .map_err(map_datafusion_error)?;
+            .map_err(|error| map_datafusion_error(&error))?;
         let schema = physical.schema();
-        let stream = execute_stream(physical, session.task_ctx()).map_err(map_datafusion_error)?;
+        let stream = execute_stream(physical, session.task_ctx())
+            .map_err(|error| map_datafusion_error(&error))?;
         Ok((schema, stream))
     }
 
@@ -1762,20 +1922,60 @@ impl Oracle {
     /// Returns a stable execution, timeout, metadata, or peer-security failure.
     async fn dispatch_sealed_fragments(
         &self,
-        context: &AuthorizedQueryContext,
-        cut: &PinnedSealedTable,
-        admitted: &AdmittedQueryGuard,
-        query_class: QueryClass,
-        deadline: Instant,
-        tier: fragment::SealedSourceTier,
-        pinned_digest: String,
-        files: Vec<fragment::SealedScanFile>,
+        input: SealedDispatchInput<'_>,
     ) -> Result<Vec<RecordBatch>, OracleExecutionError> {
         let dispatcher = self
             .fragment_dispatcher
             .as_ref()
             .ok_or(BifrostError::QueryExecutionFailed)?;
-        let remaining = deadline
+        let leader = input.admitted.leader.node_id;
+        let prepared = self.prepare_sealed_dispatch(input)?;
+        let mut output = Vec::new();
+        for fragment in prepared.fragments {
+            let primary = prepared
+                .assignment
+                .iter()
+                .find_map(|(node, work)| work.contains(&fragment).then_some(*node))
+                .unwrap_or(leader);
+            let mut order = vec![primary];
+            order.extend(
+                prepared
+                    .selected
+                    .iter()
+                    .copied()
+                    .filter(|node| *node != primary),
+            );
+            let candidates = order
+                .into_iter()
+                .filter_map(|node_id| {
+                    prepared.fences.get(&node_id).copied().map(|worker_fence| {
+                        dispatcher::DispatchCandidate {
+                            node_id,
+                            worker_fence,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let attempt = dispatcher
+                .execute(&prepared.context, fragment, &candidates)
+                .await
+                .map_err(|error| map_dispatch_error(&error))?;
+            decode_attempt_batches(attempt, &mut output)?;
+        }
+        Ok(output)
+    }
+
+    /// Plans immutable fragment work and assignment from one membership snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable timeout, metadata, role, planning, or audit-digest errors.
+    fn prepare_sealed_dispatch(
+        &self,
+        input: SealedDispatchInput<'_>,
+    ) -> Result<PreparedSealedDispatch, OracleExecutionError> {
+        let remaining = input
+            .deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
         let deadline_unix_ms = (chrono::Utc::now()
@@ -1783,19 +1983,20 @@ impl Oracle {
         .timestamp_millis();
         let binding = self
             .catalog
-            .object_location(&cut.binding, &cut.binding.object_prefix)
-            .map_err(|error| error.into_public())?;
-        let schema =
-            iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
-                .map_err(|_| BifrostError::QueryExecutionFailed)?;
+            .object_location(&input.cut.binding, &input.cut.binding.object_prefix)
+            .map_err(BifrostCatalogError::into_public)?;
+        let schema = iceberg::arrow::schema_to_arrow_schema(
+            input.cut.iceberg_table.metadata().current_schema(),
+        )
+        .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let schema_fingerprint = sealed_fragment_schema_fingerprint(&schema);
         let fragments = fragment::FragmentPlanner
             .plan(
                 &fragment::PreparedSealedLeaf {
                     binding,
-                    tier,
-                    pinned_digest,
-                    files,
+                    tier: input.tier,
+                    pinned_digest: input.pinned_digest,
+                    files: input.files,
                     projection: Vec::new(),
                     predicates: Vec::new(),
                     schema_fingerprint,
@@ -1807,7 +2008,7 @@ impl Oracle {
             )
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let snapshot = self.admission.cluster.snapshot();
-        let leader = admitted.leader.node_id;
+        let leader = input.admitted.leader.node_id;
         let mut eligible = std::collections::BTreeMap::new();
         let mut fences = HashMap::new();
         for role in snapshot.live_oracles() {
@@ -1839,60 +2040,25 @@ impl Oracle {
             .map_err(|_| BifrostError::QueryExecutionFailed)?;
         let mut selected = assignment.keys().copied().collect::<Vec<_>>();
         selected.sort_by_key(|node| node.as_uuid());
-        let permission_digest = audit_digest(&context.permission)?.as_str().to_owned();
+        let permission_digest = audit_digest(&input.context.permission)?.as_str().to_owned();
         let dispatch_context = dispatcher::DispatchContext {
-            query_id: admitted.query_id,
+            query_id: input.admitted.query_id,
             leader_node_id: leader,
-            leader_fence: admitted.leader.fencing_token,
-            tenant_id: context.data_tenant_id.as_uuid(),
-            query_class,
-            slot_units: admission_limits(u32::MAX, query_class).1,
+            leader_fence: input.admitted.leader.fencing_token,
+            tenant_id: input.context.data_tenant_id.as_uuid(),
+            query_class: input.query_class,
+            slot_units: admission_limits(u32::MAX, input.query_class).1,
             permission_digest,
             attempt_bytes: self.planner.config.attempt_max_bytes,
             attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
         };
-        let mut output = Vec::new();
-        for fragment in fragments {
-            let primary = assignment
-                .iter()
-                .find_map(|(node, work)| work.contains(&fragment).then_some(*node))
-                .unwrap_or(leader);
-            let mut order = vec![primary];
-            order.extend(selected.iter().copied().filter(|node| *node != primary));
-            let candidates = order
-                .into_iter()
-                .filter_map(|node_id| {
-                    fences.get(&node_id).copied().map(|worker_fence| {
-                        dispatcher::DispatchCandidate {
-                            node_id,
-                            worker_fence,
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            let attempt = dispatcher
-                .execute(&dispatch_context, fragment, &candidates)
-                .await
-                .map_err(|error| match error {
-                    dispatcher::DispatchError::StaleObject => OracleExecutionError::StaleObject,
-                    dispatcher::DispatchError::Terminal => {
-                        OracleExecutionError::Public(BifrostError::QueryPeerSecurity)
-                    }
-                    dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
-                        OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
-                    }
-                })?;
-            for bytes in attempt.batches {
-                let bytes = bytes.map_err(|_| BifrostError::QueryExecutionFailed)?;
-                let reader =
-                    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
-                        .map_err(|_| BifrostError::QueryExecutionFailed)?;
-                for batch in reader {
-                    output.push(batch.map_err(|_| BifrostError::QueryExecutionFailed)?);
-                }
-            }
-        }
-        Ok(output)
+        Ok(PreparedSealedDispatch {
+            fragments,
+            assignment,
+            selected,
+            fences,
+            context: dispatch_context,
+        })
     }
 
     /// Lowers and optimizes SQL against schema-only pinned table providers.
@@ -1929,8 +2095,8 @@ impl Oracle {
                 .cloned()
                 .collect::<Vec<_>>();
             let public = Arc::new(Schema::new(fields));
-            let provider =
-                MemTable::try_new(public, vec![Vec::new()]).map_err(map_datafusion_error)?;
+            let provider = MemTable::try_new(public, vec![Vec::new()])
+                .map_err(|error| map_datafusion_error(&error))?;
             register_session_table(
                 &session,
                 &cut.binding,
@@ -1940,9 +2106,9 @@ impl Oracle {
         session
             .sql(sql)
             .await
-            .map_err(map_datafusion_error)?
+            .map_err(|error| map_datafusion_error(&error))?
             .into_optimized_plan()
-            .map_err(map_datafusion_error)
+            .map_err(|error| map_datafusion_error(&error))
     }
 }
 
@@ -1970,7 +2136,7 @@ pub(super) fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
 
 /// Registers one table beneath its explicit Wyrd catalog/schema hierarchy.
 ///
-/// DataFusion does not synthesize catalog providers when a three-part table
+/// `DataFusion` does not synthesize catalog providers when a three-part table
 /// reference is registered. Oracle therefore creates the tenant-free logical
 /// hierarchy (`vala.<domain>.<table>`) explicitly while the provider itself
 /// remains bound to the authenticated tenant's physical cut.
@@ -1978,7 +2144,7 @@ pub(super) fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
 /// # Errors
 ///
 /// Returns a stable planning failure when the logical namespace is malformed
-/// or DataFusion rejects a duplicate/incompatible schema or table.
+/// or `DataFusion` rejects a duplicate/incompatible schema or table.
 fn register_session_table(
     session: &SessionContext,
     binding: &crate::catalog::TenantTableBinding,
@@ -1994,19 +2160,18 @@ fn register_session_table(
         session.register_catalog("vala", Arc::clone(&catalog));
         catalog
     });
-    let schema = match catalog.schema(schema_name) {
-        Some(schema) => schema,
-        None => {
-            let schema = Arc::new(MemorySchemaProvider::new());
-            catalog
-                .register_schema(schema_name, schema.clone())
-                .map_err(map_datafusion_error)?;
-            schema
-        }
+    let schema = if let Some(schema) = catalog.schema(schema_name) {
+        schema
+    } else {
+        let schema = Arc::new(MemorySchemaProvider::new());
+        catalog
+            .register_schema(schema_name, schema.clone())
+            .map_err(|error| map_datafusion_error(&error))?;
+        schema
     };
     schema
         .register_table(binding.table_name.clone(), provider)
-        .map_err(map_datafusion_error)?;
+        .map_err(|error| map_datafusion_error(&error))?;
     Ok(())
 }
 
@@ -2084,7 +2249,8 @@ impl OraclePlanner {
         complex: bool,
     ) -> OracleClassification {
         let cpu = (live_oracle_cpu * 0.8).floor().max(1.0);
-        let seconds = estimated_bytes as f64 / ESTIMATED_SCAN_BYTES_PER_SECOND / cpu;
+        let seconds =
+            estimated_bytes.to_f64().unwrap_or(f64::MAX) / ESTIMATED_SCAN_BYTES_PER_SECOND / cpu;
         if complex {
             OracleClassification {
                 query_class: QueryClass::Analytical,
@@ -2119,8 +2285,6 @@ pub struct OracleAdmission {
     local_role: RegisteredRole,
     /// Validated tenant ceilings and lifecycle configuration.
     config: OracleConfig,
-    /// Production admission, slot, and waiter accounting.
-    telemetry: Arc<OracleTelemetry>,
     /// Bounded tenant scopes queued for periodic authoritative repair.
     tenant_reconcile_queue: Arc<Mutex<TenantReconcileQueue>>,
 }
@@ -2144,6 +2308,23 @@ enum TenantReconcileInsert {
     /// The fixed 64-scope queue had no capacity for a new scope.
     Saturated,
 }
+
+/// Immutable durable capacity request computed from one membership snapshot.
+struct AdmissionPlan {
+    /// Candidate lease bound to the local leader fence.
+    lease: OracleAdmissionLease,
+    /// Cluster-wide usable slot ceiling.
+    cluster_limit: u32,
+    /// Independent class ceiling.
+    class_limit: u32,
+    /// Tenant/class ceiling.
+    tenant_limit: u32,
+    /// Bounded durable acquisition deadline.
+    deadline: Instant,
+}
+
+/// Shared terminal reason and cancellation-bound renewal task.
+type LeaseRenewal = (Arc<Mutex<Option<QueryTerminalErrorCode>>>, JoinHandle<()>);
 
 impl TenantReconcileQueue {
     /// Enqueues one tenant/class scope without performing durable IO.
@@ -2215,6 +2396,154 @@ impl std::fmt::Debug for OracleAdmission {
 }
 
 impl OracleAdmission {
+    /// Computes one fenced durable admission plan from the current immutable snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns role-unavailable, timeout, internal-duration, or capacity errors
+    /// when the snapshot cannot produce a valid local lease.
+    fn plan_admission(
+        &self,
+        tenant: DataTenantId,
+        query_class: QueryClass,
+        deadline: Instant,
+    ) -> Result<(AdmissionPlan, chrono::Duration), BifrostError> {
+        let snapshot = self.cluster.snapshot();
+        let live = snapshot.live_oracles();
+        let local_node = self.local_role.key.node_id;
+        if !live.iter().any(|role| role.key.node_id == local_node) {
+            return Err(BifrostError::OracleRoleUnavailable);
+        }
+        let usable_slots = live
+            .iter()
+            .filter_map(|role| match &role.capabilities {
+                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.usable_slots),
+                ClusterCapabilities::ScribeV1(_) => None,
+            })
+            .try_fold(0_u32, u32::checked_add)
+            .ok_or(BifrostError::QueryAdmissionRejected)?;
+        let (class_limit, demand) = admission_limits(usable_slots, query_class);
+        let tenant_limit = match query_class {
+            QueryClass::Interactive => self.config.tenant_interactive_slots,
+            QueryClass::Analytical => self.config.tenant_analytical_slots,
+        };
+        let lease_ttl = chrono::Duration::from_std(self.config.lease_ttl).map_err(|_| {
+            BifrostError::Internal {
+                detail: "Oracle lease TTL exceeds chrono bounds".to_owned(),
+            }
+        })?;
+        if deadline <= Instant::now() {
+            return Err(BifrostError::QueryTimeout);
+        }
+        let now = chrono::Utc::now();
+        Ok((
+            AdmissionPlan {
+                lease: OracleAdmissionLease {
+                    query_id: QueryId::new(uuid::Uuid::now_v7()),
+                    data_tenant_id: tenant,
+                    query_class,
+                    slot_units: demand,
+                    selected_node_ids: vec![local_node],
+                    leader_node_id: local_node,
+                    leader_fencing_token: self.local_role.fencing_token,
+                    acquired_at: now,
+                    expires_at: now + lease_ttl,
+                },
+                cluster_limit: usable_slots,
+                class_limit,
+                tenant_limit,
+                deadline: deadline.min(Instant::now() + Duration::from_millis(250)),
+            },
+            lease_ttl,
+        ))
+    }
+
+    /// Performs the bounded one-retry durable lease transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns admission rejection on timeout and execution failure on SQL errors.
+    async fn acquire_plan(&self, plan: &AdmissionPlan) -> Result<AdmissionAcquire, BifrostError> {
+        for attempt in 0_u8..=1 {
+            let request = AdmissionRequest {
+                lease: plan.lease.clone(),
+                cluster_limit: plan.cluster_limit,
+                class_limit: plan.class_limit,
+                tenant_limit: plan.tenant_limit,
+            };
+            let remaining = plan
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryAdmissionRejected)?;
+            let outcome = tokio::time::timeout(remaining, self.leases.acquire(&request))
+                .await
+                .map_err(|_| BifrostError::QueryAdmissionRejected)?
+                .map_err(|error| {
+                    tracing::error!(error = %error, "Oracle durable admission failed");
+                    BifrostError::QueryExecutionFailed
+                })?;
+            if matches!(outcome, AdmissionAcquire::Acquired(_)) || attempt == 1 {
+                return Ok(outcome);
+            }
+            let jitter_ms = rand::thread_rng().gen_range(20_u64..=100);
+            let remaining = plan
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryAdmissionRejected)?;
+            tokio::time::sleep(remaining.min(Duration::from_millis(jitter_ms))).await;
+        }
+        Err(BifrostError::QueryAdmissionRejected)
+    }
+
+    /// Starts cancellation-bound renewal for one acquired durable lease.
+    fn start_lease_renewal(
+        &self,
+        lease: &OracleAdmissionLease,
+        cancellation: &CancellationToken,
+        lease_ttl: chrono::Duration,
+    ) -> LeaseRenewal {
+        let renewal_cancel = cancellation.clone();
+        let renewal_terminal = Arc::new(Mutex::new(None));
+        let terminal = Arc::clone(&renewal_terminal);
+        let leases = Arc::clone(&self.leases);
+        let query_id = lease.query_id;
+        let interval_duration = self.config.lease_renew_interval;
+        let leader = RoleFence {
+            node_id: self.local_role.key.node_id,
+            fencing_token: self.local_role.fencing_token,
+        };
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(interval_duration);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    () = renewal_cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        let expiry = chrono::Utc::now() + lease_ttl;
+                        let result = leases.renew(query_id, &leader, expiry).await;
+                        if let Some((code, outcome)) = renewal_failure(&result) {
+                            if let Ok(mut reason) = terminal.lock() {
+                                *reason = Some(code);
+                            }
+                            metrics::counter!(
+                                "bifrost_oracle_lease_renewals_total",
+                                "outcome" => outcome
+                            ).increment(1);
+                            renewal_cancel.cancel();
+                            break;
+                        }
+                        metrics::counter!(
+                            "bifrost_oracle_lease_renewals_total",
+                            "outcome" => "renewed"
+                        ).increment(1);
+                    }
+                }
+            }
+        });
+        (renewal_terminal, task)
+    }
+
     /// Creates a local admission owner.
     #[must_use]
     fn new(
@@ -2223,7 +2552,6 @@ impl OracleAdmission {
         leases: Arc<vala_sql::queries::oracle_admission::OracleAdmissionLeases>,
         local_role: RegisteredRole,
         config: OracleConfig,
-        telemetry: Arc<OracleTelemetry>,
     ) -> Self {
         Self {
             cluster,
@@ -2231,7 +2559,6 @@ impl OracleAdmission {
             leases,
             local_role,
             config,
-            telemetry,
             tenant_reconcile_queue: Arc::new(Mutex::new(TenantReconcileQueue::default())),
         }
     }
@@ -2338,89 +2665,19 @@ impl OracleAdmission {
         deadline: Instant,
         cancellation: CancellationToken,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
-        let mut waiter = self.telemetry.start_admission_waiter(query_class);
+        let mut waiter = OracleTelemetry::start_admission_waiter(query_class);
         let pending = match self.slots.try_pending() {
             Ok(pending) => pending,
             Err(error) => {
-                self.telemetry
-                    .record_admission_rejection("cluster", query_class);
+                OracleTelemetry::record_admission_rejection("cluster", query_class);
                 waiter.finish("cluster", "rejected");
                 return Err(error);
             }
         };
-        let snapshot = self.cluster.snapshot();
-        let live = snapshot.live_oracles();
-        let local_node = self.local_role.key.node_id;
-        if !live.iter().any(|role| role.key.node_id == local_node) {
-            return Err(BifrostError::OracleRoleUnavailable);
-        }
-        let usable_slots = live
-            .iter()
-            .filter_map(|role| match &role.capabilities {
-                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.usable_slots),
-                ClusterCapabilities::ScribeV1(_) => None,
-            })
-            .try_fold(0_u32, u32::checked_add)
-            .ok_or(BifrostError::QueryAdmissionRejected)?;
-        let (class_limit, demand) = admission_limits(usable_slots, query_class);
-        let tenant_limit = match query_class {
-            QueryClass::Interactive => self.config.tenant_interactive_slots,
-            QueryClass::Analytical => self.config.tenant_analytical_slots,
-        };
-        let now = chrono::Utc::now();
-        let lease_ttl = chrono::Duration::from_std(self.config.lease_ttl).map_err(|_| {
-            BifrostError::Internal {
-                detail: "Oracle lease TTL exceeds chrono bounds".to_owned(),
-            }
-        })?;
-        let lease = OracleAdmissionLease {
-            query_id: QueryId::new(uuid::Uuid::now_v7()),
-            data_tenant_id: tenant,
-            query_class,
-            slot_units: demand,
-            selected_node_ids: vec![local_node],
-            leader_node_id: local_node,
-            leader_fencing_token: self.local_role.fencing_token,
-            acquired_at: now,
-            expires_at: now + lease_ttl,
-        };
-        if deadline <= Instant::now() {
-            return Err(BifrostError::QueryTimeout);
-        }
-        let admission_deadline = deadline.min(Instant::now() + Duration::from_millis(250));
-        let acquired = {
-            let mut attempt = 0_u8;
-            loop {
-                let request = AdmissionRequest {
-                    lease: lease.clone(),
-                    cluster_limit: usable_slots,
-                    class_limit,
-                    tenant_limit,
-                };
-                let remaining = admission_deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(BifrostError::QueryAdmissionRejected)?;
-                let outcome = tokio::time::timeout(remaining, self.leases.acquire(&request))
-                    .await
-                    .map_err(|_| BifrostError::QueryAdmissionRejected)?
-                    .map_err(|error| {
-                        tracing::error!(error = %error, "Oracle durable admission failed");
-                        BifrostError::QueryExecutionFailed
-                    })?;
-                if matches!(outcome, AdmissionAcquire::Acquired(_)) || attempt == 1 {
-                    break outcome;
-                }
-                attempt += 1;
-                let jitter_ms = rand::thread_rng().gen_range(20_u64..=100);
-                let remaining = admission_deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(BifrostError::QueryAdmissionRejected)?;
-                tokio::time::sleep(remaining.min(Duration::from_millis(jitter_ms))).await;
-                if Instant::now() >= admission_deadline {
-                    return Err(BifrostError::QueryAdmissionRejected);
-                }
-            }
-        };
+        let (plan, lease_ttl) = self.plan_admission(tenant, query_class, deadline)?;
+        let demand = plan.lease.slot_units;
+        let local_node = plan.lease.leader_node_id;
+        let acquired = self.acquire_plan(&plan).await?;
         match acquired {
             AdmissionAcquire::Rejected {
                 scope,
@@ -2431,8 +2688,9 @@ impl OracleAdmission {
                     let insert = self
                         .tenant_reconcile_queue
                         .lock()
-                        .map(|mut queue| queue.enqueue(tenant, query_class))
-                        .unwrap_or(TenantReconcileInsert::Saturated);
+                        .map_or(TenantReconcileInsert::Saturated, |mut queue| {
+                            queue.enqueue(tenant, query_class)
+                        });
                     if insert == TenantReconcileInsert::Saturated {
                         metrics::counter!(
                             "bifrost_oracle_admission_reconcile_queue_total",
@@ -2442,8 +2700,7 @@ impl OracleAdmission {
                     }
                 }
                 let scope = admission_scope_label(scope);
-                self.telemetry
-                    .record_admission_rejection(scope, query_class);
+                OracleTelemetry::record_admission_rejection(scope, query_class);
                 waiter.finish(scope, "rejected");
                 Err(BifrostError::QueryAdmissionRejected)
             }
@@ -2458,15 +2715,12 @@ impl OracleAdmission {
                 );
                 let running = match self.slots.try_running(demand) {
                     Ok(running) => {
-                        self.telemetry
-                            .record_slot_reservation(query_class, "acquired");
+                        OracleTelemetry::record_slot_reservation(query_class, "acquired");
                         running
                     }
                     Err(error) => {
-                        self.telemetry
-                            .record_slot_reservation(query_class, "rejected");
-                        self.telemetry
-                            .record_admission_rejection("cluster", query_class);
+                        OracleTelemetry::record_slot_reservation(query_class, "rejected");
+                        OracleTelemetry::record_admission_rejection("cluster", query_class);
                         let leader = RoleFence {
                             node_id: local_node,
                             fencing_token: self.local_role.fencing_token,
@@ -2475,92 +2729,9 @@ impl OracleAdmission {
                         return Err(error);
                     }
                 };
-                let slot_telemetry = self.telemetry.start_slot_use(query_class, demand);
-                let renewal_cancel = cancellation.clone();
-                let renewal_terminal = Arc::new(Mutex::new(None));
-                let renewal_terminal_task = Arc::clone(&renewal_terminal);
-                let renewal_leases = Arc::clone(&self.leases);
-                let renewal_query_id = lease.query_id;
-                let renewal_interval = self.config.lease_renew_interval;
-                let renewal_ttl = lease_ttl;
-                let renewal_leader = RoleFence {
-                    node_id: local_node,
-                    fencing_token: self.local_role.fencing_token,
-                };
-                let renewal = tokio::spawn(async move {
-                    let mut interval = tokio::time::interval(renewal_interval);
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    interval.tick().await;
-                    loop {
-                        tokio::select! {
-                            () = renewal_cancel.cancelled() => break,
-                            _ = interval.tick() => {
-                                let expiry = chrono::Utc::now() + renewal_ttl;
-                                match renewal_leases
-                                    .renew(renewal_query_id, &renewal_leader, expiry)
-                                    .await
-                                {
-                                    Ok(LeaseMutation::Renewed(_)) => {
-                                        metrics::counter!(
-                                            "bifrost_oracle_lease_renewals_total",
-                                            "outcome" => "renewed"
-                                        )
-                                        .increment(1);
-                                    }
-                                    Ok(LeaseMutation::StaleLeaderFence) => {
-                                        if let Ok(mut reason) = renewal_terminal_task.lock() {
-                                            *reason = Some(QueryTerminalErrorCode::QueryPeerSecurity);
-                                        }
-                                        metrics::counter!(
-                                            "bifrost_oracle_lease_renewals_total",
-                                            "outcome" => "stale_leader_fence"
-                                        )
-                                        .increment(1);
-                                        renewal_cancel.cancel();
-                                        break;
-                                    }
-                                    Ok(LeaseMutation::Missing) => {
-                                        if let Ok(mut reason) = renewal_terminal_task.lock() {
-                                            *reason = Some(QueryTerminalErrorCode::QueryExecutionFailed);
-                                        }
-                                        metrics::counter!(
-                                            "bifrost_oracle_lease_renewals_total",
-                                            "outcome" => "missing"
-                                        )
-                                        .increment(1);
-                                        renewal_cancel.cancel();
-                                        break;
-                                    }
-                                    Err(error) => {
-                                        tracing::error!(error = %error, "Oracle admission renewal failed");
-                                        if let Ok(mut reason) = renewal_terminal_task.lock() {
-                                            *reason = Some(QueryTerminalErrorCode::QueryExecutionFailed);
-                                        }
-                                        metrics::counter!(
-                                            "bifrost_oracle_lease_renewals_total",
-                                            "outcome" => "sql_error"
-                                        )
-                                        .increment(1);
-                                        renewal_cancel.cancel();
-                                        break;
-                                    }
-                                    Ok(LeaseMutation::Released | LeaseMutation::AlreadyReleased) => {
-                                        if let Ok(mut reason) = renewal_terminal_task.lock() {
-                                            *reason = Some(QueryTerminalErrorCode::QueryExecutionFailed);
-                                        }
-                                        metrics::counter!(
-                                            "bifrost_oracle_lease_renewals_total",
-                                            "outcome" => "released"
-                                        )
-                                        .increment(1);
-                                        renewal_cancel.cancel();
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+                let slot_telemetry = OracleTelemetry::start_slot_use(query_class, demand);
+                let (renewal_terminal, renewal) =
+                    self.start_lease_renewal(&lease, &cancellation, lease_ttl);
                 Ok(AdmittedQueryGuard {
                     query_id: lease.query_id,
                     leader: RoleFence {
@@ -2576,6 +2747,29 @@ impl OracleAdmission {
                     renewal: Some(renewal),
                 })
             }
+        }
+    }
+}
+
+/// Maps a non-renewed lease result to its terminal code and closed metric label.
+fn renewal_failure(
+    result: &Result<LeaseMutation, vala_sql::SqlError>,
+) -> Option<(QueryTerminalErrorCode, &'static str)> {
+    match result {
+        Ok(LeaseMutation::Renewed(_)) => None,
+        Ok(LeaseMutation::StaleLeaderFence) => Some((
+            QueryTerminalErrorCode::QueryPeerSecurity,
+            "stale_leader_fence",
+        )),
+        Ok(LeaseMutation::Missing) => {
+            Some((QueryTerminalErrorCode::QueryExecutionFailed, "missing"))
+        }
+        Ok(LeaseMutation::Released | LeaseMutation::AlreadyReleased) => {
+            Some((QueryTerminalErrorCode::QueryExecutionFailed, "released"))
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "Oracle admission renewal failed");
+            Some((QueryTerminalErrorCode::QueryExecutionFailed, "sql_error"))
         }
     }
 }
@@ -2627,9 +2821,27 @@ impl Drop for AdmittedQueryGuard {
     }
 }
 
-/// Bounded tail-fence acquisition and release owner.
-#[derive(Debug, Default)]
-pub struct TailFenceDrainer;
+/// Owns the dependencies and invariants for one query's bounded live-tail cut.
+///
+/// The owner keeps fence discovery, parent-memory accounting, telemetry,
+/// deadline, freshness, and cancellation aligned across acquisition and drain.
+/// It does not outlive the query attempt that constructed it.
+struct TailFenceDrainer<'a> {
+    /// Directory used to resolve every discovered Scribe stream transport.
+    tails: &'a TailTransportDirectory,
+    /// Parent-governed memory resources charged for decoded live batches.
+    memory: &'a OracleMemoryResources,
+    /// Query telemetry retaining live-tail memory accounting.
+    telemetry: Arc<OracleTelemetry>,
+    /// Immutable admission class applied to live-tail memory metrics.
+    query_class: QueryClass,
+    /// Absolute deadline shared by fence acquisition and every page read.
+    deadline: Instant,
+    /// Admission lifecycle cancellation shared with renewal and streaming.
+    cancellation: CancellationToken,
+    /// Caller-selected strict or degraded live-source failure policy.
+    freshness: wyrd_spec::vala::api::FreshnessPolicy,
+}
 
 /// One metadata-only acquired fence retained until its post-audit drain.
 struct AcquiredTailFence {
@@ -2641,6 +2853,18 @@ struct AcquiredTailFence {
     fence: wyrd_spec::vala::api::TailReadFence,
     /// Successful acquisition time used by the hold-duration histogram.
     acquired_at: Instant,
+    /// Whether every requested page completed before automatic release.
+    drain_succeeded: bool,
+}
+
+/// One planned metadata-only fence acquisition for a discovered Scribe stream.
+struct TailFenceAcquisition {
+    /// Canonical table that will receive the retained live interval.
+    table: String,
+    /// Transport selected for the exact Scribe stream identity.
+    transport: Arc<dyn TailReadTransport>,
+    /// Validated private request pinning cursor, schema, and deadline metadata.
+    request: wyrd_spec::vala::api::AcquireTailFenceRequest,
 }
 
 /// Bounded live rows and their parent-governor reservations.
@@ -2664,63 +2888,29 @@ struct DrainedTailFence {
     reservations: Vec<AccountedMemoryReservation>,
 }
 
-/// Acquires one metadata-only Scribe fence from an owned transport request.
-///
-/// Keeping the transport owned by this future makes the Oracle query future
-/// transport-safe without exposing a trait-object borrow through Gate's
-/// HTTP/gRPC handler futures.
-///
-/// # Errors
-///
-/// Returns visibility unavailable when Scribe rejects the interval and query
-/// timeout when the shared query deadline expires.
-async fn acquire_tail_fence(
-    table: String,
-    transport: Arc<dyn TailReadTransport>,
-    request: wyrd_spec::vala::api::AcquireTailFenceRequest,
-    deadline: Instant,
-) -> Result<AcquiredTailFence, BifrostError> {
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .ok_or(BifrostError::QueryTimeout)?;
-    match tokio::time::timeout(remaining, transport.acquire_fence(request)).await {
-        Ok(Ok(fence)) => {
-            metrics::counter!(
-                "bifrost_oracle_tail_fences_total",
-                "locality" => "local",
-                "outcome" => "success"
-            )
-            .increment(1);
-            Ok(AcquiredTailFence {
-                table,
-                transport,
-                fence,
-                acquired_at: Instant::now(),
-            })
-        }
-        Ok(Err(error)) => {
-            metrics::counter!(
-                "bifrost_oracle_tail_fences_total",
-                "locality" => "local",
-                "outcome" => "failed"
-            )
-            .increment(1);
-            tracing::warn!(error = %error, "Oracle live-tail fence acquisition failed");
-            Err(BifrostError::QueryVisibilityUnavailable)
-        }
-        Err(_) => {
-            metrics::counter!(
-                "bifrost_oracle_tail_fences_total",
-                "locality" => "local",
-                "outcome" => "failed"
-            )
-            .increment(1);
-            Err(BifrostError::QueryTimeout)
+impl TailFenceDrainer<'_> {
+    /// Creates one query-attempt owner for live-tail acquisition and draining.
+    #[must_use]
+    fn new<'a>(
+        tails: &'a TailTransportDirectory,
+        memory: &'a OracleMemoryResources,
+        telemetry: Arc<OracleTelemetry>,
+        query_class: QueryClass,
+        deadline: Instant,
+        cancellation: CancellationToken,
+        freshness: wyrd_spec::vala::api::FreshnessPolicy,
+    ) -> TailFenceDrainer<'a> {
+        TailFenceDrainer {
+            tails,
+            memory,
+            telemetry,
+            query_class,
+            deadline,
+            cancellation,
+            freshness,
         }
     }
-}
 
-impl TailFenceDrainer {
     /// Acquires the exact last-sealed-to-live interval for each observed stream.
     ///
     /// Acquisition reads metadata only. Any partial failure releases every
@@ -2729,27 +2919,138 @@ impl TailFenceDrainer {
     /// # Errors
     ///
     /// Returns visibility unavailable for missing transports, invalid
-    /// cursor/schema metadata, expired deadlines, or Scribe rejection.
+    /// cursor/schema metadata, admission cancellation, expired deadlines, or
+    /// Scribe rejection.
+    ///
+    /// # Cancellation
+    ///
+    /// Admission cancellation stops outstanding acquisition work and returns
+    /// query execution failure after releasing every completed fence.
     #[tracing::instrument(
         name = "bifrost.oracle.tail_fence",
         skip_all,
         fields(table_count = cuts.len())
     )]
     async fn acquire(
+        &self,
         cuts: &[PinnedSealedTable],
-        tails: &TailTransportDirectory,
-        deadline: Instant,
     ) -> Result<Vec<AcquiredTailFence>, BifrostError> {
-        let remaining = deadline
+        let remaining = self
+            .deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
         let wire_deadline = chrono::Utc::now()
             + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?;
-        let mut work: Vec<(
-            String,
-            Arc<dyn TailReadTransport + 'static>,
-            wyrd_spec::vala::api::AcquireTailFenceRequest,
-        )> = Vec::new();
+        let work = self.plan_acquisitions(cuts, wire_deadline)?;
+        let mut results = Vec::with_capacity(work.len());
+        let mut pending = FuturesUnordered::new();
+        for acquisition in work {
+            pending.push(self.acquire_fence(acquisition));
+            if pending.len() == 8 {
+                while let Some(result) = pending.next().await {
+                    results.push(result);
+                }
+            }
+        }
+        while let Some(result) = pending.next().await {
+            results.push(result);
+        }
+        let mut acquired = Vec::new();
+        let mut failure = None;
+        for result in results {
+            match result {
+                Ok(fence) => acquired.push(fence),
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = failure {
+            drop(acquired);
+            Err(error)
+        } else {
+            Ok(acquired)
+        }
+    }
+
+    /// Drains every acquired interval under page and parent-memory bounds.
+    ///
+    /// Every fence is released before this method returns, including all error
+    /// paths. Strict mode fails on the first unavailable source; degraded mode
+    /// records the unavailable live tier and retains complete drained sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility unavailable for strict drain failure, malformed
+    /// cursor progress, deadline expiry, admission cancellation, or
+    /// parent-memory exhaustion.
+    ///
+    /// # Cancellation
+    ///
+    /// Admission cancellation stops outstanding page reads. Each active drain
+    /// releases its fence through the drop guard before returning failure.
+    #[tracing::instrument(
+        name = "bifrost.oracle.tail",
+        skip_all,
+        fields(fence_count = fences.len(), freshness = ?self.freshness)
+    )]
+    async fn drain(&self, fences: Vec<AcquiredTailFence>) -> Result<DrainedTails, BifrostError> {
+        let mut drained = DrainedTails::default();
+        let results = futures_util::stream::iter(fences)
+            .map(|acquired| self.drain_fence(acquired))
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        let mut failed_tables = HashSet::new();
+        let mut strict_failure = None;
+        for result in results {
+            match result {
+                Ok(interval) => {
+                    drained
+                        .batches
+                        .entry(interval.table)
+                        .or_default()
+                        .extend(interval.batches);
+                    drained.reservations.extend(interval.reservations);
+                }
+                Err((table, error)) => {
+                    failed_tables.insert(table);
+                    if strict_failure.is_none() {
+                        strict_failure = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = strict_failure {
+            if error == BifrostError::QueryTimeout
+                || self.freshness == wyrd_spec::vala::api::FreshnessPolicy::Strict
+            {
+                return Err(error);
+            }
+            drained.degraded = true;
+            for table in failed_tables {
+                drained.batches.remove(&table);
+            }
+        }
+        Ok(drained)
+    }
+
+    /// Plans one exact fence request for every sealed or independently live stream.
+    ///
+    /// The synchronous stage merges duplicate hot-file cursors, adds streams
+    /// discovered without sealed files, and validates all private request
+    /// metadata before any transport IO begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns visibility unavailable when stream routing, cursor conversion,
+    /// event-day parsing, or schema request construction fails.
+    fn plan_acquisitions(
+        &self,
+        cuts: &[PinnedSealedTable],
+        wire_deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<TailFenceAcquisition>, BifrostError> {
+        let mut work = Vec::new();
         for cut in cuts {
             let table = cut.binding.table_ref.fqn();
             let mut streams = std::collections::BTreeMap::<
@@ -2770,7 +3071,8 @@ impl TailFenceDrainer {
                 let wal_lsn = u64::try_from(file.wal_lsn_max)
                     .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
                 let Some(transport) =
-                    tails.get_for_stream(&table, file.node_id, cut.binding.tenant)
+                    self.tails
+                        .get_for_stream(&table, file.node_id, cut.binding.tenant)
                 else {
                     return Err(BifrostError::QueryVisibilityUnavailable);
                 };
@@ -2790,7 +3092,7 @@ impl TailFenceDrainer {
                     })
                     .or_insert((event_day, cursor, transport));
             }
-            for route in tails.live_streams(&table, cut.binding.tenant) {
+            for route in self.tails.live_streams(&table, cut.binding.tenant) {
                 let key = (
                     route.node_id,
                     route.event_day.as_str().to_owned(),
@@ -2814,242 +3116,188 @@ impl TailFenceDrainer {
             }
             for (_, (event_day, exclusive_sealed, transport)) in streams {
                 let request = tail_fence_request(cut, event_day, exclusive_sealed, wire_deadline)?;
-                work.push((table.clone(), transport, request));
+                work.push(TailFenceAcquisition {
+                    table: table.clone(),
+                    transport,
+                    request,
+                });
             }
         }
-        let mut results = Vec::with_capacity(work.len());
-        let mut pending = FuturesUnordered::new();
-        for (table, transport, request) in work {
-            pending.push(acquire_tail_fence(table, transport, request, deadline));
-            if pending.len() == 8 {
-                while let Some(result) = pending.next().await {
-                    results.push(result);
-                }
-            }
-        }
-        while let Some(result) = pending.next().await {
-            results.push(result);
-        }
-        let mut acquired = Vec::new();
-        let mut failure = None;
-        for result in results {
-            match result {
-                Ok(fence) => acquired.push(fence),
-                Err(error) => {
-                    failure.get_or_insert(error);
-                }
-            }
-        }
-        if let Some(error) = failure {
-            release_tail_fences(&acquired);
-            return Err(error);
-        }
-        Ok(acquired)
+        Ok(work)
     }
 
-    /// Drains every acquired interval under page and parent-memory bounds.
+    /// Acquires one metadata-only Scribe fence from an owned transport request.
     ///
-    /// Every fence is released before this method returns, including all error
-    /// paths. Strict mode fails on the first unavailable source; degraded mode
-    /// records the unavailable live tier and retains complete drained sources.
+    /// Keeping the transport owned by this future makes the Oracle query future
+    /// transport-safe without exposing a trait-object borrow through Gate's
+    /// HTTP/gRPC handler futures.
     ///
     /// # Errors
     ///
-    /// Returns visibility unavailable for strict drain failure, malformed
-    /// cursor progress, deadline expiry, or parent-memory exhaustion.
-    #[tracing::instrument(
-        name = "bifrost.oracle.tail",
-        skip_all,
-        fields(fence_count = fences.len(), freshness = ?freshness)
-    )]
-    async fn drain(
-        fences: Vec<AcquiredTailFence>,
-        memory: &OracleMemoryResources,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-        deadline: Instant,
-        freshness: wyrd_spec::vala::api::FreshnessPolicy,
-    ) -> Result<DrainedTails, BifrostError> {
-        let mut drained = DrainedTails::default();
-        let results =
-            futures_util::stream::iter(fences)
-                .map(|acquired| {
-                    let memory = memory.clone();
-                    let telemetry = Arc::clone(&telemetry);
-                    async move {
-                        drain_tail_fence(acquired, memory, telemetry, query_class, deadline).await
-                    }
-                })
-                .buffer_unordered(8)
-                .collect::<Vec<_>>()
-                .await;
-        let mut failed_tables = HashSet::new();
-        let mut strict_failure = None;
-        for result in results {
-            match result {
-                Ok(interval) => {
-                    drained
-                        .batches
-                        .entry(interval.table)
-                        .or_default()
-                        .extend(interval.batches);
-                    drained.reservations.extend(interval.reservations);
-                }
-                Err((table, error)) => {
-                    failed_tables.insert(table);
-                    if strict_failure.is_none() {
-                        strict_failure = Some(error);
-                    }
-                }
-            }
-        }
-        if let Some(error) = strict_failure {
-            if error == BifrostError::QueryTimeout
-                || freshness == wyrd_spec::vala::api::FreshnessPolicy::Strict
-            {
-                return Err(error);
-            }
-            drained.degraded = true;
-            for table in failed_tables {
-                drained.batches.remove(&table);
-            }
-        }
-        Ok(drained)
-    }
-}
-
-/// Drains one retained fence and releases it on every completion path.
-///
-/// # Errors
-///
-/// Returns the canonical table plus timeout or visibility failure when a page,
-/// cursor, or parent-memory bound cannot be satisfied.
-async fn drain_tail_fence(
-    acquired: AcquiredTailFence,
-    memory: OracleMemoryResources,
-    telemetry: Arc<OracleTelemetry>,
-    query_class: QueryClass,
-    deadline: Instant,
-) -> Result<DrainedTailFence, (String, BifrostError)> {
-    let table = acquired.table.clone();
-    let mut release = TailFenceRelease {
-        transport: Arc::clone(&acquired.transport),
-        fence_id: acquired.fence.fence_id,
-        acquired_at: acquired.acquired_at,
-        drain_succeeded: false,
-    };
-    let mut after = None;
-    let mut batches = Vec::new();
-    let mut reservations = Vec::new();
-    loop {
-        let remaining = deadline
+    /// Returns visibility unavailable when Scribe rejects the interval, query
+    /// timeout when the shared deadline expires, or execution failure when the
+    /// admitted query is cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Admission cancellation wins without waiting for the transport timeout.
+    async fn acquire_fence(
+        &self,
+        acquisition: TailFenceAcquisition,
+    ) -> Result<AcquiredTailFence, BifrostError> {
+        let TailFenceAcquisition {
+            table,
+            transport,
+            request,
+        } = acquisition;
+        let remaining = self
+            .deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| (table.clone(), BifrostError::QueryTimeout))?;
-        let page_started = Instant::now();
-        let page_result = tokio::time::timeout(
-            remaining,
-            acquired
-                .transport
-                .read_page(wyrd_spec::vala::api::TailPageRequest {
-                    fence_id: acquired.fence.fence_id,
-                    after: after.clone(),
-                    max_rows: 4_096,
-                    max_encoded_bytes: 16 * 1024 * 1024,
-                }),
-        )
-        .await;
-        let page = match page_result {
-            Ok(Ok(page)) => {
+            .ok_or(BifrostError::QueryTimeout)?;
+        let acquisition = tokio::select! {
+            () = self.cancellation.cancelled() => {
+                return Err(BifrostError::QueryExecutionFailed);
+            }
+            result = tokio::time::timeout(remaining, transport.acquire_fence(request)) => result,
+        };
+        match acquisition {
+            Ok(Ok(fence)) => {
                 metrics::counter!(
-                    "bifrost_oracle_tail_pages_total",
+                    "bifrost_oracle_tail_fences_total",
                     "locality" => "local",
                     "outcome" => "success"
                 )
                 .increment(1);
-                metrics::histogram!(
-                    "bifrost_oracle_tail_page_seconds",
-                    "locality" => "local",
-                    "outcome" => "success"
-                )
-                .record(page_started.elapsed().as_secs_f64());
-                page
+                Ok(AcquiredTailFence {
+                    table,
+                    transport,
+                    fence,
+                    acquired_at: Instant::now(),
+                    drain_succeeded: false,
+                })
             }
             Ok(Err(error)) => {
                 metrics::counter!(
-                    "bifrost_oracle_tail_pages_total",
+                    "bifrost_oracle_tail_fences_total",
                     "locality" => "local",
                     "outcome" => "failed"
                 )
                 .increment(1);
-                metrics::histogram!(
-                    "bifrost_oracle_tail_page_seconds",
-                    "locality" => "local",
-                    "outcome" => "failed"
-                )
-                .record(page_started.elapsed().as_secs_f64());
-                tracing::warn!(error = %error, "Oracle live-tail drain failed");
-                return Err((table, BifrostError::QueryVisibilityUnavailable));
+                tracing::warn!(error = %error, "Oracle live-tail fence acquisition failed");
+                Err(BifrostError::QueryVisibilityUnavailable)
             }
             Err(_) => {
                 metrics::counter!(
-                    "bifrost_oracle_tail_pages_total",
+                    "bifrost_oracle_tail_fences_total",
                     "locality" => "local",
                     "outcome" => "failed"
                 )
                 .increment(1);
-                metrics::histogram!(
-                    "bifrost_oracle_tail_page_seconds",
-                    "locality" => "local",
-                    "outcome" => "failed"
-                )
-                .record(page_started.elapsed().as_secs_f64());
-                return Err((table, BifrostError::QueryTimeout));
+                Err(BifrostError::QueryTimeout)
             }
-        };
-        for batch in page.batches {
-            let reservation = memory
-                .governor
-                .try_reserve_parent(batch.get_array_memory_size())
-                .map_err(|_| (table.clone(), BifrostError::QueryVisibilityUnavailable))?;
-            reservations.push(telemetry.account_memory(
-                reservation,
-                query_class,
-                OracleMemoryKind::Tail,
-            ));
-            batches.push(batch.as_ref().clone());
-        }
-        after = page.next;
-        if page.complete {
-            break;
-        }
-        if after.is_none() {
-            return Err((table, BifrostError::QueryVisibilityUnavailable));
         }
     }
-    release.drain_succeeded = true;
-    Ok(DrainedTailFence {
-        table,
-        batches,
-        reservations,
-    })
+
+    /// Drains one retained fence and releases it on every completion path.
+    ///
+    /// # Errors
+    ///
+    /// Returns the canonical table plus timeout, cancellation, or visibility
+    /// failure when a page, cursor, or parent-memory bound cannot be satisfied.
+    ///
+    /// # Cancellation
+    ///
+    /// Admission cancellation interrupts the active page read. The release
+    /// guard then releases the retained Scribe interval before returning.
+    async fn drain_fence(
+        &self,
+        mut acquired: AcquiredTailFence,
+    ) -> Result<DrainedTailFence, (String, BifrostError)> {
+        let table = acquired.table.clone();
+        let mut after = None;
+        let mut batches = Vec::new();
+        let mut reservations = Vec::new();
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| (table.clone(), BifrostError::QueryTimeout))?;
+            let page_started = Instant::now();
+            let page_result = tokio::select! {
+                () = self.cancellation.cancelled() => {
+                    return Err((table, BifrostError::QueryExecutionFailed));
+                }
+                result = tokio::time::timeout(
+                    remaining,
+                    acquired.transport.read_page(wyrd_spec::vala::api::TailPageRequest {
+                        fence_id: acquired.fence.fence_id,
+                        after: after.clone(),
+                        max_rows: 4_096,
+                        max_encoded_bytes: 16 * 1024 * 1024,
+                    }),
+                ) => result,
+            };
+            let page_outcome = if matches!(&page_result, Ok(Ok(_))) {
+                "success"
+            } else {
+                "failed"
+            };
+            metrics::counter!(
+                "bifrost_oracle_tail_pages_total",
+                "locality" => "local",
+                "outcome" => page_outcome
+            )
+            .increment(1);
+            metrics::histogram!(
+                "bifrost_oracle_tail_page_seconds",
+                "locality" => "local",
+                "outcome" => page_outcome
+            )
+            .record(page_started.elapsed().as_secs_f64());
+            let page = match page_result {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "Oracle live-tail drain failed");
+                    return Err((table, BifrostError::QueryVisibilityUnavailable));
+                }
+                Err(_) => {
+                    return Err((table, BifrostError::QueryTimeout));
+                }
+            };
+            for batch in page.batches {
+                let reservation = self
+                    .memory
+                    .governor
+                    .try_reserve_parent(batch.get_array_memory_size())
+                    .map_err(|_| (table.clone(), BifrostError::QueryVisibilityUnavailable))?;
+                reservations.push(self.telemetry.account_memory(
+                    reservation,
+                    self.query_class,
+                    OracleMemoryKind::Tail,
+                ));
+                batches.push(batch.as_ref().clone());
+            }
+            after = page.next;
+            if page.complete {
+                break;
+            }
+            if after.is_none() {
+                return Err((table, BifrostError::QueryVisibilityUnavailable));
+            }
+        }
+        acquired.drain_succeeded = true;
+        Ok(DrainedTailFence {
+            table,
+            batches,
+            reservations,
+        })
+    }
 }
 
-/// Drop guard guaranteeing idempotent release of one retained Scribe fence.
-struct TailFenceRelease {
-    /// Transport owning the retained interval.
-    transport: Arc<dyn TailReadTransport>,
-    /// Opaque interval identity released on drop.
-    fence_id: wyrd_spec::vala::api::TailFenceId,
-    /// Successful acquisition time used by the hold-duration histogram.
-    acquired_at: Instant,
-    /// Whether every requested page completed before release.
-    drain_succeeded: bool,
-}
-
-impl Drop for TailFenceRelease {
-    /// Releases the interval and reports cleanup failure without leaking data.
+impl Drop for AcquiredTailFence {
+    /// Releases the retained interval on success, failure, or query cancellation.
     fn drop(&mut self) {
-        let released = self.transport.release_fence(self.fence_id);
+        let released = self.transport.release_fence(self.fence.fence_id);
         let outcome = if self.drain_succeeded && released.is_ok() {
             "success"
         } else {
@@ -3102,22 +3350,6 @@ fn tail_fence_request(
         schema_fingerprint: fingerprint,
         tail_protocol_version: TAIL_PROTOCOL_VERSION,
     })
-}
-
-/// Releases all retained tail intervals idempotently.
-fn release_tail_fences(fences: &[AcquiredTailFence]) {
-    for acquired in fences {
-        let released = acquired.transport.release_fence(acquired.fence.fence_id);
-        metrics::histogram!(
-            "bifrost_oracle_tail_fence_hold_seconds",
-            "locality" => "local",
-            "outcome" => "failed"
-        )
-        .record(acquired.acquired_at.elapsed().as_secs_f64());
-        if let Err(error) = released {
-            tracing::error!(error = %error, "Oracle tail fence cleanup failed");
-        }
-    }
 }
 
 /// Source tier used to resolve duplicate immutable row identities.
@@ -3506,8 +3738,8 @@ fn admission_limits(usable_slots: u32, class: QueryClass) -> (u32, u32) {
     }
 }
 
-/// Maps a pre-stream DataFusion failure into the stable public catalog.
-fn map_datafusion_error(error: datafusion::error::DataFusionError) -> BifrostError {
+/// Maps a pre-stream `DataFusion` failure into the stable public catalog.
+fn map_datafusion_error(error: &datafusion::error::DataFusionError) -> BifrostError {
     tracing::error!(error = %error, "Oracle DataFusion operation failed");
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
@@ -3559,23 +3791,57 @@ fn is_stale_file_error(error: &datafusion::error::DataFusionError) -> bool {
         && (message.contains("parquet") || message.contains("object"))
 }
 
+/// Records consumption of the sole pre-byte stale-cut replan.
+fn record_stale_replan() {
+    metrics::counter!(
+        "bifrost_oracle_stale_replans_total",
+        "outcome" => "retried"
+    )
+    .increment(1);
+}
+
+/// Complete owned inputs for one terminal-aware query stream.
+struct QueryStreamInput {
+    /// Public output schema.
+    schema: SchemaRef,
+    /// Lazy physical batch stream.
+    batches: SendableRecordBatchStream,
+    /// Pre-byte lookahead result.
+    first: Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
+    /// Stream-owned durable and local admission capacity.
+    admitted: AdmittedQueryGuard,
+    /// Absolute execution deadline.
+    deadline: Instant,
+    /// Requested visibility contract.
+    visibility: VisibilityMode,
+    /// Immutable admission class.
+    query_class: QueryClass,
+    /// Whether live visibility degraded.
+    degraded: bool,
+    /// Whether the one stale-cut replan was consumed.
+    stale_replanned: bool,
+    /// Production query telemetry retained through terminal emission.
+    query_telemetry: QueryTelemetryGuard,
+}
+
 /// Builds a terminal-aware stream around one already audited physical stream.
 ///
 /// # Errors
 ///
 /// Returns query execution failure when the output schema cannot be encoded.
-fn build_query_stream(
-    schema: SchemaRef,
-    batches: SendableRecordBatchStream,
-    first: Option<Result<RecordBatch, datafusion::error::DataFusionError>>,
-    admitted: AdmittedQueryGuard,
-    deadline: Instant,
-    visibility: VisibilityMode,
-    query_class: QueryClass,
-    degraded: bool,
-    stale_replanned: bool,
-    mut query_telemetry: QueryTelemetryGuard,
-) -> Result<OracleQueryStream, BifrostError> {
+fn build_query_stream(input: QueryStreamInput) -> Result<OracleQueryStream, BifrostError> {
+    let QueryStreamInput {
+        schema,
+        batches,
+        first,
+        admitted,
+        deadline,
+        visibility,
+        query_class,
+        degraded,
+        stale_replanned,
+        mut query_telemetry,
+    } = input;
     let schema_frame = encode_schema_frame(&schema)?;
     let schema_fingerprint = schema_frame.schema_fingerprint.clone();
     let lease_cancellation = admitted.cancellation.clone();
@@ -3593,31 +3859,19 @@ fn build_query_stream(
         let mut row_count = 0_u64;
         yield Ok(QueryStreamFrame::Schema(schema_frame));
         loop {
-            if lease_cancellation.is_cancelled() {
-                let code = renewal_terminal
-                    .lock()
-                    .ok()
-                    .and_then(|reason| *reason)
-                    .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed);
-                query_telemetry.finish("failed", "complete");
-                yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                    code,
-                    row_count,
-                    visibility,
-                )));
-                return;
-            }
-            if Instant::now() >= deadline {
-                query_telemetry.finish("failed", "complete");
-                yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                    QueryTerminalErrorCode::QueryTimeout,
-                    row_count,
-                    visibility,
-                )));
-                return;
-            }
-            match next.take().or_else(|| None) {
-                Some(Ok(batch)) => {
+            let event = if let Some(value) = next.take() {
+                QueryStreamEvent::Batch(Some(value))
+            } else {
+                next_query_stream_event(
+                    &mut batches,
+                    &lease_cancellation,
+                    &renewal_terminal,
+                    deadline,
+                )
+                .await
+            };
+            match event {
+                QueryStreamEvent::Batch(Some(Ok(batch))) => {
                     query_telemetry.first_batch();
                     row_count = row_count.saturating_add(batch.num_rows() as u64);
                     match encode_batch_frame(&batch) {
@@ -3633,7 +3887,7 @@ fn build_query_stream(
                         }
                     }
                 }
-                Some(Err(error)) => {
+                QueryStreamEvent::Batch(Some(Err(error))) => {
                     let code = terminal_error_code(&error);
                     tracing::error!(
                         error = %error,
@@ -3648,90 +3902,17 @@ fn build_query_stream(
                     )));
                     return;
                 }
-                None => {
-                    let remaining = deadline
-                        .checked_duration_since(Instant::now())
-                        .unwrap_or(Duration::ZERO);
-                    tokio::select! {
-                        () = lease_cancellation.cancelled() => {
-                            let code = renewal_terminal
-                                .lock()
-                                .ok()
-                                .and_then(|reason| *reason)
-                                .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed);
-                            query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                                code,
-                                row_count,
-                                visibility,
-                            )));
-                            return;
-                        }
-                        () = tokio::time::sleep(remaining) => {
-                            query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                                QueryTerminalErrorCode::QueryTimeout,
-                                row_count,
-                                visibility,
-                            )));
-                            return;
-                        }
-                        value = batches.next() => match value {
-                            Some(value) => {
-                                next = Some(value);
-                                continue;
-                            }
-                            None => break,
-                        }
-                    }
+                QueryStreamEvent::Batch(None) => break,
+                QueryStreamEvent::Failed(code) => {
+                    query_telemetry.finish("failed", "complete");
+                    yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
+                        code, row_count, visibility,
+                    )));
+                    return;
                 }
             }
         }
-        let freshness = if degraded {
-            QueryFreshness::Degraded
-        } else {
-            QueryFreshness::Complete
-        };
-        let outcome = if degraded {
-            QueryTerminalOutcome::Degraded
-        } else {
-            QueryTerminalOutcome::Success
-        };
-        let mut warnings = Vec::new();
-        if degraded {
-            warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
-        }
-        if stale_replanned {
-            warnings.push(wyrd_spec::vala::api::QueryWarning::StaleCutReplanned);
-        }
-        let mut source_completion = vec![
-            SourceCompletion {
-                source: QuerySource::Iceberg,
-                outcome: SourceCompletionOutcome::Complete,
-            },
-            SourceCompletion {
-                source: QuerySource::HotSealed,
-                outcome: SourceCompletionOutcome::Complete,
-            },
-        ];
-        if visibility == VisibilityMode::Fused {
-            source_completion.push(SourceCompletion {
-                source: QuerySource::LiveTail,
-                outcome: if degraded {
-                    SourceCompletionOutcome::Unavailable
-                } else {
-                    SourceCompletionOutcome::Complete
-                },
-            });
-        }
-        let terminal = QueryTerminalFrame {
-            outcome,
-            freshness,
-            row_count,
-            warnings,
-            source_completion,
-            error: None,
-        };
+        let terminal = successful_terminal(visibility, degraded, stale_replanned, row_count);
         debug_assert!(terminal.validate(visibility).is_ok());
         query_telemetry.finish(
             if degraded { "degraded" } else { "success" },
@@ -3743,6 +3924,103 @@ fn build_query_stream(
         schema_fingerprint,
         frames: Box::pin(frames),
     })
+}
+
+/// One cancellation-, timeout-, or batch-aware stream step.
+enum QueryStreamEvent {
+    /// Next physical batch result, or `None` when execution completed.
+    Batch(Option<Result<RecordBatch, datafusion::error::DataFusionError>>),
+    /// Stable terminal failure selected before another batch is exposed.
+    Failed(QueryTerminalErrorCode),
+}
+
+/// Waits for the next physical batch while enforcing lease cancellation and deadline.
+async fn next_query_stream_event(
+    batches: &mut SendableRecordBatchStream,
+    cancellation: &CancellationToken,
+    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
+    deadline: Instant,
+) -> QueryStreamEvent {
+    if cancellation.is_cancelled() {
+        return QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal));
+    }
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout);
+    };
+    tokio::select! {
+        () = cancellation.cancelled() => {
+            QueryStreamEvent::Failed(renewal_terminal_code(renewal_terminal))
+        }
+        () = tokio::time::sleep(remaining) => {
+            QueryStreamEvent::Failed(QueryTerminalErrorCode::QueryTimeout)
+        }
+        value = batches.next() => QueryStreamEvent::Batch(value),
+    }
+}
+
+/// Reads the renewal-selected terminal code without exposing lock poisoning.
+fn renewal_terminal_code(
+    renewal_terminal: &Mutex<Option<QueryTerminalErrorCode>>,
+) -> QueryTerminalErrorCode {
+    renewal_terminal
+        .lock()
+        .ok()
+        .and_then(|reason| *reason)
+        .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed)
+}
+
+/// Constructs the validated success/degraded terminal for one completed stream.
+fn successful_terminal(
+    visibility: VisibilityMode,
+    degraded: bool,
+    stale_replanned: bool,
+    row_count: u64,
+) -> QueryTerminalFrame {
+    let freshness = if degraded {
+        QueryFreshness::Degraded
+    } else {
+        QueryFreshness::Complete
+    };
+    let outcome = if degraded {
+        QueryTerminalOutcome::Degraded
+    } else {
+        QueryTerminalOutcome::Success
+    };
+    let mut warnings = Vec::new();
+    if degraded {
+        warnings.push(wyrd_spec::vala::api::QueryWarning::LiveTailUnavailable);
+    }
+    if stale_replanned {
+        warnings.push(wyrd_spec::vala::api::QueryWarning::StaleCutReplanned);
+    }
+    let mut source_completion = vec![
+        SourceCompletion {
+            source: QuerySource::Iceberg,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+        SourceCompletion {
+            source: QuerySource::HotSealed,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+    ];
+    if visibility == VisibilityMode::Fused {
+        source_completion.push(SourceCompletion {
+            source: QuerySource::LiveTail,
+            outcome: if degraded {
+                SourceCompletionOutcome::Unavailable
+            } else {
+                SourceCompletionOutcome::Complete
+            },
+        });
+    }
+    QueryTerminalFrame {
+        outcome,
+        freshness,
+        row_count,
+        warnings,
+        source_completion,
+        error: None,
+    }
 }
 
 /// Encodes one Arrow schema frame and its stable fingerprint.
@@ -3781,7 +4059,7 @@ fn encode_batch_frame(batch: &RecordBatch) -> Result<QueryBatchFrame, BifrostErr
     })
 }
 
-/// Maps a late DataFusion failure to the closed terminal-code catalog.
+/// Maps a late `DataFusion` failure to the closed terminal-code catalog.
 fn terminal_error_code(error: &datafusion::error::DataFusionError) -> QueryTerminalErrorCode {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("tenant invariant") {
@@ -3809,7 +4087,7 @@ mod tests {
             let request = BifrostQueryRequest {
                 sql: sql.to_owned(),
                 visibility: VisibilityMode::PublishedOnly,
-                freshness: Default::default(),
+                freshness: wyrd_spec::vala::api::FreshnessPolicy::default(),
                 deadline_ms: None,
             };
             assert!(planner.validate_query(&request).is_err());

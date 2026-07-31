@@ -307,16 +307,12 @@ mod pg_tests {
             )]))
         }
 
-        /// Writes four generations through Scribe's WAL, memtable, seal, and Parquet path.
-        ///
-        /// Returns the exact logical value and batch-local ordinal pairs expected
-        /// after Forge rewrites the sealed files.
+        /// Builds the real bounded Scribe used to seal incremental generations.
         ///
         /// # Panics
         ///
-        /// Panics when Scribe construction, admission, persistence, or fixture
-        /// SQL cannot establish the sealed input state.
-        async fn seal_row_identity_generations(&self) -> Vec<(i64, i32)> {
+        /// Panics when WAL, lane, or Scribe construction fails.
+        fn generation_scribe(&self) -> (tempfile::TempDir, Arc<ScribeImpl>) {
             let wal_root = tempfile::tempdir().expect("WAL root");
             let node_id = uuid::Uuid::now_v7();
             let wal = Arc::new(
@@ -329,18 +325,15 @@ mod pg_tests {
                 .expect("WAL writer"),
             );
             let memory = BifrostMemoryGovernor::new(512 * 1024 * 1024).expect("memory governor");
-            let lane_config = ScribeLaneConfig {
+            let lanes = ScribeLaneConfig {
                 ingress_cpu_threads: 1,
                 persistence_cpu_threads: 1,
                 wal_io_threads: 1,
             };
             let pools = ScribeExecutionPools::new(
-                ScribeIngressCpuPool::new_with_capacity(lane_config.ingress_cpu_threads, 16),
-                ScribePersistenceCpuPool::new_with_capacity(
-                    lane_config.persistence_cpu_threads,
-                    16,
-                ),
-                ScribeWalIoPool::new_with_capacity(lane_config.wal_io_threads, 16),
+                ScribeIngressCpuPool::new_with_capacity(lanes.ingress_cpu_threads, 16),
+                ScribePersistenceCpuPool::new_with_capacity(lanes.persistence_cpu_threads, 16),
+                ScribeWalIoPool::new_with_capacity(lanes.wal_io_threads, 16),
             );
             let (publisher, _inbox) = staging_file_channel(16).expect("Scribe hint channel");
             let scribe = Arc::new(ScribeImpl::new_with_execution_pools(ScribeBuildConfig {
@@ -358,6 +351,20 @@ mod pg_tests {
                 memory_budget: Some(memory.scribe_budget()),
                 staging_file_publisher: Some(publisher),
             }));
+            (wal_root, scribe)
+        }
+
+        /// Writes four generations through Scribe's WAL, memtable, seal, and Parquet path.
+        ///
+        /// Returns the exact logical value and batch-local ordinal pairs expected
+        /// after Forge rewrites the sealed files.
+        ///
+        /// # Panics
+        ///
+        /// Panics when Scribe construction, admission, persistence, or fixture
+        /// SQL cannot establish the sealed input state.
+        async fn seal_row_identity_generations(&self) -> Vec<(i64, i32)> {
+            let (_wal_root, scribe) = self.generation_scribe();
             scribe.replay_wal_async().await.expect("empty replay");
             let principal = Principal::new(
                 PrincipalId::new(uuid::Uuid::now_v7()),
@@ -375,12 +382,12 @@ mod pg_tests {
                     .map(|row| generation * 10 + row)
                     .collect::<Vec<_>>();
                 let row_count = values.len();
-                expected.extend(
-                    values
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, value)| (*value, ordinal as i32)),
-                );
+                expected.extend(values.iter().enumerate().map(|(ordinal, value)| {
+                    (
+                        *value,
+                        i32::try_from(ordinal).expect("test ordinal fits i32"),
+                    )
+                }));
                 let schema = Arc::new(Schema::new(vec![
                     Field::new(
                         WYRD_EVENT_TIME,
@@ -585,7 +592,9 @@ mod pg_tests {
                             .with_timezone("UTC"),
                         ),
                         Arc::new(batch_ids.finish()),
-                        Arc::new(Int32Array::from_iter_values(0..row_count as i32)),
+                        Arc::new(Int32Array::from_iter_values(
+                            0..i32::try_from(row_count).expect("test row count fits i32"),
+                        )),
                         Arc::new(StringArray::from(vec![
                             self.tenant.to_string();
                             row_count_usize

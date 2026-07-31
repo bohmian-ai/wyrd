@@ -85,7 +85,14 @@ pub struct RunningReservation {
     ///
     /// Leader-local execution leaves this empty because the admitted query guard
     /// already retains that node's running permit for the complete query stream.
-    _permit: Option<OwnedSemaphorePermit>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for RunningReservation {
+    /// Releases the retained worker permit when an attempt stream completes or is dropped.
+    fn drop(&mut self) {
+        drop(self.permit.take());
+    }
 }
 
 /// In-memory worker reservation owner; entries are never durable.
@@ -114,9 +121,9 @@ impl ReservationRegistry {
     ///
     /// # Errors
     /// Returns a retryable failure when capacity, expiry, or local pending slots reject.
-    pub fn reserve(
+    pub(crate) fn reserve(
         &self,
-        request: ReserveNodeSlotsRequest,
+        request: &ReserveNodeSlotsRequest,
         now: DateTime<Utc>,
     ) -> Result<PendingNodeReservation, DispatchError> {
         if request.slot_units == 0 || request.expires_at <= now {
@@ -140,15 +147,7 @@ impl ReservationRegistry {
         let expires_at = request.expires_at.min(now + PENDING_TTL);
         entries.insert(
             reservation_id,
-            PendingReservation {
-                query_id: request.query_id,
-                leader_node_id: request.leader_node_id,
-                leader_fencing_token: request.leader_fencing_token,
-                slot_units: request.slot_units,
-                query_class: request.query_class,
-                expires_at,
-                _permit: permit,
-            },
+            pending_reservation(request, expires_at, permit),
         );
         Ok(PendingNodeReservation {
             reservation_id,
@@ -209,7 +208,7 @@ impl ReservationRegistry {
             .slots
             .try_running(demand)
             .map(|permit| RunningReservation {
-                _permit: Some(permit),
+                permit: Some(permit),
             })
             .map_err(|_| DispatchError::Retryable);
         record_slot(
@@ -256,7 +255,7 @@ impl ReservationRegistry {
             .remove(&reservation_id)
             .ok_or(DispatchError::Terminal)?;
         record_slot(query_class, SlotOutcome::Running);
-        Ok(RunningReservation { _permit: None })
+        Ok(RunningReservation { permit: None })
     }
 
     /// Reclaims expired pending reservations and returns the number still held.
@@ -266,6 +265,23 @@ impl ReservationRegistry {
             retain_live(&mut entries, now);
             entries.len()
         })
+    }
+}
+
+/// Converts a validated wire reservation into its permit-owning registry entry.
+fn pending_reservation(
+    request: &ReserveNodeSlotsRequest,
+    expires_at: DateTime<Utc>,
+    permit: OwnedSemaphorePermit,
+) -> PendingReservation {
+    PendingReservation {
+        query_id: request.query_id,
+        leader_node_id: request.leader_node_id,
+        leader_fencing_token: request.leader_fencing_token,
+        slot_units: request.slot_units,
+        query_class: request.query_class,
+        expires_at,
+        _permit: permit,
     }
 }
 
@@ -370,19 +386,16 @@ impl OraclePeerWorker {
 
     /// Reserves bounded pending capacity for one fenced leader.
     #[must_use]
-    pub fn reserve(&self, request: ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
+    pub fn reserve(&self, request: &ReserveNodeSlotsRequest) -> ReserveNodeSlotsResponse {
         let query_class = request.query_class;
-        match self.reservations.reserve(request, Utc::now()) {
-            Ok(pending) => {
-                record_slot(query_class, SlotOutcome::Pending);
-                ReserveNodeSlotsResponse::Pending(pending)
-            }
-            Err(_) => {
-                record_slot(query_class, SlotOutcome::Rejected);
-                ReserveNodeSlotsResponse::Rejected(ReservationRejected {
-                    retry_after_ms: RESERVATION_RETRY_MS,
-                })
-            }
+        if let Ok(pending) = self.reservations.reserve(request, Utc::now()) {
+            record_slot(query_class, SlotOutcome::Pending);
+            ReserveNodeSlotsResponse::Pending(pending)
+        } else {
+            record_slot(query_class, SlotOutcome::Rejected);
+            ReserveNodeSlotsResponse::Rejected(ReservationRejected {
+                retry_after_ms: RESERVATION_RETRY_MS,
+            })
         }
     }
 
@@ -445,21 +458,16 @@ impl OraclePeerWorker {
                 record_security(SecurityEventClass::Ticket);
                 DispatchError::Terminal
             })?;
-        let claims = match PeerTicketClaims::decode(verified.0.as_slice()) {
-            Ok(claims) => claims,
-            Err(_) => {
-                self.audit_unverified(BifrostSecurityViolationKind::PeerSignature)
-                    .await?;
-                return Err(DispatchError::Terminal);
-            }
+        let Ok(claims) = PeerTicketClaims::decode(verified.0.as_slice()) else {
+            self.audit_unverified(BifrostSecurityViolationKind::PeerSignature)
+                .await?;
+            return Err(DispatchError::Terminal);
         };
-        let tenant_id = match validated_claim_identifiers(&claims) {
-            Ok(tenant_id) => tenant_id,
-            Err(violation) => {
-                self.audit_unverified(violation).await?;
-                return Err(DispatchError::Terminal);
-            }
-        };
+        let tenant_validation = validated_claim_identifiers(&claims);
+        if let Err(violation) = tenant_validation.as_ref() {
+            self.audit_unverified(*violation).await?;
+        }
+        let tenant_id = tenant_validation.map_err(|_| DispatchError::Terminal)?;
         let query_id = QueryId::new(uuid_from(&claims.query_id)?);
         let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
         let transition = match capacity {
@@ -487,13 +495,10 @@ impl OraclePeerWorker {
             }
             Err(error) => return Err(error),
         };
-        let fragment = match SealedScanFragment::decode(&request.fragment_bytes) {
-            Ok(fragment) => fragment,
-            Err(_) => {
-                self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
-                    .await?;
-                return Err(DispatchError::Terminal);
-            }
+        let Ok(fragment) = SealedScanFragment::decode(&request.fragment_bytes) else {
+            self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFragment)
+                .await?;
+            return Err(DispatchError::Terminal);
         };
         if let Err(violation) = validate_claims(&claims, &fragment) {
             self.audit_verified(tenant_id, violation).await?;
@@ -681,7 +686,7 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
         _worker: NodeId,
         request: ReserveNodeSlotsRequest,
     ) -> Result<ReserveNodeSlotsResponse, DispatchError> {
-        Ok(self.worker.reserve(request))
+        Ok(self.worker.reserve(&request))
     }
 
     /// Releases through the same tuple check used by the tonic path.
@@ -785,7 +790,7 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         let response = client
             .reserve_slots(self.authenticated(request.into()))
             .await
-            .map_err(status_error)?
+            .map_err(|status| status_error(&status))?
             .into_inner();
         response.try_into().map_err(|_| DispatchError::Terminal)
     }
@@ -803,7 +808,7 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         client
             .release_slots(self.authenticated(request.into()))
             .await
-            .map_err(status_error)?;
+            .map_err(|status| status_error(&status))?;
         Ok(())
     }
 
@@ -820,12 +825,12 @@ impl OraclePeerTransport for TonicOraclePeerTransport {
         let mut stream = client
             .execute_fragment(self.authenticated(request.into()))
             .await
-            .map_err(status_error)?
+            .map_err(|status| status_error(&status))?
             .into_inner();
         let output = async_stream::stream! {
             while let Some(frame) = stream.next().await {
                 yield frame
-                    .map_err(status_error)
+                    .map_err(|status| status_error(&status))
                     .and_then(|frame| frame.try_into().map_err(|_| DispatchError::Terminal));
             }
         };
@@ -929,7 +934,7 @@ impl OraclePeerTransportDirectory {
 }
 
 /// Classifies tonic status without retrying security or malformed-contract failures.
-fn status_error(status: Status) -> DispatchError {
+fn status_error(status: &Status) -> DispatchError {
     match status.code() {
         wyrd_tonic::tonic::Code::Unavailable
         | wyrd_tonic::tonic::Code::DeadlineExceeded
@@ -1071,12 +1076,9 @@ impl FragmentDispatcher {
                 projection_digest: projection_digest(&fragment.projection),
                 permission_digest: context.permission_digest.clone(),
             };
-            let ticket = match self.ticket_minter.mint_peer_ticket(&claims) {
-                Ok(ticket) => ticket,
-                Err(_) => {
-                    self.release_pending(candidate.node_id, release).await;
-                    return Err(DispatchError::Terminal);
-                }
+            let Ok(ticket) = self.ticket_minter.mint_peer_ticket(&claims) else {
+                self.release_pending(candidate.node_id, release).await;
+                return Err(DispatchError::Terminal);
             };
             let request = ExecuteFragmentRequest {
                 ticket,
@@ -1182,8 +1184,7 @@ fn attempt_error(_error: AttemptError) -> DispatchError {
 /// Maps internal retry classes to closed metric labels.
 fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
     match error {
-        DispatchError::Retryable => PeerErrorClass::Availability,
-        DispatchError::StaleObject => PeerErrorClass::Availability,
+        DispatchError::Retryable | DispatchError::StaleObject => PeerErrorClass::Availability,
         DispatchError::Terminal => PeerErrorClass::Security,
         DispatchError::Exhausted => PeerErrorClass::Exhausted,
     }
@@ -1355,7 +1356,7 @@ mod tests {
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let pending = registry
             .reserve(
-                reserve_request(query, leader, 7, now + ChronoDuration::seconds(2)),
+                &reserve_request(query, leader, 7, now + ChronoDuration::seconds(2)),
                 now,
             )
             .expect("pending reservation");
@@ -1386,7 +1387,7 @@ mod tests {
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let pending = registry
             .reserve(
-                reserve_request(query, leader, 11, now + ChronoDuration::seconds(2)),
+                &reserve_request(query, leader, 11, now + ChronoDuration::seconds(2)),
                 now,
             )
             .expect("pending local reservation");
@@ -1395,7 +1396,7 @@ mod tests {
             .take_for_local_leader_execute(pending.reservation_id, query, leader, 11, now)
             .expect("leader-local transition");
 
-        assert!(running._permit.is_none());
+        assert!(running.permit.is_none());
         assert!(slots.try_running(1).is_err());
         drop(leader_slot);
         assert!(slots.try_running(1).is_ok());
@@ -1410,7 +1411,7 @@ mod tests {
         let leader = NodeId::new(uuid::Uuid::now_v7());
         let pending = registry
             .reserve(
-                reserve_request(query, leader, 9, now + ChronoDuration::milliseconds(1)),
+                &reserve_request(query, leader, 9, now + ChronoDuration::milliseconds(1)),
                 now,
             )
             .expect("pending reservation");
@@ -1420,7 +1421,7 @@ mod tests {
         );
         let replacement = registry
             .reserve(
-                reserve_request(query, leader, 9, now + ChronoDuration::seconds(1)),
+                &reserve_request(query, leader, 9, now + ChronoDuration::seconds(1)),
                 now,
             )
             .expect("replacement reservation");
@@ -1571,11 +1572,11 @@ mod tests {
     #[test]
     fn oracle_tonic_status_preserves_stale_object_classification() {
         assert!(matches!(
-            status_error(Status::not_found("stale pinned object")),
+            status_error(&Status::not_found("stale pinned object")),
             DispatchError::StaleObject
         ));
         assert!(matches!(
-            status_error(Status::unavailable("storage outage")),
+            status_error(&Status::unavailable("storage outage")),
             DispatchError::Retryable
         ));
     }

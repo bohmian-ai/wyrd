@@ -137,7 +137,7 @@ impl TailReadTransport for LocalTailReadTransport {
         &self,
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
-        self.reader.read_page(request).await
+        self.reader.read_page(&request)
     }
 
     /// Delegates idempotent local release to the Scribe-owned reader.
@@ -198,7 +198,7 @@ impl TonicTailReadTransport {
         let response = client
             .acquire_fence(self.authenticated_request(request.into()))
             .await
-            .map_err(tonic_error)?;
+            .map_err(|status| tonic_error(&status))?;
         response.into_inner().try_into().map_err(
             |error: wyrd_tonic::private_conversion::PrivateConversionError| TailReadError::State {
                 detail: error.to_string(),
@@ -220,7 +220,7 @@ impl TonicTailReadTransport {
         let response = client
             .read_fence_page(self.authenticated_request(request.into()))
             .await
-            .map_err(tonic_error)?;
+            .map_err(|status| tonic_error(&status))?;
         let page: tail::TailPage = response.into_inner().try_into().map_err(
             |error: wyrd_tonic::private_conversion::PrivateConversionError| TailReadError::State {
                 detail: error.to_string(),
@@ -250,7 +250,7 @@ impl TonicTailReadTransport {
                 self.authenticated_request(tail::ReleaseTailFenceRequest { fence_id }.into()),
             )
             .await
-            .map_err(tonic_error)?;
+            .map_err(|status| tonic_error(&status))?;
         Ok(())
     }
 
@@ -299,7 +299,7 @@ impl TailReadTransport for TonicTailReadTransport {
 }
 
 /// Converts an authenticated remote status into the local reader error shape.
-fn tonic_error(status: wyrd_tonic::tonic::Status) -> TailReadError {
+fn tonic_error(status: &wyrd_tonic::tonic::Status) -> TailReadError {
     TailReadError::State {
         detail: status.to_string(),
     }
@@ -721,11 +721,11 @@ impl ScribeTailReader {
     /// Returns [`TailReadError`] when the fence expired, the continuation is
     /// outside its exact interval, or an individual row cannot meet the encoded
     /// byte bound.
-    pub async fn read_page(
+    pub fn read_page(
         &self,
-        request: tail::TailPageRequest,
+        request: &tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
-        self.read_page_inner(None, request)
+        self.read_page_inner(None, request.clone())
     }
 
     /// Reads one page only when the authenticated tenant owns the retained binding.
@@ -759,27 +759,29 @@ impl ScribeTailReader {
         tenant: Option<DataTenantId>,
         request: tail::TailPageRequest,
     ) -> Result<LocalTailPage, TailReadError> {
+        let tail::TailPageRequest {
+            fence_id,
+            after,
+            max_rows,
+            max_encoded_bytes,
+        } = request;
         let mut registry = self.fences.lock().map_err(|error| TailReadError::State {
             detail: format!("tail fence registry lock poisoned: {error}"),
         })?;
         Self::reclaim_expired(&mut registry, Instant::now(), OPPORTUNISTIC_EXPIRY_LIMIT);
         let retained = registry
             .retained
-            .get(&request.fence_id)
+            .get(&fence_id)
             .ok_or(TailReadError::CursorOutOfRange)?;
         if tenant.is_some_and(|tenant| retained.fence.binding.tenant_id != tenant) {
             return Err(TailReadError::AccessDenied);
         }
-        validate_after(request.after.as_ref(), &retained.fence)?;
-        let row_limit = request.max_rows.min(self.config.max_page_rows).max(1) as usize;
-        let byte_limit = request
-            .max_encoded_bytes
+        validate_after(after.as_ref(), &retained.fence)?;
+        let row_limit = max_rows.min(self.config.max_page_rows).max(1) as usize;
+        let byte_limit = max_encoded_bytes
             .min(self.config.max_page_encoded_bytes)
             .max(1) as usize;
-        let after = request
-            .after
-            .as_ref()
-            .unwrap_or(&retained.fence.exclusive_sealed);
+        let after = after.as_ref().unwrap_or(&retained.fence.exclusive_sealed);
         let mut rows = Vec::new();
         let mut encoded_bytes = 0_usize;
         let mut next = None;
@@ -1073,13 +1075,7 @@ impl FetchLiveTailService {
     /// Arrow response is encoded. Production calls pass through the bounded
     /// shard command queue; the direct memtable branch is only for the narrow
     /// in-process adapter used by unit tests.
-    #[allow(
-        clippy::unused_async,
-        reason = "the typed service boundary remains async for the future streaming transport"
-    )]
-    #[deprecated(
-        note = "use ScribeTailReader fences for new callers; retained only for the temporary legacy query adapter"
-    )]
+    #[cfg(feature = "test-support")]
     pub async fn fetch_live_tail(
         &self,
         req: FetchLiveTailRequest,
@@ -1332,7 +1328,9 @@ mod tests {
                 .retained
                 .get_mut(&first.fence_id)
                 .expect("first fence retained")
-                .expires_at = Instant::now() - Duration::from_secs(1);
+                .expires_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("one second is within the monotonic clock range");
         }
 
         let second = reader

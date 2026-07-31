@@ -221,7 +221,7 @@ impl SealedFragmentExecutor {
                             batch.map_err(|error| classify_decode_error(&error))?,
                             &fragment,
                         )?;
-                        let (schema, batch) = encoder.encode(batch)?;
+                        let (schema, batch) = encoder.encode(&batch)?;
                         if let Some(schema) = schema {
                             yield schema;
                         }
@@ -250,7 +250,7 @@ impl SealedFragmentExecutor {
                             batch.map_err(|_| ExecutorError::Decode)?,
                             &fragment,
                         )?;
-                        let (schema, batch) = encoder.encode(batch)?;
+                        let (schema, batch) = encoder.encode(&batch)?;
                         if let Some(schema) = schema {
                             yield schema;
                         }
@@ -319,7 +319,7 @@ fn classify_decode_error(error: &(dyn std::error::Error + 'static)) -> ExecutorE
     }
 }
 
-/// Returns whether an error chain contains an exact filesystem or OpenDAL not-found cause.
+/// Returns whether an error chain contains an exact filesystem or `OpenDAL` not-found cause.
 fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(source) = current {
@@ -580,7 +580,7 @@ impl AttemptEncoder {
     /// counters fail, and [`ExecutorError::Schema`] if later batches change schema.
     fn encode(
         &mut self,
-        batch: RecordBatch,
+        batch: &RecordBatch,
     ) -> Result<(Option<WorkerAttemptFrame>, WorkerAttemptFrame), ExecutorError> {
         let schema_frame = if let Some(schema) = &self.schema {
             if schema.as_ref() != batch.schema().as_ref() {
@@ -600,7 +600,7 @@ impl AttemptEncoder {
         let mut bytes = Vec::new();
         StreamWriter::try_new(&mut bytes, &batch.schema())
             .and_then(|mut writer| {
-                writer.write(&batch)?;
+                writer.write(batch)?;
                 writer.finish()
             })
             .map_err(|_| ExecutorError::Decode)?;

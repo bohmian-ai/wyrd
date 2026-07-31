@@ -129,6 +129,36 @@ impl InjectedRoleClock {
 /// Panics when the managed database or a durable membership transition fails.
 #[tokio::test]
 async fn oracle_and_scribe_roles_activate_only_after_explicit_readiness() {
+    let roles = reserve_role_pair().await;
+    let mut shutdown_events = deactivate_and_cancel_roles(&roles).await;
+    unregister_roles(&roles, &mut shutdown_events).await;
+    assert_eq!(
+        shutdown_events,
+        [
+            "durable_deactivate",
+            "drain",
+            "heartbeat_stop",
+            "reject_cancel_active",
+            "oracle_unregister",
+            "scribe_unregister",
+        ]
+    );
+}
+
+/// Retained database and colocated role registrations for the lifecycle proof.
+struct RolePair {
+    /// Managed database retained through teardown.
+    _pg: PgFixture,
+    /// Shared role-fenced registry.
+    cluster: Arc<ClusterRegistry>,
+    /// Reserved Oracle role.
+    oracle: vala_bifrost_redux::cluster::RegisteredRole,
+    /// Reserved Scribe role.
+    scribe: vala_bifrost_redux::cluster::RegisteredRole,
+}
+
+/// Reserves both roles, proves they are hidden, then explicitly activates them.
+async fn reserve_role_pair() -> RolePair {
     let pg = PgFixture::start().await.expect("managed Postgres fixture");
     let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
     let cluster = Arc::new(ClusterRegistry::new(pg.operator_pool().clone(), node_id));
@@ -159,145 +189,139 @@ async fn oracle_and_scribe_roles_activate_only_after_explicit_readiness() {
         )
         .await
         .expect("reserve Scribe");
-
     cluster.refresh_snapshot().await.expect("reserved snapshot");
     assert!(cluster.snapshot().live_oracles().is_empty());
     assert!(cluster.snapshot().live_scribes().is_empty());
-
     cluster.activate(&oracle).await.expect("activate Oracle");
     cluster.activate(&scribe).await.expect("activate Scribe");
     cluster.refresh_snapshot().await.expect("active snapshot");
     assert_eq!(cluster.snapshot().live_oracles().len(), 1);
     assert_eq!(cluster.snapshot().live_scribes().len(), 1);
+    RolePair {
+        _pg: pg,
+        cluster,
+        oracle,
+        scribe,
+    }
+}
 
+/// Deactivates readiness, proves draining heartbeats remain hidden, and cancels work.
+async fn deactivate_and_cancel_roles(roles: &RolePair) -> Vec<&'static str> {
     let oracle_ready = Arc::new(AtomicBool::new(true));
     let scribe_ready = Arc::new(AtomicBool::new(true));
-    let oracle_heartbeat_shutdown = CancellationToken::new();
-    let scribe_heartbeat_shutdown = CancellationToken::new();
-    let oracle_heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
-        oracle.clone(),
+    let oracle_stop = CancellationToken::new();
+    let scribe_stop = CancellationToken::new();
+    let oracle_heartbeat = Arc::clone(&roles.cluster).start_readiness_heartbeat(
+        roles.oracle.clone(),
         Arc::clone(&oracle_ready),
-        oracle_heartbeat_shutdown.clone(),
+        oracle_stop.clone(),
     );
-    let scribe_heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
-        scribe.clone(),
+    let scribe_heartbeat = Arc::clone(&roles.cluster).start_readiness_heartbeat(
+        roles.scribe.clone(),
         Arc::clone(&scribe_ready),
-        scribe_heartbeat_shutdown.clone(),
+        scribe_stop.clone(),
     );
     tokio::task::yield_now().await;
-
-    let oracle_work_shutdown = CancellationToken::new();
-    let scribe_work_shutdown = CancellationToken::new();
-    let oracle_active = {
-        let shutdown = oracle_work_shutdown.clone();
-        tokio::spawn(async move { shutdown.cancelled().await })
-    };
-    let scribe_active = {
-        let shutdown = scribe_work_shutdown.clone();
-        tokio::spawn(async move { shutdown.cancelled().await })
-    };
-    let accepting = AtomicBool::new(true);
-    let mut shutdown_events = Vec::new();
-    let mut clock = InjectedRoleClock::new();
-
+    let oracle_work = CancellationToken::new();
+    let scribe_work = CancellationToken::new();
+    let oracle_active = tokio::spawn({
+        let stop = oracle_work.clone();
+        async move { stop.cancelled().await }
+    });
+    let scribe_active = tokio::spawn({
+        let stop = scribe_work.clone();
+        async move { stop.cancelled().await }
+    });
     oracle_ready.store(false, Ordering::Release);
     scribe_ready.store(false, Ordering::Release);
-    cluster
-        .deactivate(&oracle)
+    roles
+        .cluster
+        .deactivate(&roles.oracle)
         .await
         .expect("deactivate Oracle");
-    cluster
-        .deactivate(&scribe)
+    roles
+        .cluster
+        .deactivate(&roles.scribe)
         .await
         .expect("deactivate Scribe");
-    shutdown_events.push("durable_deactivate");
-    cluster
+    roles
+        .cluster
         .refresh_snapshot()
         .await
         .expect("deactivated snapshot");
-    assert!(cluster.snapshot().live_oracles().is_empty());
-    assert!(cluster.snapshot().live_scribes().is_empty());
-
+    assert!(roles.cluster.snapshot().live_oracles().is_empty());
+    assert!(roles.cluster.snapshot().live_scribes().is_empty());
+    let mut clock = InjectedRoleClock::new();
     clock.advance(vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL);
-    cluster
-        .heartbeat_readiness_for_test(&oracle, oracle_ready.load(Ordering::Acquire))
+    roles
+        .cluster
+        .heartbeat_readiness_for_test(&roles.oracle, false)
         .await
         .expect("injected Oracle heartbeat");
-    cluster
-        .heartbeat_readiness_for_test(&scribe, scribe_ready.load(Ordering::Acquire))
+    roles
+        .cluster
+        .heartbeat_readiness_for_test(&roles.scribe, false)
         .await
         .expect("injected Scribe heartbeat");
-    cluster
+    roles
+        .cluster
         .refresh_snapshot()
         .await
         .expect("draining heartbeat snapshot");
-    assert!(
-        cluster.snapshot().live_oracles().is_empty()
-            && cluster.snapshot().live_scribes().is_empty(),
-        "matching heartbeats must preserve not-ready during drain"
-    );
+    assert!(roles.cluster.snapshot().live_oracles().is_empty());
+    assert!(roles.cluster.snapshot().live_scribes().is_empty());
     clock.advance(Duration::from_secs(1));
     assert_eq!(
         clock.elapsed,
         vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL + Duration::from_secs(1)
     );
-    shutdown_events.push("drain");
-
-    oracle_heartbeat_shutdown.cancel();
-    scribe_heartbeat_shutdown.cancel();
+    oracle_stop.cancel();
+    scribe_stop.cancel();
     oracle_heartbeat.await.expect("Oracle heartbeat stops");
     scribe_heartbeat.await.expect("Scribe heartbeat stops");
-    shutdown_events.push("heartbeat_stop");
-
-    accepting.store(false, Ordering::Release);
-    assert!(!accepting.load(Ordering::Acquire), "new work is rejected");
-    oracle_work_shutdown.cancel();
-    scribe_work_shutdown.cancel();
+    oracle_work.cancel();
+    scribe_work.cancel();
     oracle_active.await.expect("Oracle active work cancels");
     scribe_active.await.expect("Scribe active work cancels");
-    shutdown_events.push("reject_cancel_active");
+    vec![
+        "durable_deactivate",
+        "drain",
+        "heartbeat_stop",
+        "reject_cancel_active",
+    ]
+}
 
-    cluster
-        .shutdown_role(oracle.clone())
+/// Unregisters each role independently and proves the Scribe fence survives Oracle teardown.
+async fn unregister_roles(roles: &RolePair, events: &mut Vec<&'static str>) {
+    roles
+        .cluster
+        .shutdown_role(roles.oracle.clone())
         .await
         .expect("unregister Oracle");
-    shutdown_events.push("oracle_unregister");
-
-    cluster
-        .heartbeat(&scribe)
+    events.push("oracle_unregister");
+    roles
+        .cluster
+        .heartbeat(&roles.scribe)
         .await
-        .expect("Scribe exact fence survives Oracle unregister");
-    cluster
+        .expect("Scribe fence survives");
+    roles
+        .cluster
         .refresh_snapshot()
         .await
         .expect("Oracle shutdown snapshot");
-    assert!(cluster.snapshot().live_oracles().is_empty());
-    assert_eq!(
-        cluster.snapshot().live_scribes().len(),
-        1,
-        "Oracle teardown must not mutate the colocated Scribe fence"
-    );
-
-    cluster
-        .deactivate(&scribe)
+    assert!(roles.cluster.snapshot().live_oracles().is_empty());
+    assert_eq!(roles.cluster.snapshot().live_scribes().len(), 1);
+    roles
+        .cluster
+        .deactivate(&roles.scribe)
         .await
         .expect("deactivate Scribe");
-    cluster
-        .shutdown_role(scribe)
+    roles
+        .cluster
+        .shutdown_role(roles.scribe.clone())
         .await
         .expect("unregister Scribe");
-    shutdown_events.push("scribe_unregister");
-    assert_eq!(
-        shutdown_events,
-        [
-            "durable_deactivate",
-            "drain",
-            "heartbeat_stop",
-            "reject_cancel_active",
-            "oracle_unregister",
-            "scribe_unregister",
-        ]
-    );
+    events.push("scribe_unregister");
 }
 
 /// Dependencies retained for one real Postgres/catalog/Oracle integration.
@@ -620,10 +644,7 @@ impl OracleFixture {
         basename: &str,
         rows: &[(i64, DataTenantId)],
     ) -> SeededHotRows {
-        assert!(
-            !basename.is_empty() && !basename.contains(['/', '\\']),
-            "hot fixture basename must be one safe segment"
-        );
+        validate_hot_basename(basename);
         assert!(!rows.is_empty(), "hot fixture requires rows");
         let schema = Arc::new(Schema::new(with_managed_columns(vec![Field::new(
             "value",
@@ -808,6 +829,18 @@ impl OracleFixture {
         .expect("file list");
         conn.commit().await.expect("manifest commit");
     }
+}
+
+/// Rejects unsafe fixture basenames before constructing a tenant object path.
+///
+/// # Panics
+///
+/// Panics when the basename is empty or contains a path separator.
+fn validate_hot_basename(basename: &str) {
+    assert!(
+        !basename.is_empty() && !basename.contains(['/', '\\']),
+        "hot fixture basename must be one safe segment"
+    );
 }
 
 /// Audit owner that deterministically refuses the mandatory read decision.
@@ -1282,7 +1315,7 @@ fn uint64_values(result: &DecodedQuery, column: &str) -> Vec<u64> {
         .collect()
 }
 
-/// Executes one strict PublishedOnly SQL statement and decodes all frames.
+/// Executes one strict `PublishedOnly` SQL statement and decodes all frames.
 ///
 /// # Panics
 ///
@@ -1378,9 +1411,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_audit_failure_prebyte()
         .await
         .expect_err("audit refusal fails before missing object read");
     assert_eq!(error, BifrostError::QueryAuditUnavailable);
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
+    shutdown_oracle(&oracle).await;
 }
 
 /// COUNT and JOIN cannot observe a foreign row before the physical tripwire.
@@ -1501,7 +1532,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_audit_failure(
         .await;
 }
 
-/// PublishedOnly runs the locked SQL operator matrix over real hot Parquet.
+/// `PublishedOnly` runs the locked SQL operator matrix over real hot Parquet.
 #[tokio::test]
 async fn oracle_published_only_sql_semantics_matrix() {
     let fixture = OracleFixture::new("oracle_sql").await;
@@ -1607,6 +1638,12 @@ async fn oracle_published_only_sql_semantics_matrix() {
         assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
         assert!(result.terminal.error.is_none());
     }
+    assert_sql_matrix_classes(&fixture).await;
+    shutdown_oracle(&oracle).await;
+}
+
+/// Verifies the optimized-plan class persisted for every SQL matrix query.
+async fn assert_sql_matrix_classes(fixture: &OracleFixture) {
     let mut conn = fixture
         .pg
         .tenant_conn_for(fixture.tenant)
@@ -1615,8 +1652,7 @@ async fn oracle_published_only_sql_semantics_matrix() {
     let classes: Vec<String> = sqlx::query_scalar(
         "SELECT detail::jsonb->>'query_class' FROM vala.audit_outbox \
          WHERE data_tenant_id = wyrd.current_tenant() \
-           AND operation = 'bifrost.query.read_decision' \
-         ORDER BY seq",
+           AND operation = 'bifrost.query.read_decision' ORDER BY seq",
     )
     .fetch_all(&mut **conn.transaction())
     .await
@@ -1631,9 +1667,13 @@ async fn oracle_published_only_sql_semantics_matrix() {
             "analytical",
             "analytical",
             "interactive",
-            "analytical",
+            "analytical"
         ]
     );
+}
+
+/// Shuts down a test Oracle under the standard bounded drain deadline.
+async fn shutdown_oracle(oracle: &Oracle) {
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
@@ -1836,6 +1876,16 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
     assert_eq!(releases.load(Ordering::SeqCst), 2);
 
     let snapshot = recorder.snapshot();
+    assert_telemetry_counters(&snapshot);
+    assert_telemetry_histograms_and_gauges(&snapshot);
+    assert_telemetry_spans(&captured);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// Verifies canonical counter families and exact values for the telemetry journey.
+fn assert_telemetry_counters(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     for fragment in [
         "bifrost_oracle_source_bytes_total{source=\"hot_sealed\"}",
         "bifrost_oracle_source_bytes_total{source=\"iceberg\"}",
@@ -1844,74 +1894,78 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
         "bifrost_oracle_spill_bytes_total{operator=\"reconcile\",role=\"leader\"}",
         "bifrost_oracle_spill_operations_total{operator=\"reconcile\",outcome=\"spilled\",role=\"leader\"}",
     ] {
-        assert_counter(&snapshot, fragment);
+        assert_counter(snapshot, fragment);
     }
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_source_rows_total{source=\"iceberg\"}",
         1_024,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_source_rows_total{source=\"hot_sealed\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_source_rows_total{source=\"live_tail\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_classification_total{query_class=\"analytical\",reason=\"global_operator\"}",
         2,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_admission_rejections_total{query_class=\"analytical\",scope=\"class\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_slot_reservations_total{outcome=\"acquired\",query_class=\"analytical\",role=\"leader\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_files_pruned_total{reason=\"snapshot_overlap\",source=\"hot_sealed\"}",
         // Both the admitted and rejected planning attempts pin the same cut.
         2,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_rows_deduplicated_total{losing_source=\"live_tail\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_tail_pages_total{locality=\"local\",outcome=\"success\"}",
         2,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_tail_fences_total{locality=\"local\",outcome=\"success\"}",
         2,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_queries_total{outcome=\"success\",query_class=\"analytical\",visibility=\"fused\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_queries_total{outcome=\"failed\",query_class=\"analytical\",visibility=\"fused\"}",
         1,
     );
     assert_counter_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_streams_total{freshness=\"complete\",outcome=\"success\"}",
         1,
     );
+}
+
+/// Verifies histogram presence, gauge lifetimes, and low-cardinality labels.
+fn assert_telemetry_histograms_and_gauges(snapshot: &wyrd_bench::BenchmarkMetricSnapshot) {
     for series in [
         "bifrost_oracle_query_duration_seconds{outcome=\"success\",query_class=\"analytical\",visibility=\"fused\"}",
         "bifrost_oracle_query_duration_seconds{outcome=\"failed\",query_class=\"analytical\",visibility=\"fused\"}",
@@ -1923,7 +1977,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
         "bifrost_oracle_tail_fence_hold_seconds{locality=\"local\",outcome=\"success\"}",
         "bifrost_oracle_audit_seconds{audit_kind=\"read_decision\",outcome=\"success\"}",
     ] {
-        assert_histogram(&snapshot, series);
+        assert_histogram(snapshot, series);
     }
     for series in [
         "bifrost_oracle_in_flight{query_class=\"analytical\",visibility=\"fused\"}",
@@ -1934,10 +1988,10 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
         "bifrost_oracle_class_memory_bytes{memory_kind=\"tail\",query_class=\"analytical\"}",
         "bifrost_oracle_class_memory_bytes{memory_kind=\"reconciliation\",query_class=\"analytical\"}",
     ] {
-        assert_gauge_peak(&snapshot, series);
+        assert_gauge_peak(snapshot, series);
     }
     assert_gauge_value(
-        &snapshot,
+        snapshot,
         "bifrost_oracle_slots_total{role=\"leader\"}",
         16.0,
     );
@@ -1950,7 +2004,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
         "bifrost_oracle_class_memory_bytes{memory_kind=\"tail\",query_class=\"analytical\"}",
         "bifrost_oracle_class_memory_bytes{memory_kind=\"reconciliation\",query_class=\"analytical\"}",
     ] {
-        assert_gauge_value(&snapshot, series, 0.0);
+        assert_gauge_value(snapshot, series, 0.0);
     }
     assert!(
         snapshot
@@ -1970,7 +2024,10 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
             .any(|forbidden| series.contains(&format!("{forbidden}=")))),
         "high-cardinality label leaked: {snapshot:?}"
     );
+}
 
+/// Verifies scrubbed production span names and closed fields.
+fn assert_telemetry_spans(captured: &[CapturedSpan]) {
     let query_span = captured
         .iter()
         .find(|span| span.name == "bifrost.oracle.query")
@@ -2026,9 +2083,6 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_tel
             "missing production span {name}: {captured:?}"
         );
     }
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
 }
 
 /// A missing pinned file triggers exactly one whole-cut pre-byte retry.
@@ -2111,6 +2165,39 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
 #[tokio::test]
 async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
     let fixture = OracleFixture::new("oracle_live").await;
+    let tails = live_only_tail_directory(&fixture);
+    let oracle = fixture
+        .oracle(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            tails,
+            OracleConfig::default(),
+        )
+        .await;
+    let fused = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!("SELECT value FROM {}", fixture.table.fqn()),
+                visibility: VisibilityMode::Fused,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .expect("live-only Fused query");
+    let fused_terminal = terminal(fused).await;
+    assert_eq!(fused_terminal.outcome, QueryTerminalOutcome::Success);
+    assert_eq!(fused_terminal.row_count, 1);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+    assert_degraded_live_policy(&fixture).await;
+}
+
+/// Builds one real local Scribe tail containing a single live-only row.
+fn live_only_tail_directory(fixture: &OracleFixture) -> Arc<TailTransportDirectory> {
     let day = NaiveDate::from_ymd_opt(1970, 1, 1).expect("day");
     let stream = StreamIdentity::new(NodeId::new(uuid::Uuid::now_v7()), WriterEpoch::new(7));
     let memtable = Arc::new(Memtable::new());
@@ -2166,38 +2253,11 @@ async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
         wyrd_spec::vala::api::EventDay::new("1970-01-01").expect("wire day"),
         Arc::new(LocalTailReadTransport::new(reader)),
     );
-    let oracle = fixture
-        .oracle(
-            Arc::new(TestPostgresOracleAudit::new(
-                fixture.pg.vala_postgres().clone(),
-            )),
-            tails,
-            OracleConfig::default(),
-        )
-        .await;
-    let fused = oracle
-        .query_sql(
-            fixture.context(),
-            BifrostQueryRequest {
-                sql: format!("SELECT value FROM {}", fixture.table.fqn()),
-                visibility: VisibilityMode::Fused,
-                freshness: FreshnessPolicy::Strict,
-                deadline_ms: Some(5_000),
-            },
-        )
-        .await
-        .expect("live-only Fused query");
-    let fused_terminal = terminal(fused).await;
-    assert_eq!(
-        fused_terminal.outcome,
-        QueryTerminalOutcome::Success,
-        "{fused_terminal:?}"
-    );
-    assert_eq!(fused_terminal.row_count, 1);
-    oracle
-        .shutdown(Instant::now() + Duration::from_secs(1))
-        .await;
+    tails
+}
 
+/// Verifies strict rejection and degraded completion when no live route exists.
+async fn assert_degraded_live_policy(fixture: &OracleFixture) {
     let degraded_oracle = fixture
         .oracle(
             Arc::new(TestPostgresOracleAudit::new(

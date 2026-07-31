@@ -32,7 +32,7 @@ pub use crate::scribe::execution_lanes::{
 };
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
+use crate::scribe::tail_rpc::FetchLiveTailService;
 pub use crate::scribe::tail_rpc::{
     LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
     TonicTailReadTransport,
@@ -41,6 +41,7 @@ use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
 };
 use async_trait::async_trait;
+#[cfg(any(test, feature = "test-support"))]
 use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
 use num_traits::ToPrimitive;
 use std::sync::Arc;
@@ -1171,8 +1172,7 @@ impl ScribeImpl {
     /// Construct the bounded, fence-owning Scribe tail reader for new Oracle paths.
     ///
     /// The returned reader retains only shallow Arrow snapshots from this Scribe's
-    /// shard runtime. Legacy callers must keep using [`Self::tail_service`] until
-    /// their temporary compatibility adapter is removed.
+    /// shard runtime and owns the bounded fence protocol used by Oracle.
     ///
     /// # Errors
     ///
@@ -1183,13 +1183,5 @@ impl ScribeImpl {
             Arc::new(self.tail_service()?),
             TailFenceConfig::default(),
         ))
-    }
-
-    /// Fetch the typed live tail from this pod's memtable.
-    pub async fn fetch_live_tail(
-        &self,
-        request: FetchLiveTailRequest,
-    ) -> Result<Vec<TailFrame>, ScribeError> {
-        self.tail_service()?.fetch_live_tail(request).await
     }
 }

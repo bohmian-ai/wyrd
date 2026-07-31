@@ -1,6 +1,6 @@
-//! DataFusion physical sources and invariant operators owned by Oracle.
+//! `DataFusion` physical sources and invariant operators owned by Oracle.
 //!
-//! Every table enters DataFusion through one complete tagged source union.
+//! Every table enters `DataFusion` through one complete tagged source union.
 //! Tenant validation surrounds that union before exact identity reconciliation,
 //! so a foreign row cannot influence a filter, join, aggregate, or limit.
 
@@ -67,6 +67,32 @@ pub(crate) struct HotFileSource {
     pub(crate) size_bytes: usize,
 }
 
+/// Complete immutable inputs for constructing one authenticated table provider.
+pub(crate) struct OracleTableInputs {
+    /// Pinned Iceberg table for the sealed cut.
+    pub(crate) table: iceberg::table::Table,
+    /// Footer-validated distributed Iceberg batches, when peer dispatch was selected.
+    pub(crate) distributed_iceberg_batches: Option<Vec<RecordBatch>>,
+    /// Leader-local hot files absent from the pinned Iceberg snapshot.
+    pub(crate) hot_files: Vec<HotFileSource>,
+    /// Footer-validated distributed hot batches.
+    pub(crate) distributed_hot_batches: Vec<RecordBatch>,
+    /// Drained live batches for the same table cut.
+    pub(crate) live_batches: Vec<RecordBatch>,
+    /// Authenticated request context retained by the tenant tripwire.
+    pub(crate) context: AuthorizedQueryContext,
+    /// Canonical table name used in security diagnostics.
+    pub(crate) table_name: String,
+    /// Mandatory audit collaborator.
+    pub(crate) audit: Arc<dyn OracleAudit>,
+    /// Parent-governed source and reconciliation memory.
+    pub(crate) memory: OracleMemoryResources,
+    /// Production memory telemetry owner.
+    pub(crate) telemetry: Arc<OracleTelemetry>,
+    /// Admission class charged by this provider.
+    pub(crate) query_class: QueryClass,
+}
+
 /// Complete physical provider for one authenticated table visibility cut.
 pub(crate) struct OracleTableProvider {
     /// Pinned Iceberg provider built from immutable table metadata.
@@ -127,21 +153,22 @@ impl OracleTableProvider {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion error when Iceberg cannot construct its static
+    /// Returns a `DataFusion` error when Iceberg cannot construct its static
     /// provider or the physical schema lacks the required tenant column.
-    pub(crate) async fn try_new(
-        table: iceberg::table::Table,
-        distributed_iceberg_batches: Option<Vec<RecordBatch>>,
-        hot_files: Vec<HotFileSource>,
-        distributed_hot_batches: Vec<RecordBatch>,
-        live_batches: Vec<RecordBatch>,
-        context: AuthorizedQueryContext,
-        table_name: String,
-        audit: Arc<dyn OracleAudit>,
-        memory: OracleMemoryResources,
-        telemetry: Arc<OracleTelemetry>,
-        query_class: QueryClass,
-    ) -> DataFusionResult<Self> {
+    pub(crate) async fn try_new(inputs: OracleTableInputs) -> DataFusionResult<Self> {
+        let OracleTableInputs {
+            table,
+            distributed_iceberg_batches,
+            hot_files,
+            distributed_hot_batches,
+            live_batches,
+            context,
+            table_name,
+            audit,
+            memory,
+            telemetry,
+            query_class,
+        } = inputs;
         let file_io = table.file_io().clone();
         let iceberg = IcebergStaticTableProvider::try_new_from_table(table)
             .await
@@ -185,7 +212,7 @@ impl OracleTableProvider {
 
 #[async_trait]
 impl TableProvider for OracleTableProvider {
-    /// Exposes this provider for DataFusion downcasts.
+    /// Exposes this provider for `DataFusion` downcasts.
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -215,12 +242,12 @@ impl TableProvider for OracleTableProvider {
     /// Builds the exact `Iceberg + hot + live -> tripwire -> reconcile` source.
     ///
     /// Row IO remains lazy in returned execution plans. Iceberg and hot Parquet
-    /// bytes are first accessed only when DataFusion executes the already
+    /// bytes are first accessed only when `DataFusion` executes the already
     /// audited plan.
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion planning error when a source or projection cannot
+    /// Returns a `DataFusion` planning error when a source or projection cannot
     /// be represented with the pinned physical schema.
     async fn scan(
         &self,
@@ -307,7 +334,7 @@ impl SourceTagExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion error when the hidden tag field cannot be appended.
+    /// Returns a `DataFusion` error when the hidden tag field cannot be appended.
     fn new(input: Arc<dyn ExecutionPlan>, tier: SourceTier) -> DataFusionResult<Self> {
         let schema = schema_with_source(input.schema().as_ref())?;
         let partition_count = input.output_partitioning().partition_count();
@@ -355,7 +382,7 @@ impl ExecutionPlan for SourceTagExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion planning error unless exactly one child is supplied.
+    /// Returns a `DataFusion` planning error unless exactly one child is supplied.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -370,7 +397,7 @@ impl ExecutionPlan for SourceTagExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for an invalid partition, child
+    /// Returns a `DataFusion` execution error for an invalid partition, child
     /// stream failure, or Arrow batch construction failure.
     fn execute(
         &self,
@@ -433,7 +460,7 @@ impl TenantTripwireExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error when the input lacks `data_tenant_id`.
+    /// Returns a `DataFusion` plan error when the input lacks `data_tenant_id`.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         context: AuthorizedQueryContext,
@@ -488,7 +515,7 @@ impl ExecutionPlan for TenantTripwireExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error unless exactly one child is supplied.
+    /// Returns a `DataFusion` plan error unless exactly one child is supplied.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -511,7 +538,7 @@ impl ExecutionPlan for TenantTripwireExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for source failure, malformed
+    /// Returns a `DataFusion` execution error for source failure, malformed
     /// tenant data, mismatch, security-audit failure, or Arrow projection.
     fn execute(
         &self,
@@ -586,7 +613,7 @@ impl ReconcileExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error when source bookkeeping is absent.
+    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
     pub fn new(
         input: Arc<dyn ExecutionPlan>,
         memory: OracleMemoryResources,
@@ -598,7 +625,7 @@ impl ReconcileExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error when source bookkeeping is absent.
+    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
     fn new_with_telemetry(
         input: Arc<dyn ExecutionPlan>,
         memory: OracleMemoryResources,
@@ -612,7 +639,7 @@ impl ReconcileExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error when source bookkeeping is absent.
+    /// Returns a `DataFusion` plan error when source bookkeeping is absent.
     fn new_inner(
         input: Arc<dyn ExecutionPlan>,
         memory: OracleMemoryResources,
@@ -664,7 +691,7 @@ impl ExecutionPlan for ReconcileExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error unless exactly one child is supplied.
+    /// Returns a `DataFusion` plan error unless exactly one child is supplied.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -687,7 +714,7 @@ impl ExecutionPlan for ReconcileExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for invalid identities, unequal
+    /// Returns a `DataFusion` execution error for invalid identities, unequal
     /// duplicates, source failure, or parent-memory exhaustion.
     fn execute(
         &self,
@@ -713,15 +740,7 @@ impl ExecutionPlan for ReconcileExec {
             while let Some(batch) = input.next().await {
                 let batch = batch?;
                 if let Some(active_spill) = spill.take() {
-                    spill = Some(
-                        tokio::task::spawn_blocking(move || {
-                            let mut active_spill = active_spill;
-                            active_spill.write_batch(&batch)?;
-                            Ok::<_, DataFusionError>(active_spill)
-                        })
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))??,
-                    );
+                    spill = Some(active_spill.append(batch).await?);
                     continue;
                 }
                 let batch_bytes = batch.get_array_memory_size();
@@ -743,18 +762,7 @@ impl ExecutionPlan for ReconcileExec {
                     winners = BTreeMap::new();
                     reservations.clear();
                     charged = 0;
-                    spill = Some(
-                        tokio::task::spawn_blocking(move || {
-                            let mut spill = ReconcileSpill::new(batch.schema())?;
-                            for retained in prior {
-                                spill.write_batch(&retained)?;
-                            }
-                            spill.write_batch(&batch)?;
-                            Ok::<_, DataFusionError>(spill)
-                        })
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))??,
-                    );
+                    spill = Some(ReconcileSpill::start(prior, batch).await?);
                     continue;
                 }
                 let reservation = memory.governor.try_reserve_parent(batch_bytes).map_err(|error| {
@@ -783,42 +791,12 @@ impl ExecutionPlan for ReconcileExec {
                 )
                 .increment(finished.spill_bytes);
                 for partition in 0..RECONCILE_SPILL_PARTITIONS {
-                    let (mut batches, decoder) =
-                        finished.read_partition(partition, memory.clone()).await?;
-                    let mut partition_winners = BTreeMap::new();
-                    let mut partition_reservations: Vec<ReconcileMemoryReservation> = Vec::new();
-                    let mut partition_bytes = 0_usize;
-                    while let Some(decoded) = batches.recv().await {
-                        let (batch, reservation) = decoded?;
-                        partition_bytes = partition_bytes
-                            .checked_add(batch.get_array_memory_size())
-                            .ok_or_else(|| DataFusionError::ResourcesExhausted(
-                                "spill partition byte accounting overflow".to_owned()
-                            ))?;
-                        if partition_bytes > memory.reconciliation_limit_bytes {
-                            Err::<(), _>(DataFusionError::ResourcesExhausted(
-                                "one reconciliation spill partition exceeds the query limit".to_owned(),
-                            ))?;
-                        }
-                        partition_reservations.push(match &telemetry {
-                            Some((telemetry, query_class)) => {
-                                ReconcileMemoryReservation::Accounted(telemetry.account_memory(
-                                    reservation,
-                                    *query_class,
-                                    OracleMemoryKind::Reconciliation,
-                                ))
-                            }
-                            None => ReconcileMemoryReservation::Unaccounted(reservation),
-                        });
-                        reconcile_batch(&mut partition_winners, &batch)?;
+                    for batch in finished
+                        .reconcile_partition(partition, memory.clone(), telemetry.clone())
+                        .await?
+                    {
+                        yield batch;
                     }
-                    decoder
-                        .await
-                        .map_err(|error| DataFusionError::External(Box::new(error)))??;
-                    for row in partition_winners.into_values() {
-                        yield remove_column(&row.batch, SOURCE_TIER_COLUMN)?;
-                    }
-                    drop(partition_reservations);
                 }
             } else {
                 for row in winners.into_values() {
@@ -872,11 +850,43 @@ struct ReconcileSpill {
 }
 
 impl ReconcileSpill {
+    /// Creates a spill owner and writes the retained winners plus triggering batch off-thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when the blocking task fails or spill IO rejects a batch.
+    async fn start(retained: Vec<RecordBatch>, batch: RecordBatch) -> DataFusionResult<Self> {
+        tokio::task::spawn_blocking(move || {
+            let mut spill = Self::new(batch.schema())?;
+            for retained_batch in retained {
+                spill.write_batch(&retained_batch)?;
+            }
+            spill.write_batch(&batch)?;
+            Ok(spill)
+        })
+        .await
+        .map_err(|error| DataFusionError::External(Box::new(error)))?
+    }
+
+    /// Appends one source batch to an active spill owner off-thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error when the blocking task fails or spill IO rejects the batch.
+    async fn append(mut self, batch: RecordBatch) -> DataFusionResult<Self> {
+        tokio::task::spawn_blocking(move || {
+            self.write_batch(&batch)?;
+            Ok(self)
+        })
+        .await
+        .map_err(|error| DataFusionError::External(Box::new(error)))?
+    }
+
     /// Creates every fixed spill partition before accepting rows.
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error when a tempfile, clone, or Arrow
+    /// Returns a `DataFusion` execution error when a tempfile, clone, or Arrow
     /// writer cannot be created.
     fn new(schema: SchemaRef) -> DataFusionResult<Self> {
         let mut writers = Vec::with_capacity(RECONCILE_SPILL_PARTITIONS);
@@ -904,7 +914,7 @@ impl ReconcileSpill {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for malformed identities, Arrow
+    /// Returns a `DataFusion` execution error for malformed identities, Arrow
     /// projection failure, or local spill IO failure.
     fn write_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
         if batch.schema() != self.schema {
@@ -965,7 +975,7 @@ impl ReconcileSpill {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error when Arrow cannot finish a file.
+    /// Returns a `DataFusion` execution error when Arrow cannot finish a file.
     fn finish(mut self) -> DataFusionResult<FinishedReconcileSpill> {
         for writer in &mut self.writers {
             writer.finish().map_err(DataFusionError::from)?;
@@ -998,7 +1008,67 @@ struct FinishedReconcileSpill {
     spill_bytes: u64,
 }
 
+/// One decoded spill batch coupled to its parent-memory reservation.
+type SpillDecodedBatch = DataFusionResult<(RecordBatch, ParentMemoryReservation)>;
+/// Bounded spill decoder channel returned to the async reconciliation task.
+type SpillBatchReceiver = tokio::sync::mpsc::Receiver<SpillDecodedBatch>;
+/// Blocking decoder completion handle paired with a spill channel.
+type SpillDecoder = tokio::task::JoinHandle<DataFusionResult<()>>;
+
 impl FinishedReconcileSpill {
+    /// Decodes and reconciles one bounded spill partition before advancing to the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DataFusion` error for decode failure, memory exhaustion,
+    /// invalid identities, task failure, or a partition exceeding the query bound.
+    async fn reconcile_partition(
+        &self,
+        partition: usize,
+        memory: OracleMemoryResources,
+        telemetry: Option<(Arc<OracleTelemetry>, QueryClass)>,
+    ) -> DataFusionResult<Vec<RecordBatch>> {
+        let (mut batches, decoder) = self.read_partition(partition, memory.clone())?;
+        let mut winners = BTreeMap::new();
+        let mut reservations = Vec::new();
+        let mut partition_bytes = 0_usize;
+        while let Some(decoded) = batches.recv().await {
+            let (batch, reservation) = decoded?;
+            partition_bytes = partition_bytes
+                .checked_add(batch.get_array_memory_size())
+                .ok_or_else(|| {
+                    DataFusionError::ResourcesExhausted(
+                        "spill partition byte accounting overflow".to_owned(),
+                    )
+                })?;
+            if partition_bytes > memory.reconciliation_limit_bytes {
+                return Err(DataFusionError::ResourcesExhausted(
+                    "one reconciliation spill partition exceeds the query limit".to_owned(),
+                ));
+            }
+            reservations.push(match &telemetry {
+                Some((telemetry, query_class)) => {
+                    ReconcileMemoryReservation::Accounted(telemetry.account_memory(
+                        reservation,
+                        *query_class,
+                        OracleMemoryKind::Reconciliation,
+                    ))
+                }
+                None => ReconcileMemoryReservation::Unaccounted(reservation),
+            });
+            reconcile_batch(&mut winners, &batch)?;
+        }
+        decoder
+            .await
+            .map_err(|error| DataFusionError::External(Box::new(error)))??;
+        let output = winners
+            .into_values()
+            .map(|row| remove_column(&row.batch, SOURCE_TIER_COLUMN))
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        drop(reservations);
+        Ok(output)
+    }
+
     /// Starts bounded decoding of one partition on Tokio's blocking pool.
     ///
     /// The two-batch channel is the only decoded lookahead. Each batch obtains
@@ -1008,16 +1078,13 @@ impl FinishedReconcileSpill {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for invalid partition, local IO,
+    /// Returns a `DataFusion` execution error for invalid partition, local IO,
     /// Arrow IPC failure, or parent-memory exhaustion.
-    async fn read_partition(
+    fn read_partition(
         &self,
         partition: usize,
         memory: OracleMemoryResources,
-    ) -> DataFusionResult<(
-        tokio::sync::mpsc::Receiver<DataFusionResult<(RecordBatch, ParentMemoryReservation)>>,
-        tokio::task::JoinHandle<DataFusionResult<()>>,
-    )> {
+    ) -> DataFusionResult<(SpillBatchReceiver, SpillDecoder)> {
         let mut file = self
             .files
             .get(partition)
@@ -1134,7 +1201,7 @@ impl ExecutionPlan for HotParquetExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion plan error when a child is attached.
+    /// Returns a `DataFusion` plan error when a child is attached.
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
@@ -1152,7 +1219,7 @@ impl ExecutionPlan for HotParquetExec {
     ///
     /// # Errors
     ///
-    /// Returns a DataFusion execution error for an invalid partition, storage
+    /// Returns a `DataFusion` execution error for an invalid partition, storage
     /// failure, Parquet decode failure, or schema mismatch.
     fn execute(
         &self,
@@ -1247,7 +1314,7 @@ impl ExecutionPlan for HotParquetExec {
 ///
 /// # Errors
 ///
-/// Returns a DataFusion error for malformed identity/source columns or unequal
+/// Returns a `DataFusion` error for malformed identity/source columns or unequal
 /// logical duplicate rows.
 fn reconcile_batch(
     winners: &mut BTreeMap<RowIdentity, ReconciledRow>,
@@ -1342,7 +1409,7 @@ fn reconcile_batch(
 ///
 /// # Errors
 ///
-/// Returns a DataFusion error when either row omits Oracle's source field.
+/// Returns a `DataFusion` error when either row omits Oracle's source field.
 fn logical_rows_equal(left: &RecordBatch, right: &RecordBatch) -> DataFusionResult<bool> {
     let left = remove_column(left, SOURCE_TIER_COLUMN)?;
     let right = remove_column(right, SOURCE_TIER_COLUMN)?;
@@ -1358,7 +1425,7 @@ fn logical_rows_equal(left: &RecordBatch, right: &RecordBatch) -> DataFusionResu
 ///
 /// # Errors
 ///
-/// Returns a DataFusion error when the managed tenant column is absent or has
+/// Returns a `DataFusion` error when the managed tenant column is absent or has
 /// a non-UTF8 physical type.
 fn tenant_mismatch_row(
     batch: &RecordBatch,
@@ -1381,7 +1448,7 @@ fn tenant_mismatch_row(
 ///
 /// # Errors
 ///
-/// Returns a DataFusion error when a required field is missing, a cast fails,
+/// Returns a `DataFusion` error when a required field is missing, a cast fails,
 /// or Arrow rejects the projected batch.
 fn project_batch(batch: &RecordBatch, schema: SchemaRef) -> DataFusionResult<RecordBatch> {
     let columns = schema
@@ -1409,7 +1476,7 @@ fn project_batch(batch: &RecordBatch, schema: SchemaRef) -> DataFusionResult<Rec
 ///
 /// # Errors
 ///
-/// Returns a DataFusion plan error if the reserved private name already exists.
+/// Returns a `DataFusion` plan error if the reserved private name already exists.
 fn schema_with_source(schema: &Schema) -> DataFusionResult<SchemaRef> {
     if schema.index_of(SOURCE_TIER_COLUMN).is_ok() {
         return Err(DataFusionError::Plan(
@@ -1432,7 +1499,7 @@ fn schema_with_source(schema: &Schema) -> DataFusionResult<SchemaRef> {
 ///
 /// # Errors
 ///
-/// Returns a DataFusion plan error when the field is absent.
+/// Returns a `DataFusion` plan error when the field is absent.
 fn schema_without(schema: &Schema, name: &str) -> DataFusionResult<SchemaRef> {
     let index = schema
         .index_of(name)
@@ -1454,7 +1521,7 @@ fn schema_without(schema: &Schema, name: &str) -> DataFusionResult<SchemaRef> {
 ///
 /// # Errors
 ///
-/// Returns a DataFusion execution error when the field is absent or Arrow
+/// Returns a `DataFusion` execution error when the field is absent or Arrow
 /// rejects the projected batch.
 fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatch> {
     let index = batch
@@ -1476,7 +1543,7 @@ fn remove_column(batch: &RecordBatch, name: &str) -> DataFusionResult<RecordBatc
 ///
 /// # Errors
 ///
-/// Returns a DataFusion plan error when a projected ordinal is invalid.
+/// Returns a `DataFusion` plan error when a projected ordinal is invalid.
 fn project_plan(
     input: Arc<dyn ExecutionPlan>,
     projection: Option<&Vec<usize>>,

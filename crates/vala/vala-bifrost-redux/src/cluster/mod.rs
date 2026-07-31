@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -149,9 +150,30 @@ impl ClusterRegistry {
         address: &str,
         capabilities: ScribeCapabilitiesV1,
     ) -> Result<RegisteredRole, ClusterError> {
-        let capabilities = ClusterCapabilities::ScribeV1(capabilities);
-        self.register_role(ClusterRole::Scribe, address, capabilities)
-            .await
+        let registered = self.reserve_scribe(address, capabilities).await?;
+        self.activate(&registered).await?;
+        Ok(registered)
+    }
+
+    /// Reserves one independently fenced Scribe row without advertising readiness.
+    ///
+    /// Server boot uses this phase to obtain the WAL writer epoch before recovery.
+    /// The row cannot enter live snapshots until [`Self::activate`] succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError`] when the fenced row cannot be reserved.
+    pub async fn reserve_scribe(
+        &self,
+        address: &str,
+        capabilities: ScribeCapabilitiesV1,
+    ) -> Result<RegisteredRole, ClusterError> {
+        self.reserve_role(
+            ClusterRole::Scribe,
+            address,
+            ClusterCapabilities::ScribeV1(capabilities),
+        )
+        .await
     }
 
     /// Registers one Oracle role and advances only the Oracle fence for this node.
@@ -165,9 +187,30 @@ impl ClusterRegistry {
         address: &str,
         capabilities: OracleCapabilitiesV1,
     ) -> Result<RegisteredRole, ClusterError> {
-        let capabilities = ClusterCapabilities::OracleV1(capabilities);
-        self.register_role(ClusterRole::Oracle, address, capabilities)
-            .await
+        let registered = self.reserve_oracle(address, capabilities).await?;
+        self.activate(&registered).await?;
+        Ok(registered)
+    }
+
+    /// Reserves one independently fenced Oracle row without advertising readiness.
+    ///
+    /// The returned fence may construct the private worker and admission owner,
+    /// but it is excluded from live capacity until [`Self::activate`] succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError`] when the fenced row cannot be reserved.
+    pub async fn reserve_oracle(
+        &self,
+        address: &str,
+        capabilities: OracleCapabilitiesV1,
+    ) -> Result<RegisteredRole, ClusterError> {
+        self.reserve_role(
+            ClusterRole::Oracle,
+            address,
+            ClusterCapabilities::OracleV1(capabilities),
+        )
+        .await
     }
 
     /// Returns the most recently atomically published live-role snapshot.
@@ -211,6 +254,21 @@ impl ClusterRegistry {
         registered: RegisteredRole,
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
+        self.start_readiness_heartbeat(registered, Arc::new(AtomicBool::new(true)), shutdown)
+    }
+
+    /// Starts a heartbeat that preserves the owner's current readiness state.
+    ///
+    /// Role shutdown flips `ready` before durable deactivation, allowing the
+    /// heartbeat to continue fencing the role during transport drain without
+    /// accidentally advertising it as serving again.
+    #[must_use]
+    pub fn start_readiness_heartbeat(
+        self: Arc<Self>,
+        registered: RegisteredRole,
+        ready: Arc<AtomicBool>,
+        shutdown: CancellationToken,
+    ) -> JoinHandle<()> {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(ROLE_HEARTBEAT_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -218,7 +276,10 @@ impl ClusterRegistry {
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => return,
-                    _ = interval.tick() => match self.heartbeat(&registered).await {
+                    _ = interval.tick() => match self.set_readiness(
+                        &registered,
+                        ready.load(Ordering::Acquire),
+                    ).await {
                         Ok(()) => {},
                         Err(ClusterError::StaleFence) => {
                             tracing::warn!(role = ?registered.key.role, "cluster role heartbeat lost its fence");
@@ -260,12 +321,65 @@ impl ClusterRegistry {
     /// Returns [`ClusterError::StaleFence`] if a replacement role already owns
     /// the composite key, or [`ClusterError::Sql`] for membership failures.
     pub async fn heartbeat(&self, registered: &RegisteredRole) -> Result<(), ClusterError> {
+        self.set_readiness(registered, true).await
+    }
+
+    /// Applies one injected readiness-heartbeat tick for deterministic lifecycle tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::StaleFence`] if a replacement owns the role, or
+    /// [`ClusterError::Sql`] when the injected heartbeat cannot be persisted.
+    #[cfg(feature = "test-support")]
+    pub async fn heartbeat_readiness_for_test(
+        &self,
+        registered: &RegisteredRole,
+        ready: bool,
+    ) -> Result<(), ClusterError> {
+        self.set_readiness(registered, ready).await
+    }
+
+    /// Fenced-activates a reserved role after all serving dependencies are ready.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::StaleFence`] if a replacement owns the role, or
+    /// [`ClusterError::Sql`] when the ready heartbeat cannot be persisted.
+    pub async fn activate(&self, registered: &RegisteredRole) -> Result<(), ClusterError> {
+        self.set_readiness(registered, true).await
+    }
+
+    /// Removes a role from serving discovery while retaining its exact fence.
+    ///
+    /// Shutdown uses this before the transport drain window. The role can no
+    /// longer become query or tail capacity, while its heartbeat timestamp and
+    /// fence remain available for bounded in-flight cleanup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::StaleFence`] if a replacement owns the role, or
+    /// [`ClusterError::Sql`] when the not-ready heartbeat cannot be persisted.
+    pub async fn deactivate(&self, registered: &RegisteredRole) -> Result<(), ClusterError> {
+        self.set_readiness(registered, false).await
+    }
+
+    /// Applies one fenced readiness heartbeat without changing role identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::StaleFence`] when the fence no longer owns the
+    /// row, or [`ClusterError::Sql`] for a durable membership failure.
+    async fn set_readiness(
+        &self,
+        registered: &RegisteredRole,
+        ready: bool,
+    ) -> Result<(), ClusterError> {
         match self
             .nodes
             .heartbeat(
                 &registered.key,
                 registered.fencing_token,
-                true,
+                ready,
                 &registered.capabilities,
             )
             .await?
@@ -292,8 +406,8 @@ impl ClusterRegistry {
         }
     }
 
-    /// Registers one closed role and marks it ready through its new independent fence.
-    async fn register_role(
+    /// Reserves one closed role under a new independent fence as not ready.
+    async fn reserve_role(
         &self,
         role: ClusterRole,
         address: &str,
@@ -315,7 +429,6 @@ impl ClusterRegistry {
             fencing_token: registered.lease.fencing_token,
             capabilities,
         };
-        self.heartbeat(&role).await?;
         Ok(role)
     }
 }

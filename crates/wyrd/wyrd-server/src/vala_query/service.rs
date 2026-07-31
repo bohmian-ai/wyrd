@@ -1,12 +1,11 @@
 //! Typed LogicalPlan builders for each ValaQueryService method (M-07).
 //!
 //! Each function:
-//!   1. Resolves the domain table provider(s) from the bifrost catalog.
-//!   2. Registers them in a temporary session context to get a schema-aware DataFrame.
+//!   1. Requests a tenant-qualified typed DataFrame from retained Oracle.
 //!   3. Applies typed filters as bound `Expr` literals — never string interpolation.
 //!   4. Projects away sensitive payload columns when the caller lacks the payload permission.
 //!   5. Returns the `LogicalPlan` (pre-analysis). The `TenantPredicateRule` analyzer
-//!      injects the tenant predicate during `run_plan_query`'s `execute_logical_plan` call.
+//!      injects the tenant predicate during Oracle's typed-plan execution.
 //!
 //! Note on trace-summary methods (QueryTraces, QueryRecentTraces): these return spans
 //! plans filtered but NOT aggregated. The route handler performs the in-Rust GROUP-BY
@@ -21,22 +20,9 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use datafusion::common::TableReference;
-use datafusion::datasource::MemTable;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::prelude::{DataFrame, SessionContext, col, lit};
+use datafusion::prelude::{DataFrame, col, lit};
 use datafusion::scalar::ScalarValue;
-use vala_bifrost::BifrostNamespace;
-use vala_bifrost::error::BifrostError as EngineBifrostError;
-use vala_bifrost::session::wyrd_session_context;
-use vala_bifrost_redux::catalog::{
-    BifrostCatalogError as ReduxCatalogError, TableRef as ReduxTableRef, TenantTableBinding,
-};
-use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
-use vala_bifrost_redux::scribe::seal_key::EventDay;
-use vala_bifrost_redux::scribe::tail_rpc::FetchLiveTailRequest;
-use vala_bifrost_redux::scribe::wal::WalLsn;
-use vala_bifrost_redux::tables::builtin_table;
 use wyrd_runtime::{Action, Permission, Resource};
 use wyrd_spec::error::WyrdError;
 use wyrd_spec::vala::api::{
@@ -52,14 +38,6 @@ use crate::components::auth::Caller;
 /// Default time window for `GetTrace` and listing queries (F-08: no unbounded scans).
 pub(crate) const DEFAULT_WINDOW_DAYS: i64 = 7;
 
-#[derive(Clone, Copy)]
-struct TableProviderScope<'a> {
-    tenant: wyrd_spec::ids::DataTenantId,
-    fqn: &'a str,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
-}
-
 /// Ceiling on records collected before pagination (mirrors MAX_QUERY_PAGE_SIZE).
 pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
     requested
@@ -67,138 +45,32 @@ pub(crate) fn effective_limit(requested: Option<u32>) -> u32 {
         .min(MAX_QUERY_PAGE_SIZE)
 }
 
-/// Fetch the bounded active/immutable Scribe tail for one query table.
-pub(crate) async fn fetch_hot_batches(
+/// Resolves one typed published table through the retained Oracle owner.
+///
+/// # Errors
+///
+/// Returns role-unavailable or a stable Oracle catalog/planning error.
+async fn typed_dataframe(
     state: &AppState,
-    table: &ReduxTableRef,
-    tenant: wyrd_spec::ids::DataTenantId,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
-) -> Result<Vec<arrow::record_batch::RecordBatch>, WyrdError> {
-    let Some(scribe) = state
-        .bifrost_ingest
-        .as_ref()
-        .map(|runtime| runtime.scribe())
-    else {
-        return Ok(Vec::new());
-    };
-    let now = Utc::now();
-    let start = since.unwrap_or_else(|| now - Duration::days(DEFAULT_WINDOW_DAYS));
-    let end = until.unwrap_or(now);
-    if start > end {
-        return Ok(Vec::new());
-    }
-    let binding = TenantTableBinding::resolve((tenant, table.clone())).map_err(|error| {
-        WyrdError::Internal {
-            message: "invalid tenant table binding".to_owned(),
-            details: serde_json::json!({ "detail": error.to_string() }),
-        }
-    })?;
-    let service = scribe.tail_service().map_err(|error| WyrdError::Internal {
-        message: "Scribe hot-read service unavailable".to_owned(),
-        details: serde_json::json!({ "detail": error.to_string() }),
-    })?;
-    let request = FetchLiveTailRequest {
-        binding,
-        target_stream: service.stream(),
-        start_day: EventDay::from_timestamp(start),
-        end_day: EventDay::from_timestamp(end),
-        after_lsn: WalLsn::ZERO,
-        required_columns: Vec::new(),
-    };
-    service
-        .fetch_hot_batches(request)
+    caller: &Caller,
+    audit_operation: &'static str,
+    fqn: &str,
+) -> Result<DataFrame, WyrdError> {
+    crate::query::service::authorize_audited(
+        state.clone(),
+        caller.clone(),
+        Permission::bifrost_query_read(),
+        audit_operation,
+        "vala.query",
+    )
+    .await?;
+    state
+        .bifrost_query()
+        .ok_or(wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable)?
+        .oracle()
+        .typed_dataframe(caller.data_tenant_id, fqn)
         .await
-        .map(|batches| batches.into_iter().map(|batch| batch.rows).collect())
-        .map_err(|error| WyrdError::Internal {
-            message: "Scribe hot-read failed".to_owned(),
-            details: serde_json::json!({ "detail": error.to_string() }),
-        })
-}
-
-/// Register a domain table provider in `ctx`. A missing table (not yet materialized)
-/// is silently skipped — DataFusion planning will surface the error if the table is
-/// actually referenced.
-async fn attach_redux_table_provider(
-    ctx: &SessionContext,
-    state: &AppState,
-    ns: BifrostNamespace,
-    table_name: &str,
-    scope: TableProviderScope<'_>,
-) -> Result<(), WyrdError> {
-    let segment = ns.as_str().strip_prefix("vala.").unwrap_or(ns.as_str());
-    let redux_ns =
-        ReduxNamespace::from_domain_namespace(segment).ok_or_else(|| WyrdError::Internal {
-            message: "unknown Redux Bifrost namespace".to_owned(),
-            details: serde_json::json!({ "namespace": ns.as_str() }),
-        })?;
-    let table = ReduxTableRef::new(redux_ns, table_name);
-    let hot_batches =
-        fetch_hot_batches(state, &table, scope.tenant, scope.since, scope.until).await?;
-    let catalog = state
-        .bifrost_redux
-        .as_deref()
-        .ok_or_else(|| WyrdError::Internal {
-            message: "Redux Bifrost catalog is not configured".to_owned(),
-            details: serde_json::Value::Null,
-        })?;
-    match catalog
-        .provider_with_hot_batches(&table, scope.tenant, hot_batches)
-        .await
-    {
-        Ok(provider) => {
-            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(provider))
-                .map_err(|e| WyrdError::Internal {
-                    message: "failed to register domain table".to_owned(),
-                    details: serde_json::json!({ "detail": e.to_string() }),
-                })?;
-        }
-        Err(ReduxCatalogError::TableNotFound(_)) => {
-            let Some(definition) = builtin_table(segment, table_name) else {
-                return Ok(());
-            };
-            let empty = MemTable::try_new((definition.schema)(), vec![vec![]]).map_err(df_err)?;
-            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(empty))
-                .map_err(df_err)?;
-        }
-        Err(error) => {
-            return Err(WyrdError::Internal {
-                message: "bifrost provider error".to_owned(),
-                details: serde_json::json!({ "detail": error.to_string() }),
-            });
-        }
-    }
-    Ok(())
-}
-
-async fn attach_table_provider(
-    ctx: &SessionContext,
-    state: &AppState,
-    ns: BifrostNamespace,
-    table_name: &str,
-    scope: TableProviderScope<'_>,
-) -> Result<(), WyrdError> {
-    if state.bifrost_redux.is_some() {
-        return attach_redux_table_provider(ctx, state, ns, table_name, scope).await;
-    }
-
-    match state.bifrost.provider(ns, table_name, scope.tenant).await {
-        Ok(provider) => {
-            ctx.register_table(TableReference::bare(scope.fqn), Arc::new(provider))
-                .map_err(|e| WyrdError::Internal {
-                    message: "failed to register domain table".to_owned(),
-                    details: serde_json::json!({ "detail": e.to_string() }),
-                })?;
-        }
-        Err(EngineBifrostError::TableNotFound(_)) => {}
-        Err(e) => {
-            return Err(WyrdError::Internal {
-                message: "bifrost provider error".to_owned(),
-                details: serde_json::json!({ "detail": e.to_string() }),
-            });
-        }
-    }
-    Ok(())
+        .map_err(Into::into)
 }
 
 /// Apply a mandatory `wyrd_event_time` window filter. `since` defaults to
@@ -278,27 +150,13 @@ pub async fn build_get_trace_plan(
     caller: &Caller,
     req: &GetTraceRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Traces,
-        "spans",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.traces.spans",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.get_trace",
+        "vala.traces.spans",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.traces.spans"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let trace_id = hex::decode(&req.trace_id).map_err(|error| WyrdError::Validation {
         message: "trace_id must be a hexadecimal value".to_owned(),
@@ -328,27 +186,13 @@ pub async fn build_query_traces_plan(
     caller: &Caller,
     req: &QueryTracesRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Traces,
-        "spans",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.traces.spans",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_traces",
+        "vala.traces.spans",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.traces.spans"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     // service_name is the physical column; matches req.service filter name
     let df = opt_filter_str(df, "service_name", &req.service)?;
@@ -366,27 +210,13 @@ pub async fn build_query_recent_traces_plan(
     caller: &Caller,
     req: &QueryRecentTracesRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Traces,
-        "spans",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.traces.spans",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_recent_traces",
+        "vala.traces.spans",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.traces.spans"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_str(df, "service_name", &req.service)?;
     let df = opt_filter_str(df, "status", &req.status)?;
@@ -403,27 +233,13 @@ pub async fn build_query_genai_plan(
     caller: &Caller,
     req: &QueryGenAiRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::GenAi,
-        "messages",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.genai.messages",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_genai",
+        "vala.genai.messages",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.genai.messages"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_str(df, "conversation_id", &req.conversation_id)?;
     let df = opt_filter_str(df, "request_model", &req.model)?;
@@ -444,28 +260,13 @@ pub async fn build_query_eval_plan(
     caller: &Caller,
     req: &QueryEvalRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    // assertions table has assertion_name (metric), score_value (score), eval_ref (eval_id)
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Eval,
-        "assertions",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.eval.assertions",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_eval",
+        "vala.eval.assertions",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.eval.assertions"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     // eval_ref maps to EvalRow.eval_id in the extraction layer
     let df = opt_filter_str(df, "eval_ref", &req.eval_id)?;
@@ -481,27 +282,13 @@ pub async fn build_query_drift_plan(
     caller: &Caller,
     req: &QueryDriftRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Drift,
-        "observations",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.drift.observations",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_drift",
+        "vala.drift.observations",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.drift.observations"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     // series maps to DriftRow.feature in the extraction layer
     let df = opt_filter_str(df, "series", &req.feature)?;
@@ -517,27 +304,13 @@ pub async fn build_query_metrics_plan(
     caller: &Caller,
     req: &QueryMetricsRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Metrics,
-        "points",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.metrics.points",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_metrics",
+        "vala.metrics.points",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.metrics.points"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_str(df, "metric_name", &req.metric_name)?;
     let df = opt_filter_str(df, "metric_type", &req.metric_type)?;
@@ -552,27 +325,13 @@ pub async fn build_query_logs_plan(
     caller: &Caller,
     req: &QueryLogsRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Logs,
-        "records",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.logs.records",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_logs",
+        "vala.logs.records",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.logs.records"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_i32(df, "severity_number", req.severity_number_min)?;
     // trace_id in logs is FixedSizeBinary(16); string filter deferred to Stage 5
@@ -594,27 +353,13 @@ pub async fn build_query_agent_traces_plan(
     caller: &Caller,
     req: &QueryAgentTracesRequest,
 ) -> Result<LogicalPlan, WyrdError> {
-    let tenant = caller.data_tenant_id;
-    let ctx = wyrd_session_context(tenant);
-
-    attach_table_provider(
-        &ctx,
+    let df = typed_dataframe(
         state,
-        BifrostNamespace::Dev,
-        "agent_traces",
-        TableProviderScope {
-            tenant,
-            fqn: "vala.dev.agent_traces",
-            since: req.window.since,
-            until: req.window.until,
-        },
+        caller,
+        "vala.query.typed.query_agent_traces",
+        "vala.dev.agent_traces",
     )
     .await?;
-
-    let df = ctx
-        .table(TableReference::bare("vala.dev.agent_traces"))
-        .await
-        .map_err(df_err)?;
     let df = apply_window(df, req.window.since, req.window.until)?;
     let df = opt_filter_str(df, "dev_session_id", &req.dev_session_id)?;
     let df = opt_filter_str(df, "repo", &req.repo)?;

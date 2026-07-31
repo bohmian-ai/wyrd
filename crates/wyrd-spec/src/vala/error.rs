@@ -380,7 +380,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_504_QUERY_TIMEOUT",
         status = 504,
         title = "Query execution timed out",
-        remediation = "Narrow the query (add filters, reduce scanned partitions) or use the async query API."
+        remediation = "Narrow the query by adding filters or reducing scanned partitions."
     )]
     QueryTimeout,
 
@@ -390,7 +390,7 @@ pub enum BifrostError {
         code = "WYRD_VALA_413_QUERY_RESULT_TOO_LARGE",
         status = 413,
         title = "Query result too large",
-        remediation = "Add a LIMIT or narrower filters, or use the async query API for large result sets."
+        remediation = "Add a LIMIT or narrower filters for large result sets."
     )]
     QueryResultTooLarge,
 

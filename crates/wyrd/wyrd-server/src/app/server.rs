@@ -15,7 +15,9 @@ use wyrd_tonic::tonic_health::server::HealthReporter;
 use crate::app::BootExit;
 use crate::app::metrics::{install_recorder, metrics_router, serve_metrics};
 use crate::app::serve::serve;
-use crate::app::supervise::{TaskExit, TaskId, fallible_task, supervise, worker_task};
+use crate::app::supervise::{
+    TaskExit, TaskId, fallible_task, supervise_with_shutdown, worker_task,
+};
 use crate::boot::{ServerBootError, spawn_maintenance_scheduler, spawn_storage_sweeper};
 use crate::components::health::readiness_loop;
 use crate::config::{ServeMode, WyrdServerConfig};
@@ -370,12 +372,14 @@ impl BoundServer {
         }
         // One supervised Redux Forge worker owns compaction, expiry, reconciliation,
         // live-set rebuild, and orphan GC for this process.
-        let scheduler = spawn_maintenance_scheduler(&self.state, shutdown.clone())
-            .map_err(|e| BootExit::Other(Box::new(e)))?;
-        set.spawn(fallible_task(
-            TaskId::Worker("maintenance_scheduler"),
-            scheduler,
-        ));
+        if let Some(scheduler) = spawn_maintenance_scheduler(&self.state, shutdown.clone())
+            .map_err(|e| BootExit::Other(Box::new(e)))?
+        {
+            set.spawn(fallible_task(
+                TaskId::Worker("maintenance_scheduler"),
+                scheduler,
+            ));
+        }
 
         // Enterprise workers.
         for (name, worker) in self.extra_workers.drain(..) {
@@ -417,8 +421,29 @@ impl BoundServer {
         ));
 
         let drain = Duration::from_millis(self.config.shutdown.drain_ms);
-        let terminal = supervise(set, shutdown, drain).await;
+        let query = self.state.bifrost_query();
+        let ingest = self.state.bifrost_ingest.clone();
+        let terminal = supervise_with_shutdown(set, shutdown, drain, || {
+            let query = query.clone();
+            let ingest = ingest.clone();
+            async move {
+                if let Some(runtime) = query
+                    && let Err(error) = runtime.begin_shutdown().await
+                {
+                    tracing::warn!(%error, "failed to remove Oracle readiness before transport drain");
+                }
+                if let Some(runtime) = ingest
+                    && let Err(error) = runtime.begin_shutdown().await
+                {
+                    tracing::warn!(%error, "failed to remove Scribe readiness before transport drain");
+                }
+            }
+        })
+        .await;
 
+        if let Some(runtime) = self.state.bifrost_query() {
+            runtime.shutdown(std::time::Instant::now() + drain).await;
+        }
         if let Some(runtime) = &self.state.bifrost_ingest {
             runtime.shutdown().await;
         }

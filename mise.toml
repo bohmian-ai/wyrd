@@ -947,6 +947,7 @@ run = """
 cargo run --locked -p wyrd-spec --example gen_schemas --features server
 cargo run --locked -p wyrd-client --example gen_schemas
 cargo run --locked -p vala-core --example gen_schemas
+mise run codegen:openapi
 mise run codegen:stubs
 test -f openapi.yaml || { echo 'openapi.yaml missing'; exit 1; }
 """

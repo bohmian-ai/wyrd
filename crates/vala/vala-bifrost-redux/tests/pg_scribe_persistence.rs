@@ -877,7 +877,11 @@ async fn wal_replay_preserves_row_identity() {
         assert!(Instant::now() < deadline, "replay publication stalled");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    let bytes = fixture.operator.read(&path).await.expect("published parquet reads");
+    let bytes = fixture
+        .operator
+        .read(&path)
+        .await
+        .expect("published parquet reads");
     let builder = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes.to_vec()))
         .expect("published object is parquet");
     let reader = builder.build().expect("parquet reader builds");
@@ -896,10 +900,12 @@ async fn wal_replay_preserves_row_identity() {
         .flatten()
         .collect::<Vec<_>>();
     assert_eq!(ordinals.len(), 50_000);
-    assert!(ordinals
-        .iter()
-        .enumerate()
-        .all(|(index, ordinal)| *ordinal == index as i32));
+    assert!(
+        ordinals
+            .iter()
+            .enumerate()
+            .all(|(index, ordinal)| *ordinal == index as i32)
+    );
     fixture.stop().await;
 }
 

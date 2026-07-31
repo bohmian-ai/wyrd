@@ -4,7 +4,7 @@
 //! `x-wyrd-access-token` bearer is extracted from the tonic `MetadataMap`,
 //! verified via `state.auth.token_verifier`, and wrapped into a `Caller`.
 //! Plan building and execution reuse the same `vala_query::service` and
-//! `query::service::run_plan_query` seams the HTTP routes use.
+//! `query::service::run_typed_query` seam the HTTP routes use.
 
 use chrono::DateTime;
 use wyrd_spec::vala::api::QueryWindow;
@@ -25,7 +25,7 @@ use wyrd_tonic::wyrd::v1::{
 
 use crate::AppState;
 use crate::components::auth::Caller;
-use crate::query::service::run_plan_query;
+use crate::query::service::run_typed_query;
 use crate::vala_query::page_token;
 use crate::vala_query::routes::{
     aggregate_spans_to_summaries, extract_agent_trace_rows, extract_drift_rows, extract_eval_rows,
@@ -262,15 +262,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_get_trace_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, _) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.get_trace",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, _) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let spans: Vec<proto::SpanRow> = extract_span_rows_filtered(&batches, &api_req.trace_id)
             .into_iter()
@@ -326,15 +320,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_traces",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::TraceSummaryRow> = aggregate_spans_to_summaries(&batches)
             .into_iter()
@@ -385,15 +373,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_recent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_recent_traces",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::TraceSummaryRow> = aggregate_spans_to_summaries(&batches)
             .into_iter()
@@ -439,15 +421,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_genai_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_genai",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::GenAiRow> = extract_genai_rows(&batches)
             .into_iter()
@@ -490,15 +466,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_eval_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_eval",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::EvalRow> = extract_eval_rows(&batches)
             .into_iter()
@@ -541,15 +511,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_drift_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_drift",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::DriftRow> = extract_drift_rows(&batches)
             .into_iter()
@@ -599,15 +563,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_metrics_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_metrics",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::MetricRow> = extract_metric_rows(&batches)
             .into_iter()
@@ -648,15 +606,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_logs_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_logs",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::LogRow> = extract_log_rows(&batches)
             .into_iter()
@@ -710,15 +662,9 @@ impl ValaQueryService for ValaQueryGrpc {
         let plan = build_query_agent_traces_plan(&self.state, &caller, &api_req)
             .await
             .map_err(status_from_wyrd)?;
-        let (batches, has_more) = run_plan_query(
-            &self.state,
-            &caller,
-            plan,
-            "vala.query.typed.query_agent_traces",
-            limit,
-        )
-        .await
-        .map_err(status_from_wyrd)?;
+        let (batches, has_more) = run_typed_query(&self.state, &caller, plan, limit)
+            .await
+            .map_err(status_from_wyrd)?;
 
         let rows: Vec<proto::AgentTraceRow> = extract_agent_trace_rows(&batches)
             .into_iter()

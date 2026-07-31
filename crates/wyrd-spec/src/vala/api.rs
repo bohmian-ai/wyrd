@@ -892,42 +892,6 @@ pub enum QueryParam {
     Text(String),
 }
 
-/// Opaque async-query job identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-#[serde(transparent)]
-pub struct JobUid(pub uuid::Uuid);
-
-/// Terminal/in-flight state of an async query job.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum AsyncJobState {
-    /// Accepted, not yet claimed by an executor.
-    Queued,
-    /// Claimed by an executor.
-    Claimed,
-    /// Executing.
-    Running,
-    /// Completed successfully.
-    Succeeded,
-    /// Failed.
-    Failed,
-    /// Canceled.
-    Canceled,
-}
-
-/// Machine-readable executor-availability signal (review M-06). In Stage 3 a
-/// queued job is accepted but its executor does not exist yet, so status carries
-/// [`ExecutorAvailability::PendingStage5`] rather than a false "running" claim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub enum ExecutorAvailability {
-    /// An executor is available (Stage 5+).
-    Available,
-    /// No executor exists yet — the job is accepted but will not run until Stage 5.
-    PendingStage5,
-}
-
 /// Synchronous SQL query request. The response is a raw Arrow IPC stream, not a
 /// JSON type, so no response struct lives here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -2180,47 +2144,6 @@ pub enum WorkerAttemptFrame {
     Footer(WorkerFooter),
 }
 
-/// Asynchronous SQL query submission.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AsyncQueryRequest {
-    /// SELECT-only SQL text.
-    pub sql: String,
-    /// Bound parameters.
-    #[serde(default)]
-    pub params: Vec<QueryParam>,
-}
-
-/// Response to an async query submission.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AsyncQueryResponse {
-    /// Assigned job id.
-    pub job_uid: JobUid,
-    /// Initial job state.
-    pub state: AsyncJobState,
-    /// Executor-availability signal (review M-06).
-    pub executor_availability: ExecutorAvailability,
-}
-
-/// Status of a previously-submitted async query job.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[cfg_attr(feature = "server", derive(utoipa::ToSchema))]
-pub struct AsyncQueryStatus {
-    /// Job id.
-    pub job_uid: JobUid,
-    /// Current job state.
-    pub state: AsyncJobState,
-    /// Executor-availability signal — `PendingStage5` in Stage 3 (review M-06).
-    pub executor_availability: ExecutorAvailability,
-    /// Stable Wyrd error code on failure (review M-15).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    /// Sanitized error detail on failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_detail: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
@@ -2652,12 +2575,33 @@ mod bifrost_wire_tests {
     //! Contract tests for the Arrow-free Bifrost wire types in `crate::vala::api`.
 
     use crate::vala::api::{
-        AsyncJobState, AsyncQueryResponse, AsyncQueryStatus, BifrostTableDescription,
-        BifrostTableEntry, DataTypeSpec, ExecutorAvailability, FieldSpec, JobUid,
-        PartitionColumnSpec, PartitionTransformWire, QueryParam, RegisterOutcome,
-        RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableStatus, TimeUnit,
+        BifrostTableDescription, BifrostTableEntry, DataTypeSpec, FieldSpec, PartitionColumnSpec,
+        PartitionTransformWire, QueryParam, RegisterOutcome, RegisterTableRequest,
+        RegisterTableResponse, SyncQueryRequest, TableStatus, TimeUnit,
     };
     use schemars::schema_for;
+
+    /// Proves the removed asynchronous query-job contract family stays absent.
+    #[test]
+    fn async_query_contract_family_is_absent() {
+        let production = include_str!("api.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("Vala API has a production section");
+        for removed in [
+            "struct JobUid",
+            "enum AsyncJobState",
+            "enum ExecutorAvailability",
+            "struct AsyncQueryRequest",
+            "struct AsyncQueryResponse",
+            "struct AsyncQueryStatus",
+        ] {
+            assert!(
+                !production.contains(removed),
+                "removed asynchronous query contract returned: {removed}"
+            );
+        }
+    }
 
     fn bifrost_wire_round_trip<T>(value: &T) -> T
     where
@@ -2781,19 +2725,6 @@ mod bifrost_wire_tests {
                 QueryParam::Text("x".to_string()),
             ],
         });
-        let job = JobUid(uuid::Uuid::now_v7());
-        bifrost_wire_round_trip(&AsyncQueryResponse {
-            job_uid: job,
-            state: AsyncJobState::Queued,
-            executor_availability: ExecutorAvailability::PendingStage5,
-        });
-        bifrost_wire_round_trip(&AsyncQueryStatus {
-            job_uid: job,
-            state: AsyncJobState::Failed,
-            executor_availability: ExecutorAvailability::PendingStage5,
-            error_code: Some("WYRD_VALA_400_QUERY_INVALID_SQL".to_string()),
-            error_detail: Some("not a SELECT".to_string()),
-        });
     }
 
     #[test]
@@ -2818,10 +2749,7 @@ mod bifrost_wire_tests {
         let _ = schema_for!(RegisterTableRequest);
         let _ = schema_for!(RegisterTableResponse);
         let _ = schema_for!(SyncQueryRequest);
-        let _ = schema_for!(AsyncQueryResponse);
-        let _ = schema_for!(AsyncQueryStatus);
         let _ = schema_for!(QueryParam);
-        let _ = schema_for!(JobUid);
     }
 
     /// Private tail and peer DTOs remain schema-generatable pure contracts.

@@ -49,6 +49,8 @@ pub enum ProbeReason {
     Warmup,
     /// Scribe WAL recovery or downstream publication has not completed.
     ScribeRecovery,
+    /// Oracle role registration, coordination, or worker startup has not completed.
+    OracleStartup,
 }
 
 /// Snapshot published by the background readiness_loop task.
@@ -60,6 +62,8 @@ pub struct ReadinessSnapshot {
     pub storage: ProbeOutcome,
     /// Scribe recovery and write-path readiness result.
     pub scribe: ProbeOutcome,
+    /// Oracle registration and query-path readiness result.
+    pub oracle: ProbeOutcome,
 }
 
 /// Per-dependency probe result.
@@ -91,13 +95,18 @@ impl ReadinessSnapshot {
                 reason: ProbeReason::Warmup,
                 elapsed_ms: 0,
             },
+            oracle: ProbeOutcome {
+                ok: false,
+                reason: ProbeReason::Warmup,
+                elapsed_ms: 0,
+            },
         }
     }
 
     /// True when all probes passed in the most recent tick.
     #[must_use]
     pub fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok
+        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
     }
 }
 
@@ -128,12 +137,51 @@ async fn compute_snapshot(state: &AppState, probe_timeout: Duration) -> Readines
         postgres: pg,
         storage,
         scribe: probe_scribe(state),
+        oracle: probe_oracle(state),
     }
+}
+
+/// Reads retained Oracle readiness without executing a query or touching storage.
+fn probe_oracle(state: &AppState) -> ProbeOutcome {
+    let selected = state
+        .bifrost_roles
+        .contains(&crate::config::BifrostRuntimeRole::Oracle);
+    let outcome = match state.bifrost_query() {
+        Some(runtime) if runtime.is_ready() => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+        Some(_) if selected => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
+            elapsed_ms: 0,
+        },
+        None if selected => ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
+            elapsed_ms: 0,
+        },
+        None | Some(_) => ProbeOutcome {
+            ok: true,
+            reason: ProbeReason::Ok,
+            elapsed_ms: 0,
+        },
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(if selected && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
 }
 
 /// Read the Scribe recovery bit without touching its queues or storage.
 fn probe_scribe(state: &AppState) -> ProbeOutcome {
-    match &state.bifrost_ingest {
+    let selected = state
+        .bifrost_roles
+        .contains(&crate::config::BifrostRuntimeRole::Scribe);
+    let outcome = match &state.bifrost_ingest {
         Some(runtime) if runtime.is_ready() => ProbeOutcome {
             ok: true,
             reason: ProbeReason::Ok,
@@ -149,7 +197,13 @@ fn probe_scribe(state: &AppState) -> ProbeOutcome {
             reason: ProbeReason::Ok,
             elapsed_ms: 0,
         },
-    }
+    };
+    metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(if selected && outcome.ok {
+        1.0
+    } else {
+        0.0
+    });
+    outcome
 }
 
 async fn probe_postgres(state: &AppState, probe_timeout: Duration) -> ProbeOutcome {
@@ -279,6 +333,7 @@ struct PublicChecks {
     postgres: PublicProbeOutcome,
     storage: PublicProbeOutcome,
     scribe: PublicProbeOutcome,
+    oracle: PublicProbeOutcome,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -299,6 +354,9 @@ impl PublicReadinessReport {
                 },
                 scribe: PublicProbeOutcome {
                     reason: snapshot.scribe.reason,
+                },
+                oracle: PublicProbeOutcome {
+                    reason: snapshot.oracle.reason,
                 },
             },
         }
@@ -323,7 +381,7 @@ pub async fn readyz(State(state): State<AppState>) -> Response {
 
 impl wyrd_tonic::health::HealthSnapshot for ReadinessSnapshot {
     fn all_ok(&self) -> bool {
-        self.postgres.ok && self.storage.ok && self.scribe.ok
+        self.postgres.ok && self.storage.ok && self.scribe.ok && self.oracle.ok
     }
 }
 
@@ -348,6 +406,11 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            oracle: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -368,6 +431,11 @@ mod tests {
                 reason: ProbeReason::Ok,
                 elapsed_ms: 1,
             },
+            oracle: ProbeOutcome {
+                ok: true,
+                reason: ProbeReason::Ok,
+                elapsed_ms: 1,
+            },
         }
     }
 
@@ -378,6 +446,7 @@ mod tests {
         assert_eq!(snap.postgres.reason, ProbeReason::Warmup);
         assert_eq!(snap.storage.reason, ProbeReason::Warmup);
         assert_eq!(snap.scribe.reason, ProbeReason::Warmup);
+        assert_eq!(snap.oracle.reason, ProbeReason::Warmup);
     }
 
     #[test]
@@ -398,6 +467,18 @@ mod tests {
         snapshot.scribe = ProbeOutcome {
             ok: false,
             reason: ProbeReason::ScribeRecovery,
+            elapsed_ms: 0,
+        };
+        assert!(!snapshot.all_ok());
+    }
+
+    /// Oracle startup failure independently blocks public readiness.
+    #[test]
+    fn failed_oracle_startup_is_not_ready() {
+        let mut snapshot = all_ok_snapshot();
+        snapshot.oracle = ProbeOutcome {
+            ok: false,
+            reason: ProbeReason::OracleStartup,
             elapsed_ms: 0,
         };
         assert!(!snapshot.all_ok());

@@ -9,6 +9,7 @@ pub mod components;
 pub mod config;
 pub mod grpc;
 pub mod http;
+pub mod openapi;
 pub mod oracle;
 pub mod postgres;
 pub mod query;

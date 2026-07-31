@@ -107,6 +107,34 @@ pub async fn authenticate<R: PermissionResolver + 'static, I: IssuerConfigResolv
     })
 }
 
+/// Verifies owned metadata with an owned verifier for `Send` transport futures.
+///
+/// # Errors
+///
+/// Returns [`IngestError::Unauthenticated`] when metadata or token
+/// verification fails, including a verifier task that cannot complete.
+pub async fn authenticate_owned<
+    R: PermissionResolver + 'static,
+    I: IssuerConfigResolver + 'static,
+>(
+    verifier: Arc<TokenVerifier<R, I>>,
+    metadata: MetadataMap,
+) -> Result<AuthContext, IngestError> {
+    let token = extract_bearer(&metadata)?;
+    let expected_tenant = tenant_from_unverified_access_token(token.expose_secret())?;
+    let verified_token =
+        tokio::spawn(async move { verifier.verify(&token, &expected_tenant).await })
+            .await
+            .map_err(|_| IngestError::Unauthenticated("token verification task failed".to_owned()))?
+            .map_err(|error| IngestError::Unauthenticated(error.to_string()))?;
+    let request_id = read_or_mint_request_id(&metadata);
+    Ok(AuthContext {
+        principal: verified_token.principal.clone(),
+        tenant: expected_tenant,
+        request_id,
+    })
+}
+
 /// Interceptor holder generic over the concrete resolver-backed verifier.
 ///
 /// S3.C2 injects the concrete `SqlPermissionResolver`-backed verifier at mount

@@ -61,16 +61,35 @@ where
 /// - After shutdown is requested, remaining tasks drain up to `drain`; their
 ///   exits are logged, not treated as new terminal errors. On deadline, abort.
 pub async fn supervise(
-    mut set: JoinSet<TaskExit>,
+    set: JoinSet<TaskExit>,
     shutdown: CancellationToken,
     drain: Duration,
 ) -> Option<String> {
+    supervise_with_shutdown(set, shutdown, drain, || async {}).await
+}
+
+/// Drive supervision while running ordered readiness removal before cancellation.
+///
+/// The hook runs after the first exit is classified but before transport and
+/// worker cancellation. Role owners use it to become unready durably while
+/// already accepted requests still receive the configured drain budget.
+pub async fn supervise_with_shutdown<F, Fut>(
+    mut set: JoinSet<TaskExit>,
+    shutdown: CancellationToken,
+    drain: Duration,
+    before_cancel: F,
+) -> Option<String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     let mut terminal: Option<String> = None;
 
     // Phase 1 — wait for the first exit (or an empty set).
     if let Some(joined) = set.join_next().await {
         classify_first(joined, &mut terminal);
     }
+    before_cancel().await;
     shutdown.cancel();
 
     // Phase 2 — drain within budget, then abort.
@@ -139,12 +158,50 @@ fn log_drain(joined: Result<TaskExit, tokio::task::JoinError>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
     use tokio::task::JoinSet;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+
+    /// Proves readiness removal precedes cancellation of an active request.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_hook_runs_before_active_request_drain() {
+        let shutdown = CancellationToken::new();
+        let state = Arc::new(AtomicU8::new(0));
+        let mut set: JoinSet<TaskExit> = JoinSet::new();
+        set.spawn(worker_task(TaskId::Signal, async {}));
+
+        let request_shutdown = shutdown.clone();
+        let request_state = Arc::clone(&state);
+        set.spawn(worker_task(TaskId::Worker("active_query"), async move {
+            request_shutdown.cancelled().await;
+            assert_eq!(
+                request_state.load(Ordering::Acquire),
+                1,
+                "active work must observe readiness removed before cancellation"
+            );
+            request_state.store(2, Ordering::Release);
+        }));
+
+        let hook_state = Arc::clone(&state);
+        let hook_shutdown = shutdown.clone();
+        let terminal =
+            supervise_with_shutdown(set, shutdown, Duration::from_secs(1), move || async move {
+                assert!(
+                    !hook_shutdown.is_cancelled(),
+                    "transport cancellation must follow readiness removal"
+                );
+                hook_state.store(1, Ordering::Release);
+            })
+            .await;
+
+        assert!(terminal.is_none());
+        assert_eq!(state.load(Ordering::Acquire), 2);
+    }
 
     #[tokio::test]
     async fn signal_completion_is_graceful() {

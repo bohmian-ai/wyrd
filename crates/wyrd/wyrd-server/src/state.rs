@@ -1,9 +1,15 @@
 //! Shared axum application state.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use datafusion::execution::memory_pool::MemoryPool;
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
@@ -13,6 +19,7 @@ use vala_bifrost_redux::forge::Forge;
 use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
+use vala_bifrost_redux::oracle::Oracle;
 use vala_bifrost_redux::scribe::ScribeImpl;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
 use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
@@ -26,7 +33,7 @@ use crate::auth::pg_resolvers::PgIssuerResolver;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::{EvalAuditWriter, EvalRuns, TracingEvalAuditWriter, new_run_map};
 use crate::components::health::ReadinessSnapshot;
-use crate::config::DeploymentProfile;
+use crate::config::{BifrostRuntimeRole, DeploymentProfile};
 use crate::postgres::ServerPostgres;
 
 /// Production [`TokenVerifier`] specialization: SQL-backed permission resolution
@@ -37,6 +44,65 @@ pub type WyrdTokenVerifier = TokenVerifier<SqlPermissionResolver, PgIssuerResolv
 /// Production Gate specialization used by AppState.
 pub type ServerGate =
     vala_bifrost_redux::gate::Gate<BifrostCatalog, SqlPermissionResolver, PgIssuerResolver>;
+
+/// Ordered local lifecycle states for one independently fenced role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RoleLifecycleState {
+    /// The role may advertise readiness and accept new work.
+    Serving = 0,
+    /// Durable readiness is being removed while accepted transports drain.
+    Draining = 1,
+    /// Heartbeats are stopped and the owner is rejecting or cancelling work.
+    Stopping = 2,
+    /// The retained fence has been unregistered.
+    Stopped = 3,
+}
+
+/// Lock-free owner for monotonic role shutdown transitions.
+#[derive(Debug)]
+struct RoleLifecycle {
+    /// Current [`RoleLifecycleState`] encoded for request-path reads.
+    state: AtomicU8,
+}
+
+impl RoleLifecycle {
+    /// Creates a role lifecycle in its serving state.
+    fn serving() -> Self {
+        Self {
+            state: AtomicU8::new(RoleLifecycleState::Serving as u8),
+        }
+    }
+
+    /// Reports whether new work and readiness advertisement remain permitted.
+    fn is_serving(&self) -> bool {
+        self.state.load(Ordering::Acquire) == RoleLifecycleState::Serving as u8
+    }
+
+    /// Starts readiness removal exactly once.
+    fn begin_draining(&self) -> bool {
+        self.state
+            .compare_exchange(
+                RoleLifecycleState::Serving as u8,
+                RoleLifecycleState::Draining as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Advances the owner to heartbeat-stop and work-rejection.
+    fn begin_stopping(&self) {
+        self.state
+            .fetch_max(RoleLifecycleState::Stopping as u8, Ordering::AcqRel);
+    }
+
+    /// Records that the exact role fence has completed teardown.
+    fn finish(&self) {
+        self.state
+            .store(RoleLifecycleState::Stopped as u8, Ordering::Release);
+    }
+}
 
 /// Owns one completely wired Bifrost ingest subsystem for a server process.
 ///
@@ -67,6 +133,140 @@ struct ScribeRoleRuntime {
     registered: RegisteredRole,
     /// Cancels the recurring heartbeat and snapshot tasks before role removal.
     shutdown: CancellationToken,
+    /// Retains the heartbeat task so teardown can prove it stopped before unregister.
+    heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Retains the snapshot poller so role-owned background work is drained.
+    snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Enforces readiness removal before transport drain and role teardown.
+    lifecycle: Arc<RoleLifecycle>,
+    /// Readiness value preserved by heartbeats during transport drain.
+    advertise_ready: Arc<AtomicBool>,
+}
+
+/// Owns one retained Oracle and its independent fenced server lifecycle.
+#[derive(Clone)]
+pub struct BifrostQueryRuntime {
+    /// Retained leader/worker query engine used by every Gate query dispatch.
+    oracle: Arc<Oracle>,
+    /// Exact Oracle fence registered after worker dependencies became ready.
+    registered_role: RegisteredRole,
+    /// Private peer service owner mounted on the shared gRPC listener.
+    peer: Arc<crate::oracle::OraclePeerRuntime>,
+    /// Shared durable registry used by heartbeat, discovery, and unregister.
+    registry: Arc<ClusterRegistry>,
+    /// Cancels the Oracle heartbeat and membership snapshot tasks.
+    role_shutdown: CancellationToken,
+    /// Retains the heartbeat task until ordered shutdown stops it.
+    heartbeat: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Retains the membership poller until ordered shutdown stops it.
+    snapshot_poller: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Enforces readiness removal before transport drain and role teardown.
+    lifecycle: Arc<RoleLifecycle>,
+    /// Readiness value preserved by heartbeats during transport drain.
+    advertise_ready: Arc<AtomicBool>,
+    /// Optional server-owned executor retained for Oracle coordination tasks.
+    coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+}
+
+impl BifrostQueryRuntime {
+    /// Creates the retained query lifecycle after role registration succeeds.
+    #[must_use]
+    pub fn new(
+        oracle: Arc<Oracle>,
+        registered_role: RegisteredRole,
+        peer: Arc<crate::oracle::OraclePeerRuntime>,
+        registry: Arc<ClusterRegistry>,
+        coordination_runtime: Option<Arc<tokio::runtime::Runtime>>,
+    ) -> Self {
+        let role_shutdown = CancellationToken::new();
+        let advertise_ready = Arc::new(AtomicBool::new(true));
+        let heartbeat = Arc::clone(&registry).start_readiness_heartbeat(
+            registered_role.clone(),
+            Arc::clone(&advertise_ready),
+            role_shutdown.clone(),
+        );
+        let snapshot_poller = Arc::clone(&registry).start_snapshot_poller(role_shutdown.clone());
+        Self {
+            oracle,
+            registered_role,
+            peer,
+            registry,
+            role_shutdown,
+            heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
+            snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
+            lifecycle: Arc::new(RoleLifecycle::serving()),
+            advertise_ready,
+            coordination_runtime,
+        }
+    }
+
+    /// Borrows the retained Oracle used by local Gate dispatch.
+    #[must_use]
+    pub fn oracle(&self) -> &Arc<Oracle> {
+        &self.oracle
+    }
+
+    /// Returns the private peer service owner mounted for this Oracle fence.
+    #[must_use]
+    pub fn peer(&self) -> Arc<crate::oracle::OraclePeerRuntime> {
+        Arc::clone(&self.peer)
+    }
+
+    /// Reports startup reconciliation and lifecycle readiness, excluding saturation.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.lifecycle.is_serving() && self.oracle.is_ready()
+    }
+
+    /// Removes durable readiness before transport draining begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry error when the exact Oracle fence cannot be marked
+    /// unready. Local readiness still closes so the process fails closed.
+    pub async fn begin_shutdown(&self) -> Result<(), vala_bifrost_redux::cluster::ClusterError> {
+        if !self.lifecycle.begin_draining() {
+            return Ok(());
+        }
+        metrics::gauge!("bifrost_role_ready", "role" => "oracle").set(0.0);
+        self.advertise_ready.store(false, Ordering::Release);
+        self.registry.deactivate(&self.registered_role).await
+    }
+
+    /// Stops heartbeat, rejects/cancels Oracle work, drains, and unregisters.
+    ///
+    /// This method mutates only the exact Oracle fence retained at construction;
+    /// a colocated Scribe role is never advanced or removed.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancellation after readiness removal can leave accepted Oracle work
+    /// draining. The server lifecycle should continue invoking shutdown until
+    /// its process deadline.
+    pub async fn shutdown(&self, deadline: Instant) {
+        if let Err(error) = self.begin_shutdown().await {
+            tracing::warn!(%error, "failed to remove Oracle readiness before shutdown");
+        }
+        self.lifecycle.begin_stopping();
+        self.role_shutdown.cancel();
+        await_role_task(&self.heartbeat, deadline, "oracle heartbeat").await;
+        await_role_task(&self.snapshot_poller, deadline, "oracle snapshot poller").await;
+        self.oracle.shutdown(deadline).await;
+        if let Err(error) = self
+            .registry
+            .shutdown_role(self.registered_role.clone())
+            .await
+        {
+            tracing::warn!(%error, "failed to unregister the Oracle role during shutdown");
+        }
+        self.lifecycle.finish();
+    }
+
+    /// Returns whether the runtime retains a dedicated coordination executor.
+    #[must_use]
+    pub fn has_dedicated_coordination_runtime(&self) -> bool {
+        self.coordination_runtime.is_some()
+    }
 }
 
 impl BifrostIngestRuntime {
@@ -116,12 +316,21 @@ impl BifrostIngestRuntime {
         registered: RegisteredRole,
     ) -> Self {
         let shutdown = CancellationToken::new();
-        std::mem::drop(Arc::clone(&registry).start_heartbeat(registered.clone(), shutdown.clone()));
-        std::mem::drop(Arc::clone(&registry).start_snapshot_poller(shutdown.clone()));
+        let advertise_ready = Arc::new(AtomicBool::new(true));
+        let heartbeat = Arc::clone(&registry).start_readiness_heartbeat(
+            registered.clone(),
+            Arc::clone(&advertise_ready),
+            shutdown.clone(),
+        );
+        let snapshot_poller = Arc::clone(&registry).start_snapshot_poller(shutdown.clone());
         self.scribe_role = Some(ScribeRoleRuntime {
             registry,
             registered,
             shutdown,
+            heartbeat: Arc::new(Mutex::new(Some(heartbeat))),
+            snapshot_poller: Arc::new(Mutex::new(Some(snapshot_poller))),
+            lifecycle: Arc::new(RoleLifecycle::serving()),
+            advertise_ready,
         });
         self
     }
@@ -147,23 +356,54 @@ impl BifrostIngestRuntime {
     /// Reports whether the ingest writer has completed recovery and can accept work.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.scribe.is_ready()
+        self.scribe_role
+            .as_ref()
+            .is_none_or(|role| role.lifecycle.is_serving())
+            && self.scribe.is_ready()
     }
 
-    /// Closes Gate before draining the shared Scribe allocation.
+    /// Removes Scribe readiness before transport draining begins.
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry error when the exact Scribe fence cannot be marked
+    /// unready. Local readiness still closes so the process fails closed.
+    pub async fn begin_shutdown(&self) -> Result<(), vala_bifrost_redux::cluster::ClusterError> {
+        let Some(role) = &self.scribe_role else {
+            return Ok(());
+        };
+        if !role.lifecycle.begin_draining() {
+            return Ok(());
+        }
+        metrics::gauge!("bifrost_role_ready", "role" => "scribe").set(0.0);
+        role.advertise_ready.store(false, Ordering::Release);
+        role.registry.deactivate(&role.registered).await
+    }
+
+    /// Stops heartbeat before Gate rejection, Scribe drain, and unregister.
     ///
     /// # Cancellation
     ///
     /// Cancellation after Gate closes can leave accepted Scribe work draining;
     /// callers should retry shutdown until the server lifecycle completes.
     pub async fn shutdown(&self) {
+        if let Err(error) = self.begin_shutdown().await {
+            tracing::warn!(%error, "failed to remove Scribe readiness before shutdown");
+        }
+        if let Some(role) = &self.scribe_role {
+            role.lifecycle.begin_stopping();
+            role.shutdown.cancel();
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            await_role_task(&role.heartbeat, deadline, "scribe heartbeat").await;
+            await_role_task(&role.snapshot_poller, deadline, "scribe snapshot poller").await;
+        }
         self.gate.close();
         self.scribe.shutdown().await;
         if let Some(role) = &self.scribe_role {
-            role.shutdown.cancel();
             if let Err(error) = role.registry.shutdown_role(role.registered.clone()).await {
                 tracing::warn!(%error, "failed to unregister the Scribe role during shutdown");
             }
+            role.lifecycle.finish();
         }
     }
 
@@ -171,6 +411,24 @@ impl BifrostIngestRuntime {
     #[must_use]
     pub fn has_dedicated_coordination_runtime(&self) -> bool {
         self.coordination_runtime.is_some()
+    }
+}
+
+/// Wait for one role-owned task until the process shutdown deadline.
+async fn await_role_task(
+    task: &Mutex<Option<JoinHandle<()>>>,
+    deadline: Instant,
+    task_name: &'static str,
+) {
+    let Some(mut task) = task.lock().await.take() else {
+        return;
+    };
+    if timeout_at(tokio::time::Instant::from_std(deadline), &mut task)
+        .await
+        .is_err()
+    {
+        tracing::warn!(task = task_name, "role task exceeded shutdown deadline");
+        task.abort();
     }
 }
 
@@ -217,6 +475,10 @@ pub struct AppState {
     pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
     /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
     pub bifrost_ingest: Option<Arc<BifrostIngestRuntime>>,
+    /// Stable Gate mounted for every role configuration.
+    pub bifrost_gate: Option<Arc<ServerGate>>,
+    /// Independently optional retained Oracle query subsystem.
+    pub bifrost_query: Option<Arc<BifrostQueryRuntime>>,
     /// Optional readiness-qualified Oracle peer runtime mounted on private gRPC.
     pub oracle_peer: Option<Arc<crate::oracle::OraclePeerRuntime>>,
     /// Shared Redux Forge owner used by supervision and maintenance tests.
@@ -230,6 +492,8 @@ pub struct AppState {
     pub authz: ServerAuthz,
     /// Deployment posture (Development / Production) locked at boot.
     pub deployment_profile: DeploymentProfile,
+    /// Closed role set selected for this server process.
+    pub bifrost_roles: BTreeSet<BifrostRuntimeRole>,
     /// Shared cancellation token for cooperative shutdown.
     pub shutdown_token: CancellationToken,
     /// Telemetry guard (holds the tracer provider).
@@ -263,11 +527,14 @@ impl AppState {
             bifrost_memory: None,
             bifrost_query_memory: None,
             bifrost_ingest: None,
+            bifrost_gate: None,
+            bifrost_query: None,
             oracle_peer: None,
             forge: None,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
             deployment_profile: DeploymentProfile::Development,
+            bifrost_roles: BTreeSet::new(),
             shutdown_token: CancellationToken::new(),
             telemetry: Arc::new(wyrd_telemetry::init_test_only_no_global(
                 wyrd_telemetry::TelemetryConfig::default(),
@@ -305,6 +572,13 @@ impl AppState {
     #[must_use]
     pub fn with_deployment_profile(mut self, profile: DeploymentProfile) -> Self {
         self.deployment_profile = profile;
+        self
+    }
+
+    /// Attaches the closed role set selected during config validation.
+    #[must_use]
+    pub fn with_bifrost_roles(mut self, roles: BTreeSet<BifrostRuntimeRole>) -> Self {
+        self.bifrost_roles = roles;
         self
     }
 
@@ -381,6 +655,27 @@ impl AppState {
     pub fn with_bifrost_ingest(mut self, runtime: Arc<BifrostIngestRuntime>) -> Self {
         self.bifrost_ingest = Some(runtime);
         self
+    }
+
+    /// Attaches the stable Gate used by every public Bifrost transport.
+    #[must_use]
+    pub fn with_bifrost_gate(mut self, gate: Arc<ServerGate>) -> Self {
+        self.bifrost_gate = Some(gate);
+        self
+    }
+
+    /// Attaches one retained Oracle query subsystem.
+    #[must_use]
+    pub fn with_bifrost_query(mut self, runtime: Arc<BifrostQueryRuntime>) -> Self {
+        self.oracle_peer = Some(runtime.peer());
+        self.bifrost_query = Some(runtime);
+        self
+    }
+
+    /// Returns the independently optional retained Oracle query subsystem.
+    #[must_use]
+    pub fn bifrost_query(&self) -> Option<&Arc<BifrostQueryRuntime>> {
+        self.bifrost_query.as_ref()
     }
 
     /// Attach one sentinel-verified Oracle peer runtime for local and tonic execution.
@@ -509,7 +804,9 @@ impl AppState {
         if self.auth.allow_preview {
             return Err(ProductionValidationError::PreviewAuthEnabled);
         }
-        if self.oracle_peer.is_none() {
+        if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle)
+            && (self.oracle_peer.is_none() || self.bifrost_query.is_none())
+        {
             return Err(ProductionValidationError::MissingOraclePeer);
         }
         Ok(())

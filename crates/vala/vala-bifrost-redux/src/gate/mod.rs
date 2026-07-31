@@ -40,8 +40,11 @@ pub use crate::gate::collector::{
 pub use crate::gate::error::{CatalogError, IngestError};
 pub use crate::gate::limits::IngestLimits;
 use crate::namespaces::BifrostNamespace;
+use crate::oracle::{AuthorizedQueryContext, Oracle, OracleQueryStream, QueryOptions};
 use crate::schema::fingerprint::SchemaFingerprint;
 use crate::scribe::routing::shard_for;
+use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_spec::vala::error::BifrostError;
 
 /// Catalog lookup capability required by Gate. Server integrations provide the
 /// adapter; Gate does not depend on a concrete catalog implementation.
@@ -125,7 +128,9 @@ pub struct Gate<
     I: IssuerConfigResolver + 'static,
 > {
     catalog: Arc<C>,
-    scribe: Arc<dyn Scribe>,
+    scribe: Option<Arc<dyn Scribe>>,
+    /// Optional retained Oracle used by the server's stable local query dispatch.
+    oracle: Option<Arc<Oracle>>,
     limits: IngestLimits,
     projection: Arc<dyn ProjectionExecutor>,
     auth: IngestAuthInterceptor<R, I>,
@@ -145,7 +150,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     ) -> Self {
         Self {
             catalog,
-            scribe,
+            scribe: Some(scribe),
+            oracle: None,
             limits,
             projection: Arc::new(InlineProjectionExecutor),
             auth,
@@ -168,6 +174,35 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         gate
     }
 
+    /// Constructs a stable Gate whose ingest role is intentionally unavailable.
+    ///
+    /// Authentication remains active on this Gate. Authorized ingest reaches the
+    /// closed role check and receives the stable unavailable response without a
+    /// WAL allocation.
+    #[must_use]
+    pub fn without_scribe(
+        catalog: Arc<C>,
+        auth: IngestAuthInterceptor<R, I>,
+        limits: IngestLimits,
+    ) -> Self {
+        Self {
+            catalog,
+            scribe: None,
+            oracle: None,
+            limits,
+            projection: Arc::new(InlineProjectionExecutor),
+            auth,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Attaches the independently optional retained Oracle query owner.
+    #[must_use]
+    pub fn with_oracle(mut self, oracle: Arc<Oracle>) -> Self {
+        self.oracle = Some(oracle);
+        self
+    }
+
     /// Stop accepting new ingest requests.
     pub fn close(&self) {
         if !self.closed.swap(true, Ordering::AcqRel) {
@@ -176,24 +211,34 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
         }
     }
 
+    /// Reports whether lifecycle shutdown has closed new Gate work.
+    ///
+    /// This test-tier probe observes the same atomic checked by ingest request
+    /// admission without exposing a second mutable shutdown path.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn is_closed_for_test(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     fn ensure_open(&self) -> Result<(), IngestError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(IngestError::IngressClosed);
         }
-        if !self.scribe.is_ready() {
+        if !self.scribe.as_ref().is_some_and(|scribe| scribe.is_ready()) {
             return Err(IngestError::IngressClosed);
         }
         Ok(())
     }
 
     async fn authenticate(&self, metadata: &MetadataMap) -> Result<AuthContext, IngestError> {
-        self.ensure_open()?;
         let started = std::time::Instant::now();
         record_gate_event("auth_attempt");
         match self.auth.authenticate(metadata).await {
             Ok(auth) => {
                 metrics::histogram!("bifrost_gate_resolution_seconds", "stage" => "auth")
                     .record(started.elapsed().as_secs_f64());
+                self.ensure_open()?;
                 Ok(auth)
             }
             Err(error) => {
@@ -209,6 +254,71 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     pub fn into_server(self) -> BifrostIngestServiceServer<Self> {
         let size = self.limits.max_decoding_message_size;
         BifrostIngestServiceServer::new(self).max_decoding_message_size(size)
+    }
+
+    /// Dispatches authorized public SQL only to a ready local Oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns role unavailable before planning when this Gate has no ready
+    /// Oracle, otherwise returns the retained Oracle's stable query errors.
+    pub async fn query_sql(
+        &self,
+        context: AuthorizedQueryContext,
+        request: BifrostQueryRequest,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let Some(oracle) = &self.oracle else {
+            metrics::counter!(
+                "bifrost_gate_role_unavailable_total",
+                "required_role" => "oracle",
+                "reason" => "not_configured"
+            )
+            .increment(1);
+            return Err(BifrostError::OracleRoleUnavailable);
+        };
+        if !oracle.is_ready() {
+            metrics::counter!(
+                "bifrost_gate_role_unavailable_total",
+                "required_role" => "oracle",
+                "reason" => "not_ready"
+            )
+            .increment(1);
+            return Err(BifrostError::OracleRoleUnavailable);
+        }
+        oracle.query_sql(context, request).await
+    }
+
+    /// Dispatches an authorized typed logical plan only to a ready local Oracle.
+    ///
+    /// # Errors
+    ///
+    /// Returns role unavailable before admission when this Gate has no ready
+    /// Oracle, otherwise returns the retained Oracle's stable query errors.
+    pub async fn query_plan(
+        &self,
+        context: AuthorizedQueryContext,
+        plan: datafusion::logical_expr::LogicalPlan,
+        options: QueryOptions,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let Some(oracle) = &self.oracle else {
+            metrics::counter!(
+                "bifrost_gate_role_unavailable_total",
+                "required_role" => "oracle",
+                "reason" => "not_configured"
+            )
+            .increment(1);
+            return Err(BifrostError::OracleRoleUnavailable);
+        };
+        if !oracle.is_ready() {
+            metrics::counter!(
+                "bifrost_gate_role_unavailable_total",
+                "required_role" => "oracle",
+                "reason" => "not_ready"
+            )
+            .increment(1);
+            return Err(BifrostError::OracleRoleUnavailable);
+        }
+        oracle.query_plan(context, plan, options).await
     }
 
     /// Project one OTLP trace export through the Gate-owned Scribe boundary.
@@ -372,7 +482,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             payload_summary: "one projected OTLP frame".to_owned(),
             detail: None,
         };
-        self.scribe
+        let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
+        scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 binding,
@@ -474,8 +585,8 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
             payload_summary: "one bounded native batch".to_owned(),
             detail: None,
         };
-        let admission = self
-            .scribe
+        let scribe = self.scribe.as_ref().ok_or(IngestError::IngressClosed)?;
+        let admission = scribe
             .ingest_frame(ScribeIngressFrame {
                 principal: auth.principal.clone(),
                 binding,

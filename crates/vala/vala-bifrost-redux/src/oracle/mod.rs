@@ -15,6 +15,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
+use datafusion::common::TableReference;
+use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::TableProvider;
 use datafusion::execution::context::SessionContext;
@@ -22,6 +24,7 @@ use datafusion::physical_plan::{SendableRecordBatchStream, execute_stream};
 use datafusion::sql::parser::{DFParser, Statement as DfStatement};
 use datafusion::sql::resolve::resolve_table_references;
 use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
+use futures_util::stream::FuturesUnordered;
 use futures_util::{Stream, StreamExt};
 use rand::Rng;
 use sha2::{Digest as _, Sha256};
@@ -46,7 +49,7 @@ use wyrd_spec::vala::api::{
 #[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{AuditDecision, AuditEvent, AuditResult};
 
-use crate::catalog::{BifrostCatalog, PinnedSealedTable, TableRef};
+use crate::catalog::{BifrostCatalog, BifrostCatalogError, PinnedSealedTable, TableRef};
 use crate::cluster::{ClusterRegistry, RegisteredRole};
 use crate::schema::SchemaFingerprint;
 use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
@@ -735,8 +738,7 @@ impl BifrostQueryReadDecision {
 
     /// Consumes the decision into the exact T1 audit detail.
     #[must_use]
-    #[cfg(feature = "test-support")]
-    fn into_detail(self) -> AuditDetail {
+    pub fn into_detail(self) -> AuditDetail {
         self.detail
     }
 }
@@ -1059,6 +1061,54 @@ impl Oracle {
         self.planner.validate_query(request)
     }
 
+    /// Resolves one tenant-qualified published table into a typed-plan DataFrame.
+    ///
+    /// This keeps catalog provider and DataFusion session construction inside
+    /// retained Oracle. Server adapters may add bound expressions to the
+    /// returned frame, but cannot bypass Oracle for source resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable catalog or execution failure when the table namespace,
+    /// provider, empty builtin fallback, or DataFrame cannot be constructed.
+    pub async fn typed_dataframe(
+        &self,
+        tenant: DataTenantId,
+        fqn: &str,
+    ) -> Result<DataFrame, BifrostError> {
+        let (namespace, name) = fqn
+            .rsplit_once('.')
+            .ok_or(BifrostError::QueryExecutionFailed)?;
+        let namespace = namespace.strip_prefix("vala.").unwrap_or(namespace);
+        let namespace = crate::namespaces::BifrostNamespace::from_domain_namespace(namespace)
+            .ok_or(BifrostError::QueryExecutionFailed)?;
+        let table = TableRef::new(namespace, name);
+        let session = SessionContext::new();
+        let provider: Arc<dyn TableProvider> = match self
+            .catalog
+            .provider_with_hot_batches(&table, tenant, Vec::new())
+            .await
+        {
+            Ok(provider) => Arc::new(provider),
+            Err(BifrostCatalogError::TableNotFound(_)) => {
+                let definition = crate::tables::builtin_table(namespace.as_str(), name)
+                    .ok_or(BifrostError::QueryExecutionFailed)?;
+                Arc::new(
+                    MemTable::try_new((definition.schema)(), vec![vec![]])
+                        .map_err(map_datafusion_error)?,
+                )
+            }
+            Err(error) => return Err(error.into_public()),
+        };
+        session
+            .register_table(TableReference::bare(fqn), provider)
+            .map_err(map_datafusion_error)?;
+        session
+            .table(TableReference::bare(fqn))
+            .await
+            .map_err(map_datafusion_error)
+    }
+
     /// Starts a query through the retained owner.
     ///
     /// # Errors
@@ -1138,7 +1188,12 @@ impl Oracle {
             drop(planning);
             let mut admitted = self
                 .admission
-                .admit(context.data_tenant_id, query_class, deadline)
+                .admit(
+                    context.data_tenant_id,
+                    query_class,
+                    deadline,
+                    self.shutdown.child_token(),
+                )
                 .await?;
             let mut degraded = false;
             let acquired_fences = if request.visibility == VisibilityMode::Fused {
@@ -1310,7 +1365,12 @@ impl Oracle {
         });
         let admitted = self
             .admission
-            .admit(context.data_tenant_id, class, options.deadline)
+            .admit(
+                context.data_tenant_id,
+                class,
+                options.deadline,
+                self.shutdown.child_token(),
+            )
             .await?;
         let remaining = options
             .deadline
@@ -1377,9 +1437,17 @@ impl Oracle {
     /// Returns whether startup reconciliation completed and queries may enter admission.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-            && !self.shutdown.is_cancelled()
-            && self.admission.is_available()
+        self.startup_reconciled() && self.admission.is_available()
+    }
+
+    /// Reports whether local startup reconciliation completed before membership activation.
+    ///
+    /// Server boot uses this dependency-local phase to avoid waiting on
+    /// [`Self::is_ready`], which intentionally also requires the later durable
+    /// membership activation and immutable snapshot publication.
+    #[must_use]
+    pub fn startup_reconciled(&self) -> bool {
+        self.ready.load(Ordering::Acquire) && !self.shutdown.is_cancelled()
     }
 
     /// Borrows the tenant SQL root retained by the Oracle composition boundary.
@@ -2114,7 +2182,9 @@ impl OracleAdmission {
     /// Acquires cluster/class/tenant capacity and the matching local running guard.
     ///
     /// The calculation uses one immutable membership snapshot. This single-node
-    /// task selects the local leader and never downgrades analytical work.
+    /// task selects the local leader and never downgrades analytical work. The
+    /// supplied cancellation is a child of Oracle's lifecycle token and remains
+    /// owned by the returned stream guard so role shutdown cancels accepted work.
     ///
     /// # Errors
     ///
@@ -2130,6 +2200,7 @@ impl OracleAdmission {
         tenant: DataTenantId,
         query_class: QueryClass,
         deadline: Instant,
+        cancellation: CancellationToken,
     ) -> Result<AdmittedQueryGuard, BifrostError> {
         let mut waiter = self.telemetry.start_admission_waiter(query_class);
         let pending = match self.slots.try_pending() {
@@ -2269,7 +2340,6 @@ impl OracleAdmission {
                     }
                 };
                 let slot_telemetry = self.telemetry.start_slot_use(query_class, demand);
-                let cancellation = CancellationToken::new();
                 let renewal_cancel = cancellation.clone();
                 let renewal_terminal = Arc::new(Mutex::new(None));
                 let renewal_terminal_task = Arc::clone(&renewal_terminal);
@@ -2458,6 +2528,62 @@ struct DrainedTailFence {
     reservations: Vec<AccountedMemoryReservation>,
 }
 
+/// Acquires one metadata-only Scribe fence from an owned transport request.
+///
+/// Keeping the transport owned by this future makes the Oracle query future
+/// transport-safe without exposing a trait-object borrow through Gate's
+/// HTTP/gRPC handler futures.
+///
+/// # Errors
+///
+/// Returns visibility unavailable when Scribe rejects the interval and query
+/// timeout when the shared query deadline expires.
+async fn acquire_tail_fence(
+    table: String,
+    transport: Arc<dyn TailReadTransport>,
+    request: wyrd_spec::vala::api::AcquireTailFenceRequest,
+    deadline: Instant,
+) -> Result<AcquiredTailFence, BifrostError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or(BifrostError::QueryTimeout)?;
+    match tokio::time::timeout(remaining, transport.acquire_fence(request)).await {
+        Ok(Ok(fence)) => {
+            metrics::counter!(
+                "bifrost_oracle_tail_fences_total",
+                "locality" => "local",
+                "outcome" => "success"
+            )
+            .increment(1);
+            Ok(AcquiredTailFence {
+                table,
+                transport,
+                fence,
+                acquired_at: Instant::now(),
+            })
+        }
+        Ok(Err(error)) => {
+            metrics::counter!(
+                "bifrost_oracle_tail_fences_total",
+                "locality" => "local",
+                "outcome" => "failed"
+            )
+            .increment(1);
+            tracing::warn!(error = %error, "Oracle live-tail fence acquisition failed");
+            Err(BifrostError::QueryVisibilityUnavailable)
+        }
+        Err(_) => {
+            metrics::counter!(
+                "bifrost_oracle_tail_fences_total",
+                "locality" => "local",
+                "outcome" => "failed"
+            )
+            .increment(1);
+            Err(BifrostError::QueryTimeout)
+        }
+    }
+}
+
 impl TailFenceDrainer {
     /// Acquires the exact last-sealed-to-live interval for each observed stream.
     ///
@@ -2483,7 +2609,11 @@ impl TailFenceDrainer {
             .ok_or(BifrostError::QueryTimeout)?;
         let wire_deadline = chrono::Utc::now()
             + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?;
-        let mut work = Vec::new();
+        let mut work: Vec<(
+            String,
+            Arc<dyn TailReadTransport + 'static>,
+            wyrd_spec::vala::api::AcquireTailFenceRequest,
+        )> = Vec::new();
         for cut in cuts {
             let table = cut.binding.table_ref.fqn();
             let mut streams = std::collections::BTreeMap::<
@@ -2549,50 +2679,19 @@ impl TailFenceDrainer {
                 work.push((table.clone(), transport, request));
             }
         }
-        let results = futures_util::stream::iter(work)
-            .map(|(table, transport, request)| async move {
-                let remaining = deadline
-                    .checked_duration_since(Instant::now())
-                    .ok_or(BifrostError::QueryTimeout)?;
-                match tokio::time::timeout(remaining, transport.acquire_fence(request)).await {
-                    Ok(Ok(fence)) => {
-                        metrics::counter!(
-                            "bifrost_oracle_tail_fences_total",
-                            "locality" => "local",
-                            "outcome" => "success"
-                        )
-                        .increment(1);
-                        Ok(AcquiredTailFence {
-                            table,
-                            transport,
-                            fence,
-                            acquired_at: Instant::now(),
-                        })
-                    }
-                    Ok(Err(error)) => {
-                        metrics::counter!(
-                            "bifrost_oracle_tail_fences_total",
-                            "locality" => "local",
-                            "outcome" => "failed"
-                        )
-                        .increment(1);
-                        tracing::warn!(error = %error, "Oracle live-tail fence acquisition failed");
-                        Err(BifrostError::QueryVisibilityUnavailable)
-                    }
-                    Err(_) => {
-                        metrics::counter!(
-                            "bifrost_oracle_tail_fences_total",
-                            "locality" => "local",
-                            "outcome" => "failed"
-                        )
-                        .increment(1);
-                        Err(BifrostError::QueryTimeout)
-                    }
+        let mut results = Vec::with_capacity(work.len());
+        let mut pending = FuturesUnordered::new();
+        for (table, transport, request) in work {
+            pending.push(acquire_tail_fence(table, transport, request, deadline));
+            if pending.len() == 8 {
+                while let Some(result) = pending.next().await {
+                    results.push(result);
                 }
-            })
-            .buffer_unordered(8)
-            .collect::<Vec<_>>()
-            .await;
+            }
+        }
+        while let Some(result) = pending.next().await {
+            results.push(result);
+        }
         let mut acquired = Vec::new();
         let mut failure = None;
         for result in results {
@@ -2919,6 +3018,8 @@ pub type OracleFrameStream = dyn Stream<Item = Result<QueryStreamFrame, BifrostE
 
 /// Owned query stream handle.  Frame production remains lazy and cancellation-aware.
 pub struct OracleQueryStream {
+    /// Stable fingerprint known before the first transport byte is emitted.
+    pub schema_fingerprint: String,
     /// Underlying frame stream.
     pub frames: std::pin::Pin<Box<OracleFrameStream>>,
 }
@@ -3313,6 +3414,7 @@ fn build_query_stream(
     mut query_telemetry: QueryTelemetryGuard,
 ) -> Result<OracleQueryStream, BifrostError> {
     let schema_frame = encode_schema_frame(&schema)?;
+    let schema_fingerprint = schema_frame.schema_fingerprint.clone();
     let lease_cancellation = admitted.cancellation.clone();
     let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
     query_telemetry.start_stream();
@@ -3469,6 +3571,7 @@ fn build_query_stream(
         yield Ok(QueryStreamFrame::Terminal(terminal));
     };
     Ok(OracleQueryStream {
+        schema_fingerprint,
         frames: Box::pin(frames),
     })
 }

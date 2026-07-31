@@ -2,7 +2,7 @@
 //!
 //! Load order: env overrides > TOML file > compiled defaults.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -177,6 +177,480 @@ pub struct ScribeRuntimeConfig {
     pub wal_disk_limit_bytes: Option<u64>,
 }
 
+/// Independently deployable Bifrost server role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[clap(rename_all = "snake_case")]
+pub enum BifrostRuntimeRole {
+    /// WAL-backed ingest and tail service.
+    Scribe,
+    /// Maintenance and sealed-file lifecycle service.
+    Forge,
+    /// Retained query execution and peer service.
+    Oracle,
+}
+
+/// Oracle execution bounds owned by the server boot configuration.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OracleRuntimeConfig {
+    /// Private peer advertisement address.
+    #[serde(default = "default_oracle_advertise_addr")]
+    pub advertise_addr: String,
+    /// CPU budget used for admission calibration.
+    #[serde(default = "default_oracle_cpu_cores")]
+    pub cpu_cores: f64,
+    /// Optional memory budget.
+    #[serde(default)]
+    pub memory_limit_bytes: Option<usize>,
+    /// Spill byte ceiling.
+    #[serde(default = "default_oracle_spill_limit_bytes")]
+    pub spill_limit_bytes: u64,
+    /// Concurrent planning permits.
+    #[serde(default = "default_oracle_planning_permits")]
+    pub planning_permits: usize,
+    /// Admission waiters.
+    #[serde(default = "default_oracle_admission_waiters")]
+    pub admission_waiters: usize,
+    /// Maximum remote workers, excluding the leader.
+    #[serde(default = "default_oracle_max_workers_per_query")]
+    pub max_workers_per_query: usize,
+    /// Maximum encoded frame size.
+    #[serde(default = "default_oracle_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+    /// Calibration profile path.
+    #[serde(default)]
+    pub calibration_profile: PathBuf,
+    /// Whether development may start Oracle from an absent or candidate profile.
+    ///
+    /// Production ignores this switch and always requires an approved profile.
+    #[serde(default)]
+    pub allow_unapproved_profile: bool,
+}
+
+fn default_oracle_advertise_addr() -> String {
+    "127.0.0.1:50052".to_owned()
+}
+fn default_oracle_cpu_cores() -> f64 {
+    1.0
+}
+fn default_oracle_spill_limit_bytes() -> u64 {
+    1 << 30
+}
+fn default_oracle_planning_permits() -> usize {
+    2
+}
+fn default_oracle_admission_waiters() -> usize {
+    64
+}
+fn default_oracle_max_workers_per_query() -> usize {
+    2
+}
+fn default_oracle_max_frame_bytes() -> usize {
+    8 * 1024 * 1024
+}
+
+impl Default for OracleRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            advertise_addr: default_oracle_advertise_addr(),
+            cpu_cores: default_oracle_cpu_cores(),
+            memory_limit_bytes: None,
+            spill_limit_bytes: default_oracle_spill_limit_bytes(),
+            planning_permits: default_oracle_planning_permits(),
+            admission_waiters: default_oracle_admission_waiters(),
+            max_workers_per_query: default_oracle_max_workers_per_query(),
+            max_frame_bytes: default_oracle_max_frame_bytes(),
+            calibration_profile: PathBuf::new(),
+            allow_unapproved_profile: false,
+        }
+    }
+}
+
+/// Complete benchmark-produced evidence required before Oracle activation.
+///
+/// The server does not select calibration values. It only verifies that the
+/// benchmark owner supplied the complete schema and evidence references before
+/// a maintainer may mark the profile approved.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationProfile {
+    /// Version of the calibration document schema understood by this server.
+    schema_version: u16,
+    /// Maintainer-controlled activation status.
+    status: OracleCalibrationStatus,
+    /// Content digest of the benchmark report that produced this profile.
+    generated_from: String,
+    /// Source revision exercised by the benchmark.
+    source_revision: String,
+    /// Hardware, operating-system, and runtime identity.
+    environment: OracleCalibrationEnvironment,
+    /// Reproducible workload inputs and measurement windows.
+    workload: OracleCalibrationWorkload,
+    /// Topology, tenant, class, and visibility coverage.
+    matrix: OracleCalibrationMatrix,
+    /// Measured slot shape used to derive the proposal.
+    slot: OracleCalibrationSlot,
+    /// Measured per-class allocation shape.
+    class: OracleCalibrationClasses,
+    /// Proposed runtime limits, each paired with an evidence case identifier.
+    proposal: toml::Table,
+    /// Required outcome measurements, each paired with an evidence case identifier.
+    measurements: toml::Table,
+}
+
+/// Environment identity recorded by an Oracle calibration run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationEnvironment {
+    /// Hardware profile used by the run.
+    hardware: String,
+    /// Operating-system profile used by the run.
+    os: String,
+    /// Rust/runtime profile used by the run.
+    runtime: String,
+}
+
+/// Reproducible workload identity recorded by an Oracle calibration run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationWorkload {
+    /// Content hashes for all workload definitions and fixtures.
+    hashes: Vec<String>,
+    /// Random seeds used by measured cases.
+    seeds: Vec<u64>,
+    /// Input data volumes exercised by measured cases.
+    data_volumes_bytes: Vec<u64>,
+    /// Warmup interval excluded from measurement.
+    warmup_seconds: u64,
+    /// Measurement interval used for reported results.
+    measurement_seconds: u64,
+}
+
+/// Coverage matrix recorded by an Oracle calibration run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationMatrix {
+    /// Cluster topologies exercised by the run.
+    topology: Vec<String>,
+    /// Tenant modes exercised by the run.
+    tenant: Vec<String>,
+    /// Query classes exercised by the run.
+    class: Vec<String>,
+    /// Visibility modes exercised by the run.
+    visibility: Vec<String>,
+}
+
+/// Measured slot shape recorded by an Oracle calibration run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationSlot {
+    /// CPU cores assigned to one measured slot.
+    cpu_cores: f64,
+    /// Memory bytes assigned to one measured slot.
+    memory_bytes: u64,
+    /// Fraction of capacity available after safety headroom.
+    headroom: f64,
+}
+
+/// Per-class allocation shapes recorded by an Oracle calibration run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationClasses {
+    /// Interactive-query allocation shape.
+    interactive: OracleCalibrationClass,
+    /// Analytical-query allocation shape.
+    analytical: OracleCalibrationClass,
+}
+
+/// Measured allocation shape for one query class.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OracleCalibrationClass {
+    /// Fraction of measured capacity assigned to the class.
+    share: f64,
+    /// Minimum slots needed to admit the class.
+    minimum_slots: u64,
+}
+
+/// Closed activation status accepted from an Oracle calibration profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OracleCalibrationStatus {
+    /// Benchmark evidence exists but has not been approved for production.
+    Candidate,
+    /// A maintainer approved the measured profile for production activation.
+    Approved,
+}
+
+/// Proposal leaves required by the schema-v1 Oracle calibration contract.
+const ORACLE_CALIBRATION_PROPOSALS: &[&str] = &[
+    "slot.cpu_cores_per_slot",
+    "slot.memory_bytes_per_slot",
+    "slot.headroom_factor",
+    "class.interactive.share",
+    "class.interactive.minimum_slots",
+    "class.analytical.share",
+    "class.analytical.minimum_slots",
+    "tenant.single_tenant_limit",
+    "tenant.multi_tenant_default_limit",
+    "classification.assumed_scan_bytes_per_second",
+    "classification.analytical_threshold_millis",
+    "placement.max_attempts",
+    "placement.deadline_millis",
+    "placement.jitter_min_millis",
+    "placement.jitter_max_millis",
+    "lease.cluster_ttl_seconds",
+    "lease.renew_interval_seconds",
+    "reservation.pending_ttl_seconds",
+    "membership.expiration_seconds",
+    "tail.fence_ttl_seconds",
+    "tail.page_rows",
+    "tail.page_encoded_bytes",
+    "distribution.max_workers_per_query",
+    "distribution.fragment_target_rows",
+    "distribution.fragment_target_bytes",
+    "distribution.max_fragment_bytes",
+    "distribution.max_frame_bytes",
+    "distribution.max_in_flight_fragments",
+    "distribution.max_worker_concurrency",
+    "memory.oracle_limit_bytes",
+    "memory.class_limits",
+    "spill.limit_bytes",
+    "performance.p95_query_millis",
+    "performance.p99_query_millis",
+    "performance.p95_ttfb_millis",
+    "performance.p99_ttfb_millis",
+    "performance.minimum_rows_per_second",
+    "performance.last_stable_concurrency",
+    "performance.maximum_tail_page_millis",
+    "performance.maximum_object_store_throttle_rate",
+];
+
+/// Measurement leaves required by the schema-v1 Oracle calibration contract.
+const ORACLE_CALIBRATION_MEASUREMENTS: &[&str] = &[
+    "latency.p50_query_millis",
+    "latency.p95_query_millis",
+    "latency.p99_query_millis",
+    "throughput.rows_per_second",
+    "correctness.passed_cases",
+    "resource.peak_memory_bytes",
+    "retry.attempts",
+    "rejection.count",
+    "audit.records",
+    "terminal.count",
+];
+
+impl OracleCalibrationProfile {
+    /// Validate completeness and internal bounds without choosing runtime values.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when identity, workload, matrix, measured slot/class
+    /// shape, proposal evidence, or outcome measurements are absent or invalid.
+    fn validate_complete(&self) -> Result<(), String> {
+        if self.schema_version != 1 {
+            return Err("schema_version must be 1".to_owned());
+        }
+        for (name, value) in [
+            ("generated_from", self.generated_from.as_str()),
+            ("source_revision", self.source_revision.as_str()),
+            ("environment.hardware", self.environment.hardware.as_str()),
+            ("environment.os", self.environment.os.as_str()),
+            ("environment.runtime", self.environment.runtime.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} must not be empty"));
+            }
+        }
+        validate_non_empty_strings("workload.hashes", &self.workload.hashes)?;
+        if self.workload.seeds.is_empty() {
+            return Err("workload.seeds must not be empty".to_owned());
+        }
+        if self.workload.data_volumes_bytes.is_empty()
+            || self.workload.data_volumes_bytes.contains(&0)
+        {
+            return Err("workload.data_volumes_bytes must contain positive values".to_owned());
+        }
+        if self.workload.warmup_seconds == 0 || self.workload.measurement_seconds == 0 {
+            return Err(
+                "workload warmup_seconds and measurement_seconds must be positive".to_owned(),
+            );
+        }
+        validate_non_empty_strings("matrix.topology", &self.matrix.topology)?;
+        validate_non_empty_strings("matrix.tenant", &self.matrix.tenant)?;
+        validate_non_empty_strings("matrix.class", &self.matrix.class)?;
+        validate_non_empty_strings("matrix.visibility", &self.matrix.visibility)?;
+
+        if !self.slot.cpu_cores.is_finite() || self.slot.cpu_cores <= 0.0 {
+            return Err("slot.cpu_cores must be finite and positive".to_owned());
+        }
+        if self.slot.memory_bytes == 0 {
+            return Err("slot.memory_bytes must be positive".to_owned());
+        }
+        if !self.slot.headroom.is_finite() || self.slot.headroom <= 0.0 || self.slot.headroom > 1.0
+        {
+            return Err("slot.headroom must be finite and in (0, 1]".to_owned());
+        }
+        validate_calibration_class("class.interactive", &self.class.interactive)?;
+        validate_calibration_class("class.analytical", &self.class.analytical)?;
+
+        validate_evidence_table("proposal", &self.proposal, ORACLE_CALIBRATION_PROPOSALS)?;
+        validate_evidence_table(
+            "measurements",
+            &self.measurements,
+            ORACLE_CALIBRATION_MEASUREMENTS,
+        )?;
+        let max_workers =
+            calibration_evidence_value(&self.proposal, "distribution.max_workers_per_query")?
+                .as_integer()
+                .ok_or_else(|| {
+                    "proposal.distribution.max_workers_per_query.value must be an integer"
+                        .to_owned()
+                })?;
+        if !(0..=63).contains(&max_workers) {
+            return Err(
+                "proposal.distribution.max_workers_per_query.value must be in 0..=63".to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Validate that a list contains at least one non-empty string.
+///
+/// # Errors
+///
+/// Returns a message when the list is empty or contains a blank value.
+fn validate_non_empty_strings(name: &str, values: &[String]) -> Result<(), String> {
+    if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+        return Err(format!("{name} must contain non-empty values"));
+    }
+    Ok(())
+}
+
+/// Validate one measured class allocation shape.
+///
+/// # Errors
+///
+/// Returns a message when the share is not a finite fraction or the minimum
+/// slot count is zero.
+fn validate_calibration_class(name: &str, value: &OracleCalibrationClass) -> Result<(), String> {
+    if !value.share.is_finite() || value.share <= 0.0 || value.share > 1.0 {
+        return Err(format!("{name}.share must be finite and in (0, 1]"));
+    }
+    if value.minimum_slots == 0 {
+        return Err(format!("{name}.minimum_slots must be positive"));
+    }
+    Ok(())
+}
+
+/// Validate every required evidence leaf in one calibration table.
+///
+/// # Errors
+///
+/// Returns a message when a required dotted path is absent, malformed, has an
+/// empty case identifier, or includes unsupported sibling fields.
+fn validate_evidence_table(
+    table_name: &str,
+    table: &toml::Table,
+    required_paths: &[&str],
+) -> Result<(), String> {
+    for path in required_paths {
+        let leaf = calibration_table_path(table, path)?;
+        if leaf.len() != 2 || !leaf.contains_key("value") || !leaf.contains_key("evidence_case_id")
+        {
+            return Err(format!(
+                "{table_name}.{path} must contain exactly value and evidence_case_id"
+            ));
+        }
+        let case_id = leaf["evidence_case_id"]
+            .as_str()
+            .ok_or_else(|| format!("{table_name}.{path}.evidence_case_id must be a string"))?;
+        if case_id.trim().is_empty() {
+            return Err(format!(
+                "{table_name}.{path}.evidence_case_id must not be empty"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a dotted calibration path to its evidence leaf table.
+///
+/// # Errors
+///
+/// Returns a message when any path segment is absent or not a table.
+fn calibration_table_path<'a>(
+    table: &'a toml::Table,
+    path: &str,
+) -> Result<&'a toml::Table, String> {
+    let mut current = table;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let value = current
+            .get(segment)
+            .ok_or_else(|| format!("missing required calibration field {path}"))?;
+        let next = value
+            .as_table()
+            .ok_or_else(|| format!("calibration field {path} must be an evidence table"))?;
+        if segments.peek().is_none() {
+            return Ok(next);
+        }
+        current = next;
+    }
+    Err(format!("invalid empty calibration path {path}"))
+}
+
+/// Resolve the measured value stored at a required proposal path.
+///
+/// # Errors
+///
+/// Returns a message when the evidence leaf or its value is absent.
+fn calibration_evidence_value<'a>(
+    table: &'a toml::Table,
+    path: &str,
+) -> Result<&'a toml::Value, String> {
+    calibration_table_path(table, path)?
+        .get("value")
+        .ok_or_else(|| format!("calibration field {path} is missing value"))
+}
+
+/// Role selection and nested runtime bounds for Bifrost.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BifrostRuntimeConfig {
+    /// Roles enabled by this process.
+    #[serde(default = "default_bifrost_roles")]
+    pub roles: BTreeSet<BifrostRuntimeRole>,
+    /// Scribe runtime bounds.
+    #[serde(default)]
+    pub scribe: ScribeRuntimeConfig,
+    /// Oracle runtime bounds.
+    #[serde(default)]
+    pub oracle: OracleRuntimeConfig,
+}
+
+fn default_bifrost_roles() -> BTreeSet<BifrostRuntimeRole> {
+    [
+        BifrostRuntimeRole::Scribe,
+        BifrostRuntimeRole::Forge,
+        BifrostRuntimeRole::Oracle,
+    ]
+    .into_iter()
+    .collect()
+}
+
+impl Default for BifrostRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            roles: default_bifrost_roles(),
+            scribe: ScribeRuntimeConfig::default(),
+            oracle: OracleRuntimeConfig::default(),
+        }
+    }
+}
+
 fn default_scribe_coordination_threads() -> usize {
     2
 }
@@ -326,9 +800,9 @@ pub struct WyrdServerConfig {
     /// Transport-selection configuration.
     #[serde(default)]
     pub serve: ServeConfig,
-    /// Bounded Scribe runtime and queue configuration.
+    /// Role-aware Bifrost runtime configuration.
     #[serde(default)]
-    pub scribe: ScribeRuntimeConfig,
+    pub bifrost: BifrostRuntimeConfig,
     /// Prometheus metrics server configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -748,6 +1222,41 @@ impl WyrdServerConfig {
     /// Unset variables are silently skipped. Empty variables produce
     /// [`ConfigError::EmptyEnvVar`].
     fn apply_env_overrides(&mut self) -> Result<(), ConfigError> {
+        if let Some(value) = env_opt("WYRD_BIFROST_ROLES")? {
+            let mut roles = BTreeSet::new();
+            for raw in value.split(',').map(str::trim) {
+                if raw.is_empty() {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_BIFROST_ROLES".to_owned(),
+                        message: "role list contains an empty entry".to_owned(),
+                    });
+                }
+                let role = match raw {
+                    "scribe" => BifrostRuntimeRole::Scribe,
+                    "forge" => BifrostRuntimeRole::Forge,
+                    "oracle" => BifrostRuntimeRole::Oracle,
+                    _ => {
+                        return Err(ConfigError::BadEnvVar {
+                            key: "WYRD_BIFROST_ROLES".to_owned(),
+                            message: format!("unknown role {raw:?}"),
+                        });
+                    }
+                };
+                if !roles.insert(role) {
+                    return Err(ConfigError::BadEnvVar {
+                        key: "WYRD_BIFROST_ROLES".to_owned(),
+                        message: format!("duplicate role {raw:?}"),
+                    });
+                }
+            }
+            if roles.is_empty() {
+                return Err(ConfigError::BadEnvVar {
+                    key: "WYRD_BIFROST_ROLES".to_owned(),
+                    message: "role list must not be empty".to_owned(),
+                });
+            }
+            self.bifrost.roles = roles;
+        }
         // deployment_profile (APP_ENV: development | staging | production).
         // staging and production both select the hardened production profile, so
         // both fail closed without a signing key; only development is lenient.
@@ -967,9 +1476,32 @@ impl WyrdServerConfig {
     /// # Errors
     /// Returns [`ConfigError`] for any violated constraint.
     fn validate(&self) -> Result<(), ConfigError> {
-        self.scribe
+        if self.bifrost.roles.is_empty() {
+            return Err(ConfigError::Invalid {
+                message: "bifrost.roles must not be empty".to_owned(),
+            });
+        }
+        if self.bifrost.oracle.max_workers_per_query > 63 {
+            return Err(ConfigError::Invalid {
+                message: "bifrost.oracle.max_workers_per_query must be at most 63".to_owned(),
+            });
+        }
+        if self.bifrost.oracle.planning_permits == 0
+            || self.bifrost.oracle.admission_waiters == 0
+            || self.bifrost.oracle.max_frame_bytes == 0
+            || self.bifrost.oracle.spill_limit_bytes == 0
+            || !self.bifrost.oracle.cpu_cores.is_finite()
+            || self.bifrost.oracle.cpu_cores <= 0.0
+        {
+            return Err(ConfigError::Invalid {
+                message: "bifrost.oracle bounds must be positive and finite".to_owned(),
+            });
+        }
+        self.bifrost
+            .scribe
             .validate()
             .map_err(|message| ConfigError::Invalid { message })?;
+        self.validate_oracle_calibration()?;
 
         // 1. HTTP and gRPC bind addresses must differ.
         if self.http.bind == self.grpc.bind {
@@ -1198,6 +1730,76 @@ impl WyrdServerConfig {
 
         Ok(())
     }
+
+    /// Validates the activation profile for a configured Oracle role.
+    ///
+    /// Production accepts only a present schema-v1 profile whose status is
+    /// `approved`. Development requires an explicit opt-in before it may use an
+    /// absent or candidate profile, which prevents test defaults from silently
+    /// diverging from production activation policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Invalid`] when the profile is missing, malformed,
+    /// unsupported, unapproved in production, or unapproved without the
+    /// development opt-in.
+    fn validate_oracle_calibration(&self) -> Result<(), ConfigError> {
+        if !self.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
+            return Ok(());
+        }
+        if self
+            .bifrost
+            .oracle
+            .calibration_profile
+            .as_os_str()
+            .is_empty()
+        {
+            if !self.deployment_profile.is_production()
+                && self.bifrost.oracle.allow_unapproved_profile
+            {
+                return Ok(());
+            }
+            return Err(ConfigError::Invalid {
+                message: "configured Oracle requires bifrost.oracle.calibration_profile; \
+                          development may set allow_unapproved_profile=true explicitly"
+                    .to_owned(),
+            });
+        }
+        let path = &self.bifrost.oracle.calibration_profile;
+        let contents = std::fs::read_to_string(path).map_err(|error| ConfigError::Invalid {
+            message: format!(
+                "failed to read Oracle calibration profile {}: {error}",
+                path.display()
+            ),
+        })?;
+        let profile: OracleCalibrationProfile =
+            toml::from_str(&contents).map_err(|error| ConfigError::Invalid {
+                message: format!(
+                    "failed to parse Oracle calibration profile {}: {error}",
+                    path.display()
+                ),
+            })?;
+        profile
+            .validate_complete()
+            .map_err(|message| ConfigError::Invalid {
+                message: format!(
+                    "invalid Oracle calibration profile {}: {message}",
+                    path.display()
+                ),
+            })?;
+        if profile.status == OracleCalibrationStatus::Approved {
+            return Ok(());
+        }
+        if !self.deployment_profile.is_production() && self.bifrost.oracle.allow_unapproved_profile
+        {
+            return Ok(());
+        }
+        Err(ConfigError::Invalid {
+            message: "Oracle calibration profile must be approved; development may set \
+                      allow_unapproved_profile=true explicitly"
+                .to_owned(),
+        })
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1338,8 +1940,184 @@ mod tests {
 
     #[test]
     fn default_config_validates() {
-        let cfg = WyrdServerConfig::default();
+        let mut cfg = WyrdServerConfig::default();
+        assert_eq!(cfg.bifrost.roles, default_bifrost_roles());
+        cfg.bifrost.oracle.allow_unapproved_profile = true;
         cfg.validate().expect("default config must be valid");
+    }
+
+    /// Proves each supported role subset parses without constructing hidden roles.
+    #[test]
+    fn bifrost_role_sets_parse_exactly() {
+        for (source, expected) in [
+            ("roles = [\"scribe\"]", vec![BifrostRuntimeRole::Scribe]),
+            ("roles = [\"forge\"]", vec![BifrostRuntimeRole::Forge]),
+            ("roles = [\"oracle\"]", vec![BifrostRuntimeRole::Oracle]),
+            (
+                "roles = [\"scribe\", \"forge\", \"oracle\"]",
+                vec![
+                    BifrostRuntimeRole::Scribe,
+                    BifrostRuntimeRole::Forge,
+                    BifrostRuntimeRole::Oracle,
+                ],
+            ),
+        ] {
+            let config =
+                from_toml_str(&format!("[bifrost]\n{source}")).expect("closed role set parses");
+            assert_eq!(
+                config.bifrost.roles,
+                expected.into_iter().collect::<BTreeSet<_>>()
+            );
+        }
+    }
+
+    /// Proves the role environment override rejects malformed or ambiguous lists.
+    #[test]
+    fn bifrost_role_env_rejects_empty_duplicate_and_unknown_values() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        for value in ["scribe,", "scribe,scribe", "scribe,worker"] {
+            temp_env::with_vars([("WYRD_BIFROST_ROLES", Some(value))], || {
+                let mut config = WyrdServerConfig::default();
+                assert!(
+                    config.apply_env_overrides().is_err(),
+                    "{value:?} must be rejected"
+                );
+            });
+        }
+    }
+
+    /// Proves the environment role set takes precedence over a parsed TOML set.
+    #[test]
+    fn bifrost_role_env_overrides_toml() {
+        let _guard = ENV_LOCK.lock().expect("environment test lock");
+        temp_env::with_vars([("WYRD_BIFROST_ROLES", Some("oracle"))], || {
+            let mut config = from_toml_str("[bifrost]\nroles = [\"scribe\"]").expect("TOML parses");
+            config
+                .apply_env_overrides()
+                .expect("closed environment role parses");
+            assert_eq!(
+                config.bifrost.roles,
+                [BifrostRuntimeRole::Oracle].into_iter().collect()
+            );
+        });
+    }
+
+    /// Proves Oracle's protocol and allocation bounds fail closed.
+    #[test]
+    fn oracle_numeric_bounds_are_validated() {
+        let mut config = WyrdServerConfig::default();
+        config.bifrost.oracle.allow_unapproved_profile = true;
+        config.bifrost.oracle.max_workers_per_query = 64;
+        assert!(config.validate().is_err());
+        config.bifrost.oracle.max_workers_per_query = 2;
+        config.bifrost.oracle.planning_permits = 0;
+        assert!(config.validate().is_err());
+    }
+
+    /// Builds one complete schema-v1 profile for activation-policy tests.
+    fn complete_oracle_calibration(status: &str) -> String {
+        let mut profile = format!(
+            r#"schema_version = 1
+status = "{status}"
+generated_from = "sha256:report"
+source_revision = "0123456789abcdef"
+
+[environment]
+hardware = "test-hardware"
+os = "test-os"
+runtime = "test-runtime"
+
+[workload]
+hashes = ["sha256:workload"]
+seeds = [42]
+data_volumes_bytes = [1048576]
+warmup_seconds = 1
+measurement_seconds = 10
+
+[matrix]
+topology = ["1", "3", "6"]
+tenant = ["single", "multi"]
+class = ["interactive", "analytical"]
+visibility = ["live", "snapshot"]
+
+[slot]
+cpu_cores = 1.0
+memory_bytes = 2147483648
+headroom = 0.75
+
+[class.interactive]
+share = 0.8
+minimum_slots = 1
+
+[class.analytical]
+share = 0.4
+minimum_slots = 2
+"#
+        );
+        for path in ORACLE_CALIBRATION_PROPOSALS {
+            profile.push_str(&format!(
+                "\n[proposal.{path}]\nvalue = {}\nevidence_case_id = \"case-{path}\"\n",
+                if *path == "distribution.max_workers_per_query" {
+                    2
+                } else {
+                    1
+                }
+            ));
+        }
+        for path in ORACLE_CALIBRATION_MEASUREMENTS {
+            profile.push_str(&format!(
+                "\n[measurements.{path}]\nvalue = 1\nevidence_case_id = \"case-{path}\"\n"
+            ));
+        }
+        profile
+    }
+
+    /// Proves production accepts only a complete maintainer-approved profile.
+    #[test]
+    fn oracle_production_calibration_requires_approved_profile() {
+        let directory = tempfile::tempdir().expect("calibration temp directory");
+        let path = directory.path().join("oracle-calibration.toml");
+        std::fs::write(&path, complete_oracle_calibration("candidate"))
+            .expect("candidate profile writes");
+        let mut config = WyrdServerConfig::default();
+        config.deployment_profile = DeploymentProfile::Production;
+        config.bifrost.oracle.calibration_profile = path.clone();
+        assert!(config.validate().is_err());
+
+        std::fs::write(&path, complete_oracle_calibration("approved"))
+            .expect("approved profile writes");
+        config
+            .validate()
+            .expect("approved production calibration validates");
+    }
+
+    /// Proves status alone cannot activate Oracle without benchmark evidence.
+    #[test]
+    fn oracle_calibration_rejects_minimal_approved_profile() {
+        let directory = tempfile::tempdir().expect("calibration temp directory");
+        let path = directory.path().join("oracle-calibration.toml");
+        std::fs::write(&path, "schema_version = 1\nstatus = \"approved\"\n")
+            .expect("minimal profile writes");
+        let mut config = WyrdServerConfig::default();
+        config.deployment_profile = DeploymentProfile::Production;
+        config.bifrost.oracle.calibration_profile = path;
+        assert!(config.validate().is_err());
+    }
+
+    /// Proves every proposal must retain the benchmark case that supports it.
+    #[test]
+    fn oracle_calibration_rejects_empty_evidence_case() {
+        let directory = tempfile::tempdir().expect("calibration temp directory");
+        let path = directory.path().join("oracle-calibration.toml");
+        let profile = complete_oracle_calibration("approved").replace(
+            "evidence_case_id = \"case-slot.cpu_cores_per_slot\"",
+            "evidence_case_id = \"\"",
+        );
+        std::fs::write(&path, profile).expect("invalid profile writes");
+        let mut config = WyrdServerConfig::default();
+        config.deployment_profile = DeploymentProfile::Production;
+        config.bifrost.oracle.calibration_profile = path;
+        assert!(config.validate().is_err());
     }
 
     #[test]

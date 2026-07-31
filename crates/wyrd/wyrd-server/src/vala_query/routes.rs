@@ -5,7 +5,7 @@
 //!   1. Authorizes via `query::service::authorize_audited` (bifrost_query_read).
 //!   2. Optionally verifies/issues a signed page token.
 //!   3. Builds the LogicalPlan via `vala_query::service::build_*_plan`.
-//!   4. Executes via `query::service::run_plan_query`.
+//!   4. Executes via `query::service::run_typed_query`.
 //!   5. Extracts typed rows from the collected RecordBatches.
 //!   6. Issues a next_page_token when has_more.
 //!
@@ -34,7 +34,7 @@ use wyrd_spec::vala::api::{
 use crate::AppState;
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
-use crate::query::service::run_plan_query;
+use crate::query::service::run_typed_query;
 use crate::vala_query::page_token;
 use crate::vala_query::service::effective_limit;
 
@@ -486,7 +486,7 @@ async fn get_trace(
         .await
         .map_err(WyrdErrorResponse::from)?;
     let limit = effective_limit(req.window.limit);
-    let (batches, _) = run_plan_query(&state, &caller, plan, "vala.query.typed.get_trace", limit)
+    let (batches, _) = run_typed_query(&state, &caller, plan, limit)
         .await
         .map_err(WyrdErrorResponse::from)?;
 
@@ -547,15 +547,9 @@ async fn query_traces(
     let plan = build_query_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_plan_query(
-        &state,
-        &caller,
-        plan,
-        "vala.query.typed.query_traces",
-        limit,
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = aggregate_spans_to_summaries(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_traces", qhash);
@@ -601,15 +595,9 @@ async fn query_recent_traces(
     let plan = build_query_recent_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_plan_query(
-        &state,
-        &caller,
-        plan,
-        "vala.query.typed.query_recent_traces",
-        limit,
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let mut rows = aggregate_spans_to_summaries(&batches);
     rows.truncate(limit as usize);
@@ -652,10 +640,9 @@ async fn query_genai(
     let plan = build_query_genai_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) =
-        run_plan_query(&state, &caller, plan, "vala.query.typed.query_genai", limit)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_genai_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_genai", qhash);
@@ -694,10 +681,9 @@ async fn query_eval(
     let plan = build_query_eval_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) =
-        run_plan_query(&state, &caller, plan, "vala.query.typed.query_eval", limit)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_eval_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_eval", qhash);
@@ -736,10 +722,9 @@ async fn query_drift(
     let plan = build_query_drift_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) =
-        run_plan_query(&state, &caller, plan, "vala.query.typed.query_drift", limit)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_drift_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_drift", qhash);
@@ -784,15 +769,9 @@ async fn query_metrics(
     let plan = build_query_metrics_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_plan_query(
-        &state,
-        &caller,
-        plan,
-        "vala.query.typed.query_metrics",
-        limit,
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_metric_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_metrics", qhash);
@@ -828,10 +807,9 @@ async fn query_logs(
     let plan = build_query_logs_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) =
-        run_plan_query(&state, &caller, plan, "vala.query.typed.query_logs", limit)
-            .await
-            .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_log_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_logs", qhash);
@@ -877,15 +855,9 @@ async fn query_agent_traces(
     let plan = build_query_agent_traces_plan(&state, &caller, &req)
         .await
         .map_err(WyrdErrorResponse::from)?;
-    let (batches, has_more) = run_plan_query(
-        &state,
-        &caller,
-        plan,
-        "vala.query.typed.query_agent_traces",
-        limit,
-    )
-    .await
-    .map_err(WyrdErrorResponse::from)?;
+    let (batches, has_more) = run_typed_query(&state, &caller, plan, limit)
+        .await
+        .map_err(WyrdErrorResponse::from)?;
 
     let rows = extract_agent_trace_rows(&batches);
     let next_page_token = maybe_issue_token(has_more, &state, &caller, "query_agent_traces", qhash);

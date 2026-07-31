@@ -44,9 +44,6 @@ name = "pg_forge_operations"
 name = "pg_migration"
 
 [[test]]
-name = "pg_olap_query_jobs"
-
-[[test]]
 name = "pg_oracle_coordination"
 
 [[test]]

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,7 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use opendal::Buffer;
 use parquet::arrow::ArrowWriter;
 use secrecy::ExposeSecret;
+use tokio_util::sync::CancellationToken;
 use vala_bifrost_redux::catalog::{
     BifrostCatalog, CreateTableRequest, TableRef, TenantTableBinding,
 };
@@ -62,7 +63,8 @@ use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, BifrostQueryRequest,
     FreshnessPolicy, OracleCapabilitiesV1, QueryAuditDigest, QueryClass, QueryExecutionMode,
-    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalOutcome, VisibilityMode,
+    QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalOutcome, ScribeCapabilitiesV1,
+    VisibilityMode,
 };
 use wyrd_spec::vala::api::{NodeId as OracleNodeId, SignedPeerTicket};
 
@@ -99,6 +101,204 @@ impl PeerTicketVerifier for DeterministicTestVerifier {
     }
 }
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
+
+/// Deterministic role-lifecycle clock used without wall-clock sleeps.
+struct InjectedRoleClock {
+    /// Total logical time advanced by the shutdown proof.
+    elapsed: Duration,
+}
+
+impl InjectedRoleClock {
+    /// Creates a clock at the role shutdown boundary.
+    fn new() -> Self {
+        Self {
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    /// Advances logical time by one lifecycle interval.
+    fn advance(&mut self, duration: Duration) {
+        self.elapsed += duration;
+    }
+}
+
+/// Proves reserved roles stay undiscoverable and colocated fences tear down independently.
+///
+/// # Panics
+///
+/// Panics when the managed database or a durable membership transition fails.
+#[tokio::test]
+async fn oracle_and_scribe_roles_activate_only_after_explicit_readiness() {
+    let pg = PgFixture::start().await.expect("managed Postgres fixture");
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
+    let cluster = Arc::new(ClusterRegistry::new(pg.operator_pool().clone(), node_id));
+    let oracle = cluster
+        .reserve_oracle(
+            "127.0.0.1:50052",
+            OracleCapabilitiesV1 {
+                peer_protocol_version: 1,
+                storage_protocol_version: 1,
+                cpu_cores: 1.0,
+                memory_budget_bytes: 256 * 1024 * 1024,
+                cpu_cores_per_slot: 1.0,
+                memory_bytes_per_slot: 64 * 1024 * 1024,
+                raw_slots: 1,
+                usable_slots: 1,
+                supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+                max_workers_per_query: 0,
+            },
+        )
+        .await
+        .expect("reserve Oracle");
+    let scribe = cluster
+        .reserve_scribe(
+            "127.0.0.1:50053",
+            ScribeCapabilitiesV1 {
+                tail_protocol_version: 1,
+            },
+        )
+        .await
+        .expect("reserve Scribe");
+
+    cluster.refresh_snapshot().await.expect("reserved snapshot");
+    assert!(cluster.snapshot().live_oracles().is_empty());
+    assert!(cluster.snapshot().live_scribes().is_empty());
+
+    cluster.activate(&oracle).await.expect("activate Oracle");
+    cluster.activate(&scribe).await.expect("activate Scribe");
+    cluster.refresh_snapshot().await.expect("active snapshot");
+    assert_eq!(cluster.snapshot().live_oracles().len(), 1);
+    assert_eq!(cluster.snapshot().live_scribes().len(), 1);
+
+    let oracle_ready = Arc::new(AtomicBool::new(true));
+    let scribe_ready = Arc::new(AtomicBool::new(true));
+    let oracle_heartbeat_shutdown = CancellationToken::new();
+    let scribe_heartbeat_shutdown = CancellationToken::new();
+    let oracle_heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
+        oracle.clone(),
+        Arc::clone(&oracle_ready),
+        oracle_heartbeat_shutdown.clone(),
+    );
+    let scribe_heartbeat = Arc::clone(&cluster).start_readiness_heartbeat(
+        scribe.clone(),
+        Arc::clone(&scribe_ready),
+        scribe_heartbeat_shutdown.clone(),
+    );
+    tokio::task::yield_now().await;
+
+    let oracle_work_shutdown = CancellationToken::new();
+    let scribe_work_shutdown = CancellationToken::new();
+    let oracle_active = {
+        let shutdown = oracle_work_shutdown.clone();
+        tokio::spawn(async move { shutdown.cancelled().await })
+    };
+    let scribe_active = {
+        let shutdown = scribe_work_shutdown.clone();
+        tokio::spawn(async move { shutdown.cancelled().await })
+    };
+    let accepting = AtomicBool::new(true);
+    let mut shutdown_events = Vec::new();
+    let mut clock = InjectedRoleClock::new();
+
+    oracle_ready.store(false, Ordering::Release);
+    scribe_ready.store(false, Ordering::Release);
+    cluster
+        .deactivate(&oracle)
+        .await
+        .expect("deactivate Oracle");
+    cluster
+        .deactivate(&scribe)
+        .await
+        .expect("deactivate Scribe");
+    shutdown_events.push("durable_deactivate");
+    cluster
+        .refresh_snapshot()
+        .await
+        .expect("deactivated snapshot");
+    assert!(cluster.snapshot().live_oracles().is_empty());
+    assert!(cluster.snapshot().live_scribes().is_empty());
+
+    clock.advance(vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL);
+    cluster
+        .heartbeat_readiness_for_test(&oracle, oracle_ready.load(Ordering::Acquire))
+        .await
+        .expect("injected Oracle heartbeat");
+    cluster
+        .heartbeat_readiness_for_test(&scribe, scribe_ready.load(Ordering::Acquire))
+        .await
+        .expect("injected Scribe heartbeat");
+    cluster
+        .refresh_snapshot()
+        .await
+        .expect("draining heartbeat snapshot");
+    assert!(
+        cluster.snapshot().live_oracles().is_empty()
+            && cluster.snapshot().live_scribes().is_empty(),
+        "matching heartbeats must preserve not-ready during drain"
+    );
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(
+        clock.elapsed,
+        vala_bifrost_redux::cluster::ROLE_HEARTBEAT_INTERVAL + Duration::from_secs(1)
+    );
+    shutdown_events.push("drain");
+
+    oracle_heartbeat_shutdown.cancel();
+    scribe_heartbeat_shutdown.cancel();
+    oracle_heartbeat.await.expect("Oracle heartbeat stops");
+    scribe_heartbeat.await.expect("Scribe heartbeat stops");
+    shutdown_events.push("heartbeat_stop");
+
+    accepting.store(false, Ordering::Release);
+    assert!(!accepting.load(Ordering::Acquire), "new work is rejected");
+    oracle_work_shutdown.cancel();
+    scribe_work_shutdown.cancel();
+    oracle_active.await.expect("Oracle active work cancels");
+    scribe_active.await.expect("Scribe active work cancels");
+    shutdown_events.push("reject_cancel_active");
+
+    cluster
+        .shutdown_role(oracle.clone())
+        .await
+        .expect("unregister Oracle");
+    shutdown_events.push("oracle_unregister");
+
+    cluster
+        .heartbeat(&scribe)
+        .await
+        .expect("Scribe exact fence survives Oracle unregister");
+    cluster
+        .refresh_snapshot()
+        .await
+        .expect("Oracle shutdown snapshot");
+    assert!(cluster.snapshot().live_oracles().is_empty());
+    assert_eq!(
+        cluster.snapshot().live_scribes().len(),
+        1,
+        "Oracle teardown must not mutate the colocated Scribe fence"
+    );
+
+    cluster
+        .deactivate(&scribe)
+        .await
+        .expect("deactivate Scribe");
+    cluster
+        .shutdown_role(scribe)
+        .await
+        .expect("unregister Scribe");
+    shutdown_events.push("scribe_unregister");
+    assert_eq!(
+        shutdown_events,
+        [
+            "durable_deactivate",
+            "drain",
+            "heartbeat_stop",
+            "reject_cancel_active",
+            "oracle_unregister",
+            "scribe_unregister",
+        ]
+    );
+}
 
 /// Dependencies retained for one real Postgres/catalog/Oracle integration.
 struct OracleFixture {

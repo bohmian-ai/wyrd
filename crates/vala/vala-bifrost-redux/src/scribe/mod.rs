@@ -32,11 +32,11 @@ pub use crate::scribe::execution_lanes::{
 };
 pub use crate::scribe::persistence::ScribePersistenceConfig;
 use crate::scribe::seal_key::SealKey;
+use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 pub use crate::scribe::tail_rpc::{
     LocalTailReadTransport, ScribeTailReader, TailFenceConfig, TailReadTransport,
     TonicTailReadTransport,
 };
-use crate::scribe::tail_rpc::{FetchLiveTailRequest, FetchLiveTailService, TailFrame};
 use crate::scribe::telemetry::{
     ScribeBucketMemorySnapshot, ScribeInspectionSnapshot, ScribeRuntimeSnapshot,
 };

@@ -53,12 +53,11 @@ use wyrd_spec::storage::{
     UploadInitRequest, UploadInitResponse, UploadPlan, VerificationGuarantee, WireProtocol,
 };
 use wyrd_spec::vala::api::{
-    AsyncJobState, AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, AuditDecision,
-    AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor, BifrostPermissionDescriptor,
-    BifrostTableDescription, BifrostTableEntry, DataTypeSpec, ExecutorAvailability,
-    FieldSpec as BifrostFieldSpec, JobUid, PartitionColumnSpec, PartitionTransformWire, QueryParam,
-    RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest, TableStatus,
-    TimeUnit,
+    AuditDecision, AuditEvent, AuditResult, AuthMethod, BifrostErrorDescriptor,
+    BifrostPermissionDescriptor, BifrostQueryRequest, BifrostTableDescription, BifrostTableEntry,
+    DataTypeSpec, FieldSpec as BifrostFieldSpec, PartitionColumnSpec, PartitionTransformWire,
+    QueryParam, RegisterOutcome, RegisterTableRequest, RegisterTableResponse, SyncQueryRequest,
+    TableStatus, TimeUnit,
 };
 use wyrd_spec::vala::eval::{
     AgentTurnSubmission, ComparisonOperator, ConversationTurn, DagError, EvalCondition,
@@ -198,13 +197,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     write::<RegisterOutcome>(out, golden, "bifrost_register_outcome")?;
     write::<RegisterTableResponse>(out, golden, "bifrost_register_table_response")?;
     write::<QueryParam>(out, golden, "bifrost_query_param")?;
-    write::<JobUid>(out, golden, "bifrost_job_uid")?;
-    write::<AsyncJobState>(out, golden, "bifrost_async_job_state")?;
-    write::<ExecutorAvailability>(out, golden, "bifrost_executor_availability")?;
+    write::<BifrostQueryRequest>(out, golden, "bifrost_query_request")?;
     write::<SyncQueryRequest>(out, golden, "bifrost_sync_query_request")?;
-    write::<AsyncQueryRequest>(out, golden, "bifrost_async_query_request")?;
-    write::<AsyncQueryResponse>(out, golden, "bifrost_async_query_response")?;
-    write::<AsyncQueryStatus>(out, golden, "bifrost_async_query_status")?;
     write::<AuditEvent>(out, golden, "bifrost_audit_event")?;
     write::<AuthMethod>(out, golden, "bifrost_audit_auth_method")?;
     write::<AuditDecision>(out, golden, "bifrost_audit_decision")?;

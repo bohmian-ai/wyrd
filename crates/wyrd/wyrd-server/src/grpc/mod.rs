@@ -8,6 +8,7 @@ pub use wyrd_tonic::error;
 pub use wyrd_tonic::health::WyrdHealthSentinel;
 pub use wyrd_tonic::server::*;
 
+pub(crate) mod query;
 mod scribe_tail;
 
 use wyrd_tonic::tonic::transport::server::Router as TonicRouter;
@@ -38,31 +39,38 @@ where
     if state.auth.token_verifier.is_none() {
         return Err(GrpcError::MissingTokenVerifier);
     }
-    let ingest_runtime = state
-        .bifrost_ingest
+    let ingest = state
+        .bifrost_gate
         .as_ref()
         .ok_or(GrpcError::MissingScribe)?;
-    let ingest = ingest_runtime.gate();
     let traces = wyrd_tonic::otlp::trace_service::trace_service_server::TraceServiceServer::new(
-        (*ingest).clone(),
+        (**ingest).clone(),
     );
     let metrics =
         wyrd_tonic::otlp::metrics_service::metrics_service_server::MetricsServiceServer::new(
-            (*ingest).clone(),
+            (**ingest).clone(),
         );
     let logs = wyrd_tonic::otlp::logs_service::logs_service_server::LogsServiceServer::new(
-        (*ingest).clone(),
+        (**ingest).clone(),
     );
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
-    let tail = scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader());
+    let bifrost_query = query::BifrostQueryGrpc::new(state.clone());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
     let router = router
-        .add_service((*ingest).clone().into_server())
+        .add_service((**ingest).clone().into_server())
         .add_service(traces)
         .add_service(metrics)
         .add_service(logs)
         .add_service(query.into_server())
-        .add_service(tail.into_server());
+        .add_service(bifrost_query.into_server());
+    let router = if let Some(ingest_runtime) = &state.bifrost_ingest {
+        router.add_service(
+            scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader())
+                .into_server(),
+        )
+    } else {
+        router
+    };
     let router = if let Some(peer) = &state.oracle_peer {
         router.add_service(
             crate::oracle::OraclePeerGrpc::new(state.clone(), peer.worker()).into_server(),

@@ -117,15 +117,21 @@ This GROUP-BY runs in Rust after collecting the scanned batches. In Stage 5 it w
 
 ## Generic SQL surface
 
-`POST /v1/observations/query` accepts any SELECT statement:
+`POST /v1/query` accepts a bounded `BifrostQueryRequest` containing one SELECT statement:
 
 ```bash
-curl -X POST /v1/observations/query \
+curl -X POST /v1/query \
   -H "x-wyrd-access-token: Bearer $TOKEN" \
-  -d '{ "sql": "SELECT metric_name, AVG(value) AS avg FROM \"vala.metrics.points\" WHERE wyrd_event_time >= now() - interval '\''7 days'\'' GROUP BY metric_name" }'
+  -H "content-type: application/json" \
+  -d '{ "sql": "SELECT metric_name, AVG(value) AS avg FROM \"vala.metrics.points\" WHERE wyrd_event_time >= now() - interval '\''7 days'\'' GROUP BY metric_name", "visibility": "published_only", "freshness": "strict" }'
 ```
 
-The response body is a raw Arrow IPC stream (`application/vnd.apache.arrow.stream`).
+The response is `application/vnd.wyrd.bifrost-query-stream`: a
+length-delimited sequence of `QueryStreamFrame` protobuf messages. A successful
+stream starts with `Schema`, carries zero or more Arrow IPC `Batch` payloads,
+and ends with exactly one `Terminal` frame. Treat EOF before `Terminal` as an
+incomplete query, not as partial success. The initial
+`x-wyrd-schema-fingerprint` header is the only query metadata header.
 
 **Governance on the generic path:**
 
@@ -134,22 +140,4 @@ The response body is a raw Arrow IPC stream (`application/vnd.apache.arrow.strea
 - References to payload columns without the matching payload permission return `403 WYRD_VALA_403_PAYLOAD_FORBIDDEN`.
 - A domain-table scan without a `wyrd_event_time` time-window predicate is rejected with `400 WYRD_VALA_400_QUERY_INVALID_SQL`.
 - Non-SELECT statements are rejected.
-- Results are bounded at `MAX_SYNC_RESULT_ROWS` rows and `MAX_SYNC_RESULT_BYTES` bytes.
-
-## Arrow → Python conversion
-
-```python
-import pyarrow as pa
-import pyarrow.ipc as ipc
-import io
-
-response = requests.post(
-    "/v1/observations/query",
-    headers={"x-wyrd-access-token": f"Bearer {token}"},
-    json={"sql": "SELECT * FROM \"vala.metrics.points\" LIMIT 100"},
-    stream=True,
-)
-reader = ipc.open_stream(io.BytesIO(response.content))
-table = reader.read_all()
-df = table.to_pandas()
-```
+- Admission and each encoded frame are bounded by the active Oracle profile.

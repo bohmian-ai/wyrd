@@ -1,12 +1,82 @@
 openapi: 3.1.0
 info:
-  title: Wyrd API
-  version: 0.0.1
+  title: wyrd-server
+  description: ''
+  contact:
+    name: Thorrester
+    email: sjforrester32@gmail.com
   license:
     name: Apache-2.0
     identifier: Apache-2.0
-servers:
-  - url: http://localhost:8080
-paths: {}
+  version: 0.0.1
+paths:
+  /v1/query:
+    post:
+      tags:
+      - Bifrost
+      summary: Streams one authenticated SQL query as canonical protobuf frames.
+      operationId: sync_query
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BifrostQueryRequest'
+        required: true
+      responses:
+        '200':
+          description: Length-delimited protobuf QueryStreamFrame stream
+          headers:
+            x-wyrd-schema-fingerprint:
+              schema:
+                type: string
+              description: Hex SHA-256 fingerprint of the response schema
+          content:
+            application/vnd.wyrd.bifrost-query-stream:
+              schema:
+                type: array
+                items:
+                  type: integer
+                  format: int32
+                  minimum: 0
+        '503':
+          description: Oracle role is unavailable
 components:
-  schemas: {}
+  schemas:
+    BifrostQueryRequest:
+      type: object
+      description: Public synchronous Oracle query request.
+      required:
+      - sql
+      - visibility
+      properties:
+        deadline_ms:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Optional caller deadline in milliseconds.
+          minimum: 0
+        freshness:
+          $ref: '#/components/schemas/FreshnessPolicy'
+          description: Required freshness behavior.
+        sql:
+          type: string
+          description: SELECT-only SQL text.
+        visibility:
+          $ref: '#/components/schemas/VisibilityMode'
+          description: Visibility tiers requested by the caller.
+    FreshnessPolicy:
+      type: string
+      description: Behavior when a requested live source cannot complete.
+      enum:
+      - strict
+      - allow_degraded
+    VisibilityMode:
+      type: string
+      description: Visibility tiers included in one immutable Oracle query cut.
+      enum:
+      - published_only
+      - fused
+tags:
+- name: Bifrost
+  description: Bounded Bifrost query transport

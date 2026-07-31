@@ -1,79 +1,419 @@
 //! Axum adapters for the query service functions.
 //!
-//! The sync route returns a raw Arrow IPC stream (`application/vnd.apache.arrow.stream`)
-//! with the `X-Wyrd-Schema-Fingerprint` / `X-Wyrd-Row-Count` headers, so it builds
-//! a `Response` directly rather than `Json`. The async submit/status routes are
-//! ordinary JSON. Every route delegates to `service`, which authorizes and runs
-//! the floor before execution, and maps errors through the single `WyrdErrorResponse`.
+//! Query route adapters.
 
-use axum::body::Body;
-use axum::extract::{Path, State};
+use std::io;
+
+use axum::body::{Body, Bytes};
+use axum::extract::State;
 use axum::http::{StatusCode, header};
-use axum::response::Response;
-use axum::routing::{get, post};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
 use axum::{Json, Router};
+use futures_util::StreamExt;
+use vala_bifrost_redux::oracle::OracleQueryStream;
 use wyrd_spec::error::WyrdError;
-use wyrd_spec::vala::api::{
-    AsyncQueryRequest, AsyncQueryResponse, AsyncQueryStatus, JobUid, SyncQueryRequest,
-};
+use wyrd_spec::vala::api::BifrostQueryRequest;
+use wyrd_tonic::frame_codec::FrameEncoder;
 
 use crate::components::auth::Caller;
 use crate::http::error::WyrdErrorResponse;
 use crate::query::service;
 use crate::state::AppState;
 
-/// Content type of the sync-query Arrow IPC stream response.
-const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+/// Content type of the length-delimited Bifrost query frame stream.
+const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stream";
 
 /// Standalone query router for the `/v1` group.
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/query", post(sync_query))
-        .route("/query/async", post(async_query))
-        .route("/query/async/{job_uid}", get(async_query_status))
+    Router::new().route("/query", post(sync_query))
 }
 
-async fn sync_query(
+#[utoipa::path(
+    post,
+    path = "/v1/query",
+    request_body = BifrostQueryRequest,
+    responses(
+        (
+            status = 200,
+            description = "Length-delimited protobuf QueryStreamFrame stream",
+            content_type = "application/vnd.wyrd.bifrost-query-stream",
+            body = Vec<u8>,
+            headers(
+                (
+                    "x-wyrd-schema-fingerprint" = String,
+                    description = "Hex SHA-256 fingerprint of the response schema"
+                )
+            )
+        ),
+        (status = 503, description = "Oracle role is unavailable")
+    ),
+    tag = "Bifrost"
+)]
+/// Streams one authenticated SQL query as canonical protobuf frames.
+pub(crate) async fn sync_query(
     State(state): State<AppState>,
     caller: Caller,
-    Json(body): Json<SyncQueryRequest>,
-) -> Result<Response, WyrdErrorResponse> {
-    let result = service::run_sync_query(&state, caller, body)
-        .await
-        .map_err(WyrdErrorResponse::from)?;
+    Json(body): Json<BifrostQueryRequest>,
+) -> Response {
+    let result = match service::stream_query(state, caller, body).await {
+        Ok(result) => result,
+        Err(error) => return query_error_response(error),
+    };
+    query_stream_response(result)
+}
 
-    Response::builder()
+/// Converts an admitted Oracle stream into the stable HTTP frame transport.
+///
+/// The body pulls exactly one logical frame at a time, preserving downstream
+/// backpressure. Dropping the body drops Oracle's stream guards and propagates
+/// cancellation without a buffering task.
+///
+/// # Errors
+///
+/// Frame encoding and late Oracle errors surface as body-stream IO failures;
+/// response construction failures return the stable internal problem response.
+pub(crate) fn query_stream_response(result: OracleQueryStream) -> Response {
+    let schema_fingerprint = result.schema_fingerprint;
+    let mut frames = result.frames;
+    let body = Body::from_stream(async_stream::stream! {
+        while let Some(frame) = frames.next().await {
+            let frame = match frame {
+                Ok(frame) => FrameEncoder::encode(
+                    &wyrd_tonic::wyrd::v1::QueryStreamFrame::from(frame),
+                )
+                .map(Bytes::from)
+                .map_err(|error| io::Error::other(error.to_string())),
+                Err(error) => Err(io::Error::other(error.to_string())),
+            };
+            yield frame;
+        }
+    });
+
+    match Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
-        .header("x-wyrd-schema-fingerprint", result.schema_fingerprint)
-        .header("x-wyrd-row-count", result.row_count.to_string())
-        .body(Body::from(result.body))
-        .map_err(|error| {
-            WyrdErrorResponse::from(WyrdError::Internal {
-                message: "failed to build query response".to_owned(),
-                details: serde_json::json!({ "detail": error.to_string() }),
-            })
+        .header(header::CONTENT_TYPE, QUERY_STREAM_CONTENT_TYPE)
+        .header("x-wyrd-schema-fingerprint", schema_fingerprint)
+        .body(body)
+    {
+        Ok(response) => response,
+        Err(error) => query_error_response(WyrdError::Internal {
+            message: "failed to build query response".to_owned(),
+            details: serde_json::json!({ "detail": error.to_string() }),
+        }),
+    }
+}
+
+/// Renders pre-stream query errors and marks unavailable roles retryable.
+pub(crate) fn query_error_response(error: WyrdError) -> Response {
+    let retryable = error.status() == 503;
+    let mut response = WyrdErrorResponse::from(error).into_response();
+    if retryable {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            "1".parse().expect("static header is valid"),
+        );
+    }
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::body::Body;
+    use http_body_util::BodyExt;
+    use wyrd_runtime::permission::{Permission, PermissionSet};
+    use wyrd_runtime::{Principal, PrincipalKind};
+    use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::request_id::RequestId;
+    use wyrd_spec::vala::api::{
+        FreshnessPolicy, QueryBatchFrame, QueryErrorDetail, QueryFreshness, QuerySchemaFrame,
+        QuerySource, QueryStreamFrame, QueryTerminalError, QueryTerminalErrorCode,
+        QueryTerminalFrame, QueryTerminalOutcome, SourceCompletion, SourceCompletionOutcome,
+        VisibilityMode,
+    };
+    use wyrd_tonic::frame_codec::FrameDecoder;
+
+    use super::*;
+
+    /// Builds the required complete source set for a published-only terminal.
+    fn complete_sources() -> Vec<SourceCompletion> {
+        vec![
+            SourceCompletion {
+                source: QuerySource::Iceberg,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+            SourceCompletion {
+                source: QuerySource::HotSealed,
+                outcome: SourceCompletionOutcome::Complete,
+            },
+        ]
+    }
+
+    /// Builds one authorized caller for a real pre-byte service dispatch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shared fixture tenant cannot be resolved.
+    async fn query_caller() -> Caller {
+        let tenant = crate::test_support::test_tenant().await;
+        Caller {
+            data_tenant_id: tenant,
+            principal: Principal::new(
+                PrincipalId::new(uuid::Uuid::now_v7()),
+                PrincipalKind::User,
+                tenant,
+                Vec::new(),
+                PermissionSet::from_iter([Permission::bifrost_query_read()]),
+            ),
+            request_id: RequestId::now_v7(),
+        }
+    }
+
+    /// Builds real server state with no local Gate or Oracle role.
+    ///
+    /// # Panics
+    ///
+    /// Panics when shared Postgres, storage, or catalog fixtures cannot start.
+    async fn state_without_oracle() -> AppState {
+        AppState::new(
+            crate::test_support::test_server_postgres().await,
+            crate::test_support::test_storage().await,
+            crate::test_support::test_catalog().await,
+        )
+    }
+
+    /// Proves HTTP emits canonical length-delimited frames and only the schema header.
+    #[tokio::test]
+    async fn http_query_stream_has_exact_media_headers_and_frames() {
+        let expected = vec![
+            QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1, 2],
+            }),
+            QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: vec![3, 4, 5],
+            }),
+            QueryStreamFrame::Terminal(QueryTerminalFrame {
+                outcome: QueryTerminalOutcome::Degraded,
+                freshness: QueryFreshness::Degraded,
+                row_count: 1,
+                warnings: Vec::new(),
+                source_completion: Vec::new(),
+                error: None,
+            }),
+        ];
+        let frames = futures_util::stream::iter(expected.clone().into_iter().map(Ok));
+        let response = query_stream_response(OracleQueryStream {
+            schema_fingerprint: "abcd".to_owned(),
+            frames: Box::pin(frames),
+        });
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(
+                &QUERY_STREAM_CONTENT_TYPE
+                    .parse()
+                    .expect("static media type")
+            )
+        );
+        assert_eq!(
+            response.headers().get("x-wyrd-schema-fingerprint"),
+            Some(&"abcd".parse().expect("static fingerprint"))
+        );
+        assert!(!response.headers().contains_key("x-wyrd-row-count"));
+
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("stream body completes")
+            .to_bytes();
+        let mut decoder = FrameDecoder::new(1024);
+        let decoded = decoder
+            .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
+            .expect("length-delimited frames decode");
+        decoder.finish().expect("body ends between frames");
+        assert_eq!(
+            decoded,
+            expected
+                .into_iter()
+                .map(wyrd_tonic::wyrd::v1::QueryStreamFrame::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Proves role mismatch is a typed retryable problem before any body stream.
+    #[tokio::test]
+    async fn oracle_role_unavailable_has_retry_after() {
+        let response = query_error_response(
+            wyrd_spec::vala::error::BifrostError::OracleRoleUnavailable.into(),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&"1".parse().expect("static retry header"))
+        );
+        let body = Body::new(response.into_body());
+        assert!(
+            !body
+                .collect()
+                .await
+                .expect("problem body")
+                .to_bytes()
+                .is_empty()
+        );
+    }
+
+    /// Proves an empty query result emits schema then terminal with no batch.
+    #[tokio::test]
+    async fn http_query_stream_preserves_empty_result() {
+        let expected = vec![
+            QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1],
+            }),
+            QueryStreamFrame::Terminal(QueryTerminalFrame {
+                outcome: QueryTerminalOutcome::Success,
+                freshness: QueryFreshness::Complete,
+                row_count: 0,
+                warnings: Vec::new(),
+                source_completion: complete_sources(),
+                error: None,
+            }),
+        ];
+        let bytes = query_stream_response(OracleQueryStream {
+            schema_fingerprint: "abcd".to_owned(),
+            frames: Box::pin(futures_util::stream::iter(
+                expected.clone().into_iter().map(Ok),
+            )),
         })
-}
-
-async fn async_query(
-    State(state): State<AppState>,
-    caller: Caller,
-    Json(body): Json<AsyncQueryRequest>,
-) -> Result<Json<AsyncQueryResponse>, WyrdErrorResponse> {
-    service::submit_async_query(&state, caller, body)
+        .into_body()
+        .collect()
         .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
-}
+        .expect("empty result body")
+        .to_bytes();
+        let mut decoder = FrameDecoder::new(1024);
+        let actual = decoder
+            .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
+            .expect("empty result frames");
+        assert_eq!(
+            actual,
+            expected
+                .into_iter()
+                .map(wyrd_tonic::wyrd::v1::QueryStreamFrame::from)
+                .collect::<Vec<_>>()
+        );
+    }
 
-async fn async_query_status(
-    State(state): State<AppState>,
-    caller: Caller,
-    Path(job_uid): Path<JobUid>,
-) -> Result<Json<AsyncQueryStatus>, WyrdErrorResponse> {
-    service::get_async_query_status(&state, caller, job_uid)
+    /// Proves a real pre-byte role error never constructs the query frame transport.
+    #[test]
+    fn http_query_prebyte_service_error_has_no_frame_headers() {
+        wyrd_runtime::runtime().block_on(async {
+            let response = sync_query(
+                State(state_without_oracle().await),
+                query_caller().await,
+                Json(BifrostQueryRequest {
+                    sql: "SELECT 1".to_owned(),
+                    visibility: VisibilityMode::PublishedOnly,
+                    freshness: FreshnessPolicy::Strict,
+                    deadline_ms: Some(1_000),
+                }),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_ne!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(
+                    &QUERY_STREAM_CONTENT_TYPE
+                        .parse()
+                        .expect("static stream media type")
+                )
+            );
+            assert!(
+                !response.headers().contains_key("x-wyrd-schema-fingerprint"),
+                "pre-byte errors must not expose stream metadata"
+            );
+        });
+    }
+
+    /// Proves a post-byte failure remains a terminal frame, not a status rewrite.
+    #[tokio::test]
+    async fn http_query_stream_preserves_late_failed_terminal() {
+        let terminal = QueryStreamFrame::Terminal(QueryTerminalFrame {
+            outcome: QueryTerminalOutcome::Failed,
+            freshness: QueryFreshness::Complete,
+            row_count: 1,
+            warnings: Vec::new(),
+            source_completion: Vec::new(),
+            error: Some(QueryTerminalError {
+                code: QueryTerminalErrorCode::QueryExecutionFailed,
+                detail: Some(QueryErrorDetail::new("worker failed").expect("scrubbed detail")),
+            }),
+        });
+        let frames = futures_util::stream::iter([
+            Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1],
+            })),
+            Ok(QueryStreamFrame::Batch(QueryBatchFrame {
+                arrow_ipc_batch: vec![2],
+            })),
+            Ok(terminal.clone()),
+        ]);
+        let bytes = query_stream_response(OracleQueryStream {
+            schema_fingerprint: "abcd".to_owned(),
+            frames: Box::pin(frames),
+        })
+        .into_body()
+        .collect()
         .await
-        .map(Json)
-        .map_err(WyrdErrorResponse::from)
+        .expect("late failure remains a valid body")
+        .to_bytes();
+        let mut decoder = FrameDecoder::new(1024);
+        let decoded = decoder
+            .push::<wyrd_tonic::wyrd::v1::QueryStreamFrame>(&bytes)
+            .expect("failed terminal decodes");
+        assert_eq!(
+            decoded.last(),
+            Some(&wyrd_tonic::wyrd::v1::QueryStreamFrame::from(terminal))
+        );
+    }
+
+    /// Proves dropping an HTTP body drops the retained Oracle frame stream.
+    #[tokio::test]
+    async fn http_query_body_drop_propagates_cancellation() {
+        /// Marks when the synthetic Oracle stream is dropped.
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            /// Records cancellation at the same ownership boundary as Oracle guards.
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream_dropped = Arc::clone(&dropped);
+        let frames = async_stream::stream! {
+            let _signal = DropSignal(stream_dropped);
+            yield Ok(QueryStreamFrame::Schema(QuerySchemaFrame {
+                schema_fingerprint: "abcd".to_owned(),
+                arrow_ipc_schema: vec![1],
+            }));
+            std::future::pending::<()>().await;
+        };
+        let response = query_stream_response(OracleQueryStream {
+            schema_fingerprint: "abcd".to_owned(),
+            frames: Box::pin(frames),
+        });
+        let mut body = response.into_body();
+        let _first = body.frame().await.expect("first body frame");
+        drop(body);
+        assert!(
+            dropped.load(Ordering::Acquire),
+            "transport body drop must release Oracle stream guards"
+        );
+    }
 }

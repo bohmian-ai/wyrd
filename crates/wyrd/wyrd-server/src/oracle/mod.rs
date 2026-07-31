@@ -6,10 +6,12 @@ use vala_bifrost_redux::oracle::dispatcher::OraclePeerWorker;
 mod peer_audit;
 mod peer_authority;
 mod peer_service;
+mod query_audit;
 
 pub use peer_audit::PostgresPeerSecurityAudit;
 pub use peer_authority::OraclePeerAuthority;
 pub use peer_service::OraclePeerGrpc;
+pub use query_audit::ServerOracleAudit;
 
 /// Readiness-qualified private peer runtime retained by [`crate::AppState`].
 pub struct OraclePeerRuntime {

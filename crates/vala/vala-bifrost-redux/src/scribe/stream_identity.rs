@@ -137,11 +137,11 @@ pub async fn acquire_on_boot(
         .map_err(|error| ScribeError::Internal {
             detail: error.to_string(),
         })?;
-    let writer_epoch = WriterEpoch::new(
-        i64::try_from(registered.fencing_token).map_err(|_| ScribeError::Internal {
+    let writer_epoch = WriterEpoch::new(i64::try_from(registered.fencing_token).map_err(|_| {
+        ScribeError::Internal {
             detail: "Scribe role fence exceeds the WAL epoch range".to_owned(),
-        })?,
-    );
+        }
+    })?);
 
     Ok(StreamIdentity::new(node_id, writer_epoch))
 }

@@ -16,6 +16,7 @@ pub mod forge;
 pub mod gate;
 pub mod maintenance;
 pub mod namespaces;
+pub mod oracle;
 pub mod parquet;
 pub mod provider;
 pub mod schema;

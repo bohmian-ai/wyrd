@@ -14,7 +14,7 @@ use vala_sql::row_types::cluster_nodes::{RoleMutation, RoleRegistration};
 use vala_sql::{OperatorPool, SqlError};
 use wyrd_spec::vala::api::{
     ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, NodeId,
-    ScribeCapabilitiesV1,
+    OracleCapabilitiesV1, ScribeCapabilitiesV1,
 };
 
 /// Production heartbeat period for independently fenced runtime roles.
@@ -150,7 +150,24 @@ impl ClusterRegistry {
         capabilities: ScribeCapabilitiesV1,
     ) -> Result<RegisteredRole, ClusterError> {
         let capabilities = ClusterCapabilities::ScribeV1(capabilities);
-        self.register_role(ClusterRole::Scribe, address, capabilities).await
+        self.register_role(ClusterRole::Scribe, address, capabilities)
+            .await
+    }
+
+    /// Registers one Oracle role and advances only the Oracle fence for this node.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError`] when registration or the initial fenced ready
+    /// heartbeat cannot complete.
+    pub async fn register_oracle(
+        &self,
+        address: &str,
+        capabilities: OracleCapabilitiesV1,
+    ) -> Result<RegisteredRole, ClusterError> {
+        let capabilities = ClusterCapabilities::OracleV1(capabilities);
+        self.register_role(ClusterRole::Oracle, address, capabilities)
+            .await
     }
 
     /// Returns the most recently atomically published live-role snapshot.
@@ -327,7 +344,8 @@ mod tests {
             started_at: Utc::now(),
             heartbeat_at: Utc::now(),
         };
-        let snapshot = ClusterSnapshot::new(vec![lease(ClusterRole::Oracle), lease(ClusterRole::Scribe)]);
+        let snapshot =
+            ClusterSnapshot::new(vec![lease(ClusterRole::Oracle), lease(ClusterRole::Scribe)]);
         assert_eq!(snapshot.live_scribes().len(), 1);
         assert_eq!(snapshot.live_oracles().len(), 1);
     }

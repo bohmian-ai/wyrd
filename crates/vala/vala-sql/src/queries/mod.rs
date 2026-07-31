@@ -12,6 +12,7 @@ pub mod anchors;
 pub mod audit_outbox;
 pub mod cluster_nodes;
 pub mod drift_alerts;
+pub mod file_list;
 pub mod forge_operations;
 pub mod maintenance_leases;
 pub mod monitor;

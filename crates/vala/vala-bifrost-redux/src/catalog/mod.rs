@@ -9,7 +9,7 @@ pub mod table_ref;
 pub mod tenant_table;
 mod wire;
 
-pub use bifrost_catalog::{BifrostCatalog, CreateTableRequest, TableUid};
+pub use bifrost_catalog::{BifrostCatalog, CreateTableRequest, PinnedSealedTable, TableUid};
 pub use error::BifrostCatalogError;
 pub use partition_spec::{PartitionTransform, build_partition_spec};
 pub use table_ref::TableRef;

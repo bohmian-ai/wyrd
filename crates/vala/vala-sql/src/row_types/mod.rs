@@ -6,6 +6,7 @@ pub mod alerts;
 pub mod anchors;
 pub mod audit_outbox;
 pub mod cluster_nodes;
+pub mod file_list;
 pub mod forge_operations;
 pub mod maintenance;
 pub mod monitor;

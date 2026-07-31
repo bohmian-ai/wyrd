@@ -1,12 +1,14 @@
 //! Redux-owned tenant-qualified Bifrost catalog.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
 use iceberg::TableCreation;
 use iceberg::spec::{FormatVersion, NullOrder, SortDirection, SortField, SortOrder, Transform};
+use sha2::{Digest as _, Sha256};
 use vala_sql::ValaPostgres;
+use vala_sql::queries::file_list::HotFileCatalog;
 use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{AuditEvent, BifrostTableDescription, BifrostTableEntry};
 use wyrd_storage::settings::BackendConfig;
@@ -22,6 +24,16 @@ use crate::namespaces::BifrostNamespace;
 use crate::provider::ReduxTableProvider;
 use crate::schema::{SchemaFingerprint, with_managed_columns};
 use crate::tables::{BuiltinTableDefinition, builtin_table};
+
+/// Hashes an ordered metadata identity projection for immutable cut auditing.
+fn digest_strings(values: impl IntoIterator<Item = String>) -> String {
+    let mut digest = Sha256::new();
+    for value in values {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
 
 /// Build the fixed ascending sort order used by every Redux Bifrost table.
 ///
@@ -95,6 +107,27 @@ pub struct CreateTableRequest {
     pub audit: Option<AuditEvent>,
 }
 
+/// Immutable metadata cut for one tenant-qualified sealed table.
+#[derive(Debug)]
+pub struct PinnedSealedTable {
+    /// Authenticated tenant/table binding.
+    pub binding: TenantTableBinding,
+    /// Iceberg table metadata loaded once for this cut.
+    pub iceberg_table: iceberg::table::Table,
+    /// Exact current snapshot identity selected from the immutable table metadata.
+    pub snapshot_id: Option<i64>,
+    /// Stable digest of the selected snapshot identity and live data-file set.
+    pub snapshot_digest: String,
+    /// Canonical live data-file identities in the pinned Iceberg snapshot.
+    pub iceberg_file_paths: BTreeSet<String>,
+    /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
+    pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
+    /// Stable digest of the ordered, post-subtraction hot manifest.
+    pub hot_manifest_digest: String,
+    /// Bounded sealed-byte estimate used by Oracle classification.
+    pub estimated_bytes: u64,
+}
+
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
 #[derive(Clone)]
 pub struct BifrostCatalog {
@@ -104,6 +137,133 @@ pub struct BifrostCatalog {
 }
 
 impl BifrostCatalog {
+    /// Pins one Iceberg table and its tenant-scoped hot manifest without reading rows.
+    ///
+    /// # Errors
+    /// Returns a catalog or SQL error when the binding, Iceberg metadata, or
+    /// tenant-scoped manifest cannot be loaded.
+    pub async fn pin_sealed_table(
+        &self,
+        table: &TableRef,
+        tenant: DataTenantId,
+    ) -> Result<PinnedSealedTable, BifrostCatalogError> {
+        let fqn = table.fqn();
+        let Some(_row) = self.lookup_table_row(&fqn, tenant).await? else {
+            return Err(BifrostCatalogError::TableNotFound(fqn));
+        };
+        let binding = TenantTableBinding::resolve((tenant, table.clone()))
+            .map_err(|error| BifrostCatalogError::InvalidBinding(error.to_string()))?;
+        let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
+        let snapshot_id = iceberg_table.metadata().current_snapshot_id();
+        let mut iceberg_file_paths = BTreeSet::new();
+        let mut estimated_bytes = 0_u64;
+        if let Some(snapshot) = iceberg_table.metadata().current_snapshot() {
+            let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
+            for manifest_file in manifests.entries() {
+                let manifest = manifest_file.load_manifest(iceberg_table.file_io()).await?;
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    let path = entry.data_file().file_path().to_owned();
+                    let canonical = path
+                        .strip_prefix(iceberg_table.metadata().location())
+                        .and_then(|suffix| suffix.strip_prefix('/'))
+                        .map(|suffix| format!("{}/{suffix}", binding.object_prefix))
+                        .unwrap_or(path);
+                    if binding.validate_object_path(&canonical).is_none() {
+                        return Err(BifrostCatalogError::MetadataMismatch(
+                            "pinned snapshot contains a path outside the tenant/table binding"
+                                .to_owned(),
+                        ));
+                    }
+                    estimated_bytes = estimated_bytes
+                        .checked_add(entry.data_file().file_size_in_bytes())
+                        .ok_or_else(|| {
+                            BifrostCatalogError::MetadataMismatch(
+                                "sealed byte estimate overflow".to_owned(),
+                            )
+                        })?;
+                    iceberg_file_paths.insert(canonical);
+                }
+            }
+        }
+        let mut hot_files = HotFileCatalog::new(self.postgres.clone())
+            .active_files(tenant, &binding.logical_namespace, &binding.table_name)
+            .await?;
+        let hot_file_count = hot_files.len();
+        hot_files.retain(|row| !iceberg_file_paths.contains(&row.file_path));
+        metrics::counter!(
+            "bifrost_oracle_files_pruned_total",
+            "source" => "hot_sealed",
+            "reason" => "snapshot_overlap"
+        )
+        .increment(hot_file_count.saturating_sub(hot_files.len()) as u64);
+        for row in &hot_files {
+            let valid_identity = row.data_tenant_id == tenant.as_uuid()
+                && row.namespace == binding.logical_namespace
+                && row.table_name == binding.table_name
+                && row.file_size > 0
+                && row.row_count >= 0
+                && row.writer_epoch >= 0
+                && row.wal_lsn_min >= 0
+                && row.wal_lsn_max >= row.wal_lsn_min
+                && binding.validate_object_path(&row.file_path).is_some();
+            if !valid_identity {
+                return Err(BifrostCatalogError::MetadataMismatch(
+                    "hot manifest row violates its tenant/table binding".to_owned(),
+                ));
+            }
+            estimated_bytes = estimated_bytes
+                .checked_add(u64::try_from(row.file_size).map_err(|_| {
+                    BifrostCatalogError::MetadataMismatch(
+                        "hot manifest file size is invalid".to_owned(),
+                    )
+                })?)
+                .ok_or_else(|| {
+                    BifrostCatalogError::MetadataMismatch(
+                        "sealed byte estimate overflow".to_owned(),
+                    )
+                })?;
+        }
+        let snapshot_digest = digest_strings(
+            snapshot_id
+                .map(|id| id.to_string())
+                .into_iter()
+                .chain(iceberg_file_paths.iter().cloned()),
+        );
+        let hot_manifest_digest = digest_strings(hot_files.iter().map(|row| {
+            format!(
+                "{}:{}:{}:{}",
+                row.file_path, row.file_size, row.wal_lsn_min, row.wal_lsn_max
+            )
+        }));
+        Ok(PinnedSealedTable {
+            binding,
+            iceberg_table,
+            snapshot_id,
+            snapshot_digest,
+            iceberg_file_paths,
+            hot_files,
+            hot_manifest_digest,
+            estimated_bytes,
+        })
+    }
+
+    /// Converts one already validated relative table object path into a storage URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns a binding error when the path escapes the tenant-qualified table prefix.
+    pub(crate) fn object_location(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+    ) -> Result<String, BifrostCatalogError> {
+        let path = binding.validate_object_path(path).ok_or_else(|| {
+            BifrostCatalogError::InvalidBinding(
+                "object path escapes the tenant-qualified table prefix".to_owned(),
+            )
+        })?;
+        Ok(format!("{}/{}", self.warehouse.trim_end_matches('/'), path))
+    }
     /// Build the Redux Iceberg SQL catalog and tenant-scoped control-plane handle.
     ///
     /// # Errors

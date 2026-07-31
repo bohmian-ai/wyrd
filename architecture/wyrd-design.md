@@ -1164,14 +1164,17 @@ Python, generated schemas, MCP/agent documentation, and stable error codes.
 The public contract includes:
 
 - HTTP table management under `/v1/bifrost/tables`, served by `wyrd-server`.
-- HTTP query surfaces served by `wyrd-server` under the `/v1` nest: `POST /v1/query`
-  (synchronous, Arrow IPC stream), the async query-job family `POST /v1/query/async`,
-  `GET /v1/query/async/{job_uid}`, and `GET /v1/query/async/{job_uid}/result` (302
-  presigned redirect), and `GET /v1/derivations/{namespace}/{name}/freshness`. The
-  typed observation query routes under `/v1` (see `ValaQueryService` below) are the
-  companion projection surface. `wyrd-spec::vala::api` owns all query/result/freshness
-  wire types; the Arrow result media type is `application/vnd.apache.arrow.stream` with
-  `x-wyrd-schema-fingerprint` and `x-wyrd-row-count` headers.
+- HTTP query surfaces served by `wyrd-server` under the `/v1` nest:
+  `POST /v1/query` returns the terminal-safe, length-delimited Oracle frame
+  stream with media type
+  `application/vnd.wyrd.bifrost-query-stream` and only
+  `x-wyrd-schema-fingerprint` as initial query metadata. There is no
+  asynchronous query-job route family, status polling contract, result
+  redirect, or initial row-count header. Future asynchronous jobs require a
+  new architecture decision rather than a compatibility surface. The typed
+  observation query routes under `/v1` (see `ValaQueryService` below) are the
+  companion projection surface. `wyrd-spec::vala::api` owns all retained
+  query/freshness wire types.
 - gRPC ingest through `wyrd.v1.BifrostIngestService` _(under revision — serving ownership moving to wyrd-server, reconciled in a follow-up design pass)_.
 - The `wyrd.bifrost` Python SDK submodule.
 - Generated `wyrd-spec::vala::api` wire types such as `BifrostTableEntry`,

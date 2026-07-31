@@ -15,6 +15,7 @@ mod pg_tests {
         FileListInsert, FileListInsertOutcome, insert_and_audit,
     };
     use vala_bifrost_redux::scribe::seal_key::{EventDay, SealKey};
+    use vala_sql::queries::file_list::HotFileCatalog;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_spec::auth::PrincipalId;
@@ -479,6 +480,40 @@ mod pg_tests {
         assert_eq!(stored.2, binding.logical_namespace);
         assert_eq!(stored.3, binding.table_name);
         assert!(stored.4.starts_with(&binding.object_prefix));
+    }
+
+    /// Oracle sees transition rows so its pinned snapshot performs exact subtraction.
+    #[tokio::test]
+    async fn oracle_hot_manifest_retains_compacted_transition_rows() {
+        let (fixture, tenant, _) = setup().await;
+        let binding = TenantTableBinding::resolve((tenant, logical_table())).expect("binding");
+        let row = insert_row(&binding, Uuid::now_v7(), 1, 10, 20);
+        let mut conn = vala_sql::TenantConn::acquire(fixture.app_pool(), tenant)
+            .await
+            .expect("tenant connection");
+        insert_and_audit(&mut conn, &row, &[audit_event()])
+            .await
+            .expect("file-list insert");
+        conn.commit().await.expect("commit insert");
+        let superuser = fixture.superuser_pool().await.expect("superuser pool");
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = true, committed_snapshot_id = 77 WHERE id = $1",
+        )
+        .bind(row.id)
+        .execute(&superuser)
+        .await
+        .expect("mark transition row compacted");
+
+        let rows = HotFileCatalog::new(fixture.vala_postgres().clone())
+            .active_files(tenant, &binding.logical_namespace, &binding.table_name)
+            .await
+            .expect("tenant-scoped Oracle manifest");
+        let observed = rows
+            .iter()
+            .find(|candidate| candidate.id == row.id)
+            .expect("transition row remains visible until pinned subtraction");
+        assert!(observed.compacted);
+        assert_eq!(observed.committed_snapshot_id, Some(77));
     }
 
     #[tokio::test]

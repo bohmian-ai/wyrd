@@ -6,6 +6,8 @@ mod forge_incremental_compaction;
 mod immutable_tier_retention;
 #[path = "mitari_rewrite_api.rs"]
 mod mitari_rewrite_api;
+#[path = "oracle_core.rs"]
+mod oracle_core;
 #[path = "pg_file_list_tenant_table.rs"]
 mod pg_file_list_tenant_table;
 #[path = "pg_scribe_crash_injection.rs"]

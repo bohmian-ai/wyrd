@@ -58,8 +58,10 @@ fn validate_retained_manifest_entry(
 ) -> Result<(), ForgeError> {
     match (manifest, entry) {
         (ManifestContentType::Data, DataContentType::Data)
-        | (ManifestContentType::Deletes, DataContentType::PositionDeletes)
-        | (ManifestContentType::Deletes, DataContentType::EqualityDeletes) => Ok(()),
+        | (
+            ManifestContentType::Deletes,
+            DataContentType::PositionDeletes | DataContentType::EqualityDeletes,
+        ) => Ok(()),
         _ => Err(ForgeError::LiveSet {
             detail: "manifest content and entry content disagree".to_owned(),
         }),
@@ -115,6 +117,7 @@ pub(crate) struct MaintenanceProtection {
 }
 
 /// Object-store evidence evaluated by the shared eligibility predicate.
+#[derive(Clone, Copy)]
 pub(crate) enum ObjectEvidence<'metadata> {
     /// The object exists with freshly loaded metadata.
     Present(&'metadata opendal::Metadata),
@@ -165,9 +168,9 @@ impl MaintenanceProtection {
         if metadata.mode() != EntryMode::FILE {
             return GcEligibility::NotFile;
         }
-        if !metadata
+        if metadata
             .last_modified()
-            .is_some_and(|modified| modified <= self.object_age_cutoff)
+            .is_none_or(|modified| modified > self.object_age_cutoff)
         {
             return GcEligibility::TooYoung;
         }
@@ -183,6 +186,56 @@ struct CurrentGcExemption {
     canonical_prepared_detail: String,
     /// Exact normalized candidate set owned by the delete loop.
     candidate_paths: BTreeSet<String>,
+}
+
+/// Stable table-scoped inputs shared by one fenced GC workflow.
+struct GcTableContext<'context> {
+    /// Durable table identity used by operation projections.
+    key: &'context ForgeTableKey,
+    /// Validated physical table binding used by every path check.
+    binding: &'context TenantTableBinding,
+    /// Single maintenance time captured by the scheduler.
+    now: DateTime<Utc>,
+    /// Cancellation boundary checked before every destructive transition.
+    stop: &'context CancellationToken,
+    /// Outputs protected by open staging reconciliation.
+    staging_protected_paths: &'context BTreeSet<String>,
+    /// Outputs protected by open live-rewrite reconciliation.
+    live_protected_paths: &'context BTreeSet<String>,
+}
+
+/// Inputs that distinguish a fresh protection load from a GC self-reload.
+struct ProtectionRequest<'context> {
+    /// Shared table-scoped workflow context.
+    table: &'context GcTableContext<'context>,
+    /// Prepared GC detail allowed to exempt only its exact operation.
+    current_gc_detail: Option<&'context AuditDetail>,
+}
+
+/// Inputs for completing one prepared GC batch.
+struct GcBatchRequest<'context> {
+    /// Shared table-scoped workflow context.
+    table: &'context GcTableContext<'context>,
+    /// Canonical prepared audit detail owning the candidate paths.
+    detail: &'context AuditDetail,
+    /// Whether terminal evidence records recovery rather than first commit.
+    recovered: bool,
+}
+
+/// Catalog-derived live paths and the validated table metadata location.
+struct CatalogProtection {
+    /// Paths reachable from retained Iceberg catalog state.
+    live: ProtectedLiveSet,
+    /// Catalog location used to normalize SQL and audit paths.
+    table_location: String,
+}
+
+/// Reconciliation-owned output paths protected during one GC stage.
+pub(super) struct GcProtectedPaths<'paths> {
+    /// Outputs protected by open staging reconciliation.
+    pub(super) staging: &'paths BTreeSet<String>,
+    /// Outputs protected by open live-rewrite reconciliation.
+    pub(super) live: &'paths BTreeSet<String>,
 }
 
 /// Returns output objects that nonterminal operations must retain.
@@ -274,6 +327,23 @@ fn current_gc_exemption(
     }))
 }
 
+/// Rejects a self-exemption that lacks canonical candidate evidence.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Reconciliation`] for empty canonical detail or paths.
+fn validate_gc_exemption(exemption: Option<&CurrentGcExemption>) -> Result<(), ForgeError> {
+    if exemption.is_some_and(|value| {
+        value.canonical_prepared_detail.is_empty() || value.candidate_paths.is_empty()
+    }) {
+        Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption has empty canonical evidence".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Exercises the production self-exemption and remaining-open gate in integration tests.
 ///
 /// # Errors
@@ -310,19 +380,17 @@ impl Forge {
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
         stop: &CancellationToken,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
+        protected_paths: GcProtectedPaths<'_>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        self.run_orphan_gc_for_table_inner(
-            lease,
+        let table = GcTableContext {
             key,
             binding,
             now,
             stop,
-            staging_protected_paths,
-            live_protected_paths,
-        )
-        .await
+            staging_protected_paths: protected_paths.staging,
+            live_protected_paths: protected_paths.live,
+        };
+        self.run_orphan_gc_for_table_inner(lease, &table).await
     }
 
     /// Loads one complete, reloadable maintenance-protection proof.
@@ -330,26 +398,11 @@ impl Forge {
     /// # Errors
     ///
     /// Returns catalog, SQL, path-validation, or live-set failures.
-    pub(crate) async fn load_maintenance_protection(
+    async fn load_maintenance_protection(
         &self,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        now: DateTime<Utc>,
-        stop: &CancellationToken,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
-        current_gc_detail: Option<&AuditDetail>,
+        request: ProtectionRequest<'_>,
     ) -> Result<MaintenanceProtection, ForgeError> {
-        self.load_maintenance_protection_inner(
-            key,
-            binding,
-            now,
-            stop,
-            staging_protected_paths,
-            live_protected_paths,
-            current_gc_detail,
-        )
-        .await
+        self.load_maintenance_protection_inner(request).await
     }
 
     /// Loads production maintenance protection for one integration fixture.
@@ -367,15 +420,21 @@ impl Forge {
             tenant: binding.tenant,
             table_ref: binding.table_ref.clone(),
         };
-        self.load_maintenance_protection(
-            &key,
+        let stop = CancellationToken::new();
+        let staging = BTreeSet::new();
+        let live = BTreeSet::new();
+        let table = GcTableContext {
+            key: &key,
             binding,
-            self.core.clock.now()?,
-            &CancellationToken::new(),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            None,
-        )
+            now: self.core.clock.now()?,
+            stop: &stop,
+            staging_protected_paths: &staging,
+            live_protected_paths: &live,
+        };
+        self.load_maintenance_protection(ProtectionRequest {
+            table: &table,
+            current_gc_detail: None,
+        })
         .await
         .map(|protection| protection.live_set)
     }
@@ -385,58 +444,35 @@ impl Forge {
     async fn run_orphan_gc_for_table_inner(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        now: DateTime<Utc>,
-        stop: &CancellationToken,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
+        table: &GcTableContext<'_>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        let mut outcome = self
-            .reconcile_gc(
-                lease,
-                key,
-                binding,
-                stop,
-                now,
-                staging_protected_paths,
-                live_protected_paths,
-            )
-            .await?;
+        let mut outcome = self.reconcile_gc(lease, table).await?;
         let protection = self
-            .load_maintenance_protection(
-                key,
-                binding,
-                now,
-                stop,
-                staging_protected_paths,
-                live_protected_paths,
-                None,
-            )
+            .load_maintenance_protection(ProtectionRequest {
+                table,
+                current_gc_detail: None,
+            })
             .await?;
         if protection.destructive_maintenance == DestructiveMaintenance::Blocked {
             outcome.pending = outcome.pending.saturating_add(1);
             return Ok(outcome);
         }
-        let candidates = self.list_gc_candidates(binding, &protection).await?;
+        let candidates = self.list_gc_candidates(table.binding, &protection).await?;
         outcome.candidates = outcome.candidates.saturating_add(candidates.len());
         if candidates.is_empty() {
             return Ok(outcome);
         }
-        let detail = Self::gc_detail(key, candidates)?;
-        self.append_gc_audit(lease, key.tenant, &detail, "forge.orphan_gc.prepared")
+        let detail = Self::gc_detail(table.key, candidates)?;
+        self.append_gc_audit(lease, table.key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
         let (deleted, skipped) = self
             .delete_gc_batch(
                 lease,
-                key,
-                binding,
-                &detail,
-                false,
-                now,
-                stop,
-                staging_protected_paths,
-                live_protected_paths,
+                GcBatchRequest {
+                    table,
+                    detail: &detail,
+                    recovered: false,
+                },
             )
             .await?;
         outcome.recovered = outcome.recovered.saturating_add(1);
@@ -468,15 +504,119 @@ pub(crate) struct OrphanGcOutcome {
 impl Forge {
     async fn load_maintenance_protection_inner(
         &self,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        now: DateTime<Utc>,
-        stop: &CancellationToken,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
-        current_gc_detail: Option<&AuditDetail>,
+        request: ProtectionRequest<'_>,
     ) -> Result<MaintenanceProtection, ForgeError> {
-        require_running(stop)?;
+        let table_context = request.table;
+        let key = table_context.key;
+        let binding = table_context.binding;
+        require_running(table_context.stop)?;
+        let CatalogProtection {
+            mut live,
+            table_location,
+        } = self.load_catalog_protection(binding).await?;
+        let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let rows = list_nonterminal_file_paths(
+            &mut conn,
+            key.table_ref.namespace.as_str(),
+            &key.table_ref.name,
+            None,
+        )
+        .await
+        .map_err(ForgeError::Sql)?;
+        for path in rows {
+            add(&path)?;
+        }
+
+        for path in table_context
+            .staging_protected_paths
+            .iter()
+            .chain(table_context.live_protected_paths.iter())
+        {
+            add(path)?;
+        }
+
+        let resource = table_resource_for_key(key);
+        let cap = self.core.config.max_open_operations_per_table;
+        let mut blocked = false;
+        for family in [
+            ForgeOperationFamily::IcebergRewrite,
+            ForgeOperationFamily::SnapshotExpire,
+        ] {
+            let page = ForgeOperations::new(&resource, family)
+                .map_err(ForgeError::Sql)?
+                .list_open(&mut conn, cap)
+                .await
+                .map_err(ForgeError::Sql)?;
+            blocked |= page.overflowed || !page.operations.is_empty();
+            for row in &page.operations {
+                for path in operation_output_paths(&row.prepared_detail) {
+                    add(path.as_str())?;
+                }
+            }
+        }
+        let open_gc = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, cap)
+            .await
+            .map_err(ForgeError::Sql)?;
+        blocked |= open_gc.overflowed;
+        let exemption = current_gc_exemption(
+            &resource,
+            request.current_gc_detail,
+            &open_gc.operations,
+            |path| {
+                catalog_path_to_object_key(
+                    &table_location,
+                    binding,
+                    &self.core.staging,
+                    path.as_str(),
+                )
+            },
+        )?;
+        validate_gc_exemption(exemption.as_ref())?;
+        for row in &open_gc.operations {
+            if exemption
+                .as_ref()
+                .is_some_and(|value| value.operation_id == row.operation_id)
+            {
+                continue;
+            }
+            blocked = true;
+            for path in operation_output_paths(&row.prepared_detail) {
+                add(path.as_str())?;
+            }
+        }
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        require_running(table_context.stop)?;
+
+        let object_age_cutoff = self.gc_object_age_cutoff(table_context.now)?;
+        Ok(MaintenanceProtection {
+            live_set: live,
+            destructive_maintenance: if blocked {
+                DestructiveMaintenance::Blocked
+            } else {
+                DestructiveMaintenance::Allowed
+            },
+            now: table_context.now,
+            object_age_cutoff,
+        })
+    }
+
+    /// Traverses every retained Iceberg object for one validated table.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, manifest, path-validation, or retained-snapshot-cap failures.
+    async fn load_catalog_protection(
+        &self,
+        binding: &TenantTableBinding,
+    ) -> Result<CatalogProtection, ForgeError> {
         let table = self.load_table(&binding.table_ident()).await?;
         self.assert_table_location(table.metadata(), binding)?;
         let retained_snapshot_count = table.metadata().snapshots().count();
@@ -489,8 +629,8 @@ impl Forge {
             });
         }
         let mut live = ProtectedLiveSet::default();
-        let table_location = table.metadata().location();
-        let mut add = |path: &str| self.add_path(&mut live, binding, table_location, path);
+        let table_location = table.metadata().location().to_owned();
+        let mut add = |path: &str| self.add_path(&mut live, binding, &table_location, path);
         add(table
             .metadata_location_result()
             .map_err(ForgeError::Catalog)?)?;
@@ -529,87 +669,18 @@ impl Forge {
             }
         }
 
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let rows = list_nonterminal_file_paths(
-            &mut conn,
-            key.table_ref.namespace.as_str(),
-            &key.table_ref.name,
-            None,
-        )
-        .await
-        .map_err(ForgeError::Sql)?;
-        for path in rows {
-            add(&path)?;
-        }
+        Ok(CatalogProtection {
+            live,
+            table_location,
+        })
+    }
 
-        for path in staging_protected_paths
-            .iter()
-            .chain(live_protected_paths.iter())
-        {
-            add(path)?;
-        }
-
-        let resource = table_resource_for_key(key);
-        let cap = self.core.config.max_open_operations_per_table;
-        let mut blocked = false;
-        for family in [
-            ForgeOperationFamily::IcebergRewrite,
-            ForgeOperationFamily::SnapshotExpire,
-        ] {
-            let page = ForgeOperations::new(&resource, family)
-                .map_err(ForgeError::Sql)?
-                .list_open(&mut conn, cap)
-                .await
-                .map_err(ForgeError::Sql)?;
-            blocked |= page.overflowed || !page.operations.is_empty();
-            for row in &page.operations {
-                for path in operation_output_paths(&row.prepared_detail) {
-                    add(path.as_str())?;
-                }
-            }
-        }
-        let open_gc = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
-            .map_err(ForgeError::Sql)?
-            .list_open(&mut conn, cap)
-            .await
-            .map_err(ForgeError::Sql)?;
-        blocked |= open_gc.overflowed;
-        let exemption =
-            current_gc_exemption(&resource, current_gc_detail, &open_gc.operations, |path| {
-                catalog_path_to_object_key(
-                    table_location,
-                    binding,
-                    &self.core.staging,
-                    path.as_str(),
-                )
-            })?;
-        if exemption.as_ref().is_some_and(|value| {
-            value.canonical_prepared_detail.is_empty() || value.candidate_paths.is_empty()
-        }) {
-            return Err(ForgeError::Reconciliation {
-                detail: "current orphan-GC exemption has empty canonical evidence".to_owned(),
-            });
-        }
-        for row in &open_gc.operations {
-            if exemption
-                .as_ref()
-                .is_some_and(|value| value.operation_id == row.operation_id)
-            {
-                continue;
-            }
-            blocked = true;
-            for path in operation_output_paths(&row.prepared_detail) {
-                add(path.as_str())?;
-            }
-        }
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        require_running(stop)?;
-
+    /// Derives the inclusive object-store age cutoff from one captured tick time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::InvalidConfig`] when the TTL or timestamp overflows.
+    fn gc_object_age_cutoff(&self, now: DateTime<Utc>) -> Result<Timestamp, ForgeError> {
         let cutoff_chrono = now
             .checked_sub_signed(
                 chrono::Duration::from_std(self.core.config.orphan_gc_ttl).map_err(|_| {
@@ -621,19 +692,10 @@ impl Forge {
             .ok_or_else(|| ForgeError::InvalidConfig {
                 detail: "orphan GC age cutoff overflows UTC".to_owned(),
             })?;
-        let object_age_cutoff = Timestamp::from_millisecond(cutoff_chrono.timestamp_millis())
-            .map_err(|_| ForgeError::InvalidConfig {
+        Timestamp::from_millisecond(cutoff_chrono.timestamp_millis()).map_err(|_| {
+            ForgeError::InvalidConfig {
                 detail: "orphan GC cutoff cannot be represented by object storage".to_owned(),
-            })?;
-        Ok(MaintenanceProtection {
-            live_set: live,
-            destructive_maintenance: if blocked {
-                DestructiveMaintenance::Blocked
-            } else {
-                DestructiveMaintenance::Allowed
-            },
-            now,
-            object_age_cutoff,
+            }
         })
     }
 }
@@ -684,15 +746,10 @@ impl Forge {
     async fn delete_gc_batch(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        detail: &AuditDetail,
-        recovered: bool,
-        now: DateTime<Utc>,
-        stop: &CancellationToken,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
+        request: GcBatchRequest<'_>,
     ) -> Result<(usize, usize), ForgeError> {
+        let table = request.table;
+        let detail = request.detail;
         let AuditDetail::ForgeOrphanGc {
             candidate_paths,
             group,
@@ -703,7 +760,7 @@ impl Forge {
                 detail: "orphan-GC audit detail has the wrong kind".to_owned(),
             });
         };
-        if group != &table_resource_for_key(key)
+        if group != &table_resource_for_key(table.key)
             || candidate_paths.is_empty()
             || candidate_paths
                 .windows(2)
@@ -716,23 +773,19 @@ impl Forge {
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         for path in candidate_paths {
-            require_running(stop)?;
+            require_running(table.stop)?;
             lease.require_fence(&self.core.operator_pool).await?;
-            let normalized = binding.validate_object_path(path.as_str()).ok_or_else(|| {
-                ForgeError::Reconciliation {
+            let normalized = table
+                .binding
+                .validate_object_path(path.as_str())
+                .ok_or_else(|| ForgeError::Reconciliation {
                     detail: format!("orphan-GC candidate escaped table binding: {path:?}"),
-                }
-            })?;
+                })?;
             let protection = self
-                .load_maintenance_protection(
-                    key,
-                    binding,
-                    now,
-                    stop,
-                    staging_protected_paths,
-                    live_protected_paths,
-                    Some(detail),
-                )
+                .load_maintenance_protection(ProtectionRequest {
+                    table,
+                    current_gc_detail: Some(detail),
+                })
                 .await?;
             let metadata = match self.core.object_store.stat(&normalized).await {
                 Ok(metadata) => Some(metadata),
@@ -740,7 +793,7 @@ impl Forge {
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
             };
             let eligibility = protection.gc_eligibility(
-                binding,
+                table.binding,
                 &normalized,
                 metadata
                     .as_ref()
@@ -754,7 +807,7 @@ impl Forge {
                 skipped.push(path.as_str().to_owned());
                 continue;
             }
-            require_running(stop)?;
+            require_running(table.stop)?;
             lease.require_fence(&self.core.operator_pool).await?;
             match self.core.object_store.delete(&normalized).await {
                 Ok(()) => deleted.push(path.as_str().to_owned()),
@@ -764,7 +817,7 @@ impl Forge {
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
             }
         }
-        require_running(stop)?;
+        require_running(table.stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let deleted_count = deleted.len();
         let skipped_count = skipped.len();
@@ -772,7 +825,7 @@ impl Forge {
             detail,
             deleted,
             skipped,
-            if recovered {
+            if request.recovered {
                 ForgeOrphanGcPhase::Recovered
             } else {
                 ForgeOrphanGcPhase::Committed
@@ -780,9 +833,9 @@ impl Forge {
         );
         self.append_gc_audit(
             lease,
-            key.tenant,
+            table.key.tenant,
             &terminal,
-            if recovered {
+            if request.recovered {
                 "forge.orphan_gc.recovered"
             } else {
                 "forge.orphan_gc.committed"
@@ -799,19 +852,14 @@ impl Forge {
     async fn reconcile_gc(
         &self,
         lease: &mut ForgeLease,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        now: DateTime<Utc>,
-        staging_protected_paths: &BTreeSet<String>,
-        live_protected_paths: &BTreeSet<String>,
+        table: &GcTableContext<'_>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        require_running(stop)?;
-        let resource = table_resource_for_key(key);
+        require_running(table.stop)?;
+        let resource = table_resource_for_key(table.key);
         let mut conn = self
             .core
             .vala
-            .tenant_conn(key.tenant)
+            .tenant_conn(table.key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
         let page = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
@@ -820,8 +868,10 @@ impl Forge {
             .await
             .map_err(ForgeError::Sql)?;
         conn.commit().await.map_err(ForgeError::Sql)?;
-        let mut outcome = OrphanGcOutcome::default();
-        outcome.overflowed = page.overflowed;
+        let mut outcome = OrphanGcOutcome {
+            overflowed: page.overflowed,
+            ..OrphanGcOutcome::default()
+        };
         if page.overflowed {
             outcome.pending = self
                 .core
@@ -831,7 +881,7 @@ impl Forge {
             return Ok(outcome);
         }
         for row in page.operations {
-            require_running(stop)?;
+            require_running(table.stop)?;
             let detail = row.prepared_detail;
             let AuditDetail::ForgeOrphanGc {
                 candidate_paths, ..
@@ -844,14 +894,11 @@ impl Forge {
             let (deleted, skipped) = self
                 .delete_gc_batch(
                     lease,
-                    key,
-                    binding,
-                    &detail,
-                    true,
-                    now,
-                    stop,
-                    staging_protected_paths,
-                    live_protected_paths,
+                    GcBatchRequest {
+                        table,
+                        detail: &detail,
+                        recovered: true,
+                    },
                 )
                 .await?;
             outcome.candidates = outcome.candidates.saturating_add(candidate_paths.len());

@@ -23,7 +23,9 @@ use sqlx::Row;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_operations::{
+    ForgeOperationFamily, ForgeOperationStateRow, ForgeOperationTransition,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
@@ -127,6 +129,19 @@ impl Default for StagingReconciliationOutcome {
             protected_output_paths: BTreeSet::new(),
             destructive_maintenance: DestructiveMaintenance::Allowed,
         }
+    }
+}
+
+impl StagingReconciliationOutcome {
+    /// Merges one classified operation into the table-level reconciliation outcome.
+    fn merge_operation(&mut self, operation: Self) {
+        self.recovered = self.recovered.saturating_add(operation.recovered);
+        self.reset = self.reset.saturating_add(operation.reset);
+        self.pending = self.pending.saturating_add(operation.pending);
+        self.unresolved = self.unresolved.saturating_add(operation.unresolved);
+        self.overflowed |= operation.overflowed;
+        self.protected_output_paths
+            .extend(operation.protected_output_paths);
     }
 }
 
@@ -1662,120 +1677,174 @@ impl Forge {
             overflowed: page.overflowed,
             ..StagingReconciliationOutcome::default()
         };
+        if page.overflowed {
+            outcome.pending = self
+                .core
+                .config
+                .max_open_operations_per_table
+                .saturating_add(1);
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
+            return Ok(outcome);
+        }
         for row in page.operations {
-            let detail = row.prepared_detail;
-            if !matches!(
-                &detail,
-                AuditDetail::ForgeCompaction {
-                    phase: ForgeCompactionPhase::Prepared,
-                    ..
-                }
-            ) {
-                continue;
-            }
-            let AuditDetail::ForgeCompaction {
-                input_file_ids,
-                input_paths,
-                output_paths,
-                ..
-            } = &detail
-            else {
-                continue;
-            };
-            if Self::detail_group(&detail) != resource {
-                return Err(ForgeError::Reconciliation {
-                    detail: "audit detail group differs from its resource".to_owned(),
-                });
-            }
-            self.verify_hidden_inputs(key, input_file_ids, &detail)
+            let operation = self
+                .reconcile_staging_operation(lease, key, binding, now, row)
                 .await?;
-            if !lease.renew(&self.core.operator_pool).await? {
-                return Err(ForgeError::FenceLost {
-                    lease_key: lease.lease_key.clone(),
-                });
-            }
-            let table = self.load_table(&binding.table_ident()).await?;
-            if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
-                let volume = self
-                    .measure_rewrite_volume(input_paths, output_paths)
-                    .await?;
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
-                    });
-                }
-                self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
-                    .await?;
-                self.core.metrics.record_operation(
-                    super::metrics::ForgeMetricSource::Staging,
-                    super::metrics::ForgeOperationResult::Recovered,
-                    1,
-                );
-                self.core.metrics.record_rewrite_volume(
-                    super::metrics::ForgeMetricSource::Staging,
-                    volume.input_files,
-                    volume.input_bytes,
-                    volume.output_files,
-                    volume.output_bytes,
-                );
-                outcome.recovered = outcome.recovered.saturating_add(1);
-                continue;
-            }
-            if now
-                .signed_duration_since(row.prepared_at)
-                .to_std()
-                .unwrap_or_default()
-                < self.core.config.uncertainty_bound
-            {
-                outcome.pending = outcome.pending.saturating_add(1);
-                Self::protect_staging_outputs(
-                    binding,
-                    output_paths,
-                    &mut outcome.protected_output_paths,
-                )?;
-                continue;
-            }
-            let first_reload = self.load_table(&binding.table_ident()).await?;
-            if self
-                .live_snapshot_for_paths(&first_reload, output_paths)
-                .await?
-                .is_some()
-            {
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                Self::protect_staging_outputs(
-                    binding,
-                    output_paths,
-                    &mut outcome.protected_output_paths,
-                )?;
-                continue;
-            }
-            let second_reload = self.load_table(&binding.table_ident()).await?;
-            if self
-                .live_snapshot_for_paths(&second_reload, output_paths)
-                .await?
-                .is_none()
-            {
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
-                    });
-                }
-                self.reset_reconciled(lease, key, input_file_ids, &detail)
-                    .await?;
-                outcome.reset = outcome.reset.saturating_add(1);
-            } else {
-                outcome.unresolved = outcome.unresolved.saturating_add(1);
-                Self::protect_staging_outputs(
-                    binding,
-                    output_paths,
-                    &mut outcome.protected_output_paths,
-                )?;
-            }
+            outcome.merge_operation(operation);
         }
         if outcome.overflowed || outcome.pending > 0 || outcome.unresolved > 0 {
             outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
         Ok(outcome)
+    }
+
+    /// Classifies and reconciles one parity-proven staging operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns reconciliation, catalog, object-store, SQL, audit, or fence failures.
+    async fn reconcile_staging_operation(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        binding: &TenantTableBinding,
+        now: DateTime<Utc>,
+        row: ForgeOperationStateRow,
+    ) -> Result<StagingReconciliationOutcome, ForgeError> {
+        let detail = row.prepared_detail;
+        let AuditDetail::ForgeCompaction {
+            phase: ForgeCompactionPhase::Prepared,
+            input_file_ids,
+            input_paths,
+            output_paths,
+            ..
+        } = &detail
+        else {
+            return Ok(StagingReconciliationOutcome::default());
+        };
+        if Self::detail_group(&detail) != key.audit_resource() {
+            return Err(ForgeError::Reconciliation {
+                detail: "audit detail group differs from its resource".to_owned(),
+            });
+        }
+        self.verify_hidden_inputs(key, input_file_ids, &detail)
+            .await?;
+        self.renew_reconciliation_lease(lease).await?;
+        let table = self.load_table(&binding.table_ident()).await?;
+        if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
+            let volume = self
+                .measure_rewrite_volume(input_paths, output_paths)
+                .await?;
+            self.renew_reconciliation_lease(lease).await?;
+            self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
+                .await?;
+            self.core.metrics.record_operation(
+                super::metrics::ForgeMetricSource::Staging,
+                super::metrics::ForgeOperationResult::Recovered,
+                1,
+            );
+            self.core.metrics.record_rewrite_volume(
+                super::metrics::ForgeMetricSource::Staging,
+                volume.input_files,
+                volume.input_bytes,
+                volume.output_files,
+                volume.output_bytes,
+            );
+            return Ok(StagingReconciliationOutcome {
+                recovered: 1,
+                ..StagingReconciliationOutcome::default()
+            });
+        }
+        if now
+            .signed_duration_since(row.prepared_at)
+            .to_std()
+            .unwrap_or_default()
+            < self.core.config.uncertainty_bound
+        {
+            return Self::protected_staging_outcome(binding, output_paths, false);
+        }
+        self.resolve_absent_staging_operation(
+            lease,
+            key,
+            binding,
+            input_file_ids,
+            output_paths,
+            &detail,
+        )
+        .await
+    }
+
+    /// Resolves an old operation using two fresh catalog reloads.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, reconciliation, SQL, audit, or fence failures.
+    async fn resolve_absent_staging_operation(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        binding: &TenantTableBinding,
+        input_file_ids: &[Uuid],
+        output_paths: &[StoragePath],
+        detail: &AuditDetail,
+    ) -> Result<StagingReconciliationOutcome, ForgeError> {
+        let first_reload = self.load_table(&binding.table_ident()).await?;
+        if self
+            .live_snapshot_for_paths(&first_reload, output_paths)
+            .await?
+            .is_some()
+        {
+            return Self::protected_staging_outcome(binding, output_paths, true);
+        }
+        let second_reload = self.load_table(&binding.table_ident()).await?;
+        if self
+            .live_snapshot_for_paths(&second_reload, output_paths)
+            .await?
+            .is_some()
+        {
+            return Self::protected_staging_outcome(binding, output_paths, true);
+        }
+        self.renew_reconciliation_lease(lease).await?;
+        self.reset_reconciled(lease, key, input_file_ids, detail)
+            .await?;
+        Ok(StagingReconciliationOutcome {
+            reset: 1,
+            ..StagingReconciliationOutcome::default()
+        })
+    }
+
+    /// Builds one pending or unresolved result with exact output protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when an output escapes the table.
+    fn protected_staging_outcome(
+        binding: &TenantTableBinding,
+        output_paths: &[StoragePath],
+        unresolved: bool,
+    ) -> Result<StagingReconciliationOutcome, ForgeError> {
+        let mut outcome = StagingReconciliationOutcome {
+            pending: usize::from(!unresolved),
+            unresolved: usize::from(unresolved),
+            ..StagingReconciliationOutcome::default()
+        };
+        Self::protect_staging_outputs(binding, output_paths, &mut outcome.protected_output_paths)?;
+        Ok(outcome)
+    }
+
+    /// Renews the table lease before a reconciliation-side catalog transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns lease backend failures or [`ForgeError::FenceLost`].
+    async fn renew_reconciliation_lease(&self, lease: &mut ForgeLease) -> Result<(), ForgeError> {
+        if lease.renew(&self.core.operator_pool).await? {
+            Ok(())
+        } else {
+            Err(ForgeError::FenceLost {
+                lease_key: lease.lease_key.clone(),
+            })
+        }
     }
 
     /// Adds duplicate-free, table-owned prepared outputs to destructive protection.

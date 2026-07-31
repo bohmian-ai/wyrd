@@ -693,8 +693,10 @@ impl Forge {
                 binding,
                 context.now,
                 context.stop,
-                &staging.protected_output_paths,
-                &live.protected_output_paths,
+                super::orphan_gc::GcProtectedPaths {
+                    staging: &staging.protected_output_paths,
+                    live: &live.protected_output_paths,
+                },
             )),
         ))
         .await?;

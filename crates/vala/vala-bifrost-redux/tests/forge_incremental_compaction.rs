@@ -29,7 +29,7 @@ mod pg_tests {
     };
     use vala_bifrost_redux::forge::{
         Forge, ForgeBuildConfig, ForgeClock, ForgeConfig, ForgeLease, ForgeObjectStore,
-        ForgeRewriteRuntime, IcebergRewriteGroup, forge_lease_key,
+        ForgeRewriteRuntime, IcebergCandidateFile, IcebergRewriteGroup, forge_lease_key,
     };
     use vala_bifrost_redux::maintenance::staging_file_channel;
     use vala_bifrost_redux::namespaces::BifrostNamespace;
@@ -1018,6 +1018,39 @@ mod pg_tests {
         assert!(fixture.staging.stat(&path).await.is_err());
     }
 
+    /// Proves retained-snapshot traversal fails closed above its configured cap.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture setup or catalog commits fail, or traversal accepts
+    /// more retained snapshots than configured.
+    async fn assert_retained_snapshot_cap() {
+        let capped = ForgeConfig {
+            max_retained_snapshots_per_table: 1,
+            ..ForgeConfig::default()
+        };
+        let fixture = Fixture::new_with_config(capped, true, 4, 16 * 1024 * 1024).await;
+        fixture
+            .forge
+            .run_once()
+            .await
+            .expect("first capped snapshot");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("first capped table");
+        fixture.seed_files_at(99, 1, true).await;
+        fixture.append_seed_manifest(&table, 99).await;
+        assert!(
+            fixture
+                .forge
+                .load_maintenance_protection_for_test(&fixture.binding)
+                .await
+                .is_err()
+        );
+    }
+
     /// Proves the production loader traverses real retained catalog history and statistics.
     ///
     /// # Panics
@@ -1111,28 +1144,7 @@ mod pg_tests {
             }
         }
 
-        let mut capped = ForgeConfig::default();
-        capped.max_retained_snapshots_per_table = 1;
-        let capped_forge = Fixture::new_with_config(capped, true, 4, 16 * 1024 * 1024).await;
-        capped_forge
-            .forge
-            .run_once()
-            .await
-            .expect("first capped snapshot");
-        let capped_table = capped_forge
-            .catalog
-            .load_table(&capped_forge.binding.table_ident())
-            .await
-            .expect("first capped table");
-        capped_forge.seed_files_at(99, 1, true).await;
-        capped_forge.append_seed_manifest(&capped_table, 99).await;
-        assert!(
-            capped_forge
-                .forge
-                .load_maintenance_protection_for_test(&capped_forge.binding)
-                .await
-                .is_err()
-        );
+        assert_retained_snapshot_cap().await;
     }
 
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
@@ -1361,7 +1373,7 @@ mod pg_tests {
         let candidate_snapshot_ids = selected
             .files_for_test()
             .iter()
-            .map(|file| file.source_snapshot_id_for_test())
+            .map(IcebergCandidateFile::source_snapshot_id_for_test)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(candidate_snapshot_ids.len(), 2);
         assert!(
@@ -1660,6 +1672,106 @@ mod pg_tests {
     async fn staging_reset_writer_restores_rows_with_exact_parity() {
         drive_staging_reconciliation_writer(&Fixture::new().await, ForgeCompactionPhase::Reset)
             .await;
+    }
+
+    /// An overflowed staging projection blocks before touching any visible operation.
+    #[tokio::test]
+    async fn staging_projection_overflow_leaves_every_visible_row_prepared() {
+        let config = ForgeConfig {
+            max_open_operations_per_table: 1,
+            ..ForgeConfig::default()
+        };
+        let fixture = Fixture::new_with_config(config, true, 4, 16 * 1024 * 1024).await;
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("overflow tenant connection");
+        let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+            "SELECT id, file_path FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() ORDER BY id LIMIT 2",
+        )
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("overflow inputs");
+        let ids = rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        sqlx::query(
+            "UPDATE vala.file_list SET compacted = true \
+             WHERE data_tenant_id = wyrd.current_tenant() AND id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut **conn.transaction())
+        .await
+        .expect("hide overflow inputs");
+        conn.commit().await.expect("commit hidden overflow inputs");
+
+        let resource = format!(
+            "bifrost://{}/{}/{}",
+            fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+        );
+        let input_paths = rows
+            .iter()
+            .map(|(_, path)| StoragePath::new(path.clone()).expect("overflow input path"))
+            .collect::<Vec<_>>();
+        let mut operation_ids = Vec::new();
+        for _ in 0..2 {
+            let operation_id = uuid::Uuid::now_v7();
+            operation_ids.push(operation_id);
+            let detail = staging_detail_for_inputs(
+                operation_id,
+                &resource,
+                ForgeCompactionPhase::Prepared,
+                ids.clone(),
+                input_paths.clone(),
+            );
+            let prepared = operation_event("forge.file_compact.prepared", &resource, detail);
+            assert!(matches!(
+                append_operation(&fixture, ForgeOperationFamily::StagingFold, &prepared, true)
+                    .await,
+                ForgeOperationTransition::Applied { .. }
+            ));
+        }
+        sqlx::query(
+            "UPDATE vala.forge_operation_state \
+             SET prepared_at = now() - interval '1 hour' \
+             WHERE data_tenant_id = $1 AND resource = $2 AND family = 'staging_fold'",
+        )
+        .bind(fixture.tenant.as_uuid())
+        .bind(&resource)
+        .execute(fixture.operator_pool.pool())
+        .await
+        .expect("age overflow projection");
+
+        let outcome = fixture.forge.run_once().await.expect("overflow tick");
+        assert!(outcome.pending_work);
+        assert_eq!(outcome.open_operation_overflows, 1);
+        assert_eq!(outcome.reconciliation_recovered, 0);
+        let mut conn = fixture
+            .pg
+            .vala_postgres()
+            .tenant_conn(fixture.tenant)
+            .await
+            .expect("overflow assertion connection");
+        let states: Vec<(bool, Option<i64>)> = sqlx::query_as(
+            "SELECT compacted, committed_snapshot_id FROM vala.file_list \
+             WHERE data_tenant_id = wyrd.current_tenant() AND id = ANY($1) ORDER BY id",
+        )
+        .bind(&ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("overflow input states");
+        assert_eq!(states, vec![(true, None); ids.len()]);
+        let operations: Vec<(String, Option<i64>)> = sqlx::query_as(
+            "SELECT phase, terminal_audit_seq FROM vala.forge_operation_state \
+             WHERE data_tenant_id = wyrd.current_tenant() AND operation_id = ANY($1) \
+             ORDER BY operation_id",
+        )
+        .bind(&operation_ids)
+        .fetch_all(&mut **conn.transaction())
+        .await
+        .expect("overflow operation states");
+        assert_eq!(operations, vec![("prepared".to_owned(), None); 2]);
     }
 
     /// Snapshot-expiry Recovered replay leaves one state row and two audits.

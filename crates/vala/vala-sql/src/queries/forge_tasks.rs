@@ -12,9 +12,9 @@ use wyrd_spec::vala::api::AuditEvent;
 
 use crate::queries::audit_outbox::append_audit;
 use crate::row_types::forge_tasks::{
-    ForgeTask, ForgeTaskEvidence, ForgeTaskPage, ForgeTaskSqlRow, ForgeTaskState,
-    ForgeTaskTableIdentity, ForgeTaskTransition, ForgeTaskTransitionOutcome, NewForgeTask,
-    SnapshotWatermark,
+    ForgePlanningDemand, ForgePlanningDemandSqlRow, ForgeTask, ForgeTaskEvidence, ForgeTaskPage,
+    ForgeTaskSqlRow, ForgeTaskState, ForgeTaskTableIdentity, ForgeTaskTransition,
+    ForgeTaskTransitionOutcome, NewForgeTask, SnapshotWatermark,
 };
 use crate::{OperatorPool, SqlError, TenantConn};
 
@@ -53,6 +53,189 @@ impl ForgeTasks {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// Coalesces one tenant-authenticated Scribe hint and advances its generation.
+    ///
+    /// # Errors
+    /// Returns conflict when the supplied tenant differs from the connection
+    /// binding, or SQL errors when the upsert cannot complete.
+    ///
+    /// # Cancellation
+    /// The single statement either advances the durable generation or has no effect.
+    pub async fn upsert_hint(
+        &self,
+        conn: &mut TenantConn<'_>,
+        data_tenant_id: wyrd_spec::DataTenantId,
+        table: &ForgeTaskTableIdentity,
+    ) -> Result<i64, SqlError> {
+        if data_tenant_id != conn.data_tenant_id() {
+            return Err(SqlError::Conflict {
+                detail: "Forge hint tenant does not match TenantConn binding".to_owned(),
+            });
+        }
+        sqlx::query_scalar("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'hint') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='hint',generation=vala.forge_planning_demands.generation+1 RETURNING generation")
+            .bind(data_tenant_id.as_uuid()).bind(&table.catalog).bind(&table.namespace).bind(&table.table)
+            .fetch_one(&mut **conn.transaction()).await.map_err(SqlError::from)
+    }
+
+    /// Coalesces periodic roster repair through the same durable demand ingress.
+    ///
+    /// # Errors
+    /// Returns SQL errors or overflow errors from the positive generation check.
+    ///
+    /// # Cancellation
+    /// The single statement is atomic.
+    pub async fn upsert_periodic(
+        &self,
+        op: &OperatorPool,
+        data_tenant_id: wyrd_spec::DataTenantId,
+        table: &ForgeTaskTableIdentity,
+    ) -> Result<i64, SqlError> {
+        sqlx::query_scalar("INSERT INTO vala.forge_planning_demands (data_tenant_id,catalog_name,namespace_name,table_name,last_source) VALUES ($1,$2,$3,$4,'periodic') ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name) DO UPDATE SET last_requested_at=statement_timestamp(),last_source='periodic',generation=vala.forge_planning_demands.generation+1 RETURNING generation")
+            .bind(data_tenant_id.as_uuid()).bind(&table.catalog).bind(&table.namespace).bind(&table.table)
+            .fetch_one(op.pool()).await.map_err(SqlError::from)
+    }
+
+    /// Lists a bounded tenant-ring page and returns each observed CAS generation.
+    ///
+    /// # Errors
+    /// Returns conflict for a zero bound and fails closed on malformed rows.
+    ///
+    /// # Cancellation
+    /// This read has no durable partial progress.
+    pub async fn planning_demands(
+        &self,
+        op: &OperatorPool,
+        owner: Uuid,
+        scheduler_fence: i64,
+        cap: u32,
+    ) -> Result<(Vec<ForgePlanningDemand>, bool), SqlError> {
+        if cap == 0 {
+            return Err(SqlError::Conflict {
+                detail: "planning demand cap must be positive".to_owned(),
+            });
+        }
+        let rows = sqlx::query_as::<_, ForgePlanningDemandSqlRow>("WITH scheduler AS MATERIALIZED (SELECT last_tenant_id FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()), ranked AS MATERIALIZED (SELECT d.*,row_number() OVER (PARTITION BY d.data_tenant_id ORDER BY d.last_requested_at,d.catalog_name,d.namespace_name,d.table_name) AS tenant_rank FROM vala.forge_planning_demands d) SELECT d.data_tenant_id,d.catalog_name,d.namespace_name,d.table_name,d.first_requested_at,d.last_requested_at,d.last_source,d.generation FROM ranked d CROSS JOIN scheduler s WHERE d.tenant_rank=1 ORDER BY (s.last_tenant_id IS NULL OR d.data_tenant_id>s.last_tenant_id) DESC,d.data_tenant_id LIMIT $3")
+            .bind(owner).bind(scheduler_fence).bind(i64::from(cap) + 1).fetch_all(op.pool()).await.map_err(SqlError::from)?;
+        let overflowed = rows.len() > cap as usize;
+        let demands = rows
+            .into_iter()
+            .take(cap as usize)
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((demands, overflowed))
+    }
+
+    /// Atomically enqueues all exact plans and CAS-acknowledges their source demand.
+    ///
+    /// The scheduler fence is revalidated before any insert. A concurrent newer
+    /// generation makes acknowledgement return `false` while exact inserts stay
+    /// idempotent in the same committed transaction.
+    ///
+    /// # Errors
+    /// Returns validation, fencing, or SQL errors. Any error rolls back all inserts.
+    ///
+    /// # Cancellation
+    /// Cancellation rolls back the transaction, retaining the demand.
+    pub async fn enqueue_and_acknowledge<F>(
+        &self,
+        op: &OperatorPool,
+        owner: Uuid,
+        scheduler_fence: i64,
+        demand: &ForgePlanningDemand,
+        tasks: &[NewForgeTask],
+        unschedulable: &[NewForgeTask],
+        unschedulable_event: F,
+    ) -> Result<bool, SqlError>
+    where
+        F: Fn(Uuid) -> AuditEvent,
+    {
+        if tasks.iter().chain(unschedulable).any(|task| {
+            task.data_tenant_id != demand.data_tenant_id || task.table_ref != demand.table_ref
+        }) {
+            return Err(SqlError::Conflict {
+                detail: "planned task does not match Forge demand binding".to_owned(),
+            });
+        }
+        let mut tx = op.pool().begin().await.map_err(SqlError::from)?;
+        let fenced: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM vala.forge_scheduler_state WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp() FOR UPDATE)")
+            .bind(owner).bind(scheduler_fence).fetch_one(&mut *tx).await.map_err(SqlError::from)?;
+        if !fenced {
+            return Err(SqlError::Conflict {
+                detail: "Forge scheduler fence is stale".to_owned(),
+            });
+        }
+        sqlx::query(wyrd_sql::tenant_conn::BIND_CURRENT_TENANT_SQL)
+            .bind(demand.data_tenant_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(SqlError::from)?;
+        for task in tasks {
+            task.plan.validate(false)?;
+            task.estimates.validate()?;
+            let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
+            sqlx::query("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'ready',$17) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING")
+                .bind(Uuid::now_v7()).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(task.ready_at).execute(&mut *tx).await.map_err(SqlError::from)?;
+        }
+        for task in unschedulable {
+            task.plan.validate(false)?;
+            task.estimates.validate()?;
+            let plan = crate::row_types::forge_tasks::plan_to_value(&task.plan);
+            let task_id = Uuid::now_v7();
+            let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO vala.forge_tasks (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,large_task_ceiling_bytes,state,ready_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'unschedulable',$17) ON CONFLICT (data_tenant_id,catalog_name,namespace_name,table_name,strategy,base_snapshot_id,plan_hash) DO NOTHING RETURNING task_id")
+                .bind(task_id).bind(task.data_tenant_id.as_uuid()).bind(&task.table_ref.catalog).bind(&task.table_ref.namespace).bind(&task.table_ref.table).bind(task.strategy.as_str()).bind(task.lane.as_str()).bind(task.base_snapshot_id).bind(plan).bind(task.plan_hash.as_slice()).bind(i64::from(task.estimates.files)).bind(i64::try_from(task.estimates.bytes).map_err(|_|SqlError::Conflict{detail:"estimated bytes overflow".to_owned()})?).bind(i32::from(task.estimates.parallelism)).bind(i64::try_from(task.estimates.memory_bytes).map_err(|_|SqlError::Conflict{detail:"memory estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.spill_bytes).map_err(|_|SqlError::Conflict{detail:"spill estimate overflow".to_owned()})?).bind(i64::try_from(task.estimates.large_ceiling_bytes).map_err(|_|SqlError::Conflict{detail:"large ceiling overflow".to_owned()})?).bind(task.ready_at)
+                .fetch_optional(&mut *tx).await.map_err(SqlError::from)?;
+            if let Some(inserted_id) = inserted {
+                let event = unschedulable_event(inserted_id);
+                validate_audit_event(&event, inserted_id, ForgeTaskState::Unschedulable)?;
+                crate::queries::audit_outbox::append_audit_connection(&mut tx, &event).await?;
+            }
+        }
+        let deleted = sqlx::query("DELETE FROM vala.forge_planning_demands WHERE data_tenant_id=$1 AND catalog_name=$2 AND namespace_name=$3 AND table_name=$4 AND generation=$5")
+            .bind(demand.data_tenant_id.as_uuid()).bind(&demand.table_ref.catalog).bind(&demand.table_ref.namespace).bind(&demand.table_ref.table).bind(demand.generation).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected() == 1;
+        {
+            let advanced = sqlx::query("UPDATE vala.forge_scheduler_state SET last_tenant_id=$3,updated_at=statement_timestamp() WHERE singleton AND owner=$1 AND fencing_token=$2 AND expires_at>statement_timestamp()")
+                .bind(owner).bind(scheduler_fence).bind(demand.data_tenant_id.as_uuid()).execute(&mut *tx).await.map_err(SqlError::from)?.rows_affected();
+            if advanced != 1 {
+                return Err(SqlError::Conflict {
+                    detail: "Forge scheduler fence was lost before cursor advance".to_owned(),
+                });
+            }
+        }
+        tx.commit().await.map_err(SqlError::from)?;
+        Ok(deleted)
+    }
+
+    /// Reads bounded authoritative pending demand and nonterminal task status.
+    ///
+    /// # Errors
+    /// Returns conflict for zero capacity and SQL errors from the bounded union.
+    pub async fn planning_status(
+        &self,
+        op: &OperatorPool,
+        cap: u32,
+    ) -> Result<(u64, Option<DateTime<Utc>>, bool), SqlError> {
+        if cap == 0 {
+            return Err(SqlError::Conflict {
+                detail: "planning status cap must be positive".to_owned(),
+            });
+        }
+        let rows: Vec<(DateTime<Utc>,)> = sqlx::query_as("SELECT requested_at FROM (SELECT first_requested_at AS requested_at FROM vala.forge_planning_demands UNION ALL SELECT ready_at AS requested_at FROM vala.forge_tasks WHERE state IN ('ready','retryable','claimed','running','prepared')) pending ORDER BY requested_at LIMIT $1")
+            .bind(i64::from(cap) + 1).fetch_all(op.pool()).await.map_err(SqlError::from)?;
+        let overflowed = rows.len() > cap as usize;
+        let visible = rows
+            .into_iter()
+            .take(cap as usize)
+            .map(|row| row.0)
+            .collect::<Vec<_>>();
+        Ok((
+            u64::try_from(visible.len()).map_err(|_| SqlError::InvariantViolation {
+                detail: "Forge backlog count overflow".to_owned(),
+            })?,
+            visible.first().copied(),
+            overflowed,
+        ))
     }
 
     /// Acquires or renews the singleton scheduler fence and returns its generation.

@@ -11,6 +11,108 @@ use crate::SqlError;
 /// Current version of persisted task plans and evidence.
 pub const FORGE_TASK_PAYLOAD_VERSION: u16 = 1;
 
+/// Closed origin of a coalesced Forge planning request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgePlanningDemandSource {
+    /// A Scribe commit requested prompt planning.
+    Hint,
+    /// Periodic active-roster repair requested planning.
+    Periodic,
+}
+
+impl ForgePlanningDemandSource {
+    /// Returns the stable SQL spelling used by the private demand table.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hint => "hint",
+            Self::Periodic => "periodic",
+        }
+    }
+
+    /// Reconstructs a persisted source without accepting unknown values.
+    ///
+    /// # Errors
+    /// Returns an invariant violation for malformed persisted state.
+    pub(crate) fn from_sql(value: &str) -> Result<Self, SqlError> {
+        match value {
+            "hint" => Ok(Self::Hint),
+            "periodic" => Ok(Self::Periodic),
+            _ => Err(SqlError::InvariantViolation {
+                detail: format!("unknown Forge planning demand source {value}"),
+            }),
+        }
+    }
+}
+
+/// One bounded durable request for exact Forge planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgePlanningDemand {
+    /// Tenant whose table must be planned.
+    pub data_tenant_id: DataTenantId,
+    /// Validated logical table identity.
+    pub table_ref: ForgeTaskTableIdentity,
+    /// Time at which the coalesced demand was first observed.
+    pub first_requested_at: DateTime<Utc>,
+    /// Time at which its generation was most recently advanced.
+    pub last_requested_at: DateTime<Utc>,
+    /// Most recent request source.
+    pub last_source: ForgePlanningDemandSource,
+    /// Positive monotonic generation captured for CAS acknowledgement.
+    pub generation: i64,
+}
+
+/// SQL projection used to validate demand rows before catalog access.
+#[derive(sqlx::FromRow)]
+pub(crate) struct ForgePlanningDemandSqlRow {
+    /// Persisted tenant UUID.
+    pub data_tenant_id: Uuid,
+    /// Persisted catalog component.
+    pub catalog_name: String,
+    /// Persisted namespace component.
+    pub namespace_name: String,
+    /// Persisted table component.
+    pub table_name: String,
+    /// First demand timestamp.
+    pub first_requested_at: DateTime<Utc>,
+    /// Most recent demand timestamp.
+    pub last_requested_at: DateTime<Utc>,
+    /// Persisted closed source.
+    pub last_source: String,
+    /// Persisted CAS generation.
+    pub generation: i64,
+}
+
+impl TryFrom<ForgePlanningDemandSqlRow> for ForgePlanningDemand {
+    type Error = SqlError;
+
+    /// Validates every persisted identity and generation component.
+    fn try_from(row: ForgePlanningDemandSqlRow) -> Result<Self, Self::Error> {
+        let data_tenant_id =
+            DataTenantId::new(row.data_tenant_id).map_err(|_| SqlError::InvariantViolation {
+                detail: "Forge planning demand contains malformed tenant identity".to_owned(),
+            })?;
+        let table_ref =
+            ForgeTaskTableIdentity::new(row.catalog_name, row.namespace_name, row.table_name)
+                .map_err(|_| SqlError::InvariantViolation {
+                    detail: "Forge planning demand contains malformed table identity".to_owned(),
+                })?;
+        if row.generation <= 0 {
+            return Err(SqlError::InvariantViolation {
+                detail: "Forge planning demand generation must be positive".to_owned(),
+            });
+        }
+        Ok(Self {
+            data_tenant_id,
+            table_ref,
+            first_requested_at: row.first_requested_at,
+            last_requested_at: row.last_requested_at,
+            last_source: ForgePlanningDemandSource::from_sql(&row.last_source)?,
+            generation: row.generation,
+        })
+    }
+}
+
 /// Validated logical Iceberg table identity stored in separate SQL columns.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ForgeTaskTableIdentity {

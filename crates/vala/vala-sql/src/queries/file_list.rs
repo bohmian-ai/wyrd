@@ -38,3 +38,28 @@ pub async fn list_nonterminal_file_paths(
     .await
     .map_err(SqlError::from)
 }
+
+/// Lists exact path/size inputs awaiting Forge planning for one demanded table.
+///
+/// The table-scoped read is not roster discovery: callers already hold one
+/// durable planning demand and use this result only to construct its exact plan.
+///
+/// # Errors
+/// Returns SQL errors or an invariant violation for a negative persisted size.
+pub async fn list_nonterminal_files(
+    conn: &mut TenantConn<'_>,
+    namespace: &str,
+    table_name: &str,
+) -> Result<Vec<(String, u64)>, SqlError> {
+    let rows: Vec<(String, i64)> = sqlx::query_as("SELECT file_path,file_size FROM vala.file_list WHERE data_tenant_id=wyrd.current_tenant() AND namespace=$1 AND table_name=$2 AND (NOT compacted OR committed_snapshot_id IS NULL) ORDER BY file_path")
+        .bind(namespace).bind(table_name).fetch_all(&mut **conn.transaction()).await.map_err(SqlError::from)?;
+    rows.into_iter()
+        .map(|(path, size)| {
+            u64::try_from(size).map(|value| (path, value)).map_err(|_| {
+                SqlError::InvariantViolation {
+                    detail: "Forge staging file size is negative".to_owned(),
+                }
+            })
+        })
+        .collect()
+}

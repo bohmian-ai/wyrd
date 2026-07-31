@@ -27,6 +27,21 @@ use crate::row_types::audit_outbox::AuditOutboxRow;
 /// # Errors
 /// Returns [`SqlError`] when any statement fails or an RLS policy rejects a row.
 pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Result<i64, SqlError> {
+    append_audit_connection(&mut **conn.transaction(), event).await
+}
+
+/// Appends one hash-chained audit row on an already tenant-bound transaction connection.
+///
+/// This private-crate seam lets an operator-owned coordination transaction bind
+/// an explicit tenant with the established transaction-local GUC and preserve
+/// atomic task, audit, and demand acknowledgement.
+///
+/// # Errors
+/// Returns [`SqlError`] when chain locking, hashing persistence, or RLS fails.
+pub(crate) async fn append_audit_connection(
+    conn: &mut sqlx::PgConnection,
+    event: &AuditEvent,
+) -> Result<i64, SqlError> {
     sqlx::query(
         r#"
         INSERT INTO vala.audit_chain_head (data_tenant_id)
@@ -34,7 +49,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         ON CONFLICT (data_tenant_id) DO NOTHING
         "#,
     )
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -46,7 +61,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
         FOR UPDATE
         "#,
     )
-    .fetch_one(&mut **conn.transaction())
+    .fetch_one(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -87,7 +102,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     .bind(result_str(event.result))
     .bind(event.payload_summary.as_str())
     .bind(detail.as_deref())
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 
@@ -100,7 +115,7 @@ pub async fn append_audit(conn: &mut TenantConn<'_>, event: &AuditEvent) -> Resu
     )
     .bind(seq)
     .bind(entry_hash.as_slice())
-    .execute(&mut **conn.transaction())
+    .execute(&mut *conn)
     .await
     .map_err(SqlError::from)?;
 

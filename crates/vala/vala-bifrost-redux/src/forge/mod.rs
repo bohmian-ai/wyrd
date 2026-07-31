@@ -6,7 +6,7 @@
 //! to recover work after a process or catalog failure.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use iceberg::Catalog;
@@ -17,12 +17,15 @@ pub(crate) mod compact;
 mod discovery;
 pub(crate) mod error;
 pub(crate) mod expire;
+mod identity;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
 mod metrics;
 pub(crate) mod orphan_gc;
 mod path;
+mod planner;
+mod planning_scheduler;
 pub(crate) mod rewrite;
 pub(crate) mod right_size;
 mod scheduler;
@@ -32,6 +35,11 @@ pub use clock::ForgeClock;
 pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
+pub use planner::{
+    ForgeCapacity, ForgePlanCandidate, ForgePlanCapacity, ForgePlanner, ForgeTableSnapshot,
+    PlannedForgeTask,
+};
+pub use planning_scheduler::{ForgeScheduleOutcome, ForgeScheduler};
 pub use rewrite::ForgeRewriteRuntime;
 #[cfg(feature = "test-support")]
 pub use rewrite::deterministic_output_path_for_test;
@@ -79,13 +87,9 @@ pub struct Forge {
     core: Arc<ForgeCore>,
     /// Bounded inbox held only while receiving or draining advisory hints.
     hints: tokio::sync::Mutex<crate::maintenance::StagingFileInbox>,
-    /// Serializes periodic, hinted, and explicit maintenance execution.
-    tick: tokio::sync::Mutex<()>,
     /// Rejects a second directly supervised scheduler loop.
     running: AtomicBool,
-    /// Process-local starting offset for complete periodic table passes.
-    periodic_cursor: AtomicU64,
-    /// Process-local terminal identities that suppress identical unsafe work.
+    /// Bounded terminal candidate registry retained for worker execution primitives.
     terminal_work: tokio::sync::Mutex<compact::ForgeTerminalWorkRegistry>,
 }
 
@@ -156,9 +160,7 @@ impl Forge {
         Ok(Self {
             core: Arc::new(core),
             hints: tokio::sync::Mutex::new(build.hints),
-            tick: tokio::sync::Mutex::new(()),
             running: AtomicBool::new(false),
-            periodic_cursor: AtomicU64::new(0),
             terminal_work: tokio::sync::Mutex::new(compact::ForgeTerminalWorkRegistry::default()),
         })
     }

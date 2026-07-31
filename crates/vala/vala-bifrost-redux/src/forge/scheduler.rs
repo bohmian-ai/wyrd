@@ -9,8 +9,11 @@ use uuid::Uuid;
 
 use super::Forge;
 use super::binpack::ForgeGroupKey;
-use super::compact::{ForgeTableKey, ForgeTickBudget, ForgeTickOutcome};
+use super::compact::{
+    ForgeTableKey, ForgeTickBudget, ForgeTickOutcome, StagingReconciliationOutcome,
+};
 use super::error::ForgeError;
+use super::expire::ExpiryReconciliationOutcome;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::live_reconcile::{DestructiveMaintenance, IcebergReconciliationOutcome};
 use super::live_replace::IcebergRewriteDisposition;
@@ -18,6 +21,7 @@ use super::metrics::{
     ForgeGaugeSnapshot, ForgeLeaseResult, ForgeMetricSource, ForgeMetricStage,
     ReconciliationGaugeObservation,
 };
+use super::orphan_gc::OrphanGcOutcome;
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
 
@@ -38,6 +42,39 @@ enum StagingStageResult<T> {
     Completed(T),
     /// Staging fold observed global shutdown.
     Cancelled,
+}
+
+/// Borrowed batch state for one periodic table execution.
+///
+/// A periodic tick creates one context and reuses it for every table so the
+/// global budget, captured clock instant, aggregate outcome, and gauge snapshot
+/// advance together.
+struct PeriodicTableContext<'a> {
+    /// Stable advisory-lock owner for every table lease in this tick.
+    owner: Uuid,
+    /// Global cancellation source checked between durable stages.
+    stop: &'a CancellationToken,
+    /// Batch-wide committed-work budget.
+    budget: &'a mut ForgeTickBudget,
+    /// Single clock instant captured for the entire tick.
+    now: DateTime<Utc>,
+    /// Aggregate tick evidence updated by each table outcome.
+    outcome: &'a mut ForgeTickOutcome,
+    /// Complete-tick reconciliation gauges collected by source.
+    gauges: &'a mut ForgeGaugeSnapshot,
+}
+
+/// Borrowed batch state for one advisory-hint key.
+///
+/// Hinted keys share their enclosing wake's budget and captured instant while
+/// retaining independent leases and outcome values.
+struct HintedKeyContext<'a> {
+    /// Global cancellation source checked between durable stages.
+    stop: &'a CancellationToken,
+    /// Batch-wide committed-work budget.
+    budget: &'a mut ForgeTickBudget,
+    /// Clock instant captured for the enclosing hinted wake.
+    now: DateTime<Utc>,
 }
 
 impl Forge {
@@ -64,7 +101,7 @@ impl Forge {
                 () = shutdown.cancelled() => return Ok(()),
                 first = self.receive_hint(), if hints_open => {
                     match first {
-                        Some(first) => match self.run_hinted_batch(first, &shutdown).await {
+                        Some(first) => match Box::pin(self.run_hinted_batch(first, &shutdown)).await {
                             Ok(outcome) => tracing::debug!(
                                 groups_seen = outcome.groups_seen,
                                 bins_committed = outcome.bins_committed,
@@ -80,7 +117,7 @@ impl Forge {
                     }
                 },
                 _ = ticker.tick() => {
-                    match self.run_periodic_tick(&shutdown).await {
+                    match Box::pin(self.run_periodic_tick(&shutdown)).await {
                         Ok(outcome) => tracing::debug!(
                             groups_seen = outcome.groups_seen,
                             bins_committed = outcome.bins_committed,
@@ -111,7 +148,7 @@ impl Forge {
     /// tick from completing. Per-table stage errors remain isolated in its
     /// returned counters.
     pub async fn run_once(&self) -> Result<ForgeTickOutcome, ForgeError> {
-        self.run_periodic_tick(&CancellationToken::new()).await
+        Box::pin(self.run_periodic_tick(&CancellationToken::new())).await
     }
 
     /// Acquire the fail-fast guard for the directly supervised scheduler.
@@ -144,7 +181,7 @@ impl Forge {
         stop: &CancellationToken,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let _tick = self.tick.lock().await;
-        self.run_periodic_tick_locked(stop).await
+        Box::pin(self.run_periodic_tick_locked(stop)).await
     }
 
     /// Execute periodic stages while the caller retains the tick mutex.
@@ -179,26 +216,23 @@ impl Forge {
                 outcome.pending_work = true;
                 break;
             }
-            match self
-                .process_periodic_table(
-                    &key,
-                    owner,
-                    stop,
-                    &mut budget,
-                    now,
-                    &mut outcome,
-                    &mut gauges,
-                )
-                .await
-            {
+            let mut context = PeriodicTableContext {
+                owner,
+                stop,
+                budget: &mut budget,
+                now,
+                outcome: &mut outcome,
+                gauges: &mut gauges,
+            };
+            match Box::pin(self.process_periodic_table(&key, &mut context)).await {
                 TableRunStatus::Succeeded => {
-                    outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1)
+                    outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1);
                 }
                 TableRunStatus::Skipped => {
-                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1)
+                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                 }
                 TableRunStatus::Failed => {
-                    outcome.tables_failed = outcome.tables_failed.saturating_add(1)
+                    outcome.tables_failed = outcome.tables_failed.saturating_add(1);
                 }
             }
             outcome.tables_examined = outcome.tables_examined.saturating_add(1);
@@ -236,7 +270,12 @@ impl Forge {
             if stop.is_cancelled() {
                 break;
             }
-            match self.run_hinted_key(&key, stop, &mut budget, now).await {
+            let mut context = HintedKeyContext {
+                stop,
+                budget: &mut budget,
+                now,
+            };
+            match Box::pin(self.run_hinted_key(&key, &mut context)).await {
                 Ok(outcome) => aggregate.merge(outcome),
                 Err(error) => {
                     aggregate.tables_failed = aggregate.tables_failed.saturating_add(1);
@@ -269,9 +308,7 @@ impl Forge {
     async fn run_hinted_key(
         &self,
         key: &ForgeGroupKey,
-        stop: &CancellationToken,
-        budget: &mut ForgeTickBudget,
-        now: DateTime<Utc>,
+        context: &mut HintedKeyContext<'_>,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let table_key = ForgeTableKey {
             tenant: key.tenant,
@@ -301,91 +338,14 @@ impl Forge {
             };
             return Ok(outcome);
         };
-        let mut takeover = ForgeTickOutcome::default();
-        if lease.takeover() {
-            takeover.lease_takeovers = 1;
+        let took_over = lease.takeover();
+        if took_over {
             self.core.metrics.record_lease(ForgeLeaseResult::Takeover);
         }
 
-        let result = async {
-            let mut outcome = ForgeTickOutcome::default();
-            outcome.merge(takeover);
-            let staging = self
-                .core
-                .metrics
-                .observe_stage(
-                    ForgeMetricStage::ReconcileStaging,
-                    self.run_compaction_reconciliation_for_table(
-                        &mut lease, &table_key, &binding, stop, now,
-                    ),
-                )
-                .await?;
-            let reconciled = staging.recovered.saturating_add(staging.reset);
-            outcome.reconciliation_recovered =
-                outcome.reconciliation_recovered.saturating_add(reconciled);
-            outcome.reconciled = outcome.reconciled.saturating_add(reconciled);
-            outcome.open_operation_overflows = outcome
-                .open_operation_overflows
-                .saturating_add(usize::from(staging.overflowed));
-            if stop.is_cancelled() {
-                outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
-                outcome.pending_work = true;
-                return Ok(outcome);
-            }
-            let live = match self
-                .core
-                .metrics
-                .observe_stage(
-                    ForgeMetricStage::ReconcileIceberg,
-                    self.reconcile_live_replacements(&mut lease, &table_key, &binding, stop, now),
-                )
-                .await
-            {
-                Ok(live) => live,
-                Err(ForgeError::Shutdown) => {
-                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
-                    outcome.pending_work = true;
-                    return Ok(outcome);
-                }
-                Err(error) => return Err(error),
-            };
-            record_live_reconciliation(&mut outcome, &live);
-            match staging_stage_result(
-                self.core
-                    .metrics
-                    .observe_stage(
-                        ForgeMetricStage::StagingFold,
-                        self.run_targeted_compaction_for_table(
-                            &mut lease,
-                            key,
-                            &binding,
-                            budget,
-                            now.date_naive(),
-                            stop,
-                        ),
-                    )
-                    .await,
-            )? {
-                StagingStageResult::Completed(staging) => outcome.merge(staging),
-                StagingStageResult::Cancelled => {
-                    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
-                    outcome.pending_work = true;
-                    return Ok(outcome);
-                }
-            }
-            if stop.is_cancelled()
-                || staging.destructive_maintenance == DestructiveMaintenance::Blocked
-                || live.destructive_maintenance == DestructiveMaintenance::Blocked
-            {
-                outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
-                outcome.pending_work = true;
-                return Ok(outcome);
-            }
-            self.run_one_live_replacement(&mut lease, &binding, budget, now, stop, &mut outcome)
-                .await?;
-            outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1);
-            Ok(outcome)
-        }
+        let result = Box::pin(
+            self.run_hinted_key_stages(&mut lease, key, &table_key, &binding, context, took_over),
+        )
         .await;
         let release = self.release_lease(&lease).await;
         match (result, release) {
@@ -400,6 +360,97 @@ impl Forge {
                 Err(error)
             }
         }
+    }
+
+    /// Run the fenced reconciliation, targeted fold, and replacement stages.
+    ///
+    /// The caller retains the exact-key lease and releases it after this method
+    /// returns, including when a stage fails or cancellation defers later work.
+    ///
+    /// # Errors
+    ///
+    /// Returns reconciliation, discovery, rewrite, catalog, or durable
+    /// bookkeeping failures for the leased hinted key.
+    async fn run_hinted_key_stages(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeGroupKey,
+        table_key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        context: &mut HintedKeyContext<'_>,
+        took_over: bool,
+    ) -> Result<ForgeTickOutcome, ForgeError> {
+        let mut outcome = ForgeTickOutcome::default();
+        if took_over {
+            outcome.lease_takeovers = 1;
+        }
+        let staging = Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::ReconcileStaging,
+            Box::pin(self.run_compaction_reconciliation_for_table(
+                lease,
+                table_key,
+                binding,
+                context.stop,
+                context.now,
+            )),
+        ))
+        .await?;
+        record_hinted_staging_reconciliation(&mut outcome, &staging);
+        if context.stop.is_cancelled() {
+            return Ok(cancel_hinted_outcome(outcome));
+        }
+        let live = match Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::ReconcileIceberg,
+            Box::pin(self.reconcile_live_replacements(
+                lease,
+                table_key,
+                binding,
+                context.stop,
+                context.now,
+            )),
+        ))
+        .await
+        {
+            Ok(live) => live,
+            Err(ForgeError::Shutdown) => return Ok(cancel_hinted_outcome(outcome)),
+            Err(error) => return Err(error),
+        };
+        record_live_reconciliation(&mut outcome, &live);
+        let compaction = staging_stage_result(
+            Box::pin(self.core.metrics.observe_stage(
+                ForgeMetricStage::StagingFold,
+                Box::pin(self.run_targeted_compaction_for_table(
+                    lease,
+                    key,
+                    binding,
+                    context.budget,
+                    context.now.date_naive(),
+                    context.stop,
+                )),
+            ))
+            .await,
+        )?;
+        match compaction {
+            StagingStageResult::Completed(staging) => outcome.merge(staging),
+            StagingStageResult::Cancelled => return Ok(cancel_hinted_outcome(outcome)),
+        }
+        if context.stop.is_cancelled()
+            || staging.destructive_maintenance == DestructiveMaintenance::Blocked
+            || live.destructive_maintenance == DestructiveMaintenance::Blocked
+        {
+            return Ok(cancel_hinted_outcome(outcome));
+        }
+        Box::pin(self.run_one_live_replacement(
+            lease,
+            binding,
+            context.budget,
+            context.now,
+            context.stop,
+            &mut outcome,
+        ))
+        .await?;
+        outcome.tables_succeeded = outcome.tables_succeeded.saturating_add(1);
+        Ok(outcome)
     }
 
     /// Drain at most the configured wake limit and return ordered unique keys.
@@ -433,12 +484,7 @@ impl Forge {
     async fn process_periodic_table(
         &self,
         key: &ForgeTableKey,
-        owner: Uuid,
-        stop: &CancellationToken,
-        budget: &mut ForgeTickBudget,
-        now: DateTime<Utc>,
-        outcome: &mut ForgeTickOutcome,
-        gauges: &mut ForgeGaugeSnapshot,
+        context: &mut PeriodicTableContext<'_>,
     ) -> TableRunStatus {
         let binding = match TenantTableBinding::resolve((key.tenant, key.table_ref.clone())) {
             Ok(binding) => binding,
@@ -457,14 +503,15 @@ impl Forge {
         let mut lease = match ForgeLease::acquire(
             &self.core.operator_pool,
             lease_key,
-            owner,
+            context.owner,
             self.core.config.lease_ttl,
         )
         .await
         {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                outcome.lease_contention = outcome.lease_contention.saturating_add(1);
+                context.outcome.lease_contention =
+                    context.outcome.lease_contention.saturating_add(1);
                 self.core.metrics.record_lease(ForgeLeaseResult::Contention);
                 return TableRunStatus::Skipped;
             }
@@ -474,14 +521,11 @@ impl Forge {
             }
         };
         if lease.takeover() {
-            outcome.lease_takeovers = outcome.lease_takeovers.saturating_add(1);
+            context.outcome.lease_takeovers = context.outcome.lease_takeovers.saturating_add(1);
             self.core.metrics.record_lease(ForgeLeaseResult::Takeover);
         }
-        let table_result = self
-            .run_periodic_table_stages(
-                &mut lease, key, &binding, stop, budget, now, outcome, gauges,
-            )
-            .await;
+        let table_result =
+            Box::pin(self.run_periodic_table_stages(&mut lease, key, &binding, context)).await;
         let release_result = self.release_lease(&lease).await;
         match (table_result, release_result) {
             (Ok(TableStageDisposition::Completed), Ok(())) => TableRunStatus::Succeeded,
@@ -489,8 +533,8 @@ impl Forge {
                 TableRunStatus::Skipped
             }
             (Err(error), Ok(())) | (Ok(_), Err(error)) => {
-                outcome.pending_work = true;
-                self.record_table_failure(key, outcome, &error);
+                context.outcome.pending_work = true;
+                self.record_table_failure(key, context.outcome, &error);
                 TableRunStatus::Failed
             }
             (Err(error), Err(release_error)) => {
@@ -499,8 +543,8 @@ impl Forge {
                     lease_key = %lease.lease_key,
                     "Forge stage failed and lease release also failed"
                 );
-                outcome.pending_work = true;
-                self.record_table_failure(key, outcome, &error);
+                context.outcome.pending_work = true;
+                self.record_table_failure(key, context.outcome, &error);
                 TableRunStatus::Failed
             }
         }
@@ -517,165 +561,178 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        stop: &CancellationToken,
-        budget: &mut ForgeTickBudget,
-        now: DateTime<Utc>,
-        outcome: &mut ForgeTickOutcome,
-        gauges: &mut ForgeGaugeSnapshot,
+        context: &mut PeriodicTableContext<'_>,
     ) -> Result<TableStageDisposition, ForgeError> {
-        let staging = self
-            .core
-            .metrics
-            .observe_stage(
-                ForgeMetricStage::ReconcileStaging,
-                self.run_compaction_reconciliation_for_table(lease, key, binding, stop, now),
-            )
-            .await?;
-        let staging_prepared = if staging.overflowed {
-            self.core
-                .config
-                .max_open_operations_per_table
-                .saturating_add(1)
-        } else {
-            staging
-                .recovered
-                .saturating_add(staging.reset)
-                .saturating_add(staging.pending)
-                .saturating_add(staging.unresolved)
-        };
-        let staging_observation = ReconciliationGaugeObservation {
-            prepared_operations: staging_prepared,
-            uncertain_operations: if staging.overflowed {
-                self.core
-                    .config
-                    .max_open_operations_per_table
-                    .saturating_add(1)
-            } else {
-                staging.pending.saturating_add(staging.unresolved)
-            },
-        };
-        gauges.record_reconciliation(ForgeMetricSource::Staging, staging_observation);
-        let reconciliation = staging.recovered.saturating_add(staging.reset);
-        outcome.reconciliation_recovered = outcome
-            .reconciliation_recovered
-            .saturating_add(reconciliation);
-        outcome.reconciled = outcome.reconciled.saturating_add(reconciliation);
-        outcome.open_operation_overflows = outcome
-            .open_operation_overflows
-            .saturating_add(usize::from(staging.overflowed));
-        if stop.is_cancelled() {
-            outcome.pending_work = true;
+        let staging = Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::ReconcileStaging,
+            Box::pin(self.run_compaction_reconciliation_for_table(
+                lease,
+                key,
+                binding,
+                context.stop,
+                context.now,
+            )),
+        ))
+        .await?;
+        self.record_staging_reconciliation(&staging, context);
+        if context.stop.is_cancelled() {
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
-        let live = match self
-            .core
-            .metrics
-            .observe_stage(
-                ForgeMetricStage::ReconcileIceberg,
-                self.reconcile_live_replacements(lease, key, binding, stop, now),
-            )
-            .await
+        let live = match Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::ReconcileIceberg,
+            Box::pin(self.reconcile_live_replacements(
+                lease,
+                key,
+                binding,
+                context.stop,
+                context.now,
+            )),
+        ))
+        .await
         {
             Ok(live) => live,
             Err(ForgeError::Shutdown) => {
-                outcome.pending_work = true;
+                context.outcome.pending_work = true;
                 return Ok(TableStageDisposition::Cancelled);
             }
             Err(error) => return Err(error),
         };
-        record_live_reconciliation(outcome, &live);
-        gauges.record_reconciliation(
+        record_live_reconciliation(context.outcome, &live);
+        context.gauges.record_reconciliation(
             ForgeMetricSource::Iceberg,
             reconciliation_observation(&live, self.core.config.max_open_operations_per_table)?,
         );
 
         let compaction = match staging_stage_result(
-            self.core
-                .metrics
-                .observe_stage(
-                    ForgeMetricStage::StagingFold,
-                    self.run_compaction_bins_for_table(lease, key, binding, budget, now, stop),
-                )
-                .await,
+            Box::pin(self.core.metrics.observe_stage(
+                ForgeMetricStage::StagingFold,
+                Box::pin(self.run_compaction_bins_for_table(
+                    lease,
+                    key,
+                    binding,
+                    context.budget,
+                    context.now,
+                    context.stop,
+                )),
+            ))
+            .await,
         )? {
             StagingStageResult::Completed(compaction) => compaction,
             StagingStageResult::Cancelled => {
-                outcome.pending_work = true;
+                context.outcome.pending_work = true;
                 return Ok(TableStageDisposition::Cancelled);
             }
         };
-        outcome.merge(compaction);
-        if stop.is_cancelled() {
-            outcome.pending_work = true;
+        context.outcome.merge(compaction);
+        if context.stop.is_cancelled() {
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
         if staging.destructive_maintenance == DestructiveMaintenance::Blocked
             || live.destructive_maintenance == DestructiveMaintenance::Blocked
         {
-            outcome.pending_work = true;
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Blocked);
         }
+        Box::pin(
+            self.run_periodic_destructive_stages(lease, key, binding, context, &staging, &live),
+        )
+        .await
+    }
 
-        self.run_one_live_replacement(lease, binding, budget, now, stop, outcome)
-            .await?;
-        if stop.is_cancelled() {
-            outcome.pending_work = true;
+    /// Run live replacement, expiry, and orphan collection after reconciliation.
+    ///
+    /// Destructive stages are sequenced under the same table lease and retain
+    /// both reconciliation protection sets until orphan collection completes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first live-rewrite, expiry, garbage-collection, catalog, or
+    /// durable-bookkeeping error. Cancellation becomes a safe stage boundary.
+    async fn run_periodic_destructive_stages(
+        &self,
+        lease: &mut ForgeLease,
+        key: &ForgeTableKey,
+        binding: &TenantTableBinding,
+        context: &mut PeriodicTableContext<'_>,
+        staging: &StagingReconciliationOutcome,
+        live: &IcebergReconciliationOutcome,
+    ) -> Result<TableStageDisposition, ForgeError> {
+        Box::pin(self.run_one_live_replacement(
+            lease,
+            binding,
+            context.budget,
+            context.now,
+            context.stop,
+            context.outcome,
+        ))
+        .await?;
+        if context.stop.is_cancelled() {
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
-
-        let expiry = self
-            .core
-            .metrics
-            .observe_stage(
-                ForgeMetricStage::SnapshotExpiry,
-                self.run_snapshot_expiry_for_table(lease, key, binding, now),
-            )
-            .await?;
-        outcome.expiry_reconciled = outcome.expiry_reconciled.saturating_add(expiry.recovered);
-        outcome.reconciled = outcome.reconciled.saturating_add(expiry.recovered);
-        if expiry.overflowed || expiry.pending > 0 || expiry.unresolved > 0 {
-            outcome.open_operation_overflows = outcome
-                .open_operation_overflows
-                .saturating_add(usize::from(expiry.overflowed));
-            outcome.pending_work = true;
-        }
-        if stop.is_cancelled() {
-            outcome.pending_work = true;
+        let expiry = Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::SnapshotExpiry,
+            Box::pin(self.run_snapshot_expiry_for_table(lease, key, binding, context.now)),
+        ))
+        .await?;
+        record_expiry_reconciliation(context.outcome, &expiry);
+        if context.stop.is_cancelled() {
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
         if expiry.destructive_maintenance == DestructiveMaintenance::Blocked {
             return Ok(TableStageDisposition::Blocked);
         }
-
-        let gc = self
-            .core
-            .metrics
-            .observe_stage(
-                ForgeMetricStage::OrphanGc,
-                self.run_orphan_gc_for_table(
-                    lease,
-                    key,
-                    binding,
-                    now,
-                    stop,
-                    &staging.protected_output_paths,
-                    &live.protected_output_paths,
-                ),
-            )
-            .await?;
-        outcome.gc_reconciled = outcome.gc_reconciled.saturating_add(gc.recovered);
-        outcome.gc_candidates = outcome.gc_candidates.saturating_add(gc.candidates);
-        outcome.gc_deleted = outcome.gc_deleted.saturating_add(gc.deleted);
-        outcome.gc_skipped = outcome.gc_skipped.saturating_add(gc.skipped);
-        outcome.reconciled = outcome.reconciled.saturating_add(gc.recovered);
+        let gc = Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::OrphanGc,
+            Box::pin(self.run_orphan_gc_for_table(
+                lease,
+                key,
+                binding,
+                context.now,
+                context.stop,
+                &staging.protected_output_paths,
+                &live.protected_output_paths,
+            )),
+        ))
+        .await?;
+        record_gc_reconciliation(context.outcome, &gc);
         if gc.overflowed || gc.pending > 0 || gc.unresolved > 0 {
-            outcome.open_operation_overflows = outcome
+            context.outcome.open_operation_overflows = context
+                .outcome
                 .open_operation_overflows
                 .saturating_add(usize::from(gc.overflowed));
-            outcome.pending_work = true;
+            context.outcome.pending_work = true;
             return Ok(TableStageDisposition::Blocked);
         }
         Ok(TableStageDisposition::Completed)
+    }
+
+    /// Fold staging reconciliation facts into the periodic outcome and gauge.
+    fn record_staging_reconciliation(
+        &self,
+        staging: &StagingReconciliationOutcome,
+        context: &mut PeriodicTableContext<'_>,
+    ) {
+        context.gauges.record_reconciliation(
+            ForgeMetricSource::Staging,
+            staging_reconciliation_observation(
+                staging,
+                self.core.config.max_open_operations_per_table,
+            ),
+        );
+        let reconciliation = staging.recovered.saturating_add(staging.reset);
+        context.outcome.reconciliation_recovered = context
+            .outcome
+            .reconciliation_recovered
+            .saturating_add(reconciliation);
+        context.outcome.reconciled = context.outcome.reconciled.saturating_add(reconciliation);
+        context.outcome.open_operation_overflows = context
+            .outcome
+            .open_operation_overflows
+            .saturating_add(usize::from(staging.overflowed));
     }
 
     /// Attempts at most one current-snapshot live rewrite group for one table.
@@ -743,14 +800,18 @@ impl Forge {
             outcome.pending_work = true;
             return Ok(());
         }
-        match self
-            .core
-            .metrics
-            .observe_stage(
-                ForgeMetricStage::IcebergRewrite,
-                self.replace_live_group(lease, binding, &table, plan.base_snapshot_id, group, stop),
-            )
-            .await?
+        match Box::pin(self.core.metrics.observe_stage(
+            ForgeMetricStage::IcebergRewrite,
+            Box::pin(self.replace_live_group(
+                lease,
+                binding,
+                &table,
+                plan.base_snapshot_id,
+                group,
+                stop,
+            )),
+        ))
+        .await?
         {
             IcebergRewriteDisposition::Committed {
                 input_files,
@@ -834,6 +895,71 @@ fn record_live_reconciliation(tick: &mut ForgeTickOutcome, live: &IcebergReconci
         .open_operation_overflows
         .saturating_add(usize::from(live.overflowed));
     tick.pending_work |= live.overflowed || live.pending > 0 || live.unresolved > 0;
+}
+
+/// Fold staging reconciliation facts into a hinted-key outcome without gauges.
+fn record_hinted_staging_reconciliation(
+    tick: &mut ForgeTickOutcome,
+    staging: &StagingReconciliationOutcome,
+) {
+    let reconciliation = staging.recovered.saturating_add(staging.reset);
+    tick.reconciliation_recovered = tick.reconciliation_recovered.saturating_add(reconciliation);
+    tick.reconciled = tick.reconciled.saturating_add(reconciliation);
+    tick.open_operation_overflows = tick
+        .open_operation_overflows
+        .saturating_add(usize::from(staging.overflowed));
+}
+
+/// Mark a hinted result as safely deferred after cancellation or blocked work.
+fn cancel_hinted_outcome(mut outcome: ForgeTickOutcome) -> ForgeTickOutcome {
+    outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
+    outcome.pending_work = true;
+    outcome
+}
+
+/// Convert staged reconciliation evidence into the complete-tick gauge contract.
+fn staging_reconciliation_observation(
+    staging: &StagingReconciliationOutcome,
+    cap: usize,
+) -> ReconciliationGaugeObservation {
+    let lower_bound = cap.saturating_add(1);
+    ReconciliationGaugeObservation {
+        prepared_operations: if staging.overflowed {
+            lower_bound
+        } else {
+            staging
+                .recovered
+                .saturating_add(staging.reset)
+                .saturating_add(staging.pending)
+                .saturating_add(staging.unresolved)
+        },
+        uncertain_operations: if staging.overflowed {
+            lower_bound
+        } else {
+            staging.pending.saturating_add(staging.unresolved)
+        },
+    }
+}
+
+/// Fold snapshot-expiry evidence into the caller's periodic outcome.
+fn record_expiry_reconciliation(tick: &mut ForgeTickOutcome, expiry: &ExpiryReconciliationOutcome) {
+    tick.expiry_reconciled = tick.expiry_reconciled.saturating_add(expiry.recovered);
+    tick.reconciled = tick.reconciled.saturating_add(expiry.recovered);
+    if expiry.overflowed || expiry.pending > 0 || expiry.unresolved > 0 {
+        tick.open_operation_overflows = tick
+            .open_operation_overflows
+            .saturating_add(usize::from(expiry.overflowed));
+        tick.pending_work = true;
+    }
+}
+
+/// Fold orphan-collection evidence into the caller's periodic outcome.
+fn record_gc_reconciliation(tick: &mut ForgeTickOutcome, gc: &OrphanGcOutcome) {
+    tick.gc_reconciled = tick.gc_reconciled.saturating_add(gc.recovered);
+    tick.gc_candidates = tick.gc_candidates.saturating_add(gc.candidates);
+    tick.gc_deleted = tick.gc_deleted.saturating_add(gc.deleted);
+    tick.gc_skipped = tick.gc_skipped.saturating_add(gc.skipped);
+    tick.reconciled = tick.reconciled.saturating_add(gc.recovered);
 }
 
 /// Converts bounded live reconciliation into the complete-tick gauge contract.

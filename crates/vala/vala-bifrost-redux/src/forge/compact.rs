@@ -528,6 +528,26 @@ pub(crate) struct ForgeTickBudget {
     pub(crate) bins: usize,
 }
 
+/// Borrowed state shared by every staged-compaction bin in one table pass.
+///
+/// The scheduler creates this context once per targeted or periodic selection
+/// so each committed bin observes the same lease, table binding, budget, and
+/// cancellation boundary.
+struct StagingCompactionContext<'a> {
+    /// Fence retained across every compaction commit in the selected rows.
+    lease: &'a mut ForgeLease,
+    /// Resolved tenant and physical-table binding for the selected rows.
+    binding: &'a TenantTableBinding,
+    /// Table-specific bin-packing and output-rotation policy.
+    right_size_policy: &'a ForgeRightSizePolicy,
+    /// Caller-owned limits consumed only by committed bins.
+    budget: &'a mut ForgeTickBudget,
+    /// Day captured at the batch boundary for closed-partition selection.
+    current_day: NaiveDate,
+    /// Global cancellation source checked before every durable operation.
+    stop: &'a CancellationToken,
+}
+
 /// Reconcile prepared compaction audits for one tenant/table before new work.
 ///
 /// A prepared operation is marked committed when its output is still live in
@@ -647,16 +667,15 @@ impl Forge {
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_candidate_groups(table_key, now).await?;
         let right_size_policy = self.table_right_size_policy(binding).await?;
-        self.compact_candidate_rows(
+        let mut context = StagingCompactionContext {
             lease,
             binding,
-            rows,
-            &right_size_policy,
+            right_size_policy: &right_size_policy,
             budget,
-            now.date_naive(),
+            current_day: now.date_naive(),
             stop,
-        )
-        .await
+        };
+        self.compact_candidate_rows(rows, &mut context).await
     }
 
     /// Query and compact one exact durable day after an advisory hint.
@@ -675,16 +694,15 @@ impl Forge {
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let rows = self.select_targeted_candidate_group(key).await?;
         let right_size_policy = self.table_right_size_policy(binding).await?;
-        self.compact_candidate_rows(
+        let mut context = StagingCompactionContext {
             lease,
             binding,
-            rows,
-            &right_size_policy,
+            right_size_policy: &right_size_policy,
             budget,
             current_day,
             stop,
-        )
-        .await
+        };
+        self.compact_candidate_rows(rows, &mut context).await
     }
 }
 
@@ -697,123 +715,146 @@ impl Forge {
 impl Forge {
     async fn compact_candidate_rows(
         &self,
-        lease: &mut ForgeLease,
-        binding: &TenantTableBinding,
         rows: Vec<CandidateRow>,
-        right_size_policy: &ForgeRightSizePolicy,
-        budget: &mut ForgeTickBudget,
-        current_day: NaiveDate,
-        stop: &CancellationToken,
+        context: &mut StagingCompactionContext<'_>,
     ) -> Result<ForgeTickOutcome, ForgeError> {
         let mut outcome = ForgeTickOutcome::default();
         'groups: for row in rows {
             let bins = plan_staging_bins(
-                right_size_policy,
+                context.right_size_policy,
                 &row.files,
                 self.core.config.max_files_per_bin,
                 row.key.partition_day,
-                current_day,
+                context.current_day,
             );
             outcome.groups_seen = outcome.groups_seen.saturating_add(bins.len());
             for (index, bin) in bins.iter().enumerate() {
-                if stop.is_cancelled() {
-                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
-                        bins[index..]
-                            .iter()
-                            .map(|pending| pending.files.len())
-                            .sum::<usize>(),
-                    );
-                    outcome.pending_work = true;
+                if context.stop.is_cancelled() {
+                    record_staging_pending(&mut outcome, &bins, index);
                     return Ok(outcome);
                 }
-                if budget.bins >= self.core.config.max_bins_per_tick {
-                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
-                        bins[index..]
-                            .iter()
-                            .map(|pending| pending.files.len())
-                            .sum::<usize>(),
-                    );
-                    outcome.pending_work = true;
+                if context.budget.bins >= self.core.config.max_bins_per_tick {
+                    record_staging_pending(&mut outcome, &bins, index);
                     break;
                 }
-                if budget.files.saturating_add(bin.files.len())
+                if context.budget.files.saturating_add(bin.files.len())
                     > self.core.config.max_files_per_tick
-                    || budget.bytes.saturating_add(bin.total_bytes)
+                    || context.budget.bytes.saturating_add(bin.total_bytes)
                         > self.core.config.max_bytes_per_tick
                 {
-                    outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
-                    outcome.budget_skips = outcome.budget_skips.saturating_add(1);
-                    self.core.metrics.record_operation(
-                        super::metrics::ForgeMetricSource::Staging,
-                        super::metrics::ForgeOperationResult::Budget,
-                        1,
-                    );
-                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
-                        bins[index..]
-                            .iter()
-                            .map(|pending| pending.files.len())
-                            .sum::<usize>(),
-                    );
-                    outcome.pending_work = true;
+                    self.record_staging_budget_skip(&mut outcome, &bins, index);
                     break 'groups;
                 }
-                if !lease.renew(&self.core.operator_pool).await? {
-                    return Err(ForgeError::FenceLost {
-                        lease_key: lease.lease_key.clone(),
-                    });
-                }
-                if !lease.commit_window_fits(self.core.config.commit_window()) {
-                    outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
-                    outcome.budget_skips = outcome.budget_skips.saturating_add(1);
-                    self.core.metrics.record_operation(
-                        super::metrics::ForgeMetricSource::Staging,
-                        super::metrics::ForgeOperationResult::Budget,
-                        1,
-                    );
-                    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
-                        bins[index..]
-                            .iter()
-                            .map(|pending| pending.files.len())
-                            .sum::<usize>(),
-                    );
-                    outcome.pending_work = true;
+                let Some(stats) = self.compact_staging_bin(context, &row.key, bin).await? else {
+                    self.record_staging_budget_skip(&mut outcome, &bins, index);
                     break 'groups;
-                }
-                let stats = self
-                    .compact_bin(lease, &row.key, binding, &bin, right_size_policy, stop)
-                    .await?;
-                outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
-                outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
-                outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
-                outcome.outputs_committed = outcome
-                    .outputs_committed
-                    .saturating_add(stats.outputs_committed);
-                outcome.staging_input_files = outcome
-                    .staging_input_files
-                    .saturating_add(stats.input_files);
-                outcome.staging_input_bytes = outcome
-                    .staging_input_bytes
-                    .saturating_add(stats.input_bytes);
-                outcome.staging_output_files = outcome
-                    .staging_output_files
-                    .saturating_add(stats.outputs_committed);
-                outcome.staging_output_bytes = outcome
-                    .staging_output_bytes
-                    .saturating_add(stats.output_bytes);
-                budget.files = budget.files.saturating_add(bin.files.len());
-                budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
-                budget.bins = budget.bins.saturating_add(1);
-                outcome.bins_committed = outcome.bins_committed.saturating_add(1);
+                };
+                record_staging_commit(&mut outcome, context.budget, bin, stats);
             }
-            if budget.bins >= self.core.config.max_bins_per_tick
-                || budget.files >= self.core.config.max_files_per_tick
-                || budget.bytes >= self.core.config.max_bytes_per_tick
+            if context.budget.bins >= self.core.config.max_bins_per_tick
+                || context.budget.files >= self.core.config.max_files_per_tick
+                || context.budget.bytes >= self.core.config.max_bytes_per_tick
             {
                 break;
             }
         }
         Ok(outcome)
     }
+
+    /// Renew the table fence and compact one budget-admitted staged bin.
+    ///
+    /// A commit-window rejection returns `Ok(None)` so the caller can record
+    /// the same budget evidence used for other bounded-work deferrals.
+    ///
+    /// # Errors
+    ///
+    /// Returns a lost-fence, rewrite, catalog, or durable-bookkeeping error.
+    async fn compact_staging_bin(
+        &self,
+        context: &mut StagingCompactionContext<'_>,
+        key: &ForgeGroupKey,
+        bin: &RewriteBin,
+    ) -> Result<Option<CompactStats>, ForgeError> {
+        if !context.lease.renew(&self.core.operator_pool).await? {
+            return Err(ForgeError::FenceLost {
+                lease_key: context.lease.lease_key.clone(),
+            });
+        }
+        if !context
+            .lease
+            .commit_window_fits(self.core.config.commit_window())
+        {
+            return Ok(None);
+        }
+        self.compact_bin(
+            context.lease,
+            key,
+            context.binding,
+            bin,
+            context.right_size_policy,
+            context.stop,
+        )
+        .await
+        .map(Some)
+    }
+
+    /// Record a bin deferral caused by a global Forge budget or lease window.
+    fn record_staging_budget_skip(
+        &self,
+        outcome: &mut ForgeTickOutcome,
+        bins: &[RewriteBin],
+        index: usize,
+    ) {
+        outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+        outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+        self.core.metrics.record_operation(
+            super::metrics::ForgeMetricSource::Staging,
+            super::metrics::ForgeOperationResult::Budget,
+            1,
+        );
+        record_staging_pending(outcome, bins, index);
+    }
+}
+
+/// Mark the unvisited bins from one staged row as visible pending work.
+fn record_staging_pending(outcome: &mut ForgeTickOutcome, bins: &[RewriteBin], index: usize) {
+    let pending_files = bins[index..]
+        .iter()
+        .map(|pending| pending.files.len())
+        .sum::<usize>();
+    outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(pending_files);
+    outcome.pending_work = true;
+}
+
+/// Fold one committed staged rewrite into its tick outcome and shared budget.
+fn record_staging_commit(
+    outcome: &mut ForgeTickOutcome,
+    budget: &mut ForgeTickBudget,
+    bin: &RewriteBin,
+    stats: CompactStats,
+) {
+    outcome.spill_bytes = outcome.spill_bytes.saturating_add(stats.spill_bytes);
+    outcome.input_rows = outcome.input_rows.saturating_add(stats.input_rows);
+    outcome.output_rows = outcome.output_rows.saturating_add(stats.output_rows);
+    outcome.outputs_committed = outcome
+        .outputs_committed
+        .saturating_add(stats.outputs_committed);
+    outcome.staging_input_files = outcome
+        .staging_input_files
+        .saturating_add(stats.input_files);
+    outcome.staging_input_bytes = outcome
+        .staging_input_bytes
+        .saturating_add(stats.input_bytes);
+    outcome.staging_output_files = outcome
+        .staging_output_files
+        .saturating_add(stats.outputs_committed);
+    outcome.staging_output_bytes = outcome
+        .staging_output_bytes
+        .saturating_add(stats.output_bytes);
+    budget.files = budget.files.saturating_add(bin.files.len());
+    budget.bytes = budget.bytes.saturating_add(bin.total_bytes);
+    budget.bins = budget.bins.saturating_add(1);
+    outcome.bins_committed = outcome.bins_committed.saturating_add(1);
 }
 
 /// Map durable staging facts into the live-file policy without reusing its

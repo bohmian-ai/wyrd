@@ -133,10 +133,7 @@ impl ForgeClockControl {
                 detail: "Forge manual clock advance must be positive".to_owned(),
             });
         }
-        let millis =
-            i64::try_from(by.num_milliseconds()).map_err(|_| ForgeError::InvalidConfig {
-                detail: "Forge manual clock advance exceeds i64 milliseconds".to_owned(),
-            })?;
+        let millis = by.num_milliseconds();
         if millis <= 0 {
             return Err(ForgeError::InvalidConfig {
                 detail: "Forge manual clock advance must contain milliseconds".to_owned(),

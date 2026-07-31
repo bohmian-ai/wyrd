@@ -15,6 +15,7 @@ use super::binpack::ForgeGroupKey;
 use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::metrics::RewritePathContract;
 use super::path::catalog_path_to_object_key;
 use crate::catalog::TenantTableBinding;
 
@@ -457,7 +458,14 @@ impl Forge {
         match classify_evidence(&evidence, young) {
             LiveDisposition::Recovered(snapshot_id) => {
                 let volume = self
-                    .measure_rewrite_volume(&prepared.input_paths, &prepared.output_paths)
+                    .measure_rewrite_volume(
+                        RewritePathContract::Catalog {
+                            binding: context.binding,
+                            table_location: &context.observation_b.table_location,
+                        },
+                        &prepared.input_paths,
+                        &prepared.output_paths,
+                    )
                     .await?;
                 Self::require_running(context.stop)?;
                 context

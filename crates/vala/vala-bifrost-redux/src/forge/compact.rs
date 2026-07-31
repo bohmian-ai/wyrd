@@ -39,6 +39,7 @@ use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::live_reconcile::DestructiveMaintenance;
+use super::metrics::RewritePathContract;
 use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
@@ -1733,7 +1734,11 @@ impl Forge {
         let table = self.load_table(&binding.table_ident()).await?;
         if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
             let volume = self
-                .measure_rewrite_volume(input_paths, output_paths)
+                .measure_rewrite_volume(
+                    RewritePathContract::Staging { binding },
+                    input_paths,
+                    output_paths,
+                )
                 .await?;
             self.renew_reconciliation_lease(lease).await?;
             self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)

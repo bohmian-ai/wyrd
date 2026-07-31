@@ -8,9 +8,53 @@ use metrics::{Counter, Gauge, Histogram};
 use num_traits::ToPrimitive;
 use wyrd_spec::vala::api::StoragePath;
 
+use crate::catalog::TenantTableBinding;
+
 use super::Forge;
 use super::compact::ForgeTickOutcome;
 use super::error::ForgeError;
+use super::path::catalog_path_to_object_key;
+
+/// Validated object-key contract for one rewrite source.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RewritePathContract<'binding> {
+    /// Staging audit paths are already relative but must remain within binding.
+    Staging {
+        /// Physical tenant/table binding that owns every relative key.
+        binding: &'binding TenantTableBinding,
+    },
+    /// Live Iceberg audit paths are catalog URIs rooted at the table location.
+    Catalog {
+        /// Validated physical tenant/table binding that owns the catalog root.
+        binding: &'binding TenantTableBinding,
+        /// Catalog table location used by the retained-manifest observation.
+        table_location: &'binding str,
+    },
+}
+
+impl RewritePathContract<'_> {
+    /// Converts one typed rewrite path into a binding-validated object key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Invariant`] when a staging path escapes its
+    /// binding or a catalog URI does not belong to the validated table root.
+    fn object_key(self, store: &opendal::Operator, path: &str) -> Result<String, ForgeError> {
+        match self {
+            Self::Staging { binding } => {
+                binding
+                    .validate_object_path(path)
+                    .ok_or_else(|| ForgeError::Invariant {
+                        detail: format!("staging path escaped table binding: {path}"),
+                    })
+            }
+            Self::Catalog {
+                binding,
+                table_location,
+            } => catalog_path_to_object_key(table_location, binding, store, path),
+        }
+    }
+}
 
 /// Durable-data source that produced a Forge operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -400,15 +444,18 @@ impl Forge {
     ///
     /// # Errors
     ///
-    /// Returns an object-store error when any exact path cannot be stated, or
-    /// [`ForgeError::InvalidConfig`] when byte accumulation overflows.
+    /// Returns [`ForgeError::Invariant`] when a staging or catalog path is
+    /// malformed, foreign, or outside its tenant/table binding; an object-store
+    /// error when metadata stat fails; or [`ForgeError::InvalidConfig`] when
+    /// byte accumulation overflows.
     pub(super) async fn measure_rewrite_volume(
         &self,
+        contract: RewritePathContract<'_>,
         input_paths: &[StoragePath],
         output_paths: &[StoragePath],
     ) -> Result<ForgeRewriteVolume, ForgeError> {
-        let input_bytes = self.measure_path_bytes(input_paths).await?;
-        let output_bytes = self.measure_path_bytes(output_paths).await?;
+        let input_bytes = self.measure_path_bytes(contract, input_paths).await?;
+        let output_bytes = self.measure_path_bytes(contract, output_paths).await?;
         Ok(ForgeRewriteVolume {
             input_files: input_paths.len(),
             input_bytes,
@@ -421,15 +468,22 @@ impl Forge {
     ///
     /// # Errors
     ///
-    /// Returns an object-store error when metadata cannot be read, or
-    /// [`ForgeError::InvalidConfig`] when the total exceeds `u64`.
-    async fn measure_path_bytes(&self, paths: &[StoragePath]) -> Result<u64, ForgeError> {
+    /// Returns [`ForgeError::Invariant`] when a staging or catalog path is
+    /// malformed, foreign, or outside its tenant/table binding; an object-store
+    /// error when metadata stat fails; or [`ForgeError::InvalidConfig`] when
+    /// the total exceeds `u64`.
+    async fn measure_path_bytes(
+        &self,
+        contract: RewritePathContract<'_>,
+        paths: &[StoragePath],
+    ) -> Result<u64, ForgeError> {
         let mut bytes = 0_u64;
         for path in paths {
+            let object_key = contract.object_key(&self.core.staging, path.as_str())?;
             let size = self
                 .core
                 .object_store
-                .stat(path.as_str())
+                .stat(&object_key)
                 .await
                 .map_err(ForgeError::ObjectStore)?
                 .content_length();
@@ -627,8 +681,95 @@ fn convergence_result(outcome: &ForgeTickOutcome) -> ForgeConvergenceResult {
 #[cfg(test)]
 mod tests {
     use wyrd_bench::{BenchmarkMetricSnapshot, BenchmarkRecorder};
+    use wyrd_spec::DataTenantId;
 
     use super::*;
+    use crate::catalog::table_ref::TableRef;
+    use crate::namespaces::BifrostNamespace;
+
+    /// Builds one tenant-qualified binding for rewrite-path tests.
+    fn rewrite_binding() -> TenantTableBinding {
+        TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("test binding resolves")
+    }
+
+    /// Builds a filesystem operator for authority-free catalog URI tests.
+    fn rewrite_store(root: &std::path::Path) -> opendal::Operator {
+        let service = opendal::services::Fs::default()
+            .root(root.to_str().expect("temporary path is valid UTF-8"));
+        opendal::Operator::new(service)
+            .expect("filesystem backend initializes")
+            .finish()
+    }
+
+    /// Proves staging measurement preserves a validated relative object key.
+    #[test]
+    fn rewrite_path_contract_preserves_relative_staging_key() {
+        let binding = rewrite_binding();
+        let root = tempfile::tempdir().expect("temporary root initializes");
+        let store = rewrite_store(root.path());
+        let expected = format!("{}/data/part.parquet", binding.object_prefix);
+        let actual = RewritePathContract::Staging { binding: &binding }
+            .object_key(&store, &expected)
+            .expect("binding-owned staging key validates");
+        assert_eq!(actual, expected);
+    }
+
+    /// Proves live measurement converts a valid catalog URI to its object key.
+    #[test]
+    fn rewrite_path_contract_normalizes_catalog_uri() {
+        let binding = rewrite_binding();
+        let root = tempfile::tempdir().expect("temporary root initializes");
+        let store = rewrite_store(root.path());
+        let location = format!("file:///{}", binding.object_prefix);
+        let catalog_path = format!("{location}/data/part.parquet");
+        let expected = format!("{}/data/part.parquet", binding.object_prefix);
+        let actual = RewritePathContract::Catalog {
+            binding: &binding,
+            table_location: &location,
+        }
+        .object_key(&store, &catalog_path)
+        .expect("binding-owned catalog URI validates");
+        assert_eq!(actual, expected);
+    }
+
+    /// Proves live measurement rejects a catalog URI outside the table root.
+    #[test]
+    fn rewrite_path_contract_rejects_foreign_catalog_uri() {
+        let binding = rewrite_binding();
+        let root = tempfile::tempdir().expect("temporary root initializes");
+        let store = rewrite_store(root.path());
+        let location = format!("file:///{}", binding.object_prefix);
+        let foreign = format!(
+            "file:///{}-foreign/data/part.parquet",
+            binding.object_prefix
+        );
+        assert!(
+            RewritePathContract::Catalog {
+                binding: &binding,
+                table_location: &location,
+            }
+            .object_key(&store, &foreign)
+            .is_err()
+        );
+    }
+
+    /// Proves malformed staging paths fail before object-store metadata IO.
+    #[test]
+    fn rewrite_path_contract_rejects_malformed_staging_path() {
+        let binding = rewrite_binding();
+        let root = tempfile::tempdir().expect("temporary root initializes");
+        let store = rewrite_store(root.path());
+        let malformed = format!("{}/../foreign/part.parquet", binding.object_prefix);
+        assert!(
+            RewritePathContract::Staging { binding: &binding }
+                .object_key(&store, &malformed)
+                .is_err()
+        );
+    }
 
     /// Records every typed operation, lease, volume, and stage boundary once.
     fn record_authoritative_boundaries(metrics: &ForgeMetrics) {

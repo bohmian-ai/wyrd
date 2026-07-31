@@ -158,6 +158,7 @@ cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_mult
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_peer_security_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_recovery_terminal_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- typed_vala_route_uses_oracle_cut --ignored --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- oracle_production_telemetry_contract --ignored --test-threads=1
 cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_telemetry --test-threads=1

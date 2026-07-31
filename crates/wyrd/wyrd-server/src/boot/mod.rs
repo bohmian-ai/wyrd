@@ -595,14 +595,15 @@ pub async fn build_state(
 
     let state = attach_config_fields(state, config, shutdown, telemetry)?;
     let state = install_auth(state, config, &signing_key, sealing_key.clone()).await?;
-    let state = build_oracle_role(
+    let state = OracleRoleBuilder {
         state,
         config,
-        &signing_key,
-        Arc::clone(&bifrost_parts.cluster_registry),
-        bifrost_parts.node_id,
-        &config.bifrost.oracle.advertise_addr,
-    )
+        signing_key: &signing_key,
+        cluster: Arc::clone(&bifrost_parts.cluster_registry),
+        node_id: bifrost_parts.node_id,
+        advertise_addr: &config.bifrost.oracle.advertise_addr,
+    }
+    .build()
     .await?;
     let verifier = state
         .auth
@@ -786,209 +787,238 @@ async fn install_auth(
 /// Returns [`ServerBootError::OraclePeer`] when the sentinel, signing key,
 /// memory owner, Redux storage adapter, role registration, or snapshot refresh
 /// is unavailable. No peer service is attached on partial construction.
-async fn build_oracle_role(
+/// Owns Oracle construction, activation, publication, and rollback for one boot.
+///
+/// All dependencies are retained by this owner until activation succeeds, so
+/// every partial failure follows the same fenced-role cleanup path.
+struct OracleRoleBuilder<'a> {
+    /// Server state containing SQL, auth, storage, and memory owners.
     state: AppState,
-    config: &crate::config::WyrdServerConfig,
-    signing_key: &SecretString,
+    /// Validated server configuration borrowed for this activation.
+    config: &'a crate::config::WyrdServerConfig,
+    /// Server signing authority used by peer tickets.
+    signing_key: &'a SecretString,
+    /// Cluster registry owning the role fence and readiness publication.
     cluster: Arc<ClusterRegistry>,
+    /// Stable node identity advertised to peer services.
     node_id: ClusterNodeId,
-    advertise_addr: &str,
-) -> Result<AppState, ServerBootError> {
-    if !config.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
-        return Ok(state);
-    }
-    let security_audit = Arc::new(
-        PostgresPeerSecurityAudit::try_new(&state.postgres)
-            .await
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
-    let authority = Arc::new(
-        OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
-            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
-    );
-    let memory = state.bifrost_memory.clone().ok_or_else(|| {
-        ServerBootError::OraclePeer("shared Bifrost memory governor is absent".to_owned())
-    })?;
-    let catalog = state
-        .bifrost_redux
-        .as_ref()
-        .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
-    let configured_cpu = config.bifrost.oracle.cpu_cores;
-    let cpu_cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let cpu_cores = u32::try_from(cpu_cores)
-        .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
-    let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
-    let memory_budget = config
-        .bifrost
-        .oracle
-        .memory_limit_bytes
-        .unwrap_or_else(|| memory.bifrost_limit_bytes());
-    let memory_budget_bytes = u64::try_from(memory_budget)
-        .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
-    let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
-    let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
-        .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
-    let capabilities = OracleCapabilitiesV1 {
-        peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
-            .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
-        storage_protocol_version: 1,
-        cpu_cores: configured_cpu,
-        memory_budget_bytes,
-        cpu_cores_per_slot: 1.0,
-        memory_bytes_per_slot,
-        raw_slots,
-        usable_slots: raw_slots,
-        supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
-        max_workers_per_query: u32::try_from(config.bifrost.oracle.max_workers_per_query)
-            .map_err(|_| ServerBootError::OraclePeer("worker fanout exceeds u32".to_owned()))?,
-    };
-    let running_slots = usize::try_from(raw_slots)
-        .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned()))?;
-    let slots = Arc::new(OracleSlotManager::new(
-        config.bifrost.oracle.admission_waiters,
-        running_slots,
-    ));
-    let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
-    let addresses = cluster
-        .snapshot()
-        .live_oracles()
-        .into_iter()
-        .map(|lease| (lease.key.node_id, lease.address.clone()))
-        .collect::<HashMap<_, _>>();
-    let peer_credentials =
-        Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
-    let initial_bearer = peer_credentials
-        .initialize()
-        .await
-        .map_err(ServerBootError::OraclePeer)?;
-    let verifier = state
-        .auth
-        .token_verifier
-        .as_ref()
-        .ok_or_else(|| ServerBootError::OraclePeer("auth backend not configured".to_owned()))?;
-    let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
-    let bearer = format!("Bearer {initial_bearer}").parse().map_err(|_| {
-        ServerBootError::OraclePeer("Oracle peer access token is invalid".to_owned())
-    })?;
-    metadata.insert("x-wyrd-access-token", bearer);
-    let authenticated = vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), &metadata)
-        .await
-        .map_err(|_| {
-            ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
+    /// Bound endpoint published in cluster membership.
+    advertise_addr: &'a str,
+}
+
+impl<'a> OracleRoleBuilder<'a> {
+    /// Builds, reconciles, activates, and publishes one Oracle role.
+    ///
+    /// # Errors
+    /// Returns [`ServerBootError::OraclePeer`] when any security, dependency,
+    /// durable-role, reconciliation, activation, or publication stage fails.
+    async fn build(self) -> Result<AppState, ServerBootError> {
+        let Self {
+            state,
+            config,
+            signing_key,
+            cluster,
+            node_id,
+            advertise_addr,
+        } = self;
+        if !config.bifrost.roles.contains(&BifrostRuntimeRole::Oracle) {
+            return Ok(state);
+        }
+        let security_audit = Arc::new(
+            PostgresPeerSecurityAudit::try_new(&state.postgres)
+                .await
+                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+        );
+        let authority = Arc::new(
+            OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
+                .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+        );
+        let memory = state.bifrost_memory.clone().ok_or_else(|| {
+            ServerBootError::OraclePeer("shared Bifrost memory governor is absent".to_owned())
         })?;
-    if !matches!(authenticated.principal.kind, PrincipalKind::Service { .. })
-        || authenticated.principal.tenant_id != DataTenantId::SYSTEM_OWNER
-        || !authenticated
-            .principal
-            .effective_permissions
-            .contains(&Permission::bifrost_oracle_peer_invoke())
-    {
-        return Err(ServerBootError::OraclePeer(
-            "Oracle peer credential lacks platform service authority".to_owned(),
+        let catalog = state
+            .bifrost_redux
+            .as_ref()
+            .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
+        let configured_cpu = config.bifrost.oracle.cpu_cores;
+        let cpu_cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        let cpu_cores = u32::try_from(cpu_cores)
+            .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
+        let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
+        let memory_budget = config
+            .bifrost
+            .oracle
+            .memory_limit_bytes
+            .unwrap_or_else(|| memory.bifrost_limit_bytes());
+        let memory_budget_bytes = u64::try_from(memory_budget)
+            .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
+        let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
+        let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
+            .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
+        let capabilities = OracleCapabilitiesV1 {
+            peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
+                .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
+            storage_protocol_version: 1,
+            cpu_cores: configured_cpu,
+            memory_budget_bytes,
+            cpu_cores_per_slot: 1.0,
+            memory_bytes_per_slot,
+            raw_slots,
+            usable_slots: raw_slots,
+            supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+            max_workers_per_query: u32::try_from(config.bifrost.oracle.max_workers_per_query)
+                .map_err(|_| ServerBootError::OraclePeer("worker fanout exceeds u32".to_owned()))?,
+        };
+        let running_slots = usize::try_from(raw_slots).map_err(|_| {
+            ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned())
+        })?;
+        let slots = Arc::new(OracleSlotManager::new(
+            config.bifrost.oracle.admission_waiters,
+            running_slots,
         ));
-    }
-    let remote_transport = Arc::new(TonicOraclePeerTransport::with_credentials(
-        addresses,
-        peer_credentials,
-    ));
-    let reconciliation_limit_bytes = memory_budget
-        .checked_div(4)
-        .filter(|limit| *limit > 0)
-        .ok_or_else(|| {
-            ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
+        let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
+        let addresses = cluster
+            .snapshot()
+            .live_oracles()
+            .into_iter()
+            .map(|lease| (lease.key.node_id, lease.address.clone()))
+            .collect::<HashMap<_, _>>();
+        let peer_credentials =
+            Arc::new(ServerOraclePeerCredentials::from_env().map_err(ServerBootError::OraclePeer)?);
+        let initial_bearer = peer_credentials
+            .initialize()
+            .await
+            .map_err(ServerBootError::OraclePeer)?;
+        let verifier =
+            state.auth.token_verifier.as_ref().ok_or_else(|| {
+                ServerBootError::OraclePeer("auth backend not configured".to_owned())
+            })?;
+        let mut metadata = wyrd_tonic::tonic::metadata::MetadataMap::new();
+        let bearer = format!("Bearer {initial_bearer}").parse().map_err(|_| {
+            ServerBootError::OraclePeer("Oracle peer access token is invalid".to_owned())
         })?;
-    let audit = Arc::new(ServerOracleAudit::new(state.postgres.vala().clone()));
-    let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> = authority.clone();
-    let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> = authority;
-    let role = cluster
-        .reserve_oracle(advertise_addr, capabilities)
-        .await
-        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
-    let worker = Arc::new(OraclePeerWorker::new(
-        node_id,
-        role.fencing_token,
-        verifier,
-        security_audit.clone(),
-        reservations,
-        SealedFragmentExecutor::with_memory_governor(catalog.file_io(), memory.clone()),
-    ));
-    let peer = Arc::new(OraclePeerRuntime::new(
-        Arc::clone(&worker),
-        Arc::clone(&security_audit),
-        Arc::clone(&cluster),
-    ));
-    let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
-    let peer_transports =
-        OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
-    let oracle = match Oracle::new(OracleBuildConfig {
-        catalog: Arc::clone(catalog),
-        vala: state.postgres.vala().clone(),
-        admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases::new(
-            state.postgres.vala().clone(),
-        ),
-        operator_pool: state
-            .postgres
-            .operator_pool()
-            .ok_or_else(|| ServerBootError::OraclePeer("operator pool unavailable".to_owned()))?,
-        cluster: Arc::clone(&cluster),
-        local_role: role.clone(),
-        local_slots: slots,
-        memory: OracleMemoryResources {
-            governor: memory,
-            reconciliation_limit_bytes,
-        },
-        tails: Arc::new(TailTransportDirectory::default()),
-        audit,
-        peer_ticket_minter,
-        peer_transports: Some(peer_transports),
-        config: OracleConfig {
-            planning_permits: config.bifrost.oracle.planning_permits,
-            max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
-            attempt_max_bytes: config.bifrost.oracle.max_frame_bytes,
-            attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
-            ..OracleConfig::default()
-        },
-    }) {
-        Ok(oracle) => Arc::new(oracle),
-        Err(error) => {
-            release_failed_oracle_role(&cluster, &role, "construction").await;
-            return Err(ServerBootError::OraclePeer(error.to_string()));
-        }
-    };
-    match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
-            return Err(ServerBootError::OraclePeer(error.to_string()));
-        }
-        Err(_) => {
-            oracle.shutdown(std::time::Instant::now()).await;
-            release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
+        metadata.insert("x-wyrd-access-token", bearer);
+        let authenticated =
+            vala_bifrost_redux::gate::auth::authenticate(verifier.as_ref(), &metadata)
+                .await
+                .map_err(|_| {
+                    ServerBootError::OraclePeer("Oracle peer access token was rejected".to_owned())
+                })?;
+        if !matches!(authenticated.principal.kind, PrincipalKind::Service { .. })
+            || authenticated.principal.tenant_id != DataTenantId::SYSTEM_OWNER
+            || !authenticated
+                .principal
+                .effective_permissions
+                .contains(&Permission::bifrost_oracle_peer_invoke())
+        {
             return Err(ServerBootError::OraclePeer(
-                "Oracle startup admission reconciliation timed out".to_owned(),
+                "Oracle peer credential lacks platform service authority".to_owned(),
             ));
         }
-    }
-    if let Err(error) = cluster.activate(&role).await {
-        oracle.shutdown(std::time::Instant::now()).await;
-        release_failed_oracle_role(&cluster, &role, "activation").await;
-        return Err(ServerBootError::OraclePeer(error.to_string()));
-    }
-    if let Err(error) = cluster.refresh_snapshot().await {
-        oracle.shutdown(std::time::Instant::now()).await;
-        release_failed_oracle_role(&cluster, &role, "snapshot refresh").await;
-        return Err(ServerBootError::OraclePeer(error.to_string()));
-    }
-    if !oracle.is_ready() {
-        oracle.shutdown(std::time::Instant::now()).await;
-        release_failed_oracle_role(&cluster, &role, "readiness publication").await;
-        return Err(ServerBootError::OraclePeer(
-            "Oracle role did not become ready after activation".to_owned(),
+        let remote_transport = Arc::new(TonicOraclePeerTransport::with_credentials(
+            addresses,
+            peer_credentials,
         ));
+        let reconciliation_limit_bytes = memory_budget
+            .checked_div(4)
+            .filter(|limit| *limit > 0)
+            .ok_or_else(|| {
+                ServerBootError::OraclePeer("Oracle reconciliation budget is zero".to_owned())
+            })?;
+        let audit = Arc::new(ServerOracleAudit::new(state.postgres.vala().clone()));
+        let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> =
+            authority.clone();
+        let peer_ticket_minter: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketMinter> =
+            authority;
+        let role = cluster
+            .reserve_oracle(advertise_addr, capabilities)
+            .await
+            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
+        let worker = Arc::new(OraclePeerWorker::new(
+            node_id,
+            role.fencing_token,
+            verifier,
+            security_audit.clone(),
+            reservations,
+            SealedFragmentExecutor::with_memory_governor(catalog.file_io(), memory.clone()),
+        ));
+        let peer = Arc::new(OraclePeerRuntime::new(
+            Arc::clone(&worker),
+            Arc::clone(&security_audit),
+            Arc::clone(&cluster),
+        ));
+        let local_transport = Arc::new(LocalOraclePeerTransport::new(worker));
+        let peer_transports =
+            OraclePeerTransportDirectory::new(node_id, local_transport, remote_transport);
+        let oracle = match Oracle::new(OracleBuildConfig {
+            catalog: Arc::clone(catalog),
+            vala: state.postgres.vala().clone(),
+            admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases::new(
+                state.postgres.vala().clone(),
+            ),
+            operator_pool: state.postgres.operator_pool().ok_or_else(|| {
+                ServerBootError::OraclePeer("operator pool unavailable".to_owned())
+            })?,
+            cluster: Arc::clone(&cluster),
+            local_role: role.clone(),
+            local_slots: slots,
+            memory: OracleMemoryResources {
+                governor: memory,
+                reconciliation_limit_bytes,
+            },
+            tails: Arc::new(TailTransportDirectory::default()),
+            audit,
+            peer_ticket_minter,
+            peer_transports: Some(peer_transports),
+            config: OracleConfig {
+                planning_permits: config.bifrost.oracle.planning_permits,
+                max_workers_per_query: config.bifrost.oracle.max_workers_per_query,
+                attempt_max_bytes: config.bifrost.oracle.max_frame_bytes,
+                attempt_memory_bytes: config.bifrost.oracle.max_frame_bytes.min(8 * 1024 * 1024),
+                ..OracleConfig::default()
+            },
+        }) {
+            Ok(oracle) => Arc::new(oracle),
+            Err(error) => {
+                release_failed_oracle_role(&cluster, &role, "construction").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+        };
+        match tokio::time::timeout(ORACLE_STARTUP_TIMEOUT, oracle.await_startup()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
+                return Err(ServerBootError::OraclePeer(error.to_string()));
+            }
+            Err(_) => {
+                oracle.shutdown(std::time::Instant::now()).await;
+                release_failed_oracle_role(&cluster, &role, "startup reconciliation").await;
+                return Err(ServerBootError::OraclePeer(
+                    "Oracle startup admission reconciliation timed out".to_owned(),
+                ));
+            }
+        }
+        if let Err(error) = cluster.activate(&role).await {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "activation").await;
+            return Err(ServerBootError::OraclePeer(error.to_string()));
+        }
+        if let Err(error) = cluster.refresh_snapshot().await {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "snapshot refresh").await;
+            return Err(ServerBootError::OraclePeer(error.to_string()));
+        }
+        if !oracle.is_ready() {
+            oracle.shutdown(std::time::Instant::now()).await;
+            release_failed_oracle_role(&cluster, &role, "readiness publication").await;
+            return Err(ServerBootError::OraclePeer(
+                "Oracle role did not become ready after activation".to_owned(),
+            ));
+        }
+        let query_runtime = Arc::new(BifrostQueryRuntime::new(oracle, role, peer, cluster, None));
+        Ok(state.with_bifrost_query(query_runtime))
     }
-    let query_runtime = Arc::new(BifrostQueryRuntime::new(oracle, role, peer, cluster, None));
-    Ok(state.with_bifrost_query(query_runtime))
 }
 
 /// Attaches one production-shaped local Oracle runtime to test-tier state.
@@ -1054,14 +1084,15 @@ pub async fn attach_test_oracle_runtime_for_node_at(
     let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
-    build_oracle_role(
+    OracleRoleBuilder {
         state,
-        &config,
-        &signing_key,
+        config: &config,
+        signing_key: &signing_key,
         cluster,
         node_id,
-        &advertise_addr,
-    )
+        advertise_addr: &advertise_addr,
+    }
+    .build()
     .await
 }
 
@@ -1545,14 +1576,15 @@ mod pg_tests {
                 .signing_key
                 .as_ref()
                 .expect("test config retains signing key");
-            let state = build_oracle_role(
+            let state = OracleRoleBuilder {
                 state,
-                &config,
+                config: &config,
                 signing_key,
-                Arc::clone(&cluster),
+                cluster: Arc::clone(&cluster),
                 node_id,
-                "127.0.0.1:9443",
-            )
+                advertise_addr: "127.0.0.1:9443",
+            }
+            .build()
             .await
             .expect("verified Oracle peer boot");
 
@@ -1602,14 +1634,15 @@ mod pg_tests {
             let state = install_auth(state, &config, signing_key, None)
                 .await
                 .expect("test auth");
-            let state = build_oracle_role(
+            let state = OracleRoleBuilder {
                 state,
-                &config,
+                config: &config,
                 signing_key,
-                Arc::clone(&cluster),
+                cluster: Arc::clone(&cluster),
                 node_id,
-                "127.0.0.1:9443",
-            )
+                advertise_addr: "127.0.0.1:9443",
+            }
+            .build()
             .await
             .expect("Oracle role");
             let query = Arc::clone(state.bifrost_query().expect("query runtime"));

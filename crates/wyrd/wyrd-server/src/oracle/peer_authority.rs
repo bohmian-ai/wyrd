@@ -43,6 +43,8 @@ pub struct OraclePeerAuthority {
 }
 
 impl fmt::Debug for OraclePeerAuthority {
+    /// Formats only the public key identifier; private, replay, and audit
+    /// state is intentionally excluded from diagnostics and signing logs.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("OraclePeerAuthority")
@@ -318,6 +320,10 @@ impl PeerTicketMinter for OraclePeerAuthority {
     }
 }
 
+/// Builds the stable domain-separated signing preimage.
+///
+/// The byte order is fixed as `DOMAIN || key_id || protobuf claims`; changing
+/// it invalidates every issued peer ticket and must therefore be versioned.
 fn signing_input(key_id: &str, claims: &[u8]) -> Vec<u8> {
     [DOMAIN, key_id.as_bytes(), claims].concat()
 }

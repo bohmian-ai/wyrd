@@ -34,6 +34,7 @@ use sha2::{Digest as _, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use vala_sql::ValaPostgres;
 use vala_sql::row_types::oracle_admission::{
     AdmissionAcquire, AdmissionReconcileScope, AdmissionRequest, LeaseMutation, RoleFence,
@@ -65,6 +66,8 @@ mod exec;
 pub mod executor;
 pub mod fragment;
 pub mod peer;
+mod planner;
+mod query_stream;
 pub mod telemetry;
 
 use exec::{HotFileSource, OracleTableInputs, OracleTableProvider};
@@ -1300,11 +1303,12 @@ impl Oracle {
         self.planner.validate_query(request)
     }
 
-    /// Resolves one tenant-qualified published table into a typed-plan `DataFrame`.
+    /// Resolves one tenant-qualified table into a schema-only typed-plan
+    /// `DataFrame`.
     ///
-    /// This keeps catalog provider and `DataFusion` session construction inside
-    /// retained Oracle. Server adapters may add bound expressions to the
-    /// returned frame, but cannot bypass Oracle for source resolution.
+    /// The returned logical plan carries no executable provider. Oracle installs
+    /// the authenticated immutable-cut provider during [`Self::query_plan`],
+    /// after audit and visibility decisions are committed.
     ///
     /// # Errors
     ///
@@ -1323,24 +1327,33 @@ impl Oracle {
             .ok_or(BifrostError::QueryExecutionFailed)?;
         let table = TableRef::new(namespace, name);
         let session = SessionContext::new();
-        let provider: Arc<dyn TableProvider> = match self
-            .catalog
-            .provider_with_hot_batches(&table, tenant, Vec::new())
-            .await
-        {
-            Ok(provider) => Arc::new(provider),
+        // Typed plans are schema-only authoring artifacts. The executable
+        // Oracle provider is installed later by `query_plan` after it freezes
+        // a tenant-bound visibility cut and commits its read decision.
+        let schema: Arc<Schema> = match self.catalog.pin_sealed_table(&table, tenant).await {
+            Ok(cut) => Arc::new(
+                iceberg::arrow::schema_to_arrow_schema(
+                    cut.iceberg_table.metadata().current_schema(),
+                )
+                .map_err(|_| BifrostError::QueryExecutionFailed)?,
+            ),
             Err(BifrostCatalogError::TableNotFound(_)) => {
                 let definition = crate::tables::builtin_table(namespace.as_str(), name)
                     .ok_or(BifrostError::QueryExecutionFailed)?;
-                Arc::new(
-                    MemTable::try_new((definition.schema)(), vec![vec![]])
-                        .map_err(|error| map_datafusion_error(&error))?,
-                )
+                (definition.schema)()
             }
             Err(error) => return Err(error.into_public()),
         };
+        let public_fields = schema
+            .fields()
+            .iter()
+            .filter(|field| field.name() != "data_tenant_id")
+            .cloned()
+            .collect::<Vec<_>>();
+        let provider = MemTable::try_new(Arc::new(Schema::new(public_fields)), vec![Vec::new()])
+            .map_err(|error| map_datafusion_error(&error))?;
         session
-            .register_table(TableReference::bare(fqn), provider)
+            .register_table(TableReference::bare(fqn), Arc::new(provider))
             .map_err(|error| map_datafusion_error(&error))?;
         session
             .table(TableReference::bare(fqn))
@@ -1384,7 +1397,7 @@ impl Oracle {
         let mut query_telemetry = None;
         for retry_ordinal in 0_u8..=1 {
             let planned = self
-                .pin_and_classify(&context, &request.sql, &tables, deadline)
+                .plan_sql_attempt(&context, &request.sql, &tables, deadline)
                 .await?;
             let query_class = planned.query_class;
             if query_telemetry.is_none() {
@@ -1450,7 +1463,7 @@ impl Oracle {
                     let query_telemetry = query_telemetry
                         .take()
                         .ok_or(BifrostError::QueryExecutionFailed)?;
-                    return build_query_stream(QueryStreamInput {
+                    return OracleQueryStream::new(QueryStreamInput {
                         schema,
                         batches,
                         first,
@@ -1468,62 +1481,24 @@ impl Oracle {
         Err(BifrostError::QueryExecutionFailed)
     }
 
-    /// Pins table metadata and derives the immutable class for one retry attempt.
-    ///
-    /// # Errors
-    ///
-    /// Returns timeout, catalog, planning, or byte-accounting failures.
-    async fn pin_and_classify(
+    /// Delegates one SQL metadata attempt to the planner owner.
+    async fn plan_sql_attempt(
         &self,
         context: &AuthorizedQueryContext,
         sql: &str,
         tables: &[TableRef],
         deadline: Instant,
     ) -> Result<PlannedSqlCut, BifrostError> {
-        let planning = self.planner.try_planning()?;
-        let mut cuts = Vec::with_capacity(tables.len());
-        let mut estimated_bytes = 0_u64;
-        for table in tables {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or(BifrostError::QueryTimeout)?;
-            let cut = tokio::time::timeout(
-                remaining,
-                self.catalog.pin_sealed_table(table, context.data_tenant_id),
+        self.planner
+            .pin_and_classify(
+                context,
+                sql,
+                tables,
+                deadline,
+                &self.catalog,
+                &self.admission.cluster,
             )
             .await
-            .map_err(|_| BifrostError::QueryTimeout)?
-            .map_err(BifrostCatalogError::into_public)?;
-            estimated_bytes = estimated_bytes
-                .checked_add(cut.estimated_bytes)
-                .ok_or(BifrostError::QueryAdmissionRejected)?;
-            cuts.push(cut);
-        }
-        let optimized_plan = self.prepare_optimized_sql_plan(sql, &cuts).await?;
-        let live_cpu = self
-            .admission
-            .cluster
-            .snapshot()
-            .live_oracles()
-            .iter()
-            .filter_map(|role| match &role.capabilities {
-                ClusterCapabilities::OracleV1(capabilities) => Some(capabilities.cpu_cores),
-                ClusterCapabilities::ScribeV1(_) => None,
-            })
-            .sum::<f64>();
-        let classification = OraclePlanner::classification(
-            estimated_bytes,
-            live_cpu,
-            optimized_plan_is_complex(&optimized_plan),
-        );
-        tracing::Span::current()
-            .record("query_class", query_class_label(classification.query_class));
-        OracleTelemetry::record_classification(classification);
-        drop(planning);
-        Ok(PlannedSqlCut {
-            cuts,
-            query_class: classification.query_class,
-        })
     }
 
     /// Acquires live fences, commits the read decision, and drains authorized tails.
@@ -1655,26 +1630,65 @@ impl Oracle {
                 self.shutdown.child_token(),
             )
             .await?;
+        self.execute_typed_plan(&context, plan, options, class, query_telemetry, admitted)
+            .await
+    }
+
+    /// Installs immutable-cut providers and executes one typed plan.
+    ///
+    /// # Errors
+    /// Returns typed timeout, audit, visibility, reconciliation, or execution
+    /// failures and releases admission state through the returned stream owner.
+    async fn execute_typed_plan(
+        &self,
+        context: &AuthorizedQueryContext,
+        plan: datafusion::logical_expr::LogicalPlan,
+        options: QueryOptions,
+        class: QueryClass,
+        query_telemetry: QueryTelemetryGuard,
+        mut admitted: AdmittedQueryGuard,
+    ) -> Result<OracleQueryStream, BifrostError> {
+        let table_refs = collect_plan_table_refs(&plan)?;
+        let mut cuts = Vec::with_capacity(table_refs.len());
+        for table in &table_refs {
+            let remaining = options
+                .deadline
+                .checked_duration_since(Instant::now())
+                .ok_or(BifrostError::QueryTimeout)?;
+            cuts.push(
+                tokio::time::timeout(
+                    remaining,
+                    self.catalog.pin_sealed_table(table, context.data_tenant_id),
+                )
+                .await
+                .map_err(|_| BifrostError::QueryTimeout)?
+                .map_err(BifrostCatalogError::into_public)?,
+            );
+        }
         let remaining = options
             .deadline
             .checked_duration_since(Instant::now())
             .ok_or(BifrostError::QueryTimeout)?;
-        let _audit_span = tracing::info_span!(
+        let audit_span = tracing::info_span!(
             "bifrost.oracle.audit",
             audit_kind = "read_decision",
             query_class = query_class_label(class)
         );
         let audit_started = Instant::now();
-        let audit_result = tokio::time::timeout(
-            remaining,
-            self.audit.append_read_decision(
-                &context,
-                plan_read_decision(&context, &plan, options, class)?,
-            ),
-        )
-        .await
-        .map_err(|_| BifrostError::QueryTimeout)?
-        .map_err(|_| BifrostError::QueryAuditUnavailable);
+        let audit_result = async {
+            tokio::time::timeout(
+                remaining,
+                self.audit.append_read_decision(
+                    context,
+                    plan_read_decision(context, &plan, options, class, &cuts)?,
+                ),
+            )
+            .await
+            .map_err(|_| BifrostError::QueryTimeout)?
+            .map_err(|_| BifrostError::QueryAuditUnavailable)
+        }
+        .instrument(audit_span)
+        .await;
         metrics::histogram!(
             "bifrost_oracle_audit_seconds",
             "audit_kind" => "read_decision",
@@ -1682,18 +1696,32 @@ impl Oracle {
         )
         .record(audit_started.elapsed().as_secs_f64());
         audit_result?;
-        let _plan_span = tracing::info_span!("bifrost.oracle.plan", plan_kind = "typed");
+        let mut drained = DrainedTails::default();
+        if options.visibility == VisibilityMode::Fused {
+            let fence_owner = TailFenceDrainer::new(
+                &self.tails,
+                &self.memory,
+                Arc::clone(&self.telemetry),
+                class,
+                options.deadline,
+                admitted.cancellation.clone(),
+                wyrd_spec::vala::api::FreshnessPolicy::Strict,
+            );
+            let fences = fence_owner.acquire(&cuts).await?;
+            drained = fence_owner.drain(fences).await?;
+        }
+        admitted.live_reservations = std::mem::take(&mut drained.reservations);
+        let providers = self
+            .build_typed_providers(context, class, cuts, &mut drained)
+            .await?;
+        let rewritten = rewrite_typed_plan(plan, &providers)?;
         let session = SessionContext::new();
         let physical = session
             .state()
-            .create_physical_plan(&plan)
+            .create_physical_plan(&rewritten)
             .await
             .map_err(|error| map_datafusion_error(&error))?;
         let schema = physical.schema();
-        let _source_span = tracing::info_span!(
-            "bifrost.oracle.source",
-            query_class = query_class_label(class)
-        );
         let mut batches = execute_stream(physical, session.task_ctx())
             .map_err(|error| map_datafusion_error(&error))?;
         let remaining = options
@@ -1703,7 +1731,7 @@ impl Oracle {
         let first = tokio::time::timeout(remaining, batches.next())
             .await
             .map_err(|_| BifrostError::QueryTimeout)?;
-        build_query_stream(QueryStreamInput {
+        OracleQueryStream::new(QueryStreamInput {
             schema,
             batches,
             first,
@@ -1711,10 +1739,42 @@ impl Oracle {
             deadline: options.deadline,
             visibility: options.visibility,
             query_class: class,
-            degraded: false,
+            degraded: drained.degraded,
             stale_replanned: false,
             query_telemetry,
         })
+    }
+
+    /// Builds one executable Oracle provider for each authenticated table cut.
+    async fn build_typed_providers(
+        &self,
+        context: &AuthorizedQueryContext,
+        class: QueryClass,
+        cuts: Vec<PinnedSealedTable>,
+        drained: &mut DrainedTails,
+    ) -> Result<HashMap<String, Arc<dyn TableProvider>>, BifrostError> {
+        let mut providers = HashMap::with_capacity(cuts.len());
+        for cut in cuts {
+            let table_name = cut.binding.table_ref.fqn();
+            let hot_files = self.local_hot_sources(&cut)?;
+            let provider = OracleTableProvider::try_new(OracleTableInputs {
+                table: cut.iceberg_table,
+                distributed_iceberg_batches: None,
+                hot_files,
+                distributed_hot_batches: Vec::new(),
+                live_batches: drained.batches.remove(&table_name).unwrap_or_default(),
+                context: context.clone(),
+                table_name: table_name.clone(),
+                audit: Arc::clone(&self.audit),
+                memory: self.memory.clone(),
+                telemetry: Arc::clone(&self.telemetry),
+                query_class: class,
+            })
+            .await
+            .map_err(|error| map_datafusion_error(&error))?;
+            providers.insert(table_name, Arc::new(provider) as Arc<dyn TableProvider>);
+        }
+        Ok(providers)
     }
 
     /// Returns whether startup reconciliation completed and queries may enter admission.
@@ -2103,56 +2163,6 @@ impl Oracle {
             fences,
             context: dispatch_context,
         })
-    }
-
-    /// Lowers and optimizes SQL against schema-only pinned table providers.
-    ///
-    /// This classification plan cannot read source rows: every registered
-    /// provider is an empty in-memory table carrying only the public schema
-    /// from the already pinned Iceberg metadata. The actual provider union is
-    /// built only after admission, fence finalization, and audit commit.
-    ///
-    /// # Errors
-    ///
-    /// Returns a stable planning failure when schema projection, registration,
-    /// SQL lowering, or logical optimization fails.
-    #[tracing::instrument(
-        name = "bifrost.oracle.plan",
-        skip_all,
-        fields(table_count = cuts.len())
-    )]
-    async fn prepare_optimized_sql_plan(
-        &self,
-        sql: &str,
-        cuts: &[PinnedSealedTable],
-    ) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
-        let session = SessionContext::new();
-        for cut in cuts {
-            let physical = iceberg::arrow::schema_to_arrow_schema(
-                cut.iceberg_table.metadata().current_schema(),
-            )
-            .map_err(|_| BifrostError::QueryExecutionFailed)?;
-            let fields = physical
-                .fields()
-                .iter()
-                .filter(|field| field.name() != "data_tenant_id")
-                .cloned()
-                .collect::<Vec<_>>();
-            let public = Arc::new(Schema::new(fields));
-            let provider = MemTable::try_new(public, vec![Vec::new()])
-                .map_err(|error| map_datafusion_error(&error))?;
-            register_session_table(
-                &session,
-                &cut.binding,
-                Arc::new(provider) as Arc<dyn TableProvider>,
-            )?;
-        }
-        session
-            .sql(sql)
-            .await
-            .map_err(|error| map_datafusion_error(&error))?
-            .into_optimized_plan()
-            .map_err(|error| map_datafusion_error(&error))
     }
 }
 
@@ -3849,6 +3859,7 @@ fn plan_read_decision(
     plan: &datafusion::logical_expr::LogicalPlan,
     options: QueryOptions,
     query_class: QueryClass,
+    cuts: &[PinnedSealedTable],
 ) -> Result<BifrostQueryReadDecision, BifrostError> {
     let plan_text = plan.display_indent().to_string();
     let mut binding_digests = Vec::new();
@@ -3869,14 +3880,17 @@ fn plan_read_decision(
             .max(1),
     )
     .map_err(|_| BifrostError::QueryAuditUnavailable)?;
-    let empty = audit_digest("typed-plan:no-sealed-source-summary")?;
+    let snapshot_digest =
+        aggregate_audit_digest(cuts.iter().map(|cut| cut.snapshot_digest.as_str()))?;
+    let manifest_digest =
+        aggregate_audit_digest(cuts.iter().map(|cut| cut.hot_manifest_digest.as_str()))?;
     BifrostQueryReadDecision::try_new(AuditDetail::BifrostQueryReadDecision {
         query_digest: audit_digest(&plan_text)?,
         query_class,
         visibility: options.visibility,
         binding_digests,
-        snapshot_digest: empty.clone(),
-        manifest_digest: empty,
+        snapshot_digest,
+        manifest_digest,
         projection_digest: audit_digest(&plan_text)?,
         permission_digest: audit_digest(&context.permission)?,
         execution: QueryExecutionMode::Local,
@@ -3904,6 +3918,75 @@ fn collect_plan_binding_digests(
         collect_plan_binding_digests(input, output)?;
     }
     Ok(())
+}
+
+/// Collects distinct logical table identities from a typed plan.
+///
+/// The identities are resolved again against the authenticated tenant when
+/// Oracle installs executable providers; plan-carried providers are never
+/// treated as authority for physical data access.
+///
+/// # Errors
+/// Returns invalid SQL when a scan is not a canonical Bifrost table reference.
+fn collect_plan_table_refs(
+    plan: &datafusion::logical_expr::LogicalPlan,
+) -> Result<Vec<TableRef>, BifrostError> {
+    /// Walks one logical-plan subtree and records canonical table identities.
+    fn visit(
+        plan: &datafusion::logical_expr::LogicalPlan,
+        refs: &mut Vec<TableRef>,
+    ) -> Result<(), BifrostError> {
+        if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = plan {
+            let name = scan.table_name.to_string();
+            let table = TableRef::parse_fqn(&name).ok_or(BifrostError::QueryInvalidSql {
+                detail: "typed query plan contains an invalid Bifrost table reference".to_owned(),
+            })?;
+            if !refs.contains(&table) {
+                refs.push(table);
+            }
+        }
+        for input in plan.inputs() {
+            visit(input, refs)?;
+        }
+        Ok(())
+    }
+    let mut refs = Vec::new();
+    visit(plan, &mut refs)?;
+    if refs.is_empty() {
+        return Err(BifrostError::QueryInvalidSql {
+            detail: "typed query plans must contain at least one table scan".to_owned(),
+        });
+    }
+    Ok(refs)
+}
+
+/// Replaces schema-only plan sources with providers owned by the Oracle cut.
+///
+/// # Errors
+/// Returns query execution failure when `DataFusion` cannot transform the plan.
+fn rewrite_typed_plan(
+    plan: datafusion::logical_expr::LogicalPlan,
+    providers: &HashMap<String, Arc<dyn TableProvider>>,
+) -> Result<datafusion::logical_expr::LogicalPlan, BifrostError> {
+    use datafusion::common::tree_node::{Transformed, TreeNode};
+    use datafusion::datasource::default_table_source::DefaultTableSource;
+
+    plan.transform(|node| {
+        let datafusion::logical_expr::LogicalPlan::TableScan(scan) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        let table_name = scan.table_name.to_string();
+        let Some(provider) = providers.get(&table_name) else {
+            return Ok(Transformed::no(node));
+        };
+        let mut replacement = scan.clone();
+        replacement.source = Arc::new(DefaultTableSource::new(Arc::clone(provider)));
+        Ok(Transformed::yes(
+            datafusion::logical_expr::LogicalPlan::TableScan(replacement),
+        ))
+    })
+    .map(|transformed| transformed.data)
+    .map_err(|error| map_datafusion_error(&error))
 }
 
 /// Classifies an optimized logical plan by its real global/heavy operators.
@@ -4062,108 +4145,6 @@ struct QueryStreamInput {
     stale_replanned: bool,
     /// Production query telemetry retained through terminal emission.
     query_telemetry: QueryTelemetryGuard,
-}
-
-/// Builds a terminal-aware stream around one already audited physical stream.
-///
-/// # Errors
-///
-/// Returns query execution failure when the output schema cannot be encoded.
-fn build_query_stream(input: QueryStreamInput) -> Result<OracleQueryStream, BifrostError> {
-    let QueryStreamInput {
-        schema,
-        batches,
-        first,
-        admitted,
-        deadline,
-        visibility,
-        query_class,
-        degraded,
-        stale_replanned,
-        mut query_telemetry,
-    } = input;
-    let schema_frame = encode_schema_frame(&schema)?;
-    let schema_fingerprint = schema_frame.schema_fingerprint.clone();
-    let lease_cancellation = admitted.cancellation.clone();
-    let renewal_terminal = Arc::clone(&admitted.renewal_terminal);
-    query_telemetry.start_stream();
-    let _stream_span = tracing::info_span!(
-        "bifrost.oracle.stream",
-        visibility = visibility_label(visibility),
-        query_class = query_class_label(query_class)
-    );
-    let frames = async_stream::stream! {
-        let _admitted = admitted;
-        let mut batches = batches;
-        let mut next = first;
-        let mut row_count = 0_u64;
-        yield Ok(QueryStreamFrame::Schema(schema_frame));
-        loop {
-            let event = if let Some(value) = next.take() {
-                QueryStreamEvent::Batch(Some(value))
-            } else {
-                next_query_stream_event(
-                    &mut batches,
-                    &lease_cancellation,
-                    &renewal_terminal,
-                    deadline,
-                )
-                .await
-            };
-            match event {
-                QueryStreamEvent::Batch(Some(Ok(batch))) => {
-                    query_telemetry.first_batch();
-                    row_count = row_count.saturating_add(batch.num_rows() as u64);
-                    match encode_batch_frame(&batch) {
-                        Ok(frame) => yield Ok(QueryStreamFrame::Batch(frame)),
-                        Err(_) => {
-                            query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                                QueryTerminalErrorCode::QueryExecutionFailed,
-                                row_count,
-                                visibility,
-                            )));
-                            return;
-                        }
-                    }
-                }
-                QueryStreamEvent::Batch(Some(Err(error))) => {
-                    let code = terminal_error_code(&error);
-                    tracing::error!(
-                        error = %error,
-                        error_code = terminal_error_label(code),
-                        "Oracle query stream execution failed"
-                    );
-                    query_telemetry.finish("failed", "complete");
-                    yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                        code,
-                        row_count,
-                        visibility,
-                    )));
-                    return;
-                }
-                QueryStreamEvent::Batch(None) => break,
-                QueryStreamEvent::Failed(code) => {
-                    query_telemetry.finish("failed", "complete");
-                    yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
-                        code, row_count, visibility,
-                    )));
-                    return;
-                }
-            }
-        }
-        let terminal = successful_terminal(visibility, degraded, stale_replanned, row_count);
-        debug_assert!(terminal.validate(visibility).is_ok());
-        query_telemetry.finish(
-            if degraded { "degraded" } else { "success" },
-            if degraded { "degraded" } else { "complete" },
-        );
-        yield Ok(QueryStreamFrame::Terminal(terminal));
-    };
-    Ok(OracleQueryStream {
-        schema_fingerprint,
-        frames: Box::pin(frames),
-    })
 }
 
 /// One cancellation-, timeout-, or batch-aware stream step.

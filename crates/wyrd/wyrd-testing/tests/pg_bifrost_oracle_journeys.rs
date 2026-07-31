@@ -34,6 +34,9 @@ use wyrd_spec::vala::api::{
 };
 use wyrd_testing::Bootstrap;
 use wyrd_testing::bifrost::{BifrostClusterSpec, WyrdTestCluster};
+use wyrd_tonic::tonic::Request;
+use wyrd_tonic::wyrd::v1::vala_query_service_client::ValaQueryServiceClient;
+use wyrd_tonic::wyrd::v1::{QueryTracesRequest, QueryWindow};
 
 type JourneyError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -408,6 +411,60 @@ async fn pg_bifrost_oracle_recovery_terminal_journey() {
         .expect("J7 admission cleanup");
     owner.close().await;
     cluster.shutdown().await.expect("J7 shutdown");
+}
+
+/// J-typed proves Vala's typed route enters the same Oracle cut as SQL.
+#[tokio::test]
+#[ignore = "requires the serialized Postgres-backed Oracle journey lane"]
+async fn typed_vala_route_uses_oracle_cut() {
+    let cluster = WyrdTestCluster::start_spec(BifrostClusterSpec::one_mixed())
+        .await
+        .expect("start Oracle journey cluster");
+    let server = cluster.server(0).expect("query server");
+    let reader = client(server, "typed-route-reader")
+        .await
+        .expect("typed-route client");
+    let connection = reader.connect_grpc().await.expect("gRPC endpoint connects");
+    let token = connection
+        .auth()
+        .bearer()
+        .await
+        .expect("reader bearer")
+        .expose()
+        .to_owned();
+    let channel = connection.channel();
+    let mut typed = ValaQueryServiceClient::new(channel);
+    let response = typed
+        .query_traces({
+            let mut request = Request::new(QueryTracesRequest {
+                window: Some(QueryWindow {
+                    since: String::new(),
+                    until: String::new(),
+                    limit: 100,
+                    page_token: String::new(),
+                }),
+                service: String::new(),
+                min_duration_ms: 0,
+                status: String::new(),
+                name: String::new(),
+            });
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("token"),
+            );
+            request
+        })
+        .await
+        .expect("typed Vala route succeeds");
+    assert!(response.into_inner().rows.is_empty());
+    let (rows, outcome, error) =
+        query_statement(&reader, "SELECT * FROM vala.traces.spans".to_owned())
+            .await
+            .expect("SQL Oracle cut succeeds");
+    assert_eq!(rows, 0);
+    assert_eq!(outcome, QueryTerminalOutcome::Success);
+    assert!(error.is_none());
+    cluster.shutdown().await.expect("shutdown cluster");
 }
 
 /// Assert production recorder labels and production-pipeline spans for a real query.

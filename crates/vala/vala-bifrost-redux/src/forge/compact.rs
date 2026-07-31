@@ -7,7 +7,7 @@
 //! Iceberg commits observable; the next Forge tick reconciles that state before
 //! selecting more files.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::metrics::ReconciliationGaugeObservation;
+use super::live_reconcile::DestructiveMaintenance;
 use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
@@ -94,6 +94,40 @@ pub struct ForgeConfig {
     pub max_open_operations_per_table: usize,
     /// Maximum retained snapshots traversed by one reconciliation observation.
     pub max_retained_snapshots_per_table: usize,
+}
+
+/// Bounded staging reconciliation evidence retained by one table pass.
+#[derive(Debug)]
+pub(crate) struct StagingReconciliationOutcome {
+    /// Prepared operations recovered into committed Iceberg state.
+    pub(crate) recovered: usize,
+    /// Prepared operations reset after absence was proven twice.
+    pub(crate) reset: usize,
+    /// Young prepared operations still inside the uncertainty bound.
+    pub(crate) pending: usize,
+    /// Prepared operations whose external outcome remains ambiguous.
+    pub(crate) unresolved: usize,
+    /// Whether any bounded group query exceeded the table cap.
+    pub(crate) overflowed: bool,
+    /// Validated prepared outputs that destructive maintenance must retain.
+    pub(crate) protected_output_paths: BTreeSet<String>,
+    /// Fail-closed destructive-maintenance disposition.
+    pub(crate) destructive_maintenance: DestructiveMaintenance,
+}
+
+impl Default for StagingReconciliationOutcome {
+    /// Starts one reconciliation pass in the allowed, empty state.
+    fn default() -> Self {
+        Self {
+            recovered: 0,
+            reset: 0,
+            pending: 0,
+            unresolved: 0,
+            overflowed: false,
+            protected_output_paths: BTreeSet::new(),
+            destructive_maintenance: DestructiveMaintenance::Allowed,
+        }
+    }
 }
 
 impl Default for ForgeConfig {
@@ -570,25 +604,31 @@ impl Forge {
         lease: &mut ForgeLease,
         table_key: &ForgeTableKey,
         binding: &TenantTableBinding,
-    ) -> Result<(usize, ReconciliationGaugeObservation), ForgeError> {
-        let now = self.core.clock.now()?;
-        let mut reconciled: usize = 0;
-        let mut prepared_operations = 0_usize;
+        stop: &CancellationToken,
+        now: DateTime<Utc>,
+    ) -> Result<StagingReconciliationOutcome, ForgeError> {
+        let mut outcome = StagingReconciliationOutcome::default();
         for key in self.load_reconciliation_keys().await? {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
-            prepared_operations = prepared_operations.saturating_add(1);
-            reconciled =
-                reconciled.saturating_add(self.reconcile_group(lease, &key, binding, now).await?);
+            if stop.is_cancelled() {
+                return Err(ForgeError::Shutdown);
+            }
+            let group = self.reconcile_group(lease, &key, binding, now).await?;
+            outcome.recovered = outcome.recovered.saturating_add(group.recovered);
+            outcome.reset = outcome.reset.saturating_add(group.reset);
+            outcome.pending = outcome.pending.saturating_add(group.pending);
+            outcome.unresolved = outcome.unresolved.saturating_add(group.unresolved);
+            outcome.overflowed |= group.overflowed;
+            outcome
+                .protected_output_paths
+                .extend(group.protected_output_paths);
         }
-        Ok((
-            reconciled,
-            ReconciliationGaugeObservation {
-                prepared_operations,
-                uncertain_operations: prepared_operations.saturating_sub(reconciled),
-            },
-        ))
+        if outcome.overflowed || outcome.pending > 0 || outcome.unresolved > 0 {
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
+        }
+        Ok(outcome)
     }
 
     /// Select, bin-pack, and commit bounded periodic compaction work.
@@ -1027,7 +1067,7 @@ impl Forge {
     }
 
     /// Load groups whose prepared SQL transition has no committed snapshot ID.
-    async fn load_reconciliation_keys(&self) -> Result<Vec<ForgeGroupKey>, ForgeError> {
+    pub(super) async fn load_reconciliation_keys(&self) -> Result<Vec<ForgeGroupKey>, ForgeError> {
         let rows = sqlx::query(
             r"SELECT DISTINCT data_tenant_id, namespace, table_name, partition_day
              FROM vala.file_list
@@ -1563,11 +1603,26 @@ impl Forge {
         key: &ForgeGroupKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
-    ) -> Result<usize, ForgeError> {
+    ) -> Result<StagingReconciliationOutcome, ForgeError> {
         let resource = key.audit_resource();
-        let latest = self.load_reconciliation_audits(key, &resource).await?;
-        let mut recovered: usize = 0;
-        for (_operation_id, (detail, created_at)) in latest {
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::StagingFold)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let mut outcome = StagingReconciliationOutcome {
+            overflowed: page.overflowed,
+            ..StagingReconciliationOutcome::default()
+        };
+        for row in page.operations {
+            let detail = row.prepared_detail;
             if !matches!(
                 &detail,
                 AuditDetail::ForgeCompaction {
@@ -1622,15 +1677,21 @@ impl Forge {
                     volume.output_files,
                     volume.output_bytes,
                 );
-                recovered = recovered.saturating_add(1);
+                outcome.recovered = outcome.recovered.saturating_add(1);
                 continue;
             }
             if now
-                .signed_duration_since(created_at)
+                .signed_duration_since(row.prepared_at)
                 .to_std()
                 .unwrap_or_default()
                 < self.core.config.uncertainty_bound
             {
+                outcome.pending = outcome.pending.saturating_add(1);
+                Self::protect_staging_outputs(
+                    binding,
+                    output_paths,
+                    &mut outcome.protected_output_paths,
+                )?;
                 continue;
             }
             let first_reload = self.load_table(&binding.table_ident()).await?;
@@ -1639,6 +1700,12 @@ impl Forge {
                 .await?
                 .is_some()
             {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                Self::protect_staging_outputs(
+                    binding,
+                    output_paths,
+                    &mut outcome.protected_output_paths,
+                )?;
                 continue;
             }
             let second_reload = self.load_table(&binding.table_ident()).await?;
@@ -1654,94 +1721,46 @@ impl Forge {
                 }
                 self.reset_reconciled(lease, key, input_file_ids, &detail)
                     .await?;
-                recovered = recovered.saturating_add(1);
+                outcome.reset = outcome.reset.saturating_add(1);
+            } else {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
+                Self::protect_staging_outputs(
+                    binding,
+                    output_paths,
+                    &mut outcome.protected_output_paths,
+                )?;
             }
         }
-        Ok(recovered)
-    }
-}
-
-/// Load the latest audit detail for each compaction operation in a group.
-impl Forge {
-    async fn load_reconciliation_audits(
-        &self,
-        key: &ForgeGroupKey,
-        resource: &str,
-    ) -> Result<HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, ForgeError> {
-        let mut after_seq = 0_i64;
-        let mut latest = HashMap::new();
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        loop {
-            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-                &mut conn,
-                resource,
-                after_seq,
-                self.core.config.audit_page_size,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-            let page_len = page.len();
-            for row in page {
-                after_seq = row.seq;
-                let Some(detail) = row.detail else { continue };
-                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?;
-                Self::validate_reconciliation_detail(&detail, resource)?;
-                let AuditDetail::ForgeCompaction { operation_id, .. } = &detail else {
-                    continue;
-                };
-                latest.insert(*operation_id, (detail, row.created_at));
-            }
-            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
-                break;
-            }
+        if outcome.overflowed || outcome.pending > 0 || outcome.unresolved > 0 {
+            outcome.destructive_maintenance = DestructiveMaintenance::Blocked;
         }
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok(latest)
+        Ok(outcome)
     }
 
-    /// Validate the identity and ordering fields needed for compaction recovery.
-    fn validate_reconciliation_detail(
-        detail: &AuditDetail,
-        resource: &str,
+    /// Adds duplicate-free, table-owned prepared outputs to destructive protection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ForgeError::Reconciliation`] when an audited output escapes the
+    /// physical table binding.
+    fn protect_staging_outputs(
+        binding: &TenantTableBinding,
+        output_paths: &[StoragePath],
+        protected: &mut BTreeSet<String>,
     ) -> Result<(), ForgeError> {
-        let AuditDetail::ForgeCompaction {
-            group,
-            input_file_ids,
-            input_paths,
-            output_paths,
-            ..
-        } = detail
-        else {
-            return Ok(());
-        };
-        if group != resource {
-            return Err(ForgeError::Reconciliation {
-                detail: "audit detail group differs from its resource".to_owned(),
-            });
-        }
-        if input_file_ids.len() < 2
-            || input_file_ids.len() != input_paths.len()
-            || input_file_ids.windows(2).any(|pair| pair[0] >= pair[1])
-            || output_paths.is_empty()
-            || output_paths.iter().any(|path| path.as_str().is_empty())
-            || output_paths.windows(2).any(|pair| pair[0] == pair[1])
-        {
-            return Err(ForgeError::Reconciliation {
-                detail: "audit detail does not contain sorted complete input identity".to_owned(),
-            });
+        for path in output_paths {
+            let normalized = binding.validate_object_path(path.as_str()).ok_or_else(|| {
+                ForgeError::Reconciliation {
+                    detail: format!("prepared staging output escaped table binding: {path:?}"),
+                }
+            })?;
+            protected.insert(normalized);
         }
         Ok(())
     }
+}
 
+impl Forge {
     /// Extract the group resource from a compaction audit detail.
     fn detail_group(detail: &AuditDetail) -> String {
         match detail {

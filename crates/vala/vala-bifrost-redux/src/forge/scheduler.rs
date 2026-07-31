@@ -310,17 +310,23 @@ impl Forge {
         let result = async {
             let mut outcome = ForgeTickOutcome::default();
             outcome.merge(takeover);
-            let (recovered, _) = self
+            let staging = self
                 .core
                 .metrics
                 .observe_stage(
                     ForgeMetricStage::ReconcileStaging,
-                    self.run_compaction_reconciliation_for_table(&mut lease, &table_key, &binding),
+                    self.run_compaction_reconciliation_for_table(
+                        &mut lease, &table_key, &binding, stop, now,
+                    ),
                 )
                 .await?;
+            let reconciled = staging.recovered.saturating_add(staging.reset);
             outcome.reconciliation_recovered =
-                outcome.reconciliation_recovered.saturating_add(recovered);
-            outcome.reconciled = outcome.reconciled.saturating_add(recovered);
+                outcome.reconciliation_recovered.saturating_add(reconciled);
+            outcome.reconciled = outcome.reconciled.saturating_add(reconciled);
+            outcome.open_operation_overflows = outcome
+                .open_operation_overflows
+                .saturating_add(usize::from(staging.overflowed));
             if stop.is_cancelled() {
                 outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
                 outcome.pending_work = true;
@@ -368,6 +374,7 @@ impl Forge {
                 }
             }
             if stop.is_cancelled()
+                || staging.destructive_maintenance == DestructiveMaintenance::Blocked
                 || live.destructive_maintenance == DestructiveMaintenance::Blocked
             {
                 outcome.tables_skipped = outcome.tables_skipped.saturating_add(1);
@@ -516,19 +523,46 @@ impl Forge {
         outcome: &mut ForgeTickOutcome,
         gauges: &mut ForgeGaugeSnapshot,
     ) -> Result<TableStageDisposition, ForgeError> {
-        let (reconciliation, staging_observation) = self
+        let staging = self
             .core
             .metrics
             .observe_stage(
                 ForgeMetricStage::ReconcileStaging,
-                self.run_compaction_reconciliation_for_table(lease, key, binding),
+                self.run_compaction_reconciliation_for_table(lease, key, binding, stop, now),
             )
             .await?;
+        let staging_prepared = if staging.overflowed {
+            self.core
+                .config
+                .max_open_operations_per_table
+                .saturating_add(1)
+        } else {
+            staging
+                .recovered
+                .saturating_add(staging.reset)
+                .saturating_add(staging.pending)
+                .saturating_add(staging.unresolved)
+        };
+        let staging_observation = ReconciliationGaugeObservation {
+            prepared_operations: staging_prepared,
+            uncertain_operations: if staging.overflowed {
+                self.core
+                    .config
+                    .max_open_operations_per_table
+                    .saturating_add(1)
+            } else {
+                staging.pending.saturating_add(staging.unresolved)
+            },
+        };
         gauges.record_reconciliation(ForgeMetricSource::Staging, staging_observation);
+        let reconciliation = staging.recovered.saturating_add(staging.reset);
         outcome.reconciliation_recovered = outcome
             .reconciliation_recovered
             .saturating_add(reconciliation);
         outcome.reconciled = outcome.reconciled.saturating_add(reconciliation);
+        outcome.open_operation_overflows = outcome
+            .open_operation_overflows
+            .saturating_add(usize::from(staging.overflowed));
         if stop.is_cancelled() {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
@@ -575,7 +609,9 @@ impl Forge {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
         }
-        if live.destructive_maintenance == DestructiveMaintenance::Blocked {
+        if staging.destructive_maintenance == DestructiveMaintenance::Blocked
+            || live.destructive_maintenance == DestructiveMaintenance::Blocked
+        {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Blocked);
         }
@@ -595,25 +631,36 @@ impl Forge {
                 self.run_snapshot_expiry_for_table(lease, key, binding, now),
             )
             .await?;
-        outcome.expiry_reconciled = outcome.expiry_reconciled.saturating_add(expiry);
-        outcome.reconciled = outcome.reconciled.saturating_add(expiry);
+        outcome.expiry_reconciled = outcome.expiry_reconciled.saturating_add(expiry.recovered);
+        outcome.reconciled = outcome.reconciled.saturating_add(expiry.recovered);
+        if expiry.overflowed || expiry.pending > 0 || expiry.unresolved > 0 {
+            outcome.open_operation_overflows = outcome
+                .open_operation_overflows
+                .saturating_add(usize::from(expiry.overflowed));
+            outcome.pending_work = true;
+        }
         if stop.is_cancelled() {
             outcome.pending_work = true;
             return Ok(TableStageDisposition::Cancelled);
+        }
+        if expiry.destructive_maintenance == DestructiveMaintenance::Blocked {
+            return Ok(TableStageDisposition::Blocked);
         }
 
-        let table = self.load_table(&binding.table_ident()).await?;
-        let live_set = self.build_live_set(key, binding, &table).await?;
-        if stop.is_cancelled() {
-            outcome.pending_work = true;
-            return Ok(TableStageDisposition::Cancelled);
-        }
         let gc = self
             .core
             .metrics
             .observe_stage(
                 ForgeMetricStage::OrphanGc,
-                self.run_orphan_gc_for_table(lease, key, binding, &live_set, now),
+                self.run_orphan_gc_for_table(
+                    lease,
+                    key,
+                    binding,
+                    now,
+                    stop,
+                    &staging.protected_output_paths,
+                    &live.protected_output_paths,
+                ),
             )
             .await?;
         outcome.gc_reconciled = outcome.gc_reconciled.saturating_add(gc.recovered);
@@ -621,6 +668,13 @@ impl Forge {
         outcome.gc_deleted = outcome.gc_deleted.saturating_add(gc.deleted);
         outcome.gc_skipped = outcome.gc_skipped.saturating_add(gc.skipped);
         outcome.reconciled = outcome.reconciled.saturating_add(gc.recovered);
+        if gc.overflowed || gc.pending > 0 || gc.unresolved > 0 {
+            outcome.open_operation_overflows = outcome
+                .open_operation_overflows
+                .saturating_add(usize::from(gc.overflowed));
+            outcome.pending_work = true;
+            return Ok(TableStageDisposition::Blocked);
+        }
         Ok(TableStageDisposition::Completed)
     }
 

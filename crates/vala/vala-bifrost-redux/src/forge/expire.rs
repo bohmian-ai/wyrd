@@ -39,6 +39,34 @@ pub struct SnapshotSummary {
     pub timestamp_ms: i64,
 }
 
+/// Bounded snapshot-expiry reconciliation evidence for one table pass.
+#[derive(Debug)]
+pub(crate) struct ExpiryReconciliationOutcome {
+    /// Prepared operations completed or proven externally complete.
+    pub(crate) recovered: usize,
+    /// Young prepared operations retained inside the uncertainty bound.
+    pub(crate) pending: usize,
+    /// Prepared selections no longer safe to replay.
+    pub(crate) unresolved: usize,
+    /// Whether the open-state query exceeded its explicit cap.
+    pub(crate) overflowed: bool,
+    /// Fail-closed destructive-maintenance disposition.
+    pub(crate) destructive_maintenance: super::live_reconcile::DestructiveMaintenance,
+}
+
+impl Default for ExpiryReconciliationOutcome {
+    /// Starts one expiry reconciliation in the allowed, empty state.
+    fn default() -> Self {
+        Self {
+            recovered: 0,
+            pending: 0,
+            unresolved: 0,
+            overflowed: false,
+            destructive_maintenance: super::live_reconcile::DestructiveMaintenance::Allowed,
+        }
+    }
+}
+
 /// Selects only snapshots older than `cutoff_ms` that are not current, ref
 /// heads, or among the retained ancestry of a current/ref head.
 #[must_use]
@@ -99,7 +127,7 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
-    ) -> Result<usize, ForgeError> {
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
         self.run_snapshot_expiry_for_table_inner(lease, key, binding, now)
             .await
     }
@@ -153,8 +181,12 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
-    ) -> Result<usize, ForgeError> {
-        let mut recovered = self.reconcile_expiry(lease, key, binding, now).await?;
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        let mut outcome = self.reconcile_expiry(lease, key, binding, now).await?;
+        if outcome.destructive_maintenance == super::live_reconcile::DestructiveMaintenance::Blocked
+        {
+            return Ok(outcome);
+        }
         let table = self.load_table(&binding.table_ident()).await?;
         let cutoff_ms = expiry_cutoff_ms(now, self.core.config.snapshot_retention)?;
         let (summaries, ref_heads) = snapshot_summaries(&table)?;
@@ -166,15 +198,15 @@ impl Forge {
             self.core.config.retain_last,
         );
         if selected.is_empty() {
-            return Ok(recovered);
+            return Ok(outcome);
         }
         let detail = expiry_detail(&table, key, cutoff_ms, selected, ref_heads)?;
         self.append_expiry_audit(lease, key.tenant, &detail, "forge.snapshot_expire.prepared")
             .await?;
         self.complete_expiry(lease, key, binding, &detail, false)
             .await?;
-        recovered += 1;
-        Ok(recovered)
+        outcome.recovered = outcome.recovered.saturating_add(1);
+        Ok(outcome)
     }
 }
 
@@ -389,15 +421,34 @@ impl Forge {
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
         now: DateTime<Utc>,
-    ) -> Result<usize, ForgeError> {
-        let (prepared, terminal) = self.load_expiry_audits(key).await?;
-        let mut recovered = 0;
-        for (operation_id, (detail, created_at)) in prepared {
-            if terminal.contains(&operation_id) {
-                continue;
-            }
+    ) -> Result<ExpiryReconciliationOutcome, ForgeError> {
+        let resource = table_resource_for_key(key);
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::SnapshotExpire)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        let mut outcome = ExpiryReconciliationOutcome {
+            overflowed: page.overflowed,
+            ..ExpiryReconciliationOutcome::default()
+        };
+        if page.overflowed {
+            outcome.destructive_maintenance =
+                super::live_reconcile::DestructiveMaintenance::Blocked;
+            return Ok(outcome);
+        }
+        for row in page.operations {
+            let detail = row.prepared_detail;
             let AuditDetail::ForgeSnapshotExpire {
                 selected_snapshot_ids,
+                cutoff_ms,
                 ..
             } = &detail
             else {
@@ -416,95 +467,40 @@ impl Forge {
                     "forge.snapshot_expire.recovered",
                 )
                 .await?;
-                recovered += 1;
+                outcome.recovered = outcome.recovered.saturating_add(1);
                 continue;
             }
             if now
-                .signed_duration_since(created_at)
+                .signed_duration_since(row.prepared_at)
                 .to_std()
                 .unwrap_or_default()
                 < self.core.config.uncertainty_bound
             {
+                outcome.pending = outcome.pending.saturating_add(1);
+                continue;
+            }
+            if !selected_ids_are_eligible(
+                &table,
+                selected_snapshot_ids,
+                *cutoff_ms,
+                self.core.config.retain_last,
+            )? {
+                outcome.unresolved = outcome.unresolved.saturating_add(1);
                 continue;
             }
             self.complete_expiry(lease, key, binding, &detail, true)
                 .await?;
-            recovered += 1;
+            outcome.recovered = outcome.recovered.saturating_add(1);
         }
-        Ok(recovered)
+        if outcome.pending > 0 || outcome.unresolved > 0 {
+            outcome.destructive_maintenance =
+                super::live_reconcile::DestructiveMaintenance::Blocked;
+        }
+        Ok(outcome)
     }
 }
 
-/// Read the latest prepared and terminal expiry audit state for one table.
 impl Forge {
-    async fn load_expiry_audits(
-        &self,
-        key: &ForgeTableKey,
-    ) -> Result<(HashMap<Uuid, (AuditDetail, DateTime<Utc>)>, HashSet<Uuid>), ForgeError> {
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let mut after_seq = 0_i64;
-        let mut prepared = HashMap::new();
-        let mut terminal = HashSet::new();
-        loop {
-            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-                &mut conn,
-                &table_resource_for_key(key),
-                after_seq,
-                self.core.config.audit_page_size,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-            let page_len = page.len();
-            for row in page {
-                after_seq = row.seq;
-                let Some(detail) = row.detail else { continue };
-                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?;
-                let AuditDetail::ForgeSnapshotExpire {
-                    operation_id,
-                    phase,
-                    group,
-                    selected_snapshot_ids,
-                    ..
-                } = &detail
-                else {
-                    continue;
-                };
-                if group != &table_resource_for_key(key)
-                    || selected_snapshot_ids.is_empty()
-                    || selected_snapshot_ids
-                        .windows(2)
-                        .any(|pair| pair[0] >= pair[1])
-                {
-                    return Err(ForgeError::Reconciliation {
-                        detail: "snapshot-expiry audit detail is not canonical".to_owned(),
-                    });
-                }
-                match phase {
-                    ForgeSnapshotExpirePhase::Prepared => {
-                        prepared.insert(*operation_id, (detail, row.created_at));
-                    }
-                    ForgeSnapshotExpirePhase::Committed | ForgeSnapshotExpirePhase::Recovered => {
-                        terminal.insert(*operation_id);
-                    }
-                }
-            }
-            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
-                break;
-            }
-        }
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok((prepared, terminal))
-    }
-
     /// Append a fenced snapshot-expiry audit and projection transition atomically.
     ///
     /// # Errors

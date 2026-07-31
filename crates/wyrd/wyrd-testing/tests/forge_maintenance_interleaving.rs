@@ -4,7 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opendal::Buffer;
-use vala_bifrost_redux::forge::{ForgeLease, ForgeObjectStore, forge_lease_key};
+use vala_bifrost_redux::forge::{
+    ForgeLease, ForgeObjectStore, current_gc_gate_for_test, forge_lease_key,
+};
+use vala_sql::row_types::forge_operations::{
+    ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow,
+};
+use wyrd_spec::vala::api::{
+    AuditDetail, ForgeOrphanGcPhase, ForgeSnapshotExpirePhase, StoragePath,
+};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group};
 
@@ -81,7 +89,22 @@ async fn forge_gc_replay_preserves_live_reference() {
         .write(&orphan, Buffer::from(vec![1_u8]))
         .await
         .expect("race orphan object");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let modified = fixture
+        .staging
+        .stat(&orphan)
+        .await
+        .expect("orphan metadata")
+        .last_modified()
+        .expect("object age evidence")
+        .into_inner()
+        .as_millisecond();
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(modified + 100)
+                .expect("object timestamp is UTC-representable"),
+        )
+        .expect("advance Forge object age");
     let tick_context = context.clone();
     let tick = tokio::spawn(async move { tick_context.run_once().await });
     control.wait_for_list().await;
@@ -145,12 +168,35 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
             .await
             .expect("partial-delete orphan object");
     }
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let modified = fixture
+        .staging
+        .stat(&second_orphan)
+        .await
+        .expect("orphan metadata")
+        .last_modified()
+        .expect("object age evidence")
+        .into_inner()
+        .as_millisecond();
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(modified + 100)
+                .expect("object timestamp is UTC-representable"),
+        )
+        .expect("advance Forge object age");
     let first = context
         .run_once()
         .await
         .expect("partial-delete tick outcome");
-    assert_eq!(first.tables_failed, 1);
+    assert_eq!(
+        first.tables_failed,
+        1,
+        "delete calls={}, candidates={}, deleted={}, skipped={}",
+        control.delete_calls(),
+        first.gc_candidates,
+        first.gc_deleted,
+        first.gc_skipped
+    );
     assert_eq!(control.delete_calls(), 2);
     let first_exists = control.stat(&first_orphan).await.is_ok();
     let second_exists = control.stat(&second_orphan).await.is_ok();
@@ -167,6 +213,81 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
         + fixture.operation_count("forge.orphan_gc.recovered").await;
     assert_eq!(terminal, 1);
     server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Proves that only one exact prepared GC operation may pass its final gate.
+///
+/// # Panics
+///
+/// Panics when exact parity is refused, mismatched identity is accepted, or a
+/// second prepared operation fails to block destructive maintenance.
+async fn forge_gc_current_operation_exemption_requires_exact_parity() {
+    let resource = "forge:test:gc";
+    let operation_id = uuid::Uuid::now_v7();
+    let candidate = StoragePath::new("table/data/orphan.parquet").expect("candidate");
+    let detail = AuditDetail::ForgeOrphanGc {
+        operation_id,
+        phase: ForgeOrphanGcPhase::Prepared,
+        group: resource.to_owned(),
+        candidate_paths: vec![candidate],
+        deleted_paths: Vec::new(),
+        skipped_paths: Vec::new(),
+    };
+    let now = chrono::Utc::now();
+    let row = ForgeOperationStateRow {
+        resource: resource.to_owned(),
+        family: ForgeOperationFamily::OrphanGc,
+        operation_id,
+        phase: ForgeOperationPhase::Prepared,
+        prepared_detail: detail.clone(),
+        current_detail: detail.clone(),
+        prepared_audit_seq: 1,
+        terminal_audit_seq: None,
+        prepared_at: now,
+        updated_at: now,
+    };
+    assert!(
+        current_gc_gate_for_test(resource, &detail, std::slice::from_ref(&row))
+            .expect("exact operation parity")
+    );
+
+    let mismatched = AuditDetail::ForgeOrphanGc {
+        operation_id: uuid::Uuid::now_v7(),
+        phase: ForgeOrphanGcPhase::Prepared,
+        group: resource.to_owned(),
+        candidate_paths: vec![StoragePath::new("table/data/orphan.parquet").expect("candidate")],
+        deleted_paths: Vec::new(),
+        skipped_paths: Vec::new(),
+    };
+    assert!(current_gc_gate_for_test(resource, &mismatched, std::slice::from_ref(&row)).is_err());
+
+    let second_id = uuid::Uuid::now_v7();
+    let second_detail = AuditDetail::ForgeOrphanGc {
+        operation_id: second_id,
+        phase: ForgeOrphanGcPhase::Prepared,
+        group: resource.to_owned(),
+        candidate_paths: vec![StoragePath::new("table/data/second.parquet").expect("candidate")],
+        deleted_paths: Vec::new(),
+        skipped_paths: Vec::new(),
+    };
+    let second = ForgeOperationStateRow {
+        resource: resource.to_owned(),
+        family: ForgeOperationFamily::OrphanGc,
+        operation_id: second_id,
+        phase: ForgeOperationPhase::Prepared,
+        prepared_detail: second_detail.clone(),
+        current_detail: second_detail,
+        prepared_audit_seq: 2,
+        terminal_audit_seq: None,
+        prepared_at: now,
+        updated_at: now,
+    };
+    assert!(
+        !current_gc_gate_for_test(resource, &detail, &[row, second])
+            .expect("second operation is valid but unsafe")
+    );
 }
 
 #[tokio::test]
@@ -334,7 +455,23 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
         .load_table(&fixture.binding.table_ident())
         .await
         .expect("table before expiry");
-    assert_eq!(before.metadata().snapshots().len(), 2);
+    assert!(
+        before.metadata().snapshots().len() >= 2,
+        "expiry interleaving requires retained history"
+    );
+    let newest_snapshot_ms = before
+        .metadata()
+        .snapshots()
+        .map(|snapshot| snapshot.timestamp_ms())
+        .max()
+        .expect("retained snapshot timestamp");
+    server
+        .forge_clock()
+        .set(
+            chrono::DateTime::from_timestamp_millis(newest_snapshot_ms + 2)
+                .expect("snapshot timestamp is UTC-representable"),
+        )
+        .expect("advance Forge beyond retention");
 
     let mut config = fixture.config.clone();
     config.snapshot_retention = Duration::from_millis(1);
@@ -389,5 +526,125 @@ async fn forge_expiry_takeover_reconciles_current_and_retained_heads() {
         .expect("table after expiry recovery");
     assert_eq!(after.metadata().snapshots().len(), 1);
     assert!(after.metadata().current_snapshot_id().is_some());
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Proves a young prepared expiry blocks both a second expiry and orphan GC.
+///
+/// # Panics
+///
+/// Panics when projection setup fails, the pass does not report pending work,
+/// a second expiry terminal appears, or GC deletes the aged sentinel.
+async fn forge_expiry_pending_blocks_new_expiry_and_gc() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "maintenance_expiry_pending").await;
+    fixture.forge.run_once().await.expect("initial snapshot");
+    let table = fixture
+        .catalog
+        .load_table(&fixture.binding.table_ident())
+        .await
+        .expect("expiry table");
+    let current = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("current snapshot");
+    let resource = format!(
+        "bifrost://{}/{}/{}",
+        fixture.tenant, fixture.binding.table_ref.namespace, fixture.binding.table_ref.name
+    );
+    let detail = AuditDetail::ForgeSnapshotExpire {
+        operation_id: uuid::Uuid::now_v7(),
+        phase: ForgeSnapshotExpirePhase::Prepared,
+        group: resource,
+        base_metadata_location: StoragePath::new(
+            table
+                .metadata_location_result()
+                .expect("metadata location")
+                .to_owned(),
+        )
+        .expect("storage path"),
+        current_snapshot_id: Some(current),
+        retained_ref_heads: Vec::new(),
+        cutoff_ms: server
+            .forge_clock()
+            .now()
+            .expect("clock")
+            .timestamp_millis(),
+        selected_snapshot_ids: vec![current],
+    };
+    let lease_key = forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    let mut lease = ForgeLease::acquire(
+        &fixture.operator_pool,
+        lease_key,
+        uuid::Uuid::now_v7(),
+        fixture.config.lease_ttl,
+    )
+    .await
+    .expect("lease query")
+    .expect("fixture lease");
+    fixture
+        .forge
+        .append_expiry_transition_for_test(
+            &mut lease,
+            fixture.tenant,
+            &detail,
+            "forge.snapshot_expire.prepared",
+        )
+        .await
+        .expect("prepared expiry");
+    lease
+        .release(&fixture.operator_pool)
+        .await
+        .expect("release fixture lease");
+
+    let orphan = format!(
+        "{}/data/pending-expiry.parquet",
+        fixture.binding.object_prefix
+    );
+    fixture
+        .staging
+        .write(&orphan, Buffer::from(vec![1_u8]))
+        .await
+        .expect("GC sentinel");
+    let modified = fixture
+        .staging
+        .stat(&orphan)
+        .await
+        .expect("sentinel metadata")
+        .last_modified()
+        .expect("sentinel age")
+        .into_inner()
+        .as_millisecond();
+    server
+        .forge_clock()
+        .set(chrono::DateTime::from_timestamp_millis(modified + 100).expect("sentinel timestamp"))
+        .expect("age sentinel");
+    let mut config = fixture.config.clone();
+    config.orphan_gc_ttl = Duration::from_millis(1);
+    config.snapshot_retention = Duration::from_millis(1);
+    let outcome = fixture
+        .context_with_config(config)
+        .run_once()
+        .await
+        .expect("pending tick");
+    assert!(outcome.pending_work);
+    assert_eq!(outcome.gc_candidates, 0);
+    assert!(fixture.staging.stat(&orphan).await.is_ok());
+    assert_eq!(
+        fixture
+            .operation_count("forge.snapshot_expire.committed")
+            .await,
+        0
+    );
     server.shutdown().await.expect("server shutdown");
 }

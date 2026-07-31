@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use crate::bifrost::{BifrostHarness, seed_forge_group_for_tenant};
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use opendal::Buffer;
 use serde::Serialize;
 use sqlx::Row;
-use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport};
+use vala_bifrost_redux::forge::{Forge, deterministic_output_path_for_test};
+use wyrd_bench::{BifrostLane, BifrostScenario, NegativeFlowReport, SloGate};
 
 type BenchError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -52,6 +54,16 @@ struct ForgeBenchmarkReport {
     convergence: bool,
     /// Whether input and output row counts match exactly.
     exact_row_conservation: bool,
+    /// Five bounded-GC sample durations, in microseconds.
+    gc_samples_us: Vec<u64>,
+    /// Nearest-rank p99 across the five bounded-GC samples.
+    gc_p99_us: u64,
+    /// Exact orphan candidates enumerated across all five samples.
+    gc_candidates: u64,
+    /// Exact orphan count deleted across the bounded samples.
+    gc_deleted: u64,
+    /// Whether a retained Iceberg output survived every fresh protection reload.
+    gc_retained_paths_protected: bool,
 }
 
 /// Return the repository report location used by the canonical benchmark lanes.
@@ -203,6 +215,96 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         outcome.input_rows == outcome.output_rows && outcome.input_rows == expected_rows;
     let convergence = pending == 0;
     let below_demand_shared_memory = input_bytes > SHARED_PARENT_MEMORY_CEILING;
+    let mut gc_samples_us = Vec::with_capacity(5);
+    let mut gc_candidates = 0_u64;
+    let mut gc_deleted = 0_u64;
+    for sample in 0..5 {
+        let gc_fixture =
+            seed_forge_group_for_tenant(server, tenant, &format!("gc_sample_{sample}")).await;
+        let retained_control = gc_fixture
+            .object_store
+            .list(&gc_fixture.binding.object_prefix)
+            .await?
+            .into_iter()
+            .find(|entry| entry.path().contains("/metadata/") && entry.metadata().is_file())
+            .map(|entry| entry.path().to_owned())
+            .ok_or("GC sample needs one retained Iceberg metadata object")?;
+        let mut newest_modified_ms = i64::MIN;
+        let mut orphan_paths = Vec::with_capacity(32);
+        for candidate in 0..32 {
+            let operation_id = uuid::Uuid::from_u128(
+                u128::try_from(sample * 32 + candidate + 1)
+                    .map_err(|_| "benchmark GC operation identity overflow")?,
+            );
+            let orphan = deterministic_output_path_for_test(
+                &gc_fixture.binding.object_prefix,
+                operation_id,
+                candidate,
+            );
+            if !Forge::known_iceberg_object_for_test(&orphan) {
+                return Err(
+                    format!("GC benchmark candidate is not an Iceberg object: {orphan}").into(),
+                );
+            }
+            gc_fixture
+                .staging
+                .write(&orphan, Buffer::from(vec![1_u8]))
+                .await?;
+            newest_modified_ms = newest_modified_ms.max(
+                gc_fixture
+                    .staging
+                    .stat(&orphan)
+                    .await?
+                    .last_modified()
+                    .ok_or("benchmark orphan lacks age evidence")?
+                    .into_inner()
+                    .as_millisecond(),
+            );
+            orphan_paths.push(orphan);
+        }
+        let clock = server.forge_clock();
+        let age_target = newest_modified_ms.checked_add(2).ok_or("GC age overflow")?;
+        if age_target > clock.now()?.timestamp_millis() {
+            clock.set(
+                chrono::DateTime::from_timestamp_millis(age_target)
+                    .ok_or("benchmark object timestamp is outside UTC")?,
+            )?;
+        }
+        let mut gc_config = gc_fixture.config.clone();
+        gc_config.min_files = i64::MAX;
+        gc_config.orphan_gc_ttl = std::time::Duration::from_millis(1);
+        gc_config.max_gc_candidates_per_batch = 32;
+        let gc_forge = gc_fixture.context_with_config(gc_config);
+        let sample_started = Instant::now();
+        let gc = gc_forge.run_once().await?;
+        gc_samples_us.push(u64::try_from(sample_started.elapsed().as_micros())?);
+        if gc.gc_candidates != 32 || gc.gc_deleted != 32 {
+            return Err(format!(
+                "GC sample {sample} expected 32 candidates/deletes, got {}/{}",
+                gc.gc_candidates, gc.gc_deleted
+            )
+            .into());
+        }
+        for orphan in orphan_paths {
+            if gc_fixture.staging.stat(&orphan).await.is_ok() {
+                return Err(format!("GC sample retained orphan {orphan}").into());
+            }
+        }
+        if gc_fixture.staging.stat(&retained_control).await.is_err() {
+            return Err(format!("GC sample deleted retained object {retained_control}").into());
+        }
+        gc_candidates = gc_candidates.saturating_add(u64::try_from(gc.gc_candidates)?);
+        gc_deleted = gc_deleted.saturating_add(u64::try_from(gc.gc_deleted)?);
+    }
+    let mut ordered_gc_samples = gc_samples_us.clone();
+    ordered_gc_samples.sort_unstable();
+    let gc_p99_us = *ordered_gc_samples
+        .get(4)
+        .ok_or("five GC samples are required for nearest-rank p99")?;
+    let gc_slo_passed = SloGate::from_default_path()?
+        .check_value("bench.bifrost.forge_slo", gc_p99_us as f64)
+        .is_ok();
+    let gc_retained_paths_protected = true;
     let negative_flows = if scenario.require_negative_flows {
         let retry = forge.run_once().await?;
         let retry_pending = pending_rows(&fixture).await?;
@@ -222,6 +324,11 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         && bookkeeping_converged
         && exact_row_conservation
         && convergence
+        && gc_samples_us.len() == 5
+        && gc_candidates == 160
+        && gc_deleted == 160
+        && gc_retained_paths_protected
+        && gc_slo_passed
         && (outcome.tables_succeeded > 0 || outcome.tables_skipped > 0)
         && negative_flows.passed;
     let mut envelope =
@@ -246,6 +353,11 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
         bookkeeping_converged,
         convergence,
         exact_row_conservation,
+        gc_samples_us,
+        gc_p99_us,
+        gc_candidates,
+        gc_deleted,
+        gc_retained_paths_protected,
     };
     let path = report_path();
     if let Some(parent) = path.parent() {
@@ -258,7 +370,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     harness.shutdown().await?;
     if !verified {
         return Err(format!(
-            "Forge benchmark verification failed: spill={}, outputs={}, pending={}, input_rows={}, output_rows={}, expected_rows={}, peak_memory={}, bookkeeping={}, negative_flows={}",
+            "Forge benchmark verification failed: spill={}, outputs={}, pending={}, input_rows={}, output_rows={}, expected_rows={}, peak_memory={}, bookkeeping={}, gc_p99_us={}, gc_candidates={}, gc_deleted={}, retained_control={}, negative_flows={}",
             outcome.spill_bytes,
             outcome.outputs_committed,
             pending,
@@ -267,6 +379,10 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
             expected_rows,
             peak_parent_memory,
             bookkeeping_converged,
+            gc_p99_us,
+            gc_candidates,
+            gc_deleted,
+            gc_retained_paths_protected,
             negative_flows_passed,
         )
         .into());

@@ -11,6 +11,7 @@ pub mod alerts;
 pub mod anchors;
 pub mod audit_outbox;
 pub mod drift_alerts;
+pub mod file_list;
 pub mod forge_operations;
 pub mod maintenance_leases;
 pub mod monitor;

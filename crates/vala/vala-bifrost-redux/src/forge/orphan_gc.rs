@@ -1,22 +1,24 @@
 //! Reference-aware orphan garbage collection for Forge objects.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::time::Duration;
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
-use iceberg::spec::TableMetadata;
+use iceberg::spec::{DataContentType, ManifestContentType, TableMetadata};
 use opendal::raw::Timestamp;
 use opendal::{EntryMode, ErrorKind};
-use sqlx::Row;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use vala_sql::queries::file_list::list_nonterminal_file_paths;
 use vala_sql::queries::forge_operations::ForgeOperations;
-use vala_sql::row_types::forge_operations::{ForgeOperationFamily, ForgeOperationTransition};
+use vala_sql::row_types::forge_operations::{
+    ForgeOperationFamily, ForgeOperationPhase, ForgeOperationStateRow, ForgeOperationTransition,
+};
 use wyrd_spec::DataTenantId;
 use wyrd_spec::auth::{PrincipalId, PrincipalKindTag};
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::api::{
     AuditDecision, AuditDetail, AuditEvent, AuditResult, AuthMethod, ForgeOrphanGcPhase,
-    StoragePath,
+    StoragePath, audit_detail_canonical_json,
 };
 
 use crate::catalog::TenantTableBinding;
@@ -26,9 +28,43 @@ use super::compact::ForgeTableKey;
 use super::error::ForgeError;
 use super::expire::table_resource_for_key;
 use super::lease::ForgeLease;
+use super::live_reconcile::DestructiveMaintenance;
 use super::path::{catalog_path_to_object_key, validate_table_location};
 
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
+
+/// Fails closed when the table-scoped maintenance token has been cancelled.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Shutdown`] after cancellation.
+fn require_running(stop: &CancellationToken) -> Result<(), ForgeError> {
+    if stop.is_cancelled() {
+        Err(ForgeError::Shutdown)
+    } else {
+        Ok(())
+    }
+}
+
+/// Validates the only manifest/entry content pairs retained traversal accepts.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::LiveSet`] when manifest content and entry content
+/// disagree.
+fn validate_retained_manifest_entry(
+    manifest: ManifestContentType,
+    entry: DataContentType,
+) -> Result<(), ForgeError> {
+    match (manifest, entry) {
+        (ManifestContentType::Data, DataContentType::Data)
+        | (ManifestContentType::Deletes, DataContentType::PositionDeletes)
+        | (ManifestContentType::Deletes, DataContentType::EqualityDeletes) => Ok(()),
+        _ => Err(ForgeError::LiveSet {
+            detail: "manifest content and entry content disagree".to_owned(),
+        }),
+    }
+}
 
 /// The complete set of Iceberg and server-side paths that must not be deleted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,20 +93,208 @@ impl ProtectedLiveSet {
     pub fn contains(&self, path: &str) -> bool {
         self.paths.contains(path)
     }
+
+    /// Returns the exact protected keys for production-traversal integration tests.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn paths_for_test(&self) -> &BTreeSet<String> {
+        &self.paths
+    }
 }
 
-/// Whether a known object is old enough and absent from the live set.
-#[must_use]
-pub fn is_gc_candidate(
-    path: &str,
-    live_set: &ProtectedLiveSet,
-    last_modified: Option<Timestamp>,
-    now: Timestamp,
-    ttl: Duration,
-) -> bool {
-    Forge::known_iceberg_object(path)
-        && !live_set.contains(path)
-        && last_modified.is_some_and(|modified| modified < now - ttl)
+/// Fresh evidence used by both initial and immediate final GC decisions.
+pub(crate) struct MaintenanceProtection {
+    /// Every validated object reachable from retained or nonterminal work.
+    pub(crate) live_set: ProtectedLiveSet,
+    /// Fail-closed permission derived from every open operation family.
+    pub(crate) destructive_maintenance: DestructiveMaintenance,
+    /// The table lease's single captured maintenance time.
+    pub(crate) now: DateTime<Utc>,
+    /// Inclusive last-modified cutoff derived once from `now`.
+    object_age_cutoff: Timestamp,
+}
+
+/// Object-store evidence evaluated by the shared eligibility predicate.
+pub(crate) enum ObjectEvidence<'metadata> {
+    /// The object exists with freshly loaded metadata.
+    Present(&'metadata opendal::Metadata),
+    /// The object was absent at the evidence load.
+    Missing,
+}
+
+/// Closed reason produced by the shared initial/final GC predicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GcEligibility {
+    /// Every destructive-maintenance precondition is proven.
+    Eligible,
+    /// A retained/open reference or destructive gate protects the object.
+    Protected,
+    /// The object's age is absent or newer than the inclusive cutoff.
+    TooYoung,
+    /// The path resolves to a non-file object.
+    NotFile,
+    /// The path is outside the binding or is not a known Iceberg object type.
+    InvalidPath,
+    /// The object does not currently exist.
+    Missing,
+}
+
+impl MaintenanceProtection {
+    /// Applies the single closed eligibility truth used before prepare and delete.
+    #[must_use]
+    pub(crate) fn gc_eligibility(
+        &self,
+        binding: &TenantTableBinding,
+        path: &str,
+        evidence: ObjectEvidence<'_>,
+    ) -> GcEligibility {
+        let Some(normalized) = binding.validate_object_path(path) else {
+            return GcEligibility::InvalidPath;
+        };
+        if !Forge::known_iceberg_object(&normalized) {
+            return GcEligibility::InvalidPath;
+        }
+        if self.destructive_maintenance == DestructiveMaintenance::Blocked
+            || self.live_set.contains(&normalized)
+        {
+            return GcEligibility::Protected;
+        }
+        let ObjectEvidence::Present(metadata) = evidence else {
+            return GcEligibility::Missing;
+        };
+        if metadata.mode() != EntryMode::FILE {
+            return GcEligibility::NotFile;
+        }
+        if !metadata
+            .last_modified()
+            .is_some_and(|modified| modified <= self.object_age_cutoff)
+        {
+            return GcEligibility::TooYoung;
+        }
+        GcEligibility::Eligible
+    }
+}
+
+/// Validated identity of the one prepared GC batch allowed to finish itself.
+struct CurrentGcExemption {
+    /// Exact prepared operation identity.
+    operation_id: Uuid,
+    /// Canonical immutable prepared audit evidence.
+    canonical_prepared_detail: String,
+    /// Exact normalized candidate set owned by the delete loop.
+    candidate_paths: BTreeSet<String>,
+}
+
+/// Returns output objects that nonterminal operations must retain.
+fn operation_output_paths(detail: &AuditDetail) -> &[StoragePath] {
+    match detail {
+        AuditDetail::ForgeCompaction { output_paths, .. }
+        | AuditDetail::ForgeIcebergRewrite { output_paths, .. } => output_paths,
+        _ => &[],
+    }
+}
+
+/// Validates the typed self-exemption against the parity-proven open-state row.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Reconciliation`] unless the supplied detail and
+/// exactly one open row have identical resource, family, phase, audit JSON,
+/// operation identity, and duplicate-free normalized candidates.
+fn current_gc_exemption(
+    resource: &str,
+    detail: Option<&AuditDetail>,
+    open_gc: &[ForgeOperationStateRow],
+    normalize: impl Fn(&StoragePath) -> Result<String, ForgeError>,
+) -> Result<Option<CurrentGcExemption>, ForgeError> {
+    let Some(detail) = detail else {
+        return Ok(None);
+    };
+    let AuditDetail::ForgeOrphanGc {
+        operation_id,
+        phase: ForgeOrphanGcPhase::Prepared,
+        group,
+        candidate_paths,
+        deleted_paths,
+        skipped_paths,
+    } = detail
+    else {
+        return Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption is not a prepared GC detail".to_owned(),
+        });
+    };
+    if group != resource || !deleted_paths.is_empty() || !skipped_paths.is_empty() {
+        return Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption has noncanonical resource or results".to_owned(),
+        });
+    }
+    let normalized = candidate_paths
+        .iter()
+        .map(&normalize)
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if normalized.len() != candidate_paths.len() {
+        return Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption contains duplicate candidates".to_owned(),
+        });
+    }
+    let matches = open_gc
+        .iter()
+        .filter(|row| row.operation_id == *operation_id)
+        .collect::<Vec<_>>();
+    let [row] = matches.as_slice() else {
+        return Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption must match exactly one open operation".to_owned(),
+        });
+    };
+    let row_candidates = match &row.prepared_detail {
+        AuditDetail::ForgeOrphanGc {
+            candidate_paths, ..
+        } => candidate_paths
+            .iter()
+            .map(normalize)
+            .collect::<Result<BTreeSet<_>, _>>()?,
+        _ => BTreeSet::new(),
+    };
+    let canonical = audit_detail_canonical_json(detail);
+    if row.resource != resource
+        || row.family != ForgeOperationFamily::OrphanGc
+        || row.phase != ForgeOperationPhase::Prepared
+        || audit_detail_canonical_json(&row.prepared_detail) != canonical
+        || row_candidates.len() != candidate_paths.len()
+        || row_candidates != normalized
+    {
+        return Err(ForgeError::Reconciliation {
+            detail: "current orphan-GC exemption failed prepared-state parity".to_owned(),
+        });
+    }
+    Ok(Some(CurrentGcExemption {
+        operation_id: *operation_id,
+        canonical_prepared_detail: canonical,
+        candidate_paths: normalized,
+    }))
+}
+
+/// Exercises the production self-exemption and remaining-open gate in integration tests.
+///
+/// # Errors
+///
+/// Returns the production reconciliation error when `detail` does not have
+/// exact prepared-state parity with one row.
+#[cfg(feature = "test-support")]
+pub fn current_gc_gate_for_test(
+    resource: &str,
+    detail: &AuditDetail,
+    open_gc: &[ForgeOperationStateRow],
+) -> Result<bool, ForgeError> {
+    let exemption = current_gc_exemption(resource, Some(detail), open_gc, |path| {
+        Ok(path.as_str().to_owned())
+    })?
+    .ok_or_else(|| ForgeError::Reconciliation {
+        detail: "test exemption unexpectedly absent".to_owned(),
+    })?;
+    Ok(!open_gc
+        .iter()
+        .any(|row| row.operation_id != exemption.operation_id))
 }
 
 impl Forge {
@@ -84,25 +308,76 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        live_set: &ProtectedLiveSet,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        self.run_orphan_gc_for_table_inner(lease, key, binding, live_set, now)
-            .await
+        self.run_orphan_gc_for_table_inner(
+            lease,
+            key,
+            binding,
+            now,
+            stop,
+            staging_protected_paths,
+            live_protected_paths,
+        )
+        .await
     }
 
-    /// Build the complete retained snapshot and pending-staging live set.
+    /// Loads one complete, reloadable maintenance-protection proof.
     ///
     /// # Errors
     ///
     /// Returns catalog, SQL, path-validation, or live-set failures.
-    pub(super) async fn build_live_set(
+    pub(crate) async fn load_maintenance_protection(
         &self,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
+        current_gc_detail: Option<&AuditDetail>,
+    ) -> Result<MaintenanceProtection, ForgeError> {
+        self.load_maintenance_protection_inner(
+            key,
+            binding,
+            now,
+            stop,
+            staging_protected_paths,
+            live_protected_paths,
+            current_gc_detail,
+        )
+        .await
+    }
+
+    /// Loads production maintenance protection for one integration fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same catalog, manifest, SQL, operation-state, path, clock,
+    /// and cancellation errors as the production maintenance loader.
+    #[cfg(feature = "test-support")]
+    pub async fn load_maintenance_protection_for_test(
+        &self,
+        binding: &TenantTableBinding,
     ) -> Result<ProtectedLiveSet, ForgeError> {
-        self.build_live_set_inner(key, binding, table).await
+        let key = ForgeTableKey {
+            tenant: binding.tenant,
+            table_ref: binding.table_ref.clone(),
+        };
+        self.load_maintenance_protection(
+            &key,
+            binding,
+            self.core.clock.now()?,
+            &CancellationToken::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            None,
+        )
+        .await
+        .map(|protection| protection.live_set)
     }
 }
 
@@ -112,11 +387,38 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        live_set: &ProtectedLiveSet,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        let mut outcome = self.reconcile_gc(lease, key, binding, now).await?;
-        let candidates = self.list_gc_candidates(binding, live_set, now).await?;
+        let mut outcome = self
+            .reconcile_gc(
+                lease,
+                key,
+                binding,
+                stop,
+                now,
+                staging_protected_paths,
+                live_protected_paths,
+            )
+            .await?;
+        let protection = self
+            .load_maintenance_protection(
+                key,
+                binding,
+                now,
+                stop,
+                staging_protected_paths,
+                live_protected_paths,
+                None,
+            )
+            .await?;
+        if protection.destructive_maintenance == DestructiveMaintenance::Blocked {
+            outcome.pending = outcome.pending.saturating_add(1);
+            return Ok(outcome);
+        }
+        let candidates = self.list_gc_candidates(binding, &protection).await?;
         outcome.candidates = outcome.candidates.saturating_add(candidates.len());
         if candidates.is_empty() {
             return Ok(outcome);
@@ -125,7 +427,17 @@ impl Forge {
         self.append_gc_audit(lease, key.tenant, &detail, "forge.orphan_gc.prepared")
             .await?;
         let (deleted, skipped) = self
-            .delete_gc_batch(lease, key, binding, &detail, false, now)
+            .delete_gc_batch(
+                lease,
+                key,
+                binding,
+                &detail,
+                false,
+                now,
+                stop,
+                staging_protected_paths,
+                live_protected_paths,
+            )
             .await?;
         outcome.recovered = outcome.recovered.saturating_add(1);
         outcome.deleted = outcome.deleted.saturating_add(deleted);
@@ -144,18 +456,38 @@ pub(crate) struct OrphanGcOutcome {
     pub(crate) deleted: usize,
     /// Candidate paths retained after a fresh fence or live-set recheck.
     pub(crate) skipped: usize,
+    /// Open prepared operations left pending after bounded reconciliation.
+    pub(crate) pending: usize,
+    /// Operations whose external result could not be proven.
+    pub(crate) unresolved: usize,
+    /// Whether the bounded open-state query observed more than the configured cap.
+    pub(crate) overflowed: bool,
 }
 
-/// Build the live set from every retained Iceberg snapshot and every pending
-/// server-side file-list row for this exact tenant/table predicate.
+/// Build protection from every retained Iceberg object and every open workflow.
 impl Forge {
-    async fn build_live_set_inner(
+    async fn load_maintenance_protection_inner(
         &self,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
-    ) -> Result<ProtectedLiveSet, ForgeError> {
+        now: DateTime<Utc>,
+        stop: &CancellationToken,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
+        current_gc_detail: Option<&AuditDetail>,
+    ) -> Result<MaintenanceProtection, ForgeError> {
+        require_running(stop)?;
+        let table = self.load_table(&binding.table_ident()).await?;
         self.assert_table_location(table.metadata(), binding)?;
+        let retained_snapshot_count = table.metadata().snapshots().count();
+        if retained_snapshot_count > self.core.config.max_retained_snapshots_per_table {
+            return Err(ForgeError::Reconciliation {
+                detail: format!(
+                    "retained snapshot count {retained_snapshot_count} exceeds configured cap {}",
+                    self.core.config.max_retained_snapshots_per_table
+                ),
+            });
+        }
         let mut live = ProtectedLiveSet::default();
         let table_location = table.metadata().location();
         let mut add = |path: &str| self.add_path(&mut live, binding, table_location, path);
@@ -178,7 +510,8 @@ impl Forge {
                     .load_manifest(table.file_io())
                     .await
                     .map_err(ForgeError::Catalog)?;
-                for entry in manifest.entries() {
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    validate_retained_manifest_entry(manifest_file.content, entry.content_type())?;
                     add(entry.data_file().file_path())?;
                 }
             }
@@ -202,28 +535,106 @@ impl Forge {
             .tenant_conn(key.tenant)
             .await
             .map_err(ForgeError::Sql)?;
-        let rows = sqlx::query(
-            r"SELECT file_path
-             FROM vala.file_list
-            WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3
-            ORDER BY file_path",
+        let rows = list_nonterminal_file_paths(
+            &mut conn,
+            key.table_ref.namespace.as_str(),
+            &key.table_ref.name,
+            None,
         )
-        .bind(key.tenant.as_uuid())
-        .bind(key.table_ref.namespace.as_str())
-        .bind(&key.table_ref.name)
-        .fetch_all(&mut **conn.transaction())
         .await
-        .map_err(|error| ForgeError::Sql(error.into()))?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        for row in rows {
-            let path: String = row
-                .try_get("file_path")
-                .map_err(|error| ForgeError::LiveSet {
-                    detail: error.to_string(),
-                })?;
+        .map_err(ForgeError::Sql)?;
+        for path in rows {
             add(&path)?;
         }
-        Ok(live)
+
+        for path in staging_protected_paths
+            .iter()
+            .chain(live_protected_paths.iter())
+        {
+            add(path)?;
+        }
+
+        let resource = table_resource_for_key(key);
+        let cap = self.core.config.max_open_operations_per_table;
+        let mut blocked = false;
+        for family in [
+            ForgeOperationFamily::IcebergRewrite,
+            ForgeOperationFamily::SnapshotExpire,
+        ] {
+            let page = ForgeOperations::new(&resource, family)
+                .map_err(ForgeError::Sql)?
+                .list_open(&mut conn, cap)
+                .await
+                .map_err(ForgeError::Sql)?;
+            blocked |= page.overflowed || !page.operations.is_empty();
+            for row in &page.operations {
+                for path in operation_output_paths(&row.prepared_detail) {
+                    add(path.as_str())?;
+                }
+            }
+        }
+        let open_gc = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, cap)
+            .await
+            .map_err(ForgeError::Sql)?;
+        blocked |= open_gc.overflowed;
+        let exemption =
+            current_gc_exemption(&resource, current_gc_detail, &open_gc.operations, |path| {
+                catalog_path_to_object_key(
+                    table_location,
+                    binding,
+                    &self.core.staging,
+                    path.as_str(),
+                )
+            })?;
+        if exemption.as_ref().is_some_and(|value| {
+            value.canonical_prepared_detail.is_empty() || value.candidate_paths.is_empty()
+        }) {
+            return Err(ForgeError::Reconciliation {
+                detail: "current orphan-GC exemption has empty canonical evidence".to_owned(),
+            });
+        }
+        for row in &open_gc.operations {
+            if exemption
+                .as_ref()
+                .is_some_and(|value| value.operation_id == row.operation_id)
+            {
+                continue;
+            }
+            blocked = true;
+            for path in operation_output_paths(&row.prepared_detail) {
+                add(path.as_str())?;
+            }
+        }
+        conn.commit().await.map_err(ForgeError::Sql)?;
+        require_running(stop)?;
+
+        let cutoff_chrono = now
+            .checked_sub_signed(
+                chrono::Duration::from_std(self.core.config.orphan_gc_ttl).map_err(|_| {
+                    ForgeError::InvalidConfig {
+                        detail: "orphan GC TTL cannot be represented by chrono".to_owned(),
+                    }
+                })?,
+            )
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "orphan GC age cutoff overflows UTC".to_owned(),
+            })?;
+        let object_age_cutoff = Timestamp::from_millisecond(cutoff_chrono.timestamp_millis())
+            .map_err(|_| ForgeError::InvalidConfig {
+                detail: "orphan GC cutoff cannot be represented by object storage".to_owned(),
+            })?;
+        Ok(MaintenanceProtection {
+            live_set: live,
+            destructive_maintenance: if blocked {
+                DestructiveMaintenance::Blocked
+            } else {
+                DestructiveMaintenance::Allowed
+            },
+            now,
+            object_age_cutoff,
+        })
     }
 }
 
@@ -235,9 +646,13 @@ impl Forge {
     async fn list_gc_candidates(
         &self,
         binding: &TenantTableBinding,
-        live_set: &ProtectedLiveSet,
-        now: DateTime<Utc>,
+        protection: &MaintenanceProtection,
     ) -> Result<Vec<String>, ForgeError> {
+        tracing::debug!(
+            captured_now = %protection.now,
+            prefix = %binding.object_prefix,
+            "enumerating bounded orphan-GC candidates"
+        );
         let prefix = format!("{}/", binding.object_prefix.trim_end_matches('/'));
         let entries = self
             .core
@@ -245,25 +660,16 @@ impl Forge {
             .list(&prefix)
             .await
             .map_err(ForgeError::ObjectList)?;
-        let now = Timestamp::from_millisecond(now.timestamp_millis()).map_err(|_| {
-            ForgeError::InvalidConfig {
-                detail: "Forge wall clock cannot represent an object-store timestamp".to_owned(),
-            }
-        })?;
         let mut candidates = entries
             .into_iter()
-            .filter(|entry| entry.metadata().mode() == EntryMode::FILE)
             .filter_map(|entry| {
                 let path = entry.path().to_owned();
-                let modified = entry.metadata().last_modified();
-                is_gc_candidate(
+                (protection.gc_eligibility(
+                    binding,
                     &path,
-                    live_set,
-                    modified,
-                    now,
-                    self.core.config.orphan_gc_ttl,
-                )
-                .then_some(path)
+                    ObjectEvidence::Present(entry.metadata()),
+                ) == GcEligibility::Eligible)
+                    .then_some(path)
             })
             .collect::<Vec<_>>();
         candidates.sort_unstable();
@@ -283,6 +689,9 @@ impl Forge {
         detail: &AuditDetail,
         recovered: bool,
         now: DateTime<Utc>,
+        stop: &CancellationToken,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
     ) -> Result<(usize, usize), ForgeError> {
         let AuditDetail::ForgeOrphanGc {
             candidate_paths,
@@ -307,46 +716,45 @@ impl Forge {
         let mut deleted = Vec::new();
         let mut skipped = Vec::new();
         for path in candidate_paths {
+            require_running(stop)?;
             lease.require_fence(&self.core.operator_pool).await?;
-            let table = self.load_table(&binding.table_ident()).await?;
-            let now = Timestamp::from_millisecond(now.timestamp_millis()).map_err(|_| {
-                ForgeError::InvalidConfig {
-                    detail: "Forge wall clock cannot represent an object-store timestamp"
-                        .to_owned(),
+            let normalized = binding.validate_object_path(path.as_str()).ok_or_else(|| {
+                ForgeError::Reconciliation {
+                    detail: format!("orphan-GC candidate escaped table binding: {path:?}"),
                 }
             })?;
-            let normalized = catalog_path_to_object_key(
-                table.metadata().location(),
-                binding,
-                &self.core.staging,
-                path.as_str(),
-            )?;
+            let protection = self
+                .load_maintenance_protection(
+                    key,
+                    binding,
+                    now,
+                    stop,
+                    staging_protected_paths,
+                    live_protected_paths,
+                    Some(detail),
+                )
+                .await?;
             let metadata = match self.core.object_store.stat(&normalized).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == ErrorKind::NotFound => {
-                    deleted.push(path.as_str().to_owned());
-                    continue;
-                }
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == ErrorKind::NotFound => None,
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
             };
-            if metadata.mode() != EntryMode::FILE {
+            let eligibility = protection.gc_eligibility(
+                binding,
+                &normalized,
+                metadata
+                    .as_ref()
+                    .map_or(ObjectEvidence::Missing, ObjectEvidence::Present),
+            );
+            if eligibility == GcEligibility::Missing {
+                deleted.push(path.as_str().to_owned());
+                continue;
+            }
+            if eligibility != GcEligibility::Eligible {
                 skipped.push(path.as_str().to_owned());
                 continue;
             }
-            if self
-                .path_is_referenced(key, binding, &table, &normalized)
-                .await?
-                || !is_gc_candidate(
-                    &normalized,
-                    &ProtectedLiveSet::default(),
-                    metadata.last_modified(),
-                    now,
-                    self.core.config.orphan_gc_ttl,
-                )
-            {
-                skipped.push(path.as_str().to_owned());
-                continue;
-            }
+            require_running(stop)?;
             lease.require_fence(&self.core.operator_pool).await?;
             match self.core.object_store.delete(&normalized).await {
                 Ok(()) => deleted.push(path.as_str().to_owned()),
@@ -356,6 +764,7 @@ impl Forge {
                 Err(error) => return Err(ForgeError::ObjectDelete(error)),
             }
         }
+        require_running(stop)?;
         lease.require_fence(&self.core.operator_pool).await?;
         let deleted_count = deleted.len();
         let skipped_count = skipped.len();
@@ -383,107 +792,7 @@ impl Forge {
         Ok((deleted_count, skipped_count))
     }
 
-    /// Recheck one candidate against the latest Iceberg metadata and SQL rows.
-    ///
-    /// The scheduler builds one complete retained live set per table tick. This
-    /// narrower lookup is the required final race check immediately before an
-    /// object delete; it avoids rebuilding the complete set for every candidate
-    /// while still protecting a reference that appeared after the initial list.
-    /// Rechecks Iceberg and SQL references immediately before one deletion.
-    ///
-    /// # Errors
-    /// Returns catalog or SQL lookup failures; no deletion occurs in this method.
-    async fn path_is_referenced(
-        &self,
-        key: &ForgeTableKey,
-        binding: &TenantTableBinding,
-        table: &iceberg::table::Table,
-        path: &str,
-    ) -> Result<bool, ForgeError> {
-        let path = catalog_path_to_object_key(
-            table.metadata().location(),
-            binding,
-            &self.core.staging,
-            path,
-        )?;
-        let table_location = table.metadata().location();
-        let matches = |reference: &str| {
-            catalog_path_to_object_key(table_location, binding, &self.core.staging, reference)
-                .map(|key| key == path)
-        };
-        if matches(
-            table
-                .metadata_location_result()
-                .map_err(ForgeError::Catalog)?,
-        )? {
-            return Ok(true);
-        }
-        for entry in table.metadata().metadata_log() {
-            if matches(&entry.metadata_file)? {
-                return Ok(true);
-            }
-        }
-        for snapshot in table.metadata().snapshots() {
-            if matches(snapshot.manifest_list())? {
-                return Ok(true);
-            }
-            let manifest_list = table
-                .manifest_list_reader(snapshot)
-                .load()
-                .await
-                .map_err(ForgeError::Catalog)?;
-            for manifest_file in manifest_list.entries() {
-                if matches(&manifest_file.manifest_path)? {
-                    return Ok(true);
-                }
-                let manifest = manifest_file
-                    .load_manifest(table.file_io())
-                    .await
-                    .map_err(ForgeError::Catalog)?;
-                for entry in manifest.entries() {
-                    if matches(entry.data_file().file_path())? {
-                        return Ok(true);
-                    }
-                }
-            }
-            if table
-                .metadata()
-                .statistics_for_snapshot(snapshot.snapshot_id())
-                .map(|statistics| matches(&statistics.statistics_path))
-                .transpose()?
-                .unwrap_or(false)
-                || table
-                    .metadata()
-                    .partition_statistics_for_snapshot(snapshot.snapshot_id())
-                    .map(|statistics| matches(&statistics.statistics_path))
-                    .transpose()?
-                    .unwrap_or(false)
-            {
-                return Ok(true);
-            }
-        }
-
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = $2 AND table_name = $3 AND file_path = $4",
-    )
-    .bind(key.tenant.as_uuid())
-    .bind(key.table_ref.namespace.as_str())
-    .bind(&key.table_ref.name)
-    .bind(&path)
-    .fetch_one(&mut **conn.transaction())
-    .await
-    .map_err(|error| ForgeError::Sql(error.into()))?;
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok(count > 0)
-    }
-
-    /// Replays prepared orphan-GC audits that lack a terminal event.
+    /// Replays the cap-bounded, parity-proven open orphan-GC projection.
     ///
     /// # Errors
     /// Returns audit, lease, object-store, catalog, or SQL failures.
@@ -492,14 +801,38 @@ impl Forge {
         lease: &mut ForgeLease,
         key: &ForgeTableKey,
         binding: &TenantTableBinding,
+        stop: &CancellationToken,
         now: DateTime<Utc>,
+        staging_protected_paths: &BTreeSet<String>,
+        live_protected_paths: &BTreeSet<String>,
     ) -> Result<OrphanGcOutcome, ForgeError> {
-        let (prepared, terminal) = self.load_gc_audits(key).await?;
+        require_running(stop)?;
+        let resource = table_resource_for_key(key);
+        let mut conn = self
+            .core
+            .vala
+            .tenant_conn(key.tenant)
+            .await
+            .map_err(ForgeError::Sql)?;
+        let page = ForgeOperations::new(&resource, ForgeOperationFamily::OrphanGc)
+            .map_err(ForgeError::Sql)?
+            .list_open(&mut conn, self.core.config.max_open_operations_per_table)
+            .await
+            .map_err(ForgeError::Sql)?;
+        conn.commit().await.map_err(ForgeError::Sql)?;
         let mut outcome = OrphanGcOutcome::default();
-        for (operation_id, (detail, _created_at)) in prepared {
-            if terminal.contains(&operation_id) {
-                continue;
-            }
+        outcome.overflowed = page.overflowed;
+        if page.overflowed {
+            outcome.pending = self
+                .core
+                .config
+                .max_open_operations_per_table
+                .saturating_add(1);
+            return Ok(outcome);
+        }
+        for row in page.operations {
+            require_running(stop)?;
+            let detail = row.prepared_detail;
             let AuditDetail::ForgeOrphanGc {
                 candidate_paths, ..
             } = &detail
@@ -509,7 +842,17 @@ impl Forge {
                 });
             };
             let (deleted, skipped) = self
-                .delete_gc_batch(lease, key, binding, &detail, true, now)
+                .delete_gc_batch(
+                    lease,
+                    key,
+                    binding,
+                    &detail,
+                    true,
+                    now,
+                    stop,
+                    staging_protected_paths,
+                    live_protected_paths,
+                )
                 .await?;
             outcome.candidates = outcome.candidates.saturating_add(candidate_paths.len());
             outcome.recovered = outcome.recovered.saturating_add(1);
@@ -517,84 +860,6 @@ impl Forge {
             outcome.skipped = outcome.skipped.saturating_add(skipped);
         }
         Ok(outcome)
-    }
-
-    /// Loads prepared and terminal orphan-GC audit records for one table.
-    ///
-    /// # Errors
-    /// Returns SQL or audit decoding failures. Cancellation leaves audit state unchanged.
-    async fn load_gc_audits(
-        &self,
-        key: &ForgeTableKey,
-    ) -> Result<
-        (
-            HashMap<Uuid, (AuditDetail, chrono::DateTime<chrono::Utc>)>,
-            HashSet<Uuid>,
-        ),
-        ForgeError,
-    > {
-        let mut conn = self
-            .core
-            .vala
-            .tenant_conn(key.tenant)
-            .await
-            .map_err(ForgeError::Sql)?;
-        let mut after_seq = 0_i64;
-        let mut prepared = HashMap::new();
-        let mut terminal = HashSet::new();
-        loop {
-            let page = vala_sql::queries::audit_outbox::list_audit_events_for_resource(
-                &mut conn,
-                &table_resource_for_key(key),
-                after_seq,
-                self.core.config.audit_page_size,
-            )
-            .await
-            .map_err(ForgeError::Sql)?;
-            let page_len = page.len();
-            for row in page {
-                after_seq = row.seq;
-                let Some(detail) = row.detail else { continue };
-                let detail = serde_json::from_str::<AuditDetail>(&detail).map_err(|error| {
-                    ForgeError::Reconciliation {
-                        detail: error.to_string(),
-                    }
-                })?;
-                let AuditDetail::ForgeOrphanGc {
-                    operation_id,
-                    phase,
-                    group,
-                    candidate_paths,
-                    ..
-                } = &detail
-                else {
-                    continue;
-                };
-                if group != &table_resource_for_key(key)
-                    || candidate_paths.is_empty()
-                    || candidate_paths
-                        .windows(2)
-                        .any(|pair| pair[0].as_str() >= pair[1].as_str())
-                {
-                    return Err(ForgeError::Reconciliation {
-                        detail: "orphan-GC audit detail is not canonical".to_owned(),
-                    });
-                }
-                match phase {
-                    ForgeOrphanGcPhase::Prepared => {
-                        prepared.insert(*operation_id, (detail, row.created_at));
-                    }
-                    ForgeOrphanGcPhase::Committed | ForgeOrphanGcPhase::Recovered => {
-                        terminal.insert(*operation_id);
-                    }
-                }
-            }
-            if page_len < usize::try_from(self.core.config.audit_page_size).unwrap_or(usize::MAX) {
-                break;
-            }
-        }
-        conn.commit().await.map_err(ForgeError::Sql)?;
-        Ok((prepared, terminal))
     }
 
     fn gc_detail(
@@ -776,6 +1041,12 @@ impl Forge {
         })
     }
 
+    /// Applies the production Iceberg-object predicate to a test fixture path.
+    #[cfg(feature = "test-support")]
+    pub fn known_iceberg_object_for_test(path: &str) -> bool {
+        Self::known_iceberg_object(path)
+    }
+
     fn gc_operation_id(key: &ForgeTableKey, candidates: &[String]) -> Uuid {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
@@ -796,7 +1067,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gc_live_set_includes_all_retained_iceberg_and_pending_file_list_paths() {
+    fn maintenance_protection_traverses_retained_history() {
         let mut live = ProtectedLiveSet::default();
         live.insert("tenants/t/traces/spans/data/live.parquet");
         live.insert("tenants/t/traces/spans/metadata/v1.metadata.json");
@@ -807,33 +1078,103 @@ mod tests {
     }
 
     #[test]
-    fn gc_candidate_requires_absent_live_reference_and_24h_age() {
-        let now = Timestamp::from_millisecond(48 * 60 * 60 * 1_000).expect("timestamp");
+    /// Covers every accepted retained manifest pair and rejects cross-content drift.
+    fn retained_manifest_entry_parity_covers_data_and_delete_files() {
+        assert!(
+            validate_retained_manifest_entry(ManifestContentType::Data, DataContentType::Data)
+                .is_ok()
+        );
+        assert!(
+            validate_retained_manifest_entry(
+                ManifestContentType::Deletes,
+                DataContentType::PositionDeletes
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_retained_manifest_entry(
+                ManifestContentType::Deletes,
+                DataContentType::EqualityDeletes
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_retained_manifest_entry(
+                ManifestContentType::Data,
+                DataContentType::PositionDeletes
+            )
+            .is_err()
+        );
+        assert!(
+            validate_retained_manifest_entry(ManifestContentType::Deletes, DataContentType::Data)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gc_eligibility_uses_one_initial_and_final_truth_table() {
+        use crate::catalog::TableRef;
+        use crate::namespaces::BifrostNamespace;
+
         let old = Timestamp::from_millisecond(0).expect("timestamp");
         let young = Timestamp::from_millisecond(47 * 60 * 60 * 1_000).expect("timestamp");
+        let cutoff = Timestamp::from_millisecond(24 * 60 * 60 * 1_000).expect("timestamp");
+        let binding = TenantTableBinding::resolve((
+            DataTenantId::new_v7(),
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("binding");
+        let old_path = format!("{}/data/old.parquet", binding.object_prefix);
+        let young_path = format!("{}/data/young.parquet", binding.object_prefix);
+        let protected_path = format!("{}/data/live.parquet", binding.object_prefix);
         let mut live = ProtectedLiveSet::default();
-        live.insert("tenants/t/traces/spans/data/live.parquet");
-        let ttl = Duration::from_hours(24);
-        assert!(!is_gc_candidate(
-            "tenants/t/traces/spans/data/live.parquet",
-            &live,
-            Some(old),
-            now,
-            ttl
-        ));
-        assert!(!is_gc_candidate(
-            "tenants/t/traces/spans/data/young.parquet",
-            &live,
-            Some(young),
-            now,
-            ttl
-        ));
-        assert!(is_gc_candidate(
-            "tenants/t/traces/spans/data/old.parquet",
-            &live,
-            Some(old),
-            now,
-            ttl
-        ));
+        live.insert(protected_path.clone());
+        let protection = MaintenanceProtection {
+            live_set: live,
+            destructive_maintenance: DestructiveMaintenance::Allowed,
+            now: DateTime::<Utc>::from_timestamp_millis(48 * 60 * 60 * 1_000).expect("time"),
+            object_age_cutoff: cutoff,
+        };
+        let old_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(old);
+        let young_metadata = opendal::Metadata::new(EntryMode::FILE).with_last_modified(young);
+        let directory = opendal::Metadata::new(EntryMode::DIR);
+
+        assert_eq!(
+            protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Present(&old_metadata)),
+            GcEligibility::Eligible
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &binding,
+                &protected_path,
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::Protected
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &binding,
+                &young_path,
+                ObjectEvidence::Present(&young_metadata)
+            ),
+            GcEligibility::TooYoung
+        );
+        assert_eq!(
+            protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Present(&directory)),
+            GcEligibility::NotFile
+        );
+        assert_eq!(
+            protection.gc_eligibility(
+                &binding,
+                "other/data/file.parquet",
+                ObjectEvidence::Present(&old_metadata)
+            ),
+            GcEligibility::InvalidPath
+        );
+        assert_eq!(
+            protection.gc_eligibility(&binding, &old_path, ObjectEvidence::Missing),
+            GcEligibility::Missing
+        );
+        assert_eq!(protection.now.timestamp_millis(), 48 * 60 * 60 * 1_000);
     }
 }

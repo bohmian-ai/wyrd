@@ -1164,6 +1164,16 @@ fn deterministic_output_path(prefix: &str, operation_id: Uuid, ordinal: usize) -
     )
 }
 
+/// Builds the production deterministic Forge output path for test fixtures.
+#[cfg(feature = "test-support")]
+pub fn deterministic_output_path_for_test(
+    prefix: &str,
+    operation_id: Uuid,
+    ordinal: usize,
+) -> String {
+    deterministic_output_path(prefix, operation_id, ordinal)
+}
+
 /// `DataFusion` leaf plan that owns bounded staging-file decoding.
 #[derive(Debug)]
 struct StagingParquetExec {
@@ -1560,12 +1570,14 @@ mod tests {
     #[test]
     fn rotation_keeps_one_operation_identity() {
         let operation_id = Uuid::from_u128(42);
-        let first = deterministic_output_path("tenants/a/table", operation_id, 0);
-        let second = deterministic_output_path("tenants/a/table", operation_id, 1);
+        let first = deterministic_output_path_for_test("tenants/a/table", operation_id, 0);
+        let second = deterministic_output_path_for_test("tenants/a/table", operation_id, 1);
         assert!(first.contains(&operation_id.to_string()));
         assert!(second.contains(&operation_id.to_string()));
         assert!(first.ends_with("-00000.parquet"));
         assert!(second.ends_with("-00001.parquet"));
+        assert!(crate::forge::Forge::known_iceberg_object_for_test(&first));
+        assert!(crate::forge::Forge::known_iceberg_object_for_test(&second));
     }
 
     /// A writer recipe change produces a distinct deterministic storage path.

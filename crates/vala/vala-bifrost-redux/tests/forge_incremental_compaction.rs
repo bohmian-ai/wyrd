@@ -15,7 +15,7 @@ mod pg_tests {
     use iceberg::Catalog;
     use iceberg::spec::{
         DataContentType, DataFile, DataFileBuilder, DataFileFormat, Datum, Literal, NullOrder,
-        PrimitiveType, SortDirection, Struct, Transform, Type,
+        PrimitiveType, SortDirection, StatisticsFile, Struct, Transform, Type,
     };
     use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
     use opendal::services::Fs;
@@ -956,6 +956,183 @@ mod pg_tests {
         .await
         .expect("fixture lease query")
         .expect("fixture lease")
+    }
+
+    /// Proves a terminal staging row alone cannot retain an otherwise eligible object.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the real catalog roster, tenant row, object store, or Forge
+    /// GC workflow fails to delete the expired object.
+    #[tokio::test]
+    async fn terminal_file_list_history_does_not_protect_expired_object() {
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                min_files: 10,
+                orphan_gc_ttl: Duration::from_millis(1),
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let path = format!(
+            "{}/data/terminal-history.parquet",
+            fixture.binding.object_prefix
+        );
+        fixture
+            .staging
+            .write(&path, Buffer::from(vec![1_u8]))
+            .await
+            .expect("orphan object");
+        let now = chrono::Utc::now();
+        sqlx::query(
+            "INSERT INTO vala.file_list (
+                id, data_tenant_id, namespace, table_name, file_path, file_size,
+                row_count, min_event_time, max_event_time, partition_day,
+                node_id, writer_epoch, wal_lsn_min, wal_lsn_max,
+                compacted, committed_snapshot_id
+             ) VALUES ($1,$2,$3,$4,$5,1,1,$6,$6,$7,$8,1,1,2,true,1)",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(fixture.tenant.as_uuid())
+        .bind(&fixture.binding.logical_namespace)
+        .bind(&fixture.binding.table_name)
+        .bind(&path)
+        .bind(now)
+        .bind(now.date_naive())
+        .bind(uuid::Uuid::now_v7())
+        .execute(
+            &fixture
+                .pg
+                .superuser_pool()
+                .await
+                .expect("fixture owner pool"),
+        )
+        .await
+        .expect("terminal staging history");
+
+        let outcome = fixture.forge.run_once().await.expect("Forge GC tick");
+        assert_eq!(outcome.gc_deleted, 1);
+        assert!(fixture.staging.stat(&path).await.is_err());
+    }
+
+    /// Proves the production loader traverses real retained catalog history and statistics.
+    ///
+    /// # Panics
+    ///
+    /// Panics when fixture commits fail, a real retained object is omitted, or
+    /// the retained-snapshot cap does not fail closed.
+    #[tokio::test]
+    async fn maintenance_protection_real_catalog_inventory_and_cap() {
+        let fixture =
+            Fixture::new_with_config(ForgeConfig::default(), true, 4, 16 * 1024 * 1024).await;
+        fixture.forge.run_once().await.expect("data snapshot");
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("table with data snapshot");
+        let snapshot_id = table
+            .metadata()
+            .current_snapshot_id()
+            .expect("data snapshot id");
+        let statistics_key = format!("{}/metadata/stats.puffin", fixture.binding.object_prefix);
+        fixture
+            .staging
+            .write(&statistics_key, Buffer::from(vec![1_u8]))
+            .await
+            .expect("statistics object");
+        let statistics = StatisticsFile {
+            snapshot_id,
+            statistics_path: format!("{}/metadata/stats.puffin", table.metadata().location()),
+            file_size_in_bytes: 1,
+            file_footer_size_in_bytes: 0,
+            key_metadata: None,
+            blob_metadata: Vec::new(),
+        };
+        let update = Transaction::new(&table)
+            .update_statistics()
+            .set_statistics(statistics);
+        ApplyTransactionAction::apply(update, Transaction::new(&table))
+            .expect("statistics action")
+            .commit(fixture.catalog.as_ref())
+            .await
+            .expect("statistics commit");
+
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("retained table");
+        let protection = fixture
+            .forge
+            .load_maintenance_protection_for_test(&fixture.binding)
+            .await
+            .expect("production protection");
+        let paths = protection.paths_for_test();
+        assert!(paths.contains(&statistics_key));
+        assert!(
+            table
+                .metadata()
+                .metadata_log()
+                .iter()
+                .all(|entry| paths.iter().any(|path| entry.metadata_file.ends_with(path)))
+        );
+        for snapshot in table.metadata().snapshots() {
+            assert!(
+                paths
+                    .iter()
+                    .any(|path| snapshot.manifest_list().ends_with(path))
+            );
+            let manifests = table
+                .manifest_list_reader(snapshot)
+                .load()
+                .await
+                .expect("manifest list");
+            for manifest_file in manifests.entries() {
+                assert!(
+                    paths
+                        .iter()
+                        .any(|path| manifest_file.manifest_path.ends_with(path))
+                );
+                let manifest = manifest_file
+                    .load_manifest(table.file_io())
+                    .await
+                    .expect("manifest");
+                for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                    assert!(
+                        paths
+                            .iter()
+                            .any(|path| entry.data_file().file_path().ends_with(path))
+                    );
+                }
+            }
+        }
+
+        let mut capped = ForgeConfig::default();
+        capped.max_retained_snapshots_per_table = 1;
+        let capped_forge = Fixture::new_with_config(capped, true, 4, 16 * 1024 * 1024).await;
+        capped_forge
+            .forge
+            .run_once()
+            .await
+            .expect("first capped snapshot");
+        let capped_table = capped_forge
+            .catalog
+            .load_table(&capped_forge.binding.table_ident())
+            .await
+            .expect("first capped table");
+        capped_forge.seed_files_at(99, 1, true).await;
+        capped_forge.append_seed_manifest(&capped_table, 99).await;
+        assert!(
+            capped_forge
+                .forge
+                .load_maintenance_protection_for_test(&capped_forge.binding)
+                .await
+                .is_err()
+        );
     }
 
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.

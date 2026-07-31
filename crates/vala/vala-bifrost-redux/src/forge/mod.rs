@@ -33,6 +33,8 @@ pub use clock::ForgeClockControl;
 pub use compact::{ForgeConfig, ForgeObjectStore, ForgeTickOutcome};
 pub use error::ForgeError;
 pub use rewrite::ForgeRewriteRuntime;
+#[cfg(feature = "test-support")]
+pub use rewrite::deterministic_output_path_for_test;
 
 #[cfg(feature = "test-support")]
 pub use lease::{ForgeLease, forge_lease_key};
@@ -40,6 +42,8 @@ pub use lease::{ForgeLease, forge_lease_key};
 pub use live_reconcile::LiveReconciliationTestOutcome;
 #[cfg(feature = "test-support")]
 pub use live_replace::IcebergRewriteDisposition;
+#[cfg(feature = "test-support")]
+pub use orphan_gc::current_gc_gate_for_test;
 #[cfg(feature = "test-support")]
 pub use right_size::{IcebergCandidateFile, IcebergRewriteGroup, IcebergTablePlan};
 

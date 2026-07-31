@@ -133,7 +133,7 @@ async fn run_scenario(scenario: Scenario) {
             .unwrap_or_else(|error| panic!("{} advance Forge clock: {error}", scenario.name));
     }
 
-    let expected_rows = u64::try_from(scenario.pods * WRITE_CYCLES * SPANS_PER_WRITE)
+    let expected_rows = u64::try_from((scenario.pods * WRITE_CYCLES + 2) * SPANS_PER_WRITE)
         .expect("bounded journey row count");
     let pending_before = pending_files(control, &tenants).await;
     assert_pending_files_are_old_enough(control, &tenants, scenario).await;
@@ -167,7 +167,48 @@ async fn run_scenario(scenario: Scenario) {
             .unwrap_or_else(|error| panic!("{} Forge tick: {error}", scenario.name));
     }
 
+    wait_for_compaction(servers, &tenants, scenario).await;
+    let retention_writer = &servers[..1];
+    for cycle in WRITE_CYCLES..(WRITE_CYCLES + 2) {
+        write_cycle(retention_writer, &tenants, cycle, scenario).await;
+        for server in retention_writer {
+            for tenant in &tenants {
+                server
+                    .flush_bifrost_for_tenant(tenant.id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} tenant {} retained-history flush: {error}",
+                            scenario.name, tenant.id
+                        )
+                    });
+            }
+        }
+    }
+    for server in servers {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::days(1) + chrono::Duration::minutes(3))
+            .unwrap_or_else(|error| {
+                panic!("{} advance retained-history clock: {error}", scenario.name)
+            });
+    }
+    let retained_ticks = servers
+        .iter()
+        .map(|server| {
+            let forge = server.state().forge().expect("server-owned Forge").clone();
+            tokio::spawn(async move { forge.run_once().await })
+        })
+        .collect::<Vec<_>>();
+    for tick in retained_ticks {
+        tick.await
+            .expect("retained-history Forge tick task")
+            .unwrap_or_else(|error| {
+                panic!("{} retained-history Forge tick: {error}", scenario.name)
+            });
+    }
     let tails = wait_for_compaction(servers, &tenants, scenario).await;
+    let retained_only_path = retained_only_catalog_path(control, tenants[0].id, scenario).await;
     let terminal_history_deleted = delete_terminal_file_list_history(control, tenants[0].id).await;
     assert!(
         terminal_history_deleted > 0,
@@ -175,6 +216,47 @@ async fn run_scenario(scenario: Scenario) {
         scenario.name
     );
     assert_active_traces_roster(control, &tenants, scenario).await;
+    let retained_tick = control
+        .state()
+        .forge()
+        .expect("server-owned Forge")
+        .run_once()
+        .await
+        .unwrap_or_else(|error| panic!("{} retained-history tick: {error}", scenario.name));
+    assert_eq!(
+        retained_tick.gc_deleted, 0,
+        "{} retained history allowed premature deletion",
+        scenario.name
+    );
+    assert!(
+        control
+            .state()
+            .storage
+            .operator()
+            .stat(&retained_only_path)
+            .await
+            .is_ok(),
+        "{} retained-only object disappeared before expiry: {retained_only_path}",
+        scenario.name
+    );
+    for server in servers {
+        server
+            .forge_clock()
+            .advance(chrono::Duration::hours(121))
+            .unwrap_or_else(|error| panic!("{} advance retention clock: {error}", scenario.name));
+    }
+    wait_for_converged_tick(control, scenario).await;
+    assert!(
+        control
+            .state()
+            .storage
+            .operator()
+            .stat(&retained_only_path)
+            .await
+            .is_err(),
+        "{} expired retained-only object survived GC: {retained_only_path}",
+        scenario.name
+    );
     let no_op = wait_for_converged_tick(control, scenario).await;
     assert!(
         no_op.is_converged()
@@ -235,6 +317,90 @@ async fn run_scenario(scenario: Scenario) {
         .shutdown()
         .await
         .unwrap_or_else(|error| panic!("{} shutdown: {error}", scenario.name));
+}
+
+/// Returns one catalog object reachable only from retained, non-current history.
+///
+/// # Panics
+///
+/// Panics when the real catalog cannot be loaded or the scenario failed to
+/// produce a retained non-current snapshot with a manifest-list object.
+async fn retained_only_catalog_path(
+    server: &WyrdTestServer,
+    tenant: DataTenantId,
+    scenario: Scenario,
+) -> String {
+    use std::collections::BTreeSet;
+
+    let binding = vala_bifrost_redux::catalog::TenantTableBinding::resolve((
+        tenant,
+        vala_bifrost_redux::catalog::TableRef::new(
+            vala_bifrost_redux::namespaces::BifrostNamespace::Traces,
+            "spans",
+        ),
+    ))
+    .expect("traces binding");
+    let table = server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Redux catalog")
+        .iceberg_catalog()
+        .load_table(&binding.table_ident())
+        .await
+        .unwrap_or_else(|error| panic!("{} load retained table: {error}", scenario.name));
+    let current = table
+        .metadata()
+        .current_snapshot_id()
+        .expect("current snapshot");
+    let location = table.metadata().location().trim_end_matches('/');
+    let normalize = |path: &str| {
+        if path.starts_with(&format!("{}/", binding.object_prefix)) {
+            path.to_owned()
+        } else {
+            let relative = path
+                .strip_prefix(&format!("{location}/"))
+                .expect("catalog data path stays below table");
+            format!("{}/{relative}", binding.object_prefix)
+        }
+    };
+    for snapshot in table.metadata().snapshots() {
+        if snapshot.snapshot_id() != current {
+            return normalize(snapshot.manifest_list());
+        }
+    }
+
+    let mut all = BTreeSet::new();
+    let mut current_paths = BTreeSet::new();
+    for snapshot in table.metadata().snapshots() {
+        let manifests = table
+            .manifest_list_reader(snapshot)
+            .load()
+            .await
+            .expect("retained manifest list");
+        for manifest_file in manifests.entries() {
+            let manifest = manifest_file
+                .load_manifest(table.file_io())
+                .await
+                .expect("retained manifest");
+            for entry in manifest.entries().iter().filter(|entry| entry.is_alive()) {
+                let path = normalize(entry.data_file().file_path());
+                all.insert(path.clone());
+                if snapshot.snapshot_id() == current {
+                    current_paths.insert(path);
+                }
+            }
+        }
+    }
+    all.difference(&current_paths)
+        .next()
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "{} did not produce a retained non-current catalog object",
+                scenario.name
+            )
+        })
 }
 
 /// Authenticated tenant identity used by concurrent writers and query checks.

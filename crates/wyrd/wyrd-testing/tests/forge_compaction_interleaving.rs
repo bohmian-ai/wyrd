@@ -116,6 +116,69 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
     (owner, token.fencing_token)
 }
 
+/// Fold exactly the fixture's two staged inputs without consuming a live rewrite.
+///
+/// The real scheduler still runs the complete production stage order. Limiting
+/// the per-tick file budget to the two staged inputs deliberately exhausts the
+/// shared budget before live replacement, leaving the resulting snapshot for a
+/// test that needs to control that replacement separately.
+///
+/// # Panics
+///
+/// Panics when the production-shaped tick cannot compact the fixture's exact
+/// staged pair or unexpectedly commits a live replacement.
+async fn fold_staged_pair_without_live_replacement(fixture: &wyrd_testing::bifrost::ForgeFixture) {
+    let mut config = fixture.config.clone();
+    config.max_files_per_tick = 2;
+    let outcome = fixture
+        .context_with_config(config)
+        .run_once()
+        .await
+        .expect("staged-pair preparation tick");
+    assert_eq!(outcome.staging_input_files, 2);
+    assert_eq!(outcome.bins_committed, 1);
+    assert_eq!(outcome.live_groups_committed, 0);
+}
+
+/// Advance the fixture's shared manual Forge clock beyond short uncertainty windows.
+///
+/// Live-rewrite recovery is intentionally based on Forge wall time rather than
+/// elapsed Tokio time, so prepared-operation fixtures advance this control
+/// explicitly to a full second beyond wall time before asking a fresh scheduler
+/// to classify their state. The margin exceeds both Forge's millisecond clock
+/// storage and PostgreSQL's microsecond audit timestamps.
+///
+/// # Panics
+///
+/// Panics when a checked future UTC instant cannot be represented or the
+/// test-owned monotonic clock cannot reach it.
+fn advance_forge_clock_past_uncertainty(server: &WyrdTestServer) {
+    let future = chrono::Utc::now()
+        .checked_add_signed(chrono::Duration::seconds(1))
+        .expect("future Forge clock instant is representable");
+    server
+        .forge_clock()
+        .set(future)
+        .expect("advance Forge clock beyond uncertainty window");
+}
+
+/// Build a recovery tick configuration that cannot start a two-file replacement.
+///
+/// Reset and recovered-state tests inspect one terminal transition. Their
+/// scheduler tick must still execute production reconciliation, but a one-file
+/// budget keeps the next eligible two-file live rewrite for a later test step;
+/// a one-year snapshot window prevents unrelated expiry commits from consuming
+/// an uncertainty-injection catalog seam.
+fn recovery_config_without_live_replacement(
+    fixture: &wyrd_testing::bifrost::ForgeFixture,
+) -> vala_bifrost_redux::forge::ForgeConfig {
+    let mut config = fixture.config.clone();
+    config.max_files_per_tick = 1;
+    config.uncertainty_bound = Duration::from_micros(1);
+    config.snapshot_retention = Duration::from_secs(31_536_000);
+    config
+}
+
 /// Build two eligible live files, then discover one exact replacement through
 /// the supplied catalog graph.
 async fn live_replacement_context(
@@ -127,10 +190,10 @@ async fn live_replacement_context(
     vala_bifrost_redux::forge::IcebergTablePlan,
     vala_bifrost_redux::forge::ForgeLease,
 ) {
-    fixture.forge.run_once().await.expect("first staging fold");
+    fold_staged_pair_without_live_replacement(fixture).await;
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    fixture.forge.run_once().await.expect("second staging fold");
+    fold_staged_pair_without_live_replacement(fixture).await;
 
     let context = fixture.context_with_catalog(fixture.config.clone(), control.clone());
     let table = control
@@ -372,10 +435,10 @@ async fn live_rewrite_state_phase(fixture: &wyrd_testing::bifrost::ForgeFixture)
 async fn prepare_cancelled_live_rewrite(
     fixture: &wyrd_testing::bifrost::ForgeFixture,
 ) -> (Arc<ForgeObjectStoreControl>, BTreeSet<String>) {
-    fixture.forge.run_once().await.expect("first staging fold");
+    fold_staged_pair_without_live_replacement(fixture).await;
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    fixture.forge.run_once().await.expect("second staging fold");
+    fold_staged_pair_without_live_replacement(fixture).await;
 
     let control = ForgeObjectStoreControl::new(Arc::clone(&fixture.staging));
     let context = fixture.context_with_object_store(fixture.config.clone(), Arc::clone(&control));
@@ -557,8 +620,8 @@ async fn restart_resets_abandoned_live_output_exactly_once() {
     let expected_rows = current_logical_rows(&fixture, &base_table).await;
     assert!(!expected_rows.is_empty());
     let output = control.last_output_path().expect("prepared output path");
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let restarted = fixture.context_with_object_store(config, Arc::clone(&control));
     let restart_task = tokio::spawn({
         let restarted = Arc::clone(&restarted);
@@ -569,7 +632,7 @@ async fn restart_resets_abandoned_live_output_exactly_once() {
         .expect("fresh reset tick completion bound")
         .expect("fresh reset tick task")
         .expect("fresh reset tick");
-    assert_eq!(outcome.tables_succeeded, 1);
+    assert_eq!(outcome.tables_succeeded, 1, "reset outcome: {outcome:?}");
     assert_eq!(outcome.live_reset, 1);
     assert_eq!(outcome.live_recovered, 0);
     assert_eq!(outcome.live_pending, 0);
@@ -617,8 +680,8 @@ async fn restart_replay_does_not_duplicate_live_terminal_transition() {
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "live_rewrite_restart_replay").await;
     let (control, _) = prepare_cancelled_live_rewrite(&fixture).await;
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let restarted = fixture.context_with_object_store(config, control);
     assert_eq!(
         {
@@ -719,8 +782,8 @@ async fn restart_recovers_catalog_accepted_live_rewrite_exactly_once() {
     assert_eq!(prepared_rows[0].0, "prepared");
     assert_eq!(prepared_rows[0].2, prepared_rows[0].3);
 
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let restarted = fixture.context_with_catalog(config, control);
     let restart_task = tokio::spawn({
         let restarted = Arc::clone(&restarted);
@@ -731,7 +794,7 @@ async fn restart_recovers_catalog_accepted_live_rewrite_exactly_once() {
         .expect("fresh recovered tick completion bound")
         .expect("fresh recovered tick task")
         .expect("fresh recovered tick");
-    assert_eq!(outcome.tables_succeeded, 1);
+    assert_eq!(outcome.tables_succeeded, 1, "recovery outcome: {outcome:?}");
     assert_eq!(outcome.live_recovered, 1);
     assert_eq!(outcome.live_reset, 0);
     assert_eq!(outcome.live_pending, 0);
@@ -816,8 +879,8 @@ async fn fence_loss_before_reset_delete_keeps_prepared_and_protected() {
     let (control, _) = prepare_cancelled_live_rewrite(&fixture).await;
     let output = control.last_output_path().expect("prepared output path");
     control.pause_next_delete();
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let restarted = fixture.context_with_object_store(config, Arc::clone(&control));
     let task = tokio::spawn(async move { restarted.run_once().await });
     tokio::time::timeout(Duration::from_secs(30), control.wait_for_delete())
@@ -874,8 +937,8 @@ async fn cancellation_at_reset_delete_keeps_prepared_without_terminal() {
     let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
     let output = control.last_output_path().expect("prepared output path");
     control.pause_next_delete();
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let (restarted, publisher) =
         fixture.context_with_object_store_and_publisher(config, Arc::clone(&control));
     let old_context = Arc::downgrade(&restarted);
@@ -937,8 +1000,8 @@ async fn live_rewrite_terminal_append_failure_leaves_prepared() {
     let fixture = seed_forge_group(&server, "live_rewrite_terminal_failure").await;
     let (control, before_paths) = prepare_cancelled_live_rewrite(&fixture).await;
     let output = control.last_output_path().expect("prepared output path");
-    let mut config = fixture.config.clone();
-    config.uncertainty_bound = Duration::from_micros(1);
+    let config = recovery_config_without_live_replacement(&fixture);
+    advance_forge_clock_past_uncertainty(&server);
     let restarted = fixture.context_with_object_store(config, control);
     restarted.fail_next_terminal_live_audit_for_test();
     let failed = restarted
@@ -1176,11 +1239,7 @@ async fn live_replacement_uses_plan_base_not_file_addition_snapshot() {
     );
     fixture.append_forge_file(4).await;
     fixture.append_forge_file(5).await;
-    fixture
-        .forge
-        .run_once()
-        .await
-        .expect("later candidate snapshot");
+    fold_staged_pair_without_live_replacement(&fixture).await;
     let candidate_table = fixture
         .catalog
         .load_table(&fixture.binding.table_ident())
@@ -1955,12 +2014,14 @@ async fn forge_expiry_lease_theft_before_terminal_audit_fails_closed() {
         .await
         .expect("real Forge server");
     let fixture = seed_forge_group(&server, "expiry_fence_rows").await;
-    fixture.forge.run_once().await.expect("first snapshot");
+    fold_staged_pair_without_live_replacement(&fixture).await;
     fixture.append_forge_file(2).await;
     fixture.append_forge_file(3).await;
-    fixture.forge.run_once().await.expect("second snapshot");
+    fold_staged_pair_without_live_replacement(&fixture).await;
+    advance_forge_clock_past_uncertainty(&server);
 
     let mut config = fixture.config.clone();
+    config.max_files_per_tick = 1;
     config.snapshot_retention = Duration::from_millis(1);
     let control = CommitUncertaintyCatalog::new(Arc::clone(&fixture.catalog));
     control.pause_after_commit();

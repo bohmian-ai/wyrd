@@ -170,3 +170,58 @@ impl Forge {
         self.core.clock.clone()
     }
 }
+
+#[cfg(test)]
+/// Verifies that Forge can consume the owned fork's maintenance contract types.
+mod iceberg_maintenance_contract_tests {
+    use iceberg::io::FileIO;
+    use iceberg::spec::TableMetadata;
+    use iceberg::table::Table;
+    use iceberg::transaction::{
+        CleanupTraversalLimits, ExpiredFileSet, ManifestRewriteLimits, ManifestRewriteOutcome,
+        ManifestRewriteResult, ManifestRewriteSelection, expired_files_between, rewrite_manifests,
+    };
+    use iceberg::{Catalog, Result};
+
+    /// Type-checks both maintenance futures without performing metadata or catalog IO.
+    async fn assert_owned_fork_function_signatures(
+        catalog: &dyn Catalog,
+        table: &Table,
+        file_io: &FileIO,
+        before: &TableMetadata,
+        after: &TableMetadata,
+        rewrite_selection: ManifestRewriteSelection,
+        rewrite_limits: ManifestRewriteLimits,
+        cleanup_limits: CleanupTraversalLimits,
+    ) {
+        let _: Result<ManifestRewriteResult> =
+            rewrite_manifests(catalog, table, rewrite_selection, rewrite_limits).await;
+        let _: Result<ExpiredFileSet> =
+            expired_files_between(file_io, before, after, cleanup_limits).await;
+    }
+
+    /// Pins the narrow owned-fork types consumed by later Forge maintenance orchestration.
+    #[test]
+    fn owned_fork_maintenance_types_are_consumable() {
+        let cleanup = CleanupTraversalLimits {
+            max_items: 8,
+            max_bytes: 1_024,
+        };
+        let rewrite = ManifestRewriteLimits {
+            max_manifests: 2,
+            max_entries: 8,
+            max_bytes: 1_024,
+        };
+        let selection = ManifestRewriteSelection {
+            manifest_paths: vec!["metadata/manifest.avro".to_owned()],
+        };
+        let expired = ExpiredFileSet::default();
+
+        assert_eq!(cleanup.max_items, 8);
+        assert_eq!(rewrite.max_manifests, 2);
+        assert_eq!(selection.manifest_paths.len(), 1);
+        assert!(expired.data_files.is_empty());
+        assert_eq!(ManifestRewriteOutcome::NoOp, ManifestRewriteOutcome::NoOp);
+        let _ = assert_owned_fork_function_signatures;
+    }
+}

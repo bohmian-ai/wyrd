@@ -4440,7 +4440,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.0"
-source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1d3bbf48a6ae5ab4b851f6538fe793067736c5d6"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1422e94ac570ed99abbf530403dd40de67d37dbf"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4496,7 +4496,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-sql"
 version = "0.9.0"
-source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1d3bbf48a6ae5ab4b851f6538fe793067736c5d6"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1422e94ac570ed99abbf530403dd40de67d37dbf"
 dependencies = [
  "async-trait",
  "iceberg",
@@ -4507,7 +4507,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.9.0"
-source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1d3bbf48a6ae5ab4b851f6538fe793067736c5d6"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1422e94ac570ed99abbf530403dd40de67d37dbf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4523,7 +4523,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.9.0"
-source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1d3bbf48a6ae5ab4b851f6538fe793067736c5d6"
+source = "git+https://github.com/mitari-ai/iceberg-rust?branch=wyrd%2Frewrite-files-action#1422e94ac570ed99abbf530403dd40de67d37dbf"
 dependencies = [
  "anyhow",
  "async-trait",

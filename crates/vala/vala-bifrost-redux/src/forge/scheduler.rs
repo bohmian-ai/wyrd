@@ -14,6 +14,10 @@ use super::error::ForgeError;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::live_reconcile::{DestructiveMaintenance, IcebergReconciliationOutcome};
 use super::live_replace::IcebergRewriteDisposition;
+use super::metrics::{
+    ForgeGaugeSnapshot, ForgeLeaseResult, ForgeMetricSource, ForgeMetricStage,
+    ReconciliationGaugeObservation,
+};
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
 
@@ -156,6 +160,7 @@ impl Forge {
         let owner = Uuid::now_v7();
         let now = self.core.clock.now()?;
         let mut outcome = ForgeTickOutcome::default();
+        let mut gauges = ForgeGaugeSnapshot::default();
         let mut budget = ForgeTickBudget::default();
         let (mut tables, discovery_failures) = self.discover_tables().await?;
         outcome.tables_discovered = tables.len().saturating_add(discovery_failures);
@@ -175,7 +180,15 @@ impl Forge {
                 break;
             }
             match self
-                .process_periodic_table(&key, owner, stop, &mut budget, now, &mut outcome)
+                .process_periodic_table(
+                    &key,
+                    owner,
+                    stop,
+                    &mut budget,
+                    now,
+                    &mut outcome,
+                    &mut gauges,
+                )
                 .await
             {
                 TableRunStatus::Succeeded => {
@@ -194,6 +207,8 @@ impl Forge {
             outcome.tick_complete = true;
             self.periodic_cursor.fetch_add(1, Ordering::AcqRel);
         }
+        self.core.metrics.record_outcome(&outcome);
+        self.core.metrics.record_complete_tick(&outcome, gauges);
         Ok(outcome)
     }
 
@@ -237,6 +252,7 @@ impl Forge {
                 }
             }
         }
+        self.core.metrics.record_outcome(&aggregate);
         Ok(aggregate)
     }
 
@@ -277,6 +293,7 @@ impl Forge {
         )
         .await?
         else {
+            self.core.metrics.record_lease(ForgeLeaseResult::Contention);
             let outcome = ForgeTickOutcome {
                 lease_contention: 1,
                 tables_skipped: 1,
@@ -284,11 +301,22 @@ impl Forge {
             };
             return Ok(outcome);
         };
+        let mut takeover = ForgeTickOutcome::default();
+        if lease.takeover() {
+            takeover.lease_takeovers = 1;
+            self.core.metrics.record_lease(ForgeLeaseResult::Takeover);
+        }
 
         let result = async {
             let mut outcome = ForgeTickOutcome::default();
-            let recovered = self
-                .run_compaction_reconciliation_for_table(&mut lease, &table_key, &binding, now)
+            outcome.merge(takeover);
+            let (recovered, _) = self
+                .core
+                .metrics
+                .observe_stage(
+                    ForgeMetricStage::ReconcileStaging,
+                    self.run_compaction_reconciliation_for_table(&mut lease, &table_key, &binding),
+                )
                 .await?;
             outcome.reconciliation_recovered =
                 outcome.reconciliation_recovered.saturating_add(recovered);
@@ -299,7 +327,12 @@ impl Forge {
                 return Ok(outcome);
             }
             let live = match self
-                .reconcile_live_replacements(&mut lease, &table_key, &binding, stop, now)
+                .core
+                .metrics
+                .observe_stage(
+                    ForgeMetricStage::ReconcileIceberg,
+                    self.reconcile_live_replacements(&mut lease, &table_key, &binding, stop, now),
+                )
                 .await
             {
                 Ok(live) => live,
@@ -312,15 +345,20 @@ impl Forge {
             };
             record_live_reconciliation(&mut outcome, &live);
             match staging_stage_result(
-                self.run_targeted_compaction_for_table(
-                    &mut lease,
-                    key,
-                    &binding,
-                    budget,
-                    now.date_naive(),
-                    stop,
-                )
-                .await,
+                self.core
+                    .metrics
+                    .observe_stage(
+                        ForgeMetricStage::StagingFold,
+                        self.run_targeted_compaction_for_table(
+                            &mut lease,
+                            key,
+                            &binding,
+                            budget,
+                            now.date_naive(),
+                            stop,
+                        ),
+                    )
+                    .await,
             )? {
                 StagingStageResult::Completed(staging) => outcome.merge(staging),
                 StagingStageResult::Cancelled => {
@@ -393,6 +431,7 @@ impl Forge {
         budget: &mut ForgeTickBudget,
         now: DateTime<Utc>,
         outcome: &mut ForgeTickOutcome,
+        gauges: &mut ForgeGaugeSnapshot,
     ) -> TableRunStatus {
         let binding = match TenantTableBinding::resolve((key.tenant, key.table_ref.clone())) {
             Ok(binding) => binding,
@@ -419,6 +458,7 @@ impl Forge {
             Ok(Some(lease)) => lease,
             Ok(None) => {
                 outcome.lease_contention = outcome.lease_contention.saturating_add(1);
+                self.core.metrics.record_lease(ForgeLeaseResult::Contention);
                 return TableRunStatus::Skipped;
             }
             Err(error) => {
@@ -426,8 +466,14 @@ impl Forge {
                 return TableRunStatus::Failed;
             }
         };
+        if lease.takeover() {
+            outcome.lease_takeovers = outcome.lease_takeovers.saturating_add(1);
+            self.core.metrics.record_lease(ForgeLeaseResult::Takeover);
+        }
         let table_result = self
-            .run_periodic_table_stages(&mut lease, key, &binding, stop, budget, now, outcome)
+            .run_periodic_table_stages(
+                &mut lease, key, &binding, stop, budget, now, outcome, gauges,
+            )
             .await;
         let release_result = self.release_lease(&lease).await;
         match (table_result, release_result) {
@@ -437,7 +483,7 @@ impl Forge {
             }
             (Err(error), Ok(())) | (Ok(_), Err(error)) => {
                 outcome.pending_work = true;
-                Self::record_table_failure(key, outcome, &error);
+                self.record_table_failure(key, outcome, &error);
                 TableRunStatus::Failed
             }
             (Err(error), Err(release_error)) => {
@@ -447,7 +493,7 @@ impl Forge {
                     "Forge stage failed and lease release also failed"
                 );
                 outcome.pending_work = true;
-                Self::record_table_failure(key, outcome, &error);
+                self.record_table_failure(key, outcome, &error);
                 TableRunStatus::Failed
             }
         }
@@ -468,10 +514,17 @@ impl Forge {
         budget: &mut ForgeTickBudget,
         now: DateTime<Utc>,
         outcome: &mut ForgeTickOutcome,
+        gauges: &mut ForgeGaugeSnapshot,
     ) -> Result<TableStageDisposition, ForgeError> {
-        let reconciliation = self
-            .run_compaction_reconciliation_for_table(lease, key, binding, now)
+        let (reconciliation, staging_observation) = self
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::ReconcileStaging,
+                self.run_compaction_reconciliation_for_table(lease, key, binding),
+            )
             .await?;
+        gauges.record_reconciliation(ForgeMetricSource::Staging, staging_observation);
         outcome.reconciliation_recovered = outcome
             .reconciliation_recovered
             .saturating_add(reconciliation);
@@ -481,7 +534,12 @@ impl Forge {
             return Ok(TableStageDisposition::Cancelled);
         }
         let live = match self
-            .reconcile_live_replacements(lease, key, binding, stop, now)
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::ReconcileIceberg,
+                self.reconcile_live_replacements(lease, key, binding, stop, now),
+            )
             .await
         {
             Ok(live) => live,
@@ -492,9 +550,18 @@ impl Forge {
             Err(error) => return Err(error),
         };
         record_live_reconciliation(outcome, &live);
+        gauges.record_reconciliation(
+            ForgeMetricSource::Iceberg,
+            reconciliation_observation(&live, self.core.config.max_open_operations_per_table)?,
+        );
 
         let compaction = match staging_stage_result(
-            self.run_compaction_bins_for_table(lease, key, binding, budget, now, stop)
+            self.core
+                .metrics
+                .observe_stage(
+                    ForgeMetricStage::StagingFold,
+                    self.run_compaction_bins_for_table(lease, key, binding, budget, now, stop),
+                )
                 .await,
         )? {
             StagingStageResult::Completed(compaction) => compaction,
@@ -521,7 +588,12 @@ impl Forge {
         }
 
         let expiry = self
-            .run_snapshot_expiry_for_table(lease, key, binding, now)
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::SnapshotExpiry,
+                self.run_snapshot_expiry_for_table(lease, key, binding, now),
+            )
             .await?;
         outcome.expiry_reconciled = outcome.expiry_reconciled.saturating_add(expiry);
         outcome.reconciled = outcome.reconciled.saturating_add(expiry);
@@ -537,7 +609,12 @@ impl Forge {
             return Ok(TableStageDisposition::Cancelled);
         }
         let gc = self
-            .run_orphan_gc_for_table(lease, key, binding, &live_set, now)
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::OrphanGc,
+                self.run_orphan_gc_for_table(lease, key, binding, &live_set, now),
+            )
             .await?;
         outcome.gc_reconciled = outcome.gc_reconciled.saturating_add(gc.recovered);
         outcome.gc_candidates = outcome.gc_candidates.saturating_add(gc.candidates);
@@ -568,7 +645,12 @@ impl Forge {
     ) -> Result<(), ForgeError> {
         let table = self.load_table(&binding.table_ident()).await?;
         let plan = self
-            .discover_live_rewrites(binding, &table, now.date_naive())
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::ManifestDiscovery,
+                self.discover_live_rewrites(binding, &table, now.date_naive()),
+            )
             .await?;
         outcome.live_candidates = outcome.live_candidates.saturating_add(
             plan.groups
@@ -599,11 +681,21 @@ impl Forge {
                 .is_some_and(|value| value <= self.core.config.max_bytes_per_tick);
         if !admitted {
             outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+            self.core.metrics.record_operation(
+                ForgeMetricSource::Iceberg,
+                super::metrics::ForgeOperationResult::Budget,
+                1,
+            );
             outcome.pending_work = true;
             return Ok(());
         }
         match self
-            .replace_live_group(lease, binding, &table, plan.base_snapshot_id, group, stop)
+            .core
+            .metrics
+            .observe_stage(
+                ForgeMetricStage::IcebergRewrite,
+                self.replace_live_group(lease, binding, &table, plan.base_snapshot_id, group, stop),
+            )
             .await?
         {
             IcebergRewriteDisposition::Committed {
@@ -659,6 +751,7 @@ impl Forge {
 
     /// Add one isolated periodic-table failure to the tick outcome.
     fn record_table_failure(
+        &self,
         key: &ForgeTableKey,
         outcome: &mut ForgeTickOutcome,
         error: &ForgeError,
@@ -666,6 +759,7 @@ impl Forge {
         outcome.stage_failures = outcome.stage_failures.saturating_add(1);
         if matches!(error, ForgeError::FenceLost { .. }) {
             outcome.fence_losses = outcome.fence_losses.saturating_add(1);
+            self.core.metrics.record_lease(ForgeLeaseResult::FenceLost);
         }
         tracing::error!(
             tenant = %key.tenant,
@@ -686,6 +780,47 @@ fn record_live_reconciliation(tick: &mut ForgeTickOutcome, live: &IcebergReconci
         .open_operation_overflows
         .saturating_add(usize::from(live.overflowed));
     tick.pending_work |= live.overflowed || live.pending > 0 || live.unresolved > 0;
+}
+
+/// Converts bounded live reconciliation into the complete-tick gauge contract.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::InvalidConfig`] when the configured overflow sentinel
+/// or an ordinary bounded total cannot be represented by `usize`.
+fn reconciliation_observation(
+    live: &IcebergReconciliationOutcome,
+    cap: usize,
+) -> Result<ReconciliationGaugeObservation, ForgeError> {
+    if live.overflowed {
+        let lower_bound = cap
+            .checked_add(1)
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "open-operation overflow sentinel exceeds usize".to_owned(),
+            })?;
+        return Ok(ReconciliationGaugeObservation {
+            prepared_operations: lower_bound,
+            uncertain_operations: lower_bound,
+        });
+    }
+    let prepared_operations = live
+        .recovered
+        .checked_add(live.reset)
+        .and_then(|value| value.checked_add(live.pending))
+        .and_then(|value| value.checked_add(live.unresolved))
+        .ok_or_else(|| ForgeError::InvalidConfig {
+            detail: "live reconciliation gauge total exceeds usize".to_owned(),
+        })?;
+    let uncertain_operations =
+        live.pending
+            .checked_add(live.unresolved)
+            .ok_or_else(|| ForgeError::InvalidConfig {
+                detail: "live uncertainty gauge total exceeds usize".to_owned(),
+            })?;
+    Ok(ReconciliationGaugeObservation {
+        prepared_operations,
+        uncertain_operations,
+    })
 }
 
 /// Convert only shutdown into a non-error cancelled staging disposition.
@@ -749,6 +884,7 @@ fn rotate_tables(tables: &mut [ForgeTableKey], cursor: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -758,6 +894,39 @@ mod tests {
     use super::*;
     use crate::catalog::TableRef;
     use crate::namespaces::BifrostNamespace;
+
+    /// Ordinary, recovered/reset, and overflow reconciliation gauges use exact formulas.
+    #[test]
+    fn forge_reconciliation_gauge_formulas_are_exact() {
+        let ordinary = IcebergReconciliationOutcome {
+            recovered: 2,
+            reset: 3,
+            pending: 5,
+            unresolved: 7,
+            overflowed: false,
+            protected_output_paths: BTreeSet::new(),
+            destructive_maintenance: DestructiveMaintenance::Allowed,
+        };
+        assert_eq!(
+            reconciliation_observation(&ordinary, 256).expect("ordinary observation"),
+            ReconciliationGaugeObservation {
+                prepared_operations: 17,
+                uncertain_operations: 12,
+            }
+        );
+        let overflow = IcebergReconciliationOutcome {
+            overflowed: true,
+            ..ordinary
+        };
+        assert_eq!(
+            reconciliation_observation(&overflow, 256).expect("overflow observation"),
+            ReconciliationGaugeObservation {
+                prepared_operations: 257,
+                uncertain_operations: 257,
+            }
+        );
+        assert!(reconciliation_observation(&overflow, usize::MAX).is_err());
+    }
 
     /// The scheduler run guard rejects a second owner without waiting.
     #[test]

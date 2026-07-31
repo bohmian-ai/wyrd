@@ -27,6 +27,8 @@ pub struct ForgeLease {
     pub owner: Uuid,
     /// Monotonic token asserted by every durable transition.
     pub fencing_token: i64,
+    /// Whether this acquisition replaced an expired different owner.
+    takeover: bool,
     ttl: Duration,
     confirmed_at: Instant,
 }
@@ -47,7 +49,7 @@ impl ForgeLease {
         let seconds = i64::try_from(ttl.as_secs()).map_err(|_| ForgeError::InvalidConfig {
             detail: "lease TTL is too large".to_owned(),
         })?;
-        let fencing_token = vala_sql::queries::maintenance_leases::try_acquire_lease(
+        let acquisition = vala_sql::queries::maintenance_leases::try_acquire_lease(
             operator_pool,
             &lease_key,
             owner,
@@ -55,13 +57,20 @@ impl ForgeLease {
         )
         .await
         .map_err(ForgeError::Lease)?;
-        Ok(fencing_token.map(|fencing_token| Self {
+        Ok(acquisition.map(|acquisition| Self {
             lease_key,
             owner,
-            fencing_token,
+            fencing_token: acquisition.fencing_token,
+            takeover: acquisition.takeover,
             ttl,
             confirmed_at: Instant::now(),
         }))
+    }
+
+    /// Reports whether acquisition replaced an expired row owned by another owner.
+    #[must_use]
+    pub const fn takeover(&self) -> bool {
+        self.takeover
     }
 
     /// Renew this lease and refresh its local confirmation time.

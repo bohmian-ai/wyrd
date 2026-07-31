@@ -456,6 +456,9 @@ impl Forge {
         let young = context.now.signed_duration_since(row.prepared_at) < uncertainty;
         match classify_evidence(&evidence, young) {
             LiveDisposition::Recovered(snapshot_id) => {
+                let volume = self
+                    .measure_rewrite_volume(&prepared.input_paths, &prepared.output_paths)
+                    .await?;
                 Self::require_running(context.stop)?;
                 context
                     .lease
@@ -480,6 +483,18 @@ impl Forge {
                     )?,
                 )
                 .await?;
+                self.core.metrics.record_operation(
+                    super::metrics::ForgeMetricSource::Iceberg,
+                    super::metrics::ForgeOperationResult::Recovered,
+                    1,
+                );
+                self.core.metrics.record_rewrite_volume(
+                    super::metrics::ForgeMetricSource::Iceberg,
+                    volume.input_files,
+                    volume.input_bytes,
+                    volume.output_files,
+                    volume.output_bytes,
+                );
                 outcome.recovered = outcome.recovered.saturating_add(1);
             }
             LiveDisposition::Pending => {
@@ -565,6 +580,11 @@ impl Forge {
             iceberg_terminal_detail(&row.prepared_detail, ForgeIcebergRewritePhase::Reset, None)?,
         )
         .await?;
+        self.core.metrics.record_operation(
+            super::metrics::ForgeMetricSource::Iceberg,
+            super::metrics::ForgeOperationResult::Reset,
+            1,
+        );
         outcome.reset = outcome.reset.saturating_add(1);
         Ok(())
     }

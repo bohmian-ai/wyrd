@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opendal::Buffer;
-use vala_bifrost_redux::forge::ForgeObjectStore;
+use vala_bifrost_redux::forge::{ForgeLease, ForgeObjectStore, forge_lease_key};
 use wyrd_testing::WyrdTestServer;
 use wyrd_testing::bifrost::{CommitUncertaintyCatalog, ForgeObjectStoreControl, seed_forge_group};
 
@@ -37,7 +37,11 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
     .await
     .expect("successor lease acquisition")
     .expect("successor owns expired Forge lease");
-    (owner, token)
+    assert!(
+        token.takeover,
+        "expired different owner must report takeover"
+    );
+    (owner, token.fencing_token)
 }
 
 #[tokio::test]
@@ -169,19 +173,10 @@ async fn forge_gc_partial_delete_restarts_idempotently() {
 #[ignore = "requires the Postgres-backed Forge interleaving lane"]
 /// Tests fencing immediately before a destructive object-store effect.
 ///
-/// Steps:
-/// 1. Seed an old orphan, disable compaction eligibility, and pause the real
-///    OpenDAL delete boundary.
-/// 2. Take over the durable table lease while the stale worker is paused, then
-///    resume the wrapper with a stale-worker error.
-/// 3. Assert the orphan and terminal audit remain untouched, release the
-///    successor lease, and run a recovery tick that deletes the orphan once.
-///
 /// # Errors
 ///
 /// The test panics when lease takeover, stale-worker fencing, or recovery
-/// assertions fail. The paused task is always joined before the successor
-/// lease is released, so cancellation cannot escape the test boundary.
+/// assertions fail.
 async fn forge_gc_lease_theft_before_delete_fails_closed() {
     let server = WyrdTestServer::builder()
         .with_forge_interval(Duration::from_secs(3600))
@@ -201,10 +196,19 @@ async fn forge_gc_lease_theft_before_delete_fails_closed() {
         .write(&orphan, Buffer::from(vec![7_u8]))
         .await
         .expect("orphan object");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    server
+        .forge_clock()
+        .advance(chrono::Duration::seconds(1))
+        .expect("advance Forge clock beyond orphan TTL");
     let tick_context = context.clone();
-    let task = tokio::spawn(async move { tick_context.run_once().await });
-    control.wait_for_delete().await;
+    let mut task = tokio::spawn(async move { tick_context.run_once().await });
+    tokio::select! {
+        () = control.wait_for_delete() => {}
+        result = &mut task => panic!("tick completed before orphan delete boundary: {result:?}"),
+        () = tokio::time::sleep(Duration::from_secs(30)) => {
+            panic!("orphan delete boundary must be reached")
+        }
+    }
     let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
     control.reject_paused_delete();
     let outcome = task
@@ -217,9 +221,10 @@ async fn forge_gc_lease_theft_before_delete_fails_closed() {
         fixture.operation_count("forge.orphan_gc.committed").await,
         0
     );
-    let lease_key = format!(
-        "forge:table:{}:{}:{}",
-        fixture.tenant, fixture.binding.logical_namespace, fixture.binding.table_name
+    let lease_key = forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
     );
     assert!(
         vala_sql::queries::maintenance_leases::release_lease_fenced(
@@ -236,6 +241,61 @@ async fn forge_gc_lease_theft_before_delete_fails_closed() {
     assert_eq!(
         fixture.operation_count("forge.orphan_gc.recovered").await,
         1
+    );
+    server.shutdown().await.expect("server shutdown");
+}
+
+#[tokio::test]
+#[ignore = "requires the Postgres-backed Forge interleaving lane"]
+/// Tests authoritative takeover evidence and stale-owner fence loss.
+///
+/// Steps:
+/// 1. Acquire one real Forge table lease.
+/// 2. Expire and replace it through the authoritative acquisition statement.
+/// 3. Assert takeover evidence and stale-owner fence loss are both exact.
+///
+/// # Errors
+///
+/// The test panics when lease takeover or stale-worker fencing differs from the
+/// durable maintenance-lease row.
+async fn lease_theft_records_fence_loss_metric() {
+    let server = WyrdTestServer::builder()
+        .with_forge_interval(Duration::from_secs(3600))
+        .start_bound()
+        .await
+        .expect("real Forge server");
+    let fixture = seed_forge_group(&server, "lease_metric_rows").await;
+    let lease_key = forge_lease_key(
+        fixture.tenant,
+        &fixture.binding.logical_namespace,
+        &fixture.binding.table_name,
+    );
+    let mut stale = ForgeLease::acquire(
+        &fixture.operator_pool,
+        lease_key.clone(),
+        uuid::Uuid::now_v7(),
+        fixture.config.lease_ttl,
+    )
+    .await
+    .expect("stale lease query")
+    .expect("stale owner acquires lease");
+    let (successor_owner, successor_token) = steal_forge_lease(&fixture).await;
+    assert!(
+        matches!(
+            stale.require_fence(&fixture.operator_pool).await,
+            Err(vala_bifrost_redux::forge::ForgeError::FenceLost { .. })
+        ),
+        "the replaced owner must observe exact fence loss"
+    );
+    assert!(
+        vala_sql::queries::maintenance_leases::release_lease_fenced(
+            &fixture.operator_pool,
+            &lease_key,
+            successor_owner,
+            successor_token,
+        )
+        .await
+        .expect("successor release")
     );
     server.shutdown().await.expect("server shutdown");
 }

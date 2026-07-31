@@ -36,6 +36,7 @@ use super::Forge;
 use super::binpack::{CandidateFile, ForgeGroupKey, RewriteBin};
 use super::error::ForgeError;
 use super::lease::ForgeLease;
+use super::metrics::ReconciliationGaugeObservation;
 use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
@@ -569,17 +570,25 @@ impl Forge {
         lease: &mut ForgeLease,
         table_key: &ForgeTableKey,
         binding: &TenantTableBinding,
-        now: DateTime<Utc>,
-    ) -> Result<usize, ForgeError> {
+    ) -> Result<(usize, ReconciliationGaugeObservation), ForgeError> {
+        let now = self.core.clock.now()?;
         let mut reconciled: usize = 0;
+        let mut prepared_operations = 0_usize;
         for key in self.load_reconciliation_keys().await? {
             if key.tenant != table_key.tenant || key.table_ref != table_key.table_ref {
                 continue;
             }
+            prepared_operations = prepared_operations.saturating_add(1);
             reconciled =
                 reconciled.saturating_add(self.reconcile_group(lease, &key, binding, now).await?);
         }
-        Ok(reconciled)
+        Ok((
+            reconciled,
+            ReconciliationGaugeObservation {
+                prepared_operations,
+                uncertain_operations: prepared_operations.saturating_sub(reconciled),
+            },
+        ))
     }
 
     /// Select, bin-pack, and commit bounded periodic compaction work.
@@ -694,6 +703,11 @@ impl Forge {
                 {
                     outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
                     outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+                    self.core.metrics.record_operation(
+                        super::metrics::ForgeMetricSource::Staging,
+                        super::metrics::ForgeOperationResult::Budget,
+                        1,
+                    );
                     outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
                         bins[index..]
                             .iter()
@@ -711,6 +725,11 @@ impl Forge {
                 if !lease.commit_window_fits(self.core.config.commit_window()) {
                     outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
                     outcome.budget_skips = outcome.budget_skips.saturating_add(1);
+                    self.core.metrics.record_operation(
+                        super::metrics::ForgeMetricSource::Staging,
+                        super::metrics::ForgeOperationResult::Budget,
+                        1,
+                    );
                     outcome.staging_pending_files = outcome.staging_pending_files.saturating_add(
                         bins[index..]
                             .iter()
@@ -1560,6 +1579,7 @@ impl Forge {
             }
             let AuditDetail::ForgeCompaction {
                 input_file_ids,
+                input_paths,
                 output_paths,
                 ..
             } = &detail
@@ -1580,6 +1600,9 @@ impl Forge {
             }
             let table = self.load_table(&binding.table_ident()).await?;
             if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
+                let volume = self
+                    .measure_rewrite_volume(input_paths, output_paths)
+                    .await?;
                 if !lease.renew(&self.core.operator_pool).await? {
                     return Err(ForgeError::FenceLost {
                         lease_key: lease.lease_key.clone(),
@@ -1587,6 +1610,18 @@ impl Forge {
                 }
                 self.stamp_reconciled(lease, key, input_file_ids, &detail, snapshot_id)
                     .await?;
+                self.core.metrics.record_operation(
+                    super::metrics::ForgeMetricSource::Staging,
+                    super::metrics::ForgeOperationResult::Recovered,
+                    1,
+                );
+                self.core.metrics.record_rewrite_volume(
+                    super::metrics::ForgeMetricSource::Staging,
+                    volume.input_files,
+                    volume.input_bytes,
+                    volume.output_files,
+                    volume.output_bytes,
+                );
                 recovered = recovered.saturating_add(1);
                 continue;
             }
@@ -2210,32 +2245,105 @@ mod tests {
         assert!(invalid_snapshots.validate().is_err());
     }
 
-    /// Interim live counters saturate and pending state merges by logical OR.
+    /// Every numeric outcome field saturates and completion booleans merge conservatively.
     #[test]
     fn forge_tick_outcome_merge_saturates_live_reconciliation_counters() {
         let mut aggregate = ForgeTickOutcome {
+            groups_seen: usize::MAX,
+            bins_committed: usize::MAX,
+            bins_skipped: usize::MAX,
+            reconciled: usize::MAX,
+            tables_discovered: usize::MAX,
+            tables_examined: usize::MAX,
+            tables_succeeded: usize::MAX,
+            tables_skipped: usize::MAX,
+            tables_failed: usize::MAX,
+            reconciliation_recovered: usize::MAX,
+            expiry_reconciled: usize::MAX,
+            gc_reconciled: usize::MAX,
+            gc_candidates: usize::MAX,
+            gc_deleted: usize::MAX,
+            gc_skipped: usize::MAX,
+            budget_skips: usize::MAX,
+            lease_contention: usize::MAX,
+            lease_takeovers: usize::MAX,
+            fence_losses: usize::MAX,
+            stage_failures: usize::MAX,
+            spill_bytes: u64::MAX,
+            input_rows: u64::MAX,
+            output_rows: u64::MAX,
+            outputs_committed: usize::MAX,
             live_recovered: usize::MAX,
             live_reset: usize::MAX,
             live_pending: usize::MAX,
             live_unresolved: usize::MAX,
             open_operation_overflows: usize::MAX,
-            ..ForgeTickOutcome::default()
+            staging_pending_files: usize::MAX,
+            live_candidates: usize::MAX,
+            live_groups_planned: usize::MAX,
+            live_groups_committed: usize::MAX,
+            live_snapshot_changes: usize::MAX,
+            staging_input_files: usize::MAX,
+            staging_input_bytes: u64::MAX,
+            staging_output_files: usize::MAX,
+            staging_output_bytes: u64::MAX,
+            live_input_files: usize::MAX,
+            live_input_bytes: u64::MAX,
+            live_output_files: usize::MAX,
+            live_output_bytes: u64::MAX,
+            tick_complete: true,
+            pending_work: false,
         };
+        let mut expected = aggregate;
+        expected.tick_complete = false;
+        expected.pending_work = true;
         aggregate.merge(ForgeTickOutcome {
+            groups_seen: 1,
+            bins_committed: 1,
+            bins_skipped: 1,
+            reconciled: 1,
+            tables_discovered: 1,
+            tables_examined: 1,
+            tables_succeeded: 1,
+            tables_skipped: 1,
+            tables_failed: 1,
+            reconciliation_recovered: 1,
+            expiry_reconciled: 1,
+            gc_reconciled: 1,
+            gc_candidates: 1,
+            gc_deleted: 1,
+            gc_skipped: 1,
+            budget_skips: 1,
+            lease_contention: 1,
+            lease_takeovers: 1,
+            fence_losses: 1,
+            stage_failures: 1,
+            spill_bytes: 1,
+            input_rows: 1,
+            output_rows: 1,
+            outputs_committed: 1,
             live_recovered: 1,
             live_reset: 1,
             live_pending: 1,
             live_unresolved: 1,
             open_operation_overflows: 1,
+            staging_pending_files: 1,
+            live_candidates: 1,
+            live_groups_planned: 1,
+            live_groups_committed: 1,
+            live_snapshot_changes: 1,
+            staging_input_files: 1,
+            staging_input_bytes: 1,
+            staging_output_files: 1,
+            staging_output_bytes: 1,
+            live_input_files: 1,
+            live_input_bytes: 1,
+            live_output_files: 1,
+            live_output_bytes: 1,
+            tick_complete: false,
             pending_work: true,
-            ..ForgeTickOutcome::default()
         });
-        assert_eq!(aggregate.live_recovered, usize::MAX);
-        assert_eq!(aggregate.live_reset, usize::MAX);
-        assert_eq!(aggregate.live_pending, usize::MAX);
-        assert_eq!(aggregate.live_unresolved, usize::MAX);
-        assert_eq!(aggregate.open_operation_overflows, usize::MAX);
-        assert!(aggregate.pending_work);
+        assert_eq!(aggregate, expected);
     }
 
     /// The staging seam consumes the right-size policy's selected groups.

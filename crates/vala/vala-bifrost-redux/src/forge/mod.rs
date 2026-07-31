@@ -20,6 +20,7 @@ pub(crate) mod expire;
 pub(crate) mod lease;
 mod live_reconcile;
 mod live_replace;
+mod metrics;
 pub(crate) mod orphan_gc;
 mod path;
 pub(crate) mod rewrite;
@@ -102,6 +103,8 @@ pub(crate) struct ForgeCore {
     maintenance_interval: Duration,
     /// Wall clock shared by periodic and hinted maintenance batches.
     clock: ForgeClock,
+    /// Fixed-cardinality operational metric handles registered at construction.
+    metrics: metrics::ForgeMetrics,
 }
 
 impl Forge {
@@ -141,6 +144,7 @@ impl Forge {
             config: build.config,
             maintenance_interval: build.maintenance_interval,
             clock: build.clock,
+            metrics: metrics::ForgeMetrics::new(),
         };
         debug_assert!(core.rewrite.uses_staging(&core.staging));
         Ok(Self {

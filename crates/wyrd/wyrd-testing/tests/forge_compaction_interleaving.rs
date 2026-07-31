@@ -113,7 +113,7 @@ async fn steal_forge_lease(fixture: &wyrd_testing::bifrost::ForgeFixture) -> (uu
     .await
     .expect("successor lease acquisition")
     .expect("successor owns expired Forge lease");
-    (owner, token)
+    (owner, token.fencing_token)
 }
 
 /// Build two eligible live files, then discover one exact replacement through

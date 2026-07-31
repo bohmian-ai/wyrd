@@ -5,6 +5,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use metrics::{Counter, Gauge, Histogram};
+use num_traits::ToPrimitive;
 use wyrd_spec::vala::api::StoragePath;
 
 use super::Forge;
@@ -157,14 +158,10 @@ impl ForgeConvergenceResult {
 /// Complete-tick reconciliation backlog accumulated across every table.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ForgeGaugeSnapshot {
-    /// Latest prepared staging operations examined by the complete pass.
-    pub(super) staging_prepared_operations: usize,
-    /// Latest prepared Iceberg operations examined by the complete pass.
-    pub(super) iceberg_prepared_operations: usize,
-    /// Staging operations whose terminal state remains uncertain.
-    pub(super) staging_uncertain_operations: usize,
-    /// Iceberg operations whose terminal state remains uncertain.
-    pub(super) iceberg_uncertain_operations: usize,
+    /// Complete staging reconciliation observation.
+    staging: ReconciliationGaugeObservation,
+    /// Complete Iceberg reconciliation observation.
+    iceberg: ReconciliationGaugeObservation,
 }
 
 /// One bounded reconciliation observation before it is merged into a tick.
@@ -196,18 +193,16 @@ impl ForgeGaugeSnapshot {
         source: ForgeMetricSource,
         observation: ReconciliationGaugeObservation,
     ) {
-        let (prepared, uncertain) = match source {
-            ForgeMetricSource::Staging => (
-                &mut self.staging_prepared_operations,
-                &mut self.staging_uncertain_operations,
-            ),
-            ForgeMetricSource::Iceberg => (
-                &mut self.iceberg_prepared_operations,
-                &mut self.iceberg_uncertain_operations,
-            ),
+        let aggregate = match source {
+            ForgeMetricSource::Staging => &mut self.staging,
+            ForgeMetricSource::Iceberg => &mut self.iceberg,
         };
-        *prepared = prepared.saturating_add(observation.prepared_operations);
-        *uncertain = uncertain.saturating_add(observation.uncertain_operations);
+        aggregate.prepared_operations = aggregate
+            .prepared_operations
+            .saturating_add(observation.prepared_operations);
+        aggregate.uncertain_operations = aggregate
+            .uncertain_operations
+            .saturating_add(observation.uncertain_operations);
     }
 }
 
@@ -250,99 +245,12 @@ pub(super) struct ForgeMetrics {
 impl ForgeMetrics {
     /// Registers the complete fixed-cardinality Forge metric inventory.
     pub(super) fn new() -> Self {
-        const SOURCES: [ForgeMetricSource; 2] =
-            [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg];
-        const RESULTS: [ForgeOperationResult; 7] = [
-            ForgeOperationResult::Committed,
-            ForgeOperationResult::Recovered,
-            ForgeOperationResult::Reset,
-            ForgeOperationResult::Noop,
-            ForgeOperationResult::Budget,
-            ForgeOperationResult::FenceLost,
-            ForgeOperationResult::Failed,
-        ];
-        const LEASE_RESULTS: [ForgeLeaseResult; 3] = [
-            ForgeLeaseResult::Contention,
-            ForgeLeaseResult::Takeover,
-            ForgeLeaseResult::FenceLost,
-        ];
-        const CONVERGENCE_RESULTS: [ForgeConvergenceResult; 3] = [
-            ForgeConvergenceResult::Noop,
-            ForgeConvergenceResult::Progress,
-            ForgeConvergenceResult::Incomplete,
-        ];
-        const STAGES: [ForgeMetricStage; 7] = [
-            ForgeMetricStage::ReconcileStaging,
-            ForgeMetricStage::ReconcileIceberg,
-            ForgeMetricStage::StagingFold,
-            ForgeMetricStage::ManifestDiscovery,
-            ForgeMetricStage::IcebergRewrite,
-            ForgeMetricStage::SnapshotExpiry,
-            ForgeMetricStage::OrphanGc,
-        ];
-        let mut operations = BTreeMap::new();
-        for source in SOURCES {
-            for result in RESULTS {
-                operations.insert(
-                    (source, result),
-                    metrics::counter!(
-                        "bifrost_forge_operations",
-                        "source" => source.as_str(),
-                        "result" => result.as_str()
-                    ),
-                );
-            }
-        }
         Self {
-            operations,
-            lease_events: LEASE_RESULTS
-                .into_iter()
-                .map(|result| {
-                    (
-                        result,
-                        metrics::counter!(
-                            "bifrost_forge_lease_events_total",
-                            "result" => result.as_str()
-                        ),
-                    )
-                })
-                .collect(),
-            convergence: CONVERGENCE_RESULTS
-                .into_iter()
-                .map(|result| {
-                    (
-                        result,
-                        metrics::counter!(
-                            "bifrost_forge_convergence_passes_total",
-                            "result" => result.as_str()
-                        ),
-                    )
-                })
-                .collect(),
-            stage_failures: STAGES
-                .into_iter()
-                .map(|stage| {
-                    (
-                        stage,
-                        metrics::counter!(
-                            "bifrost_forge_stage_failures_total",
-                            "stage" => stage.as_str()
-                        ),
-                    )
-                })
-                .collect(),
-            stage_seconds: STAGES
-                .into_iter()
-                .map(|stage| {
-                    (
-                        stage,
-                        metrics::histogram!(
-                            "bifrost_forge_stage_seconds",
-                            "stage" => stage.as_str()
-                        ),
-                    )
-                })
-                .collect(),
+            operations: operation_counters(),
+            lease_events: lease_counters(),
+            convergence: convergence_counters(),
+            stage_failures: stage_failure_counters(),
+            stage_seconds: stage_histograms(),
             pending_files: source_gauges("bifrost_forge_pending_files"),
             eligible_iceberg_files: metrics::gauge!("bifrost_forge_eligible_iceberg_files"),
             prepared_operations: source_gauges("bifrost_forge_prepared_operations"),
@@ -430,18 +338,19 @@ impl ForgeMetrics {
         if !outcome.tick_complete || outcome.tables_examined != outcome.tables_discovered {
             return;
         }
-        self.pending_files[&ForgeMetricSource::Staging].set(outcome.staging_pending_files as f64);
-        self.pending_files[&ForgeMetricSource::Iceberg].set(outcome.live_candidates as f64);
+        self.pending_files[&ForgeMetricSource::Staging]
+            .set(gauge_value(outcome.staging_pending_files));
+        self.pending_files[&ForgeMetricSource::Iceberg].set(gauge_value(outcome.live_candidates));
         self.eligible_iceberg_files
-            .set(outcome.live_candidates as f64);
+            .set(gauge_value(outcome.live_candidates));
         self.prepared_operations[&ForgeMetricSource::Staging]
-            .set(gauges.staging_prepared_operations as f64);
+            .set(gauge_value(gauges.staging.prepared_operations));
         self.prepared_operations[&ForgeMetricSource::Iceberg]
-            .set(gauges.iceberg_prepared_operations as f64);
+            .set(gauge_value(gauges.iceberg.prepared_operations));
         self.uncertain_operations[&ForgeMetricSource::Staging]
-            .set(gauges.staging_uncertain_operations as f64);
+            .set(gauge_value(gauges.staging.uncertain_operations));
         self.uncertain_operations[&ForgeMetricSource::Iceberg]
-            .set(gauges.iceberg_uncertain_operations as f64);
+            .set(gauge_value(gauges.iceberg.uncertain_operations));
         self.convergence[&convergence_result(outcome)].increment(1);
     }
 
@@ -534,6 +443,117 @@ impl Forge {
     }
 }
 
+/// Registers every closed source/result operation counter.
+fn operation_counters() -> BTreeMap<(ForgeMetricSource, ForgeOperationResult), Counter> {
+    let mut counters = BTreeMap::new();
+    for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
+        for result in [
+            ForgeOperationResult::Committed,
+            ForgeOperationResult::Recovered,
+            ForgeOperationResult::Reset,
+            ForgeOperationResult::Noop,
+            ForgeOperationResult::Budget,
+            ForgeOperationResult::FenceLost,
+            ForgeOperationResult::Failed,
+        ] {
+            counters.insert(
+                (source, result),
+                metrics::counter!(
+                    "bifrost_forge_operations",
+                    "source" => source.as_str(),
+                    "result" => result.as_str()
+                ),
+            );
+        }
+    }
+    counters
+}
+
+/// Registers every closed lease-result counter.
+fn lease_counters() -> BTreeMap<ForgeLeaseResult, Counter> {
+    [
+        ForgeLeaseResult::Contention,
+        ForgeLeaseResult::Takeover,
+        ForgeLeaseResult::FenceLost,
+    ]
+    .into_iter()
+    .map(|result| {
+        (
+            result,
+            metrics::counter!(
+                "bifrost_forge_lease_events_total",
+                "result" => result.as_str()
+            ),
+        )
+    })
+    .collect()
+}
+
+/// Registers every closed convergence-result counter.
+fn convergence_counters() -> BTreeMap<ForgeConvergenceResult, Counter> {
+    [
+        ForgeConvergenceResult::Noop,
+        ForgeConvergenceResult::Progress,
+        ForgeConvergenceResult::Incomplete,
+    ]
+    .into_iter()
+    .map(|result| {
+        (
+            result,
+            metrics::counter!(
+                "bifrost_forge_convergence_passes_total",
+                "result" => result.as_str()
+            ),
+        )
+    })
+    .collect()
+}
+
+/// Returns every closed owning-stage label.
+fn stages() -> [ForgeMetricStage; 7] {
+    [
+        ForgeMetricStage::ReconcileStaging,
+        ForgeMetricStage::ReconcileIceberg,
+        ForgeMetricStage::StagingFold,
+        ForgeMetricStage::ManifestDiscovery,
+        ForgeMetricStage::IcebergRewrite,
+        ForgeMetricStage::SnapshotExpiry,
+        ForgeMetricStage::OrphanGc,
+    ]
+}
+
+/// Registers failure counters for every closed owning stage.
+fn stage_failure_counters() -> BTreeMap<ForgeMetricStage, Counter> {
+    stages()
+        .into_iter()
+        .map(|stage| {
+            (
+                stage,
+                metrics::counter!(
+                    "bifrost_forge_stage_failures_total",
+                    "stage" => stage.as_str()
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Registers duration histograms for every closed owning stage.
+fn stage_histograms() -> BTreeMap<ForgeMetricStage, Histogram> {
+    stages()
+        .into_iter()
+        .map(|stage| {
+            (
+                stage,
+                metrics::histogram!(
+                    "bifrost_forge_stage_seconds",
+                    "stage" => stage.as_str()
+                ),
+            )
+        })
+        .collect()
+}
+
 /// Registers one gauge handle for each closed source value.
 fn source_gauges(name: &'static str) -> BTreeMap<ForgeMetricSource, Gauge> {
     [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg]
@@ -548,6 +568,25 @@ fn source_counters(name: &'static str) -> BTreeMap<ForgeMetricSource, Counter> {
         .into_iter()
         .map(|source| (source, metrics::counter!(name, "source" => source.as_str())))
         .collect()
+}
+
+/// Largest integer that an `f64` metrics gauge represents exactly.
+const MAX_EXACT_GAUGE_INTEGER: u64 = 1_u64 << 53;
+
+/// Converts an in-memory count into the metrics gauge representation.
+///
+/// Counts through `2^53` remain exact. Larger counts saturate monotonically at
+/// `2^53`, which is a truthful lower-bound sentinel that never rounds the
+/// observed count upward. The saturation matches Forge's existing saturating
+/// outcome contract for impossible or extreme in-memory counts.
+fn gauge_value(value: usize) -> f64 {
+    value
+        .to_u64()
+        .map_or(MAX_EXACT_GAUGE_INTEGER, |count| {
+            count.min(MAX_EXACT_GAUGE_INTEGER)
+        })
+        .to_f64()
+        .unwrap_or(9_007_199_254_740_992.0)
 }
 
 /// Classifies a complete returned periodic outcome with the approved predicates.
@@ -587,9 +626,161 @@ fn convergence_result(outcome: &ForgeTickOutcome) -> ForgeConvergenceResult {
 
 #[cfg(test)]
 mod tests {
-    use wyrd_bench::BenchmarkRecorder;
+    use wyrd_bench::{BenchmarkMetricSnapshot, BenchmarkRecorder};
 
     use super::*;
+
+    /// Records every typed operation, lease, volume, and stage boundary once.
+    fn record_authoritative_boundaries(metrics: &ForgeMetrics) {
+        for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
+            for result in [
+                ForgeOperationResult::Committed,
+                ForgeOperationResult::Recovered,
+                ForgeOperationResult::Reset,
+                ForgeOperationResult::Noop,
+                ForgeOperationResult::Budget,
+                ForgeOperationResult::FenceLost,
+                ForgeOperationResult::Failed,
+            ] {
+                metrics.record_operation(source, result, 1);
+            }
+        }
+        for result in [
+            ForgeLeaseResult::Contention,
+            ForgeLeaseResult::Takeover,
+            ForgeLeaseResult::FenceLost,
+        ] {
+            metrics.record_lease(result);
+        }
+        metrics.snapshot_expired.increment(2);
+        metrics.gc_candidates.increment(3);
+        metrics.gc_deleted.increment(4);
+        metrics.record_rewrite_volume(ForgeMetricSource::Iceberg, 5, 6, 7, 8);
+        metrics.record_rewrite_volume(ForgeMetricSource::Staging, 9, 10, 11, 12);
+        metrics.record_stage(
+            ForgeMetricStage::StagingFold,
+            Duration::from_millis(1),
+            false,
+        );
+        metrics.record_stage(
+            ForgeMetricStage::IcebergRewrite,
+            Duration::from_millis(2),
+            true,
+        );
+    }
+
+    /// Asserts every source/result operation and lease series changed once.
+    fn assert_operation_and_lease_boundaries(snapshot: &BenchmarkMetricSnapshot) {
+        for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
+            for result in [
+                ForgeOperationResult::Committed,
+                ForgeOperationResult::Recovered,
+                ForgeOperationResult::Reset,
+                ForgeOperationResult::Noop,
+                ForgeOperationResult::Budget,
+                ForgeOperationResult::FenceLost,
+                ForgeOperationResult::Failed,
+            ] {
+                assert_eq!(
+                    snapshot.counters[&format!(
+                        "bifrost_forge_operations{{result=\"{}\",source=\"{}\"}}",
+                        result.as_str(),
+                        source.as_str()
+                    )],
+                    1
+                );
+            }
+        }
+        for result in [
+            ForgeLeaseResult::Contention,
+            ForgeLeaseResult::Takeover,
+            ForgeLeaseResult::FenceLost,
+        ] {
+            assert_eq!(
+                snapshot.counters[&format!(
+                    "bifrost_forge_lease_events_total{{result=\"{}\"}}",
+                    result.as_str()
+                )],
+                1
+            );
+        }
+    }
+
+    /// Asserts exact rewrite volume, expiry, GC, duration, and failure deltas.
+    fn assert_volume_and_stage_boundaries(snapshot: &BenchmarkMetricSnapshot) {
+        assert_eq!(snapshot.counters["bifrost_forge_snapshot_expired_total"], 2);
+        assert_eq!(snapshot.counters["bifrost_forge_gc_candidates_total"], 3);
+        assert_eq!(snapshot.counters["bifrost_forge_gc_deleted_total"], 4);
+        for (source, values) in [
+            (ForgeMetricSource::Iceberg, [5, 6, 7, 8]),
+            (ForgeMetricSource::Staging, [9, 10, 11, 12]),
+        ] {
+            for (family, expected) in [
+                ("bifrost_forge_rewrite_input_files_total", values[0]),
+                ("bifrost_forge_rewrite_input_bytes_total", values[1]),
+                ("bifrost_forge_rewrite_output_files_total", values[2]),
+                ("bifrost_forge_rewrite_output_bytes_total", values[3]),
+            ] {
+                assert_eq!(
+                    snapshot.counters[&format!("{family}{{source=\"{}\"}}", source.as_str())],
+                    expected
+                );
+            }
+        }
+        assert_eq!(
+            snapshot.histograms["bifrost_forge_stage_seconds{stage=\"staging_fold\"}"].count,
+            1
+        );
+        assert_eq!(
+            snapshot.histograms["bifrost_forge_stage_seconds{stage=\"iceberg_rewrite\"}"].count,
+            1
+        );
+        assert_eq!(
+            snapshot.counters["bifrost_forge_stage_failures_total{stage=\"iceberg_rewrite\"}"],
+            1
+        );
+        assert_eq!(
+            snapshot.counters["bifrost_forge_stage_failures_total{stage=\"staging_fold\"}"],
+            0
+        );
+    }
+
+    /// Asserts one gauge value without exact floating-point comparison.
+    fn assert_gauge(snapshot: &BenchmarkMetricSnapshot, key: &str, expected: f64) {
+        let actual = snapshot.gauges[key];
+        assert!(
+            (actual - expected).abs() < f64::EPSILON,
+            "{key} expected {expected}, observed {actual}"
+        );
+    }
+
+    /// Proves gauge conversion is exact through `2^53` and saturates above it.
+    #[test]
+    fn gauge_value_saturates_without_overstatement() {
+        let boundaries: [(u64, f64); 3] = [
+            (MAX_EXACT_GAUGE_INTEGER - 1, 9_007_199_254_740_991.0),
+            (MAX_EXACT_GAUGE_INTEGER, 9_007_199_254_740_992.0),
+            (MAX_EXACT_GAUGE_INTEGER + 1, 9_007_199_254_740_992.0),
+        ];
+        for (input, expected) in boundaries {
+            if let Ok(input) = usize::try_from(input) {
+                let actual = gauge_value(input);
+                assert_eq!(actual.to_bits(), expected.to_bits());
+                assert!(actual <= input.to_f64().unwrap_or(f64::INFINITY));
+            }
+        }
+        let maximum = usize::MAX;
+        let actual = gauge_value(maximum);
+        let expected = maximum
+            .to_u64()
+            .map_or(MAX_EXACT_GAUGE_INTEGER, |count| {
+                count.min(MAX_EXACT_GAUGE_INTEGER)
+            })
+            .to_f64()
+            .unwrap_or(9_007_199_254_740_992.0);
+        assert_eq!(actual.to_bits(), expected.to_bits());
+        assert!(actual <= maximum.to_f64().unwrap_or(f64::INFINITY));
+    }
 
     /// Proves the fixed inventory constructs without accepting arbitrary labels.
     #[test]
@@ -670,110 +861,10 @@ mod tests {
     fn forge_metrics_record_authoritative_boundaries() {
         let recorder = BenchmarkRecorder::new();
         let metrics = metrics::with_local_recorder(&recorder, ForgeMetrics::new);
-        for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
-            for result in [
-                ForgeOperationResult::Committed,
-                ForgeOperationResult::Recovered,
-                ForgeOperationResult::Reset,
-                ForgeOperationResult::Noop,
-                ForgeOperationResult::Budget,
-                ForgeOperationResult::FenceLost,
-                ForgeOperationResult::Failed,
-            ] {
-                metrics.record_operation(source, result, 1);
-            }
-        }
-        for result in [
-            ForgeLeaseResult::Contention,
-            ForgeLeaseResult::Takeover,
-            ForgeLeaseResult::FenceLost,
-        ] {
-            metrics.record_lease(result);
-        }
-        metrics.snapshot_expired.increment(2);
-        metrics.gc_candidates.increment(3);
-        metrics.gc_deleted.increment(4);
-        metrics.record_rewrite_volume(ForgeMetricSource::Iceberg, 5, 6, 7, 8);
-        metrics.record_rewrite_volume(ForgeMetricSource::Staging, 9, 10, 11, 12);
-        metrics.record_stage(
-            ForgeMetricStage::StagingFold,
-            Duration::from_millis(1),
-            false,
-        );
-        metrics.record_stage(
-            ForgeMetricStage::IcebergRewrite,
-            Duration::from_millis(2),
-            true,
-        );
+        record_authoritative_boundaries(&metrics);
         let snapshot = recorder.snapshot();
-        for source in [ForgeMetricSource::Staging, ForgeMetricSource::Iceberg] {
-            for result in [
-                ForgeOperationResult::Committed,
-                ForgeOperationResult::Recovered,
-                ForgeOperationResult::Reset,
-                ForgeOperationResult::Noop,
-                ForgeOperationResult::Budget,
-                ForgeOperationResult::FenceLost,
-                ForgeOperationResult::Failed,
-            ] {
-                assert_eq!(
-                    snapshot.counters[&format!(
-                        "bifrost_forge_operations{{result=\"{}\",source=\"{}\"}}",
-                        result.as_str(),
-                        source.as_str()
-                    )],
-                    1
-                );
-            }
-        }
-        for result in [
-            ForgeLeaseResult::Contention,
-            ForgeLeaseResult::Takeover,
-            ForgeLeaseResult::FenceLost,
-        ] {
-            assert_eq!(
-                snapshot.counters[&format!(
-                    "bifrost_forge_lease_events_total{{result=\"{}\"}}",
-                    result.as_str()
-                )],
-                1
-            );
-        }
-        assert_eq!(snapshot.counters["bifrost_forge_snapshot_expired_total"], 2);
-        assert_eq!(snapshot.counters["bifrost_forge_gc_candidates_total"], 3);
-        assert_eq!(snapshot.counters["bifrost_forge_gc_deleted_total"], 4);
-        for (source, values) in [
-            (ForgeMetricSource::Iceberg, [5, 6, 7, 8]),
-            (ForgeMetricSource::Staging, [9, 10, 11, 12]),
-        ] {
-            for (family, expected) in [
-                ("bifrost_forge_rewrite_input_files_total", values[0]),
-                ("bifrost_forge_rewrite_input_bytes_total", values[1]),
-                ("bifrost_forge_rewrite_output_files_total", values[2]),
-                ("bifrost_forge_rewrite_output_bytes_total", values[3]),
-            ] {
-                assert_eq!(
-                    snapshot.counters[&format!("{family}{{source=\"{}\"}}", source.as_str())],
-                    expected
-                );
-            }
-        }
-        assert_eq!(
-            snapshot.histograms["bifrost_forge_stage_seconds{stage=\"staging_fold\"}"].count,
-            1
-        );
-        assert_eq!(
-            snapshot.histograms["bifrost_forge_stage_seconds{stage=\"iceberg_rewrite\"}"].count,
-            1
-        );
-        assert_eq!(
-            snapshot.counters["bifrost_forge_stage_failures_total{stage=\"iceberg_rewrite\"}"],
-            1
-        );
-        assert_eq!(
-            snapshot.counters["bifrost_forge_stage_failures_total{stage=\"staging_fold\"}"],
-            0
-        );
+        assert_operation_and_lease_boundaries(&snapshot);
+        assert_volume_and_stage_boundaries(&snapshot);
     }
 
     /// Proves incomplete publication cannot overwrite a complete snapshot.
@@ -790,66 +881,64 @@ mod tests {
         metrics.record_complete_tick(
             &complete,
             ForgeGaugeSnapshot {
-                staging_prepared_operations: 7,
-                iceberg_prepared_operations: 11,
-                staging_uncertain_operations: 2,
-                iceberg_uncertain_operations: 4,
+                staging: ReconciliationGaugeObservation {
+                    prepared_operations: 7,
+                    uncertain_operations: 2,
+                },
+                iceberg: ReconciliationGaugeObservation {
+                    prepared_operations: 11,
+                    uncertain_operations: 4,
+                },
             },
         );
         metrics.record_complete_tick(
             &ForgeTickOutcome::default(),
             ForgeGaugeSnapshot {
-                staging_prepared_operations: 1,
+                staging: ReconciliationGaugeObservation {
+                    prepared_operations: 1,
+                    uncertain_operations: 1,
+                },
                 ..ForgeGaugeSnapshot::default()
             },
         );
         let snapshot = recorder.snapshot();
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_pending_files{source=\"staging\"}"],
-            3.0
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_pending_files{source=\"staging\"}",
+            3.0,
         );
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_prepared_operations{source=\"staging\"}"],
-            7.0
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_prepared_operations{source=\"staging\"}",
+            7.0,
         );
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_pending_files{source=\"iceberg\"}"],
-            5.0
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_pending_files{source=\"iceberg\"}",
+            5.0,
         );
-        assert_eq!(snapshot.gauges["bifrost_forge_eligible_iceberg_files"], 5.0);
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_prepared_operations{source=\"iceberg\"}"],
-            11.0
+        assert_gauge(&snapshot, "bifrost_forge_eligible_iceberg_files", 5.0);
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_prepared_operations{source=\"iceberg\"}",
+            11.0,
         );
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_uncertain_operations{source=\"staging\"}"],
-            2.0
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_uncertain_operations{source=\"staging\"}",
+            2.0,
         );
-        assert_eq!(
-            snapshot.gauges["bifrost_forge_uncertain_operations{source=\"iceberg\"}"],
-            4.0
+        assert_gauge(
+            &snapshot,
+            "bifrost_forge_uncertain_operations{source=\"iceberg\"}",
+            4.0,
         );
         assert_eq!(snapshot.gauges.len(), 7);
     }
 
-    /// Proves every complete-pass convergence classification is exhaustive.
-    #[test]
-    fn forge_metrics_convergence_table_is_exhaustive() {
-        let noop = ForgeTickOutcome {
-            tick_complete: true,
-            ..ForgeTickOutcome::default()
-        };
-        assert_eq!(convergence_result(&noop), ForgeConvergenceResult::Noop);
-        let progress = ForgeTickOutcome {
-            bins_committed: 1,
-            tick_complete: true,
-            ..ForgeTickOutcome::default()
-        };
-        assert_eq!(
-            convergence_result(&progress),
-            ForgeConvergenceResult::Progress
-        );
-        for terminal in [
+    /// Builds one complete tick for every terminal-work signal.
+    fn terminal_outcomes() -> [ForgeTickOutcome; 10] {
+        [
             ForgeTickOutcome {
                 bins_committed: 1,
                 tick_complete: true,
@@ -900,84 +989,109 @@ mod tests {
                 tick_complete: true,
                 ..ForgeTickOutcome::default()
             },
-        ] {
-            assert_eq!(
-                convergence_result(&terminal),
-                ForgeConvergenceResult::Progress
-            );
-        }
-        for incomplete in [
+        ]
+    }
+
+    /// Builds one tick for every signal that prevents convergence.
+    fn incomplete_outcomes(progress: &ForgeTickOutcome) -> [ForgeTickOutcome; 14] {
+        [
             ForgeTickOutcome {
                 pending_work: true,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 lease_contention: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 tables_skipped: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 tables_failed: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 bins_skipped: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 budget_skips: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 fence_losses: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 stage_failures: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 live_snapshot_changes: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 live_pending: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 live_unresolved: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 open_operation_overflows: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 tables_discovered: 2,
                 tables_examined: 1,
                 tick_complete: true,
-                ..progress
+                ..*progress
             },
             ForgeTickOutcome {
                 tick_complete: false,
-                ..progress
+                ..*progress
             },
-        ] {
+        ]
+    }
+
+    /// Proves every complete-pass convergence classification is exhaustive.
+    #[test]
+    fn forge_metrics_convergence_table_is_exhaustive() {
+        let noop = ForgeTickOutcome {
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        assert_eq!(convergence_result(&noop), ForgeConvergenceResult::Noop);
+        let progress = ForgeTickOutcome {
+            bins_committed: 1,
+            tick_complete: true,
+            ..ForgeTickOutcome::default()
+        };
+        assert_eq!(
+            convergence_result(&progress),
+            ForgeConvergenceResult::Progress
+        );
+        for terminal in terminal_outcomes() {
+            assert_eq!(
+                convergence_result(&terminal),
+                ForgeConvergenceResult::Progress
+            );
+        }
+        for incomplete in incomplete_outcomes(&progress) {
             assert_eq!(
                 convergence_result(&incomplete),
                 ForgeConvergenceResult::Incomplete

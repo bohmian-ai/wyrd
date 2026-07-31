@@ -78,7 +78,7 @@ impl NativeQueryStart {
     }
 
     /// Builds the failed side with stable metadata retained as independent fields.
-    fn failure(error: ValaSdkError) -> Self {
+    fn failure(error: &ValaSdkError) -> Self {
         Self {
             stream: None,
             error_code: Some(error.code().to_owned()),
@@ -140,15 +140,17 @@ pub struct NativeBifrostQueryClient {
 impl NativeBifrostQueryClient {
     /// Constructs a bearer-token query client without performing IO.
     #[napi(constructor)]
-    pub fn new(server_url: String, token: String) -> napi::Result<Self> {
+    pub fn new(mut server_url: String, token: String) -> napi::Result<Self> {
         if server_url.trim().is_empty() || token.is_empty() {
             return Err(napi::Error::from_reason(
                 "serverUrl and token must not be empty".to_owned(),
             ));
         }
+        let base_url_len = server_url.trim_end_matches('/').len();
+        server_url.truncate(base_url_len);
         let config = ClientConfig {
             http: HttpConfig {
-                base_url: server_url.trim_end_matches('/').to_owned(),
+                base_url: server_url,
                 ..HttpConfig::default()
             },
             ..ClientConfig::default()
@@ -181,17 +183,17 @@ impl NativeBifrostQueryClient {
             sql: request.sql,
             visibility: match parse_visibility(&request.visibility) {
                 Ok(visibility) => visibility,
-                Err(error) => return Ok(NativeQueryStart::failure(error)),
+                Err(error) => return Ok(NativeQueryStart::failure(&error)),
             },
             freshness: match parse_freshness(&request.freshness) {
                 Ok(freshness) => freshness,
-                Err(error) => return Ok(NativeQueryStart::failure(error)),
+                Err(error) => return Ok(NativeQueryStart::failure(&error)),
             },
             deadline_ms: request.deadline_ms.map(u64::from),
         };
         Ok(match self.client.query(&request).await {
             Ok(stream) => NativeQueryStart::success(stream),
-            Err(error) => NativeQueryStart::failure(error),
+            Err(error) => NativeQueryStart::failure(&error),
         })
     }
 }
@@ -243,7 +245,7 @@ impl NativeBifrostQueryStream {
                 let terminal = serde_json::to_string(
                     stream
                         .terminal()
-                        .ok_or_else(|| sdk_error(ValaSdkError::IncompleteQueryStream))?,
+                        .ok_or_else(|| sdk_error(&ValaSdkError::IncompleteQueryStream))?,
                 )
                 .map_err(napi_error)?;
                 *self
@@ -345,7 +347,7 @@ fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> napi::Result<Vec<u8
 }
 
 /// Projects an SDK error with its stable code intact.
-fn sdk_error(error: ValaSdkError) -> napi::Error {
+fn sdk_error(error: &ValaSdkError) -> napi::Error {
     napi::Error::from_reason(format!("[{}] {error}", error.code()))
 }
 
@@ -362,7 +364,7 @@ mod tests {
     use super::*;
 
     /// Verifies one SDK error is copied into independent native metadata fields.
-    fn assert_start_failure(error: ValaSdkError) {
+    fn assert_start_failure(error: &ValaSdkError) {
         let code = error.code().to_owned();
         let status = u32::from(error.status());
         let title = error.title().to_owned();
@@ -384,21 +386,21 @@ mod tests {
     /// Gate, auth, transport, and request failures retain structured startup metadata.
     #[test]
     fn bifrost_query_native_start_preserves_structured_error_metadata() {
-        assert_start_failure(ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
+        assert_start_failure(&ValaSdkError::Transport(WyrdError::PermissionDeniedRbac {
             message: "principal lacks bifrost_query:read".to_owned(),
             details: serde_json::json!({}),
         }));
-        assert_start_failure(ValaSdkError::Transport(
+        assert_start_failure(&ValaSdkError::Transport(
             WyrdError::PermissionUnauthenticated {
                 message: "access token is invalid".to_owned(),
                 details: serde_json::json!({}),
             },
         ));
-        assert_start_failure(ValaSdkError::Transport(WyrdError::ServiceUnavailable {
+        assert_start_failure(&ValaSdkError::Transport(WyrdError::ServiceUnavailable {
             message: "query transport is unavailable".to_owned(),
             details: serde_json::json!({}),
         }));
-        assert_start_failure(ValaSdkError::Transport(WyrdError::from(
+        assert_start_failure(&ValaSdkError::Transport(WyrdError::from(
             BifrostError::QueryInvalidSql {
                 detail: "query request failed validation".to_owned(),
             },

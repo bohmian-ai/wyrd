@@ -93,7 +93,10 @@ impl ClusterNodes {
         Ok(mutation(result.rows_affected()))
     }
 
-    /// Removes exactly one matching role fence.
+    /// Marks exactly one matching role fence not ready while retaining its epoch.
+    ///
+    /// The retained row is the durable monotonic-fence tombstone used by the
+    /// next registration UPSERT. Ready/fresh discovery excludes it immediately.
     ///
     /// # Errors
     /// Returns [`SqlError`] for fence overflow or database failures.
@@ -103,7 +106,8 @@ impl ClusterNodes {
         fence: FencingToken,
     ) -> Result<RoleMutation, SqlError> {
         let result = sqlx::query(
-            "DELETE FROM vala.cluster_nodes WHERE node_id=$1 AND role=$2 AND fencing_token=$3",
+            "UPDATE vala.cluster_nodes SET ready=false, heartbeat_at=now() \
+             WHERE node_id=$1 AND role=$2 AND fencing_token=$3",
         )
         .bind(key.node_id.as_uuid())
         .bind(role_name(key.role))

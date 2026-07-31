@@ -128,7 +128,7 @@ async fn run_closeout_journey(
 
     // Exercise symmetric traffic: every independently bound server receives a
     // frame through its own public SDK connection and server-owned Gate.
-    for (pod, server) in cluster.servers().iter().enumerate() {
+    for (pod, server) in cluster.servers().enumerate() {
         let transport =
             bootstrap_transport(server, &format!("closeout-pod-{pod}"), &["admin"]).await?;
         let id = uuid::Uuid::now_v7().into_bytes();
@@ -191,7 +191,7 @@ async fn run_closeout_journey(
     assert_eq!(conflict.status(), 409);
 
     let mut oracle_rows = 0_u64;
-    for (pod, server) in cluster.servers().iter().enumerate() {
+    for (pod, server) in cluster.servers().enumerate() {
         let query_client =
             bootstrap_client(server, &format!("closeout-query-{pod}"), &["admin"]).await?;
         let query = query_client

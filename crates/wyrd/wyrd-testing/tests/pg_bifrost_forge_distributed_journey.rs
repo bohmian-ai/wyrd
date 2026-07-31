@@ -2,10 +2,17 @@
 
 use std::time::{Duration, Instant};
 
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use secrecy::SecretString;
+use vala_bifrost_redux::catalog::{TableRef, TenantTableBinding};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_sdk::QueryClient;
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_spec::DataTenantId;
-use wyrd_spec::vala::api::{AuditDetail, SyncQueryRequest};
-use wyrd_testing::bifrost::BifrostHarness;
+use wyrd_spec::vala::api::{AuditDetail, BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
+use wyrd_testing::bifrost::{BifrostTopology, WyrdTestCluster};
 use wyrd_testing::otlp::RandomTraceGenerator;
 use wyrd_testing::{Bootstrap, WyrdTestServer};
 
@@ -76,17 +83,22 @@ async fn forge_distributed_writer_matrix_preserves_rows_and_converges_once() {
 /// Panics when tenant provisioning, OTLP ingestion, Scribe flush, Forge
 /// maintenance, durable inspection, or public query validation fails.
 async fn run_scenario(scenario: Scenario) {
-    let harness = BifrostHarness::start(scenario.pods, 1)
+    let topology = if scenario.pods == 1 {
+        BifrostTopology::OnePod
+    } else {
+        BifrostTopology::ThreePod
+    };
+    let cluster = WyrdTestCluster::start(scenario.pods, topology)
         .await
         .unwrap_or_else(|error| panic!("{} harness: {error}", scenario.name));
-    let servers = harness.cluster().servers();
+    let servers = cluster.servers().collect::<Vec<_>>();
     assert_eq!(servers.len(), scenario.pods, "{} pod count", scenario.name);
     let control = &servers[0];
     let tenants = provision_tenants(control, scenario).await;
 
     for cycle in 0..WRITE_CYCLES {
-        write_cycle(servers, &tenants, cycle, scenario).await;
-        for server in servers {
+        write_cycle(&servers, &tenants, cycle, scenario).await;
+        for server in &servers {
             for tenant in &tenants {
                 server
                     .flush_bifrost_for_tenant(tenant.id)
@@ -108,16 +120,17 @@ async fn run_scenario(scenario: Scenario) {
         "{} Scribe did not create independent durable files: {pending_before:?}",
         scenario.name
     );
-
+    wait_for_scribe_retirement(&servers, scenario).await;
     for tenant in &tenants {
-        let response = query_response(control, &tenant.jwt).await;
+        let rows = query_rows(&tenant.query).await;
         assert!(
-            response.status().is_success(),
-            "{} query must not use an Oracle publication fence: {}",
+            rows > 0,
+            "{} PublishedOnly Oracle query must see sealed rows before compaction",
             scenario.name,
-            response.status()
         );
     }
+    make_pending_files_periodically_eligible(control, &tenants).await;
+    configure_active_day_targets(control, &tenants).await;
     let ticks = servers
         .iter()
         .map(|server| {
@@ -131,10 +144,10 @@ async fn run_scenario(scenario: Scenario) {
             .unwrap_or_else(|error| panic!("{} Forge tick: {error}", scenario.name));
     }
 
-    wait_for_compaction(servers, &tenants, scenario).await;
+    wait_for_compaction(&servers, &tenants, scenario).await;
     for tenant in &tenants {
         assert_eq!(
-            wait_for_query_rows(control, &tenant.jwt, expected_rows, scenario).await,
+            wait_for_query_rows(&tenant.query, expected_rows, scenario).await,
             expected_rows,
             "{} tenant {} exact rows",
             scenario.name,
@@ -145,10 +158,47 @@ async fn run_scenario(scenario: Scenario) {
     }
     assert_no_forge_leases(control, scenario).await;
 
-    harness
+    drop(servers);
+    cluster
         .shutdown()
         .await
         .unwrap_or_else(|error| panic!("{} shutdown: {error}", scenario.name));
+}
+
+/// Wait until every Scribe releases the immutable overlap generations.
+///
+/// # Panics
+///
+/// Panics when Scribe inspection fails or the fixture's bounded retention
+/// grace does not retire every immutable generation before the deadline.
+async fn wait_for_scribe_retirement(servers: &[&WyrdTestServer], scenario: Scenario) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for server in servers {
+            server
+                .bifrost_scribe()
+                .expect("server-owned Scribe")
+                .check_age(std::time::Instant::now() + Duration::from_secs(120));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let remaining = servers
+            .iter()
+            .map(|server| {
+                server
+                    .scribe_inspection_snapshot()
+                    .expect("Scribe retirement inspection")
+                    .immutable_bucket_count
+            })
+            .sum::<usize>();
+        if remaining == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} Scribe retained {remaining} immutable generations",
+            scenario.name
+        );
+    }
 }
 
 /// Authenticated tenant identity used by concurrent writers and query checks.
@@ -157,6 +207,8 @@ struct TenantWriter {
     id: DataTenantId,
     /// Tenant-scoped access token accepted by OTLP and query endpoints.
     jwt: String,
+    /// Tenant-scoped public SDK client used for terminal-safe Oracle queries.
+    query: WyrdClient,
 }
 
 /// Provision the requested number of isolated tenants and writer identities.
@@ -198,7 +250,21 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
             .exchange_api_key(&api_key)
             .await
             .unwrap_or_else(|error| panic!("{} exchange tenant {id}: {error}", scenario.name));
-        tenants.push(TenantWriter { id, jwt });
+        let query = WyrdClient::with_config(ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: server.grpc_url().expect("bound gRPC endpoint"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: server.base_url().expect("bound HTTP endpoint").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(api_key),
+            ..ClientConfig::default()
+        })
+        .unwrap_or_else(|error| panic!("{} query client for {id}: {error}", scenario.name));
+        tenants.push(TenantWriter { id, jwt, query });
     }
     tenants
 }
@@ -210,7 +276,7 @@ async fn provision_tenants(server: &WyrdTestServer, scenario: Scenario) -> Vec<T
 /// Panics when a bound gRPC endpoint cannot connect or rejects an authenticated
 /// export request.
 async fn write_cycle(
-    servers: &[WyrdTestServer],
+    servers: &[&WyrdTestServer],
     tenants: &[TenantWriter],
     cycle: usize,
     scenario: Scenario,
@@ -301,6 +367,88 @@ async fn pending_files(
     counts
 }
 
+/// Move this fixture's staged files beyond Forge's periodic discovery age guard.
+///
+/// The journey invokes `Forge::run_once`, which intentionally exercises periodic
+/// discovery rather than the asynchronous hint fast path. Backdating only the
+/// freshly created tenant rows establishes that production-path precondition
+/// without sleeping for the two-minute safety window.
+///
+/// # Panics
+///
+/// Panics when the shared operator connection cannot update all fixture rows.
+async fn make_pending_files_periodically_eligible(
+    server: &WyrdTestServer,
+    tenants: &[TenantWriter],
+) {
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    for tenant in tenants {
+        sqlx::query(
+            "UPDATE vala.file_list SET created_at = now() - interval '3 min' WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
+        )
+        .bind(tenant.id.as_uuid())
+        .execute(operator_pool.pool())
+        .await
+        .expect("backdate periodic Forge candidates");
+    }
+}
+
+/// Set each fixture table's target to its exact staged-byte total.
+///
+/// Forge retains a below-target trailing group on the active day. This
+/// production property update makes the complete fixture group eligible while
+/// preserving its real partition and event-time identities.
+///
+/// # Panics
+///
+/// Panics when staged totals, table loading, property validation, or the
+/// Iceberg metadata commit fails.
+async fn configure_active_day_targets(server: &WyrdTestServer, tenants: &[TenantWriter]) {
+    let operator_pool = server
+        .state()
+        .postgres
+        .operator_pool()
+        .expect("operator pool");
+    let catalog = server
+        .state()
+        .bifrost_redux
+        .as_ref()
+        .expect("Bifrost Redux catalog")
+        .iceberg_catalog();
+    for tenant in tenants {
+        let staged_bytes: i64 = sqlx::query_scalar(
+            "SELECT sum(file_size)::bigint FROM vala.file_list WHERE data_tenant_id = $1 AND namespace = 'vala.traces' AND table_name = 'spans' AND NOT compacted",
+        )
+        .bind(tenant.id.as_uuid())
+        .fetch_one(operator_pool.pool())
+        .await
+        .expect("staged byte total");
+        assert!(staged_bytes > 0, "fixture staged bytes must be positive");
+        let binding = TenantTableBinding::resolve((
+            tenant.id,
+            TableRef::new(BifrostNamespace::Traces, "spans"),
+        ))
+        .expect("spans binding");
+        let table = catalog
+            .load_table(&binding.table_ident())
+            .await
+            .expect("load spans table");
+        let action = Transaction::new(&table).update_table_properties().set(
+            "write.target-file-size-bytes".to_owned(),
+            staged_bytes.to_string(),
+        );
+        ApplyTransactionAction::apply(action, Transaction::new(&table))
+            .expect("target property action")
+            .commit(catalog.as_ref())
+            .await
+            .expect("target property commit");
+    }
+}
+
 /// Wait until every tenant's durable files have a committed Forge snapshot.
 ///
 /// # Panics
@@ -308,7 +456,7 @@ async fn pending_files(
 /// Panics when SQL inspection fails or the bounded convergence deadline
 /// expires.
 async fn wait_for_compaction(
-    servers: &[WyrdTestServer],
+    servers: &[&WyrdTestServer],
     tenants: &[TenantWriter],
     scenario: Scenario,
 ) {
@@ -342,44 +490,29 @@ async fn wait_for_compaction(
     }
 }
 
-/// Send the public same-table query used before and after Forge publication.
+/// Return the exact row count from the public terminal-safe Oracle query.
 ///
 /// # Panics
 ///
-/// Panics when the HTTP request cannot be sent.
-async fn query_response(server: &WyrdTestServer, jwt: &str) -> reqwest::Response {
-    reqwest::Client::new()
-        .post(format!(
-            "{}/v1/query",
-            server.base_url().expect("bound server URL")
-        ))
-        .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-        .json(&SyncQueryRequest {
-            sql: "SELECT * FROM \"vala.traces.spans\" WHERE service_name = 'checkout-api'"
-                .to_owned(),
-            params: Vec::new(),
-        })
-        .send()
+/// Panics when the query, Arrow stream, or validated terminal fails.
+async fn query_rows(client: &WyrdClient) -> u64 {
+    let request = BifrostQueryRequest {
+        sql: "SELECT * FROM vala.traces.spans".to_owned(),
+        visibility: VisibilityMode::PublishedOnly,
+        freshness: FreshnessPolicy::Strict,
+        deadline_ms: None,
+    };
+    let mut stream = QueryClient::new(client)
+        .query(&request)
         .await
-        .expect("public query request")
-}
-
-/// Return the exact row count from the public same-table query.
-///
-/// # Panics
-///
-/// Panics when the query fails or omits its row-count header.
-async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
-    let response = query_response(server, jwt)
-        .await
-        .error_for_status()
-        .expect("public query response");
-    response
-        .headers()
-        .get("x-wyrd-row-count")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .expect("row-count header")
+        .expect("public Oracle query");
+    let mut rows = 0_u64;
+    while let Some(batch) = stream.next_batch().await.expect("Oracle query batch") {
+        rows = rows.saturating_add(u64::try_from(batch.num_rows()).expect("batch rows fit u64"));
+    }
+    let terminal = stream.terminal().expect("validated Oracle terminal");
+    assert_eq!(terminal.row_count, rows, "terminal row count");
+    rows
 }
 
 /// Wait for Scribe's committed-generation grace window to retire overlap.
@@ -388,15 +521,10 @@ async fn query_rows(server: &WyrdTestServer, jwt: &str) -> u64 {
 ///
 /// Panics when the public query does not converge to the exact expected row
 /// count before the bounded deadline.
-async fn wait_for_query_rows(
-    server: &WyrdTestServer,
-    jwt: &str,
-    expected: u64,
-    scenario: Scenario,
-) -> u64 {
+async fn wait_for_query_rows(client: &WyrdClient, expected: u64, scenario: Scenario) -> u64 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let rows = query_rows(server, jwt).await;
+        let rows = query_rows(client).await;
         if rows == expected {
             return rows;
         }

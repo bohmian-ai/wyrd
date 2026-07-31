@@ -1,6 +1,6 @@
 //! Real-socket Wyrd server test harness.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +19,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use vala_bifrost::catalog::WyrdCatalog;
 use vala_bifrost_redux::catalog::BifrostCatalog;
+use vala_bifrost_redux::contracts::Scribe;
 use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
@@ -46,12 +47,13 @@ use wyrd_semver::VersionBlock;
 use wyrd_server::boot::build_workload_bindings;
 use wyrd_server::boot::issuer::{seed_trusted_issuers, seed_workload_bindings};
 use wyrd_server::components::auth::audit_writer::{AuthzAuditWriter, NoopAuthzAuditWriter};
-use wyrd_server::config::ServeMode;
-use wyrd_server::config::{IssuerEntry, WorkloadBindingEntry};
+use wyrd_server::config::{BifrostRuntimeRole, IssuerEntry, ServeMode, WorkloadBindingEntry};
 use wyrd_server::postgres::ServerPostgres;
 use wyrd_server::state::BifrostIngestRuntime;
 use wyrd_server::{AppState, WyrdServer, WyrdServerConfig, build_router};
 use wyrd_spec::DataTenantId;
+use wyrd_spec::vala::api::NodeId;
+use wyrd_telemetry::TelemetryGuard;
 
 /// Production-shaped object-store seam for the embedded Forge fixture.
 #[derive(Debug)]
@@ -121,6 +123,8 @@ pub struct WyrdTestServer {
     mode: Mode,
     shutdown_token: Option<CancellationToken>,
     serve_handle: Option<JoinHandle<Result<(), wyrd_server::BootExit>>>,
+    /// Optional fixed HTTP/gRPC addresses reserved by a multi-node harness.
+    requested_bind: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
 }
 
 struct WyrdTestServerInner {
@@ -128,9 +132,9 @@ struct WyrdTestServerInner {
     // Lifetime guard: only set for local-backend servers; cloud backends need no tempdir.
     #[allow(dead_code)]
     storage_root: Option<Arc<tempfile::TempDir>>,
-    _scribe_wal_root: Arc<tempfile::TempDir>,
+    _scribe_wal_root: Option<Arc<tempfile::TempDir>>,
     /// Lifetime guard for the Forge DataFusion spill directory.
-    _forge_spill_root: Arc<tempfile::TempDir>,
+    _forge_spill_root: Option<Arc<tempfile::TempDir>>,
     state: AppState,
     router: axum::Router,
     verifier: Arc<TokenVerifier<SqlPermissionResolver, PgIssuerResolver>>,
@@ -164,6 +168,18 @@ pub struct WyrdTestServerBuilder {
     forge_max_files_per_bin: usize,
     wal_sync_delay: Duration,
     scribe_admission: Option<AdmissionConfig>,
+    /// Stable node identity retained when a cluster restarts this builder.
+    node_id: Option<NodeId>,
+    /// Closed role set constructed for this server instance.
+    bifrost_roles: BTreeSet<BifrostRuntimeRole>,
+    /// Cluster-retained Scribe WAL root reused across restarts.
+    scribe_wal_root: Option<Arc<tempfile::TempDir>>,
+    /// Cluster-retained Forge/Oracle spill root reused across restarts.
+    oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+    /// Process-installed production telemetry guard shared by every node.
+    telemetry: Option<Arc<TelemetryGuard>>,
+    /// Optional fixed HTTP/gRPC addresses used for truthful peer advertisement.
+    bind_addrs: Option<(std::net::SocketAddr, std::net::SocketAddr)>,
 }
 
 impl Default for WyrdTestServerBuilder {
@@ -182,6 +198,18 @@ impl Default for WyrdTestServerBuilder {
             forge_max_files_per_bin: 3,
             wal_sync_delay: Duration::ZERO,
             scribe_admission: None,
+            node_id: None,
+            bifrost_roles: [
+                BifrostRuntimeRole::Scribe,
+                BifrostRuntimeRole::Forge,
+                BifrostRuntimeRole::Oracle,
+            ]
+            .into_iter()
+            .collect(),
+            scribe_wal_root: None,
+            oracle_spill_root: None,
+            telemetry: None,
+            bind_addrs: None,
         }
     }
 }
@@ -1023,9 +1051,10 @@ impl WyrdTestServer {
         let loopback = "127.0.0.1:0"
             .parse()
             .expect("static loopback socket addr is valid");
+        let (http_bind, grpc_bind) = self.requested_bind.unwrap_or((loopback, loopback));
         let mut config = WyrdServerConfig::default();
-        config.http.bind = loopback;
-        config.grpc.bind = loopback;
+        config.http.bind = http_bind;
+        config.grpc.bind = grpc_bind;
         config.metrics.enabled = false;
         config.serve.mode = ServeMode::Both;
 
@@ -1212,6 +1241,48 @@ impl WyrdTestServerBuilder {
         self
     }
 
+    /// Retain one stable physical identity and role set across cluster restarts.
+    #[must_use]
+    pub(crate) fn with_bifrost_node(
+        mut self,
+        node_id: NodeId,
+        roles: BTreeSet<BifrostRuntimeRole>,
+    ) -> Self {
+        self.node_id = Some(node_id);
+        self.bifrost_roles = roles;
+        self
+    }
+
+    /// Reuse cluster-owned local WAL and spill directories for this node.
+    #[must_use]
+    pub(crate) fn with_bifrost_roots(
+        mut self,
+        scribe_wal_root: Option<Arc<tempfile::TempDir>>,
+        oracle_spill_root: Option<Arc<tempfile::TempDir>>,
+    ) -> Self {
+        self.scribe_wal_root = scribe_wal_root;
+        self.oracle_spill_root = oracle_spill_root;
+        self
+    }
+
+    /// Attach the process-installed production telemetry pipeline.
+    #[must_use]
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<TelemetryGuard>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Bind to cluster-reserved addresses and advertise the real private gRPC endpoint.
+    #[must_use]
+    pub(crate) fn with_bind_addrs(
+        mut self,
+        http: std::net::SocketAddr,
+        grpc: std::net::SocketAddr,
+    ) -> Self {
+        self.bind_addrs = Some((http, grpc));
+        self
+    }
+
     /// Build and start an in-process server.
     ///
     /// # Errors
@@ -1384,89 +1455,116 @@ impl WyrdTestServerBuilder {
                 bifrost_memory.clone(),
             ),
         );
-        let spill_root = Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
-        let forge_runtime = ForgeRewriteRuntime::new(
-            query_memory.clone(),
-            spill_root.path(),
-            forge_config.spill_limit_bytes,
-        )
-        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
-        let staging = Arc::new(storage.operator().clone());
-        let object_store: Arc<dyn ForgeObjectStore> =
-            Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
-        let forge = Arc::new(
-            Forge::new(ForgeBuildConfig {
-                vala: postgres.vala().clone(),
-                operator_pool: operator_pool.clone(),
-                catalog: bifrost_redux.iceberg_catalog(),
-                staging,
-                object_store,
-                rewrite_runtime: forge_runtime,
-                hints: forge_inbox,
-                config: forge_config,
-                maintenance_interval: self.forge_interval,
-            })
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
-        let scribe_wal_root = Arc::new(
-            tempfile::tempdir().map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
-        let node_id = Uuid::now_v7();
-        let wal = Arc::new(
-            WalWriter::new(
-                scribe_wal_root.path(),
-                *node_id.as_bytes(),
-                1,
-                WalConfig::default(),
-            )
-            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
-        );
-        let scribe = if self.wal_sync_delay.is_zero() {
-            ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
-                Arc::new(storage.operator().clone()),
-                wal,
-                &node_id.to_string(),
-                1,
-                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
-                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
-                    admission: scribe_admission,
-                    coordination_runtime: tokio::runtime::Handle::current(),
-                    memory_budget: Some(bifrost_memory.scribe_budget()),
-                    staging_file_publisher: Some(forge_publisher.clone()),
-                },
+        let spill_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
+            Some(
+                self.oracle_spill_root.unwrap_or(Arc::new(
+                    tempfile::tempdir()
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                )),
             )
         } else {
-            ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
-                Arc::new(storage.operator().clone()),
-                wal,
-                &node_id.to_string(),
-                1,
-                self.wal_sync_delay,
-                vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
-                    lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
-                    admission: scribe_admission,
-                    coordination_runtime: tokio::runtime::Handle::current(),
-                    memory_budget: Some(bifrost_memory.scribe_budget()),
-                    staging_file_publisher: Some(forge_publisher.clone()),
-                },
-            )
-            .map_err(WyrdTestServerError::Start)?
+            self.oracle_spill_root
         };
-        let scribe = Arc::new(scribe);
-        let ingest = Arc::new(BifrostIngestRuntime::new(
-            Arc::clone(&scribe),
-            Arc::clone(&bifrost_redux),
-            Arc::clone(&verifier),
-            vala_bifrost_redux::gate::limits::IngestLimits::default(),
-            None,
-        ));
+        let forge = if self.bifrost_roles.contains(&BifrostRuntimeRole::Forge) {
+            let root = spill_root.as_ref().ok_or_else(|| {
+                WyrdTestServerError::Start("Forge spill root is unavailable".to_owned())
+            })?;
+            let forge_runtime = ForgeRewriteRuntime::new(
+                query_memory.clone(),
+                root.path(),
+                forge_config.spill_limit_bytes,
+            )
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+            let staging = Arc::new(storage.operator().clone());
+            let object_store: Arc<dyn ForgeObjectStore> =
+                Arc::new(TestForgeObjectStore::new(Arc::clone(&staging)));
+            Some(Arc::new(
+                Forge::new(ForgeBuildConfig {
+                    vala: postgres.vala().clone(),
+                    operator_pool: operator_pool.clone(),
+                    catalog: bifrost_redux.iceberg_catalog(),
+                    staging,
+                    object_store,
+                    rewrite_runtime: forge_runtime,
+                    hints: forge_inbox,
+                    config: forge_config,
+                    maintenance_interval: self.forge_interval,
+                })
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            ))
+        } else {
+            None
+        };
+        let node_id = self.node_id.unwrap_or_else(|| NodeId::new(Uuid::now_v7()));
+        let scribe_wal_root = if self.bifrost_roles.contains(&BifrostRuntimeRole::Scribe) {
+            Some(
+                self.scribe_wal_root.unwrap_or(Arc::new(
+                    tempfile::tempdir()
+                        .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+                )),
+            )
+        } else {
+            self.scribe_wal_root
+        };
+        let scribe = if let Some(wal_root) = &scribe_wal_root {
+            let wal = Arc::new(
+                WalWriter::new(
+                    wal_root.path(),
+                    *node_id.as_uuid().as_bytes(),
+                    1,
+                    WalConfig::default(),
+                )
+                .map_err(|error| WyrdTestServerError::Start(error.to_string()))?,
+            );
+            let node_name = node_id.as_uuid().to_string();
+            let scribe = if self.wal_sync_delay.is_zero() {
+                ScribeImpl::new_for_embedded_with_runtime_config_and_admission_and_memory(
+                    Arc::new(storage.operator().clone()),
+                    wal,
+                    &node_name,
+                    1,
+                    vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                        lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::default(),
+                        admission: scribe_admission,
+                        coordination_runtime: tokio::runtime::Handle::current(),
+                        memory_budget: Some(bifrost_memory.scribe_budget()),
+                        staging_file_publisher: Some(forge_publisher.clone()),
+                    },
+                )
+            } else {
+                ScribeImpl::try_new_for_embedded_with_wal_sync_delay_and_admission_and_memory(
+                    Arc::new(storage.operator().clone()),
+                    wal,
+                    &node_name,
+                    1,
+                    self.wal_sync_delay,
+                    vala_bifrost_redux::scribe::ScribeEmbeddedConfig {
+                        lane_config: vala_bifrost_redux::scribe::ScribeLaneConfig::resolved(),
+                        admission: scribe_admission,
+                        coordination_runtime: tokio::runtime::Handle::current(),
+                        memory_budget: Some(bifrost_memory.scribe_budget()),
+                        staging_file_publisher: Some(forge_publisher.clone()),
+                    },
+                )
+                .map_err(WyrdTestServerError::Start)?
+            };
+            Some(Arc::new(scribe))
+        } else {
+            None
+        };
+        let ingest = scribe.as_ref().map(|scribe| {
+            Arc::new(BifrostIngestRuntime::new(
+                Arc::clone(scribe),
+                Arc::clone(&bifrost_redux),
+                Arc::clone(&verifier),
+                vala_bifrost_redux::gate::limits::IngestLimits::default(),
+                None,
+            ))
+        });
         let mut state = AppState::new(postgres, storage, bifrost)
             .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
-            .with_forge(forge)
-            .with_bifrost_ingest(Arc::clone(&ingest))
+            .with_bifrost_roles(self.bifrost_roles.clone())
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
@@ -1476,19 +1574,48 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
-        state = wyrd_server::boot::attach_test_oracle_runtime(state, operator_pool)
+        if let Some(forge) = forge {
+            state = state.with_forge(forge);
+        }
+        if let Some(ingest) = &ingest {
+            state = state.with_bifrost_ingest(Arc::clone(ingest));
+        }
+        if let Some(telemetry) = self.telemetry {
+            state = state.with_telemetry(telemetry);
+        }
+        if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle) {
+            state = wyrd_server::boot::attach_test_oracle_runtime_for_node_at(
+                state,
+                operator_pool,
+                node_id,
+                SecretString::from(crate::keys::private_key_pem().to_owned()),
+                self.bind_addrs.map_or_else(
+                    || "http://127.0.0.1:0".to_owned(),
+                    |(_, grpc)| format!("http://{grpc}"),
+                ),
+            )
             .await
             .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        }
         let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
-        let mut gate = vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
-            Arc::clone(&bifrost_redux),
-            scribe,
-            vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
-            limits,
-            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
-                ingest.scribe().ingress_cpu_pool(),
-            )),
-        );
+        let mut gate = if let Some(ingest) = &ingest {
+            let gate_scribe: Arc<dyn Scribe> = ingest.scribe().clone();
+            vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+                Arc::clone(&bifrost_redux),
+                gate_scribe,
+                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
+                limits,
+                Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+                    ingest.scribe().ingress_cpu_pool(),
+                )),
+            )
+        } else {
+            vala_bifrost_redux::gate::Gate::without_scribe(
+                Arc::clone(&bifrost_redux),
+                vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
+                limits,
+            )
+        };
         if let Some(query) = state.bifrost_query() {
             gate = gate.with_oracle(Arc::clone(query.oracle()));
         }
@@ -1518,6 +1645,7 @@ impl WyrdTestServerBuilder {
             mode: Mode::InProcess,
             shutdown_token: None,
             serve_handle: None,
+            requested_bind: self.bind_addrs,
         })
     }
 

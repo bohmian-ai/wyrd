@@ -275,9 +275,17 @@ pub(crate) enum ShardCommand {
             Result<Vec<crate::scribe::memtable::FrozenMemtable>, ScribeError>,
         >,
     },
+    /// Publish a generation persisted by the direct force-seal path.
     CompletePostCommit {
+        /// Exact partition bucket whose generation was persisted.
+        seal_key: crate::scribe::seal_key::SealKey,
+        /// Memtable generation that is now durable.
         seal_id: u64,
+        /// Arrow memory retained until the lifecycle grace period elapses.
+        arrow_bytes: usize,
+        /// Durable file-list row that proves the generation was published.
         file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
+        /// Completion channel for publication bookkeeping errors.
         response: tokio::sync::oneshot::Sender<Result<(), ScribeError>>,
     },
     AbortPostCommit {
@@ -558,6 +566,7 @@ impl ScribeShardRuntime {
         &self,
         seal_id: u64,
         seal_key: &crate::scribe::seal_key::SealKey,
+        arrow_bytes: usize,
         file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
     ) -> Result<(), ScribeError> {
         let shard = shard_for(seal_key.tenant, &seal_key.table);
@@ -565,7 +574,9 @@ impl ScribeShardRuntime {
         self.senders[shard]
             .sender
             .send(ShardCommand::CompletePostCommit {
+                seal_key: seal_key.clone(),
                 seal_id,
+                arrow_bytes,
                 file_list_key,
                 response,
             })
@@ -820,11 +831,18 @@ impl ShardOwner {
                 let _ = response.send(self.freeze_tenant(tenant));
             }
             ShardCommand::CompletePostCommit {
+                seal_key,
                 seal_id,
+                arrow_bytes,
                 file_list_key,
                 response,
             } => {
-                let _ = response.send(self.memtable.complete_post_commit(seal_id, file_list_key));
+                let _ = response.send(self.complete_external_post_commit(
+                    &seal_key,
+                    seal_id,
+                    arrow_bytes,
+                    file_list_key,
+                ));
             }
             ShardCommand::AbortPostCommit { seal_id, response } => {
                 let _ = response.send(self.memtable.abort_post_commit(seal_id));
@@ -1095,6 +1113,46 @@ impl ShardOwner {
         for key in keys {
             self.submit_front(&key);
         }
+    }
+
+    /// Register externally persisted force-seal state for grace-ordered retirement.
+    ///
+    /// The direct force-seal path commits SQL outside the shard-owned persistence
+    /// runtime. It must still create the retained-generation bookkeeping used to
+    /// release immutable memory and WAL references on lifecycle ticks.
+    ///
+    /// # Errors
+    ///
+    /// Returns a memtable or WAL ownership error when publication cannot move
+    /// the exact generation into retained state.
+    fn complete_external_post_commit(
+        &mut self,
+        seal_key: &crate::scribe::seal_key::SealKey,
+        seal_id: u64,
+        arrow_bytes: usize,
+        file_list_key: crate::scribe::file_list_writer::FileListCommitKey,
+    ) -> Result<(), ScribeError> {
+        let segment_refs = self
+            .wal_segments
+            .get(seal_key)
+            .into_iter()
+            .flat_map(|segments| segments.values())
+            .map(|segment| segment.reference())
+            .collect::<Vec<_>>();
+        self.wal_handle.retain_segments(&segment_refs)?;
+        if let Err(error) = self.memtable.complete_post_commit(seal_id, file_list_key) {
+            let _ = self.wal_handle.retire_segments(&segment_refs);
+            return Err(error);
+        }
+        self.retained_generations.insert(
+            seal_id,
+            RetainedGeneration {
+                arrow_bytes,
+                wal_segments: segment_refs,
+                wal: self.wal_handle.clone(),
+            },
+        );
+        Ok(())
     }
 
     /// Retires committed generations after their retention grace period.

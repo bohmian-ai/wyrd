@@ -30,6 +30,8 @@ mod otlp_trace_export_http;
 mod pg_bifrost_e2e_closeout_journey;
 #[path = "pg_bifrost_forge_distributed_journey.rs"]
 mod pg_bifrost_forge_distributed_journey;
+#[path = "pg_bifrost_oracle_journeys.rs"]
+mod pg_bifrost_oracle_journeys;
 #[path = "pg_bifrost_scribe_multipod_journey.rs"]
 mod pg_bifrost_scribe_multipod_journey;
 #[path = "pg_bifrost_sustained_journey.rs"]

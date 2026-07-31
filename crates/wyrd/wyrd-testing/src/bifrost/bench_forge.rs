@@ -139,7 +139,7 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     let server = harness
         .cluster()
         .servers()
-        .first()
+        .next()
         .ok_or("Forge needs one server")?;
     let fixture = seed_forge_group_for_tenant(server, tenant, "bifrost_bench_forge").await;
     sqlx::query(

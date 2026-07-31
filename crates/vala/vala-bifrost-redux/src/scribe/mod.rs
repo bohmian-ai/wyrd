@@ -992,7 +992,12 @@ impl ScribeImpl {
                         detail: error.to_string(),
                     })?;
             self.shards
-                .complete_post_commit(token.seal_id, &token.seal_key, token.file_list_key)
+                .complete_post_commit(
+                    token.seal_id,
+                    &token.seal_key,
+                    token.memtable_bytes,
+                    token.file_list_key,
+                )
                 .await?;
             if let Some(publisher) = &self.staging_file_publisher {
                 let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(
@@ -1075,7 +1080,12 @@ impl ScribeImpl {
                         detail: error.to_string(),
                     })?;
             self.shards
-                .complete_post_commit(token.seal_id, &token.seal_key, key.clone())
+                .complete_post_commit(
+                    token.seal_id,
+                    &token.seal_key,
+                    token.memtable_bytes,
+                    key.clone(),
+                )
                 .await?;
             if let Some(publisher) = &self.staging_file_publisher {
                 let _ = publisher.try_publish(crate::maintenance::StagingFileCommitted::new(

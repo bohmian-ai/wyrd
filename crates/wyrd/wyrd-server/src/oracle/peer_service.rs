@@ -133,7 +133,23 @@ fn conversion_status(error: PrivateConversionError) -> Status {
 fn dispatch_status(error: DispatchError) -> Status {
     match error {
         DispatchError::Retryable => Status::unavailable(error.to_string()),
+        DispatchError::StaleObject => Status::not_found(error.to_string()),
         DispatchError::Terminal => Status::permission_denied(error.to_string()),
         DispatchError::Exhausted => Status::aborted(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Proves the private tonic boundary preserves only stale-object failures as not-found.
+    #[test]
+    fn stale_object_dispatch_status_is_not_found() {
+        let stale = dispatch_status(DispatchError::StaleObject);
+        let outage = dispatch_status(DispatchError::Retryable);
+
+        assert_eq!(stale.code(), wyrd_tonic::tonic::Code::NotFound);
+        assert_eq!(outage.code(), wyrd_tonic::tonic::Code::Unavailable);
     }
 }

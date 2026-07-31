@@ -84,7 +84,20 @@ struct PeerTestService {
     /// Worker owner under test.
     worker: Arc<OraclePeerWorker>,
     /// Deterministic fault injected before worker execution.
-    fail_execute: bool,
+    fault: PeerFault,
+}
+
+/// Deterministic production-stream fault injected by the tonic test adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerFault {
+    /// Preserve the production worker stream.
+    None,
+    /// Fail before the worker consumes the ticket.
+    BeforeExecute,
+    /// Change a footer count after production encoding.
+    CorruptFooter,
+    /// End the transport stream before the required footer.
+    MissingFooter,
 }
 
 #[wyrd_tonic::tonic::async_trait]
@@ -128,7 +141,7 @@ impl OraclePeerService for PeerTestService {
         &self,
         request: Request<ProtoExecuteFragmentRequest>,
     ) -> Result<Response<Self::ExecuteFragmentStream>, Status> {
-        if self.fail_execute {
+        if self.fault == PeerFault::BeforeExecute {
             return Err(Status::unavailable("injected peer loss"));
         }
         let request = ExecuteFragmentRequest::try_from(request.into_inner())
@@ -138,6 +151,7 @@ impl OraclePeerService for PeerTestService {
             .execute(request)
             .await
             .map_err(|error| Status::permission_denied(error.to_string()))?;
+        let fault = self.fault;
         let output = async_stream::stream! {
             let mut index = 0_usize;
             while let Some(frame) = stream.next().await {
@@ -145,9 +159,15 @@ impl OraclePeerService for PeerTestService {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
                 index += 1;
-                yield frame
-                    .map(Into::into)
-                    .map_err(|error| Status::permission_denied(error.to_string()));
+                let frame = frame.map_err(|error| Status::permission_denied(error.to_string()))?;
+                match (fault, frame) {
+                    (PeerFault::MissingFooter, wyrd_spec::vala::api::WorkerAttemptFrame::Footer(_)) => return,
+                    (PeerFault::CorruptFooter, wyrd_spec::vala::api::WorkerAttemptFrame::Footer(mut footer)) => {
+                        footer.row_count = footer.row_count.saturating_add(1);
+                        yield Ok(wyrd_spec::vala::api::WorkerAttemptFrame::Footer(footer).into());
+                    }
+                    (_, frame) => yield Ok(frame.into()),
+                }
             }
         };
         Ok(Response::new(Box::pin(output)))
@@ -180,7 +200,7 @@ async fn start_peer(
     fence: u64,
     authority: Arc<OraclePeerAuthority>,
     security_audit: Arc<dyn PeerSecurityAudit>,
-    fail_execute: bool,
+    fault: PeerFault,
 ) -> RunningPeer {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").expect("peer listener");
     let address = socket.local_addr().expect("peer address");
@@ -204,7 +224,7 @@ async fn start_peer(
         wyrd_tonic::tonic::transport::Server::builder()
             .add_service(OraclePeerServiceServer::new(PeerTestService {
                 worker,
-                fail_execute,
+                fault,
             }))
             .serve_with_shutdown(address, shutdown_task.cancelled_owned())
             .await
@@ -346,9 +366,41 @@ fn execute_request(
     }
 }
 
+/// Reserves one pending slot through the generated tonic client.
+///
+/// # Panics
+///
+/// Panics when transport, conversion, or capacity prevents the isolated peer
+/// from accepting the reservation.
+async fn reserve_pending(
+    client: &mut OraclePeerServiceClient<wyrd_tonic::tonic::transport::Channel>,
+    context: &DispatchContext,
+) -> PendingNodeReservation {
+    let response: ReserveNodeSlotsResponse = client
+        .reserve_slots(Request::new(
+            ReserveNodeSlotsRequest {
+                query_id: context.query_id,
+                leader_node_id: context.leader_node_id,
+                leader_fencing_token: context.leader_fence,
+                query_class: context.query_class,
+                slot_units: context.slot_units,
+                expires_at: chrono::Utc::now() + chrono::Duration::seconds(2),
+            }
+            .into(),
+        ))
+        .await
+        .expect("reserve transport")
+        .into_inner()
+        .try_into()
+        .expect("reserve conversion");
+    let ReserveNodeSlotsResponse::Pending(pending) = response else {
+        panic!("isolated peer must accept one pending reservation");
+    };
+    pending
+}
+
 /// One dispatcher retries a failed remote peer on its in-process leader with parity and cleanup.
-#[tokio::test]
-async fn oracle_peer_remote_failure_falls_back_to_leader_local() {
+pub(crate) async fn prove_oracle_peer_remote_failure_falls_back_to_leader_local() {
     let audit = Arc::new(RecordingPeerAudit::default());
     let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
     let authority = Arc::new(
@@ -365,7 +417,7 @@ async fn oracle_peer_remote_failure_falls_back_to_leader_local() {
         21,
         Arc::clone(&authority),
         Arc::clone(&security_audit),
-        true,
+        PeerFault::BeforeExecute,
     )
     .await;
     let file = NamedTempFile::new().expect("parquet temp");
@@ -444,9 +496,14 @@ async fn oracle_peer_remote_failure_falls_back_to_leader_local() {
     failed.stop().await;
 }
 
-/// Three accepted placements fail in order and each pending reservation releases immediately.
+/// Runs the remote-failure fallback proof as a focused peer test.
 #[tokio::test]
-async fn oracle_peer_three_failures_exhaust_and_release_partial_placement() {
+async fn oracle_peer_remote_failure_falls_back_to_leader_local() {
+    prove_oracle_peer_remote_failure_falls_back_to_leader_local().await;
+}
+
+/// Three accepted placements fail in order and each pending reservation releases immediately.
+pub(crate) async fn prove_oracle_peer_three_failures_exhaust_and_release_partial_placement() {
     let audit = Arc::new(RecordingPeerAudit::default());
     let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
     let authority = Arc::new(
@@ -468,7 +525,7 @@ async fn oracle_peer_three_failures_exhaust_and_release_partial_placement() {
             fence,
             Arc::clone(&authority),
             Arc::clone(&security_audit),
-            true,
+            PeerFault::BeforeExecute,
         )
         .await;
         addresses.insert(node, format!("http://{}", peer.address));
@@ -504,9 +561,14 @@ async fn oracle_peer_three_failures_exhaust_and_release_partial_placement() {
     }
 }
 
-/// A restarted tonic role rejects the old fence and accepts only a fresh fenced ticket.
+/// Runs the partial-placement exhaustion proof as a focused peer test.
 #[tokio::test]
-async fn oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
+async fn oracle_peer_three_failures_exhaust_and_release_partial_placement() {
+    prove_oracle_peer_three_failures_exhaust_and_release_partial_placement().await;
+}
+
+/// A restarted tonic role rejects the old fence and accepts only a fresh fenced ticket.
+pub(crate) async fn prove_oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
     let audit = Arc::new(RecordingPeerAudit::default());
     let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
     let authority = Arc::new(
@@ -523,7 +585,7 @@ async fn oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
         40,
         Arc::clone(&authority),
         Arc::clone(&security_audit),
-        false,
+        PeerFault::None,
     )
     .await;
     old.stop().await;
@@ -532,7 +594,7 @@ async fn oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
         41,
         Arc::clone(&authority),
         Arc::clone(&security_audit),
-        false,
+        PeerFault::None,
     )
     .await;
     let transports = transport_directory(
@@ -582,9 +644,14 @@ async fn oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
     restarted.stop().await;
 }
 
-/// Dropping a tonic attempt before its footer releases the running slot for fresh work.
+/// Runs the restarted-fence replay proof as a focused peer test.
 #[tokio::test]
-async fn oracle_peer_tonic_cancellation_releases_running_slot() {
+async fn oracle_peer_restart_rejects_old_fence_and_releases_reservation() {
+    prove_oracle_peer_restart_rejects_old_fence_and_releases_reservation().await;
+}
+
+/// Dropping a tonic attempt before its footer releases the running slot for fresh work.
+pub(crate) async fn prove_oracle_peer_tonic_cancellation_releases_running_slot() {
     let audit = Arc::new(RecordingPeerAudit::default());
     let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
     let authority = Arc::new(
@@ -601,7 +668,7 @@ async fn oracle_peer_tonic_cancellation_releases_running_slot() {
         51,
         Arc::clone(&authority),
         Arc::clone(&security_audit),
-        false,
+        PeerFault::None,
     )
     .await;
     let address = format!("http://{}", peer.address);
@@ -665,4 +732,161 @@ async fn oracle_peer_tonic_cancellation_releases_running_slot() {
     assert_eq!(peer.reservations.cleanup_expired(chrono::Utc::now()), 0);
     assert_eq!(*audit.calls.lock().expect("audit mutex"), 1);
     peer.stop().await;
+}
+
+/// Runs the tonic cancellation and replay proof as a focused peer test.
+#[tokio::test]
+async fn oracle_peer_tonic_cancellation_releases_running_slot() {
+    prove_oracle_peer_tonic_cancellation_releases_running_slot().await;
+}
+
+/// Tonic worker rejects signed-permission, payload, and raw-ticket tamper before storage output.
+pub(crate) async fn prove_oracle_peer_tonic_rejects_ticket_payload_and_permission_tamper() {
+    let audit = Arc::new(RecordingPeerAudit::default());
+    let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
+    let authority = Arc::new(
+        OraclePeerAuthority::from_pem(
+            &SecretString::from(PRIVATE_KEY_PEM),
+            Arc::clone(&security_audit),
+        )
+        .expect("key"),
+    );
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let worker = NodeId::new(uuid::Uuid::now_v7());
+    let peer = start_peer(
+        worker,
+        61,
+        Arc::clone(&authority),
+        Arc::clone(&security_audit),
+        PeerFault::None,
+    )
+    .await;
+    let mut client = OraclePeerServiceClient::connect(format!("http://{}", peer.address))
+        .await
+        .expect("client");
+    let file = NamedTempFile::new().expect("parquet temp");
+    let sealed = fragment(&file);
+
+    let ticket_context = context(leader);
+    let pending = reserve_pending(&mut client, &ticket_context).await;
+    let mut ticket_tamper =
+        execute_request(&authority, &ticket_context, worker, 61, &pending, &sealed);
+    ticket_tamper.ticket.signature[0] ^= 1;
+    let rejection = client
+        .execute_fragment(Request::new(ticket_tamper.into()))
+        .await
+        .expect_err("signature tamper rejects");
+    assert_eq!(rejection.code(), wyrd_tonic::tonic::Code::PermissionDenied);
+
+    let payload_context = context(leader);
+    let pending = reserve_pending(&mut client, &payload_context).await;
+    let mut payload_tamper =
+        execute_request(&authority, &payload_context, worker, 61, &pending, &sealed);
+    payload_tamper.fragment_bytes[0] ^= 1;
+    let rejection = client
+        .execute_fragment(Request::new(payload_tamper.into()))
+        .await
+        .expect_err("payload tamper rejects");
+    assert_eq!(rejection.code(), wyrd_tonic::tonic::Code::PermissionDenied);
+
+    let mut permission_context = context(leader);
+    permission_context.permission_digest.clear();
+    let pending = reserve_pending(&mut client, &permission_context).await;
+    let permission_tamper = execute_request(
+        &authority,
+        &permission_context,
+        worker,
+        61,
+        &pending,
+        &sealed,
+    );
+    let rejection = client
+        .execute_fragment(Request::new(permission_tamper.into()))
+        .await
+        .expect_err("empty permission binding rejects");
+    assert_eq!(rejection.code(), wyrd_tonic::tonic::Code::PermissionDenied);
+    assert_eq!(*audit.calls.lock().expect("audit mutex"), 3);
+    peer.stop().await;
+}
+
+/// Runs ticket, payload, and permission tamper proofs as a focused peer test.
+#[tokio::test]
+async fn oracle_peer_tonic_rejects_ticket_payload_and_permission_tamper() {
+    prove_oracle_peer_tonic_rejects_ticket_payload_and_permission_tamper().await;
+}
+
+/// Leader refuses corrupted and missing footers without admitting partial peer batches.
+pub(crate) async fn prove_oracle_peer_rejects_corrupted_and_missing_footer_attempts() {
+    for (ordinal, fault) in [PeerFault::CorruptFooter, PeerFault::MissingFooter]
+        .into_iter()
+        .enumerate()
+    {
+        let audit = Arc::new(RecordingPeerAudit::default());
+        let security_audit: Arc<dyn PeerSecurityAudit> = audit.clone();
+        let authority = Arc::new(
+            OraclePeerAuthority::from_pem(
+                &SecretString::from(PRIVATE_KEY_PEM),
+                Arc::clone(&security_audit),
+            )
+            .expect("key"),
+        );
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let worker = NodeId::new(uuid::Uuid::now_v7());
+        let fence = 70_u64 + u64::try_from(ordinal).expect("bounded ordinal");
+        let peer = start_peer(
+            worker,
+            fence,
+            Arc::clone(&authority),
+            Arc::clone(&security_audit),
+            fault,
+        )
+        .await;
+        let dispatcher = FragmentDispatcher::new(
+            authority.clone(),
+            transport_directory(
+                leader,
+                Arc::clone(&authority),
+                Arc::clone(&security_audit),
+                TonicOraclePeerTransport::new(
+                    HashMap::from([(worker, format!("http://{}", peer.address))]),
+                    None,
+                )
+                .expect("transport"),
+            ),
+        );
+        let file = NamedTempFile::new().expect("parquet temp");
+        let error = dispatcher
+            .execute(
+                &context(leader),
+                fragment(&file),
+                &[DispatchCandidate {
+                    node_id: worker,
+                    worker_fence: fence,
+                }],
+            )
+            .await
+            .expect_err("invalid footer cannot produce an admitted attempt");
+        assert!(
+            matches!(error, DispatchError::Terminal | DispatchError::Exhausted),
+            "footer failure must be terminal or exhaust the bounded candidate set: {error:?}"
+        );
+        assert_eq!(peer.reservations.cleanup_expired(chrono::Utc::now()), 0);
+        peer.stop().await;
+    }
+}
+
+/// Runs corrupt and missing footer proofs as a focused peer test.
+#[tokio::test]
+async fn oracle_peer_rejects_corrupted_and_missing_footer_attempts() {
+    prove_oracle_peer_rejects_corrupted_and_missing_footer_attempts().await;
+}
+
+/// Execute the complete real-tonic peer security and cleanup journey.
+pub async fn prove_oracle_peer_security_journey() {
+    prove_oracle_peer_remote_failure_falls_back_to_leader_local().await;
+    prove_oracle_peer_three_failures_exhaust_and_release_partial_placement().await;
+    prove_oracle_peer_restart_rejects_old_fence_and_releases_reservation().await;
+    prove_oracle_peer_tonic_cancellation_releases_running_slot().await;
+    prove_oracle_peer_tonic_rejects_ticket_payload_and_permission_tamper().await;
+    prove_oracle_peer_rejects_corrupted_and_missing_footer_attempts().await;
 }

@@ -262,6 +262,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     ///
     /// Returns role unavailable before planning when this Gate has no ready
     /// Oracle, otherwise returns the retained Oracle's stable query errors.
+    #[tracing::instrument(
+        name = "bifrost.gate.role_dispatch",
+        skip_all,
+        fields(required_role = "oracle", operation = "query_sql")
+    )]
     pub async fn query_sql(
         &self,
         context: AuthorizedQueryContext,
@@ -294,6 +299,11 @@ impl<C: Catalog + 'static, R: PermissionResolver + 'static, I: IssuerConfigResol
     ///
     /// Returns role unavailable before admission when this Gate has no ready
     /// Oracle, otherwise returns the retained Oracle's stable query errors.
+    #[tracing::instrument(
+        name = "bifrost.gate.role_dispatch",
+        skip_all,
+        fields(required_role = "oracle", operation = "query_plan")
+    )]
     pub async fn query_plan(
         &self,
         context: AuthorizedQueryContext,

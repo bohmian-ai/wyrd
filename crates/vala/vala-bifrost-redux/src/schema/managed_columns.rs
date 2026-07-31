@@ -72,14 +72,15 @@ pub(crate) fn row_ordinals(batch: &RecordBatch) -> Result<&Int32Array, RowOrdina
 /// non-null `data_tenant_id`.
 ///
 /// The correlation columns are server-stamped/resolved but must exist in the stored
-/// Iceberg schema so the columnar write has a landing target; they are nullable so
-/// the internal `BifrostWriteContext::system()` path can write them as NULL. They do
-/// **not** perturb the user-fields-only [`SchemaFingerprint`], which is computed over
-/// the user fields alone in `create_table`.
+/// Iceberg schema so the columnar write has a landing target. Optional card/run
+/// context stays nullable, while the authenticated principal and request identity
+/// are required. These columns do **not** perturb the user-fields-only
+/// [`SchemaFingerprint`], which is computed over the user fields alone in
+/// `create_table`.
 pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-    user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+    user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
     user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
     user_fields.push(Field::new(
         WYRD_EVENT_TIME,
@@ -106,6 +107,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Dynamic schemas include the complete non-null tenant and request identity.
     fn with_managed_columns_always_includes_tenant() {
         let fields = with_managed_columns(vec![Field::new("value", DataType::UInt64, false)]);
 
@@ -135,6 +137,18 @@ mod tests {
         assert_eq!(tenant_fields.len(), 1);
         assert_eq!(tenant_fields[0].data_type(), &DataType::Utf8);
         assert!(!tenant_fields[0].is_nullable());
+        assert!(
+            fields
+                .iter()
+                .find(|field| field.name() == PRINCIPAL_ID)
+                .is_some_and(|field| !field.is_nullable())
+        );
+        assert!(
+            fields
+                .iter()
+                .find(|field| field.name() == WYRD_REQUEST_ID)
+                .is_some_and(|field| !field.is_nullable())
+        );
         assert_eq!(
             fields.last().map(|field| field.name().as_str()),
             Some(DATA_TENANT_ID)

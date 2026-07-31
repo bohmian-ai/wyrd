@@ -15,6 +15,7 @@ for lane in \
   "bench:bifrost:scribe:sustained" \
   "bench:bifrost:forge:slo" \
   "bench:bifrost:oracle:slo" \
+  "bench:bifrost:oracle:calibrate" \
   "bench:bifrost:capacity"; do
   if ! rg -n -F "[tasks.\"$lane\"]" mise.toml >/dev/null; then
     echo "missing required Bifrost benchmark lane: $lane" >&2
@@ -37,11 +38,12 @@ for lane in \
   "bench:bifrost:scribe:sustained" \
   "bench:bifrost:forge:slo" \
   "bench:bifrost:oracle:slo" \
+  "bench:bifrost:oracle:calibrate" \
   "bench:bifrost:capacity"; do
   case "$lane" in
     bench:bifrost:scribe:*) runner="--bench bench_bifrost_scribe" ;;
     bench:bifrost:forge:slo|bench:bifrost:capacity) runner="--bench bench_bifrost_forge" ;;
-    bench:bifrost:oracle:slo) runner="--bench bench_bifrost_oracle" ;;
+    bench:bifrost:oracle:slo|bench:bifrost:oracle:calibrate) runner="--bench bench_bifrost_oracle" ;;
     *) echo "unknown benchmark lane: $lane" >&2; exit 1 ;;
   esac
   if ! require_lane_runner mise.toml "$lane" "$runner"; then

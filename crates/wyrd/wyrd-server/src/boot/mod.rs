@@ -971,11 +971,57 @@ pub async fn attach_test_oracle_runtime(
     state: AppState,
     operator_pool: vala_sql::OperatorPool,
 ) -> Result<AppState, ServerBootError> {
-    let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
-    let cluster = Arc::new(ClusterRegistry::new(operator_pool, node_id));
-    let mut config = crate::config::WyrdServerConfig::default();
+    let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
     let signing_key = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
         .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
+    attach_test_oracle_runtime_for_node(state, operator_pool, node_id, signing_key).await
+}
+
+/// Attach a production-shaped Oracle role with cluster-controlled identity.
+///
+/// Restartable cluster journeys call this variant with the same physical node
+/// ID and signing authority while constructing a fresh fenced role instance.
+/// The production Oracle constructor remains the sole owner of registration,
+/// admission, peer security, and readiness behavior.
+///
+/// # Errors
+///
+/// Returns the same signing, sentinel, registration, admission, and readiness
+/// failures as [`attach_test_oracle_runtime`].
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node(
+    state: AppState,
+    operator_pool: vala_sql::OperatorPool,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+) -> Result<AppState, ServerBootError> {
+    attach_test_oracle_runtime_for_node_at(
+        state,
+        operator_pool,
+        node_id,
+        signing_key,
+        "http://127.0.0.1:0".to_owned(),
+    )
+    .await
+}
+
+/// Attach a test Oracle role advertising its already-reserved private endpoint.
+///
+/// # Errors
+///
+/// Returns the same signing, sentinel, registration, admission, and readiness
+/// failures as [`attach_test_oracle_runtime_for_node`].
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime_for_node_at(
+    state: AppState,
+    operator_pool: vala_sql::OperatorPool,
+    node_id: wyrd_spec::vala::api::NodeId,
+    signing_key: secrecy::SecretString,
+    advertise_addr: String,
+) -> Result<AppState, ServerBootError> {
+    let node_id = ClusterNodeId::new(node_id.as_uuid());
+    let cluster = Arc::new(ClusterRegistry::new(operator_pool, node_id));
+    let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
     build_oracle_role(
         state,
@@ -983,7 +1029,7 @@ pub async fn attach_test_oracle_runtime(
         &signing_key,
         cluster,
         node_id,
-        "127.0.0.1:0",
+        &advertise_addr,
     )
     .await
 }

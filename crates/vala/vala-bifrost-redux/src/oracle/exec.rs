@@ -853,14 +853,12 @@ impl Drop for ReconcileMemoryReservation {
     }
 }
 
-/// One retained exact-identity winner and its comparison bytes.
+/// One retained exact-identity winner.
 struct ReconciledRow {
     /// Winning source tier.
     tier: SourceTier,
     /// Shallow one-row batch retaining the source arrays.
     batch: RecordBatch,
-    /// Deterministic logical row bytes excluding source bookkeeping.
-    comparison: Vec<u8>,
 }
 
 /// Blocking-tempfile spill state partitioned by immutable row identity.
@@ -1305,19 +1303,18 @@ fn reconcile_batch(
         let tier = SourceTier::from_u8(sources.value(row))
             .ok_or_else(|| DataFusionError::External(Box::new(ReconcileError::InvalidIdentity)))?;
         let one = batch.slice(row, 1);
-        let comparison = comparison_bytes(&one)?;
         match winners.get_mut(&identity) {
-            Some(existing) if existing.comparison != comparison => {
-                metrics::counter!(
-                    "bifrost_oracle_security_events_total",
-                    "event_class" => "reconciliation"
-                )
-                .increment(1);
-                return Err(DataFusionError::External(Box::new(
-                    BifrostError::QueryReconciliationInvariant,
-                )));
-            }
             Some(existing) => {
+                if !logical_rows_equal(&existing.batch, &one)? {
+                    metrics::counter!(
+                        "bifrost_oracle_security_events_total",
+                        "event_class" => "reconciliation"
+                    )
+                    .increment(1);
+                    return Err(DataFusionError::External(Box::new(
+                        BifrostError::QueryReconciliationInvariant,
+                    )));
+                }
                 let losing_source = if tier < existing.tier {
                     existing.tier
                 } else {
@@ -1334,33 +1331,27 @@ fn reconcile_batch(
                 .increment(1);
             }
             None => {
-                winners.insert(
-                    identity,
-                    ReconciledRow {
-                        tier,
-                        batch: one,
-                        comparison,
-                    },
-                );
+                winners.insert(identity, ReconciledRow { tier, batch: one });
             }
         }
     }
     Ok(())
 }
 
-/// Encodes one logical row excluding only Oracle source bookkeeping.
+/// Compares one logical row by Arrow values after removing source bookkeeping.
 ///
 /// # Errors
 ///
-/// Returns a DataFusion error when Arrow cannot encode the row.
-fn comparison_bytes(batch: &RecordBatch) -> DataFusionResult<Vec<u8>> {
-    let logical = remove_column(batch, SOURCE_TIER_COLUMN)?;
-    let mut bytes = Vec::new();
-    let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut bytes, &logical.schema())
-        .map_err(DataFusionError::from)?;
-    writer.write(&logical).map_err(DataFusionError::from)?;
-    writer.finish().map_err(DataFusionError::from)?;
-    Ok(bytes)
+/// Returns a DataFusion error when either row omits Oracle's source field.
+fn logical_rows_equal(left: &RecordBatch, right: &RecordBatch) -> DataFusionResult<bool> {
+    let left = remove_column(left, SOURCE_TIER_COLUMN)?;
+    let right = remove_column(right, SOURCE_TIER_COLUMN)?;
+    Ok(left.schema() == right.schema()
+        && left
+            .columns()
+            .iter()
+            .zip(right.columns())
+            .all(|(left, right)| left.to_data() == right.to_data()))
 }
 
 /// Returns the first tenant mismatch row, or `None` for a valid batch.

@@ -150,6 +150,19 @@ cargo test --locked -p vala-sdk --test pg_bifrost_e2e -- --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_e2e_closeout_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_scribe_multipod_journey --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_forge_distributed_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_published_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_fused_reconcile_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_role_separated_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_distributed_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_multitenant_admission_journey --ignored --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_peer_security_journey --ignored --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- pg_bifrost_oracle_recovery_terminal_journey --ignored --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey --test-threads=1
+cargo test --locked -p wyrd-testing --test integration -- oracle_production_telemetry_contract --ignored --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_telemetry --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join --test-threads=1
+cargo test --locked -p vala-bifrost-redux --features test-support --test integration -- pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- task15_inspection --ignored --test-threads=1
 cargo test --locked -p wyrd-testing --test integration -- otlp_negative_journeys --test-threads=1
 """
@@ -226,6 +239,16 @@ description = "Run the real authenticated Oracle query smoke path"
 depends = ["setup:postgres", "db:migrate"]
 env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw" }
 run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --pods=3"
+
+[tasks."bench:bifrost:oracle:calibrate"]
+description = "Run the reproducible 1/3/6-pod Oracle calibration matrix"
+depends = ["setup:postgres", "db:migrate"]
+env = { WYRD_DATABASE_URL = "postgres://wyrd_app:wyrd_app_pw@127.0.0.1:55432/wyrd", WYRD_DATABASE_MIGRATOR_PASSWORD = "wyrd_migrator_pw", WYRD_DATABASE_PLATFORM_ADMIN_PASSWORD = "wyrd_platform_admin_pw", WYRD_DATABASE_CATALOG_APP_PASSWORD = "wyrd_catalog_app_pw", WYRD_BIFROST_CALIBRATION = "1" }
+run = "cargo bench --locked -p wyrd-testing --features bench --bench bench_bifrost_oracle -- --pods=6 --tenants=2"
+
+[tasks."check:bifrost-oracle-deploy"]
+description = "Validate Bifrost Oracle Kubernetes role selectors and rollback"
+run = "cargo test --locked -p wyrd-testing bifrost_deployment_contract -- --nocapture"
 
 [tasks."bench:bifrost:capacity"]
 description = "Run the complete real Scribe and Forge capacity workload"
@@ -1136,6 +1159,7 @@ depends = [
   "check:no-testing-in-prod-deps",
   "check:redux-isolation",
   "check:redux-single-table-model",
+  "check:bifrost-oracle-deploy",
   "check:bifrost-bench-registration",
   "check:test-coverage"]
 

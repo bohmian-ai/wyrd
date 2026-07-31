@@ -1,0 +1,95 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyrd-bifrost-mixed
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: wyrd-bifrost
+  template:
+    metadata:
+      labels:
+        app: wyrd-bifrost
+        wyrd.ai/bifrost-scribe: "true"
+        wyrd.ai/bifrost-oracle: "true"
+        wyrd.ai/bifrost-private: "true"
+    spec:
+      containers:
+        - name: wyrd-server
+          image: wyrd/server:latest
+          ports:
+            - {name: http, containerPort: 8080}
+            - {name: grpc, containerPort: 50051}
+          env:
+            - name: WYRD_ROLES
+              value: scribe,forge,oracle
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wyrd-ingest
+spec:
+  selector:
+    wyrd.ai/bifrost-scribe: "true"
+  ports:
+    - name: grpc
+      port: 443
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wyrd-query
+spec:
+  selector:
+    wyrd.ai/bifrost-oracle: "true"
+  ports:
+    - name: http
+      port: 443
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wyrd-bifrost-private
+spec:
+  selector:
+    wyrd.ai/bifrost-private: "true"
+  ports:
+    - {name: grpc, port: 50051, targetPort: grpc}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: wyrd-query
+spec:
+  rules:
+    - matches: [{path: {type: PathPrefix, value: /v1/query}}]
+      backendRefs: [{name: wyrd-query, port: 443}]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: wyrd-ingest
+spec:
+  rules:
+    - matches:
+        - method: {service: wyrd.v1.BifrostIngestService}
+      backendRefs: [{name: wyrd-ingest, port: 443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wyrd-bifrost-private
+spec:
+  podSelector: {matchLabels: {wyrd.ai/bifrost-private: "true"}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {wyrd.ai/bifrost-private: "true"}}
+      ports: [{protocol: TCP, port: 50051}]

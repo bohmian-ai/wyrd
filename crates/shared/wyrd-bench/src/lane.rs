@@ -227,8 +227,8 @@ impl BifrostScenario {
 
     /// Validate topology, bounds, and lane-specific constraints before setup.
     pub fn validate(&self) -> Result<(), ScenarioError> {
-        if !matches!(self.pods, 1 | 3) {
-            return Err(ScenarioError::Invalid("pods must be 1 or 3".to_owned()));
+        if !matches!(self.pods, 1 | 3 | 6) {
+            return Err(ScenarioError::Invalid("pods must be 1, 3, or 6".to_owned()));
         }
         if self.tenants == 0 || self.tables == 0 {
             return Err(ScenarioError::Invalid(

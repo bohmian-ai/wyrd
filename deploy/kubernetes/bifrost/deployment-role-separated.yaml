@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyrd-bifrost-ingest
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: wyrd-bifrost-ingest}
+  template:
+    metadata:
+      labels: {app: wyrd-bifrost-ingest, wyrd.ai/bifrost-scribe: "true", wyrd.ai/bifrost-private: "true"}
+    spec:
+      containers:
+        - name: wyrd-server
+          image: wyrd/server:latest
+          ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
+          env: [{name: WYRD_ROLES, value: "scribe,forge"}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyrd-bifrost-query
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: wyrd-bifrost-query}
+  template:
+    metadata:
+      labels: {app: wyrd-bifrost-query, wyrd.ai/bifrost-oracle: "true", wyrd.ai/bifrost-private: "true"}
+    spec:
+      containers:
+        - name: wyrd-server
+          image: wyrd/server:latest
+          ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
+          env: [{name: WYRD_ROLES, value: oracle}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}

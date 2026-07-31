@@ -27,7 +27,6 @@ use thiserror::Error;
 use wyrd_spec::vala::api::{QueryAuditDigest, WorkerAttemptFrame, WorkerFooter};
 
 use super::fragment::{ClosedLeafPredicate, LeafComparison, LeafScalar, SealedScanFragment};
-use crate::schema::SchemaFingerprint;
 use crate::scribe::memory::BifrostMemoryGovernor;
 
 /// Executor validation or sealed-read failure.
@@ -54,6 +53,9 @@ pub enum ExecutorError {
     /// The configured storage backend could not read an immutable object.
     #[error("sealed fragment storage read failed")]
     Storage,
+    /// A pinned immutable object disappeared after the Oracle cut was selected.
+    #[error("sealed fragment object is stale")]
+    StaleObject,
     /// Parquet decode, projection, or Arrow encoding failed.
     #[error("sealed fragment decode failed")]
     Decode,
@@ -191,16 +193,22 @@ impl SealedFragmentExecutor {
                 if let Some(file_io) = &file_io {
                     let input = file_io
                         .new_input(&file.location)
-                        .map_err(|_| ExecutorError::Storage)?;
-                    let metadata = input.metadata().await.map_err(|_| ExecutorError::Storage)?;
+                        .map_err(|error| classify_storage_error(&error))?;
+                    let metadata = input
+                        .metadata()
+                        .await
+                        .map_err(|error| classify_storage_error(&error))?;
                     if metadata.size != file.size_bytes {
                         Err(ExecutorError::Size)?;
                     }
-                    let reader = input.reader().await.map_err(|_| ExecutorError::Storage)?;
+                    let reader = input
+                        .reader()
+                        .await
+                        .map_err(|error| classify_storage_error(&error))?;
                     let arrow_reader = ArrowFileReader::new(metadata, reader);
                     let mut builder = ParquetRecordBatchStreamBuilder::new(arrow_reader)
                         .await
-                        .map_err(|_| ExecutorError::Decode)?;
+                        .map_err(|error| classify_decode_error(&error))?;
                     if !selected_groups.is_empty() {
                         builder = builder.with_row_groups(selected_groups);
                     }
@@ -210,7 +218,7 @@ impl SealedFragmentExecutor {
                         .map_err(|_| ExecutorError::Decode)?;
                     while let Some(batch) = batches.next().await {
                         let batch = prepare_batch(
-                            batch.map_err(|_| ExecutorError::Decode)?,
+                            batch.map_err(|error| classify_decode_error(&error))?,
                             &fragment,
                         )?;
                         let (schema, batch) = encoder.encode(batch)?;
@@ -220,13 +228,14 @@ impl SealedFragmentExecutor {
                         yield batch;
                     }
                 } else {
-                    let metadata =
-                        std::fs::metadata(&file.location).map_err(|_| ExecutorError::Storage)?;
+                    let metadata = std::fs::metadata(&file.location)
+                        .map_err(|error| classify_storage_error(&error))?;
                     if metadata.len() != file.size_bytes {
                         Err(ExecutorError::Size)?;
                     }
                     let mut builder = ParquetRecordBatchReaderBuilder::try_new(
-                        File::open(&file.location).map_err(|_| ExecutorError::Storage)?,
+                        File::open(&file.location)
+                            .map_err(|error| classify_storage_error(&error))?,
                     )
                     .map_err(|_| ExecutorError::Decode)?;
                     if !selected_groups.is_empty() {
@@ -272,7 +281,7 @@ impl SealedFragmentExecutor {
             .map(|group| usize::try_from(group).map_err(|_| ExecutorError::Decode))
             .collect::<Result<Vec<_>, _>>()?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(
-            File::open(&file.location).map_err(|_| ExecutorError::Storage)?,
+            File::open(&file.location).map_err(|error| classify_storage_error(&error))?,
         )
         .map_err(|_| ExecutorError::Decode)?;
         if !groups.is_empty() {
@@ -290,6 +299,42 @@ impl SealedFragmentExecutor {
             })
             .collect()
     }
+}
+
+/// Classifies a sealed-object access error without treating outages as stale metadata.
+fn classify_storage_error(error: &(dyn std::error::Error + 'static)) -> ExecutorError {
+    if error_chain_contains_not_found(error) {
+        ExecutorError::StaleObject
+    } else {
+        ExecutorError::Storage
+    }
+}
+
+/// Preserves an object-not-found race surfaced through Parquet's reader error chain.
+fn classify_decode_error(error: &(dyn std::error::Error + 'static)) -> ExecutorError {
+    if error_chain_contains_not_found(error) {
+        ExecutorError::StaleObject
+    } else {
+        ExecutorError::Decode
+    }
+}
+
+/// Returns whether an error chain contains an exact filesystem or OpenDAL not-found cause.
+fn error_chain_contains_not_found(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(source) = current {
+        if source
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            || source
+                .downcast_ref::<opendal::Error>()
+                .is_some_and(|error| error.kind() == opendal::ErrorKind::NotFound)
+        {
+            return true;
+        }
+        current = source.source();
+    }
+    false
 }
 
 /// Verifies one object location remains inside its authenticated binding.
@@ -506,7 +551,7 @@ fn prepare_batch(
 ) -> Result<RecordBatch, ExecutorError> {
     let batch = apply_predicates(batch, &fragment.predicates)?;
     let batch = project(batch, &fragment.projection)?;
-    let actual = hex::encode(SchemaFingerprint::from_arrow_schema(&batch.schema()));
+    let actual = super::sealed_fragment_schema_fingerprint(&batch.schema());
     if actual != fragment.schema_fingerprint {
         return Err(ExecutorError::Schema);
     }
@@ -673,5 +718,15 @@ mod tests {
             "/warehouse/tenants/one",
             "warehouse/tenants/one/data.parquet"
         ));
+    }
+
+    /// Missing pinned objects are the only local storage failures classified as stale.
+    #[test]
+    fn oracle_executor_distinguishes_stale_objects_from_storage_outages() {
+        let stale = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let outage = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        assert_eq!(classify_storage_error(&stale), ExecutorError::StaleObject);
+        assert_eq!(classify_storage_error(&outage), ExecutorError::Storage);
     }
 }

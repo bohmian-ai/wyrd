@@ -159,6 +159,9 @@ pub struct TonicTailReadTransport {
     access_token: MetadataValue<wyrd_tonic::tonic::metadata::Ascii>,
 }
 
+/// Remote tail-page ceiling including protobuf framing overhead.
+const TAIL_RPC_MAX_MESSAGE_BYTES: usize = 32 * 1024 * 1024 + 64 * 1024;
+
 impl TonicTailReadTransport {
     /// Creates a remote transport using the authenticated private Scribe channel.
     ///
@@ -177,7 +180,7 @@ impl TonicTailReadTransport {
                 }
             })?;
         Ok(Self {
-            client,
+            client: client.max_decoding_message_size(TAIL_RPC_MAX_MESSAGE_BYTES),
             access_token,
         })
     }
@@ -258,6 +261,40 @@ impl TonicTailReadTransport {
             .metadata_mut()
             .insert("x-wyrd-access-token", self.access_token.clone());
         request
+    }
+}
+
+#[async_trait]
+impl TailReadTransport for TonicTailReadTransport {
+    /// Acquire a remote immutable fence through the authenticated tonic client.
+    async fn acquire_fence(
+        &self,
+        request: tail::AcquireTailFenceRequest,
+    ) -> Result<tail::TailReadFence, TailReadError> {
+        TonicTailReadTransport::acquire_fence(self, request).await
+    }
+
+    /// Read and decode one remote owned-frame page.
+    async fn read_page(
+        &self,
+        request: tail::TailPageRequest,
+    ) -> Result<LocalTailPage, TailReadError> {
+        TonicTailReadTransport::read_page(self, request).await
+    }
+
+    /// Schedule idempotent remote release from the synchronous drop boundary.
+    ///
+    /// The fence owner also expires abandoned intervals at its bounded TTL. A
+    /// transport error is logged by the spawned cleanup task and never blocks
+    /// an async executor thread during query cancellation.
+    fn release_fence(&self, fence_id: tail::TailFenceId) -> Result<FenceRelease, TailReadError> {
+        let transport = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = TonicTailReadTransport::release_fence(&transport, fence_id).await {
+                tracing::error!(error = %error, "remote Oracle tail fence cleanup failed");
+            }
+        });
+        Ok(FenceRelease { released: true })
     }
 }
 

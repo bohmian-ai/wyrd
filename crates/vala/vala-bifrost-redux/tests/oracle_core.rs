@@ -645,7 +645,11 @@ impl OracleFixture {
                 )) as ArrayRef,
                 Arc::new(StringArray::from(vec![None::<String>; row_count])),
                 Arc::new(StringArray::from(vec![None::<String>; row_count])),
-                Arc::new(StringArray::from(vec![None::<String>; row_count])),
+                Arc::new(StringArray::from(
+                    (0..row_count)
+                        .map(|_| uuid::Uuid::now_v7().to_string())
+                        .collect::<Vec<_>>(),
+                )),
                 Arc::new(StringArray::from(
                     (0..row_count)
                         .map(|_| RequestId::now_v7().to_string())
@@ -1351,7 +1355,7 @@ async fn oracle_postgres_audit_commits_locked_read_decision() {
 
 /// A refused audit returns before a pinned missing hot object can be read.
 #[tokio::test]
-async fn oracle_audit_failure_prevents_hot_object_read() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_audit_failure_prebyte() {
     let fixture = OracleFixture::new("oracle_audit_gate").await;
     fixture.seed_missing_hot_row().await;
     let oracle = fixture
@@ -1381,7 +1385,7 @@ async fn oracle_audit_failure_prevents_hot_object_read() {
 
 /// COUNT and JOIN cannot observe a foreign row before the physical tripwire.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_tripwire_precedes_aggregate_and_join_with_allow_failure_audit() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_count_join() {
     let fixture = OracleFixture::new("oracle_tripwire").await;
     let foreign = DataTenantId::new_v7();
     let _ = fixture.seed_hot_rows(&[(5, foreign)]).await;
@@ -1453,7 +1457,7 @@ async fn oracle_tripwire_precedes_aggregate_and_join_with_allow_failure_audit() 
 
 /// A failed security append aborts the tripwire without emitting a row batch.
 #[tokio::test]
-async fn oracle_tripwire_security_audit_failure_aborts_query() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_tripwire_audit_failure() {
     let fixture = OracleFixture::new("oracle_tripwire_audit_failure").await;
     let _ = fixture.seed_hot_rows(&[(9, DataTenantId::new_v7())]).await;
     let oracle = fixture
@@ -1725,7 +1729,7 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
     let captured_spans = spans.snapshot();
     assert!(
         captured_spans.iter().any(|span| {
-            span.name == "bifrost.oracle.fragment_attempt"
+            span.name == "bifrost.oracle.fragment"
                 && span.fields.get("locality").map(String::as_str) == Some("local")
         }),
         "fragment attempt span must use the closed locality label: {captured_spans:?}",
@@ -1748,7 +1752,7 @@ async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
 
 /// Real execution emits required closed metrics and scrubbed span fields.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_real_recorder_and_span_fields_cover_fused_spill_path() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_admission_reconcile_telemetry() {
     let fixture = OracleFixture::new("oracle_telemetry").await;
     let rows = (0_i64..1_024)
         .map(|value| (value, fixture.tenant))
@@ -2029,7 +2033,7 @@ async fn oracle_real_recorder_and_span_fields_cover_fused_spill_path() {
 
 /// A missing pinned file triggers exactly one whole-cut pre-byte retry.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_stale_file_replans_once_before_failure() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_stale_file_replan() {
     let fixture = OracleFixture::new("oracle_stale").await;
     fixture.seed_missing_hot_row().await;
     let oracle = fixture
@@ -2126,7 +2130,7 @@ async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
             Arc::new(Int64Array::from(vec![11])) as ArrayRef,
             Arc::new(StringArray::from(vec![None::<String>])),
             Arc::new(StringArray::from(vec![None::<String>])),
-            Arc::new(StringArray::from(vec![None::<String>])),
+            Arc::new(StringArray::from(vec![uuid::Uuid::now_v7().to_string()])),
             Arc::new(StringArray::from(vec![RequestId::now_v7().to_string()])),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_000]).with_timezone("UTC")),
             Arc::new(TimestampMicrosecondArray::from(vec![1_000_001]).with_timezone("UTC")),
@@ -2239,7 +2243,7 @@ async fn oracle_fused_live_only_real_scribe_and_degraded_policy() {
 
 /// Partial concurrent fence acquisition releases every successful sibling.
 #[tokio::test]
-async fn oracle_partial_fence_acquire_failure_releases_successes() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
     let fixture = OracleFixture::new("oracle_partial_fence").await;
     let tails = Arc::new(TailTransportDirectory::default());
     let releases = Arc::new(AtomicUsize::new(0));
@@ -2289,7 +2293,7 @@ async fn oracle_partial_fence_acquire_failure_releases_successes() {
 
 /// Failed startup reconciliation leaves readiness false and refuses queries.
 #[tokio::test]
-async fn oracle_startup_reconciliation_failure_never_becomes_ready() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_startup_reconcile_failure() {
     let fixture = OracleFixture::new("oracle_not_ready").await;
     let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
     sqlx::query(
@@ -2353,7 +2357,7 @@ async fn oracle_admission_expiry_batch_is_capped_at_128() {
 
 /// A missing durable lease deterministically cancels with execution failure.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_lease_renewal_missing_returns_failed_terminal() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_missing_lease_terminal() {
     let fixture = OracleFixture::new("oracle_renew_missing").await;
     fixture.seed_hot_row(1).await;
     let oracle = fixture
@@ -2405,7 +2409,7 @@ async fn oracle_lease_renewal_missing_returns_failed_terminal() {
 
 /// A stale leader fence deterministically cancels with peer-security failure.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_lease_renewal_stale_fence_returns_security_terminal() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_stale_fence_terminal() {
     let fixture = OracleFixture::new("oracle_renew_stale").await;
     fixture.seed_hot_row(1).await;
     let oracle = fixture
@@ -2460,7 +2464,7 @@ async fn oracle_lease_renewal_stale_fence_returns_security_terminal() {
 
 /// A renewal SQL failure deterministically cancels with execution failure.
 #[tokio::test(flavor = "current_thread")]
-async fn oracle_lease_renewal_sql_error_returns_failed_terminal() {
+async fn pg_bifrost_oracle_recovery_terminal_journey_lease_sql_failure_terminal() {
     let fixture = OracleFixture::new("oracle_renew_sql").await;
     fixture.seed_hot_row(1).await;
     let oracle = fixture

@@ -48,6 +48,9 @@ pub enum DispatchError {
     /// Worker or transport failed and may be retried.
     #[error("peer attempt unavailable")]
     Retryable,
+    /// A pinned immutable object disappeared and requires a whole-query replan.
+    #[error("peer fragment references a stale object")]
+    StaleObject,
     /// Ticket or fragment contract failed and must not be retried.
     #[error("peer security or fragment contract rejected")]
     Terminal,
@@ -307,6 +310,7 @@ impl WorkerErrorMapper {
     async fn classify(&self, error: ExecutorError) -> DispatchError {
         tracing::warn!(error = ?error, "Oracle sealed-fragment execution rejected");
         let violation = match error {
+            ExecutorError::StaleObject => return DispatchError::StaleObject,
             ExecutorError::Storage | ExecutorError::Deadline | ExecutorError::Capacity => {
                 return DispatchError::Retryable;
             }
@@ -931,6 +935,7 @@ fn status_error(status: Status) -> DispatchError {
         | wyrd_tonic::tonic::Code::DeadlineExceeded
         | wyrd_tonic::tonic::Code::ResourceExhausted
         | wyrd_tonic::tonic::Code::Cancelled => DispatchError::Retryable,
+        wyrd_tonic::tonic::Code::NotFound => DispatchError::StaleObject,
         _ => DispatchError::Terminal,
     }
 }
@@ -1085,7 +1090,10 @@ impl FragmentDispatcher {
                 return result;
             }
             self.release_pending(candidate.node_id, release).await;
-            if matches!(result, Err(DispatchError::Terminal)) {
+            if matches!(
+                result,
+                Err(DispatchError::Terminal | DispatchError::StaleObject)
+            ) {
                 return result;
             }
         }
@@ -1108,7 +1116,7 @@ impl FragmentDispatcher {
     /// # Errors
     /// Returns retryable for incomplete/invalid footer or transport outcomes.
     #[tracing::instrument(
-        name = "bifrost.oracle.fragment_attempt",
+        name = "bifrost.oracle.fragment",
         skip_all,
         fields(locality = if worker == context.leader_node_id { "local" } else { "remote" })
     )]
@@ -1175,6 +1183,7 @@ fn attempt_error(_error: AttemptError) -> DispatchError {
 fn dispatch_error_label(error: &DispatchError) -> PeerErrorClass {
     match error {
         DispatchError::Retryable => PeerErrorClass::Availability,
+        DispatchError::StaleObject => PeerErrorClass::Availability,
         DispatchError::Terminal => PeerErrorClass::Security,
         DispatchError::Exhausted => PeerErrorClass::Exhausted,
     }
@@ -1556,5 +1565,18 @@ mod tests {
         assert!(matches!(error, DispatchError::Terminal));
         assert_eq!(transport.release_calls.load(Ordering::SeqCst), 1);
         assert_eq!(transport.execute_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Tonic not-found preserves the stale-object signal while outages stay retryable.
+    #[test]
+    fn oracle_tonic_status_preserves_stale_object_classification() {
+        assert!(matches!(
+            status_error(Status::not_found("stale pinned object")),
+            DispatchError::StaleObject
+        ));
+        assert!(matches!(
+            status_error(Status::unavailable("storage outage")),
+            DispatchError::Retryable
+        ));
     }
 }

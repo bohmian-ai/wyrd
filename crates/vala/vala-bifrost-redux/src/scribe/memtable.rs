@@ -668,6 +668,7 @@ impl Memtable {
             .map_err(|error| ScribeError::Internal {
                 detail: format!("memtable immutable lock poisoned: {error}"),
             })?;
+        let mut retired = None;
         for entries in immutable.values_mut() {
             let Some(index) = entries.iter().position(|entry| {
                 entry.seal_id() == seal_id
@@ -680,10 +681,11 @@ impl Memtable {
                 continue;
             };
             let entry = entries.remove(index);
-            return Ok(Some(entry.wal_range()));
+            retired = Some(entry.wal_range());
+            break;
         }
         immutable.retain(|_, entries| !entries.is_empty());
-        Ok(None)
+        Ok(retired)
     }
 
     /// Number of immutable generations currently retained.
@@ -1320,6 +1322,7 @@ mod tests {
         assert_eq!(lsns, vec![WalLsn::new(10), WalLsn::new(20)]);
     }
 
+    /// Verifies elapsed retention removes both a generation and its empty bucket.
     #[test]
     fn committed_generations_retire_only_after_grace() {
         let memtable = Memtable::new_with_retention(Duration::from_secs(1));
@@ -1347,6 +1350,10 @@ mod tests {
             1
         );
         assert_eq!(memtable.immutable_generation_count().expect("immutable"), 0);
+        assert_eq!(
+            memtable.stats().expect("retired stats").immutable_buckets,
+            0
+        );
     }
 
     #[test]

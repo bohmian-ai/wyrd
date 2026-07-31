@@ -84,9 +84,10 @@ impl BifrostHarness {
         let topology = match pods {
             1 => BifrostTopology::OnePod,
             3 => BifrostTopology::ThreePod,
+            6 => BifrostTopology::SixPod,
             other => {
                 return Err(HarnessError::Configuration(format!(
-                    "supported pod counts are 1 and 3, got {other}"
+                    "supported pod counts are 1, 3, and 6, got {other}"
                 )));
             }
         };
@@ -103,7 +104,6 @@ impl BifrostHarness {
             };
             let scribes = cluster
                 .servers()
-                .iter()
                 .filter_map(WyrdTestServer::bifrost_scribe)
                 .collect();
             Ok((scribes, tenants))
@@ -214,7 +214,6 @@ impl BifrostHarness {
     pub fn server_forges(&self) -> Vec<Arc<Forge>> {
         self.cluster
             .servers()
-            .iter()
             .filter_map(|server| server.state().forge().cloned())
             .collect()
     }
@@ -224,7 +223,6 @@ impl BifrostHarness {
     pub fn server_forge_publishers(&self) -> Vec<StagingFilePublisher> {
         self.cluster
             .servers()
-            .iter()
             .map(WyrdTestServer::forge_publisher)
             .collect()
     }
@@ -332,6 +330,7 @@ impl BifrostHarness {
 fn pods_for(cluster: &WyrdTestCluster) -> usize {
     match cluster.topology() {
         BifrostTopology::OnePod => 1,
-        BifrostTopology::ThreePod => 3,
+        BifrostTopology::ThreePod | BifrostTopology::RoleSeparated => 3,
+        BifrostTopology::SixPod => 6,
     }
 }

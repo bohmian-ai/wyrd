@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wyrd-bifrost-rollback-mixed
+spec:
+  selector: {matchLabels: {app: wyrd-bifrost-rollback-mixed}}
+  template:
+    metadata:
+      labels:
+        app: wyrd-bifrost-rollback-mixed
+        wyrd.ai/bifrost-scribe: "true"
+        wyrd.ai/bifrost-oracle: "true"
+        wyrd.ai/bifrost-private: "true"
+    spec:
+      containers:
+        - name: wyrd-server
+          image: wyrd/server:stable
+          ports: [{name: http, containerPort: 8080}, {name: grpc, containerPort: 50051}]
+          env: [{name: WYRD_ROLES, value: "scribe,forge,oracle"}]
+          readinessProbe: {httpGet: {path: /readyz, port: http}}

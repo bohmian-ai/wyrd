@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use arrow::array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
@@ -16,6 +17,11 @@ use wyrd_testing::bifrost::BifrostHarness;
 const TABLE_NAME: &str = "scribe_journey_events";
 const ROWS_PER_APPEND: usize = 4;
 
+/// Proves three Scribe pods isolate tenants and retire force-sealed generations.
+///
+/// # Panics
+///
+/// Panics when the Postgres-backed journey cannot start, verify, or shut down.
 #[tokio::test]
 #[ignore = "requires the Postgres-backed Bifrost journey environment"]
 async fn multi_scribe_three_pods_three_tenants_persists_and_isolates_rows() {
@@ -66,6 +72,13 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
 
     harness.force_seal_all().await?;
     assert!(harness.is_drained()?);
+    assert!(
+        harness.scribes().iter().all(|scribe| scribe
+            .memtable_stats()
+            .is_ok_and(|stats| stats.immutable_generations > 0)),
+        "force-seal completion must retain published generations"
+    );
+    wait_for_force_seal_retirement(harness).await?;
 
     let operator_pool = harness.cluster().pg_fixture().operator_pool();
     let (file_count, row_count): (i64, i64) = sqlx::query_as(
@@ -103,6 +116,41 @@ async fn run_journey(harness: &BifrostHarness) -> Result<(), Box<dyn Error + Sen
         assert_eq!(visible, i64::try_from(3 * ROWS_PER_APPEND)?);
     }
     Ok(())
+}
+
+/// Drive the production age lifecycle beyond grace and observe full retirement.
+///
+/// # Errors
+///
+/// Returns an error when Scribe inspection fails or retained generations do not
+/// release before the bounded deadline.
+async fn wait_for_force_seal_retirement(
+    harness: &BifrostHarness,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        for scribe in harness.scribes() {
+            scribe.check_age(Instant::now() + Duration::from_secs(120));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let remaining = harness
+            .scribes()
+            .iter()
+            .map(|scribe| {
+                scribe
+                    .memtable_stats()
+                    .map(|stats| stats.immutable_generations)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum::<usize>();
+        if remaining == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("force-seal retained {remaining} generations").into());
+        }
+    }
 }
 
 fn make_batch(pod_index: usize, tenant_index: usize) -> RecordBatch {

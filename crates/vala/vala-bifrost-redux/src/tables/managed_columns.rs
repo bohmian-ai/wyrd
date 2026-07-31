@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::tables::CorrelationPolicy;
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
 };
 
 /// Append the Bifrost system columns (and policy-gated correlation columns)
@@ -24,12 +24,14 @@ pub fn ensure_managed_columns(
         CorrelationPolicy::Observation => {
             user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
             user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
+            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
         }
         CorrelationPolicy::CodeAxis => {
             // run_id is declared as a code-axis user field; do not append the universal one.
             user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
+            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
         }
         CorrelationPolicy::None => {
             // audit_log: no universal correlation columns appended.
@@ -68,6 +70,7 @@ mod tests {
     }
 
     #[test]
+    /// Observation schemas match the non-null identities stamped by Scribe.
     fn observation_policy_appends_all_three_then_system() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
         let names = field_names(&fields);
@@ -77,6 +80,7 @@ mod tests {
                 RUN_ID,
                 CARD_UID,
                 PRINCIPAL_ID,
+                WYRD_REQUEST_ID,
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
@@ -84,9 +88,12 @@ mod tests {
                 DATA_TENANT_ID
             ]
         );
+        assert!(!fields[2].is_nullable());
+        assert!(!fields[3].is_nullable());
     }
 
     #[test]
+    /// Code-axis schemas omit only the already-declared run identifier.
     fn code_axis_policy_omits_run_id() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
         let names = field_names(&fields);
@@ -96,9 +103,11 @@ mod tests {
         );
         assert!(names.contains(&CARD_UID));
         assert!(names.contains(&PRINCIPAL_ID));
+        assert!(names.contains(&WYRD_REQUEST_ID));
     }
 
     #[test]
+    /// Tables without correlation policy receive only physical system columns.
     fn none_policy_only_managed_columns() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::None);
         let names = field_names(&fields);
@@ -110,6 +119,7 @@ mod tests {
     }
 
     #[test]
+    /// Caller-declared fields remain ahead of every server-managed field.
     fn user_fields_come_before_system() {
         let user = vec![Field::new("my_col", DataType::Utf8, true)];
         let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);

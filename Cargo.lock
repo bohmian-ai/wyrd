@@ -11235,6 +11235,7 @@ dependencies = [
  "hex",
  "http 1.4.2",
  "iceberg",
+ "metrics-exporter-prometheus",
  "opendal",
  "parquet",
  "pyo3",
@@ -11243,6 +11244,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sqlx 0.9.0",
  "tempfile",
  "thiserror 2.0.18",
@@ -11272,6 +11274,7 @@ dependencies = [
  "wyrd-spec",
  "wyrd-sql",
  "wyrd-storage",
+ "wyrd-telemetry",
  "wyrd-tonic",
  "wyrd-utils",
 ]

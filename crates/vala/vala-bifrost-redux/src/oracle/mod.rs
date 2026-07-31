@@ -183,6 +183,7 @@ impl OracleTelemetry {
         visibility: VisibilityMode,
         query_class: QueryClass,
     ) -> QueryTelemetryGuard {
+        self.register_sparse_series(query_class);
         metrics::gauge!("bifrost_oracle_slots_total", "role" => "leader")
             .set(self.slots.running_capacity() as f64);
         metrics::gauge!(
@@ -199,6 +200,46 @@ impl OracleTelemetry {
             stream_started: false,
             finished: false,
         }
+    }
+
+    /// Registers sparse event families with zero-valued closed-label series.
+    ///
+    /// A healthy query may not reject admission, spill, deduplicate, replan, or
+    /// detect a security violation. Registering those families at real query
+    /// entry keeps the production scrape contract discoverable without
+    /// fabricating an event or changing subsequent counter values.
+    fn register_sparse_series(&self, query_class: QueryClass) {
+        metrics::counter!(
+            "bifrost_oracle_admission_rejections_total",
+            "scope" => "cluster",
+            "query_class" => query_class_label(query_class)
+        )
+        .increment(0);
+        metrics::counter!(
+            "bifrost_oracle_spill_bytes_total",
+            "role" => "leader",
+            "operator" => "reconcile"
+        )
+        .increment(0);
+        metrics::counter!(
+            "bifrost_oracle_spill_operations_total",
+            "role" => "leader",
+            "operator" => "reconcile",
+            "outcome" => "spilled"
+        )
+        .increment(0);
+        metrics::counter!(
+            "bifrost_oracle_rows_deduplicated_total",
+            "losing_source" => "live_tail"
+        )
+        .increment(0);
+        metrics::counter!("bifrost_oracle_stale_replans_total", "outcome" => "retried")
+            .increment(0);
+        metrics::counter!(
+            "bifrost_oracle_security_events_total",
+            "event_class" => "tenant_row"
+        )
+        .increment(0);
     }
 
     /// Records one classification decision and its predicted scan duration.
@@ -562,9 +603,11 @@ impl OracleSlotManager {
 #[derive(Default)]
 pub struct TailTransportDirectory {
     /// Canonical table-to-transport map owned by the serving composition root.
-    transports: RwLock<HashMap<(String, Option<uuid::Uuid>), Arc<dyn TailReadTransport>>>,
+    transports: RwLock<
+        HashMap<(String, Option<uuid::Uuid>, Option<uuid::Uuid>), Arc<dyn TailReadTransport>>,
+    >,
     /// Independently discovered live streams, including tables with no sealed file.
-    live_streams: RwLock<HashMap<String, Vec<LiveTailRoute>>>,
+    live_streams: RwLock<HashMap<(String, Option<uuid::Uuid>), Vec<LiveTailRoute>>>,
 }
 
 /// One independently discovered live Scribe stream for a table/day.
@@ -592,7 +635,7 @@ impl TailTransportDirectory {
     /// Registers or replaces the transport for one canonical table key.
     pub fn insert(&self, table: impl Into<String>, transport: Arc<dyn TailReadTransport>) {
         if let Ok(mut transports) = self.transports.write() {
-            transports.insert((table.into(), None), transport);
+            transports.insert((table.into(), None, None), transport);
         }
     }
 
@@ -604,7 +647,7 @@ impl TailTransportDirectory {
         transport: Arc<dyn TailReadTransport>,
     ) {
         if let Ok(mut transports) = self.transports.write() {
-            transports.insert((table.into(), Some(node_id.as_uuid())), transport);
+            transports.insert((table.into(), Some(node_id.as_uuid()), None), transport);
         }
     }
 
@@ -621,15 +664,57 @@ impl TailTransportDirectory {
         event_day: wyrd_spec::vala::api::EventDay,
         transport: Arc<dyn TailReadTransport>,
     ) {
-        let table = table.into();
+        self.insert_live_stream_route(
+            table.into(),
+            None,
+            node_id,
+            writer_epoch,
+            event_day,
+            transport,
+        );
+    }
+
+    /// Registers a tenant-scoped independently discovered live stream.
+    ///
+    /// Tenant-scoped routes prevent one tenant's authenticated Scribe channel
+    /// from being selected for another tenant that uses the same logical table.
+    pub fn insert_live_stream_for_tenant(
+        &self,
+        tenant: wyrd_spec::DataTenantId,
+        table: impl Into<String>,
+        node_id: wyrd_spec::vala::api::NodeId,
+        writer_epoch: u64,
+        event_day: wyrd_spec::vala::api::EventDay,
+        transport: Arc<dyn TailReadTransport>,
+    ) {
+        self.insert_live_stream_route(
+            table.into(),
+            Some(tenant.as_uuid()),
+            node_id,
+            writer_epoch,
+            event_day,
+            transport,
+        );
+    }
+
+    /// Stores one generic or tenant-scoped live-stream route.
+    fn insert_live_stream_route(
+        &self,
+        table: String,
+        tenant: Option<uuid::Uuid>,
+        node_id: wyrd_spec::vala::api::NodeId,
+        writer_epoch: u64,
+        event_day: wyrd_spec::vala::api::EventDay,
+        transport: Arc<dyn TailReadTransport>,
+    ) {
         if let Ok(mut transports) = self.transports.write() {
             transports.insert(
-                (table.clone(), Some(node_id.as_uuid())),
+                (table.clone(), Some(node_id.as_uuid()), tenant),
                 Arc::clone(&transport),
             );
         }
         if let Ok(mut streams) = self.live_streams.write() {
-            let routes = streams.entry(table).or_default();
+            let routes = streams.entry((table, tenant)).or_default();
             routes.retain(|route| {
                 route.node_id != node_id.as_uuid()
                     || route.writer_epoch != writer_epoch
@@ -657,7 +742,7 @@ impl TailTransportDirectory {
         self.transports
             .read()
             .ok()
-            .and_then(|transports| transports.get(&(table.to_owned(), None)).cloned())
+            .and_then(|transports| transports.get(&(table.to_owned(), None, None)).cloned())
     }
 
     /// Looks up a stream-specific transport, falling back to the local table route.
@@ -666,23 +751,34 @@ impl TailTransportDirectory {
         &self,
         table: &str,
         node_id: uuid::Uuid,
+        tenant: wyrd_spec::DataTenantId,
     ) -> Option<Arc<dyn TailReadTransport>> {
         self.transports.read().ok().and_then(|transports| {
             transports
-                .get(&(table.to_owned(), Some(node_id)))
-                .or_else(|| transports.get(&(table.to_owned(), None)))
+                .get(&(table.to_owned(), Some(node_id), Some(tenant.as_uuid())))
+                .or_else(|| transports.get(&(table.to_owned(), Some(node_id), None)))
+                .or_else(|| transports.get(&(table.to_owned(), None, None)))
                 .cloned()
         })
     }
 
-    /// Returns an immutable snapshot of independently discovered live streams.
+    /// Returns tenant-scoped and generic independently discovered live streams.
     #[must_use]
-    fn live_streams(&self, table: &str) -> Vec<LiveTailRoute> {
-        self.live_streams
-            .read()
-            .ok()
-            .and_then(|streams| streams.get(table).cloned())
-            .unwrap_or_default()
+    fn live_streams(&self, table: &str, tenant: wyrd_spec::DataTenantId) -> Vec<LiveTailRoute> {
+        let Ok(streams) = self.live_streams.read() else {
+            return Vec::new();
+        };
+        let mut routes = streams
+            .get(&(table.to_owned(), None))
+            .cloned()
+            .unwrap_or_default();
+        routes.extend(
+            streams
+                .get(&(table.to_owned(), Some(tenant.as_uuid())))
+                .cloned()
+                .unwrap_or_default(),
+        );
+        routes
     }
 }
 
@@ -949,6 +1045,17 @@ impl Default for OracleConfig {
     }
 }
 
+/// Internal execution outcome that preserves the sole whole-query replan signal.
+#[derive(Debug, thiserror::Error)]
+enum OracleExecutionError {
+    /// A pinned immutable object disappeared after the read cut was selected.
+    #[error("Oracle read cut references a stale object")]
+    StaleObject,
+    /// A stable public failure that must cross the transport boundary unchanged.
+    #[error(transparent)]
+    Public(#[from] BifrostError),
+}
+
 /// Retained local query engine owner.
 pub struct Oracle {
     /// Planner and floor configuration.
@@ -987,6 +1094,16 @@ impl std::fmt::Debug for Oracle {
 }
 
 impl Oracle {
+    /// Borrow the serving composition's live-tail transport directory.
+    ///
+    /// Test and server composition roots use this handle to register transports
+    /// discovered after the Oracle owner was constructed; query callers never
+    /// receive or bypass this directory.
+    #[must_use]
+    pub fn tail_transports(&self) -> &TailTransportDirectory {
+        &self.tails
+    }
+
     /// Constructs a retained Oracle owner from explicit dependency handles.
     ///
     /// # Errors
@@ -1279,7 +1396,7 @@ impl Oracle {
             };
             degraded |= drained.degraded;
             admitted.live_reservations = drained.reservations;
-            let (schema, mut batches) = self
+            let execution = self
                 .execute_sql_cut(
                     &context,
                     &request.sql,
@@ -1289,7 +1406,23 @@ impl Oracle {
                     &admitted,
                     deadline,
                 )
-                .await?;
+                .await;
+            let (schema, mut batches) = match execution {
+                Ok(execution) => execution,
+                Err(OracleExecutionError::StaleObject) if retry_ordinal == 0 => {
+                    metrics::counter!(
+                        "bifrost_oracle_stale_replans_total",
+                        "outcome" => "retried"
+                    )
+                    .increment(1);
+                    drop(admitted);
+                    continue;
+                }
+                Err(OracleExecutionError::StaleObject) => {
+                    return Err(BifrostError::QueryExecutionFailed);
+                }
+                Err(OracleExecutionError::Public(error)) => return Err(error),
+            };
             let remaining = deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(BifrostError::QueryTimeout)?;
@@ -1495,7 +1628,7 @@ impl Oracle {
         query_class: QueryClass,
         admitted: &AdmittedQueryGuard,
         deadline: Instant,
-    ) -> Result<(SchemaRef, SendableRecordBatchStream), BifrostError> {
+    ) -> Result<(SchemaRef, SendableRecordBatchStream), OracleExecutionError> {
         let _source_span = tracing::info_span!(
             "bifrost.oracle.source",
             query_class = query_class_label(query_class)
@@ -1637,7 +1770,7 @@ impl Oracle {
         tier: fragment::SealedSourceTier,
         pinned_digest: String,
         files: Vec<fragment::SealedScanFile>,
-    ) -> Result<Vec<RecordBatch>, BifrostError> {
+    ) -> Result<Vec<RecordBatch>, OracleExecutionError> {
         let dispatcher = self
             .fragment_dispatcher
             .as_ref()
@@ -1690,7 +1823,7 @@ impl Oracle {
             }
         }
         if !eligible.contains_key(&leader) {
-            return Err(BifrostError::OracleRoleUnavailable);
+            return Err(BifrostError::OracleRoleUnavailable.into());
         }
         let assignment = assignment::PortableAssignmentV1
             .assign(
@@ -1741,9 +1874,12 @@ impl Oracle {
                 .execute(&dispatch_context, fragment, &candidates)
                 .await
                 .map_err(|error| match error {
-                    dispatcher::DispatchError::Terminal => BifrostError::QueryPeerSecurity,
+                    dispatcher::DispatchError::StaleObject => OracleExecutionError::StaleObject,
+                    dispatcher::DispatchError::Terminal => {
+                        OracleExecutionError::Public(BifrostError::QueryPeerSecurity)
+                    }
                     dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
-                        BifrostError::QueryExecutionFailed
+                        OracleExecutionError::Public(BifrostError::QueryExecutionFailed)
                     }
                 })?;
             for bytes in attempt.batches {
@@ -1815,7 +1951,7 @@ impl Oracle {
 /// Iceberg projects UTC as `+00:00`, while Arrow's Parquet reader projects the
 /// same logical timezone as `UTC`. This boundary removes that adapter spelling
 /// drift without weakening any column, order, or non-UTC type check.
-fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
+pub(super) fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
     let fields = schema
         .fields()
         .iter()
@@ -2633,7 +2769,9 @@ impl TailFenceDrainer {
                     .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
                 let wal_lsn = u64::try_from(file.wal_lsn_max)
                     .map_err(|_| BifrostError::QueryVisibilityUnavailable)?;
-                let Some(transport) = tails.get_for_stream(&table, file.node_id) else {
+                let Some(transport) =
+                    tails.get_for_stream(&table, file.node_id, cut.binding.tenant)
+                else {
                     return Err(BifrostError::QueryVisibilityUnavailable);
                 };
                 let key = (file.node_id, event_day.as_str().to_owned(), writer_epoch);
@@ -2652,7 +2790,7 @@ impl TailFenceDrainer {
                     })
                     .or_insert((event_day, cursor, transport));
             }
-            for route in tails.live_streams(&table) {
+            for route in tails.live_streams(&table, cut.binding.tenant) {
                 let key = (
                     route.node_id,
                     route.event_day.as_str().to_owned(),
@@ -3035,12 +3173,37 @@ impl std::fmt::Debug for OracleQueryStream {
 /// Returns a terminal failed frame for a late execution error.
 #[must_use]
 pub fn failed_terminal(code: QueryTerminalErrorCode, row_count: u64) -> QueryTerminalFrame {
+    failed_terminal_for_visibility(code, row_count, VisibilityMode::PublishedOnly)
+}
+
+/// Returns a contract-valid failed terminal for the query's visibility cut.
+fn failed_terminal_for_visibility(
+    code: QueryTerminalErrorCode,
+    row_count: u64,
+    visibility: VisibilityMode,
+) -> QueryTerminalFrame {
+    let mut source_completion = vec![
+        SourceCompletion {
+            source: QuerySource::Iceberg,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+        SourceCompletion {
+            source: QuerySource::HotSealed,
+            outcome: SourceCompletionOutcome::Complete,
+        },
+    ];
+    if visibility == VisibilityMode::Fused {
+        source_completion.push(SourceCompletion {
+            source: QuerySource::LiveTail,
+            outcome: SourceCompletionOutcome::Complete,
+        });
+    }
     QueryTerminalFrame {
         outcome: QueryTerminalOutcome::Failed,
         freshness: wyrd_spec::vala::api::QueryFreshness::Complete,
         row_count,
         warnings: Vec::new(),
-        source_completion: Vec::new(),
+        source_completion,
         error: Some(wyrd_spec::vala::api::QueryTerminalError { code, detail: None }),
     }
 }
@@ -3437,17 +3600,19 @@ fn build_query_stream(
                     .and_then(|reason| *reason)
                     .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed);
                 query_telemetry.finish("failed", "complete");
-                yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                     code,
                     row_count,
+                    visibility,
                 )));
                 return;
             }
             if Instant::now() >= deadline {
                 query_telemetry.finish("failed", "complete");
-                yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                     QueryTerminalErrorCode::QueryTimeout,
                     row_count,
+                    visibility,
                 )));
                 return;
             }
@@ -3459,9 +3624,10 @@ fn build_query_stream(
                         Ok(frame) => yield Ok(QueryStreamFrame::Batch(frame)),
                         Err(_) => {
                             query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                                 QueryTerminalErrorCode::QueryExecutionFailed,
                                 row_count,
+                                visibility,
                             )));
                             return;
                         }
@@ -3475,9 +3641,10 @@ fn build_query_stream(
                         "Oracle query stream execution failed"
                     );
                     query_telemetry.finish("failed", "complete");
-                    yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                    yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                         code,
                         row_count,
+                        visibility,
                     )));
                     return;
                 }
@@ -3493,17 +3660,19 @@ fn build_query_stream(
                                 .and_then(|reason| *reason)
                                 .unwrap_or(QueryTerminalErrorCode::QueryExecutionFailed);
                             query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                                 code,
                                 row_count,
+                                visibility,
                             )));
                             return;
                         }
                         () = tokio::time::sleep(remaining) => {
                             query_telemetry.finish("failed", "complete");
-                            yield Ok(QueryStreamFrame::Terminal(failed_terminal(
+                            yield Ok(QueryStreamFrame::Terminal(failed_terminal_for_visibility(
                                 QueryTerminalErrorCode::QueryTimeout,
                                 row_count,
+                                visibility,
                             )));
                             return;
                         }
@@ -3716,6 +3885,7 @@ mod tests {
         let terminal = failed_terminal(QueryTerminalErrorCode::QueryExecutionFailed, 17);
         assert_eq!(terminal.outcome, QueryTerminalOutcome::Failed);
         assert_eq!(terminal.row_count, 17);
+        assert!(terminal.validate(VisibilityMode::PublishedOnly).is_ok());
         assert_eq!(
             terminal
                 .error

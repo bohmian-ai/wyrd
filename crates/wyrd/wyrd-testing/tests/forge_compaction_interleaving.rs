@@ -1575,8 +1575,9 @@ async fn forge_compaction_lease_theft_after_catalog_commit_fails_closed() {
         .await
         .expect("successor release")
     );
+    advance_forge_clock_past_uncertainty(&server);
     fixture
-        .forge
+        .context_with_config(recovery_config_without_live_replacement(&fixture))
         .run_once()
         .await
         .expect("successor reconciliation");
@@ -1968,7 +1969,9 @@ async fn forge_commit_cancellation_windows_reconcile_once() {
         after.operation_count("forge.file_compact.prepared").await,
         1
     );
-    after_forge
+    advance_forge_clock_past_uncertainty(&server);
+    after
+        .context_with_config(recovery_config_without_live_replacement(&after))
         .run_once()
         .await
         .expect("after-acceptance reconciliation");

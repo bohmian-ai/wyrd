@@ -2,6 +2,8 @@
 
 use crate::{SqlError, TenantConn};
 
+// raw-query grep allowlist: this tenant-scoped file-list query post-dates the sqlx offline cache; run `mise run sqlx:prepare` to promote it to a macro. It remains bound to `TenantConn` and `wyrd.current_tenant()` and introduces no tenant-boundary exception.
+
 /// Lists file paths whose staging lifecycle is not terminal for one physical table.
 ///
 /// The optional `path` narrows the same nonterminal predicate for focused

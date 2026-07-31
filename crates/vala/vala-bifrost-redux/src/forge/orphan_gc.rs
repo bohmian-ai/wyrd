@@ -154,7 +154,7 @@ impl MaintenanceProtection {
         let Some(normalized) = binding.validate_object_path(path) else {
             return GcEligibility::InvalidPath;
         };
-        if !Forge::known_iceberg_object(&normalized) {
+        if !is_never_published_forge_generation(&normalized) {
             return GcEligibility::InvalidPath;
         }
         if self.destructive_maintenance == DestructiveMaintenance::Blocked
@@ -176,6 +176,29 @@ impl MaintenanceProtection {
         }
         GcEligibility::Eligible
     }
+}
+
+/// Recognize only immutable Forge attempt-generation data paths.
+///
+/// Scribe pod/ULID names and generic Iceberg metadata paths deliberately fail
+/// this predicate and can be reclaimed only from committed expiry evidence.
+fn is_never_published_forge_generation(path: &str) -> bool {
+    let marker = format!(
+        "/data/forge/{}/",
+        crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
+    );
+    let Some((_, file_name)) = path.rsplit_once(&marker) else {
+        return false;
+    };
+    let Some(stem) = file_name.strip_suffix(".parquet") else {
+        return false;
+    };
+    let Some((generation, ordinal)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    ordinal.len() == 5
+        && ordinal.bytes().all(|byte| byte.is_ascii_digit())
+        && Uuid::parse_str(generation).is_ok_and(|uuid| uuid.get_version_num() == 7)
 }
 
 /// Validated identity of the one prepared GC batch allowed to finish itself.
@@ -1072,26 +1095,11 @@ impl Forge {
         validate_table_location(binding, metadata.location(), &self.core.staging)
     }
 
-    fn known_iceberg_object(path: &str) -> bool {
-        let lower = path.to_ascii_lowercase();
-        let extension = std::path::Path::new(path)
-            .extension()
-            .and_then(std::ffi::OsStr::to_str);
-        if extension.is_some_and(|extension| extension.eq_ignore_ascii_case("parquet")) {
-            return true;
-        }
-        if !lower.contains("/metadata/") {
-            return false;
-        }
-        extension.is_some_and(|extension| {
-            extension.eq_ignore_ascii_case("json") || extension.eq_ignore_ascii_case("avro")
-        })
-    }
-
-    /// Applies the production Iceberg-object predicate to a test fixture path.
+    /// Apply generic Forge-generation eligibility to a test fixture path.
     #[cfg(feature = "test-support")]
+    #[must_use]
     pub fn known_iceberg_object_for_test(path: &str) -> bool {
-        Self::known_iceberg_object(path)
+        is_never_published_forge_generation(path)
     }
 
     fn gc_operation_id(key: &ForgeTableKey, candidates: &[String]) -> Uuid {
@@ -1171,9 +1179,16 @@ mod tests {
             TableRef::new(BifrostNamespace::Traces, "spans"),
         ))
         .expect("binding");
-        let old_path = format!("{}/data/old.parquet", binding.object_prefix);
-        let young_path = format!("{}/data/young.parquet", binding.object_prefix);
-        let protected_path = format!("{}/data/live.parquet", binding.object_prefix);
+        let forge_path = |generation: Uuid| {
+            format!(
+                "{}/data/forge/{}/{generation}-00000.parquet",
+                binding.object_prefix,
+                crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
+            )
+        };
+        let old_path = forge_path(Uuid::now_v7());
+        let young_path = forge_path(Uuid::now_v7());
+        let protected_path = forge_path(Uuid::now_v7());
         let mut live = ProtectedLiveSet::default();
         live.insert(protected_path.clone());
         let protection = MaintenanceProtection {
@@ -1223,5 +1238,21 @@ mod tests {
             GcEligibility::Missing
         );
         assert_eq!(protection.now.timestamp_millis(), 48 * 60 * 60 * 1_000);
+    }
+
+    /// Generic orphan collection excludes Scribe pod/ULID and Iceberg-owned paths.
+    #[test]
+    fn generic_gc_accepts_only_forge_attempt_generations() {
+        let generation = Uuid::now_v7();
+        assert!(is_never_published_forge_generation(&format!(
+            "tenant/table/data/forge/{}/{generation}-00000.parquet",
+            crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION
+        )));
+        assert!(!is_never_published_forge_generation(
+            "tenant/table/data/pod-a-01JABC.parquet"
+        ));
+        assert!(!is_never_published_forge_generation(
+            "tenant/table/metadata/v1.metadata.json"
+        ));
     }
 }

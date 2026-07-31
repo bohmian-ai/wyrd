@@ -381,7 +381,13 @@ impl ForgeMetrics {
         outcome: &ForgeTickOutcome,
         gauges: ForgeGaugeSnapshot,
     ) {
-        if !outcome.tick_complete || outcome.tables_examined != outcome.tables_discovered {
+        if !outcome.tick_complete
+            || outcome.tables_examined != outcome.tables_discovered
+            || outcome.tables_succeeded != outcome.tables_discovered
+            || outcome.tables_failed != 0
+            || outcome.tables_skipped != 0
+            || outcome.stage_failures != 0
+        {
             return;
         }
         self.pending_files[&ForgeMetricSource::Staging]
@@ -1020,7 +1026,7 @@ mod tests {
 
     /// Proves incomplete publication cannot overwrite a complete snapshot.
     #[test]
-    fn forge_metrics_gauges_preserve_complete_tick_snapshot() {
+    fn failed_pass_preserves_gauges() {
         let recorder = BenchmarkRecorder::new();
         let metrics = metrics::with_local_recorder(&recorder, ForgeMetrics::new);
         let complete = ForgeTickOutcome {
@@ -1043,7 +1049,14 @@ mod tests {
             },
         );
         metrics.record_complete_tick(
-            &ForgeTickOutcome::default(),
+            &ForgeTickOutcome {
+                tick_complete: true,
+                tables_discovered: 1,
+                tables_examined: 1,
+                tables_failed: 1,
+                stage_failures: 1,
+                ..ForgeTickOutcome::default()
+            },
             ForgeGaugeSnapshot {
                 staging: ReconciliationGaugeObservation {
                     prepared_operations: 1,

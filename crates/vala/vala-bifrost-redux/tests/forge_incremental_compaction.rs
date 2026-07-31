@@ -1152,6 +1152,7 @@ mod pg_tests {
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
         let fixture = Fixture::new_with_config(
             ForgeConfig {
+                max_files_per_bin: 32,
                 max_files_per_tick: 32,
                 max_bins_per_tick: 32,
                 max_concurrent_reads: 2,

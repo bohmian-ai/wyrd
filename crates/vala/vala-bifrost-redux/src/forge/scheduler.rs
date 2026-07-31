@@ -1,27 +1,31 @@
 //! Serialized periodic and advisory-hint scheduling for the Forge owner.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use chrono::{DateTime, Utc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use wyrd_spec::DataTenantId;
 
 use super::Forge;
 use super::binpack::ForgeGroupKey;
 use super::compact::{
-    ForgeTableKey, ForgeTickBudget, ForgeTickOutcome, StagingReconciliationOutcome,
+    ForgeTableKey, ForgeTerminalWorkKey, ForgeTickBudget, ForgeTickOutcome,
+    ForgeWorkClassification, ForgeWorkDisposition, StagingReconciliationOutcome,
 };
 use super::error::ForgeError;
 use super::expire::ExpiryReconciliationOutcome;
 use super::lease::{ForgeLease, forge_lease_key};
 use super::live_reconcile::{DestructiveMaintenance, IcebergReconciliationOutcome};
-use super::live_replace::IcebergRewriteDisposition;
+use super::live_replace::{IcebergRewriteDisposition, iceberg_rewrite_operation_id};
 use super::metrics::{
     ForgeGaugeSnapshot, ForgeLeaseResult, ForgeMetricSource, ForgeMetricStage,
     ReconciliationGaugeObservation,
 };
 use super::orphan_gc::OrphanGcOutcome;
+use super::rewrite::RewriteSourceFile;
+use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
 use crate::maintenance::StagingFileCommitted;
 
@@ -205,12 +209,7 @@ impl Forge {
         outcome.tables_failed = outcome.tables_failed.saturating_add(discovery_failures);
         outcome.stage_failures = outcome.stage_failures.saturating_add(discovery_failures);
         outcome.pending_work |= discovery_failures > 0;
-        tables.sort_by(|left, right| {
-            left.tenant
-                .cmp(&right.tenant)
-                .then_with(|| left.table_ref.fqn().cmp(&right.table_ref.fqn()))
-        });
-        rotate_tables(&mut tables, self.periodic_cursor.load(Ordering::Acquire));
+        tables = tenant_round_robin_tables(tables, self.periodic_cursor.load(Ordering::Acquire));
         for key in tables {
             if stop.is_cancelled() {
                 outcome.pending_work = true;
@@ -774,6 +773,7 @@ impl Forge {
         let Some(group) = plan.groups.first() else {
             return Ok(());
         };
+        let terminal_key = live_terminal_work_key(binding, plan.base_snapshot_id, group)?;
         outcome.live_groups_planned = outcome.live_groups_planned.saturating_add(1);
         let files = group.files.len();
         let bytes = group.files.iter().try_fold(0_u64, |total, file| {
@@ -783,15 +783,51 @@ impl Forge {
                     detail: "live rewrite input bytes overflow the Forge tick budget".to_owned(),
                 })
         })?;
-        let admitted = budget.bins < self.core.config.max_bins_per_tick
+        let disposition = self
+            .terminal_work
+            .lock()
+            .await
+            .disposition_with(terminal_key, || {
+                self.core.config.classify_fresh_work(files, bytes)
+            });
+        let classification = match disposition {
+            ForgeWorkDisposition::SuppressedTerminal => {
+                outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                return Ok(());
+            }
+            ForgeWorkDisposition::NewlyTerminal => {
+                tracing::warn!(
+                    operation_id = %terminal_key.operation_id(),
+                    files,
+                    bytes,
+                    "Forge terminalized an unschedulable live rewrite"
+                );
+                outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                return Ok(());
+            }
+            ForgeWorkDisposition::Eligible(classification @ ForgeWorkClassification::Ordinary)
+            | ForgeWorkDisposition::Eligible(
+                classification @ ForgeWorkClassification::LargeSingleton,
+            ) => classification,
+            ForgeWorkDisposition::Eligible(ForgeWorkClassification::Unschedulable) => {
+                return Err(ForgeError::Invariant {
+                    detail: "terminal registry returned unschedulable work as eligible".to_owned(),
+                });
+            }
+        };
+        let large_lane_available = classification != ForgeWorkClassification::LargeSingleton
+            || (budget.files == 0 && budget.bytes == 0 && budget.bins == 0);
+        let admitted = large_lane_available
+            && budget.bins < self.core.config.max_bins_per_tick
             && budget
                 .files
                 .checked_add(files)
                 .is_some_and(|value| value <= self.core.config.max_files_per_tick)
-            && budget
-                .bytes
-                .checked_add(bytes)
-                .is_some_and(|value| value <= self.core.config.max_bytes_per_tick);
+            && (classification == ForgeWorkClassification::LargeSingleton
+                || budget
+                    .bytes
+                    .checked_add(bytes)
+                    .is_some_and(|value| value <= self.core.config.max_bytes_per_tick));
         if !admitted {
             outcome.budget_skips = outcome.budget_skips.saturating_add(1);
             self.core.metrics.record_operation(
@@ -1056,12 +1092,86 @@ fn order_hint_keys(keys: HashSet<ForgeGroupKey>) -> Vec<ForgeGroupKey> {
     keys
 }
 
-/// Rotates a sorted periodic roster without changing its stable relative order.
-fn rotate_tables(tables: &mut [ForgeTableKey], cursor: u64) {
-    if !tables.is_empty() {
-        let offset = usize::try_from(cursor).unwrap_or(usize::MAX) % tables.len();
-        tables.rotate_left(offset);
+/// Order a complete roster by tenant rounds, rotating tenants before tables.
+///
+/// Each eligible tenant contributes at most one table per round. Tables remain
+/// deterministically ordered by FQN within their tenant, while `cursor`
+/// chooses the first tenant for the next complete pass.
+fn tenant_round_robin_tables(tables: Vec<ForgeTableKey>, cursor: u64) -> Vec<ForgeTableKey> {
+    let mut by_tenant = BTreeMap::<DataTenantId, Vec<ForgeTableKey>>::new();
+    for table in tables {
+        by_tenant.entry(table.tenant).or_default().push(table);
     }
+    for tenant_tables in by_tenant.values_mut() {
+        tenant_tables.sort_by(|left, right| left.table_ref.fqn().cmp(&right.table_ref.fqn()));
+    }
+    let mut tenants = by_tenant.into_iter().collect::<Vec<_>>();
+    if !tenants.is_empty() {
+        let offset = usize::try_from(cursor % u64::try_from(tenants.len()).unwrap_or(u64::MAX))
+            .unwrap_or_default();
+        tenants.rotate_left(offset);
+    }
+    let capacity = tenants.iter().map(|(_, tables)| tables.len()).sum();
+    let mut ordered = Vec::with_capacity(capacity);
+    let max_tables = tenants
+        .iter()
+        .map(|(_, tables)| tables.len())
+        .max()
+        .unwrap_or_default();
+    for index in 0..max_tables {
+        for (_, tables) in &tenants {
+            if let Some(table) = tables.get(index) {
+                ordered.push(table.clone());
+            }
+        }
+    }
+    ordered
+}
+
+/// Derive the exact live candidate identity suppressed after terminalization.
+///
+/// # Errors
+///
+/// Returns [`ForgeError::Invariant`] when the planner produced an empty group.
+fn live_terminal_work_key(
+    binding: &TenantTableBinding,
+    base_snapshot_id: i64,
+    group: &IcebergRewriteGroup,
+) -> Result<ForgeTerminalWorkKey, ForgeError> {
+    let first = group.files.first().ok_or_else(|| ForgeError::Invariant {
+        detail: "live rewrite planner produced an empty group".to_owned(),
+    })?;
+    let key = ForgeGroupKey {
+        tenant: binding.tenant,
+        table_ref: binding.table_ref.clone(),
+        partition_day: first.partition_day,
+    };
+    let sources = group
+        .files
+        .iter()
+        .map(|file| RewriteSourceFile {
+            catalog_path: file.catalog_path.clone(),
+            object_path: file.object_path.clone(),
+            file_size_bytes: file.file_size_bytes,
+            record_count: file.record_count,
+        })
+        .collect::<Vec<_>>();
+    let resource = key.audit_resource();
+    let subject = iceberg_rewrite_operation_id(
+        &resource,
+        0,
+        first.partition_spec_id,
+        first.partition_day,
+        &[],
+    );
+    let candidate = iceberg_rewrite_operation_id(
+        &resource,
+        base_snapshot_id,
+        first.partition_spec_id,
+        first.partition_day,
+        &sources,
+    );
+    Ok(ForgeTerminalWorkKey::live(subject, candidate))
 }
 
 #[cfg(test)]
@@ -1255,21 +1365,23 @@ mod tests {
 
     /// Proves the process-local cursor rotates a stable roster and wraps.
     #[test]
-    fn forge_scheduler_rotation_is_fair_and_wraps() {
-        let tenant = DataTenantId::try_from(Uuid::now_v7()).expect("tenant ID must be valid");
-        let mut tables = ["a", "b", "c"]
+    fn forge_constrained_tenant_progresses() {
+        let hot = DataTenantId::try_from(Uuid::now_v7()).expect("hot tenant ID must be valid");
+        let constrained =
+            DataTenantId::try_from(Uuid::now_v7()).expect("constrained tenant ID must be valid");
+        let continuously_eligible = [(hot, "a"), (hot, "b"), (hot, "c"), (constrained, "z")]
             .into_iter()
-            .map(|name| ForgeTableKey {
+            .map(|(tenant, name)| ForgeTableKey {
                 tenant,
                 table_ref: TableRef::new(BifrostNamespace::Bifrost, name),
             })
             .collect::<Vec<_>>();
-        rotate_tables(&mut tables, 1);
-        assert_eq!(tables[0].table_ref.name, "b");
-        rotate_tables(&mut tables, 2);
-        assert_eq!(tables[0].table_ref.name, "a");
-        rotate_tables(&mut tables, u64::MAX);
-        assert_eq!(tables.len(), 3);
+        let mut admitted = Vec::new();
+        for cursor in 0..2 {
+            let ordered = tenant_round_robin_tables(continuously_eligible.clone(), cursor);
+            admitted.push(ordered[0].tenant);
+        }
+        assert!(admitted.contains(&constrained));
     }
 
     /// Proves complete outcome merging is saturating and convergence is strict.

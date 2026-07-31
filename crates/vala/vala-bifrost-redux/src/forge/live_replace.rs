@@ -20,7 +20,7 @@ use super::binpack::ForgeGroupKey;
 use super::compact::forge_transition_event;
 use super::error::ForgeError;
 use super::lease::ForgeLease;
-use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
+use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::IcebergRewriteGroup;
 use crate::catalog::TenantTableBinding;
 use crate::parquet::writer_properties::BIFROST_WRITER_RECIPE_VERSION;
@@ -230,7 +230,7 @@ impl Forge {
             .rewrite
             .rewrite(
                 RewriteRequest {
-                    operation_id,
+                    attempt_generation: ForgeAttemptGeneration::now_v7(),
                     binding,
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),

@@ -7,7 +7,7 @@
 //! Iceberg commits observable; the next Forge tick reconciles that state before
 //! selecting more files.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +40,7 @@ use super::error::ForgeError;
 use super::lease::ForgeLease;
 use super::live_reconcile::DestructiveMaintenance;
 use super::metrics::RewritePathContract;
-use super::rewrite::{RewriteOutput, RewriteRequest, RewriteSourceFile};
+use super::rewrite::{ForgeAttemptGeneration, RewriteOutput, RewriteRequest, RewriteSourceFile};
 use super::right_size::{
     ForgeRightSizePolicy, IcebergCandidateFile, IcebergRewriteGroup, IcebergRewriteReason,
     validate_supported_layout,
@@ -52,6 +52,8 @@ const DEFAULT_MAX_CONCURRENT_READS: usize = 4;
 const DEFAULT_SPILL_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_OPEN_OPERATIONS_PER_TABLE: usize = 256;
 const DEFAULT_MAX_RETAINED_SNAPSHOTS_PER_TABLE: usize = 256;
+/// Hard process-local bound for terminal logical-subject suppression.
+const MAX_TERMINAL_WORK_SUBJECTS: usize = 4_096;
 const SYSTEM_PRINCIPAL: PrincipalId = PrincipalId::new(uuid::Uuid::nil());
 
 #[derive(Debug, Clone)]
@@ -65,6 +67,8 @@ pub struct ForgeConfig {
     pub max_files_per_tick: usize,
     /// Maximum input bytes processed by one tick.
     pub max_bytes_per_tick: u64,
+    /// Hard ceiling for one oversized singleton admitted outside the ordinary byte lane.
+    pub max_large_task_bytes: u64,
     /// Maximum bins committed by one tick.
     pub max_bins_per_tick: usize,
     /// Lease duration used to fence one table's maintenance work.
@@ -154,6 +158,7 @@ impl Default for ForgeConfig {
             max_files_per_bin: 256,
             max_files_per_tick: 1_024,
             max_bytes_per_tick: 2 * 512 * 1024 * 1024,
+            max_large_task_bytes: 4 * 512 * 1024 * 1024,
             max_bins_per_tick: 64,
             lease_ttl: Duration::from_mins(15),
             iceberg_total_retry_timeout: Duration::from_mins(5),
@@ -187,6 +192,7 @@ impl ForgeConfig {
             || self.max_files_per_bin < 2
             || self.max_files_per_tick == 0
             || self.max_bytes_per_tick == 0
+            || self.max_large_task_bytes == 0
             || self.max_bins_per_tick == 0
             || self.lease_ttl.is_zero()
             || self.iceberg_total_retry_timeout.is_zero()
@@ -208,6 +214,13 @@ impl ForgeConfig {
                 detail: "Forge limits must be positive and min_files/max_files_per_bin must be at least two".to_owned(),
             });
         }
+        if self.max_files_per_bin > self.max_files_per_tick
+            || self.max_large_task_bytes < self.max_bytes_per_tick
+        {
+            return Err(ForgeError::InvalidConfig {
+                detail: "max_files_per_bin must not exceed max_files_per_tick and max_large_task_bytes must cover the ordinary byte limit".to_owned(),
+            });
+        }
         let required = self
             .iceberg_total_retry_timeout
             .saturating_add(self.catalog_request_timeout)
@@ -225,6 +238,281 @@ impl ForgeConfig {
         self.iceberg_total_retry_timeout
             .saturating_add(self.catalog_request_timeout)
             .saturating_add(self.uncertainty_margin)
+    }
+
+    /// Classify one complete rewrite group against fresh configured capacity.
+    ///
+    /// A multi-file group must fit the ordinary lane. Only one oversized file
+    /// may use the bounded large lane; work above that ceiling is terminally
+    /// unschedulable rather than a budget deferral.
+    #[must_use]
+    pub(crate) const fn classify_fresh_work(
+        &self,
+        files: usize,
+        bytes: u64,
+    ) -> ForgeWorkClassification {
+        if files > 0 && files <= self.max_files_per_tick && bytes <= self.max_bytes_per_tick {
+            ForgeWorkClassification::Ordinary
+        } else if files == 1 && bytes <= self.max_large_task_bytes {
+            ForgeWorkClassification::LargeSingleton
+        } else {
+            ForgeWorkClassification::Unschedulable
+        }
+    }
+}
+
+/// Closed schedulability outcome for one complete Forge rewrite group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForgeWorkClassification {
+    /// The group fits every ordinary fresh-capacity ceiling.
+    Ordinary,
+    /// One file exceeds the ordinary byte budget but fits the bounded large lane.
+    LargeSingleton,
+    /// The group cannot run within either configured safety envelope.
+    Unschedulable,
+}
+
+/// Stable logical subject whose newest terminal candidate supersedes older ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ForgeTerminalWorkSubject {
+    /// One tenant/table/day staging group.
+    Staging(Uuid),
+    /// One tenant/table/spec/day live rewrite group.
+    Live(Uuid),
+}
+
+/// Exact candidate identity paired with its bounded logical subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForgeTerminalWorkKey {
+    /// Logical subject used as the replacement slot.
+    subject: ForgeTerminalWorkSubject,
+    /// Exact immutable candidate fingerprint.
+    candidate: Uuid,
+}
+
+impl ForgeTerminalWorkKey {
+    /// Build one staging key from its logical subject and exact file-set identity.
+    pub(crate) const fn staging(subject: Uuid, candidate: Uuid) -> Self {
+        Self {
+            subject: ForgeTerminalWorkSubject::Staging(subject),
+            candidate,
+        }
+    }
+
+    /// Build one live key from its logical subject and exact snapshot/input identity.
+    pub(crate) const fn live(subject: Uuid, candidate: Uuid) -> Self {
+        Self {
+            subject: ForgeTerminalWorkSubject::Live(subject),
+            candidate,
+        }
+    }
+
+    /// Return the deterministic operation identity carried by either source.
+    pub(crate) const fn operation_id(self) -> Uuid {
+        self.candidate
+    }
+}
+
+/// Process-local terminal registry used before the durable task scheduler lands.
+#[derive(Debug, Default)]
+pub(crate) struct ForgeTerminalWorkRegistry {
+    /// Newest exact terminal identity for each bounded logical subject.
+    terminal: HashMap<ForgeTerminalWorkSubject, Uuid>,
+    /// FIFO subject order used for deterministic global eviction.
+    order: VecDeque<ForgeTerminalWorkSubject>,
+}
+
+/// Scheduler disposition after terminal identity suppression is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForgeWorkDisposition {
+    /// The candidate remains eligible for ordinary or large-lane admission.
+    Eligible(ForgeWorkClassification),
+    /// This exact candidate became terminal during the current consideration.
+    NewlyTerminal,
+    /// An identical terminal candidate was rediscovered and not reconsidered.
+    SuppressedTerminal,
+}
+
+impl ForgeTerminalWorkRegistry {
+    /// Return whether this exact candidate was already terminalized.
+    #[must_use]
+    pub(crate) fn contains(&self, key: ForgeTerminalWorkKey) -> bool {
+        self.terminal.get(&key.subject) == Some(&key.candidate)
+    }
+
+    /// Replace this logical subject's prior terminal identity with the newest one.
+    ///
+    /// A new subject evicts the oldest retained subject at the hard global
+    /// bound. Evicted work may be safely reconsidered later; false suppression
+    /// and unbounded process memory are both avoided.
+    fn terminalize(&mut self, key: ForgeTerminalWorkKey) {
+        if !self.terminal.contains_key(&key.subject) {
+            if self.terminal.len() == MAX_TERMINAL_WORK_SUBJECTS
+                && let Some(oldest) = self.order.pop_front()
+            {
+                self.terminal.remove(&oldest);
+            }
+            self.order.push_back(key.subject);
+        }
+        self.terminal.insert(key.subject, key.candidate);
+    }
+
+    /// Remove a changed subject's stale fingerprint and FIFO position.
+    fn remove_subject(&mut self, subject: ForgeTerminalWorkSubject) {
+        self.terminal.remove(&subject);
+        self.order.retain(|current| *current != subject);
+    }
+
+    /// Apply terminal suppression to one freshly planned candidate.
+    #[must_use]
+    pub(crate) fn disposition_with(
+        &mut self,
+        key: ForgeTerminalWorkKey,
+        classify: impl FnOnce() -> ForgeWorkClassification,
+    ) -> ForgeWorkDisposition {
+        if self.contains(key) {
+            return ForgeWorkDisposition::SuppressedTerminal;
+        }
+        self.remove_subject(key.subject);
+        let classification = classify();
+        if classification == ForgeWorkClassification::Unschedulable {
+            self.terminalize(key);
+            ForgeWorkDisposition::NewlyTerminal
+        } else {
+            ForgeWorkDisposition::Eligible(classification)
+        }
+    }
+
+    /// Return the bounded logical-subject count for exact regressions.
+    #[cfg(test)]
+    #[must_use]
+    fn len(&self) -> usize {
+        self.terminal.len()
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::{
+        ForgeConfig, ForgeTerminalWorkKey, ForgeTerminalWorkRegistry, ForgeWorkClassification,
+        ForgeWorkDisposition, MAX_TERMINAL_WORK_SUBJECTS,
+    };
+    use uuid::Uuid;
+
+    /// Fresh work always receives one closed capacity classification.
+    #[test]
+    fn capacity_classifies_fresh_work() {
+        let config = ForgeConfig::default();
+        assert_eq!(
+            config.classify_fresh_work(2, config.max_bytes_per_tick),
+            ForgeWorkClassification::Ordinary
+        );
+        assert_eq!(
+            config.classify_fresh_work(1, config.max_bytes_per_tick.saturating_add(1)),
+            ForgeWorkClassification::LargeSingleton
+        );
+        assert_eq!(
+            config.classify_fresh_work(2, config.max_bytes_per_tick.saturating_add(1)),
+            ForgeWorkClassification::Unschedulable
+        );
+    }
+
+    /// The large lane accepts exactly one file and enforces its hard byte ceiling.
+    #[test]
+    fn large_singleton_is_bounded() {
+        let config = ForgeConfig::default();
+        assert_eq!(
+            config.classify_fresh_work(1, config.max_large_task_bytes),
+            ForgeWorkClassification::LargeSingleton
+        );
+        assert_eq!(
+            config.classify_fresh_work(1, config.max_large_task_bytes.saturating_add(1)),
+            ForgeWorkClassification::Unschedulable
+        );
+    }
+
+    /// Terminal work cannot be mistaken for a transient remaining-budget deferral.
+    #[test]
+    fn unschedulable_does_not_repeat() {
+        let config = ForgeConfig::default();
+        let subject = Uuid::from_u128(1);
+        let unchanged = ForgeTerminalWorkKey::staging(subject, Uuid::from_u128(10));
+        let changed = ForgeTerminalWorkKey::staging(subject, Uuid::from_u128(11));
+        let mut terminal = ForgeTerminalWorkRegistry::default();
+        let mut planning_calls = 0;
+        let mut classify = || {
+            planning_calls += 1;
+            config.classify_fresh_work(2, config.max_large_task_bytes.saturating_add(1))
+        };
+        assert_eq!(
+            terminal.disposition_with(unchanged, &mut classify),
+            ForgeWorkDisposition::NewlyTerminal
+        );
+        assert_eq!(
+            terminal.disposition_with(unchanged, &mut classify),
+            ForgeWorkDisposition::SuppressedTerminal
+        );
+        assert_eq!(
+            terminal.disposition_with(changed, &mut classify),
+            ForgeWorkDisposition::NewlyTerminal
+        );
+        drop(classify);
+        assert_eq!(planning_calls, 2);
+        assert!(!terminal.contains(unchanged));
+        assert!(terminal.contains(changed));
+    }
+
+    /// Successive changed identities replace one bounded logical-subject slot.
+    #[test]
+    fn terminal_registry_replaces_changed_candidate_within_bound() {
+        let config = ForgeConfig::default();
+        let subject = Uuid::from_u128(7);
+        let mut terminal = ForgeTerminalWorkRegistry::default();
+        for candidate in 1..=64 {
+            let changed = ForgeTerminalWorkKey::staging(subject, Uuid::from_u128(candidate));
+            assert_eq!(
+                terminal.disposition_with(changed, || {
+                    config.classify_fresh_work(2, config.max_large_task_bytes.saturating_add(1))
+                }),
+                ForgeWorkDisposition::NewlyTerminal
+            );
+            assert_eq!(terminal.len(), 1);
+        }
+        let newest = ForgeTerminalWorkKey::staging(subject, Uuid::from_u128(64));
+        assert_eq!(
+            terminal.disposition_with(newest, || ForgeWorkClassification::Ordinary),
+            ForgeWorkDisposition::SuppressedTerminal
+        );
+        assert_eq!(terminal.len(), 1);
+    }
+
+    /// Distinct subjects evict deterministically without false suppression.
+    #[test]
+    fn terminal_registry_hard_bound_evicts_oldest_safely() {
+        let mut terminal = ForgeTerminalWorkRegistry::default();
+        let candidate = Uuid::from_u128(9);
+        for subject in 1..=MAX_TERMINAL_WORK_SUBJECTS + 1 {
+            let subject = u128::try_from(subject).expect("registry bound fits u128");
+            let key = ForgeTerminalWorkKey::staging(Uuid::from_u128(subject), candidate);
+            assert_eq!(
+                terminal.disposition_with(key, || ForgeWorkClassification::Unschedulable),
+                ForgeWorkDisposition::NewlyTerminal
+            );
+            assert!(terminal.len() <= MAX_TERMINAL_WORK_SUBJECTS);
+        }
+        let newest_subject =
+            u128::try_from(MAX_TERMINAL_WORK_SUBJECTS + 1).expect("registry bound fits u128");
+        let newest = ForgeTerminalWorkKey::staging(Uuid::from_u128(newest_subject), candidate);
+        assert_eq!(
+            terminal.disposition_with(newest, || ForgeWorkClassification::Ordinary),
+            ForgeWorkDisposition::SuppressedTerminal
+        );
+        let evicted_oldest = ForgeTerminalWorkKey::staging(Uuid::from_u128(1), candidate);
+        assert_eq!(
+            terminal.disposition_with(evicted_oldest, || ForgeWorkClassification::Ordinary),
+            ForgeWorkDisposition::Eligible(ForgeWorkClassification::Ordinary)
+        );
+        assert_eq!(terminal.len(), MAX_TERMINAL_WORK_SUBJECTS);
     }
 }
 
@@ -745,6 +1033,10 @@ impl Forge {
             );
             outcome.groups_seen = outcome.groups_seen.saturating_add(bins.len());
             for (index, bin) in bins.iter().enumerate() {
+                let terminal_key = ForgeTerminalWorkKey::staging(
+                    staging_terminal_subject_id(&row.key),
+                    operation_id(&row.key, bin),
+                );
                 if context.stop.is_cancelled() {
                     record_staging_pending(&mut outcome, &bins, index);
                     return Ok(outcome);
@@ -753,10 +1045,51 @@ impl Forge {
                     record_staging_pending(&mut outcome, &bins, index);
                     break;
                 }
+                match self
+                    .terminal_work
+                    .lock()
+                    .await
+                    .disposition_with(terminal_key, || {
+                        self.core
+                            .config
+                            .classify_fresh_work(bin.files.len(), bin.total_bytes)
+                    }) {
+                    ForgeWorkDisposition::SuppressedTerminal => {
+                        outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                        continue;
+                    }
+                    ForgeWorkDisposition::NewlyTerminal => {
+                        tracing::warn!(
+                            operation_id = %terminal_key.operation_id(),
+                            files = bin.files.len(),
+                            bytes = bin.total_bytes,
+                            "Forge terminalized an unschedulable staging rewrite"
+                        );
+                        outcome.bins_skipped = outcome.bins_skipped.saturating_add(1);
+                        continue;
+                    }
+                    ForgeWorkDisposition::Eligible(ForgeWorkClassification::LargeSingleton)
+                        if context.budget.files != 0
+                            || context.budget.bytes != 0
+                            || context.budget.bins != 0 =>
+                    {
+                        self.record_staging_budget_skip(&mut outcome, &bins, index);
+                        break 'groups;
+                    }
+                    ForgeWorkDisposition::Eligible(ForgeWorkClassification::LargeSingleton) => {}
+                    ForgeWorkDisposition::Eligible(ForgeWorkClassification::Ordinary) => {}
+                    ForgeWorkDisposition::Eligible(ForgeWorkClassification::Unschedulable) => {
+                        return Err(ForgeError::Invariant {
+                            detail: "terminal registry returned unschedulable work as eligible"
+                                .to_owned(),
+                        });
+                    }
+                }
                 if context.budget.files.saturating_add(bin.files.len())
                     > self.core.config.max_files_per_tick
-                    || context.budget.bytes.saturating_add(bin.total_bytes)
-                        > self.core.config.max_bytes_per_tick
+                    || (bin.total_bytes <= self.core.config.max_bytes_per_tick
+                        && context.budget.bytes.saturating_add(bin.total_bytes)
+                            > self.core.config.max_bytes_per_tick)
                 {
                     self.record_staging_budget_skip(&mut outcome, &bins, index);
                     break 'groups;
@@ -1205,7 +1538,7 @@ impl Forge {
             .rewrite
             .rewrite(
                 RewriteRequest {
-                    operation_id,
+                    attempt_generation: ForgeAttemptGeneration::now_v7(),
                     binding,
                     schema,
                     iceberg_schema: table.metadata().current_schema().clone(),
@@ -2296,6 +2629,19 @@ fn operation_id(key: &ForgeGroupKey, bin: &RewriteBin) -> Uuid {
         hasher.update(file.id.as_bytes());
         hasher.update(file.path.as_bytes());
     }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Derive the stable replacement slot for one tenant/table/day staging subject.
+fn staging_terminal_subject_id(key: &ForgeGroupKey) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"forge-terminal-staging");
+    hasher.update(key.audit_resource());
+    hasher.update(key.partition_day.to_string());
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest[..16]);

@@ -135,10 +135,7 @@ async fn run_gc_samples(
         let mut newest_modified_ms = i64::MIN;
         let mut orphan_paths = Vec::with_capacity(32);
         for candidate in 0..32 {
-            let operation_id = uuid::Uuid::from_u128(
-                u128::try_from(sample * 32 + candidate + 1)
-                    .map_err(|_| "benchmark GC operation identity overflow")?,
-            );
+            let operation_id = uuid::Uuid::now_v7();
             let orphan = deterministic_output_path_for_test(
                 &fixture.binding.object_prefix,
                 operation_id,

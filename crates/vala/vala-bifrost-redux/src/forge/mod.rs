@@ -85,6 +85,8 @@ pub struct Forge {
     running: AtomicBool,
     /// Process-local starting offset for complete periodic table passes.
     periodic_cursor: AtomicU64,
+    /// Process-local terminal identities that suppress identical unsafe work.
+    terminal_work: tokio::sync::Mutex<compact::ForgeTerminalWorkRegistry>,
 }
 
 /// Immutable dependency graph shared by one Forge owner.
@@ -157,6 +159,7 @@ impl Forge {
             tick: tokio::sync::Mutex::new(()),
             running: AtomicBool::new(false),
             periodic_cursor: AtomicU64::new(0),
+            terminal_work: tokio::sync::Mutex::new(compact::ForgeTerminalWorkRegistry::default()),
         })
     }
 

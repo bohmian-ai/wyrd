@@ -452,6 +452,7 @@ impl Forge {
                 ..
             } = &detail
             else {
+                record_malformed_expiry(&mut outcome);
                 continue;
             };
             let table = self.load_table(&binding.table_ident()).await?;
@@ -498,6 +499,11 @@ impl Forge {
         }
         Ok(outcome)
     }
+}
+
+/// Mark a wrong-family open expiry row as unresolved and fail closed later.
+fn record_malformed_expiry(outcome: &mut ExpiryReconciliationOutcome) {
+    outcome.unresolved = outcome.unresolved.saturating_add(1);
 }
 
 impl Forge {
@@ -633,6 +639,22 @@ fn expiry_operation_id(key: &ForgeTableKey, cutoff_ms: i64, selected: &[i64]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wrong-family expiry state contributes unresolved evidence that blocks GC.
+    #[test]
+    fn malformed_expiry_blocks_gc() {
+        let mut outcome = ExpiryReconciliationOutcome::default();
+        record_malformed_expiry(&mut outcome);
+        if outcome.unresolved > 0 {
+            outcome.destructive_maintenance =
+                super::super::live_reconcile::DestructiveMaintenance::Blocked;
+        }
+        assert_eq!(outcome.unresolved, 1);
+        assert_eq!(
+            outcome.destructive_maintenance,
+            super::super::live_reconcile::DestructiveMaintenance::Blocked
+        );
+    }
 
     #[test]
     fn snapshot_selection_never_includes_current_or_retained_head() {

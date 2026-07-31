@@ -2587,16 +2587,59 @@ mod tests {
         assert!(matches!(error, ScribeError::WalDiskFull));
     }
 
+    /// Proves the WAL capacity probe agrees with direct bracketing `statvfs` samples.
+    ///
+    /// The available-space assertion uses the direct samples immediately before
+    /// and after the implementation probe so unrelated filesystem activity cannot
+    /// impose a false monotonic ordering on the three observations.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the temporary filesystem cannot be sampled or when capacity,
+    /// block-size, or observed available-space invariants diverge.
     #[test]
     fn statvfs_matches_direct_measurement_without_df() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let stats = rustix::fs::statvfs(temp_dir.path()).expect("statvfs");
-        let expected_capacity = stats.f_blocks.saturating_mul(stats.f_frsize);
-        let expected_available = stats.f_bavail.saturating_mul(stats.f_frsize);
+        let before = rustix::fs::statvfs(temp_dir.path()).expect("statvfs before probe");
         let measured = filesystem_space(temp_dir.path()).expect("filesystem sample");
-        assert_eq!(measured.0, expected_capacity);
-        assert!(measured.1 <= expected_available);
-        assert!(expected_available - measured.1 <= stats.f_frsize);
+        let after = rustix::fs::statvfs(temp_dir.path()).expect("statvfs after probe");
+
+        let before_block_size = if before.f_frsize == 0 {
+            before.f_bsize
+        } else {
+            before.f_frsize
+        };
+        let after_block_size = if after.f_frsize == 0 {
+            after.f_bsize
+        } else {
+            after.f_frsize
+        };
+        assert_ne!(before_block_size, 0, "filesystem block size is nonzero");
+        assert_eq!(before.f_blocks, after.f_blocks, "total blocks are stable");
+        assert_eq!(
+            before_block_size, after_block_size,
+            "filesystem block size is stable"
+        );
+
+        let before_capacity = before.f_blocks.saturating_mul(before_block_size);
+        let after_capacity = after.f_blocks.saturating_mul(after_block_size);
+        assert_eq!(measured.0, before_capacity);
+        assert_eq!(measured.0, after_capacity);
+
+        let before_available = before.f_bavail.saturating_mul(before_block_size);
+        let after_available = after.f_bavail.saturating_mul(after_block_size);
+        let one_block = before_block_size.max(after_block_size);
+        let lower_bound = before_available
+            .min(after_available)
+            .saturating_sub(one_block);
+        let upper_bound = before_available
+            .max(after_available)
+            .saturating_add(one_block);
+        assert!(
+            (lower_bound..=upper_bound).contains(&measured.1),
+            "measured available bytes {} must fall within bracket {lower_bound}..={upper_bound}",
+            measured.1
+        );
     }
 
     #[test]

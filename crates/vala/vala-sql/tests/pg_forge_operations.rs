@@ -26,6 +26,7 @@ mod pg_tests {
         };
 
         use vala_sql::queries::forge_operations::ForgeOperations;
+        use vala_sql::queries::forge_tasks::FAIR_CLAIM_SQL;
         use vala_sql::row_types::forge_operations::{
             ForgeOperationFamily, ForgeOperationTransition,
         };
@@ -2243,6 +2244,95 @@ mod pg_tests {
             assert!(
                 growth_blocks <= baseline_blocks + 64,
                 "shared blocks grew beyond bound: baseline={baseline_blocks}, growth={growth_blocks}"
+            );
+
+            // The same registered scale lane also proves the durable task
+            // queue keeps ready and terminal reads on their partial indexes.
+            sqlx::query(
+                r#"INSERT INTO vala.forge_tasks
+                   (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,
+                    base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,
+                    estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,
+                    large_task_ceiling_bytes,state,ready_at,created_at,updated_at)
+                   SELECT (substr(md5('task-' || n::text),1,8)||'-'||substr(md5('task-' || n::text),9,4)||'-7'||substr(md5('task-' || n::text),14,3)||'-8'||substr(md5('task-' || n::text),18,3)||'-'||substr(md5('task-' || n::text),21,12))::uuid,
+                          $1,'wyrd-redux','vala.bifrost','scale_'||n::text,'small_files','ordinary',n,
+                          '{"version":1,"inputs":[],"parameters":{}}'::jsonb,
+                          decode(repeat('07',32),'hex'),1,1,1,1,1,1,'succeeded',
+                          statement_timestamp(),statement_timestamp()-interval '2 days',statement_timestamp()-interval '2 days'
+                     FROM generate_series(1,10000) n"#,
+            )
+            .bind(tenant.as_uuid())
+            .execute(&superuser)
+            .await
+            .expect("insert terminal task history");
+            sqlx::query(
+                r#"INSERT INTO vala.forge_tasks
+                   (task_id,data_tenant_id,catalog_name,namespace_name,table_name,strategy,lane,
+                    base_snapshot_id,plan,plan_hash,estimated_files,estimated_bytes,
+                    estimated_parallelism,estimated_memory_bytes,estimated_spill_bytes,
+                    large_task_ceiling_bytes,state,ready_at,created_at,updated_at)
+                   SELECT (substr(md5('ready-task-' || n::text),1,8)||'-'||substr(md5('ready-task-' || n::text),9,4)||'-7'||substr(md5('ready-task-' || n::text),14,3)||'-8'||substr(md5('ready-task-' || n::text),18,3)||'-'||substr(md5('ready-task-' || n::text),21,12))::uuid,
+                          $1,'wyrd-redux','vala.bifrost','ready_scale_'||n::text,'small_files','ordinary',20000+n,
+                          '{"version":1,"inputs":[],"parameters":{}}'::jsonb,
+                          decode(lpad(to_hex(n),64,'0'),'hex'),1,1,1,1,1,1,'ready',
+                          statement_timestamp(),statement_timestamp(),statement_timestamp()
+                     FROM generate_series(1,8) n"#,
+            )
+            .bind(tenant.as_uuid())
+            .execute(&superuser)
+            .await
+            .expect("insert bounded ready set");
+            sqlx::query("VACUUM (ANALYZE) vala.forge_tasks")
+                .execute(&mut *admin_conn)
+                .await
+                .expect("vacuum Forge tasks");
+            let task_plan = sqlx::query_scalar::<sqlx::Postgres, String>(
+                "EXPLAIN (FORMAT TEXT) SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 AND state IN ('succeeded','unschedulable','failed','cancelled') AND updated_at<statement_timestamp() ORDER BY updated_at,task_id LIMIT 100",
+            )
+            .bind(tenant.as_uuid())
+            .fetch_all(&superuser)
+            .await
+            .expect("explain terminal pruning")
+            .join("\n");
+            assert!(
+                task_plan.contains("forge_tasks_terminal"),
+                "terminal pruning uses its bounded partial index: {task_plan}"
+            );
+            let fair_explain = format!("EXPLAIN (FORMAT TEXT) {FAIR_CLAIM_SQL}");
+            let fair_plan =
+                sqlx::query_scalar::<sqlx::Postgres, String>(sqlx::AssertSqlSafe(fair_explain))
+                    .bind(0_i64)
+                    .bind(Uuid::now_v7())
+                    .bind(4_i64)
+                    .bind(Uuid::now_v7())
+                    .bind(30_i64)
+                    .bind(10_i64)
+                    .bind(1_000_i64)
+                    .bind(4_i32)
+                    .bind(1_000_i64)
+                    .bind(1_000_i64)
+                    .bind(2_000_i64)
+                    .fetch_all(&superuser)
+                    .await
+                    .expect("explain production fair claim")
+                    .join("\n");
+            assert!(
+                fair_plan.contains("forge_tasks_ready")
+                    && fair_plan.contains("forge_tasks_publication_active")
+                    && fair_plan.contains("forge_large_lane_lease_pkey"),
+                "production fair claim uses bounded ready/active/singleton indexes: {fair_plan}"
+            );
+            assert!(
+                FAIR_CLAIM_SQL.contains("SKIP LOCKED")
+                    && FAIR_CLAIM_SQL.contains("eligible_tenants")
+                    && FAIR_CLAIM_SQL.contains("last_tenant_id")
+                    && FAIR_CLAIM_SQL.contains("large_lock"),
+                "explained statement is the complete production fair-claim CTE"
+            );
+            let status_plan=sqlx::query_scalar::<sqlx::Postgres,String>("EXPLAIN (FORMAT TEXT) SELECT task_id FROM vala.forge_tasks WHERE data_tenant_id=$1 ORDER BY updated_at DESC,task_id LIMIT 9").bind(tenant.as_uuid()).fetch_all(&superuser).await.expect("explain bounded status").join("\n");
+            assert!(
+                status_plan.contains("forge_tasks_status"),
+                "bounded status uses tenant status index: {status_plan}"
             );
 
             // Functional test: list_open returns 8 operations

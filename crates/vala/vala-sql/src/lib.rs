@@ -119,6 +119,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    /// Query modules that intentionally combine operator coordination with tenant lifecycle work.
+    const MIXED_EXECUTOR_QUERY_MODULES: &[&str] = &["forge_tasks.rs"];
+
+    /// Returns whether a query module owns sanctioned cross-tenant coordination transactions.
+    fn is_mixed_executor_query_module(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| MIXED_EXECUTOR_QUERY_MODULES.contains(&name))
+    }
+
     #[test]
     fn schema_ownership_is_explicit() {
         assert_eq!(OWNED_SCHEMAS, &["vala", "iceberg_catalog"]);
@@ -255,6 +265,7 @@ mod tests {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_mixed_executor_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query file is readable");
                 let checked = without_line_comments(&body);
@@ -278,6 +289,7 @@ mod tests {
         let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let forbidden = rust_files_under(&crate_dir.join("src/queries"))
             .into_iter()
+            .filter(|path| !is_mixed_executor_query_module(path))
             .filter_map(|path| {
                 let body = fs::read_to_string(&path).expect("Vala query source is readable");
                 let checked = without_line_comments(&body).to_ascii_uppercase();

@@ -41,6 +41,9 @@ name = "pg_drift_alerts"
 name = "pg_forge_operations"
 
 [[test]]
+name = "pg_forge_tasks"
+
+[[test]]
 name = "pg_forge_file_list"
 
 [[test]]

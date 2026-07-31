@@ -424,7 +424,6 @@ impl BoundServer {
         let query = self.state.bifrost_query();
         let ingest = self.state.bifrost_ingest.clone();
         let terminal = supervise_with_shutdown(set, shutdown, drain, || {
-            let query = query.clone();
             let ingest = ingest.clone();
             async move {
                 if let Some(runtime) = query

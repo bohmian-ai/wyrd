@@ -13,6 +13,10 @@ use wyrd_tonic::wyrd::v1::{self as proto, BifrostQueryRequest};
 use crate::AppState;
 use crate::components::auth::Caller;
 
+/// Owned server-streaming gRPC frame transport returned by the query service.
+pub(crate) type QueryGrpcStream =
+    Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>;
+
 /// Public query service backed by the process-retained Oracle runtime.
 pub struct BifrostQueryGrpc {
     /// Shared server state containing auth, Gate, and Oracle role state.
@@ -61,8 +65,7 @@ async fn caller(
 #[wyrd_tonic::tonic::async_trait]
 impl BifrostQueryService for BifrostQueryGrpc {
     /// Server-streaming protobuf response type.
-    type QueryStream =
-        Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>;
+    type QueryStream = QueryGrpcStream;
 
     /// Authenticates, authorizes, and starts one bounded Oracle query stream.
     ///
@@ -90,8 +93,7 @@ impl BifrostQueryService for BifrostQueryGrpc {
 /// Converts one Oracle logical stream to the canonical gRPC frame transport.
 pub(crate) fn query_stream_response(
     result: vala_bifrost_redux::oracle::OracleQueryStream,
-) -> Response<Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>>
-{
+) -> Response<QueryGrpcStream> {
     let mut frames = result.frames;
     let output = async_stream::stream! {
         while let Some(frame) = frames.next().await {
@@ -101,8 +103,7 @@ pub(crate) fn query_stream_response(
                 .map_err(query_status);
         }
     };
-    let mut response = Response::new(Box::pin(output)
-        as Pin<Box<dyn Stream<Item = Result<proto::QueryStreamFrame, Status>> + Send + 'static>>);
+    let mut response = Response::new(Box::pin(output) as QueryGrpcStream);
     if let Ok(value) = result.schema_fingerprint.parse() {
         response
             .metadata_mut()

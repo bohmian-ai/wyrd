@@ -122,10 +122,12 @@ mod pg_tests {
             vala_bifrost_redux::gate::limits::IngestLimits::default(),
             None,
         ));
+        let gate = ingest.gate();
         (
             AppState::new(postgres, storage, catalog)
                 .with_bifrost_redux(redux_catalog)
                 .with_bifrost_ingest(ingest)
+                .with_bifrost_gate(gate)
                 .with_auth(ServerAuth {
                     issuing_key: Some(issuing_key),
                     token_verifier: Some(verifier),
@@ -567,7 +569,7 @@ mod pg_tests {
         assert_eq!(page_status.code(), Code::PermissionDenied);
 
         let mut release = Request::new(ReleaseTailFenceRequest {
-            fence_id: fence.fence_id.as_uuid().as_bytes().to_vec().into(),
+            fence_id: fence.fence_id.as_uuid().as_bytes().to_vec(),
         });
         release.metadata_mut().insert(
             "x-wyrd-access-token",

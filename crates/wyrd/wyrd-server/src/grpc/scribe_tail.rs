@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use arrow::ipc::writer::StreamWriter;
+use thiserror::Error;
 use vala_bifrost_redux::scribe::tail_rpc::{ScribeTailReader, TailReadError};
 use wyrd_runtime::PrincipalKind;
 use wyrd_tonic::private_conversion::PrivateConversionError;
@@ -15,6 +16,29 @@ use wyrd_tonic::wyrd::v1::{
 };
 
 use crate::AppState;
+
+/// Reports a bounded Arrow IPC encoding stage without retaining tonic state.
+#[derive(Debug, Error)]
+enum TailBatchEncodingError {
+    /// Arrow rejected creation of the stream writer for the batch schema.
+    #[error("failed to initialize Arrow IPC tail-batch writer: {detail}")]
+    Initialize {
+        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
+        detail: String,
+    },
+    /// Arrow rejected the batch while writing the owned stream payload.
+    #[error("failed to write Arrow IPC tail batch: {detail}")]
+    Write {
+        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
+        detail: String,
+    },
+    /// Arrow rejected finalization of the owned stream payload.
+    #[error("failed to finish Arrow IPC tail batch: {detail}")]
+    Finish {
+        /// Scrubbed Arrow diagnostic retained until the handler maps the error.
+        detail: String,
+    },
+}
 
 /// Private gRPC adapter that validates a workload caller before touching a tail fence.
 pub struct ScribeTailGrpc {
@@ -99,7 +123,8 @@ impl ScribeTailService for ScribeTailGrpc {
             .batches
             .iter()
             .map(|batch| encode_batch(batch.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(encoding_status)?;
         Ok(Response::new(proto::TailPage {
             arrow_ipc_batches: batches,
             next_cursor: page
@@ -149,16 +174,89 @@ fn tail_status(error: TailReadError) -> Status {
     }
 }
 
+/// Maps a local Arrow IPC encoding failure at the tonic handler boundary.
+fn encoding_status(error: TailBatchEncodingError) -> Status {
+    Status::internal(error.to_string())
+}
+
 /// Encodes one local shallow batch into the private transport's owned Arrow IPC bytes.
-fn encode_batch(batch: &arrow::record_batch::RecordBatch) -> Result<Vec<u8>, Status> {
+///
+/// # Errors
+///
+/// Returns a local encoding error when Arrow cannot initialize, write, or
+/// finish the bounded IPC stream.
+fn encode_batch(
+    batch: &arrow::record_batch::RecordBatch,
+) -> Result<Vec<u8>, TailBatchEncodingError> {
     let mut bytes = Vec::new();
-    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema())
-        .map_err(|error| Status::internal(error.to_string()))?;
+    let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).map_err(|error| {
+        TailBatchEncodingError::Initialize {
+            detail: error.to_string(),
+        }
+    })?;
     writer
         .write(batch)
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| TailBatchEncodingError::Write {
+            detail: error.to_string(),
+        })?;
     writer
         .finish()
-        .map_err(|error| Status::internal(error.to_string()))?;
+        .map_err(|error| TailBatchEncodingError::Finish {
+            detail: error.to_string(),
+        })?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::reader::StreamReader;
+    use arrow::record_batch::RecordBatch;
+    use wyrd_tonic::tonic::Code;
+
+    use super::{TailBatchEncodingError, encode_batch, encoding_status};
+
+    /// Proves the local encoder produces a complete owned Arrow IPC stream.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the fixture batch cannot be built, encoded, decoded, or
+    /// compared with its round-tripped values.
+    #[test]
+    fn tail_batch_encoding_round_trips_arrow_ipc() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2]))])
+            .expect("valid tail batch fixture");
+
+        let bytes = encode_batch(&batch).expect("tail batch encodes");
+        let decoded = StreamReader::try_new(Cursor::new(bytes), None)
+            .expect("encoded stream initializes")
+            .next()
+            .expect("encoded stream contains one batch")
+            .expect("encoded batch decodes");
+
+        assert_eq!(decoded, batch);
+    }
+
+    /// Proves local encoding failures become opaque internal statuses only at the boundary.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the boundary mapper exposes a non-internal tonic status.
+    #[test]
+    fn tail_batch_encoding_error_maps_to_internal_status() {
+        let status = encoding_status(TailBatchEncodingError::Finish {
+            detail: "fixture failure".to_owned(),
+        });
+
+        assert_eq!(status.code(), Code::Internal);
+    }
 }

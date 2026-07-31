@@ -2079,8 +2079,10 @@ minimum_slots = 2
         let path = directory.path().join("oracle-calibration.toml");
         std::fs::write(&path, complete_oracle_calibration("candidate"))
             .expect("candidate profile writes");
-        let mut config = WyrdServerConfig::default();
-        config.deployment_profile = DeploymentProfile::Production;
+        let mut config = WyrdServerConfig {
+            deployment_profile: DeploymentProfile::Production,
+            ..WyrdServerConfig::default()
+        };
         config.bifrost.oracle.calibration_profile = path.clone();
         assert!(config.validate().is_err());
 
@@ -2098,8 +2100,10 @@ minimum_slots = 2
         let path = directory.path().join("oracle-calibration.toml");
         std::fs::write(&path, "schema_version = 1\nstatus = \"approved\"\n")
             .expect("minimal profile writes");
-        let mut config = WyrdServerConfig::default();
-        config.deployment_profile = DeploymentProfile::Production;
+        let mut config = WyrdServerConfig {
+            deployment_profile: DeploymentProfile::Production,
+            ..WyrdServerConfig::default()
+        };
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }
@@ -2114,8 +2118,10 @@ minimum_slots = 2
             "evidence_case_id = \"\"",
         );
         std::fs::write(&path, profile).expect("invalid profile writes");
-        let mut config = WyrdServerConfig::default();
-        config.deployment_profile = DeploymentProfile::Production;
+        let mut config = WyrdServerConfig {
+            deployment_profile: DeploymentProfile::Production,
+            ..WyrdServerConfig::default()
+        };
         config.bifrost.oracle.calibration_profile = path;
         assert!(config.validate().is_err());
     }

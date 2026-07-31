@@ -18,10 +18,12 @@ use super::path::catalog_path_to_object_key;
 /// Validated object-key contract for one rewrite source.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum RewritePathContract<'binding> {
-    /// Staging audit paths are already relative but must remain within binding.
+    /// Staging audits may retain relative keys or catalog-normalized URIs.
     Staging {
-        /// Physical tenant/table binding that owns every relative key.
+        /// Physical tenant/table binding that owns every accepted path.
         binding: &'binding TenantTableBinding,
+        /// Authoritative table location used only when the audit path is a URI.
+        table_location: &'binding str,
     },
     /// Live Iceberg audit paths are catalog URIs rooted at the table location.
     Catalog {
@@ -41,13 +43,13 @@ impl RewritePathContract<'_> {
     /// binding or a catalog URI does not belong to the validated table root.
     fn object_key(self, store: &opendal::Operator, path: &str) -> Result<String, ForgeError> {
         match self {
-            Self::Staging { binding } => {
-                binding
-                    .validate_object_path(path)
-                    .ok_or_else(|| ForgeError::Invariant {
-                        detail: format!("staging path escaped table binding: {path}"),
-                    })
-            }
+            Self::Staging {
+                binding,
+                table_location,
+            } => binding.validate_object_path(path).map_or_else(
+                || catalog_path_to_object_key(table_location, binding, store, path),
+                Ok,
+            ),
             Self::Catalog {
                 binding,
                 table_location,
@@ -711,23 +713,27 @@ mod tests {
         let binding = rewrite_binding();
         let root = tempfile::tempdir().expect("temporary root initializes");
         let store = rewrite_store(root.path());
+        let location = format!("file:///{}", binding.object_prefix);
         let expected = format!("{}/data/part.parquet", binding.object_prefix);
-        let actual = RewritePathContract::Staging { binding: &binding }
-            .object_key(&store, &expected)
-            .expect("binding-owned staging key validates");
+        let actual = RewritePathContract::Staging {
+            binding: &binding,
+            table_location: &location,
+        }
+        .object_key(&store, &expected)
+        .expect("binding-owned staging key validates");
         assert_eq!(actual, expected);
     }
 
-    /// Proves live measurement converts a valid catalog URI to its object key.
+    /// Proves staging measurement converts a valid catalog URI to its object key.
     #[test]
-    fn rewrite_path_contract_normalizes_catalog_uri() {
+    fn rewrite_path_contract_normalizes_staging_catalog_uri() {
         let binding = rewrite_binding();
         let root = tempfile::tempdir().expect("temporary root initializes");
         let store = rewrite_store(root.path());
         let location = format!("file:///{}", binding.object_prefix);
         let catalog_path = format!("{location}/data/part.parquet");
         let expected = format!("{}/data/part.parquet", binding.object_prefix);
-        let actual = RewritePathContract::Catalog {
+        let actual = RewritePathContract::Staging {
             binding: &binding,
             table_location: &location,
         }
@@ -736,9 +742,9 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// Proves live measurement rejects a catalog URI outside the table root.
+    /// Proves staging measurement rejects a catalog URI outside the table root.
     #[test]
-    fn rewrite_path_contract_rejects_foreign_catalog_uri() {
+    fn rewrite_path_contract_rejects_foreign_staging_catalog_uri() {
         let binding = rewrite_binding();
         let root = tempfile::tempdir().expect("temporary root initializes");
         let store = rewrite_store(root.path());
@@ -748,7 +754,7 @@ mod tests {
             binding.object_prefix
         );
         assert!(
-            RewritePathContract::Catalog {
+            RewritePathContract::Staging {
                 binding: &binding,
                 table_location: &location,
             }
@@ -763,11 +769,15 @@ mod tests {
         let binding = rewrite_binding();
         let root = tempfile::tempdir().expect("temporary root initializes");
         let store = rewrite_store(root.path());
+        let location = format!("file:///{}", binding.object_prefix);
         let malformed = format!("{}/../foreign/part.parquet", binding.object_prefix);
         assert!(
-            RewritePathContract::Staging { binding: &binding }
-                .object_key(&store, &malformed)
-                .is_err()
+            RewritePathContract::Staging {
+                binding: &binding,
+                table_location: &location,
+            }
+            .object_key(&store, &malformed)
+            .is_err()
         );
     }
 

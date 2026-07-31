@@ -1735,7 +1735,10 @@ impl Forge {
         if let Some(snapshot_id) = self.live_snapshot_for_paths(&table, output_paths).await? {
             let volume = self
                 .measure_rewrite_volume(
-                    RewritePathContract::Staging { binding },
+                    RewritePathContract::Staging {
+                        binding,
+                        table_location: table.metadata().location(),
+                    },
                     input_paths,
                     output_paths,
                 )

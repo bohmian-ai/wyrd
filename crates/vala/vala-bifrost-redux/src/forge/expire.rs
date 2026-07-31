@@ -139,7 +139,7 @@ impl Forge {
 /// not prevent maintenance for the remaining tables.
 impl Forge {
     async fn discover_tables_inner(&self) -> Result<(Vec<ForgeTableKey>, usize), ForgeError> {
-        let rows = vala_sql::queries::olap_catalog::list_active_tables_for_operator(
+        let rows = vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator(
             &self.core.operator_pool,
         )
         .await

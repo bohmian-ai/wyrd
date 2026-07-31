@@ -42,13 +42,16 @@ VALA_CATALOG_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/iceberg_catalog.rs",
 }
 
-# Vala query modules that manage cross-tenant control-plane state (maintenance
-# leases) via the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Lease keys are
-# global and carry no tenant column, so these functions take `&OperatorPool`
-# rather than a tenant-scoped `TenantConn`. Isolation is a DB-role boundary, not
-# RLS. Must take PgPool/OperatorPool.
+# Vala query modules that perform narrow cross-tenant maintenance work through
+# the OperatorPool (`wyrd_platform_admin` BYPASSRLS). Maintenance leases use
+# global keys without a tenant column; the Forge active-table roster deliberately
+# inventories active tenant registrations. Both are operator-only surfaces, so
+# their isolation boundary is the DB role rather than tenant-scoped RLS. Must
+# take PgPool/OperatorPool.
 VALA_OPERATOR_ALLOWLIST = {
     "crates/vala/vala-sql/src/queries/maintenance_leases.rs",
+    # Cross-tenant active Bifrost roster used only by the Forge scheduler.
+    "crates/vala/vala-sql/src/queries/forge_catalog_operator.rs",
 }
 
 # Vala tables that are intentionally cross-tenant control-plane surfaces with no

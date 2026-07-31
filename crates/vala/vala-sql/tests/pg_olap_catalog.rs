@@ -1,7 +1,8 @@
 mod pg_tests {
     //! PostgreSQL integration coverage for the operator-owned Bifrost roster.
 
-    use vala_sql::queries::olap_catalog::{list_active_tables_for_operator, upsert_table};
+    use vala_sql::queries::forge_catalog_operator::list_active_tables_for_operator;
+    use vala_sql::queries::olap_catalog::upsert_table;
     use wyrd_dev_fixtures::pg::PgFixture;
     use wyrd_spec::DataTenantId;
     use wyrd_sql::TenantConn;

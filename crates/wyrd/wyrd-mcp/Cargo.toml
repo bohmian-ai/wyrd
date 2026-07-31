@@ -15,6 +15,8 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+arrow = { workspace = true }
+vala-sdk = { workspace = true }
 wyrd-client = { workspace = true }
 wyrd-spec = { workspace = true }
 wyrd-runtime = { workspace = true }

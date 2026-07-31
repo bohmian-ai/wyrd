@@ -10,7 +10,8 @@
 #   - wyrd-spec: no server-tier or async-runtime deps at --no-default-features
 #   - wyrd-auth-verify: no PyO3, no sqlx
 #   - wyrd-client: no DB, cloud SDK, object-store, or engine deps
-#   - wyrd-mcp: no sqlx, datafusion, vala-*, or axum
+#   - vala-sdk: no server, database, storage, cloud, or query-engine deps
+#   - wyrd-mcp: no sqlx, datafusion, server-owned Vala engines, or axum
 #   - skald-prompt: no network runtime or engine deps; stays the Skald/Wyrd boundary
 #   - skald engine crates: no Wyrd/Vala deps outside the locked foundation set
 set -eu
@@ -45,12 +46,23 @@ if [ -n "$forbidden_wyrd_client" ]; then
   exit 1
 fi
 
-# S3.C7: wyrd-mcp must stay engine-free (no vala-bifrost, no sqlx, no datafusion, no axum).
+# The Vala SDK is a first-class client owner. Its optional Python projection
+# does not permit server, database, storage, cloud, or query-engine dependencies.
+forbidden_vala_sdk=$(cargo tree -p vala-sdk --all-features -e normal | \
+  rg '(^|[ ─└├])(sqlx|tokio-postgres|postgres|deltalake|datafusion|axum|kube|aws-sdk|azure_|google-cloud|opendal|rdkafka|lapin|redis|deadpool-|vala-bifrost|vala-sql|wyrd-server|wyrd-testing)' || true)
+if [ -n "$forbidden_vala_sdk" ]; then
+  echo "FAIL: vala-sdk pulls forbidden client-tier deps:"
+  echo "$forbidden_vala_sdk"
+  exit 1
+fi
+
+# S3.C7: wyrd-mcp may depend on vala-sdk's client projection but must stay
+# engine-free (no vala-bifrost, vala-sql, sqlx, datafusion, or axum).
 # Mirror of the wyrd-client guard above. Dev-deps are excluded (-e normal).
 forbidden_wyrd_mcp=$(cargo tree -p wyrd-mcp --all-features -e normal | \
-  rg '(^|[ ─└├])(sqlx|datafusion|vala-|axum)' || true)
+  rg '(^|[ ─└├])(sqlx|datafusion|vala-bifrost|vala-sql|axum)' || true)
 if [ -n "$forbidden_wyrd_mcp" ]; then
-  echo "FAIL: wyrd-mcp pulls forbidden engine deps (sqlx|datafusion|vala-|axum):"
+  echo "FAIL: wyrd-mcp pulls forbidden engine deps:"
   echo "$forbidden_wyrd_mcp"
   exit 1
 fi

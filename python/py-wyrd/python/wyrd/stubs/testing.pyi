@@ -42,4 +42,8 @@ class WyrdTestServer:
         """
         ...
 
+    def prepare_oracle_query_fixture(self) -> tuple[str, str]:
+        """Create a sealed query table and return ``(table_fqn, access_token)``."""
+        ...
+
 __all__ = ["WyrdTestServer"]

@@ -1,0 +1,210 @@
+import { tableFromIPC, type RecordBatch } from "apache-arrow";
+
+import {
+  NativeBifrostQueryClient,
+  type NativeBifrostQueryStream,
+  type NativeQueryRequest,
+} from "../index.js";
+
+export type VisibilityMode = "published_only" | "fused";
+export type FreshnessPolicy = "strict" | "allow_degraded";
+
+export interface BifrostQueryRequest {
+  sql: string;
+  visibility?: VisibilityMode;
+  freshness?: FreshnessPolicy;
+  deadlineMs?: number;
+}
+
+export interface QueryTerminal {
+  outcome: "success" | "degraded" | "failed";
+  freshness: string;
+  row_count: number;
+  warnings: unknown[];
+  source_completion: unknown[];
+  error?: unknown;
+}
+
+export class WyrdError extends Error {
+  readonly code: string;
+  readonly status: number;
+  readonly title: string;
+  readonly detail: string;
+  readonly remediation: string | undefined;
+
+  constructor(
+    code: string,
+    status: number,
+    title: string,
+    detail: string,
+    remediation?: string,
+  ) {
+    super(detail);
+    this.name = "WyrdError";
+    this.code = code;
+    this.status = status;
+    this.title = title;
+    this.detail = detail;
+    this.remediation = remediation;
+  }
+}
+
+export class IncompleteQueryStreamError extends WyrdError {
+  constructor(
+    status: number,
+    title: string,
+    detail: string,
+    remediation?: string,
+  ) {
+    super(
+      "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE",
+      status,
+      title,
+      detail,
+      remediation,
+    );
+    this.name = "IncompleteQueryStreamError";
+  }
+}
+
+interface NativeErrorMetadata {
+  errorCode?: string | null;
+  errorStatus?: number | null;
+  errorTitle?: string | null;
+  errorDetail?: string | null;
+  errorRemediation?: string | null;
+}
+
+function projectedError(metadata: NativeErrorMetadata): WyrdError | undefined {
+  if (metadata.errorCode === null || metadata.errorCode === undefined) {
+    return undefined;
+  }
+  const detail = metadata.errorDetail ?? "Bifrost query failed";
+  const status = metadata.errorStatus ?? 500;
+  const title = metadata.errorTitle ?? "Bifrost query failed";
+  const remediation = metadata.errorRemediation ?? undefined;
+  if (metadata.errorCode === "WYRD_VALA_502_QUERY_STREAM_INCOMPLETE") {
+    return new IncompleteQueryStreamError(
+      status,
+      title,
+      detail,
+      remediation,
+    );
+  }
+  return new WyrdError(
+    metadata.errorCode,
+    status,
+    title,
+    detail,
+    remediation,
+  );
+}
+
+export class BifrostQueryStream
+  implements AsyncIterableIterator<RecordBatch>
+{
+  readonly #native: NativeBifrostQueryStream;
+  #terminal: QueryTerminal | undefined;
+  #done = false;
+
+  constructor(native: NativeBifrostQueryStream) {
+    this.#native = native;
+  }
+
+  get terminal(): QueryTerminal | undefined {
+    return this.#terminal;
+  }
+
+  [Symbol.asyncIterator](): AsyncIterableIterator<RecordBatch> {
+    return this;
+  }
+
+  async next(): Promise<IteratorResult<RecordBatch>> {
+    if (this.#done) {
+      return { done: true, value: undefined };
+    }
+    const step = await this.#native.next();
+    const error = projectedError(step);
+    if (error !== undefined) {
+      this.#done = true;
+      throw error;
+    }
+    if (step.ipc !== null && step.ipc !== undefined) {
+      const batch = tableFromIPC(step.ipc).batches[0];
+      if (batch === undefined) {
+        await this.#native.close();
+        throw new WyrdError(
+          "WYRD_VALA_502_QUERY_STREAM_PROTOCOL",
+          502,
+          "Query stream protocol failed",
+          "native Arrow payload contained no record batch",
+        );
+      }
+      return { done: false, value: batch };
+    }
+    if (step.terminalJson === null || step.terminalJson === undefined) {
+      await this.#native.close();
+      throw new IncompleteQueryStreamError(
+        502,
+        "Query stream incomplete",
+        "query stream ended without terminal metadata",
+      );
+    }
+    this.#terminal = JSON.parse(step.terminalJson) as QueryTerminal;
+    this.#done = true;
+    return { done: true, value: undefined };
+  }
+
+  async return(): Promise<IteratorResult<RecordBatch>> {
+    this.#done = true;
+    await this.#native.close();
+    return { done: true, value: undefined };
+  }
+}
+
+export class BifrostClient {
+  readonly #native: NativeBifrostQueryClient;
+
+  constructor(native: NativeBifrostQueryClient) {
+    this.#native = native;
+  }
+
+  async query(request: BifrostQueryRequest): Promise<BifrostQueryStream> {
+    const nativeRequest: NativeQueryRequest = {
+      sql: request.sql,
+      visibility: request.visibility ?? "published_only",
+      freshness: request.freshness ?? "strict",
+      deadlineMs: request.deadlineMs,
+    };
+    const start = await this.#native.query(nativeRequest);
+    const error = projectedError(start);
+    if (error !== undefined) {
+      throw error;
+    }
+    const stream = start.takeStream();
+    if (stream === null || stream === undefined) {
+      throw new IncompleteQueryStreamError(
+        502,
+        "Query stream incomplete",
+        "native query startup returned neither a stream nor structured error",
+      );
+    }
+    return new BifrostQueryStream(stream);
+  }
+}
+
+export class BifrostQueryClient extends BifrostClient {
+  constructor(serverUrl: string, token: string) {
+    super(new NativeBifrostQueryClient(serverUrl, token));
+  }
+}
+
+export class WyrdClient {
+  readonly bifrost: BifrostClient;
+
+  constructor(serverUrl: string, token: string) {
+    this.bifrost = new BifrostClient(
+      new NativeBifrostQueryClient(serverUrl, token),
+    );
+  }
+}

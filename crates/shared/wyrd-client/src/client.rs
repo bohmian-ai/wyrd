@@ -180,6 +180,25 @@ impl WyrdClient {
             .await
     }
 
+    /// Send an authenticated JSON request and preserve the response as a
+    /// streaming body for incremental protocol decoding.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Wyrd error for serialization, authentication,
+    /// transport, HTTP problem, or response media-type failures.
+    pub async fn request_json_stream<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        self.http.request_json_stream(method, path, body).await
+    }
+
     /// Return the shared [`AuthMiddleware`] handle.
     ///
     /// Use this to obtain the current bearer for a transport the façade does

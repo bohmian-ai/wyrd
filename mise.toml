@@ -1014,13 +1014,13 @@ run = "pnpm install --frozen-lockfile"
 description = "Build the public @wyrd/sdk napi addon (crates/bindings/wyrd-node) + emit index.d.ts into typescript/wyrd (slice 13a)"
 depends = ["ts:install"]
 dir = "typescript/wyrd"
-run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml"
+run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node/Cargo.toml --output-dir . --package-json-path package.json"
 
 [tasks."ts:build:testing"]
 description = "Build the private @wyrd/testing napi harness addon (crates/bindings/wyrd-node-testing) into typescript/testing; feeds the integration lane only (slice 13a)"
 depends = ["ts:install"]
 dir = "typescript/testing"
-run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node-testing/Cargo.toml"
+run = "pnpm exec napi build --platform --manifest-path ../../crates/bindings/wyrd-node-testing/Cargo.toml --output-dir . --package-json-path package.json"
 
 [tasks."ts:napi:check"]
 description = "Fail if the public @wyrd/sdk napi-generated index.d.ts is not committed/current (slice 13a; Node analogue of .pyi drift). Scoped to the SDK declaration, not the harness."

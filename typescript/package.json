@@ -1,0 +1,11 @@
+{
+  "name": "wyrd-typescript-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.4.0",
+  "devDependencies": {
+    "@napi-rs/cli": "3.4.1",
+    "@types/node": "24.10.0",
+    "typescript": "5.9.3",
+    "vitest": "4.0.16"
+  }
+}

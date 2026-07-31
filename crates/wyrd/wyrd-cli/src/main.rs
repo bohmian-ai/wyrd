@@ -8,6 +8,7 @@ mod dev;
 mod error;
 mod eval;
 mod principal;
+mod query;
 
 use clap::Parser;
 
@@ -40,5 +41,6 @@ async fn dispatch(cli: Cli) -> Result<std::process::ExitCode, WyrdCliError> {
         Command::Dev(command) => crate::dev::dispatch(command).await,
         Command::Eval(command) => crate::eval::run::dispatch(command).await,
         Command::Principal(command) => crate::principal::dispatch(command).await,
+        Command::Query(command) => crate::query::dispatch(command).await,
     }
 }

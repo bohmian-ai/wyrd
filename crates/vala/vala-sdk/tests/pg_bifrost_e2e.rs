@@ -24,8 +24,10 @@ mod pg_tests {
     use vala_bifrost::catalog::CreateTableRequest;
     use vala_bifrost::catalog::namespaces::BifrostNamespace;
     use vala_bifrost::types::TableScope;
+    use vala_bifrost_redux::catalog::{CreateTableRequest as ReduxCreateTableRequest, TableRef};
+    use vala_bifrost_redux::namespaces::BifrostNamespace as ReduxNamespace;
     use vala_sdk::{
-        Bifrost, BifrostGrpcTransport, ClientScope, IngestTransport, SinkKind, observe,
+        Bifrost, BifrostGrpcTransport, ClientScope, IngestTransport, QueryClient, SinkKind, observe,
     };
     use wyrd_client::WyrdClient;
     use wyrd_client::config::ClientConfig;
@@ -33,6 +35,7 @@ mod pg_tests {
     use wyrd_queue::{BatchSink, MockSink, QueueConfig, SealedBatch, WyrdQueueError};
     use wyrd_spec::error::WyrdError;
     use wyrd_spec::reference::CardRef;
+    use wyrd_spec::vala::api::{BifrostQueryRequest, FreshnessPolicy, VisibilityMode};
     use wyrd_testing::server::WyrdTestServer;
 
     fn schema() -> SchemaRef {
@@ -151,6 +154,75 @@ mod pg_tests {
         writer.write(&batch).expect("write IPC batch");
         writer.finish().expect("finish IPC stream");
         bytes
+    }
+
+    /// Runs the public Rust SDK through HTTP Gate and Oracle after a real gRPC ingest.
+    #[tokio::test]
+    async fn oracle_query_returns_arrow_batches_and_terminal() {
+        let srv = WyrdTestServer::start_bound()
+            .await
+            .expect("test server start");
+        let table_name = format!("sdk_oracle_{}", uuid::Uuid::now_v7().simple());
+        let table_fqn = format!("vala.bifrost.{table_name}");
+        srv.state()
+            .bifrost_redux
+            .as_ref()
+            .expect("Redux catalog is provisioned")
+            .create_table(ReduxCreateTableRequest {
+                table: TableRef::new(ReduxNamespace::Bifrost, &table_name),
+                user_fields: vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("value", DataType::Utf8, false),
+                ],
+                tenant: srv.data_tenant_id(),
+                audit: None,
+            })
+            .await
+            .expect("register Oracle journey table");
+        let bootstrap = srv
+            .bootstrap_service("sdk-oracle-query", &["admin"])
+            .await
+            .expect("bootstrap SDK caller");
+        let mut config = ClientConfig {
+            grpc: GrpcConfig {
+                endpoint: srv.grpc_url().expect("gRPC URL"),
+                connect_retries: 0,
+                ..GrpcConfig::default()
+            },
+            http: HttpConfig {
+                base_url: srv.base_url().expect("HTTP URL").to_owned(),
+                ..HttpConfig::default()
+            },
+            api_key: Some(bootstrap.api_key().expect("machine API key").clone()),
+            ..ClientConfig::default()
+        };
+        config.grpc.max_message_bytes = 32 * 1024 * 1024;
+        let client = WyrdClient::with_config(config).expect("public SDK client");
+        BifrostGrpcTransport::connect(&client)
+            .await
+            .expect("connect ingest")
+            .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), native_ipc())
+            .await
+            .expect("durable ingest ACK");
+        srv.flush_bifrost().await.expect("flush Scribe");
+
+        let request = BifrostQueryRequest {
+            sql: format!("SELECT id, value FROM {table_fqn} ORDER BY id"),
+            visibility: VisibilityMode::PublishedOnly,
+            freshness: FreshnessPolicy::Strict,
+            deadline_ms: None,
+        };
+        let mut stream = QueryClient::new(&client)
+            .query(&request)
+            .await
+            .expect("Oracle query starts");
+        let mut rows = 0;
+        while let Some(batch) = stream.next_batch().await.expect("valid terminal stream") {
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 2);
+        assert_eq!(stream.terminal().expect("validated terminal").row_count, 2);
+        srv.shutdown().await.expect("server shutdown");
     }
 
     #[tokio::test]

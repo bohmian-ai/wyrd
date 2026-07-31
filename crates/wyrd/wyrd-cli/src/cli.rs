@@ -6,6 +6,7 @@ use crate::auth::AuthCommand;
 use crate::dev::DevCommand;
 use crate::eval::run::EvalCommand;
 use crate::principal::PrincipalCommand;
+use crate::query::QueryCommand;
 
 /// Wyrd command-line interface.
 #[derive(Debug, Parser)]
@@ -31,4 +32,6 @@ pub enum Command {
     /// Manage Wyrd principals (revoke).
     #[command(subcommand)]
     Principal(PrincipalCommand),
+    /// Run a terminal-safe streaming Oracle query.
+    Query(QueryCommand),
 }

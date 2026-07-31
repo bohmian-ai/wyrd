@@ -38,6 +38,11 @@ for package in metadata["packages"]:
             and dependency.get("optional")
         ):
             continue
+        if (
+            package["name"] == "wyrd-node-testing"
+            and dependency["name"] == "wyrd-testing"
+        ):
+            continue
         violations.append(
             f"{package['name']} declares {dependency['name']} as a normal dependency"
         )

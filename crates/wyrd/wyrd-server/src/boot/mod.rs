@@ -954,6 +954,40 @@ async fn build_oracle_role(
     Ok(state.with_bifrost_query(query_runtime))
 }
 
+/// Attaches one production-shaped local Oracle runtime to test-tier state.
+///
+/// This helper is compiled only for the `test-support` feature. It reuses the
+/// production role registration, peer security, admission, reconciliation,
+/// and lifecycle constructor so external language journeys do not build a
+/// second Oracle implementation in `wyrd-testing`.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::SigningKey`] if an ephemeral peer key cannot be
+/// generated, or the same [`ServerBootError::OraclePeer`] failures as the
+/// production Oracle constructor.
+#[cfg(feature = "test-support")]
+pub async fn attach_test_oracle_runtime(
+    state: AppState,
+    operator_pool: vala_sql::OperatorPool,
+) -> Result<AppState, ServerBootError> {
+    let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
+    let cluster = Arc::new(ClusterRegistry::new(operator_pool, node_id));
+    let mut config = crate::config::WyrdServerConfig::default();
+    let signing_key = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
+        .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
+    config.auth.signing_key = Some(signing_key.clone());
+    build_oracle_role(
+        state,
+        &config,
+        &signing_key,
+        cluster,
+        node_id,
+        "127.0.0.1:0",
+    )
+    .await
+}
+
 /// Releases a reserved or active Oracle fence after partial boot failure.
 async fn release_failed_oracle_role(
     cluster: &ClusterRegistry,

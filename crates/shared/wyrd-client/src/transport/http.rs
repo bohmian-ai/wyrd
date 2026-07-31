@@ -7,6 +7,7 @@
 //!
 //! - [`HttpTransport::request_json`] — JSON in, JSON out.
 //! - [`HttpTransport::request_arrow`] — JSON in, raw Arrow IPC bytes + metadata headers out.
+//! - [`HttpTransport::request_json_stream`] — JSON in, terminal-framed streaming bytes out.
 //! - [`HttpTransport::submit_idempotent`] — JSON in, JSON out, one stable `Idempotency-Key`.
 //!
 //! Each helper mints a fresh origin `wyrd-request-id` per request: in v1 the
@@ -48,6 +49,7 @@ const HEADER_REQUEST_ID: &str = "wyrd-request-id";
 const HEADER_IDEMPOTENCY_KEY: &str = "Idempotency-Key";
 const HEADER_SCHEMA_FINGERPRINT: &str = "X-Wyrd-Schema-Fingerprint";
 const HEADER_ROW_COUNT: &str = "X-Wyrd-Row-Count";
+const QUERY_STREAM_CONTENT_TYPE: &str = "application/vnd.wyrd.bifrost-query-stream";
 /// Wyrd access-token header. The server authenticates data-plane requests from
 /// this header only; the application's own `Authorization` header is reserved
 /// for the embedding app and is never read or written by Wyrd.
@@ -285,6 +287,73 @@ impl HttpTransport {
             })?;
         if response.status().is_success() {
             Ok(response)
+        } else {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({}));
+            Err(from_problem_json(&body))
+        }
+    }
+
+    /// Send an authenticated JSON request and return its response body as a
+    /// stream. This is used by terminal-safe query clients so response bytes
+    /// are decoded incrementally without buffering the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable Wyrd error for request serialization, authentication,
+    /// transport, HTTP problem responses, or an unexpected success media type.
+    pub async fn request_json_stream<S>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: &S,
+    ) -> Result<reqwest::Response, WyrdError>
+    where
+        S: Serialize,
+    {
+        let url = self.authenticated_url(path)?;
+        let bearer = self.auth.bearer().await.map_err(auth_to_wyrd)?;
+        let payload = serde_json::to_vec(body).map_err(|error| WyrdError::Internal {
+            message: format!("request serialization failed: {error}"),
+            details: serde_json::json!({}),
+        })?;
+        let response = self
+            .client
+            .request(method, url)
+            .header(
+                HEADER_WYRD_ACCESS_TOKEN,
+                format!("Bearer {}", bearer.expose()),
+            )
+            .header(HEADER_REQUEST_ID, self.auth.request_id(None))
+            .header("content-type", "application/json")
+            .header("accept", QUERY_STREAM_CONTENT_TYPE)
+            .body(payload)
+            .send()
+            .await
+            .map_err(|error| WyrdError::Internal {
+                message: format!("transport error: {error}"),
+                details: serde_json::json!({"transport": "http"}),
+            })?;
+        if response.status().is_success() {
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim);
+            if content_type == Some(QUERY_STREAM_CONTENT_TYPE) {
+                Ok(response)
+            } else {
+                Err(WyrdError::UpstreamFailure {
+                    message: "query response used an unsupported content type".to_owned(),
+                    details: serde_json::json!({
+                        "expected": QUERY_STREAM_CONTENT_TYPE,
+                        "actual": content_type
+                    }),
+                })
+            }
         } else {
             let body = response
                 .json::<serde_json::Value>()

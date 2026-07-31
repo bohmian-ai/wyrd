@@ -33,7 +33,7 @@ use wyrd_runtime::Principal;
 use wyrd_spec::reference::CardRef;
 use wyrd_spec::request_id::RequestId;
 use wyrd_spec::vala::managed_columns::{
-    CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
+    CARD_REF, CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
     WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
 };
 
@@ -383,6 +383,15 @@ fn validate_card_scope(rows: &RecordBatch, principal: &Principal) -> Result<(), 
     Ok(())
 }
 
+/// Stamps server-owned correlation and managed columns onto one admitted batch.
+///
+/// Native Arrow payloads cannot supply correlation fields, so the canonical
+/// nullable `run_id` field is materialized as all-null before the other
+/// correlation columns. Projected payloads retain their server-derived value.
+///
+/// # Errors
+/// Returns a typed Scribe error when correlation resolution, timestamp
+/// construction, managed-array construction, or final batch validation fails.
 fn stamp_correlation_columns(
     rows: &RecordBatch,
     principal: &Principal,
@@ -396,6 +405,10 @@ fn stamp_correlation_columns(
     let card_uids = resolve_card_uids(rows, principal, row_count)?;
     let mut fields = user_fields(rows, &server_owned);
     let mut columns = user_columns(rows, &server_owned);
+    if native_payload {
+        fields.push(Field::new(RUN_ID, DataType::Utf8, true));
+        columns.push(Arc::new(StringArray::from(vec![None::<&str>; row_count])));
+    }
     columns.push(Arc::new(StringArray::from(card_uids)) as ArrayRef);
     columns.push(Arc::new(StringArray::from(vec![
         principal.id.to_string();
@@ -1114,6 +1127,7 @@ mod tests {
         source_schema_fingerprint, stamp_correlation_columns,
     };
     use crate::contracts::{IngressPayload, ScribeError};
+    use crate::schema::SchemaFingerprint;
 
     fn principal() -> Principal {
         Principal::new(
@@ -1146,6 +1160,37 @@ mod tests {
         .expect("stamp");
         let value_index = stamped.schema().index_of("value").expect("value column");
         assert!(Arc::ptr_eq(&value, stamped.column(value_index)));
+    }
+
+    /// Native stamping writes the complete canonical physical schema.
+    #[test]
+    fn native_stamping_materializes_nullable_run_id() {
+        let rows = batch(
+            vec![Field::new("value", DataType::Int64, false)],
+            vec![Arc::new(Int64Array::from(vec![1_i64, 2_i64]))],
+        );
+
+        let stamped = stamp_correlation_columns(
+            &rows,
+            &principal(),
+            &RequestId::now_v7(),
+            Uuid::now_v7(),
+            true,
+        )
+        .expect("stamp native batch");
+
+        let run_id = stamped.schema().index_of("run_id").expect("run_id field");
+        assert!(stamped.schema().field(run_id).is_nullable());
+        assert_eq!(stamped.column(run_id).null_count(), stamped.num_rows());
+        let expected = Schema::new(crate::schema::with_managed_columns(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        assert_eq!(
+            SchemaFingerprint::from_arrow_schema(stamped.schema().as_ref()),
+            SchemaFingerprint::from_arrow_schema(&expected),
+        );
     }
 
     #[test]

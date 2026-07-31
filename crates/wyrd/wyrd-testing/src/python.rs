@@ -2,9 +2,19 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use arrow::array::{Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::ipc::writer::StreamWriter;
+use arrow::record_batch::RecordBatch;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 use secrecy::ExposeSecret;
+use vala_bifrost_redux::catalog::{CreateTableRequest, TableRef};
+use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_sdk::{BifrostGrpcTransport, IngestTransport};
+use wyrd_client::WyrdClient;
+use wyrd_client::config::ClientConfig;
+use wyrd_client::transport::{GrpcConfig, HttpConfig};
 use wyrd_utils::py::wyrd_error_to_py_err;
 
 static ENV_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -198,6 +208,119 @@ impl WyrdTestServer {
                 ))
             }
         }
+    }
+
+    /// Creates a real sealed Oracle fixture and returns its table and access token.
+    ///
+    /// The setup uses the public gRPC ingest transport, flushes Scribe, and
+    /// exchanges the harness admin API key through the real auth route. The
+    /// returned values are intended for public language-client integration tests.
+    ///
+    /// # Errors
+    ///
+    /// Raises a Wyrd Python error when the context manager is inactive or table
+    /// registration, ingest, flush, token exchange, or Arrow encoding fails.
+    fn prepare_oracle_query_fixture(&self) -> PyResult<(String, String)> {
+        let srv = self.server.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "WyrdTestServer not started (use as context manager)",
+            )
+        })?;
+        wyrd_runtime::runtime()
+            .block_on(prepare_oracle_query_fixture(srv))
+            .map_err(wyrd_error_to_py_err)
+    }
+}
+
+/// Builds the Python query journey's real ingest-to-sealed prerequisite.
+///
+/// # Errors
+///
+/// Returns a Wyrd error when table registration, Arrow encoding, client
+/// construction, gRPC ingest, Scribe flush, or token exchange fails.
+async fn prepare_oracle_query_fixture(
+    srv: &crate::server::WyrdTestServer,
+) -> Result<(String, String), wyrd_spec::error::WyrdError> {
+    let bootstrap = srv
+        .bootstrap_service("python-oracle-query", &["admin"])
+        .await
+        .map_err(wyrd_spec::error::WyrdError::from)?;
+    let api_key = bootstrap
+        .api_key()
+        .ok_or_else(|| harness_error("Oracle fixture bootstrap did not return an API key"))?;
+    let table_name = format!("python_oracle_{}", uuid::Uuid::now_v7().simple());
+    let table_fqn = format!("vala.bifrost.{table_name}");
+    let schema = std::sync::Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("value", DataType::Utf8, false),
+    ]));
+    srv.state()
+        .bifrost_redux
+        .as_ref()
+        .ok_or_else(|| harness_error("Redux catalog is unavailable"))?
+        .create_table(CreateTableRequest {
+            table: TableRef::new(BifrostNamespace::Bifrost, &table_name),
+            user_fields: schema
+                .fields()
+                .iter()
+                .map(|field| field.as_ref().clone())
+                .collect(),
+            tenant: srv.data_tenant_id(),
+            audit: None,
+        })
+        .await
+        .map_err(harness_error)?;
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::clone(&schema),
+        vec![
+            std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+            std::sync::Arc::new(StringArray::from(vec!["first", "second"])),
+        ],
+    )
+    .map_err(harness_error)?;
+    let mut ipc = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc, schema.as_ref()).map_err(harness_error)?;
+        writer
+            .write(&batch)
+            .and_then(|()| writer.finish())
+            .map_err(harness_error)?;
+    }
+    let client = WyrdClient::with_config(ClientConfig {
+        grpc: GrpcConfig {
+            endpoint: srv.grpc_url().unwrap_or_default(),
+            connect_retries: 0,
+            ..GrpcConfig::default()
+        },
+        http: HttpConfig {
+            base_url: srv.base_url().unwrap_or_default().to_owned(),
+            ..HttpConfig::default()
+        },
+        api_key: Some(api_key.clone()),
+        ..ClientConfig::default()
+    })
+    .map_err(harness_error)?;
+    BifrostGrpcTransport::connect(&client)
+        .await
+        .map_err(harness_error)?
+        .insert_batch(&table_fqn, uuid::Uuid::now_v7().into_bytes(), ipc)
+        .await
+        .map_err(harness_error)?;
+    srv.flush_bifrost()
+        .await
+        .map_err(wyrd_spec::error::WyrdError::from)?;
+    let token = srv
+        .exchange_api_key(api_key)
+        .await
+        .map_err(wyrd_spec::error::WyrdError::from)?;
+    Ok((table_fqn, token))
+}
+
+/// Converts one fixture setup failure into the stable test-harness catalog.
+fn harness_error(error: impl std::fmt::Display) -> wyrd_spec::error::WyrdError {
+    wyrd_spec::error::WyrdError::HarnessStart {
+        message: error.to_string(),
+        details: serde_json::json!({}),
     }
 }
 

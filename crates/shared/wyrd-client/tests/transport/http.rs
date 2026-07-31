@@ -226,8 +226,16 @@ mod transport_behavior {
                         .pop_front()
                         .unwrap_or_else(|| MockResponse::ok("{}"));
 
+                    let has_content_type = extra_headers
+                        .iter()
+                        .any(|(name, _)| name.eq_ignore_ascii_case("content-type"));
+                    let content_type = if has_content_type {
+                        String::new()
+                    } else {
+                        "content-type: application/json\r\n".to_owned()
+                    };
                     let mut response = format!(
-                        "HTTP/1.1 {status} Status\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        "HTTP/1.1 {status} Status\r\n{content_type}content-length: {}\r\nconnection: close\r\n",
                         body.len()
                     );
                     for (name, value) in &extra_headers {
@@ -626,5 +634,54 @@ mod transport_behavior {
             extract_header(&captured[0], "Authorization").is_none(),
             "the SDK must not write the caller's reserved Authorization header"
         );
+    }
+
+    /// Proves streaming JSON POSTs retain auth and negotiate the closed media type.
+    #[tokio::test]
+    async fn request_json_stream_authenticates_and_preserves_body_stream() {
+        let server =
+            spawn_mock(vec![MockResponse::ok("frame-bytes").with_header(
+                "content-type",
+                "application/vnd.wyrd.bifrost-query-stream",
+            )])
+            .await;
+        let transport = make_transport(server.base_url);
+        let response = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect("stream response accepted");
+        assert_eq!(
+            response.bytes().await.expect("response bytes"),
+            "frame-bytes"
+        );
+        let captured = server.captured.lock().await;
+        assert_eq!(
+            extract_header(&captured[0], "accept").as_deref(),
+            Some("application/vnd.wyrd.bifrost-query-stream")
+        );
+        assert!(
+            extract_header(&captured[0], "x-wyrd-access-token").is_some(),
+            "streaming request carries the Wyrd bearer"
+        );
+    }
+
+    /// Proves a successful response with the wrong media type is rejected.
+    #[tokio::test]
+    async fn request_json_stream_rejects_unapproved_media_type() {
+        let server = spawn_mock(vec![MockResponse::ok("not-a-query-stream")]).await;
+        let transport = make_transport(server.base_url);
+        let error = transport
+            .request_json_stream(
+                reqwest::Method::POST,
+                "/v1/query",
+                &serde_json::json!({"sql": "SELECT 1"}),
+            )
+            .await
+            .expect_err("JSON success must not masquerade as a query stream");
+        assert_eq!(error.code(), "WYRD_SPEC_502_UPSTREAM_FAILURE");
     }
 }

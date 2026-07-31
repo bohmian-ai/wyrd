@@ -5,6 +5,7 @@ members = [
     "crates/vala/*",
     "crates/skald/*",
     "crates/shared/*",
+    "crates/bindings/*",
     "crates/wyrd-spec",
     "examples/rust",
     "python/py-wyrd",
@@ -164,6 +165,9 @@ tonic-reflection = "0.12"
 tonic-types = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
+napi = { version = "3", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "3"
+napi-build = "2"
 
 # Cloud SDKs are server-tier only.
 aws-sdk-s3 = "=1.75.0"

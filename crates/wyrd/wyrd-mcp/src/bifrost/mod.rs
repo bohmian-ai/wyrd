@@ -1,6 +1,6 @@
 //! Bifrost read/discovery MCP tools.
 //!
-//! Registers four read-only tools into the Skald tool registry:
+//! Registers five read-only tools into the Skald tool registry:
 //!
 //! - `bifrost.list_tables` — lists the caller's tenant Bifrost tables;
 //!   requires `bifrost_table:read` (enforced server-side).
@@ -10,27 +10,32 @@
 //!   permissions; no bearer required.
 //! - `bifrost.list_errors` — static catalog of every `WYRD_VALA_*_BIFROST_*`
 //!   error code; no bearer required.
+//! - `bifrost.query` — bounded terminal-safe Oracle query results; requires
+//!   `bifrost_query:read` (enforced server-side).
 //!
 //! Write tools are not available in this module. This module never imports
 //! `vala-bifrost`, `sqlx`, or `datafusion` — no engine in the MCP process.
 
 use std::sync::Arc;
 
+use arrow::json::ArrayWriter;
 use async_trait::async_trait;
 use reqwest::Method;
 use serde_json::{Value, json};
 use skald_tool::{AgentTool, ToolError, ToolRegistry};
+use vala_sdk::{CollectedQueryLimits, QueryClient};
 use wyrd_client::WyrdClient;
 use wyrd_runtime::Permission;
 use wyrd_spec::vala::BifrostError;
 use wyrd_spec::vala::api::{
-    BifrostErrorDescriptor, BifrostPermissionDescriptor, BifrostTableDescription, BifrostTableEntry,
+    BifrostErrorDescriptor, BifrostPermissionDescriptor, BifrostQueryRequest,
+    BifrostTableDescription, BifrostTableEntry, FreshnessPolicy, VisibilityMode,
 };
 
 // ── list_tables ─────────────────────────────────────────────────────────────
 
 struct ListTablesTool {
-    client: WyrdClient,
+    client: Arc<WyrdClient>,
 }
 
 #[async_trait]
@@ -73,7 +78,7 @@ impl AgentTool for ListTablesTool {
 // ── describe_table ───────────────────────────────────────────────────────────
 
 struct DescribeTableTool {
-    client: WyrdClient,
+    client: Arc<WyrdClient>,
 }
 
 #[async_trait]
@@ -193,9 +198,211 @@ impl AgentTool for ListErrorsTool {
     }
 }
 
+// ── query ───────────────────────────────────────────────────────────────────
+
+/// Configured defaults and non-negotiable MCP result ceilings.
+#[derive(Debug, Clone, Copy)]
+pub struct McpQueryLimits {
+    /// Default maximum decoded rows when the caller omits a lower ceiling.
+    pub default_max_rows: usize,
+    /// Absolute maximum decoded rows accepted from any caller.
+    pub hard_max_rows: usize,
+    /// Default maximum encoded Arrow bytes.
+    pub default_max_bytes: usize,
+    /// Absolute maximum encoded Arrow bytes accepted from any caller.
+    pub hard_max_bytes: usize,
+}
+
+impl Default for McpQueryLimits {
+    /// Uses conservative MCP defaults and hard response ceilings.
+    fn default() -> Self {
+        Self {
+            default_max_rows: 1_000,
+            hard_max_rows: 10_000,
+            default_max_bytes: 4 * 1024 * 1024,
+            hard_max_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+/// Bounded read tool that delegates all query and terminal semantics to Vala.
+struct BifrostQueryTool {
+    /// Shared registration-owned authenticated Wyrd client.
+    client: Arc<WyrdClient>,
+    /// MCP-specific collection ceilings.
+    limits: McpQueryLimits,
+}
+
+#[async_trait]
+impl AgentTool for BifrostQueryTool {
+    fn name(&self) -> &str {
+        "bifrost.query"
+    }
+
+    fn description(&self) -> &str {
+        "Run a bounded SELECT-only Oracle query and return typed JSON rows plus \
+         validated terminal metadata. Requires bifrost_query:read permission."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["sql"],
+            "properties": {
+                "sql": {"type": "string"},
+                "visibility": {"enum": ["published_only", "fused"]},
+                "freshness": {"enum": ["strict", "allow_degraded"]},
+                "max_rows": {"type": "integer", "minimum": 1},
+                "max_bytes": {"type": "integer", "minimum": 1}
+            },
+            "additionalProperties": false
+        })
+    }
+
+    fn output_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "required": ["schema", "rows", "terminal"],
+            "properties": {
+                "schema": {"type": "object"},
+                "rows": {"type": "array", "items": {"type": "object"}},
+                "terminal": {"type": "object"}
+            }
+        })
+    }
+
+    async fn invoke(&self, args: Value) -> Result<Value, ToolError> {
+        let sql = required_string(&args, "sql")?;
+        let request = BifrostQueryRequest {
+            sql: sql.to_owned(),
+            visibility: parse_visibility(args.get("visibility"))?,
+            freshness: parse_freshness(args.get("freshness"))?,
+            deadline_ms: None,
+        };
+        let limits = requested_limits(&args, self.limits)?;
+        let result = QueryClient::new(self.client.as_ref())
+            .collect_bounded(&request, limits)
+            .await
+            .map_err(|error| ToolError::Invocation {
+                detail: format!("[{}] {error}", error.code()),
+                cause: None,
+            })?;
+        let schema = result
+            .batches
+            .first()
+            .map(|batch| batch.schema())
+            .map(|schema| {
+                json!({
+                    "fields": schema.fields().iter().map(|field| json!({
+                        "name": field.name(),
+                        "data_type": field.data_type().to_string(),
+                        "nullable": field.is_nullable()
+                    })).collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_else(|| json!({"fields": []}));
+        let mut writer = ArrayWriter::new(Vec::new());
+        for batch in &result.batches {
+            writer
+                .write(batch)
+                .map_err(|error| ToolError::OutputSerialization(error.to_string()))?;
+        }
+        writer
+            .finish()
+            .map_err(|error| ToolError::OutputSerialization(error.to_string()))?;
+        let rows: Value = serde_json::from_slice(&writer.into_inner())
+            .map_err(|error| ToolError::OutputSerialization(error.to_string()))?;
+        Ok(json!({
+            "schema": schema,
+            "rows": rows,
+            "terminal": result.terminal
+        }))
+    }
+}
+
+/// Extracts one required string argument.
+///
+/// # Errors
+///
+/// Returns invalid input when the field is absent or not a string.
+fn required_string<'a>(args: &'a Value, field: &str) -> Result<&'a str, ToolError> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidInput(format!("missing field: {field}")))
+}
+
+/// Parses the optional closed visibility spelling.
+///
+/// # Errors
+///
+/// Returns invalid input for an unknown or non-string value.
+fn parse_visibility(value: Option<&Value>) -> Result<VisibilityMode, ToolError> {
+    match value.and_then(Value::as_str).unwrap_or("published_only") {
+        "published_only" => Ok(VisibilityMode::PublishedOnly),
+        "fused" => Ok(VisibilityMode::Fused),
+        _ => Err(ToolError::InvalidInput(
+            "visibility must be published_only or fused".to_owned(),
+        )),
+    }
+}
+
+/// Parses the optional closed freshness spelling.
+///
+/// # Errors
+///
+/// Returns invalid input for an unknown or non-string value.
+fn parse_freshness(value: Option<&Value>) -> Result<FreshnessPolicy, ToolError> {
+    match value.and_then(Value::as_str).unwrap_or("strict") {
+        "strict" => Ok(FreshnessPolicy::Strict),
+        "allow_degraded" => Ok(FreshnessPolicy::AllowDegraded),
+        _ => Err(ToolError::InvalidInput(
+            "freshness must be strict or allow_degraded".to_owned(),
+        )),
+    }
+}
+
+/// Resolves caller ceilings without allowing either hard limit to be raised.
+///
+/// # Errors
+///
+/// Returns invalid input for zero, non-integer, platform-overflowing, or
+/// above-hard-ceiling bounds.
+fn requested_limits(
+    args: &Value,
+    configured: McpQueryLimits,
+) -> Result<CollectedQueryLimits, ToolError> {
+    fn bound(args: &Value, name: &str, default: usize, hard: usize) -> Result<usize, ToolError> {
+        let Some(value) = args.get(name) else {
+            return Ok(default);
+        };
+        let value = value
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|value| *value > 0 && *value <= hard)
+            .ok_or_else(|| {
+                ToolError::InvalidInput(format!("{name} must be between 1 and {hard}"))
+            })?;
+        Ok(value)
+    }
+    Ok(CollectedQueryLimits {
+        max_rows: bound(
+            args,
+            "max_rows",
+            configured.default_max_rows,
+            configured.hard_max_rows,
+        )?,
+        max_encoded_bytes: bound(
+            args,
+            "max_bytes",
+            configured.default_max_bytes,
+            configured.hard_max_bytes,
+        )?,
+    })
+}
+
 // ── Registration ─────────────────────────────────────────────────────────────
 
-/// Register the four Bifrost read/discovery tools into `registry`.
+/// Register the five Bifrost read/discovery tools into `registry`.
 ///
 /// The two client-backed tools (`list_tables`, `describe_table`) use the
 /// provided [`WyrdClient`] to call the Bifrost routes under the caller's bearer.
@@ -205,14 +412,20 @@ impl AgentTool for ListErrorsTool {
 /// Returns [`ToolError::NameTaken`] if any tool name is already registered.
 pub fn register_bifrost_tools(
     registry: &ToolRegistry,
-    client: WyrdClient,
+    client: Arc<WyrdClient>,
 ) -> Result<(), ToolError> {
     registry.register(Arc::new(ListTablesTool {
-        client: client.clone(),
+        client: Arc::clone(&client),
     }))?;
-    registry.register(Arc::new(DescribeTableTool { client }))?;
+    registry.register(Arc::new(DescribeTableTool {
+        client: Arc::clone(&client),
+    }))?;
     registry.register(Arc::new(ListPermissionsTool))?;
     registry.register(Arc::new(ListErrorsTool))?;
+    registry.register(Arc::new(BifrostQueryTool {
+        client,
+        limits: McpQueryLimits::default(),
+    }))?;
     Ok(())
 }
 
@@ -380,13 +593,18 @@ fn bifrost_error_variants() -> Vec<BifrostError> {
 /// no bearer required, no DB required.
 #[cfg(test)]
 mod bifrost_tools {
+    use std::sync::Arc;
+
     use serde_json::json;
     use skald_tool::ToolRegistry;
     use strum::EnumCount;
     use wyrd_client::{WyrdClient, config::ClientConfig};
     use wyrd_spec::vala::error::BifrostError;
 
-    use crate::bifrost::{bifrost_error_catalog, bifrost_permissions, register_bifrost_tools};
+    use crate::bifrost::{
+        McpQueryLimits, bifrost_error_catalog, bifrost_permissions, register_bifrost_tools,
+        requested_limits,
+    };
 
     fn dummy_client() -> WyrdClient {
         let config = ClientConfig {
@@ -399,25 +617,46 @@ mod bifrost_tools {
     // ── Registration ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn bifrost_tools_register_four_tools() {
+    fn bifrost_tools_register_five_tools() {
         let registry = ToolRegistry::new();
         let client = dummy_client();
-        register_bifrost_tools(&registry, client).expect("registration succeeds");
+        register_bifrost_tools(&registry, Arc::new(client)).expect("registration succeeds");
 
         let names = registry.names();
-        assert_eq!(names.len(), 4, "expected exactly 4 tools, got {names:?}");
+        assert_eq!(names.len(), 5, "expected exactly 5 tools, got {names:?}");
         assert!(names.contains(&"bifrost.list_tables".to_string()));
         assert!(names.contains(&"bifrost.describe_table".to_string()));
         assert!(names.contains(&"bifrost.list_permissions".to_string()));
         assert!(names.contains(&"bifrost.list_errors".to_string()));
+        assert!(names.contains(&"bifrost.query".to_string()));
+    }
+
+    /// Proves caller-supplied MCP query bounds cannot exceed hard ceilings.
+    #[test]
+    fn bifrost_query_rejects_above_hard_bounds() {
+        let limits = McpQueryLimits::default();
+        assert!(requested_limits(&json!({"max_rows": limits.hard_max_rows + 1}), limits).is_err());
+        assert!(
+            requested_limits(&json!({"max_bytes": limits.hard_max_bytes + 1}), limits).is_err()
+        );
+    }
+
+    /// Proves omitted MCP query bounds use conservative defaults.
+    #[test]
+    fn bifrost_query_uses_default_bounds() {
+        let configured = McpQueryLimits::default();
+        let actual = requested_limits(&json!({}), configured).expect("defaults are valid");
+        assert_eq!(actual.max_rows, configured.default_max_rows);
+        assert_eq!(actual.max_encoded_bytes, configured.default_max_bytes);
     }
 
     #[test]
     fn bifrost_tools_duplicate_registration_returns_name_taken() {
         let registry = ToolRegistry::new();
         let client = dummy_client();
-        register_bifrost_tools(&registry, client.clone()).expect("first registration succeeds");
-        let err = register_bifrost_tools(&registry, client).expect_err("duplicate fails");
+        register_bifrost_tools(&registry, Arc::new(client.clone()))
+            .expect("first registration succeeds");
+        let err = register_bifrost_tools(&registry, Arc::new(client)).expect_err("duplicate fails");
         let code = err.code();
         assert_eq!(code, "SKALD_TOOL_409_NAME_TAKEN");
     }
@@ -472,7 +711,7 @@ mod bifrost_tools {
         wyrd_runtime::runtime().block_on(async {
             let registry = ToolRegistry::new();
             let client = dummy_client();
-            register_bifrost_tools(&registry, client).expect("registration succeeds");
+            register_bifrost_tools(&registry, Arc::new(client)).expect("registration succeeds");
             let tool = registry
                 .resolve("bifrost.list_permissions")
                 .expect("tool is registered");
@@ -541,7 +780,7 @@ mod bifrost_tools {
         wyrd_runtime::runtime().block_on(async {
             let registry = ToolRegistry::new();
             let client = dummy_client();
-            register_bifrost_tools(&registry, client).expect("registration succeeds");
+            register_bifrost_tools(&registry, Arc::new(client)).expect("registration succeeds");
             let tool = registry
                 .resolve("bifrost.list_errors")
                 .expect("tool is registered");

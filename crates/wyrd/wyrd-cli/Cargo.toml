@@ -18,6 +18,7 @@ name = "wyrd"
 path = "src/main.rs"
 
 [dependencies]
+arrow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
@@ -35,7 +36,9 @@ tracing-subscriber = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 vala-eval = { workspace = true }
+vala-sdk = { workspace = true }
 vala-sql = { workspace = true }
+wyrd-client = { workspace = true }
 wyrd-auth-issue = { workspace = true }
 wyrd-error-derive = { workspace = true }
 wyrd-semver = { workspace = true }

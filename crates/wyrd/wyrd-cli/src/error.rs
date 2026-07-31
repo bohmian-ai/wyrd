@@ -6,6 +6,32 @@ use wyrd_error_derive::WyrdError;
 /// Errors raised by the `wyrd` binary.
 #[derive(Debug, Error, WyrdError)]
 pub enum WyrdCliError {
+    /// Required Oracle client configuration was not supplied.
+    #[error("query configuration is missing {field}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_400_QUERY_CONFIG",
+        status = 400,
+        title = "Query configuration missing",
+        remediation = "Pass --server and --token or set WYRD_SERVER_URL and WYRD_ACCESS_TOKEN."
+    )]
+    QueryConfig {
+        /// Missing command field.
+        field: &'static str,
+    },
+
+    /// Oracle query setup, streaming, terminal validation, or output failed.
+    #[error("query failed: {detail}")]
+    #[wyrd_error(
+        code = "WYRD_CLI_500_QUERY",
+        status = 500,
+        title = "Oracle query failed",
+        remediation = "Inspect the stable query error and terminal diagnostics, then retry."
+    )]
+    Query {
+        /// Scrubbed query failure detail.
+        detail: String,
+    },
+
     /// `wyrd dev bootstrap` rejected because `WYRD_DATABASE_URL` points to a
     /// non-loopback host and `--i-understand-this-is-not-production` was not set.
     #[error(

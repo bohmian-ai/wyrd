@@ -27,6 +27,7 @@ pub mod handle;
 pub mod observe;
 #[cfg(feature = "python")]
 pub mod python;
+pub mod query;
 pub mod scope;
 pub mod sink;
 
@@ -35,6 +36,10 @@ pub use grpc::{
     PROTO_FRAME_OVERHEAD_BYTES,
 };
 pub use handle::{Bifrost, schema_from_json_schema};
+pub use query::{
+    CollectedQueryLimits, CollectedQueryResult, QueryClient, QueryResultStream, RawQueryStream,
+    ValaSdkError,
+};
 pub use scope::{ClientScope, SinkKind};
 pub use sink::{BifrostIngestSink, IngestTransport};
 

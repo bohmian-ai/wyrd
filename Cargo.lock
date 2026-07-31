@@ -2035,6 +2035,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "convert_case"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affbf0190ed2caf063e3def54ff444b449371d55c58e513a95ab98eca50adb49"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5065,6 +5074,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "liblzma"
 version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5409,6 +5428,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "napi"
+version = "3.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6f71d6bc097c4a6eb853c3f24991ab8c9f50f57d1f719e305175541482217e36"
+dependencies = [
+ "bitflags 2.13.0",
+ "ctor",
+ "futures",
+ "napi-build",
+ "napi-sys",
+ "nohash-hasher",
+ "rustc-hash",
+ "tokio",
+]
+
+[[package]]
+name = "napi-build"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5282704fbe8d49b0cf8b08e3f33233416a528658f205c7e5ace63b582de0b11c"
+
+[[package]]
+name = "napi-derive"
+version = "3.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d5c9c02556ea6dc99dffd36c1ce60141411657438501a125b675776d011ce92"
+dependencies = [
+ "convert_case",
+ "ctor",
+ "napi-derive-backend",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "napi-derive-backend"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a9d8365cf97f54d9b6d6dbf83a25ca227ad7d6e920717426c599225aca6740b"
+dependencies = [
+ "convert_case",
+ "proc-macro2",
+ "quote",
+ "semver",
+ "syn",
+]
+
+[[package]]
+name = "napi-sys"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85fbf1fa9f1babfe396d74bbbf52b3643770243e8f5b0b46715d4caf7f0dfc9a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5424,6 +5501,12 @@ dependencies = [
  "security-framework-sys",
  "tempfile",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -9949,6 +10032,7 @@ dependencies = [
  "arrow-schema",
  "async-trait",
  "bytes",
+ "futures-util",
  "hex",
  "pyo3",
  "reqwest 0.12.28",
@@ -9956,11 +10040,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx 0.9.0",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tracing",
  "uuid",
  "vala-bifrost",
+ "vala-bifrost-redux",
  "wyrd-client",
  "wyrd-queue",
  "wyrd-runtime",
@@ -10681,6 +10767,7 @@ dependencies = [
 name = "wyrd-cli"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "assert_cmd",
  "async-trait",
  "axum 0.8.9",
@@ -10702,9 +10789,11 @@ dependencies = [
  "url",
  "uuid",
  "vala-eval",
+ "vala-sdk",
  "vala-sql",
  "wiremock",
  "wyrd-auth-issue",
+ "wyrd-client",
  "wyrd-dev-fixtures",
  "wyrd-error-derive",
  "wyrd-semver",
@@ -10806,6 +10895,7 @@ dependencies = [
 name = "wyrd-mcp"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "async-trait",
  "reqwest 0.12.28",
  "secrecy",
@@ -10813,9 +10903,39 @@ dependencies = [
  "skald-tool",
  "strum",
  "tokio",
+ "vala-sdk",
  "wyrd-client",
  "wyrd-runtime",
  "wyrd-spec",
+ "wyrd-testing",
+]
+
+[[package]]
+name = "wyrd-node"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "secrecy",
+ "serde_json",
+ "tokio",
+ "vala-sdk",
+ "wyrd-client",
+ "wyrd-spec",
+]
+
+[[package]]
+name = "wyrd-node-testing"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "vala-bifrost-redux",
+ "wyrd-runtime",
  "wyrd-testing",
 ]
 

@@ -1399,7 +1399,7 @@ impl WyrdTestServerBuilder {
         let forge = Arc::new(
             Forge::new(ForgeBuildConfig {
                 vala: postgres.vala().clone(),
-                operator_pool,
+                operator_pool: operator_pool.clone(),
                 catalog: bifrost_redux.iceberg_catalog(),
                 staging,
                 object_store,
@@ -1456,17 +1456,17 @@ impl WyrdTestServerBuilder {
         };
         let scribe = Arc::new(scribe);
         let ingest = Arc::new(BifrostIngestRuntime::new(
-            scribe,
+            Arc::clone(&scribe),
             Arc::clone(&bifrost_redux),
             Arc::clone(&verifier),
             vala_bifrost_redux::gate::limits::IngestLimits::default(),
             None,
         ));
         let mut state = AppState::new(postgres, storage, bifrost)
-            .with_bifrost_redux(bifrost_redux)
+            .with_bifrost_redux(Arc::clone(&bifrost_redux))
             .with_bifrost_memory_pool(bifrost_memory, query_memory)
             .with_forge(forge)
-            .with_bifrost_ingest(ingest)
+            .with_bifrost_ingest(Arc::clone(&ingest))
             .with_auth(wyrd_server::components::auth::ServerAuth {
                 allow_preview: self.allow_preview_auth,
                 issuing_key: Some(Arc::clone(&issuing_key)),
@@ -1476,6 +1476,23 @@ impl WyrdTestServerBuilder {
                 workload_binding_resolver: Some(binding_resolver),
                 sealing_key: Some(sealing_key),
             });
+        state = wyrd_server::boot::attach_test_oracle_runtime(state, operator_pool)
+            .await
+            .map_err(|error| WyrdTestServerError::Start(error.to_string()))?;
+        let limits = vala_bifrost_redux::gate::limits::IngestLimits::default();
+        let mut gate = vala_bifrost_redux::gate::Gate::with_scribe_and_projection(
+            Arc::clone(&bifrost_redux),
+            scribe,
+            vala_bifrost_redux::gate::auth::ingest_auth_interceptor(Arc::clone(&verifier)),
+            limits,
+            Arc::new(vala_bifrost_redux::gate::IngressCpuProjection::new(
+                ingest.scribe().ingress_cpu_pool(),
+            )),
+        );
+        if let Some(query) = state.bifrost_query() {
+            gate = gate.with_oracle(Arc::clone(query.oracle()));
+        }
+        state = state.with_bifrost_gate(Arc::new(gate));
         state.authz.permission_check = Arc::new(RbacCheck);
         state.authz.audit_writer = self
             .audit_writer

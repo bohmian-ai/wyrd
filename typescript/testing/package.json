@@ -1,0 +1,15 @@
+{
+  "name": "@wyrd/testing",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "wyrd_testing",
+    "triples": {
+      "defaults": true
+    }
+  }
+}
+

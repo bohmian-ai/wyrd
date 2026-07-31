@@ -78,8 +78,11 @@ struct PendingReservation {
 /// Running worker reservation retained through attempt-stream completion.
 #[derive(Debug)]
 pub struct RunningReservation {
-    /// Running slot permit released on stream completion, failure, or drop.
-    _permit: OwnedSemaphorePermit,
+    /// Remote-worker slot permit released on stream completion, failure, or drop.
+    ///
+    /// Leader-local execution leaves this empty because the admitted query guard
+    /// already retains that node's running permit for the complete query stream.
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 /// In-memory worker reservation owner; entries are never durable.
@@ -202,7 +205,9 @@ impl ReservationRegistry {
         let result = self
             .slots
             .try_running(demand)
-            .map(|permit| RunningReservation { _permit: permit })
+            .map(|permit| RunningReservation {
+                _permit: Some(permit),
+            })
             .map_err(|_| DispatchError::Retryable);
         record_slot(
             query_class,
@@ -213,6 +218,42 @@ impl ReservationRegistry {
             },
         );
         result
+    }
+
+    /// Converts a matching local-leader reservation without charging its slot twice.
+    ///
+    /// This transition is restricted to the in-process transport. Its caller must
+    /// retain the admitted query guard whose running permit covers the local
+    /// fragment and subsequent leader-owned operators. The complete ownership
+    /// tuple is still checked and consumed before fragment decoding or object IO.
+    ///
+    /// # Errors
+    /// Returns terminal for missing, expired, or mismatched ownership.
+    fn take_for_local_leader_execute(
+        &self,
+        reservation_id: ReservationId,
+        query_id: QueryId,
+        leader_node_id: NodeId,
+        leader_fencing_token: FencingToken,
+        now: DateTime<Utc>,
+    ) -> Result<RunningReservation, DispatchError> {
+        let mut entries = self.entries.lock().map_err(|_| DispatchError::Terminal)?;
+        retain_live(&mut entries, now);
+        let entry = entries
+            .get(&reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        if entry.query_id != query_id
+            || entry.leader_node_id != leader_node_id
+            || entry.leader_fencing_token != leader_fencing_token
+        {
+            return Err(DispatchError::Terminal);
+        }
+        let query_class = entry.query_class;
+        entries
+            .remove(&reservation_id)
+            .ok_or(DispatchError::Terminal)?;
+        record_slot(query_class, SlotOutcome::Running);
+        Ok(RunningReservation { _permit: None })
     }
 
     /// Reclaims expired pending reservations and returns the number still held.
@@ -358,6 +399,35 @@ impl OraclePeerWorker {
         &self,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerExecution, DispatchError> {
+        self.execute_with_capacity(request, WorkerCapacity::ReserveRunning)
+            .await
+    }
+
+    /// Verifies and executes a leader-local fragment under its admitted query slot.
+    ///
+    /// The in-process dispatcher retains the admitted query guard while this
+    /// operation runs, so this path validates and consumes the pending
+    /// reservation without acquiring a duplicate local running permit.
+    ///
+    /// # Errors
+    /// Returns terminal security/contract failures or retryable storage failures.
+    async fn execute_local(
+        &self,
+        request: ExecuteFragmentRequest,
+    ) -> Result<WorkerExecution, DispatchError> {
+        self.execute_with_capacity(request, WorkerCapacity::LeaderAdmitted)
+            .await
+    }
+
+    /// Executes the shared verification and fragment workflow with explicit capacity ownership.
+    ///
+    /// # Errors
+    /// Returns terminal security/contract failures or retryable capacity/storage failures.
+    async fn execute_with_capacity(
+        &self,
+        request: ExecuteFragmentRequest,
+        capacity: WorkerCapacity,
+    ) -> Result<WorkerExecution, DispatchError> {
         let verified = self
             .verifier
             .verify_peer_ticket(
@@ -388,13 +458,23 @@ impl OraclePeerWorker {
         };
         let query_id = QueryId::new(uuid_from(&claims.query_id)?);
         let leader = NodeId::new(uuid_from(&claims.leader_node_id)?);
-        let running = match self.reservations.take_for_execute(
-            request.reservation_id,
-            query_id,
-            leader,
-            claims.leader_fence,
-            Utc::now(),
-        ) {
+        let transition = match capacity {
+            WorkerCapacity::ReserveRunning => self.reservations.take_for_execute(
+                request.reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            ),
+            WorkerCapacity::LeaderAdmitted => self.reservations.take_for_local_leader_execute(
+                request.reservation_id,
+                query_id,
+                leader,
+                claims.leader_fence,
+                Utc::now(),
+            ),
+        };
+        let running = match transition {
             Ok(running) => running,
             Err(DispatchError::Terminal) => {
                 self.audit_verified(tenant_id, BifrostSecurityViolationKind::PeerFence)
@@ -475,6 +555,15 @@ impl OraclePeerWorker {
             .await
             .map_err(|_| DispatchError::Terminal)
     }
+}
+
+/// Source of the running capacity retained while one worker attempt streams.
+#[derive(Clone, Copy)]
+enum WorkerCapacity {
+    /// A remote worker acquires its own local running permit.
+    ReserveRunning,
+    /// The in-process leader reuses the permit retained by query admission.
+    LeaderAdmitted,
 }
 
 /// Validates fixed-width and non-empty claims before constructing typed IDs.
@@ -613,7 +702,7 @@ impl OraclePeerTransport for LocalOraclePeerTransport {
         _worker: NodeId,
         request: ExecuteFragmentRequest,
     ) -> Result<WorkerAttemptStream, DispatchError> {
-        Ok(self.worker.execute(request).await?.stream)
+        Ok(self.worker.execute_local(request).await?.stream)
     }
 }
 
@@ -1275,6 +1364,32 @@ mod tests {
             .take_for_execute(pending.reservation_id, query, leader, 7, now)
             .expect("matching transition");
         drop(running);
+    }
+
+    /// Leader-local execution consumes its reservation while reusing one admitted slot.
+    #[test]
+    fn oracle_peer_local_transition_does_not_double_charge_leader_slot() {
+        let slots = Arc::new(OracleSlotManager::new(1, 1));
+        let leader_slot = slots.try_running(1).expect("admitted leader slot");
+        let registry = ReservationRegistry::new(Arc::clone(&slots), 1);
+        let now = Utc::now();
+        let query = QueryId::new(uuid::Uuid::now_v7());
+        let leader = NodeId::new(uuid::Uuid::now_v7());
+        let pending = registry
+            .reserve(
+                reserve_request(query, leader, 11, now + ChronoDuration::seconds(2)),
+                now,
+            )
+            .expect("pending local reservation");
+
+        let running = registry
+            .take_for_local_leader_execute(pending.reservation_id, query, leader, 11, now)
+            .expect("leader-local transition");
+
+        assert!(running._permit.is_none());
+        assert!(slots.try_running(1).is_err());
+        drop(leader_slot);
+        assert!(slots.try_running(1).is_ok());
     }
 
     /// Expiry cleanup releases pending capacity and release is fenced and idempotent.

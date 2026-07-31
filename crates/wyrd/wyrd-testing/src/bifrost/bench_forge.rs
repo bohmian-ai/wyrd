@@ -330,6 +330,8 @@ pub async fn run(scenario: BifrostScenario) -> Result<(), BenchError> {
     .execute(fixture.operator_pool.pool())
     .await?;
     let mut config = fixture.config.clone();
+    config.max_files_per_tick = 32;
+    config.max_bins_per_tick = 32;
     config.max_bytes_per_tick = u64::MAX;
     for sequence in 0_i64..32 {
         fixture.append_forge_file_with_rows(sequence, 100_000).await;

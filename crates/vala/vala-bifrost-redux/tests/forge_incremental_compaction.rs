@@ -1150,10 +1150,26 @@ mod pg_tests {
     /// Real Parquet inputs spill, rotate, and conserve rows under one Forge operation.
     #[tokio::test]
     async fn streaming_rewrite_spills_and_commits_multiple_outputs() {
-        let fixture = Fixture::new().await;
-        // The default fixture seeds four files. Thirty-two more 100k-row files
-        // make the sort exceed the bounded 16 MiB pool while keeping the
-        // external journey deterministic and reasonably sized.
+        let fixture = Fixture::new_with_config(
+            ForgeConfig {
+                max_files_per_tick: 32,
+                max_bins_per_tick: 32,
+                max_concurrent_reads: 2,
+                ..ForgeConfig::default()
+            },
+            false,
+            0,
+            16 * 1024 * 1024,
+        )
+        .await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.binding.table_ident())
+            .await
+            .expect("benchmark-shaped table");
+        fixture.set_live_target_file_size(&table, 64 * 1024).await;
+        // Thirty-two 100k-row files make the sort exceed the bounded 16 MiB
+        // pool while exactly consuming the benchmark-shaped shared file budget.
         fixture.seed_files(32, true).await;
         let outcome = fixture.forge.run_once().await.expect("rewrite");
         assert_eq!(outcome.bins_committed, 1, "outcome: {outcome:?}");
@@ -1164,6 +1180,7 @@ mod pg_tests {
         assert!(outcome.spill_bytes <= ForgeConfig::default().spill_limit_bytes);
         assert!(outcome.outputs_committed >= 2);
         assert_eq!(outcome.staging_input_files, 32, "outcome: {outcome:?}");
+        assert_eq!(outcome.live_groups_committed, 0, "outcome: {outcome:?}");
         assert_eq!(outcome.staging_input_bytes, 3_200, "outcome: {outcome:?}");
         assert_eq!(
             outcome.staging_output_files, outcome.outputs_committed,

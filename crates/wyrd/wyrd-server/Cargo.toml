@@ -70,6 +70,8 @@ http-body-util = "0.1"
 wyrd-spec = { workspace = true }
 wyrd-semver = { workspace = true }
 wyrd-storage = { workspace = true }
+ed25519-dalek = { workspace = true }
+prost = { workspace = true }
 
 [dev-dependencies]
 insta = { workspace = true }

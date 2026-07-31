@@ -12,6 +12,8 @@ mod genai_derivation_recovery;
 mod interleaving_smoke;
 #[path = "load_smoke.rs"]
 mod load_smoke;
+#[path = "oracle_peer.rs"]
+mod oracle_peer;
 #[path = "otlp_logs_export.rs"]
 mod otlp_logs_export;
 #[path = "otlp_metrics_export.rs"]

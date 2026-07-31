@@ -17,6 +17,11 @@ use vala_bifrost_redux::forge::{
     Forge, ForgeBuildConfig, ForgeConfig, ForgeObjectStore, ForgeRewriteRuntime,
 };
 use vala_bifrost_redux::maintenance::staging_file_channel;
+use vala_bifrost_redux::oracle::OracleSlotManager;
+use vala_bifrost_redux::oracle::dispatcher::{
+    OraclePeerWorker, PEER_PROTOCOL_VERSION, ReservationRegistry,
+};
+use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
 use vala_bifrost_redux::scribe::admission::AdmissionConfig;
 use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
 use vala_bifrost_redux::scribe::stream_identity::{NodeId, StreamIdentity, WriterEpoch};
@@ -33,7 +38,9 @@ use wyrd_spec::auth::IssuerUrl;
 use wyrd_spec::envelope::CardKind;
 use wyrd_spec::ids::{CardName, SpaceName};
 use wyrd_spec::reference::CardRef;
-use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
+use wyrd_spec::vala::api::{
+    NodeId as ClusterNodeId, OracleCapabilitiesV1, QueryClass, ScribeCapabilitiesV1,
+};
 use wyrd_sql::postgres_boot::{BootError, PostgresBoot};
 use wyrd_storage::{StorageHandle, settings::from_env as load_storage_settings};
 
@@ -42,6 +49,7 @@ use crate::components::auth::audit_writer::RealAuthzAuditWriter;
 use crate::components::auth::{ServerAuth, ServerAuthz};
 use crate::components::eval::EvalAuditWriter;
 use crate::config::WorkloadBindingEntry;
+use crate::oracle::{OraclePeerAuthority, OraclePeerRuntime, PostgresPeerSecurityAudit};
 use crate::postgres::ServerPostgres;
 use crate::state::{AppState, BifrostIngestRuntime, ProductionValidationError};
 
@@ -142,6 +150,10 @@ struct BifrostIngestParts {
     cluster_registry: Arc<ClusterRegistry>,
     /// Independently fenced Scribe role registered during this boot.
     scribe_role: RegisteredRole,
+    /// Physical node identity shared by independently fenced local roles.
+    node_id: ClusterNodeId,
+    /// Private address advertised by both local role registrations.
+    advertise_addr: String,
 }
 
 /// Errors raised while assembling server state.
@@ -235,6 +247,9 @@ pub enum ServerBootError {
     /// Scribe WAL/runtime construction failed during boot.
     #[error("Scribe runtime construction failed: {0}")]
     Scribe(String),
+    /// Oracle peer authority, audit, role, or worker construction failed.
+    #[error("Oracle peer runtime construction failed: {0}")]
+    OraclePeer(String),
 }
 
 /// Resolve database configuration, run migrations, and assemble runtime state.
@@ -476,6 +491,8 @@ async fn build_bifrost_parts_from_boot(
         coordination_runtime,
         cluster_registry,
         scribe_role,
+        node_id: ClusterNodeId::new(node_id.as_uuid()),
+        advertise_addr,
     })
 }
 
@@ -523,6 +540,14 @@ pub async fn build_state(
 
     let state = attach_config_fields(state, config, shutdown, telemetry)?;
     let state = install_auth(state, config, sealing_key.clone()).await?;
+    let state = install_oracle_peer(
+        state,
+        config,
+        Arc::clone(&bifrost_parts.cluster_registry),
+        bifrost_parts.node_id,
+        &bifrost_parts.advertise_addr,
+    )
+    .await?;
     let verifier = state
         .auth
         .token_verifier
@@ -532,14 +557,16 @@ pub async fn build_state(
         .bifrost_redux
         .clone()
         .ok_or_else(|| ServerBootError::Scribe("Gate requires the Redux catalog".to_owned()))?;
-    let ingest = Arc::new(BifrostIngestRuntime::new(
-        bifrost_parts.scribe,
-        bifrost_redux,
-        verifier,
-        vala_bifrost_redux::gate::limits::IngestLimits::default(),
-        Some(bifrost_parts.coordination_runtime),
-    )
-    .with_scribe_role(bifrost_parts.cluster_registry, bifrost_parts.scribe_role));
+    let ingest = Arc::new(
+        BifrostIngestRuntime::new(
+            bifrost_parts.scribe,
+            bifrost_redux,
+            verifier,
+            vala_bifrost_redux::gate::limits::IngestLimits::default(),
+            Some(bifrost_parts.coordination_runtime),
+        )
+        .with_scribe_role(bifrost_parts.cluster_registry, bifrost_parts.scribe_role),
+    );
     let state = state.with_bifrost_ingest(ingest);
     seed_federation(&state, config, sealing_key.as_deref()).await?;
 
@@ -654,6 +681,97 @@ async fn install_auth(
         sealing_key: sealing_key.clone(),
         token_exchange_settings: crate::auth::exchange_api_key::TokenExchangeSettings::default(),
     }))
+}
+
+/// Constructs and registers the local Oracle peer only after security dependencies verify.
+///
+/// The exact system sentinel and signing authority are checked before the
+/// Oracle role advertises readiness. Development boots without a configured
+/// stable key omit the private peer; production already requires that key.
+///
+/// # Errors
+///
+/// Returns [`ServerBootError::OraclePeer`] when the sentinel, signing key,
+/// memory owner, Redux storage adapter, role registration, or snapshot refresh
+/// is unavailable. No peer service is attached on partial construction.
+async fn install_oracle_peer(
+    state: AppState,
+    config: &crate::config::WyrdServerConfig,
+    cluster: Arc<ClusterRegistry>,
+    node_id: ClusterNodeId,
+    advertise_addr: &str,
+) -> Result<AppState, ServerBootError> {
+    let Some(signing_key) = config.auth.signing_key.as_ref() else {
+        if config.deployment_profile.is_production() {
+            return Err(ServerBootError::OraclePeer(
+                "production Oracle peer requires the configured Wyrd signing key".to_owned(),
+            ));
+        }
+        tracing::warn!(
+            "stable signing key is absent; private Oracle peer remains disabled in development"
+        );
+        return Ok(state);
+    };
+    let security_audit = Arc::new(
+        PostgresPeerSecurityAudit::try_new(&state.postgres)
+            .await
+            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+    );
+    let authority = Arc::new(
+        OraclePeerAuthority::from_pem(signing_key, security_audit.clone())
+            .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
+    );
+    let memory = state.bifrost_memory.clone().ok_or_else(|| {
+        ServerBootError::OraclePeer("shared Bifrost memory governor is absent".to_owned())
+    })?;
+    let catalog = state
+        .bifrost_redux
+        .as_ref()
+        .ok_or_else(|| ServerBootError::OraclePeer("Redux catalog is absent".to_owned()))?;
+    let cpu_cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let cpu_cores = u32::try_from(cpu_cores)
+        .map_err(|_| ServerBootError::OraclePeer("CPU count exceeds u32".to_owned()))?;
+    let memory_bytes_per_slot = 256_u64 * 1024 * 1024;
+    let memory_budget_bytes = u64::try_from(memory.bifrost_limit_bytes())
+        .map_err(|_| ServerBootError::OraclePeer("memory budget exceeds u64".to_owned()))?;
+    let memory_slots = (memory_budget_bytes / memory_bytes_per_slot).max(1);
+    let raw_slots = u32::try_from(u64::from(cpu_cores).min(memory_slots).max(1))
+        .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds u32".to_owned()))?;
+    let capabilities = OracleCapabilitiesV1 {
+        peer_protocol_version: u16::try_from(PEER_PROTOCOL_VERSION)
+            .map_err(|_| ServerBootError::OraclePeer("peer protocol exceeds u16".to_owned()))?,
+        storage_protocol_version: 1,
+        cpu_cores: f64::from(cpu_cores),
+        memory_budget_bytes,
+        cpu_cores_per_slot: 1.0,
+        memory_bytes_per_slot,
+        raw_slots,
+        usable_slots: raw_slots,
+        supported_classes: vec![QueryClass::Interactive, QueryClass::Analytical],
+        max_workers_per_query: 2,
+    };
+    let role = cluster
+        .register_oracle(advertise_addr, capabilities)
+        .await
+        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
+    cluster
+        .refresh_snapshot()
+        .await
+        .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?;
+    let running_slots = usize::try_from(raw_slots)
+        .map_err(|_| ServerBootError::OraclePeer("Oracle slot count exceeds usize".to_owned()))?;
+    let slots = Arc::new(OracleSlotManager::new(1_024, running_slots));
+    let reservations = Arc::new(ReservationRegistry::new(Arc::clone(&slots), 1_024));
+    let verifier: Arc<dyn vala_bifrost_redux::oracle::peer::PeerTicketVerifier> = authority.clone();
+    let worker = Arc::new(OraclePeerWorker::new(
+        node_id,
+        role.fencing_token,
+        verifier,
+        security_audit.clone(),
+        reservations,
+        SealedFragmentExecutor::with_memory_governor(catalog.file_io(), memory),
+    ));
+    Ok(state.with_oracle_peer(Arc::new(OraclePeerRuntime::new(worker, security_audit))))
 }
 
 /// Seed `[[trusted_issuers]]` and `[[workload_bindings]]` into Postgres under
@@ -1084,6 +1202,51 @@ mod pg_tests {
         let signer = LocalSigner::new(root.path().to_path_buf()).expect("local signer");
         let storage = Arc::new(StorageHandle::new(BackendSigner::Local(signer)));
         AppState::new(postgres, storage, crate::test_support::test_catalog().await)
+    }
+
+    /// Verified boot dependencies register and retain one ready local Oracle peer.
+    #[test]
+    fn oracle_peer_boot_registers_role_and_runtime_after_sentinel_verification() {
+        wyrd_runtime::runtime().block_on(async {
+            let postgres = crate::test_support::test_server_postgres().await;
+            let storage = crate::test_support::test_storage().await;
+            let catalog = crate::test_support::test_catalog().await;
+            let redux = crate::test_support::test_redux_catalog().await;
+            let memory = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("memory governor");
+            let query_memory = Arc::new(BifrostDataFusionMemoryPool::new(memory.clone()));
+            let state = AppState::new(postgres, storage, catalog)
+                .with_bifrost_redux(redux)
+                .with_bifrost_memory_pool(memory, query_memory);
+            let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
+            let cluster = Arc::new(ClusterRegistry::new(
+                crate::test_support::test_operator_pool().await,
+                node_id,
+            ));
+            let mut config = crate::config::WyrdServerConfig::default();
+            config.auth.signing_key = Some(
+                wyrd_auth_issue::IssuingKey::generate_ephemeral_pem().expect("ephemeral test key"),
+            );
+
+            let state = install_oracle_peer(
+                state,
+                &config,
+                Arc::clone(&cluster),
+                node_id,
+                "127.0.0.1:9443",
+            )
+            .await
+            .expect("verified Oracle peer boot");
+
+            assert!(state.oracle_peer.is_some());
+            let snapshot = cluster.snapshot();
+            let role = snapshot
+                .live_oracles()
+                .into_iter()
+                .find(|role| role.key.node_id == node_id)
+                .expect("local Oracle role is ready");
+            assert!(role.ready);
+            assert_eq!(role.address, "127.0.0.1:9443");
+        });
     }
 
     #[tokio::test(flavor = "current_thread")]

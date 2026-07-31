@@ -17,8 +17,13 @@ python = ["dep:pyo3", "dep:wyrd-utils"]
 name = "integration"
 path = "tests/integration.rs"
 
+[[test]]
+name = "oracle_peer"
+path = "tests/oracle_peer.rs"
+
 [dependencies]
 async-trait = { workspace = true }
+async-stream = { workspace = true }
 axum = { workspace = true }
 arrow = { workspace = true }
 base64 = { workspace = true }
@@ -27,6 +32,7 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["pkcs8"] }
 futures-util = { workspace = true }
 hdrhistogram = { workspace = true }
+hex = { workspace = true }
 iceberg = { workspace = true }
 http = { workspace = true }
 opendal = { workspace = true }

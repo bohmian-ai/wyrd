@@ -56,11 +56,19 @@ where
     let query = crate::vala_query::grpc::ValaQueryGrpc::new(state.clone());
     let tail = scribe_tail::ScribeTailGrpc::new(state.clone(), ingest_runtime.tail_reader());
     let router = build_grpc_router(health_service, NoopInterceptor, cfg)?;
-    Ok(router
+    let router = router
         .add_service((*ingest).clone().into_server())
         .add_service(traces)
         .add_service(metrics)
         .add_service(logs)
         .add_service(query.into_server())
-        .add_service(tail.into_server()))
+        .add_service(tail.into_server());
+    let router = if let Some(peer) = &state.oracle_peer {
+        router.add_service(
+            crate::oracle::OraclePeerGrpc::new(state.clone(), peer.worker()).into_server(),
+        )
+    } else {
+        router
+    };
+    Ok(router)
 }

@@ -1,10 +1,11 @@
 //! Redux-owned tenant-qualified Bifrost catalog.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema};
 use iceberg::TableCreation;
+use iceberg::io::{FileIO, FileIOBuilder};
 use iceberg::spec::{FormatVersion, NullOrder, SortDirection, SortField, SortOrder, Transform};
 use sha2::{Digest as _, Sha256};
 use vala_sql::ValaPostgres;
@@ -120,6 +121,8 @@ pub struct PinnedSealedTable {
     pub snapshot_digest: String,
     /// Canonical live data-file identities in the pinned Iceberg snapshot.
     pub iceberg_file_paths: BTreeSet<String>,
+    /// Ordered immutable data-file work from the pinned Iceberg snapshot.
+    pub iceberg_files: Vec<PinnedIcebergFile>,
     /// Ordered tenant hot rows absent from the exact pinned snapshot manifest.
     pub hot_files: Vec<vala_sql::row_types::file_list::HotFileRow>,
     /// Stable digest of the ordered, post-subtraction hot manifest.
@@ -128,12 +131,24 @@ pub struct PinnedSealedTable {
     pub estimated_bytes: u64,
 }
 
+/// Immutable file metadata retained from one pinned Iceberg manifest entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedIcebergFile {
+    /// Canonical tenant-qualified object path.
+    pub file_path: String,
+    /// Exact object byte size from the pinned manifest.
+    pub file_size: u64,
+    /// Exact record count from the pinned manifest.
+    pub row_count: u64,
+}
+
 /// Redux catalog shared by Gate, Forge, Oracle, and server catalog routes.
 #[derive(Clone)]
 pub struct BifrostCatalog {
     catalog: Arc<dyn iceberg::Catalog>,
     postgres: ValaPostgres,
     warehouse: String,
+    file_io: FileIO,
 }
 
 impl BifrostCatalog {
@@ -156,6 +171,7 @@ impl BifrostCatalog {
         let iceberg_table = self.catalog.load_table(&binding.table_ident()).await?;
         let snapshot_id = iceberg_table.metadata().current_snapshot_id();
         let mut iceberg_file_paths = BTreeSet::new();
+        let mut iceberg_files = BTreeMap::new();
         let mut estimated_bytes = 0_u64;
         if let Some(snapshot) = iceberg_table.metadata().current_snapshot() {
             let manifests = iceberg_table.manifest_list_reader(snapshot).load().await?;
@@ -181,6 +197,20 @@ impl BifrostCatalog {
                                 "sealed byte estimate overflow".to_owned(),
                             )
                         })?;
+                    let pinned = PinnedIcebergFile {
+                        file_path: canonical.clone(),
+                        file_size: entry.data_file().file_size_in_bytes(),
+                        row_count: entry.data_file().record_count(),
+                    };
+                    if iceberg_files
+                        .insert(canonical.clone(), pinned.clone())
+                        .is_some_and(|existing| existing != pinned)
+                    {
+                        return Err(BifrostCatalogError::MetadataMismatch(
+                            "pinned snapshot repeats a data path with conflicting metadata"
+                                .to_owned(),
+                        ));
+                    }
                     iceberg_file_paths.insert(canonical);
                 }
             }
@@ -241,6 +271,7 @@ impl BifrostCatalog {
             snapshot_id,
             snapshot_digest,
             iceberg_file_paths,
+            iceberg_files: iceberg_files.into_values().collect(),
             hot_files,
             hot_manifest_digest,
             estimated_bytes,
@@ -274,6 +305,9 @@ impl BifrostCatalog {
         postgres: ValaPostgres,
     ) -> Result<Self, BifrostCatalogError> {
         let (storage_factory, storage_properties) = iceberg_storage_factory(backend);
+        let file_io = FileIOBuilder::new(Arc::clone(&storage_factory))
+            .with_props(storage_properties.clone())
+            .build();
         let warehouse = warehouse_uri(backend);
         let catalog = iceberg_sql::build_catalog(
             catalog_uri,
@@ -286,6 +320,7 @@ impl BifrostCatalog {
             catalog: Arc::new(catalog),
             postgres,
             warehouse,
+            file_io,
         })
     }
 
@@ -293,6 +328,12 @@ impl BifrostCatalog {
     #[must_use]
     pub fn iceberg_catalog(&self) -> Arc<dyn iceberg::Catalog> {
         Arc::clone(&self.catalog)
+    }
+
+    /// Clones the exact storage adapter used by Redux Iceberg tables.
+    #[must_use]
+    pub fn file_io(&self) -> FileIO {
+        self.file_io.clone()
     }
 
     /// Register one logical table as a tenant-qualified physical Iceberg table.

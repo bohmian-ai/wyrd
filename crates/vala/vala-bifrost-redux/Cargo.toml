@@ -54,6 +54,7 @@ secrecy = { workspace = true }
 wyrd-auth-oidc = { workspace = true }
 wyrd-auth-verify = { workspace = true }
 wyrd-tonic = { workspace = true, features = ["server", "client"] }
+prost = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 sqlx_catalog = { package = "sqlx", version = "=0.8.1", default-features = false, features = ["postgres", "runtime-tokio", "any"] }

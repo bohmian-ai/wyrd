@@ -129,6 +129,14 @@ pub(crate) async fn test_operator_pool() -> OperatorPool {
         .expect("shared PgFixture always configures the platform-admin operator pool")
 }
 
+/// Return a server Postgres owner over the shared fixture's exact runtime handles.
+pub(crate) async fn test_server_postgres() -> Arc<crate::postgres::ServerPostgres> {
+    Arc::new(crate::postgres::ServerPostgres::from_parts(
+        shared().wyrd_postgres().clone(),
+        shared().vala_postgres().clone(),
+    ))
+}
+
 /// Return the process-lifetime local storage handle used by the test catalog.
 pub(crate) async fn test_storage() -> Arc<StorageHandle> {
     Arc::clone(&shared().storage)

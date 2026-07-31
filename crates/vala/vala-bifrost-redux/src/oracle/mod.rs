@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::Array;
-use arrow::datatypes::{Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
@@ -52,7 +52,14 @@ use crate::schema::SchemaFingerprint;
 use crate::scribe::memory::{BifrostMemoryGovernor, ParentMemoryReservation};
 use crate::scribe::tail_rpc::{TAIL_PROTOCOL_VERSION, TailReadTransport};
 
+pub mod assignment;
+pub mod attempt;
+pub mod dispatcher;
 mod exec;
+pub mod executor;
+pub mod fragment;
+pub mod peer;
+pub mod telemetry;
 
 use exec::{HotFileSource, OracleTableProvider};
 pub use exec::{ReconcileExec, TenantTripwireExec};
@@ -530,7 +537,7 @@ impl OracleSlotManager {
     /// # Errors
     ///
     /// Returns admission rejection when the local waiter bound is full.
-    fn try_pending(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
+    pub(crate) fn try_pending(&self) -> Result<OwnedSemaphorePermit, BifrostError> {
         Arc::clone(&self.pending)
             .try_acquire_owned()
             .map_err(|_| BifrostError::QueryAdmissionRejected)
@@ -541,7 +548,7 @@ impl OracleSlotManager {
     /// # Errors
     ///
     /// Returns admission rejection when local running capacity changed since placement.
-    fn try_running(&self, demand: u32) -> Result<OwnedSemaphorePermit, BifrostError> {
+    pub(crate) fn try_running(&self, demand: u32) -> Result<OwnedSemaphorePermit, BifrostError> {
         Arc::clone(&self.running)
             .try_acquire_many_owned(demand)
             .map_err(|_| BifrostError::QueryAdmissionRejected)
@@ -884,6 +891,10 @@ pub struct OracleBuildConfig {
     pub tails: Arc<TailTransportDirectory>,
     /// Read/security audit collaborator.
     pub audit: Arc<dyn OracleAudit>,
+    /// Server-owned narrow peer-ticket authority.
+    pub peer_ticket_minter: Arc<dyn peer::PeerTicketMinter>,
+    /// Optional node-aware local/tonic directory used for immutable sealed leaves.
+    pub peer_transports: Option<dispatcher::OraclePeerTransportDirectory>,
     /// Engine limits and lifecycle values.
     pub config: OracleConfig,
 }
@@ -907,6 +918,14 @@ pub struct OracleConfig {
     pub lease_renew_interval: Duration,
     /// Cadence for expiry and authoritative tenant-counter maintenance.
     pub maintenance_interval: Duration,
+    /// Maximum remote workers selected per query; leader is additional.
+    pub max_workers_per_query: usize,
+    /// Maximum sealed files represented by one micro-fragment.
+    pub fragment_max_files: usize,
+    /// Hard byte ceiling for one complete worker attempt.
+    pub attempt_max_bytes: usize,
+    /// In-memory attempt threshold before permission-restricted spill.
+    pub attempt_memory_bytes: usize,
 }
 
 impl Default for OracleConfig {
@@ -920,6 +939,10 @@ impl Default for OracleConfig {
             lease_ttl: Duration::from_secs(60),
             lease_renew_interval: Duration::from_secs(20),
             maintenance_interval: Duration::from_secs(5),
+            max_workers_per_query: 2,
+            fragment_max_files: 16,
+            attempt_max_bytes: 64 * 1024 * 1024,
+            attempt_memory_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -940,6 +963,8 @@ pub struct Oracle {
     tails: Arc<TailTransportDirectory>,
     /// Mandatory immutable read/security audit collaborator.
     audit: Arc<dyn OracleAudit>,
+    /// Optional distributed fragment owner assembled from server capabilities.
+    fragment_dispatcher: Option<dispatcher::FragmentDispatcher>,
     /// Production metrics owner shared by query execution and admission.
     telemetry: Arc<OracleTelemetry>,
     /// Lifecycle cancellation token.
@@ -965,6 +990,16 @@ impl Oracle {
     /// # Errors
     /// Returns [`BifrostError::Internal`] when the configured SQL floor is zero.
     pub fn new(config: OracleBuildConfig) -> Result<Self, BifrostError> {
+        if config.config.max_workers_per_query > 63
+            || config.config.fragment_max_files == 0
+            || config.config.attempt_max_bytes == 0
+            || config.config.attempt_memory_bytes == 0
+            || config.config.attempt_memory_bytes > config.config.attempt_max_bytes
+        {
+            return Err(BifrostError::Internal {
+                detail: "Oracle fragment configuration is invalid".to_owned(),
+            });
+        }
         if config.config.max_sql_bytes == 0 {
             return Err(BifrostError::Internal {
                 detail: "Oracle SQL byte limit must be positive".to_owned(),
@@ -995,6 +1030,10 @@ impl Oracle {
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
         let maintenance = admission.start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
+        let fragment_dispatcher = config.peer_transports.map(|transports| {
+            dispatcher::FragmentDispatcher::new(Arc::clone(&config.peer_ticket_minter), transports)
+                .with_memory_governor(config.memory.governor.clone())
+        });
         Ok(Self {
             planner,
             admission,
@@ -1003,6 +1042,7 @@ impl Oracle {
             memory: config.memory,
             tails: config.tails,
             audit: config.audit,
+            fragment_dispatcher,
             telemetry,
             shutdown,
             ready,
@@ -1185,7 +1225,15 @@ impl Oracle {
             degraded |= drained.degraded;
             admitted.live_reservations = drained.reservations;
             let (schema, mut batches) = self
-                .execute_sql_cut(&context, &request.sql, cuts, drained.batches, query_class)
+                .execute_sql_cut(
+                    &context,
+                    &request.sql,
+                    cuts,
+                    drained.batches,
+                    query_class,
+                    &admitted,
+                    deadline,
+                )
                 .await?;
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -1377,6 +1425,8 @@ impl Oracle {
         cuts: Vec<PinnedSealedTable>,
         mut live_batches: HashMap<String, Vec<RecordBatch>>,
         query_class: QueryClass,
+        admitted: &AdmittedQueryGuard,
+        deadline: Instant,
     ) -> Result<(SchemaRef, SendableRecordBatchStream), BifrostError> {
         let _source_span = tracing::info_span!(
             "bifrost.oracle.source",
@@ -1385,7 +1435,7 @@ impl Oracle {
         let session = SessionContext::new();
         for cut in cuts {
             let table_name = cut.binding.table_ref.fqn();
-            let hot_files = cut
+            let mut hot_files = cut
                 .hot_files
                 .iter()
                 .map(|file| {
@@ -1403,9 +1453,78 @@ impl Oracle {
                     })
                 })
                 .collect::<Result<Vec<_>, BifrostError>>()?;
+            let distributed_iceberg_batches =
+                if self.fragment_dispatcher.is_some() && !cut.iceberg_files.is_empty() {
+                    let files = cut
+                        .iceberg_files
+                        .iter()
+                        .map(|file| {
+                            Ok(fragment::SealedScanFile {
+                                location: self
+                                    .catalog
+                                    .object_location(&cut.binding, &file.file_path)
+                                    .map_err(|error| error.into_public())?,
+                                row_groups: Vec::new(),
+                                size_bytes: file.file_size,
+                                estimated_rows: file.row_count,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, BifrostError>>()?;
+                    Some(
+                        self.dispatch_sealed_fragments(
+                            context,
+                            &cut,
+                            admitted,
+                            query_class,
+                            deadline,
+                            fragment::SealedSourceTier::Iceberg,
+                            cut.snapshot_digest.clone(),
+                            files,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+            let distributed_hot_batches =
+                if self.fragment_dispatcher.is_some() && !cut.hot_files.is_empty() {
+                    hot_files.clear();
+                    let files = cut
+                        .hot_files
+                        .iter()
+                        .map(|file| {
+                            Ok(fragment::SealedScanFile {
+                                location: self
+                                    .catalog
+                                    .object_location(&cut.binding, &file.file_path)
+                                    .map_err(|error| error.into_public())?,
+                                row_groups: Vec::new(),
+                                size_bytes: u64::try_from(file.file_size)
+                                    .map_err(|_| BifrostError::QueryExecutionFailed)?,
+                                estimated_rows: u64::try_from(file.row_count)
+                                    .map_err(|_| BifrostError::QueryExecutionFailed)?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, BifrostError>>()?;
+                    self.dispatch_sealed_fragments(
+                        context,
+                        &cut,
+                        admitted,
+                        query_class,
+                        deadline,
+                        fragment::SealedSourceTier::HotSealed,
+                        cut.hot_manifest_digest.clone(),
+                        files,
+                    )
+                    .await?
+                } else {
+                    Vec::new()
+                };
             let provider = OracleTableProvider::try_new(
                 cut.iceberg_table,
+                distributed_iceberg_batches,
                 hot_files,
+                distributed_hot_batches,
                 live_batches.remove(&table_name).unwrap_or_default(),
                 context.clone(),
                 table_name.clone(),
@@ -1430,6 +1549,146 @@ impl Oracle {
         let schema = physical.schema();
         let stream = execute_stream(physical, session.task_ctx()).map_err(map_datafusion_error)?;
         Ok((schema, stream))
+    }
+
+    /// Plans, assigns, executes, and decodes one footer-validated sealed source tier.
+    ///
+    /// The immutable membership snapshot is captured once. Small single-fragment
+    /// work stays leader-local; larger work selects no more configured workers
+    /// than fragments and retries only within this snapshot.
+    ///
+    /// # Errors
+    /// Returns a stable execution, timeout, metadata, or peer-security failure.
+    async fn dispatch_sealed_fragments(
+        &self,
+        context: &AuthorizedQueryContext,
+        cut: &PinnedSealedTable,
+        admitted: &AdmittedQueryGuard,
+        query_class: QueryClass,
+        deadline: Instant,
+        tier: fragment::SealedSourceTier,
+        pinned_digest: String,
+        files: Vec<fragment::SealedScanFile>,
+    ) -> Result<Vec<RecordBatch>, BifrostError> {
+        let dispatcher = self
+            .fragment_dispatcher
+            .as_ref()
+            .ok_or(BifrostError::QueryExecutionFailed)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or(BifrostError::QueryTimeout)?;
+        let deadline_unix_ms = (chrono::Utc::now()
+            + chrono::Duration::from_std(remaining).map_err(|_| BifrostError::QueryTimeout)?)
+        .timestamp_millis();
+        let binding = self
+            .catalog
+            .object_location(&cut.binding, &cut.binding.object_prefix)
+            .map_err(|error| error.into_public())?;
+        let schema =
+            iceberg::arrow::schema_to_arrow_schema(cut.iceberg_table.metadata().current_schema())
+                .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let schema_fingerprint = sealed_fragment_schema_fingerprint(&schema);
+        let fragments = fragment::FragmentPlanner
+            .plan(
+                &fragment::PreparedSealedLeaf {
+                    binding,
+                    tier,
+                    pinned_digest,
+                    files,
+                    projection: Vec::new(),
+                    predicates: Vec::new(),
+                    schema_fingerprint,
+                    deadline_unix_ms,
+                },
+                &fragment::FragmentConfig {
+                    max_files: self.planner.config.fragment_max_files,
+                },
+            )
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let snapshot = self.admission.cluster.snapshot();
+        let leader = admitted.leader.node_id;
+        let mut eligible = std::collections::BTreeMap::new();
+        let mut fences = HashMap::new();
+        for role in snapshot.live_oracles() {
+            if let ClusterCapabilities::OracleV1(capabilities) = &role.capabilities {
+                eligible.insert(
+                    role.key.node_id,
+                    assignment::OracleNode {
+                        node_id: role.key.node_id,
+                        capabilities: capabilities.clone(),
+                    },
+                );
+                fences.insert(role.key.node_id, role.fencing_token);
+            }
+        }
+        if !eligible.contains_key(&leader) {
+            return Err(BifrostError::OracleRoleUnavailable);
+        }
+        let assignment = assignment::PortableAssignmentV1
+            .assign(
+                &fragments,
+                &eligible,
+                leader,
+                if fragments.len() == 1 {
+                    0
+                } else {
+                    self.planner.config.max_workers_per_query
+                },
+            )
+            .map_err(|_| BifrostError::QueryExecutionFailed)?;
+        let mut selected = assignment.keys().copied().collect::<Vec<_>>();
+        selected.sort_by_key(|node| node.as_uuid());
+        let permission_digest = audit_digest(&context.permission)?.as_str().to_owned();
+        let dispatch_context = dispatcher::DispatchContext {
+            query_id: admitted.query_id,
+            leader_node_id: leader,
+            leader_fence: admitted.leader.fencing_token,
+            tenant_id: context.data_tenant_id.as_uuid(),
+            query_class,
+            slot_units: admission_limits(u32::MAX, query_class).1,
+            permission_digest,
+            attempt_bytes: self.planner.config.attempt_max_bytes,
+            attempt_memory_bytes: self.planner.config.attempt_memory_bytes,
+        };
+        let mut output = Vec::new();
+        for fragment in fragments {
+            let primary = assignment
+                .iter()
+                .find_map(|(node, work)| work.contains(&fragment).then_some(*node))
+                .unwrap_or(leader);
+            let mut order = vec![primary];
+            order.extend(selected.iter().copied().filter(|node| *node != primary));
+            let candidates = order
+                .into_iter()
+                .filter_map(|node_id| {
+                    fences.get(&node_id).copied().map(|worker_fence| {
+                        dispatcher::DispatchCandidate {
+                            node_id,
+                            worker_fence,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            let attempt = dispatcher
+                .execute(&dispatch_context, fragment, &candidates)
+                .await
+                .map_err(|error| match error {
+                    dispatcher::DispatchError::Terminal => BifrostError::QueryPeerSecurity,
+                    dispatcher::DispatchError::Retryable | dispatcher::DispatchError::Exhausted => {
+                        BifrostError::QueryExecutionFailed
+                    }
+                })?;
+            for bytes in attempt.batches {
+                let bytes = bytes.map_err(|_| BifrostError::QueryExecutionFailed)?;
+                let reader =
+                    arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+                        .map_err(|_| BifrostError::QueryExecutionFailed)?;
+                for batch in reader {
+                    output.push(batch.map_err(|_| BifrostError::QueryExecutionFailed)?);
+                }
+            }
+        }
+        Ok(output)
     }
 
     /// Lowers and optimizes SQL against schema-only pinned table providers.
@@ -1481,6 +1740,28 @@ impl Oracle {
             .into_optimized_plan()
             .map_err(map_datafusion_error)
     }
+}
+
+/// Computes the executor fingerprint after canonicalizing equivalent UTC timezone spellings.
+///
+/// Iceberg projects UTC as `+00:00`, while Arrow's Parquet reader projects the
+/// same logical timezone as `UTC`. This boundary removes that adapter spelling
+/// drift without weakening any column, order, or non-UTC type check.
+fn sealed_fragment_schema_fingerprint(schema: &Schema) -> String {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let data_type = match field.data_type() {
+                DataType::Timestamp(unit, Some(timezone)) if timezone.as_ref() == "+00:00" => {
+                    DataType::Timestamp(*unit, Some("UTC".into()))
+                }
+                data_type => data_type.clone(),
+            };
+            Field::new(field.name(), data_type, field.is_nullable())
+        })
+        .collect::<Vec<_>>();
+    hex::encode(SchemaFingerprint::from_arrow_schema(&Schema::new(fields)).as_ref())
 }
 
 /// Registers one table beneath its explicit Wyrd catalog/schema hierarchy.
@@ -3363,6 +3644,28 @@ mod tests {
         assert!(
             observed,
             "canonical stream metric was not recorded: {snapshot:?}"
+        );
+    }
+
+    /// Equivalent Arrow UTC spellings produce one sealed-fragment schema identity.
+    #[test]
+    fn oracle_sealed_fragment_fingerprint_canonicalizes_utc_aliases() {
+        let iceberg = Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("+00:00".into()),
+            ),
+            false,
+        )]);
+        let parquet = Schema::new(vec![Field::new(
+            "event_time",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )]);
+        assert_eq!(
+            sealed_fragment_schema_fingerprint(&iceberg),
+            sealed_fragment_schema_fingerprint(&parquet),
         );
     }
 

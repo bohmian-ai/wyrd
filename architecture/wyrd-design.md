@@ -1159,6 +1159,18 @@ is distinct from the doctrinal `RunRef` — the Card→Run→Observation run is 
 client-side execution record (see the "There is no run registry" note under
 _Observation identity — `Card → Run → Observation`_), never server-persisted.
 
+**Platform audit sentinel.** `DataTenantId::SYSTEM_OWNER` is the established
+durable platform tenant for security events that cannot safely be attributed
+to caller-controlled tenant data, including peer tickets rejected before
+verified claim decoding. Platform migrations must provision this sentinel
+idempotently. Callers must never create or select an audit tenant from
+unverified payload bytes.
+Its canonical row is UUID `00000000-0000-0000-0000-000000000000`, slug
+`wyrd-system`, display name `Wyrd System`, status `active`, and
+`deleted_at IS NULL`. Provisioning and boot verification fail closed rather
+than overwriting or accepting conflicting UUID/slug ownership or incompatible
+attributes.
+
 **Public surface.** Bifrost is a stable Wyrd public surface across HTTP, gRPC,
 Python, generated schemas, MCP/agent documentation, and stable error codes.
 The public contract includes:

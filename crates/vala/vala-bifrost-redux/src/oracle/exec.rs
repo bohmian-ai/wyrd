@@ -71,8 +71,12 @@ pub(crate) struct HotFileSource {
 pub(crate) struct OracleTableProvider {
     /// Pinned Iceberg provider built from immutable table metadata.
     iceberg: IcebergStaticTableProvider,
+    /// Footer-validated distributed Iceberg batches, or `None` for leader-local scanning.
+    distributed_iceberg_batches: Option<Vec<RecordBatch>>,
     /// Pinned hot files absent from the selected Iceberg manifest.
     hot_files: Vec<HotFileSource>,
+    /// Fully validated local/peer hot batches admitted only after a matching footer.
+    distributed_hot_batches: Vec<RecordBatch>,
     /// Already-audited and drained live batches.
     live_batches: Vec<RecordBatch>,
     /// File reader inherited from the pinned Iceberg table.
@@ -101,7 +105,18 @@ impl fmt::Debug for OracleTableProvider {
         formatter
             .debug_struct("OracleTableProvider")
             .field("table", &self.table)
+            .field(
+                "distributed_iceberg_batch_count",
+                &self
+                    .distributed_iceberg_batches
+                    .as_ref()
+                    .map_or(0, Vec::len),
+            )
             .field("hot_file_count", &self.hot_files.len())
+            .field(
+                "distributed_hot_batch_count",
+                &self.distributed_hot_batches.len(),
+            )
             .field("live_batch_count", &self.live_batches.len())
             .finish_non_exhaustive()
     }
@@ -116,7 +131,9 @@ impl OracleTableProvider {
     /// provider or the physical schema lacks the required tenant column.
     pub(crate) async fn try_new(
         table: iceberg::table::Table,
+        distributed_iceberg_batches: Option<Vec<RecordBatch>>,
         hot_files: Vec<HotFileSource>,
+        distributed_hot_batches: Vec<RecordBatch>,
         live_batches: Vec<RecordBatch>,
         context: AuthorizedQueryContext,
         table_name: String,
@@ -131,13 +148,27 @@ impl OracleTableProvider {
             .map_err(|error| DataFusionError::External(Box::new(error)))?;
         let physical_schema = iceberg.schema();
         let public_schema = schema_without(&physical_schema, DATA_TENANT_ID)?;
+        let distributed_iceberg_batches = distributed_iceberg_batches
+            .map(|batches| {
+                batches
+                    .into_iter()
+                    .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
+                    .collect::<DataFusionResult<Vec<_>>>()
+            })
+            .transpose()?;
+        let distributed_hot_batches = distributed_hot_batches
+            .into_iter()
+            .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
+            .collect::<DataFusionResult<Vec<_>>>()?;
         let live_batches = live_batches
             .into_iter()
             .map(|batch| project_batch(&batch, Arc::clone(&physical_schema)))
             .collect::<DataFusionResult<Vec<_>>>()?;
         Ok(Self {
             iceberg,
+            distributed_iceberg_batches,
             hot_files,
+            distributed_hot_batches,
             live_batches,
             file_io,
             physical_schema,
@@ -198,11 +229,24 @@ impl TableProvider for OracleTableProvider {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let published = self.iceberg.scan(state, None, &[], None).await?;
-        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = vec![Arc::new(SourceTagExec::new(
-            published,
-            SourceTier::Iceberg,
-        )?)];
+        let mut inputs: Vec<Arc<dyn ExecutionPlan>> = Vec::new();
+        if let Some(batches) = &self.distributed_iceberg_batches {
+            let published = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(batches),
+                Arc::clone(&self.physical_schema),
+                None,
+            )?;
+            inputs.push(Arc::new(SourceTagExec::new(
+                published,
+                SourceTier::Iceberg,
+            )?));
+        } else {
+            let published = self.iceberg.scan(state, None, &[], None).await?;
+            inputs.push(Arc::new(SourceTagExec::new(
+                published,
+                SourceTier::Iceberg,
+            )?));
+        }
         if !self.hot_files.is_empty() {
             let hot = Arc::new(HotParquetExec::new(
                 self.hot_files.clone(),
@@ -212,6 +256,14 @@ impl TableProvider for OracleTableProvider {
                 Arc::clone(&self.telemetry),
                 self.query_class,
             ));
+            inputs.push(Arc::new(SourceTagExec::new(hot, SourceTier::HotSealed)?));
+        }
+        if !self.distributed_hot_batches.is_empty() {
+            let hot = MemorySourceConfig::try_new_exec(
+                std::slice::from_ref(&self.distributed_hot_batches),
+                Arc::clone(&self.physical_schema),
+                None,
+            )?;
             inputs.push(Arc::new(SourceTagExec::new(hot, SourceTier::HotSealed)?));
         }
         if !self.live_batches.is_empty() {

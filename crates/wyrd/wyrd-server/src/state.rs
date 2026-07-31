@@ -14,8 +14,8 @@ use vala_bifrost_redux::gate::IngressCpuProjection;
 use vala_bifrost_redux::gate::auth::ingest_auth_interceptor;
 use vala_bifrost_redux::gate::limits::IngestLimits;
 use vala_bifrost_redux::scribe::ScribeImpl;
-use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
 use vala_bifrost_redux::scribe::memory::BifrostMemoryGovernor;
+use vala_bifrost_redux::scribe::tail_rpc::ScribeTailReader;
 use wyrd_auth_verify::TokenVerifier;
 use wyrd_storage::StorageHandle;
 use wyrd_telemetry::TelemetryGuard;
@@ -116,9 +116,7 @@ impl BifrostIngestRuntime {
         registered: RegisteredRole,
     ) -> Self {
         let shutdown = CancellationToken::new();
-        std::mem::drop(
-            Arc::clone(&registry).start_heartbeat(registered.clone(), shutdown.clone()),
-        );
+        std::mem::drop(Arc::clone(&registry).start_heartbeat(registered.clone(), shutdown.clone()));
         std::mem::drop(Arc::clone(&registry).start_snapshot_poller(shutdown.clone()));
         self.scribe_role = Some(ScribeRoleRuntime {
             registry,
@@ -219,6 +217,8 @@ pub struct AppState {
     pub bifrost_query_memory: Option<Arc<dyn MemoryPool>>,
     /// Complete Gate/Scribe ingest subsystem, absent only when Bifrost ingest is disabled.
     pub bifrost_ingest: Option<Arc<BifrostIngestRuntime>>,
+    /// Optional readiness-qualified Oracle peer runtime mounted on private gRPC.
+    pub oracle_peer: Option<Arc<crate::oracle::OraclePeerRuntime>>,
     /// Shared Redux Forge owner used by supervision and maintenance tests.
     ///
     /// This is private so every server path observes the one supervised Forge
@@ -263,6 +263,7 @@ impl AppState {
             bifrost_memory: None,
             bifrost_query_memory: None,
             bifrost_ingest: None,
+            oracle_peer: None,
             forge: None,
             auth: ServerAuth::default(),
             authz: ServerAuthz::default(),
@@ -382,6 +383,13 @@ impl AppState {
         self
     }
 
+    /// Attach one sentinel-verified Oracle peer runtime for local and tonic execution.
+    #[must_use]
+    pub fn with_oracle_peer(mut self, peer: Arc<crate::oracle::OraclePeerRuntime>) -> Self {
+        self.oracle_peer = Some(peer);
+        self
+    }
+
     /// Attach the single production Forge owner used by the supervised worker.
     ///
     /// The caller must pass the Forge built from the same memory-pool Arc stored
@@ -476,6 +484,9 @@ pub enum ProductionValidationError {
     /// Preview auth is still enabled in a production build.
     #[error("auth.allow_preview is true in a production build; clear WYRD_AUTH_ALLOW_PREVIEW")]
     PreviewAuthEnabled,
+    /// The private Oracle peer was not constructed from verified production dependencies.
+    #[error("oracle_peer is None in a production build; Oracle role boot must complete")]
+    MissingOraclePeer,
 }
 
 impl AppState {
@@ -497,6 +508,9 @@ impl AppState {
         }
         if self.auth.allow_preview {
             return Err(ProductionValidationError::PreviewAuthEnabled);
+        }
+        if self.oracle_peer.is_none() {
+            return Err(ProductionValidationError::MissingOraclePeer);
         }
         Ok(())
     }

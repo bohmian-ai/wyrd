@@ -26,6 +26,15 @@ use vala_bifrost_redux::catalog::{
 };
 use vala_bifrost_redux::cluster::{ClusterRegistry, RegisteredRole};
 use vala_bifrost_redux::namespaces::BifrostNamespace;
+use vala_bifrost_redux::oracle::dispatcher::{
+    LocalOraclePeerTransport, OraclePeerTransportDirectory, OraclePeerWorker, ReservationRegistry,
+    TonicOraclePeerTransport,
+};
+use vala_bifrost_redux::oracle::executor::SealedFragmentExecutor;
+use vala_bifrost_redux::oracle::peer::{
+    NoopPeerSecurityAudit, PeerSecurityError, PeerTicketClaims, PeerTicketVerifier,
+    VerifiedClaimsBytes,
+};
 use vala_bifrost_redux::oracle::{
     AuthorizedQueryContext, BifrostQueryReadDecision, BifrostSecurityViolation, Oracle,
     OracleAudit, OracleBuildConfig, OracleConfig, OracleMemoryResources, OracleSlotManager,
@@ -55,6 +64,40 @@ use wyrd_spec::vala::api::{
     FreshnessPolicy, OracleCapabilitiesV1, QueryAuditDigest, QueryClass, QueryExecutionMode,
     QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalOutcome, VisibilityMode,
 };
+use wyrd_spec::vala::api::{NodeId as OracleNodeId, SignedPeerTicket};
+
+/// Verifies deterministic fixture tickets while preserving audience and fence checks.
+struct DeterministicTestVerifier;
+
+#[async_trait]
+impl PeerTicketVerifier for DeterministicTestVerifier {
+    /// Authenticates the fixture ticket and returns its opaque verified claims.
+    ///
+    /// # Errors
+    /// Returns a closed peer-security failure for tamper, malformed claims, audience, or fence.
+    async fn verify_peer_ticket(
+        &self,
+        ticket: &SignedPeerTicket,
+        expected_worker: OracleNodeId,
+        expected_worker_fence: u64,
+        _now: chrono::DateTime<Utc>,
+    ) -> Result<VerifiedClaimsBytes, PeerSecurityError> {
+        use prost::Message as _;
+
+        if ticket.key_id != "test" || ticket.signature != ticket.claims_bytes {
+            return Err(PeerSecurityError::InvalidSignature);
+        }
+        let claims = PeerTicketClaims::decode(ticket.claims_bytes.as_slice())
+            .map_err(|_| PeerSecurityError::Claims)?;
+        if claims.audience != expected_worker.as_uuid().as_bytes() {
+            return Err(PeerSecurityError::Audience);
+        }
+        if claims.worker_fence != expected_worker_fence {
+            return Err(PeerSecurityError::Fence);
+        }
+        Ok(VerifiedClaimsBytes(ticket.claims_bytes.clone()))
+    }
+}
 use wyrd_storage::{BackendConfig, StorageHandle, StorageSettings};
 
 /// Dependencies retained for one real Postgres/catalog/Oracle integration.
@@ -209,6 +252,59 @@ impl OracleFixture {
         oracle
     }
 
+    /// Builds an Oracle whose leader-local peer path reads the pinned table through `FileIO`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the table, worker, Oracle, or startup readiness cannot be constructed.
+    async fn oracle_with_local_fragments(
+        &self,
+        audit: Arc<dyn OracleAudit>,
+        config: OracleConfig,
+    ) -> Oracle {
+        let table = self
+            .catalog
+            .iceberg_catalog()
+            .load_table(&self.binding.table_ident())
+            .await
+            .expect("pinned table for peer executor");
+        let reservations = Arc::new(ReservationRegistry::new(
+            Arc::new(OracleSlotManager::new(16, 16)),
+            16,
+        ));
+        let worker = Arc::new(OraclePeerWorker::new(
+            self.role.key.node_id,
+            self.role.fencing_token,
+            Arc::new(DeterministicTestVerifier),
+            Arc::new(NoopPeerSecurityAudit),
+            reservations,
+            SealedFragmentExecutor::new(table.file_io().clone()),
+        ));
+        let transports = OraclePeerTransportDirectory::new(
+            self.role.key.node_id,
+            Arc::new(LocalOraclePeerTransport::new(worker)),
+            Arc::new(
+                TonicOraclePeerTransport::new(HashMap::new(), None)
+                    .expect("empty remote transport"),
+            ),
+        );
+        let oracle = self.build_oracle_with_transport(
+            audit,
+            Arc::new(TailTransportDirectory::default()),
+            config,
+            64 * 1024 * 1024,
+            Some(transports),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !oracle.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Oracle readiness");
+        oracle
+    }
+
     /// Constructs Oracle without waiting for startup reconciliation.
     ///
     /// # Panics
@@ -220,6 +316,22 @@ impl OracleFixture {
         tails: Arc<TailTransportDirectory>,
         config: OracleConfig,
         reconciliation_limit_bytes: usize,
+    ) -> Oracle {
+        self.build_oracle_with_transport(audit, tails, config, reconciliation_limit_bytes, None)
+    }
+
+    /// Constructs Oracle with an optional immutable-fragment transport.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the supplied configuration violates Oracle invariants.
+    fn build_oracle_with_transport(
+        &self,
+        audit: Arc<dyn OracleAudit>,
+        tails: Arc<TailTransportDirectory>,
+        config: OracleConfig,
+        reconciliation_limit_bytes: usize,
+        peer_transports: Option<OraclePeerTransportDirectory>,
     ) -> Oracle {
         Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(&self.catalog),
@@ -234,6 +346,12 @@ impl OracleFixture {
             },
             tails,
             audit,
+            peer_ticket_minter: Arc::new(
+                vala_bifrost_redux::oracle::peer::DeterministicTestSigner {
+                    key_id: "test".to_owned(),
+                },
+            ),
+            peer_transports,
             config,
         })
         .expect("Oracle")
@@ -1349,6 +1467,80 @@ async fn oracle_configured_memory_spills_and_preserves_exact_count() {
     .await;
     assert_eq!(result.terminal.outcome, QueryTerminalOutcome::Success);
     assert_eq!(int64_values(&result, "total"), [1_024]);
+    oracle
+        .shutdown(Instant::now() + Duration::from_secs(1))
+        .await;
+}
+
+/// A real pinned Iceberg data file executes through the shared local fragment path.
+#[tokio::test]
+async fn oracle_distributes_real_pinned_iceberg_leaf_without_double_scan() {
+    let fixture = OracleFixture::new("oracle_distributed_iceberg").await;
+    let seeded = fixture
+        .seed_hot_rows(&[(7, fixture.tenant), (9, fixture.tenant)])
+        .await;
+    fixture.append_hot_to_iceberg_snapshot(&seeded).await;
+    let oracle = fixture
+        .oracle_with_local_fragments(
+            Arc::new(TestPostgresOracleAudit::new(
+                fixture.pg.vala_postgres().clone(),
+            )),
+            OracleConfig::default(),
+        )
+        .await;
+    let recorder = wyrd_bench::BenchmarkRecorder::new();
+    let spans = SpanProbe::default();
+    let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+    let _span_guard = tracing::subscriber::set_default(spans.clone());
+    let query = oracle
+        .query_sql(
+            fixture.context(),
+            BifrostQueryRequest {
+                sql: format!(
+                    "SELECT count(*) AS total, sum(value) AS total_value FROM {}",
+                    fixture.table.fqn()
+                ),
+                visibility: VisibilityMode::PublishedOnly,
+                freshness: FreshnessPolicy::Strict,
+                deadline_ms: Some(5_000),
+            },
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "distributed Iceberg query failed: {error:?}; {:?}",
+                spans.snapshot()
+            )
+        });
+    let result = decoded_query(query).await;
+    assert_eq!(
+        result.terminal.outcome,
+        QueryTerminalOutcome::Success,
+        "{:?}; {:?}",
+        result.terminal,
+        spans.snapshot(),
+    );
+    assert_eq!(int64_values(&result, "total"), [2]);
+    assert_eq!(int64_values(&result, "total_value"), [16]);
+    let captured_spans = spans.snapshot();
+    assert!(
+        captured_spans.iter().any(|span| {
+            span.name == "bifrost.oracle.fragment_attempt"
+                && span.fields.get("locality").map(String::as_str) == Some("local")
+        }),
+        "fragment attempt span must use the closed locality label: {captured_spans:?}",
+    );
+    let metrics = recorder.snapshot();
+    assert_counter_value(
+        &metrics,
+        "bifrost_oracle_fragments_total{locality=\"local\",outcome=\"success\"}",
+        1,
+    );
+    assert_counter_value(
+        &metrics,
+        "bifrost_oracle_source_rows_total{source=\"iceberg\"}",
+        2,
+    );
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;

@@ -161,7 +161,7 @@ struct RolePair {
 async fn reserve_role_pair() -> RolePair {
     let pg = PgFixture::start().await.expect("managed Postgres fixture");
     let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
-    let cluster = Arc::new(ClusterRegistry::new(pg.operator_pool().clone(), node_id));
+    let cluster = Arc::new(ClusterRegistry::new(pg.vala_postgres().clone(), node_id));
     let oracle = cluster
         .reserve_oracle(
             "127.0.0.1:50052",
@@ -402,7 +402,7 @@ impl OracleFixture {
         let binding =
             TenantTableBinding::resolve((tenant, table.clone())).expect("tenant table binding");
         let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
-        let cluster = Arc::new(ClusterRegistry::new(pg.operator_pool().clone(), node_id));
+        let cluster = Arc::new(ClusterRegistry::new(pg.vala_postgres().clone(), node_id));
         let role = cluster
             .register_oracle(
                 "127.0.0.1:0",
@@ -560,7 +560,7 @@ impl OracleFixture {
         Oracle::new(OracleBuildConfig {
             catalog: Arc::clone(&self.catalog),
             vala: self.pg.vala_postgres().clone(),
-            admission_leases: OracleAdmissionLeases::new(self.pg.operator_pool().clone()),
+            admission_leases: OracleAdmissionLeases::new(self.pg.vala_postgres().clone()),
             cluster: Arc::clone(&self.cluster),
             local_role: self.role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),
@@ -1353,10 +1353,35 @@ fn renewal_test_config() -> OracleConfig {
 ///
 /// Panics when the fixture does not contain exactly one active lease.
 async fn sole_lease_id(fixture: &OracleFixture) -> uuid::Uuid {
-    sqlx::query_scalar("SELECT query_id FROM vala.oracle_admission_leases")
-        .fetch_one(fixture.pg.operator_pool().pool())
+    let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
+    sqlx::query_scalar("SELECT query_id FROM vala.oracle_admission_leases WHERE data_tenant_id=$1")
+        .bind(uuid::Uuid::from(fixture.tenant))
+        .fetch_one(&owner)
         .await
         .expect("sole admission lease")
+}
+
+/// Counts active admission leases inside the fixture's tenant boundary.
+///
+/// # Panics
+///
+/// Panics when the tenant connection, count query, or commit fails.
+async fn active_lease_count(fixture: &OracleFixture) -> i64 {
+    let mut conn = fixture
+        .pg
+        .vala_postgres()
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    let count = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_leases WHERE data_tenant_id=$1",
+    )
+    .bind(uuid::Uuid::from(fixture.tenant))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("active lease count");
+    conn.commit().await.expect("commit lease count");
+    count
 }
 
 /// Real tenant SQL audit appends the exact locked T1 detail and commits it.
@@ -2351,9 +2376,9 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_partial_fence_cleanup() {
         .await;
 }
 
-/// Failed startup reconciliation leaves readiness false and refuses queries.
+/// Startup avoids cross-tenant reconciliation and tenant SQL still fails closed.
 #[tokio::test]
-async fn pg_bifrost_oracle_multitenant_admission_journey_startup_reconcile_failure() {
+async fn pg_bifrost_oracle_multitenant_admission_journey_startup_avoids_tenant_scan() {
     let fixture = OracleFixture::new("oracle_not_ready").await;
     let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
     sqlx::query(
@@ -2382,7 +2407,7 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_startup_reconcile_failu
         64 * 1024 * 1024,
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!oracle.is_ready());
+    assert!(oracle.is_ready());
     let error = oracle
         .query_sql(
             fixture.context(),
@@ -2394,8 +2419,8 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_startup_reconcile_failu
             },
         )
         .await
-        .expect_err("unreconciled Oracle refuses queries");
-    assert_eq!(error, BifrostError::OracleRoleUnavailable);
+        .expect_err("tenant admission failure refuses the query");
+    assert_eq!(error, BifrostError::QueryExecutionFailed);
     oracle
         .shutdown(Instant::now() + Duration::from_secs(1))
         .await;
@@ -2405,12 +2430,24 @@ async fn pg_bifrost_oracle_multitenant_admission_journey_startup_reconcile_failu
 #[tokio::test]
 async fn oracle_admission_expiry_batch_is_capped_at_128() {
     let fixture = OracleFixture::new("oracle_expiry_cap").await;
-    let leases = OracleAdmissionLeases::new(fixture.pg.operator_pool().clone());
-    assert!(leases.expire_batch(Utc::now(), 129).await.is_err());
+    let leases = OracleAdmissionLeases::new(fixture.pg.vala_postgres().clone());
+    let mut conn = fixture
+        .pg
+        .vala_postgres()
+        .tenant_conn(fixture.tenant)
+        .await
+        .expect("tenant connection");
+    assert!(
+        leases
+            .expire_batch(&mut conn, Utc::now(), 129)
+            .await
+            .is_err()
+    );
     let report = leases
-        .expire_batch(Utc::now(), 128)
+        .expire_batch(&mut conn, Utc::now(), 128)
         .await
         .expect("maximum expiry batch");
+    conn.commit().await.expect("commit expiry batch");
     assert_eq!(report.expired_leases, 0);
     assert_eq!(report.released_slots, 0);
 }
@@ -2445,7 +2482,8 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_missing_lease_terminal() {
         .expect("leased query");
     let query_id = sole_lease_id(&fixture).await;
     let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
-    sqlx::query("DELETE FROM vala.oracle_admission_leases WHERE query_id=$1")
+    sqlx::query("DELETE FROM vala.oracle_admission_leases WHERE data_tenant_id=$1 AND query_id=$2")
+        .bind(uuid::Uuid::from(fixture.tenant))
         .bind(query_id)
         .execute(&owner)
         .await
@@ -2499,8 +2537,10 @@ async fn pg_bifrost_oracle_recovery_terminal_journey_stale_fence_terminal() {
     let owner = fixture.pg.superuser_pool().await.expect("table-owner pool");
     sqlx::query(
         "UPDATE vala.oracle_admission_leases \
-         SET leader_fencing_token=leader_fencing_token+1 WHERE query_id=$1",
+         SET leader_fencing_token=leader_fencing_token+1 \
+         WHERE data_tenant_id=$1 AND query_id=$2",
     )
+    .bind(uuid::Uuid::from(fixture.tenant))
     .bind(query_id)
     .execute(&owner)
     .await
@@ -2618,19 +2658,12 @@ async fn oracle_lease_renewal_and_stream_drop_release() {
         .await
         .expect("leased stream");
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM vala.oracle_admission_leases")
-        .fetch_one(fixture.pg.operator_pool().pool())
-        .await
-        .expect("active lease");
+    let active = active_lease_count(&fixture).await;
     assert_eq!(active, 1);
     drop(stream);
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let active: i64 =
-                sqlx::query_scalar("SELECT count(*) FROM vala.oracle_admission_leases")
-                    .fetch_one(fixture.pg.operator_pool().pool())
-                    .await
-                    .expect("lease release query");
+            let active = active_lease_count(&fixture).await;
             if active == 0 {
                 break;
             }

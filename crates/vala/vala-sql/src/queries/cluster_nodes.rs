@@ -1,4 +1,8 @@
-//! Operator-owned role membership workflows.
+//! Tenant-scoped role membership workflows.
+//!
+//! Dynamic query is intentional: membership projections decode capability JSON
+//! through typed row conversions while every statement remains tenant-bound by
+//! both [`TenantConn`] RLS and an explicit `data_tenant_id` predicate.
 
 use chrono::{DateTime, Utc};
 use wyrd_spec::vala::api::{
@@ -6,19 +10,25 @@ use wyrd_spec::vala::api::{
 };
 
 use crate::row_types::cluster_nodes::{RegisteredRoleRow, RoleMutation, RoleRegistration};
-use crate::{OperatorPool, SqlError};
+use crate::{SqlError, TenantConn, ValaPostgres};
 
-/// Operator-pool owner for role-fenced cluster membership.
+/// SQL owner for role-fenced cluster membership.
 pub struct ClusterNodes {
-    /// Audited operator-role pool used for cluster-global membership state.
-    pool: OperatorPool,
+    /// Vala runtime handle from which callers open tenant transactions.
+    postgres: ValaPostgres,
 }
 
 impl ClusterNodes {
-    /// Constructs the membership owner.
+    /// Constructs the membership owner over the Vala runtime pool.
     #[must_use]
-    pub fn new(pool: OperatorPool) -> Self {
-        Self { pool }
+    pub fn new(postgres: ValaPostgres) -> Self {
+        Self { postgres }
+    }
+
+    /// Borrows the runtime handle used by the outer workflow to open transactions.
+    #[must_use]
+    pub fn postgres(&self) -> &ValaPostgres {
+        &self.postgres
     }
 
     /// Registers one role and atomically advances only its composite fence.
@@ -28,6 +38,7 @@ impl ClusterNodes {
     /// or database failures.
     pub async fn register(
         &self,
+        conn: &mut TenantConn<'_>,
         registration: &RoleRegistration,
     ) -> Result<RegisteredRoleRow, SqlError> {
         validate_role(
@@ -40,10 +51,10 @@ impl ClusterNodes {
             .map_err(|error| invariant(&error.to_string()))?;
         let row = sqlx::query_as::<_, ClusterNodeDbRow>(
             r#"INSERT INTO vala.cluster_nodes
-               (node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,
+               (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at,
                 capability_version, capabilities, ready)
-               VALUES ($1,$2,$3,1,$4,$4,1,$5,false)
-               ON CONFLICT (node_id, role) DO UPDATE SET
+               VALUES ($1,$2,$3,$4,1,$5,$5,1,$6,false)
+               ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE SET
                  advertise_addr=EXCLUDED.advertise_addr,
                  fencing_token=vala.cluster_nodes.fencing_token + 1,
                  started_at=EXCLUDED.started_at, heartbeat_at=EXCLUDED.heartbeat_at,
@@ -51,12 +62,13 @@ impl ClusterNodes {
                RETURNING node_id, role, advertise_addr, fencing_token, capability_version,
                          capabilities, ready, started_at, heartbeat_at"#,
         )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(registration.key.node_id.as_uuid())
         .bind(role)
         .bind(&registration.address)
         .bind(registration.started_at)
         .bind(capabilities)
-        .fetch_one(self.pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
         Ok(RegisteredRoleRow {
@@ -70,6 +82,7 @@ impl ClusterNodes {
     /// Returns [`SqlError`] for invalid capability data or database failures.
     pub async fn heartbeat(
         &self,
+        conn: &mut TenantConn<'_>,
         key: &ClusterNodeKey,
         fence: FencingToken,
         ready: bool,
@@ -79,15 +92,16 @@ impl ClusterNodes {
         let capabilities =
             serde_json::to_value(capabilities).map_err(|error| invariant(&error.to_string()))?;
         let result = sqlx::query(
-            "UPDATE vala.cluster_nodes SET heartbeat_at=now(), ready=$4, capabilities=$5 \
-             WHERE node_id=$1 AND role=$2 AND fencing_token=$3",
+            "UPDATE vala.cluster_nodes SET heartbeat_at=now(), ready=$5, capabilities=$6 \
+             WHERE data_tenant_id=$1 AND node_id=$2 AND role=$3 AND fencing_token=$4",
         )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(key.node_id.as_uuid())
         .bind(role_name(key.role))
         .bind(i64::try_from(fence).map_err(|_| invariant("fence exceeds i64"))?)
         .bind(ready)
         .bind(capabilities)
-        .execute(self.pool.pool())
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
         Ok(mutation(result.rows_affected()))
@@ -102,17 +116,19 @@ impl ClusterNodes {
     /// Returns [`SqlError`] for fence overflow or database failures.
     pub async fn unregister(
         &self,
+        conn: &mut TenantConn<'_>,
         key: &ClusterNodeKey,
         fence: FencingToken,
     ) -> Result<RoleMutation, SqlError> {
         let result = sqlx::query(
             "UPDATE vala.cluster_nodes SET ready=false, heartbeat_at=now() \
-             WHERE node_id=$1 AND role=$2 AND fencing_token=$3",
+             WHERE data_tenant_id=$1 AND node_id=$2 AND role=$3 AND fencing_token=$4",
         )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(key.node_id.as_uuid())
         .bind(role_name(key.role))
         .bind(i64::try_from(fence).map_err(|_| invariant("fence exceeds i64"))?)
-        .execute(self.pool.pool())
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
         Ok(mutation(result.rows_affected()))
@@ -126,17 +142,20 @@ impl ClusterNodes {
     /// Returns [`SqlError`] for malformed row/capability data or database failures.
     pub async fn list_live(
         &self,
+        conn: &mut TenantConn<'_>,
         role: ClusterRole,
         heartbeat_after: DateTime<Utc>,
     ) -> Result<Vec<ClusterRoleLease>, SqlError> {
         let rows = sqlx::query_as::<_, ClusterNodeDbRow>(
             "SELECT node_id, role, advertise_addr, fencing_token, capability_version, \
              capabilities, ready, started_at, heartbeat_at FROM vala.cluster_nodes \
-             WHERE role=$1 AND ready=true AND heartbeat_at >= $2 ORDER BY node_id",
+             WHERE data_tenant_id=$1 AND role=$2 AND ready=true AND heartbeat_at >= $3 \
+             ORDER BY node_id",
         )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(role_name(role))
         .bind(heartbeat_after)
-        .fetch_all(self.pool.pool())
+        .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
         rows.into_iter().map(TryInto::try_into).collect()

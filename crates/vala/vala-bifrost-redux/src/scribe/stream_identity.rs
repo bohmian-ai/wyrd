@@ -7,7 +7,7 @@
 
 use uuid::Uuid;
 #[cfg(feature = "test-support")]
-use vala_sql::OperatorPool;
+use vala_sql::ValaPostgres;
 #[cfg(feature = "test-support")]
 use wyrd_spec::vala::api::{NodeId as ClusterNodeId, ScribeCapabilitiesV1};
 
@@ -117,7 +117,7 @@ impl std::fmt::Display for StreamIdentity {
 /// epoch representation.
 #[cfg(feature = "test-support")]
 pub async fn acquire_on_boot(
-    pool: &OperatorPool,
+    postgres: &ValaPostgres,
     node_id: NodeId,
     role: &str,
     advertise_addr: &str,
@@ -127,7 +127,7 @@ pub async fn acquire_on_boot(
             detail: "stream identity exists only for the Scribe role".to_owned(),
         });
     }
-    let registry = ClusterRegistry::new(pool.clone(), ClusterNodeId::new(node_id.as_uuid()));
+    let registry = ClusterRegistry::new(postgres.clone(), ClusterNodeId::new(node_id.as_uuid()));
     let registered = registry
         .register_scribe(
             advertise_addr,

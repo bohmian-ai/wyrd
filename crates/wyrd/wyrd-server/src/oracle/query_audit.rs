@@ -275,10 +275,8 @@ mod tests {
         vala_bifrost_redux::cluster::RegisteredRole,
     ) {
         let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
-        let cluster = Arc::new(ClusterRegistry::new(
-            crate::test_support::test_operator_pool().await,
-            node_id,
-        ));
+        let vala = crate::test_support::test_vala_postgres().await;
+        let cluster = Arc::new(ClusterRegistry::new(vala.clone(), node_id));
         let role = cluster
             .reserve_oracle(
                 "127.0.0.1:50052",
@@ -299,13 +297,10 @@ mod tests {
             .expect("reserve Oracle");
         cluster.activate(&role).await.expect("activate Oracle");
         cluster.refresh_snapshot().await.expect("Oracle snapshot");
-        let vala = crate::test_support::test_vala_postgres().await;
         let oracle = Oracle::new(OracleBuildConfig {
             catalog: crate::test_support::test_redux_catalog().await,
+            admission_leases: OracleAdmissionLeases::new(vala.clone()),
             vala,
-            admission_leases: OracleAdmissionLeases::new(
-                crate::test_support::test_operator_pool().await,
-            ),
             cluster: Arc::clone(&cluster),
             local_role: role.clone(),
             local_slots: Arc::new(OracleSlotManager::new(16, 16)),

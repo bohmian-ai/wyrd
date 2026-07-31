@@ -92,14 +92,17 @@ mod pg_tests {
             assert_eq!(count, 0, "forbidden column {table}.{column} is absent");
         }
 
-        let nil_tenant = uuid::Uuid::nil();
-        let nil_count: i64 =
+        let system_tenant = uuid::Uuid::from(DataTenantId::SYSTEM_OWNER);
+        let system_tenant_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM platform.tenants WHERE data_tenant_id = $1")
-                .bind(nil_tenant)
+                .bind(system_tenant)
                 .fetch_one(&superuser)
                 .await
                 .unwrap();
-        assert_eq!(nil_count, 0, "fresh migrations do not create a nil tenant");
+        assert_eq!(
+            system_tenant_count, 1,
+            "fresh migrations retain exactly one canonical system tenant"
+        );
 
         let table_count: i64 =
             sqlx::query_scalar("SELECT count(*) FROM vala.bifrost_tables WHERE table_uid = $1")

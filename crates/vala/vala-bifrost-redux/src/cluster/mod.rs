@@ -13,7 +13,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vala_sql::queries::cluster_nodes::ClusterNodes;
 use vala_sql::row_types::cluster_nodes::{RoleMutation, RoleRegistration};
-use vala_sql::{OperatorPool, SqlError};
+use vala_sql::{SqlError, ValaPostgres};
+use wyrd_spec::DataTenantId;
 use wyrd_spec::vala::api::{
     ClusterCapabilities, ClusterNodeKey, ClusterRole, ClusterRoleLease, NodeId,
     OracleCapabilitiesV1, ScribeCapabilitiesV1,
@@ -27,7 +28,7 @@ pub const ROLE_LIVENESS_CUTOFF: Duration = Duration::from_secs(15);
 /// Cluster membership operation failure.
 #[derive(Debug, Error)]
 pub enum ClusterError {
-    /// The role registry could not complete its operator-owned SQL operation.
+    /// The role registry could not complete its tenant-bound SQL operation.
     #[error("cluster membership operation failed: {0}")]
     Sql(#[from] SqlError),
     /// A role instance lost its independent fence before a lifecycle update.
@@ -130,11 +131,11 @@ pub struct ClusterRegistry {
 }
 
 impl ClusterRegistry {
-    /// Creates a registry for the server-owned operator pool and pod node identity.
+    /// Creates a registry for the Vala runtime pool and pod node identity.
     #[must_use]
-    pub fn new(pool: OperatorPool, node_id: NodeId) -> Self {
+    pub fn new(postgres: ValaPostgres, node_id: NodeId) -> Self {
         Self {
-            nodes: ClusterNodes::new(pool),
+            nodes: ClusterNodes::new(postgres),
             node_id,
             snapshot: ArcSwap::from_pointee(ClusterSnapshot::default()),
         }
@@ -233,8 +234,20 @@ impl ClusterRegistry {
                     detail: error.to_string(),
                 })
             })?;
-        let scribes = self.nodes.list_live(ClusterRole::Scribe, cutoff).await?;
-        let oracles = self.nodes.list_live(ClusterRole::Oracle, cutoff).await?;
+        let mut conn = self
+            .nodes
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let scribes = self
+            .nodes
+            .list_live(&mut conn, ClusterRole::Scribe, cutoff)
+            .await?;
+        let oracles = self
+            .nodes
+            .list_live(&mut conn, ClusterRole::Oracle, cutoff)
+            .await?;
+        conn.commit().await?;
         self.snapshot.store(Arc::new(ClusterSnapshot::new(
             scribes.into_iter().chain(oracles).collect(),
         )));
@@ -385,16 +398,23 @@ impl ClusterRegistry {
         registered: &RegisteredRole,
         ready: bool,
     ) -> Result<(), ClusterError> {
-        match self
+        let mut conn = self
+            .nodes
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let mutation = self
             .nodes
             .heartbeat(
+                &mut conn,
                 &registered.key,
                 registered.fencing_token,
                 ready,
                 &registered.capabilities,
             )
-            .await?
-        {
+            .await?;
+        conn.commit().await?;
+        match mutation {
             RoleMutation::Applied => Ok(()),
             RoleMutation::StaleFence => Err(ClusterError::StaleFence),
         }
@@ -407,11 +427,17 @@ impl ClusterRegistry {
     /// Returns [`ClusterError::StaleFence`] if the role was replaced, or
     /// [`ClusterError::Sql`] if durable membership cannot be updated.
     pub async fn shutdown_role(&self, registered: RegisteredRole) -> Result<(), ClusterError> {
-        match self
+        let mut conn = self
             .nodes
-            .unregister(&registered.key, registered.fencing_token)
-            .await?
-        {
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let mutation = self
+            .nodes
+            .unregister(&mut conn, &registered.key, registered.fencing_token)
+            .await?;
+        conn.commit().await?;
+        match mutation {
             RoleMutation::Applied => Ok(()),
             RoleMutation::StaleFence => Err(ClusterError::StaleFence),
         }
@@ -434,7 +460,13 @@ impl ClusterRegistry {
             capabilities: capabilities.clone(),
             started_at: Utc::now(),
         };
-        let registered = self.nodes.register(&registration).await?;
+        let mut conn = self
+            .nodes
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let registered = self.nodes.register(&mut conn, &registration).await?;
+        conn.commit().await?;
         let role = RegisteredRole {
             key,
             fencing_token: registered.lease.fencing_token,

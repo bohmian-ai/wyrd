@@ -20,28 +20,36 @@ mod pg_tests {
     use vala_bifrost_redux::contracts::ScribeError;
     use vala_bifrost_redux::scribe::registry::{ScribeHeartbeat, heartbeat_tick, live_scribes};
     use vala_bifrost_redux::scribe::stream_identity::{NodeId, acquire_on_boot};
-    use vala_sql::OperatorPool;
+    use vala_sql::ValaPostgres;
     use wyrd_dev_fixtures::pg::PgFixture;
+    use wyrd_spec::DataTenantId;
 
     const TICK: Duration = Duration::from_millis(200);
 
-    async fn setup() -> (PgFixture, OperatorPool) {
+    async fn setup() -> (PgFixture, ValaPostgres) {
         let fixture = PgFixture::start().await.expect("fixture");
-        let pool = fixture.operator_pool().clone();
-        (fixture, pool)
+        let postgres = fixture.vala_postgres().clone();
+        (fixture, postgres)
     }
 
     async fn read_row(
-        pool: &OperatorPool,
+        postgres: &ValaPostgres,
         node_id: NodeId,
     ) -> (i64, chrono::DateTime<chrono::Utc>) {
+        let mut conn = postgres
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await
+            .expect("system tenant connection");
         let row: (i64, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
-            "SELECT fencing_token, heartbeat_at FROM vala.cluster_nodes WHERE node_id = $1",
+            "SELECT fencing_token, heartbeat_at FROM vala.cluster_nodes \
+             WHERE data_tenant_id = $1 AND node_id = $2",
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(node_id.as_uuid())
-        .fetch_one(pool.pool())
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("cluster_nodes row");
+        conn.commit().await.expect("commit row read");
         row
     }
 
@@ -51,21 +59,21 @@ mod pg_tests {
             eprintln!("skipping: WYRD_DATABASE_URL unset");
             return;
         }
-        let (_fixture, pool) = setup().await;
+        let (_fixture, postgres) = setup().await;
         let node_id = NodeId::generate();
-        acquire_on_boot(&pool, node_id, "scribe", "127.0.0.1:9000")
+        acquire_on_boot(&postgres, node_id, "scribe", "127.0.0.1:9000")
             .await
             .expect("acquire");
 
-        let (_, initial_heartbeat) = read_row(&pool, node_id).await;
+        let (_, initial_heartbeat) = read_row(&postgres, node_id).await;
 
-        let heartbeat = ScribeHeartbeat::start(pool.clone(), node_id, TICK);
+        let heartbeat = ScribeHeartbeat::start(postgres.clone(), node_id, TICK);
 
         let mut samples = vec![initial_heartbeat];
         let deadline = std::time::Instant::now() + TICK * 8;
         while std::time::Instant::now() < deadline {
             tokio::time::sleep(TICK / 2).await;
-            let (_, latest) = read_row(&pool, node_id).await;
+            let (_, latest) = read_row(&postgres, node_id).await;
             if samples.last().copied() != Some(latest) {
                 samples.push(latest);
             }
@@ -84,20 +92,21 @@ mod pg_tests {
 
     #[tokio::test]
     async fn scribe_heartbeat_errors_when_row_missing() {
-        let (fixture, pool) = setup().await;
+        let (fixture, postgres) = setup().await;
         let node_id = NodeId::generate();
-        acquire_on_boot(&pool, node_id, "scribe", "127.0.0.1:9003")
+        acquire_on_boot(&postgres, node_id, "scribe", "127.0.0.1:9003")
             .await
             .expect("acquire");
 
         let superuser = fixture.superuser_pool().await.expect("superuser pool");
-        sqlx::query("DELETE FROM vala.cluster_nodes WHERE node_id = $1")
+        sqlx::query("DELETE FROM vala.cluster_nodes WHERE data_tenant_id = $1 AND node_id = $2")
+            .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
             .bind(node_id.as_uuid())
             .execute(&superuser)
             .await
             .expect("delete cluster_nodes row");
 
-        match heartbeat_tick(&pool, node_id).await {
+        match heartbeat_tick(&postgres, node_id).await {
             Err(ScribeError::Internal { detail }) => {
                 assert!(
                     detail.contains("cluster_nodes row missing"),
@@ -115,22 +124,22 @@ mod pg_tests {
             eprintln!("skipping: WYRD_DATABASE_URL unset");
             return;
         }
-        let (_fixture, pool) = setup().await;
+        let (_fixture, postgres) = setup().await;
         let node_id = NodeId::generate();
-        let identity = acquire_on_boot(&pool, node_id, "scribe", "127.0.0.1:9001")
+        let identity = acquire_on_boot(&postgres, node_id, "scribe", "127.0.0.1:9001")
             .await
             .expect("acquire");
 
-        let (epoch_before, _) = read_row(&pool, node_id).await;
+        let (epoch_before, _) = read_row(&postgres, node_id).await;
         assert_eq!(
             epoch_before,
             identity.writer_epoch.as_i64(),
             "sanity: acquire_on_boot returned the row's fencing_token",
         );
 
-        let heartbeat = ScribeHeartbeat::start(pool.clone(), node_id, TICK);
+        let heartbeat = ScribeHeartbeat::start(postgres.clone(), node_id, TICK);
         tokio::time::sleep(TICK * 4).await; // ≥3 heartbeat cycles
-        let (epoch_after, _) = read_row(&pool, node_id).await;
+        let (epoch_after, _) = read_row(&postgres, node_id).await;
         heartbeat.shutdown();
 
         assert_eq!(
@@ -145,21 +154,27 @@ mod pg_tests {
             eprintln!("skipping: WYRD_DATABASE_URL unset");
             return;
         }
-        let (_fixture, pool) = setup().await;
+        let (_fixture, postgres) = setup().await;
         let stale_node = NodeId::generate();
 
+        let mut conn = postgres
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await
+            .expect("system tenant connection");
         sqlx::query(
             "INSERT INTO vala.cluster_nodes
-                (node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at)
-             VALUES ($1, 'scribe', $2, 7, now() - interval '30 seconds', now() - interval '30 seconds')",
+                (data_tenant_id, node_id, role, advertise_addr, fencing_token, started_at, heartbeat_at)
+             VALUES ($1, $2, 'scribe', $3, 7, now() - interval '30 seconds', now() - interval '30 seconds')",
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(stale_node.as_uuid())
         .bind("127.0.0.1:9002")
-        .execute(pool.pool())
+        .execute(&mut **conn.transaction())
         .await
         .expect("insert stale");
+        conn.commit().await.expect("commit stale row");
 
-        let live = live_scribes(&pool).await.expect("live_scribes");
+        let live = live_scribes(&postgres).await.expect("live_scribes");
         assert!(
             !live.iter().any(|s| s.node_id == stale_node),
             "row with heartbeat_at 30s old must be filtered by the 15s liveness window (got: {live:?})",
@@ -172,17 +187,17 @@ mod pg_tests {
             eprintln!("skipping: WYRD_DATABASE_URL unset");
             return;
         }
-        let (_fixture, pool) = setup().await;
+        let (_fixture, postgres) = setup().await;
         let node_id = NodeId::generate();
         let advertise_addr = format!(
             "127.0.0.1:{}",
             9100_u16 + u16::try_from(Uuid::now_v7().as_u128() % 500).expect("port offset < 500")
         );
-        let identity = acquire_on_boot(&pool, node_id, "scribe", &advertise_addr)
+        let identity = acquire_on_boot(&postgres, node_id, "scribe", &advertise_addr)
             .await
             .expect("acquire");
 
-        let live = live_scribes(&pool).await.expect("live_scribes");
+        let live = live_scribes(&postgres).await.expect("live_scribes");
         let mine = live
             .iter()
             .find(|s| s.node_id == node_id)

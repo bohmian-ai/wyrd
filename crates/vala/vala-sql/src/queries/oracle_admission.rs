@@ -1,60 +1,82 @@
-//! Durable, operator-owned Oracle admission transactions.
+//! Durable request-tenant Oracle admission with deployment-wide cluster accounting.
+//!
+//! Dynamic query is intentional: admission selects closed runtime scopes while
+//! every statement remains constrained by [`TenantConn`] RLS and an explicit
+//! `data_tenant_id` predicate to either request-owned rows or the bounded
+//! `SYSTEM_OWNER` cluster/class counters.
 
 use chrono::{DateTime, Utc};
-use wyrd_spec::vala::api::{AdmissionScope, OracleAdmissionLease, QueryClass, QueryId};
+use wyrd_spec::{
+    DataTenantId,
+    vala::api::{AdmissionScope, OracleAdmissionLease, QueryClass, QueryId},
+};
 
-use crate::operator_transaction::OperatorTransaction;
 use crate::row_types::oracle_admission::{
     AdmissionAcquire, AdmissionExpiryReport, AdmissionLeaseRow, AdmissionReconcileScope,
     AdmissionReconciliationReport, AdmissionRequest, LeaseMutation, RoleFence,
 };
-use crate::{OperatorPool, SqlError};
+use crate::{SqlError, TenantConn, ValaPostgres};
 
 /// Stable bounded retry hint returned for admission-capacity rejection.
 const RETRY_AFTER_MS: u64 = 1_000;
 
-/// Operator-pool owner for admission leases and counters.
+/// SQL owner for tenant-scoped leases and shared cluster/class counters.
 pub struct OracleAdmissionLeases {
-    /// Audited operator-role pool used for cluster-global admission state.
-    pool: OperatorPool,
+    /// Vala runtime handle from which outer workflows open tenant transactions.
+    postgres: ValaPostgres,
 }
 
 impl OracleAdmissionLeases {
-    /// Constructs the durable admission owner.
+    /// Constructs the durable admission owner over the Vala runtime pool.
     #[must_use]
-    pub fn new(pool: OperatorPool) -> Self {
-        Self { pool }
+    pub fn new(postgres: ValaPostgres) -> Self {
+        Self { postgres }
     }
 
-    /// Atomically locks and enforces cluster, class, and tenant counters.
+    /// Borrows the runtime handle used by outer admission workflows.
+    #[must_use]
+    pub fn postgres(&self) -> &ValaPostgres {
+        &self.postgres
+    }
+
+    /// Atomically locks shared cluster/class and request-tenant counters.
     ///
     /// # Errors
     /// Returns [`SqlError`] for invalid demand/limits, duplicate leases, or
     /// database failures. Rejection commits no lease or counter increment.
-    pub async fn acquire(&self, request: &AdmissionRequest) -> Result<AdmissionAcquire, SqlError> {
+    pub async fn acquire(
+        &self,
+        conn: &mut TenantConn<'_>,
+        request: &AdmissionRequest,
+    ) -> Result<AdmissionAcquire, SqlError> {
         validate_request(request)?;
-        let mut tx = OperatorTransaction::start(&self.pool).await?;
+        validate_tenant(conn, request.lease.data_tenant_id)?;
+        let data_tenant_id = uuid::Uuid::from(conn.data_tenant_id());
+        let shared_owner = uuid::Uuid::from(DataTenantId::SYSTEM_OWNER);
         let class = class_name(request.lease.query_class);
         let tenant = request.lease.data_tenant_id.to_string();
-        for (kind, key, accounting_class) in [
-            ("cluster", "global", "all"),
-            ("class", "global", class),
-            ("tenant", tenant.as_str(), class),
+        for (owner, kind, key, accounting_class) in [
+            (shared_owner, "cluster", "global", "all"),
+            (shared_owner, "class", "global", class),
+            (data_tenant_id, "tenant", tenant.as_str(), class),
         ] {
             sqlx::query(
                 "INSERT INTO vala.oracle_admission_accounting \
-                 (scope_kind,scope_key,accounting_class,used_slots) VALUES ($1,$2,$3,0) \
+                 (data_tenant_id,scope_kind,scope_key,accounting_class,used_slots) \
+                 VALUES ($1,$2,$3,$4,0) \
                  ON CONFLICT DO NOTHING",
             )
+            .bind(owner)
             .bind(kind)
             .bind(key)
             .bind(accounting_class)
-            .execute(tx.connection())
+            .execute(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?;
         }
-        for (kind, key, accounting_class, limit, scope) in [
+        for (owner, kind, key, accounting_class, limit, scope) in [
             (
+                shared_owner,
                 "cluster",
                 "global",
                 "all",
@@ -62,6 +84,7 @@ impl OracleAdmissionLeases {
                 AdmissionScope::Cluster,
             ),
             (
+                shared_owner,
                 "class",
                 "global",
                 class,
@@ -69,6 +92,7 @@ impl OracleAdmissionLeases {
                 AdmissionScope::Class,
             ),
             (
+                data_tenant_id,
                 "tenant",
                 tenant.as_str(),
                 class,
@@ -78,41 +102,43 @@ impl OracleAdmissionLeases {
         ] {
             let used: i64 = sqlx::query_scalar(
                 "SELECT used_slots FROM vala.oracle_admission_accounting \
-                 WHERE scope_kind=$1 AND scope_key=$2 AND accounting_class=$3 FOR UPDATE",
+                 WHERE data_tenant_id=$1 AND scope_kind=$2 AND scope_key=$3 \
+                 AND accounting_class=$4 FOR UPDATE",
             )
+            .bind(owner)
             .bind(kind)
             .bind(key)
             .bind(accounting_class)
-            .fetch_one(tx.connection())
+            .fetch_one(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?;
             if used + i64::from(request.lease.slot_units) > i64::from(limit) {
-                tx.cancel().await?;
                 return Ok(AdmissionAcquire::Rejected {
                     scope,
                     retry_after_ms: RETRY_AFTER_MS,
                 });
             }
         }
-        for (kind, key, accounting_class) in [
-            ("cluster", "global", "all"),
-            ("class", "global", class),
-            ("tenant", tenant.as_str(), class),
+        for (owner, kind, key, accounting_class) in [
+            (shared_owner, "cluster", "global", "all"),
+            (shared_owner, "class", "global", class),
+            (data_tenant_id, "tenant", tenant.as_str(), class),
         ] {
             sqlx::query(
-                "UPDATE vala.oracle_admission_accounting SET used_slots=used_slots+$4, \
-                 updated_at=now() WHERE scope_kind=$1 AND scope_key=$2 AND accounting_class=$3",
+                "UPDATE vala.oracle_admission_accounting SET used_slots=used_slots+$5, \
+                 updated_at=now() WHERE data_tenant_id=$1 AND scope_kind=$2 \
+                 AND scope_key=$3 AND accounting_class=$4",
             )
+            .bind(owner)
             .bind(kind)
             .bind(key)
             .bind(accounting_class)
             .bind(i64::from(request.lease.slot_units))
-            .execute(tx.connection())
+            .execute(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?;
         }
-        insert_lease(&mut tx, &request.lease).await?;
-        tx.finish().await?;
+        insert_lease(conn, &request.lease).await?;
         Ok(AdmissionAcquire::Acquired(request.lease.clone()))
     }
 
@@ -124,32 +150,32 @@ impl OracleAdmissionLeases {
     /// Returns [`SqlError`] for invalid expiry or database failures.
     pub async fn renew(
         &self,
+        conn: &mut TenantConn<'_>,
         query_id: QueryId,
         leader: &RoleFence,
         new_expiry: DateTime<Utc>,
     ) -> Result<LeaseMutation, SqlError> {
-        let mut tx = OperatorTransaction::start(&self.pool).await?;
-        let Some(row) = lock_lease(&mut tx, query_id).await? else {
-            tx.finish().await?;
+        let Some(row) = lock_lease(conn, query_id).await? else {
             return Ok(LeaseMutation::Missing);
         };
         if !leader_matches(&row, leader)? {
-            tx.cancel().await?;
             return Ok(LeaseMutation::StaleLeaderFence);
         }
         if row.expires_at <= Utc::now() || new_expiry <= Utc::now() {
-            tx.finish().await?;
             return Ok(LeaseMutation::Missing);
         }
-        sqlx::query("UPDATE vala.oracle_admission_leases SET expires_at=$2 WHERE query_id=$1")
-            .bind(query_id.as_uuid())
-            .bind(new_expiry)
-            .execute(tx.connection())
-            .await
-            .map_err(SqlError::from)?;
-        let mut lease = row_to_lease(&mut tx, row).await?;
+        sqlx::query(
+            "UPDATE vala.oracle_admission_leases SET expires_at=$3 \
+             WHERE data_tenant_id=$1 AND query_id=$2",
+        )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
+        .bind(query_id.as_uuid())
+        .bind(new_expiry)
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
+        let mut lease = row_to_lease(conn, row).await?;
         lease.expires_at = new_expiry;
-        tx.finish().await?;
         Ok(LeaseMutation::Renewed(lease))
     }
 
@@ -159,20 +185,17 @@ impl OracleAdmissionLeases {
     /// Returns [`SqlError`] for malformed stored state or database failures.
     pub async fn release(
         &self,
+        conn: &mut TenantConn<'_>,
         query_id: QueryId,
         leader: &RoleFence,
     ) -> Result<LeaseMutation, SqlError> {
-        let mut tx = OperatorTransaction::start(&self.pool).await?;
-        let Some(row) = lock_lease(&mut tx, query_id).await? else {
-            tx.finish().await?;
+        let Some(row) = lock_lease(conn, query_id).await? else {
             return Ok(LeaseMutation::AlreadyReleased);
         };
         if !leader_matches(&row, leader)? {
-            tx.cancel().await?;
             return Ok(LeaseMutation::StaleLeaderFence);
         }
-        decrement_and_delete(&mut tx, &row).await?;
-        tx.finish().await?;
+        decrement_and_delete(conn, &row).await?;
         Ok(LeaseMutation::Released)
     }
 
@@ -183,22 +206,24 @@ impl OracleAdmissionLeases {
     /// counters would underflow, or the transaction fails.
     pub async fn expire_batch(
         &self,
+        conn: &mut TenantConn<'_>,
         now: DateTime<Utc>,
         max_leases: u16,
     ) -> Result<AdmissionExpiryReport, SqlError> {
         if !(1..=128).contains(&max_leases) {
             return Err(invariant("expiry batch must be 1..=128"));
         }
-        let mut tx = OperatorTransaction::start(&self.pool).await?;
         let rows = sqlx::query_as::<_, AdmissionLeaseRow>(
             "SELECT query_id,data_tenant_id,query_class,slot_units,leader_node_id,\
              leader_fencing_token,acquired_at,expires_at FROM vala.oracle_admission_leases \
-             WHERE expires_at <= $1 ORDER BY expires_at,query_id LIMIT $2 \
+             WHERE data_tenant_id=$1 AND expires_at <= $2 \
+             ORDER BY expires_at,query_id LIMIT $3 \
              FOR UPDATE SKIP LOCKED",
         )
+        .bind(uuid::Uuid::from(conn.data_tenant_id()))
         .bind(now)
         .bind(i64::from(max_leases))
-        .fetch_all(tx.connection())
+        .fetch_all(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
         let released_slots = rows.iter().try_fold(0_u64, |sum, row| {
@@ -207,29 +232,38 @@ impl OracleAdmissionLeases {
                 .map_err(|_| invariant("negative lease slots"))
         })?;
         for row in &rows {
-            decrement_and_delete(&mut tx, row).await?;
+            decrement_and_delete(conn, row).await?;
         }
         let expired_leases =
             u16::try_from(rows.len()).map_err(|_| invariant("expiry count overflow"))?;
-        tx.finish().await?;
         Ok(AdmissionExpiryReport {
             expired_leases,
             released_slots,
         })
     }
 
-    /// Recomputes only the supplied bounded, distinct accounting scopes.
+    /// Recomputes request-tenant scopes and validates locked shared counters.
+    ///
+    /// Cluster and class accounting are exact transaction invariants maintained
+    /// by acquire, release, and expiry. Reconciliation never scans other
+    /// tenants' leases to reconstruct them.
     ///
     /// # Errors
     /// Returns [`SqlError`] for empty, duplicate, or over-64 scope input, or
     /// database failures.
     pub async fn reconcile_scopes(
         &self,
+        conn: &mut TenantConn<'_>,
         scopes: &[AdmissionReconcileScope],
         now: DateTime<Utc>,
     ) -> Result<AdmissionReconciliationReport, SqlError> {
         if scopes.is_empty() || scopes.len() > 64 {
             return Err(invariant("reconciliation scopes must be 1..=64"));
+        }
+        for scope in scopes {
+            if let AdmissionReconcileScope::Tenant { data_tenant_id, .. } = scope {
+                validate_tenant(conn, *data_tenant_id)?;
+            }
         }
         let mut keys = scopes.iter().map(scope_key).collect::<Vec<_>>();
         keys.sort();
@@ -237,48 +271,72 @@ impl OracleAdmissionLeases {
         if keys.len() != scopes.len() {
             return Err(invariant("duplicate reconciliation scope"));
         }
-        let mut tx = OperatorTransaction::start(&self.pool).await?;
+        let data_tenant_id = uuid::Uuid::from(conn.data_tenant_id());
+        let shared_owner = uuid::Uuid::from(DataTenantId::SYSTEM_OWNER);
         let mut repaired = 0_u8;
         let mut unchanged = 0_u8;
-        for (_, kind, key, accounting_class, filter_tenant) in keys {
-            sqlx::query(
-                "INSERT INTO vala.oracle_admission_accounting \
-                 (scope_kind,scope_key,accounting_class,used_slots) VALUES ($1,$2,$3,0) \
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(kind)
-            .bind(&key)
-            .bind(accounting_class)
-            .execute(tx.connection())
-            .await
-            .map_err(SqlError::from)?;
-            let _: i64 = sqlx::query_scalar(
+        for (_, kind, key, accounting_class) in keys {
+            let owner = if matches!(kind, "cluster" | "class") {
+                shared_owner
+            } else {
+                data_tenant_id
+            };
+            if kind == "tenant" {
+                sqlx::query(
+                    "INSERT INTO vala.oracle_admission_accounting \
+                     (data_tenant_id,scope_kind,scope_key,accounting_class,used_slots) \
+                     VALUES ($1,$2,$3,$4,0) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(owner)
+                .bind(kind)
+                .bind(&key)
+                .bind(accounting_class)
+                .execute(&mut **conn.transaction())
+                .await
+                .map_err(SqlError::from)?;
+            }
+            let used: i64 = sqlx::query_scalar(
                 "SELECT used_slots FROM vala.oracle_admission_accounting \
-                 WHERE scope_kind=$1 AND scope_key=$2 AND accounting_class=$3 FOR UPDATE",
+                 WHERE data_tenant_id=$1 AND scope_kind=$2 AND scope_key=$3 \
+                 AND accounting_class=$4 FOR UPDATE",
             )
+            .bind(owner)
             .bind(kind)
             .bind(&key)
             .bind(accounting_class)
-            .fetch_one(tx.connection())
+            .fetch_one(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?;
             let authoritative: i64 = match kind {
-                "cluster" => sqlx::query_scalar("SELECT COALESCE(sum(slot_units),0)::bigint FROM vala.oracle_admission_leases WHERE expires_at > $1")
-                    .bind(now).fetch_one(tx.connection()).await.map_err(SqlError::from)?,
-                "class" => sqlx::query_scalar("SELECT COALESCE(sum(slot_units),0)::bigint FROM vala.oracle_admission_leases WHERE expires_at > $1 AND query_class=$2")
-                    .bind(now).bind(accounting_class).fetch_one(tx.connection()).await.map_err(SqlError::from)?,
-                _ => sqlx::query_scalar("SELECT COALESCE(sum(slot_units),0)::bigint FROM vala.oracle_admission_leases WHERE expires_at > $1 AND query_class=$2 AND data_tenant_id=$3")
-                    .bind(now).bind(accounting_class).bind(filter_tenant.expect("tenant scope has tenant")).fetch_one(tx.connection()).await.map_err(SqlError::from)?,
+                // Deployment-wide counters are maintained exactly by every
+                // lease mutation. Request tenants may lock them, but never
+                // scan other tenants' leases to reconstruct them.
+                "cluster" | "class" => used,
+                "tenant" => sqlx::query_scalar(
+                    "SELECT COALESCE(sum(slot_units),0)::bigint \
+                     FROM vala.oracle_admission_leases \
+                     WHERE data_tenant_id=$1 AND expires_at > $2 AND query_class=$3",
+                )
+                .bind(data_tenant_id)
+                .bind(now)
+                .bind(accounting_class)
+                .fetch_one(&mut **conn.transaction())
+                .await
+                .map_err(SqlError::from)?,
+                _ => return Err(invariant("unknown reconciliation scope")),
             };
             let changed = sqlx::query(
-                "UPDATE vala.oracle_admission_accounting SET used_slots=$4,updated_at=now() \
-                 WHERE scope_kind=$1 AND scope_key=$2 AND accounting_class=$3 AND used_slots<>$4",
+                "UPDATE vala.oracle_admission_accounting SET used_slots=$5,updated_at=now() \
+                 WHERE data_tenant_id=$1 AND scope_kind=$2 AND scope_key=$3 \
+                 AND accounting_class=$4 AND used_slots<>$5",
             )
+            .bind(owner)
             .bind(kind)
             .bind(&key)
             .bind(accounting_class)
             .bind(authoritative)
-            .execute(tx.connection())
+            .execute(&mut **conn.transaction())
             .await
             .map_err(SqlError::from)?
             .rows_affected()
@@ -289,7 +347,6 @@ impl OracleAdmissionLeases {
                 unchanged += 1;
             }
         }
-        tx.finish().await?;
         Ok(AdmissionReconciliationReport {
             repaired_scopes: repaired,
             unchanged_scopes: unchanged,
@@ -301,21 +358,23 @@ impl OracleAdmissionLeases {
 ///
 /// # Errors
 /// Returns [`SqlError`] for numeric overflow, duplicate nodes, or database
-/// failures. Mutations remain uncommitted in `tx`.
+/// failures. Mutations remain uncommitted in `conn`.
 async fn insert_lease(
-    tx: &mut OperatorTransaction,
+    conn: &mut TenantConn<'_>,
     lease: &OracleAdmissionLease,
 ) -> Result<(), SqlError> {
+    validate_tenant(conn, lease.data_tenant_id)?;
+    let data_tenant_id = uuid::Uuid::from(conn.data_tenant_id());
     sqlx::query("INSERT INTO vala.oracle_admission_leases \
-        (query_id,data_tenant_id,query_class,slot_units,leader_node_id,leader_fencing_token,acquired_at,expires_at) \
+        (data_tenant_id,query_id,query_class,slot_units,leader_node_id,leader_fencing_token,acquired_at,expires_at) \
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)")
-        .bind(lease.query_id.as_uuid()).bind(uuid::Uuid::from(lease.data_tenant_id))
+        .bind(data_tenant_id).bind(lease.query_id.as_uuid())
         .bind(class_name(lease.query_class))
         .bind(i32::try_from(lease.slot_units).map_err(|_| invariant("slot demand exceeds i32"))?)
         .bind(lease.leader_node_id.as_uuid())
         .bind(i64::try_from(lease.leader_fencing_token).map_err(|_| invariant("leader fence exceeds i64"))?)
         .bind(lease.acquired_at).bind(lease.expires_at)
-        .execute(tx.connection()).await.map_err(SqlError::from)?;
+        .execute(&mut **conn.transaction()).await.map_err(SqlError::from)?;
     let mut nodes = lease.selected_node_ids.clone();
     nodes.sort();
     nodes.dedup();
@@ -323,12 +382,16 @@ async fn insert_lease(
         return Err(invariant("duplicate selected node"));
     }
     for node in nodes {
-        sqlx::query("INSERT INTO vala.oracle_admission_nodes (query_id,node_id) VALUES ($1,$2)")
-            .bind(lease.query_id.as_uuid())
-            .bind(node.as_uuid())
-            .execute(tx.connection())
-            .await
-            .map_err(SqlError::from)?;
+        sqlx::query(
+            "INSERT INTO vala.oracle_admission_nodes (data_tenant_id,query_id,node_id) \
+             VALUES ($1,$2,$3)",
+        )
+        .bind(data_tenant_id)
+        .bind(lease.query_id.as_uuid())
+        .bind(node.as_uuid())
+        .execute(&mut **conn.transaction())
+        .await
+        .map_err(SqlError::from)?;
     }
     Ok(())
 }
@@ -338,16 +401,17 @@ async fn insert_lease(
 /// # Errors
 /// Returns [`SqlError`] when PostgreSQL cannot execute the locking read.
 async fn lock_lease(
-    tx: &mut OperatorTransaction,
+    conn: &mut TenantConn<'_>,
     query_id: QueryId,
 ) -> Result<Option<AdmissionLeaseRow>, SqlError> {
     sqlx::query_as(
         "SELECT query_id,data_tenant_id,query_class,slot_units,leader_node_id,\
         leader_fencing_token,acquired_at,expires_at FROM vala.oracle_admission_leases \
-        WHERE query_id=$1 FOR UPDATE",
+        WHERE data_tenant_id=$1 AND query_id=$2 FOR UPDATE",
     )
+    .bind(uuid::Uuid::from(conn.data_tenant_id()))
     .bind(query_id.as_uuid())
-    .fetch_optional(tx.connection())
+    .fetch_optional(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)
 }
@@ -357,26 +421,32 @@ async fn lock_lease(
 /// # Errors
 /// Returns [`SqlError`] for missing/underflowing counters or database failure.
 async fn decrement_and_delete(
-    tx: &mut OperatorTransaction,
+    conn: &mut TenantConn<'_>,
     row: &AdmissionLeaseRow,
 ) -> Result<(), SqlError> {
+    let data_tenant_id = uuid::Uuid::from(conn.data_tenant_id());
+    let shared_owner = uuid::Uuid::from(DataTenantId::SYSTEM_OWNER);
+    if row.data_tenant_id != data_tenant_id {
+        return Err(invariant("locked lease tenant does not match transaction"));
+    }
     let class = row.query_class.as_str();
     let tenant = row.data_tenant_id.to_string();
-    for (kind, key, accounting_class) in [
-        ("cluster", "global", "all"),
-        ("class", "global", class),
-        ("tenant", tenant.as_str(), class),
+    for (owner, kind, key, accounting_class) in [
+        (shared_owner, "cluster", "global", "all"),
+        (shared_owner, "class", "global", class),
+        (data_tenant_id, "tenant", tenant.as_str(), class),
     ] {
         let changed = sqlx::query(
             "UPDATE vala.oracle_admission_accounting \
-            SET used_slots=used_slots-$4,updated_at=now() WHERE scope_kind=$1 AND scope_key=$2 \
-            AND accounting_class=$3 AND used_slots >= $4",
+            SET used_slots=used_slots-$5,updated_at=now() WHERE data_tenant_id=$1 \
+            AND scope_kind=$2 AND scope_key=$3 AND accounting_class=$4 AND used_slots >= $5",
         )
+        .bind(owner)
         .bind(kind)
         .bind(key)
         .bind(accounting_class)
         .bind(i64::from(row.slot_units))
-        .execute(tx.connection())
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?
         .rows_affected();
@@ -384,9 +454,10 @@ async fn decrement_and_delete(
             return Err(invariant("admission counter underflow or missing scope"));
         }
     }
-    sqlx::query("DELETE FROM vala.oracle_admission_leases WHERE query_id=$1")
+    sqlx::query("DELETE FROM vala.oracle_admission_leases WHERE data_tenant_id=$1 AND query_id=$2")
+        .bind(data_tenant_id)
         .bind(row.query_id)
-        .execute(tx.connection())
+        .execute(&mut **conn.transaction())
         .await
         .map_err(SqlError::from)?;
     Ok(())
@@ -398,14 +469,16 @@ async fn decrement_and_delete(
 /// Returns [`SqlError`] for malformed stored identifiers/classes/counts or
 /// database failures.
 async fn row_to_lease(
-    tx: &mut OperatorTransaction,
+    conn: &mut TenantConn<'_>,
     row: AdmissionLeaseRow,
 ) -> Result<OracleAdmissionLease, SqlError> {
     let nodes: Vec<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT node_id FROM vala.oracle_admission_nodes WHERE query_id=$1 ORDER BY node_id",
+        "SELECT node_id FROM vala.oracle_admission_nodes \
+         WHERE data_tenant_id=$1 AND query_id=$2 ORDER BY node_id",
     )
+    .bind(uuid::Uuid::from(conn.data_tenant_id()))
     .bind(row.query_id)
-    .fetch_all(tx.connection())
+    .fetch_all(&mut **conn.transaction())
     .await
     .map_err(SqlError::from)?;
     Ok(OracleAdmissionLease {
@@ -435,7 +508,7 @@ fn leader_matches(row: &AdmissionLeaseRow, leader: &RoleFence) -> Result<bool, S
             .map_err(|_| invariant("negative leader fence"))?
             == leader.fencing_token)
 }
-/// Validates lease and all three positive ceilings before transaction start.
+/// Validates lease and all three positive ceilings before durable mutation.
 ///
 /// # Errors
 /// Returns [`SqlError`] for invalid pure lease invariants or zero limits.
@@ -449,6 +522,19 @@ fn validate_request(request: &AdmissionRequest) -> Result<(), SqlError> {
     }
     Ok(())
 }
+
+/// Verifies that a request-carried tenant matches the caller-owned transaction.
+///
+/// # Errors
+/// Returns [`SqlError`] when the two independently supplied tenant identities differ.
+fn validate_tenant(conn: &TenantConn<'_>, data_tenant_id: DataTenantId) -> Result<(), SqlError> {
+    if conn.data_tenant_id() == data_tenant_id {
+        Ok(())
+    } else {
+        Err(invariant("admission tenant does not match transaction"))
+    }
+}
+
 /// Maps one closed admission class to durable SQL text.
 fn class_name(class: QueryClass) -> &'static str {
     match class {
@@ -468,26 +554,18 @@ fn parse_class(class: &str) -> Result<QueryClass, SqlError> {
     }
 }
 /// Produces the canonical cluster/class/tenant reconciliation sort and SQL key.
-fn scope_key(
-    scope: &AdmissionReconcileScope,
-) -> (u8, &'static str, String, &'static str, Option<uuid::Uuid>) {
+fn scope_key(scope: &AdmissionReconcileScope) -> (u8, &'static str, String, &'static str) {
     match scope {
-        AdmissionReconcileScope::Cluster => (0, "cluster", "global".into(), "all", None),
+        AdmissionReconcileScope::Cluster => (0, "cluster", "global".into(), "all"),
         AdmissionReconcileScope::Class { query_class } => {
-            (1, "class", "global".into(), class_name(*query_class), None)
+            (1, "class", "global".into(), class_name(*query_class))
         }
         AdmissionReconcileScope::Tenant {
             data_tenant_id,
             query_class,
         } => {
             let tenant = uuid::Uuid::from(*data_tenant_id);
-            (
-                2,
-                "tenant",
-                tenant.to_string(),
-                class_name(*query_class),
-                Some(tenant),
-            )
+            (2, "tenant", tenant.to_string(), class_name(*query_class))
         }
     }
 }

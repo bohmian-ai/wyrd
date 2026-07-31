@@ -80,25 +80,31 @@ mod pg_tests {
         .execute(&pool)
         .await
         .expect("exact migration 11 applies");
-        let row: (i16, serde_json::Value, bool) = sqlx::query_as(
-            "SELECT capability_version,capabilities,ready FROM vala.cluster_nodes \
+        let row: (uuid::Uuid, i16, serde_json::Value, bool) = sqlx::query_as(
+            "SELECT data_tenant_id,capability_version,capabilities,ready \
+             FROM vala.cluster_nodes \
              WHERE node_id=$1 AND role='scribe'",
         )
         .bind(node_id)
         .fetch_one(&pool)
         .await
         .expect("preserved Scribe row reads");
-        assert_eq!(row.0, 1);
         assert_eq!(
-            row.1,
+            row.0,
+            uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER)
+        );
+        assert_eq!(row.1, 1);
+        assert_eq!(
+            row.2,
             serde_json::json!({"kind":"scribe_v1","tail_protocol_version":1})
         );
-        assert!(!row.2);
+        assert!(!row.3);
         sqlx::query(
             "INSERT INTO vala.cluster_nodes \
-             (node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at,capabilities) \
-             VALUES ($1,'oracle','http://oracle:5002',1,now(),now(),$2)",
+             (data_tenant_id,node_id,role,advertise_addr,fencing_token,started_at,heartbeat_at,capabilities) \
+             VALUES ($1,$2,'oracle','http://oracle:5002',1,now(),now(),$3)",
         )
+        .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
         .bind(node_id)
         .bind(serde_json::json!({
             "kind":"oracle_v1",
@@ -108,12 +114,15 @@ mod pg_tests {
         .execute(&pool)
         .await
         .expect("same node Oracle role inserts under composite primary key");
-        let roles: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM vala.cluster_nodes WHERE node_id=$1")
-                .bind(node_id)
-                .fetch_one(&pool)
-                .await
-                .expect("role count reads");
+        let roles: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM vala.cluster_nodes \
+             WHERE data_tenant_id=$1 AND node_id=$2",
+        )
+        .bind(uuid::Uuid::from(wyrd_spec::DataTenantId::SYSTEM_OWNER))
+        .bind(node_id)
+        .fetch_one(&pool)
+        .await
+        .expect("role count reads");
         assert_eq!(roles, 2);
     }
 }

@@ -2,7 +2,11 @@
 
 use chrono::{Duration, Utc};
 use vala_sql::{
-    queries::{cluster_nodes::ClusterNodes, oracle_admission::OracleAdmissionLeases},
+    ValaPostgres,
+    queries::{
+        cluster_nodes::ClusterNodes as SqlClusterNodes,
+        oracle_admission::OracleAdmissionLeases as SqlOracleAdmissionLeases,
+    },
     row_types::{
         cluster_nodes::{RoleMutation, RoleRegistration},
         oracle_admission::{
@@ -10,12 +14,210 @@ use vala_sql::{
         },
     },
 };
+
+/// Test workflow owner that supplies one platform-tenant transaction per membership operation.
+struct ClusterNodes {
+    /// Tenant-aware SQL owner under test.
+    inner: SqlClusterNodes,
+}
+
+impl ClusterNodes {
+    /// Creates a membership test owner over the fixture's Vala runtime pool.
+    fn new(postgres: ValaPostgres) -> Self {
+        Self {
+            inner: SqlClusterNodes::new(postgres),
+        }
+    }
+
+    /// Registers one role and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, registration, or commit fails.
+    async fn register(
+        &self,
+        registration: &RoleRegistration,
+    ) -> Result<vala_sql::row_types::cluster_nodes::RegisteredRoleRow, vala_sql::SqlError> {
+        let mut conn = self
+            .inner
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let row = self.inner.register(&mut conn, registration).await?;
+        conn.commit().await?;
+        Ok(row)
+    }
+
+    /// Applies one heartbeat and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, mutation, or commit fails.
+    async fn heartbeat(
+        &self,
+        key: &ClusterNodeKey,
+        fence: u64,
+        ready: bool,
+        capabilities: &ClusterCapabilities,
+    ) -> Result<RoleMutation, vala_sql::SqlError> {
+        let mut conn = self
+            .inner
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let mutation = self
+            .inner
+            .heartbeat(&mut conn, key, fence, ready, capabilities)
+            .await?;
+        conn.commit().await?;
+        Ok(mutation)
+    }
+
+    /// Unregisters one role and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, mutation, or commit fails.
+    async fn unregister(
+        &self,
+        key: &ClusterNodeKey,
+        fence: u64,
+    ) -> Result<RoleMutation, vala_sql::SqlError> {
+        let mut conn = self
+            .inner
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let mutation = self.inner.unregister(&mut conn, key, fence).await?;
+        conn.commit().await?;
+        Ok(mutation)
+    }
+
+    /// Lists live roles and commits the caller-owned read transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, discovery, or commit fails.
+    async fn list_live(
+        &self,
+        role: ClusterRole,
+        heartbeat_after: chrono::DateTime<Utc>,
+    ) -> Result<Vec<wyrd_spec::vala::api::ClusterRoleLease>, vala_sql::SqlError> {
+        let mut conn = self
+            .inner
+            .postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await?;
+        let rows = self
+            .inner
+            .list_live(&mut conn, role, heartbeat_after)
+            .await?;
+        conn.commit().await?;
+        Ok(rows)
+    }
+}
+
+/// Test workflow owner that supplies one exact tenant transaction per admission operation.
+struct OracleAdmissionLeases {
+    /// Tenant-aware SQL owner under test.
+    inner: SqlOracleAdmissionLeases,
+    /// Tenant bound to every transaction opened by this test owner.
+    tenant: DataTenantId,
+}
+
+impl OracleAdmissionLeases {
+    /// Creates an admission test owner for one seeded tenant.
+    fn new(postgres: ValaPostgres, tenant: DataTenantId) -> Self {
+        Self {
+            inner: SqlOracleAdmissionLeases::new(postgres),
+            tenant,
+        }
+    }
+
+    /// Acquires one lease and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, admission, or commit fails.
+    async fn acquire(
+        &self,
+        request: &AdmissionRequest,
+    ) -> Result<AdmissionAcquire, vala_sql::SqlError> {
+        let mut conn = self.inner.postgres().tenant_conn(self.tenant).await?;
+        let outcome = self.inner.acquire(&mut conn, request).await?;
+        conn.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Renews one lease and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, renewal, or commit fails.
+    async fn renew(
+        &self,
+        query_id: QueryId,
+        leader: &RoleFence,
+        expiry: chrono::DateTime<Utc>,
+    ) -> Result<LeaseMutation, vala_sql::SqlError> {
+        let mut conn = self.inner.postgres().tenant_conn(self.tenant).await?;
+        let outcome = self
+            .inner
+            .renew(&mut conn, query_id, leader, expiry)
+            .await?;
+        conn.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Releases one lease and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, release, or commit fails.
+    async fn release(
+        &self,
+        query_id: QueryId,
+        leader: &RoleFence,
+    ) -> Result<LeaseMutation, vala_sql::SqlError> {
+        let mut conn = self.inner.postgres().tenant_conn(self.tenant).await?;
+        let outcome = self.inner.release(&mut conn, query_id, leader).await?;
+        conn.commit().await?;
+        Ok(outcome)
+    }
+
+    /// Expires one lease batch and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, expiry, or commit fails.
+    async fn expire_batch(
+        &self,
+        now: chrono::DateTime<Utc>,
+        max_leases: u16,
+    ) -> Result<vala_sql::row_types::oracle_admission::AdmissionExpiryReport, vala_sql::SqlError>
+    {
+        let mut conn = self.inner.postgres().tenant_conn(self.tenant).await?;
+        let report = self.inner.expire_batch(&mut conn, now, max_leases).await?;
+        conn.commit().await?;
+        Ok(report)
+    }
+
+    /// Reconciles bounded scopes and commits the caller-owned transaction.
+    ///
+    /// # Errors
+    /// Returns [`vala_sql::SqlError`] when acquisition, reconciliation, or commit fails.
+    async fn reconcile_scopes(
+        &self,
+        scopes: &[AdmissionReconcileScope],
+        now: chrono::DateTime<Utc>,
+    ) -> Result<
+        vala_sql::row_types::oracle_admission::AdmissionReconciliationReport,
+        vala_sql::SqlError,
+    > {
+        let mut conn = self.inner.postgres().tenant_conn(self.tenant).await?;
+        let report = self.inner.reconcile_scopes(&mut conn, scopes, now).await?;
+        conn.commit().await?;
+        Ok(report)
+    }
+}
 use wyrd_dev_fixtures::pg::PgFixture;
 use wyrd_spec::{
     DataTenantId,
     vala::api::{
-        ClusterCapabilities, ClusterNodeKey, ClusterRole, NodeId, OracleAdmissionLease, QueryClass,
-        QueryId, ScribeCapabilitiesV1,
+        AdmissionScope, ClusterCapabilities, ClusterNodeKey, ClusterRole, NodeId,
+        OracleAdmissionLease, QueryClass, QueryId, ScribeCapabilitiesV1,
     },
 };
 
@@ -57,11 +259,33 @@ fn request(
     }
 }
 
+/// Proves durable admission tenant columns reference the platform tenant catalog.
+#[tokio::test]
+async fn admission_tables_reference_platform_tenants() {
+    let (fixture, _) = setup().await;
+    let owner = fixture.superuser_pool().await.expect("table-owner pool");
+    for table in ["oracle_admission_leases", "oracle_admission_accounting"] {
+        let foreign_keys: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_constraint constraint_row \
+             JOIN pg_class table_row ON table_row.oid=constraint_row.conrelid \
+             JOIN pg_namespace schema_row ON schema_row.oid=table_row.relnamespace \
+             WHERE schema_row.nspname='vala' AND table_row.relname=$1 \
+             AND constraint_row.contype='f' \
+             AND constraint_row.confrelid='platform.tenants'::regclass",
+        )
+        .bind(table)
+        .fetch_one(&owner)
+        .await
+        .expect("foreign-key metadata reads");
+        assert_eq!(foreign_keys, 1, "{table} references platform.tenants");
+    }
+}
+
 /// Proves one physical node receives independent role fences.
 #[tokio::test]
 async fn same_node_roles_have_independent_fences() {
     let (fixture, _) = setup().await;
-    let owner = ClusterNodes::new(fixture.operator_pool().clone());
+    let owner = ClusterNodes::new(fixture.vala_postgres().clone());
     let node_id = NodeId::new(uuid::Uuid::now_v7());
     let now = Utc::now();
     let scribe = RoleRegistration {
@@ -110,13 +334,21 @@ async fn same_node_roles_have_independent_fences() {
             .expect("operator role can delete matching membership"),
         RoleMutation::Applied
     );
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system tenant connection opens");
     let scribe_rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM vala.cluster_nodes WHERE node_id=$1 AND role='scribe'",
+        "SELECT count(*) FROM vala.cluster_nodes \
+         WHERE data_tenant_id=$1 AND node_id=$2 AND role='scribe'",
     )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
     .bind(node_id.as_uuid())
-    .fetch_one(fixture.operator_pool().pool())
+    .fetch_one(&mut **conn.transaction())
     .await
     .expect("Scribe role reads");
+    conn.commit().await.expect("system tenant read commits");
     assert_eq!(scribe_rows, 1);
 }
 
@@ -124,7 +356,7 @@ async fn same_node_roles_have_independent_fences() {
 #[tokio::test]
 async fn stale_role_mutation_is_rejected() {
     let (fixture, _) = setup().await;
-    let owner = ClusterNodes::new(fixture.operator_pool().clone());
+    let owner = ClusterNodes::new(fixture.vala_postgres().clone());
     let registration = RoleRegistration {
         key: ClusterNodeKey {
             node_id: NodeId::new(uuid::Uuid::now_v7()),
@@ -159,8 +391,8 @@ async fn stale_role_mutation_is_rejected() {
 async fn concurrent_admission_never_exceeds_scope_limits() {
     let (fixture, tenant) = setup().await;
     let leader = NodeId::new(uuid::Uuid::now_v7());
-    let first = OracleAdmissionLeases::new(fixture.operator_pool().clone());
-    let second = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let first = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let second = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let expiry = Utc::now() + Duration::minutes(5);
     let one = request(
         tenant,
@@ -187,11 +419,176 @@ async fn concurrent_admission_never_exceeds_scope_limits() {
     assert_eq!(acquired, 1);
 }
 
+/// Proves two request tenants serialize on one deployment-wide cluster limit.
+#[tokio::test]
+async fn concurrent_two_tenant_admission_never_exceeds_cluster_limit() {
+    let (fixture, tenant_a) = setup().await;
+    let tenant_b = DataTenantId::new_v7();
+    fixture
+        .seed_additional_tenant_with_uuid(
+            tenant_b,
+            &format!("oracle-{}", tenant_b.as_uuid().simple()),
+        )
+        .await
+        .expect("second tenant seeds");
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let first = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant_a);
+    let second = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant_b);
+    let expiry = Utc::now() + Duration::minutes(5);
+    let mut request_a = request(
+        tenant_a,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        expiry,
+    );
+    let mut request_b = request(
+        tenant_b,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        expiry,
+    );
+    request_a.class_limit = 2;
+    request_a.tenant_limit = 2;
+    request_b.class_limit = 2;
+    request_b.tenant_limit = 2;
+
+    let (a, b) = tokio::join!(first.acquire(&request_a), second.acquire(&request_b));
+    let acquired = [
+        a.expect("tenant A admission"),
+        b.expect("tenant B admission"),
+    ]
+    .into_iter()
+    .filter(|outcome| matches!(outcome, AdmissionAcquire::Acquired(_)))
+    .count();
+    assert_eq!(acquired, 1);
+
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant_a)
+        .await
+        .expect("tenant connection opens");
+    let used: i64 = sqlx::query_scalar(
+        "SELECT used_slots FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+         AND accounting_class='all'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("global counter reads");
+    let foreign_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_accounting WHERE data_tenant_id=$1",
+    )
+    .bind(uuid::Uuid::from(tenant_b))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("foreign counter visibility reads");
+    conn.commit().await.expect("global counter read commits");
+    assert_eq!(used, 1);
+    assert_eq!(foreign_rows, 0);
+}
+
+/// Proves two request tenants serialize on one deployment-wide class limit.
+#[tokio::test]
+async fn concurrent_two_tenant_same_class_never_exceeds_class_limit() {
+    let (fixture, tenant_a) = setup().await;
+    let tenant_b = DataTenantId::new_v7();
+    fixture
+        .seed_additional_tenant_with_uuid(
+            tenant_b,
+            &format!("oracle-{}", tenant_b.as_uuid().simple()),
+        )
+        .await
+        .expect("second tenant seeds");
+    let leader = NodeId::new(uuid::Uuid::now_v7());
+    let first = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant_a);
+    let second = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant_b);
+    let expiry = Utc::now() + Duration::minutes(5);
+    let mut request_a = request(
+        tenant_a,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        expiry,
+    );
+    let mut request_b = request(
+        tenant_b,
+        QueryId::new(uuid::Uuid::now_v7()),
+        leader,
+        1,
+        1,
+        expiry,
+    );
+    request_a.cluster_limit = 2;
+    request_a.tenant_limit = 2;
+    request_b.cluster_limit = 2;
+    request_b.tenant_limit = 2;
+
+    let (a, b) = tokio::join!(first.acquire(&request_a), second.acquire(&request_b));
+    let outcomes = [
+        a.expect("tenant A admission"),
+        b.expect("tenant B admission"),
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AdmissionAcquire::Acquired(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    AdmissionAcquire::Rejected {
+                        scope: AdmissionScope::Class,
+                        ..
+                    }
+                )
+            })
+            .count(),
+        1
+    );
+
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant_a)
+        .await
+        .expect("tenant connection opens");
+    let used: i64 = sqlx::query_scalar(
+        "SELECT used_slots FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_kind='class' AND scope_key='global' \
+         AND accounting_class='interactive'",
+    )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("shared class counter reads");
+    let foreign_tenant_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM vala.oracle_admission_accounting \
+         WHERE data_tenant_id=$1 AND scope_kind='tenant'",
+    )
+    .bind(uuid::Uuid::from(tenant_b))
+    .fetch_one(&mut **conn.transaction())
+    .await
+    .expect("foreign tenant-counter visibility reads");
+    conn.commit().await.expect("accounting reads commit");
+    assert_eq!(used, 1);
+    assert_eq!(foreign_tenant_rows, 0);
+}
+
 /// Proves release is idempotent while a mismatched fence remains stale.
 #[tokio::test]
 async fn release_is_idempotent_and_fenced() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let query_id = QueryId::new(uuid::Uuid::now_v7());
     owner
@@ -242,7 +639,7 @@ async fn release_is_idempotent_and_fenced() {
 #[tokio::test]
 async fn expiry_reclaims_once() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     owner
         .acquire(&request(
             tenant,
@@ -268,11 +665,11 @@ async fn expiry_reclaims_once() {
     assert_eq!((second.expired_leases, second.released_slots), (0, 0));
 }
 
-/// Proves reconciliation restores a corrupted authoritative counter.
+/// Proves reconciliation restores one corrupted request-tenant counter.
 #[tokio::test]
 async fn reconciliation_repairs_interrupted_counter() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     owner
         .acquire(&request(
             tenant,
@@ -284,25 +681,49 @@ async fn reconciliation_repairs_interrupted_counter() {
         ))
         .await
         .expect("admission succeeds");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     sqlx::query(
         "UPDATE vala.oracle_admission_accounting SET used_slots=99 \
-         WHERE scope_kind='cluster' AND scope_key='global' AND accounting_class='all'",
+         WHERE data_tenant_id=$1 AND scope_kind='tenant' AND scope_key=$2 \
+         AND accounting_class='interactive'",
     )
-    .execute(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(tenant))
+    .bind(tenant.to_string())
+    .execute(&mut **conn.transaction())
     .await
     .expect("counter corrupts");
+    conn.commit().await.expect("counter corruption commits");
 
     let report = owner
-        .reconcile_scopes(&[AdmissionReconcileScope::Cluster], Utc::now())
+        .reconcile_scopes(
+            &[AdmissionReconcileScope::Tenant {
+                data_tenant_id: tenant,
+                query_class: QueryClass::Interactive,
+            }],
+            Utc::now(),
+        )
         .await
         .expect("reconciliation succeeds");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     let used: i64 = sqlx::query_scalar(
         "SELECT used_slots FROM vala.oracle_admission_accounting \
-         WHERE scope_kind='cluster' AND scope_key='global' AND accounting_class='all'",
+         WHERE data_tenant_id=$1 AND scope_kind='tenant' AND scope_key=$2 \
+         AND accounting_class='interactive'",
     )
-    .fetch_one(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(tenant))
+    .bind(tenant.to_string())
+    .fetch_one(&mut **conn.transaction())
     .await
     .expect("counter reads");
+    conn.commit().await.expect("counter read commits");
 
     assert_eq!(report.repaired_scopes, 1);
     assert_eq!(used, 2);
@@ -312,7 +733,7 @@ async fn reconciliation_repairs_interrupted_counter() {
 #[tokio::test]
 async fn concurrent_reconcile_and_acquire_preserve_accounting() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let mut first = request(
         tenant,
@@ -327,8 +748,8 @@ async fn concurrent_reconcile_and_acquire_preserve_accounting() {
     first.tenant_limit = 10;
     owner.acquire(&first).await.expect("first lease acquires");
 
-    let acquiring = OracleAdmissionLeases::new(fixture.operator_pool().clone());
-    let reconciling = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let acquiring = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let reconciling = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let mut second = request(
         tenant,
         QueryId::new(uuid::Uuid::now_v7()),
@@ -350,13 +771,21 @@ async fn concurrent_reconcile_and_acquire_preserve_accounting() {
     ));
     reconciled.expect("concurrent reconciliation completes");
 
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     let used: i64 = sqlx::query_scalar(
         "SELECT used_slots FROM vala.oracle_admission_accounting \
-         WHERE scope_kind='cluster' AND scope_key='global' AND accounting_class='all'",
+         WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+         AND accounting_class='all'",
     )
-    .fetch_one(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(&mut **conn.transaction())
     .await
     .expect("counter reads");
+    conn.commit().await.expect("counter read commits");
     assert_eq!(used, 2);
 }
 
@@ -364,7 +793,7 @@ async fn concurrent_reconcile_and_acquire_preserve_accounting() {
 #[tokio::test]
 async fn admission_hints_and_maintenance_bounds_are_enforced() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let expiry = Utc::now() + Duration::minutes(5);
     owner
@@ -424,7 +853,7 @@ async fn admission_hints_and_maintenance_bounds_are_enforced() {
 #[tokio::test]
 async fn expired_mismatched_renewal_is_stale() {
     let (fixture, tenant) = setup().await;
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let query_id = QueryId::new(uuid::Uuid::now_v7());
     owner
@@ -438,13 +867,21 @@ async fn expired_mismatched_renewal_is_stale() {
         ))
         .await
         .expect("admission succeeds");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     sqlx::query(
         "UPDATE vala.oracle_admission_leases \
-         SET acquired_at=now()-interval '2 seconds',expires_at=now()-interval '1 second'",
+         SET acquired_at=now()-interval '2 seconds',expires_at=now()-interval '1 second' \
+         WHERE data_tenant_id=$1",
     )
-    .execute(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(tenant))
+    .execute(&mut **conn.transaction())
     .await
     .expect("lease expires");
+    conn.commit().await.expect("lease expiry commits");
     assert!(matches!(
         owner
             .renew(
@@ -465,7 +902,7 @@ async fn expired_mismatched_renewal_is_stale() {
 #[tokio::test]
 async fn live_discovery_excludes_expired_heartbeat() {
     let (fixture, _) = setup().await;
-    let owner = ClusterNodes::new(fixture.operator_pool().clone());
+    let owner = ClusterNodes::new(fixture.vala_postgres().clone());
     let registration = RoleRegistration {
         key: ClusterNodeKey {
             node_id: NodeId::new(uuid::Uuid::now_v7()),
@@ -487,14 +924,21 @@ async fn live_discovery_excludes_expired_heartbeat() {
         )
         .await
         .expect("role becomes ready");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(DataTenantId::SYSTEM_OWNER)
+        .await
+        .expect("system tenant connection opens");
     sqlx::query(
         "UPDATE vala.cluster_nodes SET heartbeat_at=now()-interval '10 minutes' \
-         WHERE node_id=$1 AND role='scribe'",
+         WHERE data_tenant_id=$1 AND node_id=$2 AND role='scribe'",
     )
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
     .bind(registration.key.node_id.as_uuid())
-    .execute(fixture.operator_pool().pool())
+    .execute(&mut **conn.transaction())
     .await
     .expect("heartbeat ages");
+    conn.commit().await.expect("heartbeat aging commits");
     assert!(
         owner
             .list_live(ClusterRole::Scribe, Utc::now() - Duration::minutes(1))
@@ -510,7 +954,7 @@ async fn concurrent_release_and_expiry_do_not_double_decrement() {
     let (fixture, tenant) = setup().await;
     let leader = NodeId::new(uuid::Uuid::now_v7());
     let query_id = QueryId::new(uuid::Uuid::now_v7());
-    let owner = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    let owner = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     owner
         .acquire(&request(
             tenant,
@@ -522,15 +966,23 @@ async fn concurrent_release_and_expiry_do_not_double_decrement() {
         ))
         .await
         .expect("admission succeeds");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     sqlx::query(
         "UPDATE vala.oracle_admission_leases \
-         SET acquired_at=now()-interval '2 seconds',expires_at=now()-interval '1 second'",
+         SET acquired_at=now()-interval '2 seconds',expires_at=now()-interval '1 second' \
+         WHERE data_tenant_id=$1",
     )
-    .execute(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(tenant))
+    .execute(&mut **conn.transaction())
     .await
     .expect("lease expires");
-    let releasing = OracleAdmissionLeases::new(fixture.operator_pool().clone());
-    let expiring = OracleAdmissionLeases::new(fixture.operator_pool().clone());
+    conn.commit().await.expect("lease expiry commits");
+    let releasing = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
+    let expiring = OracleAdmissionLeases::new(fixture.vala_postgres().clone(), tenant);
     let fence = RoleFence {
         node_id: leader,
         fencing_token: 3,
@@ -541,12 +993,20 @@ async fn concurrent_release_and_expiry_do_not_double_decrement() {
     );
     released.expect("release completes");
     expired.expect("expiry completes");
+    let mut conn = fixture
+        .vala_postgres()
+        .tenant_conn(tenant)
+        .await
+        .expect("tenant connection opens");
     let used: i64 = sqlx::query_scalar(
         "SELECT used_slots FROM vala.oracle_admission_accounting \
-         WHERE scope_kind='cluster' AND scope_key='global' AND accounting_class='all'",
+         WHERE data_tenant_id=$1 AND scope_kind='cluster' AND scope_key='global' \
+         AND accounting_class='all'",
     )
-    .fetch_one(fixture.operator_pool().pool())
+    .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
+    .fetch_one(&mut **conn.transaction())
     .await
     .expect("counter reads");
+    conn.commit().await.expect("counter read commits");
     assert_eq!(used, 0);
 }

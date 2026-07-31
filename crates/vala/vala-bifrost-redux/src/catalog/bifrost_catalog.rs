@@ -186,9 +186,10 @@ impl BifrostCatalog {
         let iceberg_file_paths = pinned.file_paths;
         let iceberg_files = pinned.files;
         let mut estimated_bytes = pinned.estimated_bytes;
-        let mut hot_files = HotFileCatalog::new(self.postgres.clone())
-            .active_files(tenant, &binding.logical_namespace, &binding.table_name)
-            .await?;
+        let hot_file_catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+        let mut conn = self.postgres.tenant_conn(tenant).await?;
+        let mut hot_files = hot_file_catalog.active_files(&mut conn).await?;
+        conn.commit().await?;
         let hot_file_count = hot_files.len();
         hot_files.retain(|row| !iceberg_file_paths.contains(&row.file_path));
         metrics::counter!(

@@ -5,7 +5,7 @@ mod pg_tests {
     //! - Migration applies cleanly (columns, types, nullability)
     //! - Indexes exist (watermark, duplicate-range guard, discovery)
     //! - RLS blocks cross-tenant SELECT on file_list
-    //! - OperatorPool grants permit required operations
+    //! - TenantConn grants permit required operations
     //! - Duplicate stream range INSERT fails on unique constraint
     //!
     //! Skipped when WYRD_DATABASE_URL is unset (credential-free default suite).
@@ -263,6 +263,7 @@ mod pg_tests {
             ("started_at", "timestamp with time zone", "NO"),
             ("heartbeat_at", "timestamp with time zone", "NO"),
             ("meta", "jsonb", "NO"),
+            ("data_tenant_id", "uuid", "NO"),
             ("capability_version", "smallint", "NO"),
             ("capabilities", "jsonb", "NO"),
             ("ready", "boolean", "NO"),
@@ -385,48 +386,58 @@ mod pg_tests {
         assert_eq!(row.0, file_id, "OperatorPool can SELECT file_list");
     }
 
+    /// Proves the system tenant can UPSERT its isolated membership fence.
+    ///
+    /// # Panics
+    /// Panics when the database fixture, tenant transaction, UPSERT, or commit fails.
     #[tokio::test]
-    async fn vala_operator_pool_can_upsert_cluster_nodes() {
+    async fn vala_tenant_conn_can_upsert_cluster_nodes() {
         let (fixture, _tenant) = setup().await;
-        let pool = fixture.superuser_pool().await.expect("superuser pool");
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(DataTenantId::SYSTEM_OWNER)
+            .await
+            .expect("system tenant connection");
 
         let node_id = Uuid::now_v7();
 
-        // INSERT via OperatorPool.
         sqlx::query(
             r#"
             INSERT INTO vala.cluster_nodes (
-                node_id, role, advertise_addr, fencing_token,
+                data_tenant_id, node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
-            ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id, role) DO UPDATE
+            ) VALUES ($1, $2, 'scribe', 'localhost:50051', 1, now(), now())
+            ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token
             "#,
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(node_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut **conn.transaction())
         .await
-        .expect("OperatorPool INSERT/UPSERT");
+        .expect("TenantConn INSERT/UPSERT");
 
         // Second UPSERT should increment fencing_token.
         let token: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO vala.cluster_nodes (
-                node_id, role, advertise_addr, fencing_token,
+                data_tenant_id, node_id, role, advertise_addr, fencing_token,
                 started_at, heartbeat_at
-            ) VALUES ($1, 'scribe', 'localhost:50051', 1, now(), now())
-            ON CONFLICT (node_id, role) DO UPDATE
+            ) VALUES ($1, $2, 'scribe', 'localhost:50051', 1, now(), now())
+            ON CONFLICT (data_tenant_id, node_id, role) DO UPDATE
             SET fencing_token = vala.cluster_nodes.fencing_token + 1,
                 heartbeat_at = now()
             RETURNING fencing_token
             "#,
         )
+        .bind(uuid::Uuid::from(DataTenantId::SYSTEM_OWNER))
         .bind(node_id)
-        .fetch_one(&pool)
+        .fetch_one(&mut **conn.transaction())
         .await
         .expect("second UPSERT");
+        conn.commit().await.expect("commit membership UPSERTs");
 
         assert_eq!(
             token.0, 2,

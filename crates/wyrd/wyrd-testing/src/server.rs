@@ -1586,7 +1586,6 @@ impl WyrdTestServerBuilder {
         if self.bifrost_roles.contains(&BifrostRuntimeRole::Oracle) {
             state = wyrd_server::boot::attach_test_oracle_runtime_for_node_at(
                 state,
-                operator_pool,
                 node_id,
                 SecretString::from(crate::keys::private_key_pem().to_owned()),
                 self.bind_addrs.map_or_else(

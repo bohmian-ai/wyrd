@@ -1172,7 +1172,7 @@ pub struct Oracle {
     /// Planner and floor configuration.
     planner: OraclePlanner,
     /// Admission state and local guards.
-    admission: OracleAdmission,
+    admission: Arc<OracleAdmission>,
     /// Tenant-qualified catalog and SQL owners retained for query execution.
     catalog: Arc<BifrostCatalog>,
     /// Tenant SQL handle retained for the Oracle lifecycle boundary.
@@ -1249,13 +1249,13 @@ impl Oracle {
         }
         let planner = OraclePlanner::new(config.config);
         let telemetry = Arc::new(OracleTelemetry::new(Arc::clone(&config.local_slots)));
-        let admission = OracleAdmission::new(
+        let admission = Arc::new(OracleAdmission::new(
             config.cluster,
             config.local_slots,
             Arc::new(config.admission_leases),
             config.local_role,
             config.config,
-        );
+        ));
         let shutdown = CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
         let maintenance = admission.start_maintenance(shutdown.clone(), Arc::clone(&ready))?;
@@ -2475,7 +2475,17 @@ impl OracleAdmission {
                 .deadline
                 .checked_duration_since(Instant::now())
                 .ok_or(BifrostError::QueryAdmissionRejected)?;
-            let outcome = tokio::time::timeout(remaining, self.leases.acquire(&request))
+            let operation = async {
+                let mut conn = self
+                    .leases
+                    .postgres()
+                    .tenant_conn(request.lease.data_tenant_id)
+                    .await?;
+                let outcome = self.leases.acquire(&mut conn, &request).await?;
+                conn.commit().await?;
+                Ok::<AdmissionAcquire, vala_sql::SqlError>(outcome)
+            };
+            let outcome = tokio::time::timeout(remaining, operation)
                 .await
                 .map_err(|_| BifrostError::QueryAdmissionRejected)?
                 .map_err(|error| {
@@ -2495,9 +2505,87 @@ impl OracleAdmission {
         Err(BifrostError::QueryAdmissionRejected)
     }
 
+    /// Renews one tenant-bound durable lease and commits the outer transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`vala_sql::SqlError`] when the tenant transaction, fenced
+    /// renewal, or commit fails.
+    async fn renew_lease(
+        &self,
+        data_tenant_id: DataTenantId,
+        query_id: QueryId,
+        leader: &RoleFence,
+        expiry: chrono::DateTime<chrono::Utc>,
+    ) -> Result<LeaseMutation, vala_sql::SqlError> {
+        let mut conn = self.leases.postgres().tenant_conn(data_tenant_id).await?;
+        let mutation = self
+            .leases
+            .renew(&mut conn, query_id, leader, expiry)
+            .await?;
+        conn.commit().await?;
+        Ok(mutation)
+    }
+
+    /// Releases one tenant-bound durable lease and commits the outer transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`vala_sql::SqlError`] when the tenant transaction, fenced
+    /// release, or commit fails.
+    async fn release_lease(
+        &self,
+        data_tenant_id: DataTenantId,
+        query_id: QueryId,
+        leader: &RoleFence,
+    ) -> Result<LeaseMutation, vala_sql::SqlError> {
+        let mut conn = self.leases.postgres().tenant_conn(data_tenant_id).await?;
+        let mutation = self.leases.release(&mut conn, query_id, leader).await?;
+        conn.commit().await?;
+        Ok(mutation)
+    }
+
+    /// Expires and reconciles one tenant/class maintenance scope atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`vala_sql::SqlError`] when the tenant transaction, expiry,
+    /// reconciliation, or commit fails.
+    async fn maintain_scope(
+        &self,
+        scope: &AdmissionReconcileScope,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), vala_sql::SqlError> {
+        let AdmissionReconcileScope::Tenant {
+            data_tenant_id,
+            query_class,
+        } = scope
+        else {
+            return Err(vala_sql::SqlError::InvariantViolation {
+                detail: "maintenance requires a tenant scope".to_owned(),
+            });
+        };
+        let mut conn = self.leases.postgres().tenant_conn(*data_tenant_id).await?;
+        self.leases.expire_batch(&mut conn, now, 128).await?;
+        self.leases
+            .reconcile_scopes(
+                &mut conn,
+                &[
+                    AdmissionReconcileScope::Cluster,
+                    AdmissionReconcileScope::Class {
+                        query_class: *query_class,
+                    },
+                    scope.clone(),
+                ],
+                now,
+            )
+            .await?;
+        conn.commit().await
+    }
+
     /// Starts cancellation-bound renewal for one acquired durable lease.
     fn start_lease_renewal(
-        &self,
+        self: &Arc<Self>,
         lease: &OracleAdmissionLease,
         cancellation: &CancellationToken,
         lease_ttl: chrono::Duration,
@@ -2505,7 +2593,8 @@ impl OracleAdmission {
         let renewal_cancel = cancellation.clone();
         let renewal_terminal = Arc::new(Mutex::new(None));
         let terminal = Arc::clone(&renewal_terminal);
-        let leases = Arc::clone(&self.leases);
+        let admission = Arc::clone(self);
+        let data_tenant_id = lease.data_tenant_id;
         let query_id = lease.query_id;
         let interval_duration = self.config.lease_renew_interval;
         let leader = RoleFence {
@@ -2521,7 +2610,9 @@ impl OracleAdmission {
                     () = renewal_cancel.cancelled() => break,
                     _ = interval.tick() => {
                         let expiry = chrono::Utc::now() + lease_ttl;
-                        let result = leases.renew(query_id, &leader, expiry).await;
+                        let result = admission
+                            .renew_lease(data_tenant_id, query_id, &leader, expiry)
+                            .await;
                         if let Some((code, outcome)) = renewal_failure(&result) {
                             if let Ok(mut reason) = terminal.lock() {
                                 *reason = Some(code);
@@ -2569,7 +2660,7 @@ impl OracleAdmission {
     ///
     /// Returns an internal error when construction occurs outside a Tokio runtime.
     fn start_maintenance(
-        &self,
+        self: &Arc<Self>,
         shutdown: CancellationToken,
         ready: Arc<AtomicBool>,
     ) -> Result<JoinHandle<()>, BifrostError> {
@@ -2577,23 +2668,10 @@ impl OracleAdmission {
             tokio::runtime::Handle::try_current().map_err(|_| BifrostError::Internal {
                 detail: "Oracle construction requires an active Tokio runtime".to_owned(),
             })?;
-        let leases = Arc::clone(&self.leases);
+        let admission = Arc::clone(self);
         let queue = Arc::clone(&self.tenant_reconcile_queue);
         let maintenance_interval = self.config.maintenance_interval;
         Ok(runtime.spawn(async move {
-            let startup = [
-                AdmissionReconcileScope::Cluster,
-                AdmissionReconcileScope::Class {
-                    query_class: QueryClass::Interactive,
-                },
-                AdmissionReconcileScope::Class {
-                    query_class: QueryClass::Analytical,
-                },
-            ];
-            if let Err(error) = leases.reconcile_scopes(&startup, chrono::Utc::now()).await {
-                tracing::error!(error = %error, "Oracle startup admission reconciliation failed");
-                return;
-            }
             ready.store(true, Ordering::Release);
             let mut interval = tokio::time::interval(maintenance_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2602,29 +2680,26 @@ impl OracleAdmission {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        if let Err(error) = leases.expire_batch(chrono::Utc::now(), 128).await {
-                            tracing::error!(error = %error, "Oracle admission expiry maintenance failed");
-                        }
                         let scopes = queue
                             .lock()
                             .map(|mut queue| queue.take(64))
                             .unwrap_or_default();
-                        if !scopes.is_empty() {
-                            match leases.reconcile_scopes(&scopes, chrono::Utc::now()).await {
-                                Ok(_) => {
+                        for scope in scopes {
+                            match admission.maintain_scope(&scope, chrono::Utc::now()).await {
+                                Ok(()) => {
                                     if let Ok(mut queue) = queue.lock() {
-                                        queue.complete(&scopes);
+                                        queue.complete(std::slice::from_ref(&scope));
                                     }
                                 }
                                 Err(error) => {
                                     if let Ok(mut queue) = queue.lock() {
-                                        queue.requeue(&scopes);
+                                        queue.requeue(std::slice::from_ref(&scope));
                                     }
                                     metrics::counter!(
                                         "bifrost_oracle_admission_reconcile_total",
                                         "outcome" => "requeued"
                                     )
-                                    .increment(scopes.len() as u64);
+                                    .increment(1);
                                     tracing::error!(error = %error, "Oracle tenant admission reconciliation failed; scopes requeued");
                                 }
                             }
@@ -2659,7 +2734,7 @@ impl OracleAdmission {
         fields(query_class = query_class_label(query_class))
     )]
     async fn admit(
-        &self,
+        self: &Arc<Self>,
         tenant: DataTenantId,
         query_class: QueryClass,
         deadline: Instant,
@@ -2725,7 +2800,9 @@ impl OracleAdmission {
                             node_id: local_node,
                             fencing_token: self.local_role.fencing_token,
                         };
-                        let _ = self.leases.release(lease.query_id, &leader).await;
+                        let _ = self
+                            .release_lease(lease.data_tenant_id, lease.query_id, &leader)
+                            .await;
                         return Err(error);
                     }
                 };
@@ -2733,12 +2810,13 @@ impl OracleAdmission {
                 let (renewal_terminal, renewal) =
                     self.start_lease_renewal(&lease, &cancellation, lease_ttl);
                 Ok(AdmittedQueryGuard {
+                    data_tenant_id: lease.data_tenant_id,
                     query_id: lease.query_id,
                     leader: RoleFence {
                         node_id: local_node,
                         fencing_token: self.local_role.fencing_token,
                     },
-                    leases: Arc::clone(&self.leases),
+                    admission: Arc::clone(self),
                     running: Some(running),
                     slot_telemetry: Some(slot_telemetry),
                     live_reservations: Vec::new(),
@@ -2776,12 +2854,14 @@ fn renewal_failure(
 
 /// Stream-owned durable/local capacity cleanup.
 struct AdmittedQueryGuard {
+    /// Tenant whose transaction owns the durable lease and cleanup.
+    data_tenant_id: DataTenantId,
     /// Durable lease identity released on every completion path.
     query_id: QueryId,
     /// Fenced leader authorized to release the durable lease.
     leader: RoleFence,
-    /// Durable admission owner.
-    leases: Arc<vala_sql::queries::oracle_admission::OracleAdmissionLeases>,
+    /// Durable admission workflow owner retained through asynchronous cleanup.
+    admission: Arc<OracleAdmission>,
     /// Local running capacity retained until stream completion/drop.
     running: Option<OwnedSemaphorePermit>,
     /// Canonical local slot-use gauge retained with the running permit.
@@ -2805,15 +2885,19 @@ impl Drop for AdmittedQueryGuard {
         }
         self.running.take();
         self.slot_telemetry.take();
+        let data_tenant_id = self.data_tenant_id;
         let query_id = self.query_id;
         let leader = RoleFence {
             node_id: self.leader.node_id,
             fencing_token: self.leader.fencing_token,
         };
-        let leases = Arc::clone(&self.leases);
+        let admission = Arc::clone(&self.admission);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = leases.release(query_id, &leader).await {
+                if let Err(error) = admission
+                    .release_lease(data_tenant_id, query_id, &leader)
+                    .await
+                {
                     tracing::error!(error = %error, "Oracle admission cleanup failed");
                 }
             });

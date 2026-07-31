@@ -372,7 +372,7 @@ async fn build_bifrost_parts_from_boot(
     let advertise_addr =
         std::env::var("WYRD_SERVER_ADVERTISE_ADDR").unwrap_or_else(|_| "127.0.0.1:0".to_owned());
     let cluster_registry = Arc::new(ClusterRegistry::new(
-        operator_pool.clone(),
+        postgres.vala().clone(),
         ClusterNodeId::new(node_id.as_uuid()),
     ));
     let scribe_config = bifrost_config.scribe;
@@ -857,9 +857,6 @@ async fn build_oracle_role(
         TonicOraclePeerTransport::new(addresses, None)
             .map_err(|error| ServerBootError::OraclePeer(error.to_string()))?,
     );
-    let operator_pool = state.postgres.operator_pool().ok_or_else(|| {
-        ServerBootError::OraclePeer("platform-admin operator pool is unavailable".to_owned())
-    })?;
     let reconciliation_limit_bytes = memory_budget
         .checked_div(4)
         .filter(|limit| *limit > 0)
@@ -892,7 +889,7 @@ async fn build_oracle_role(
         catalog: Arc::clone(catalog),
         vala: state.postgres.vala().clone(),
         admission_leases: vala_sql::queries::oracle_admission::OracleAdmissionLeases::new(
-            operator_pool,
+            state.postgres.vala().clone(),
         ),
         cluster: Arc::clone(&cluster),
         local_role: role.clone(),
@@ -967,14 +964,11 @@ async fn build_oracle_role(
 /// generated, or the same [`ServerBootError::OraclePeer`] failures as the
 /// production Oracle constructor.
 #[cfg(feature = "test-support")]
-pub async fn attach_test_oracle_runtime(
-    state: AppState,
-    operator_pool: vala_sql::OperatorPool,
-) -> Result<AppState, ServerBootError> {
+pub async fn attach_test_oracle_runtime(state: AppState) -> Result<AppState, ServerBootError> {
     let node_id = wyrd_spec::vala::api::NodeId::new(uuid::Uuid::now_v7());
     let signing_key = wyrd_auth_issue::IssuingKey::generate_ephemeral_pem()
         .map_err(|error| ServerBootError::SigningKey(error.to_string()))?;
-    attach_test_oracle_runtime_for_node(state, operator_pool, node_id, signing_key).await
+    attach_test_oracle_runtime_for_node(state, node_id, signing_key).await
 }
 
 /// Attach a production-shaped Oracle role with cluster-controlled identity.
@@ -991,13 +985,11 @@ pub async fn attach_test_oracle_runtime(
 #[cfg(feature = "test-support")]
 pub async fn attach_test_oracle_runtime_for_node(
     state: AppState,
-    operator_pool: vala_sql::OperatorPool,
     node_id: wyrd_spec::vala::api::NodeId,
     signing_key: secrecy::SecretString,
 ) -> Result<AppState, ServerBootError> {
     attach_test_oracle_runtime_for_node_at(
         state,
-        operator_pool,
         node_id,
         signing_key,
         "http://127.0.0.1:0".to_owned(),
@@ -1014,13 +1006,12 @@ pub async fn attach_test_oracle_runtime_for_node(
 #[cfg(feature = "test-support")]
 pub async fn attach_test_oracle_runtime_for_node_at(
     state: AppState,
-    operator_pool: vala_sql::OperatorPool,
     node_id: wyrd_spec::vala::api::NodeId,
     signing_key: secrecy::SecretString,
     advertise_addr: String,
 ) -> Result<AppState, ServerBootError> {
     let node_id = ClusterNodeId::new(node_id.as_uuid());
-    let cluster = Arc::new(ClusterRegistry::new(operator_pool, node_id));
+    let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
     let mut config = crate::config::WyrdServerConfig::default();
     config.auth.signing_key = Some(signing_key.clone());
     build_oracle_role(
@@ -1503,10 +1494,7 @@ mod pg_tests {
                 .with_bifrost_redux(redux)
                 .with_bifrost_memory_pool(memory, query_memory);
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
-            let cluster = Arc::new(ClusterRegistry::new(
-                crate::test_support::test_operator_pool().await,
-                node_id,
-            ));
+            let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
             let mut config = crate::config::WyrdServerConfig::default();
             config.auth.signing_key = Some(
                 wyrd_auth_issue::IssuingKey::generate_ephemeral_pem().expect("ephemeral test key"),
@@ -1561,10 +1549,7 @@ mod pg_tests {
                 .with_bifrost_redux(Arc::clone(&redux))
                 .with_bifrost_memory_pool(memory, query_memory);
             let node_id = ClusterNodeId::new(uuid::Uuid::now_v7());
-            let cluster = Arc::new(ClusterRegistry::new(
-                crate::test_support::test_operator_pool().await,
-                node_id,
-            ));
+            let cluster = Arc::new(ClusterRegistry::new(state.postgres.vala().clone(), node_id));
             let mut config = crate::config::WyrdServerConfig::default();
             config.auth.signing_key = Some(
                 wyrd_auth_issue::IssuingKey::generate_ephemeral_pem().expect("ephemeral test key"),

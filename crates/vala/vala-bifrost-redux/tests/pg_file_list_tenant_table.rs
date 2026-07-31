@@ -504,10 +504,17 @@ mod pg_tests {
         .await
         .expect("mark transition row compacted");
 
-        let rows = HotFileCatalog::new(fixture.vala_postgres().clone())
-            .active_files(tenant, &binding.logical_namespace, &binding.table_name)
+        let catalog = HotFileCatalog::new(&binding.logical_namespace, &binding.table_name);
+        let mut conn = fixture
+            .vala_postgres()
+            .tenant_conn(tenant)
+            .await
+            .expect("tenant connection");
+        let rows = catalog
+            .active_files(&mut conn)
             .await
             .expect("tenant-scoped Oracle manifest");
+        conn.commit().await.expect("commit manifest read");
         let observed = rows
             .iter()
             .find(|candidate| candidate.id == row.id)

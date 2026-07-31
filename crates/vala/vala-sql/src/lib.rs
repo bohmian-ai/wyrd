@@ -12,7 +12,6 @@
 
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
 
-mod operator_transaction;
 pub mod postgres;
 pub mod queries;
 pub mod row_types;

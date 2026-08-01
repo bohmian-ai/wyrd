@@ -476,13 +476,7 @@ impl WyrdCatalog {
         let Some(expected) = expected_physical_schema::<T>() else {
             return false;
         };
-        // Compare field names and types (order-sensitive).
-        physical.fields().len() == expected.fields().len()
-            && physical
-                .fields()
-                .iter()
-                .zip(expected.fields().iter())
-                .all(|(p, e)| p.name() == e.name() && p.data_type() == e.data_type())
+        physical_schema_matches_expected(physical, &expected)
     }
 
     /// Compute the fingerprint of a physical schema over user fields only.
@@ -610,4 +604,74 @@ fn expected_physical_schema<T: DomainTable>() -> Option<SchemaRef> {
         iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(declared.as_ref()).ok()?;
     let roundtripped = iceberg::arrow::schema_to_arrow_schema(&iceberg_schema).ok()?;
     Some(Arc::new(roundtripped))
+}
+
+/// Compare the complete ordered physical shape after Iceberg normalization.
+///
+/// Registration and split-brain repair use this validator before accepting a
+/// persisted table. Names, normalized Arrow types, order, and nullability all
+/// participate so an old nullable identity column or a missing request column
+/// fails closed instead of being silently coerced.
+fn physical_schema_matches_expected(physical: &SchemaRef, expected: &SchemaRef) -> bool {
+    physical.fields().len() == expected.fields().len()
+        && physical
+            .fields()
+            .iter()
+            .zip(expected.fields().iter())
+            .all(|(actual, declared)| {
+                actual.name() == declared.name()
+                    && actual.data_type() == declared.data_type()
+                    && actual.is_nullable() == declared.is_nullable()
+            })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tables::traces::SpansTable;
+    use arrow::datatypes::Schema;
+
+    #[test]
+    /// A nullable principal is rejected even when every other physical field matches.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the declared schema cannot be normalized or the mismatch is accepted.
+    fn physical_schema_rejects_nullable_principal_id() {
+        let expected = expected_physical_schema::<SpansTable>().expect("schema normalizes");
+        let fields: Vec<_> = expected
+            .fields()
+            .iter()
+            .map(|field| {
+                let field = if field.name() == wyrd_spec::vala::PRINCIPAL_ID {
+                    field.as_ref().clone().with_nullable(true)
+                } else {
+                    field.as_ref().clone()
+                };
+                Arc::new(field)
+            })
+            .collect();
+        let physical = Arc::new(Schema::new(fields));
+
+        assert!(!physical_schema_matches_expected(&physical, &expected));
+    }
+
+    #[test]
+    /// A physical schema missing request correlation is rejected before repair.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the declared schema cannot be normalized or the mismatch is accepted.
+    fn physical_schema_rejects_missing_request_id() {
+        let expected = expected_physical_schema::<SpansTable>().expect("schema normalizes");
+        let fields: Vec<_> = expected
+            .fields()
+            .iter()
+            .filter(|field| field.name() != wyrd_spec::vala::WYRD_REQUEST_ID)
+            .cloned()
+            .collect();
+        let physical = Arc::new(Schema::new(fields));
+
+        assert!(!physical_schema_matches_expected(&physical, &expected));
+    }
 }

@@ -30,11 +30,12 @@ pub mod traces;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CorrelationPolicy {
     /// Observation facts (traces, metrics, logs, genai, eval, drift).
-    /// Appends `run_id`, `card_uid`, `principal_id` (all nullable).
+    /// Appends nullable `run_id` and `card_uid`, then required principal and
+    /// request identities.
     Observation,
     /// `agent_traces`: the code axis owns `run_id`, so the universal `run_id` is
     /// NOT appended (it would collide with the code-axis column).
-    /// `card_uid` + `principal_id` ARE appended.
+    /// nullable `card_uid` plus required principal and request identities ARE appended.
     CodeAxis,
 }
 
@@ -46,8 +47,13 @@ impl CorrelationPolicy {
                 wyrd_spec::vala::RUN_ID,
                 wyrd_spec::vala::CARD_UID,
                 wyrd_spec::vala::PRINCIPAL_ID,
+                wyrd_spec::vala::WYRD_REQUEST_ID,
             ],
-            Self::CodeAxis => &[wyrd_spec::vala::CARD_UID, wyrd_spec::vala::PRINCIPAL_ID],
+            Self::CodeAxis => &[
+                wyrd_spec::vala::CARD_UID,
+                wyrd_spec::vala::PRINCIPAL_ID,
+                wyrd_spec::vala::WYRD_REQUEST_ID,
+            ],
         }
     }
 }
@@ -306,14 +312,25 @@ mod tests {
     use wyrd_spec::vala::{CARD_UID, PRINCIPAL_ID, RUN_ID};
 
     #[test]
+    /// Observation policy exposes both authenticated identity columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the policy omits or reorders an identity column.
     fn observation_policy_appends_all_three() {
         let cols = CorrelationPolicy::Observation.appended_correlation_columns();
         assert!(cols.contains(&RUN_ID));
         assert!(cols.contains(&CARD_UID));
         assert!(cols.contains(&PRINCIPAL_ID));
+        assert!(cols.contains(&wyrd_spec::vala::WYRD_REQUEST_ID));
     }
 
     #[test]
+    /// Code-axis policy omits only the run column owned by the user schema.
+    ///
+    /// # Panics
+    ///
+    /// Panics when code-axis policy appends the owned run field or omits identity.
     fn code_axis_policy_omits_run_id() {
         let cols = CorrelationPolicy::CodeAxis.appended_correlation_columns();
         assert!(
@@ -322,12 +339,23 @@ mod tests {
         );
         assert!(cols.contains(&CARD_UID));
         assert!(cols.contains(&PRINCIPAL_ID));
+        assert!(cols.contains(&wyrd_spec::vala::WYRD_REQUEST_ID));
     }
 
     #[test]
+    /// Observation policy rejects declarations that collide with managed identity columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a managed identity field is incorrectly accepted.
     fn observation_table_rejects_reserved_correlation_names() {
         let policy = CorrelationPolicy::Observation;
-        for reserved in [RUN_ID, CARD_UID, PRINCIPAL_ID] {
+        for reserved in [
+            RUN_ID,
+            CARD_UID,
+            PRINCIPAL_ID,
+            wyrd_spec::vala::WYRD_REQUEST_ID,
+        ] {
             assert!(
                 reject_reserved_domain_fields(&[reserved], policy).is_err(),
                 "'{reserved}' must be rejected on Observation table"
@@ -336,6 +364,11 @@ mod tests {
     }
 
     #[test]
+    /// Code-axis policy allows its user-owned run field but reserves other identities.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the code-axis user-owned run field is rejected.
     fn code_axis_table_permits_run_id_content_column() {
         // agent_traces has CorrelationPolicy::CodeAxis and declares run_id as its own code-axis column.
         let result = reject_reserved_domain_fields(&["run_id"], CorrelationPolicy::CodeAxis);
@@ -346,6 +379,11 @@ mod tests {
     }
 
     #[test]
+    /// System columns remain reserved for every domain correlation policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a system-managed field is incorrectly accepted.
     fn system_column_always_rejected_regardless_of_policy() {
         for policy in [CorrelationPolicy::Observation, CorrelationPolicy::CodeAxis] {
             for sys in [

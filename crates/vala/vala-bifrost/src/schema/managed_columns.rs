@@ -6,21 +6,22 @@ use wyrd_spec::vala::{
 };
 
 /// Extend the user fields with the physical Bifrost columns for a dynamically-created
-/// (non-domain) table: the three universal correlation columns (`run_id`, `card_uid`,
-/// `principal_id`, all nullable) followed by the server-owned system columns.
+/// (non-domain) table: the correlation columns (`run_id`, `card_uid`, required
+/// `principal_id`, and required `wyrd_request_id`) followed by the server-owned
+/// system columns.
 ///
 /// For pre-declared domain tables use `ensure_managed_columns` in `tables/managed_columns.rs`,
 /// which appends only the columns the table's `CorrelationPolicy` permits.
 ///
 /// The correlation columns are server-stamped/resolved but must exist in the stored
-/// Iceberg schema so the columnar write has a landing target; they are nullable so
-/// the internal `BifrostWriteContext::system()` path can write them as NULL. They do
-/// **not** perturb the user-fields-only [`SchemaFingerprint`], which is computed over
-/// the user fields alone in `create_table`.
+/// Iceberg schema so the columnar write has a landing target. Optional run and card
+/// context remain nullable; authenticated writes always stamp `principal_id`. These
+/// columns do **not** perturb the user-fields-only [`SchemaFingerprint`], which is
+/// computed over the user fields alone in `create_table`.
 pub fn with_managed_columns(mut user_fields: Vec<Field>) -> Vec<Field> {
     user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
     user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-    user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+    user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
     user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
     user_fields.push(Field::new(
         WYRD_EVENT_TIME,
@@ -47,6 +48,11 @@ mod tests {
     use super::*;
 
     #[test]
+    /// Dynamic schemas retain Redux field order and required identity nullability.
+    ///
+    /// # Panics
+    ///
+    /// Panics when field order or required nullability changes.
     fn managed_column_order_matches_redux_contract() {
         let fields = with_managed_columns(vec![Field::new("value", DataType::UInt64, false)]);
         let names = fields
@@ -69,5 +75,6 @@ mod tests {
             ]
         );
         assert!(!fields[4].is_nullable());
+        assert!(!fields[3].is_nullable());
     }
 }

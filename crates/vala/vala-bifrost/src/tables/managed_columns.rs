@@ -3,7 +3,7 @@ use arrow::datatypes::{DataType, Field, TimeUnit};
 use crate::tables::CorrelationPolicy;
 use wyrd_spec::vala::{
     CARD_UID, DATA_TENANT_ID, PRINCIPAL_ID, RUN_ID, WYRD_BATCH_ID, WYRD_EVENT_TIME,
-    WYRD_INGESTED_AT, WYRD_ROW_ORDINAL,
+    WYRD_INGESTED_AT, WYRD_REQUEST_ID, WYRD_ROW_ORDINAL,
 };
 
 /// Append the Bifrost system columns (and policy-gated correlation columns)
@@ -12,7 +12,8 @@ use wyrd_spec::vala::{
 /// Column order: policy correlation columns first, then system timestamp
 /// columns, then `wyrd_batch_id`, immutable `wyrd_row_ordinal`, and
 /// `data_tenant_id` (always present on domain tables, which are all
-/// `SystemShared`).
+/// `SystemShared`). Both authenticated identity columns are required; only
+/// policy-specific run and card context remains nullable.
 ///
 /// This is the single source of truth for what gets appended per policy.
 /// The appended columns here are excluded from `schema_fingerprint()`, which
@@ -26,12 +27,14 @@ pub fn ensure_managed_columns(
         CorrelationPolicy::Observation => {
             user_fields.push(Field::new(RUN_ID, DataType::Utf8, true));
             user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
+            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
         }
         CorrelationPolicy::CodeAxis => {
             // run_id is declared as a code-axis user field; do not append the universal one.
             user_fields.push(Field::new(CARD_UID, DataType::Utf8, true));
-            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, true));
+            user_fields.push(Field::new(PRINCIPAL_ID, DataType::Utf8, false));
+            user_fields.push(Field::new(WYRD_REQUEST_ID, DataType::Utf8, false));
         }
     }
 
@@ -67,6 +70,11 @@ mod tests {
     }
 
     #[test]
+    /// Observation schemas require authenticated principal and request identity.
+    ///
+    /// # Panics
+    ///
+    /// Panics when required identity fields are absent, reordered, or nullable.
     fn observation_policy_appends_all_three_then_system() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::Observation);
         let names = field_names(&fields);
@@ -76,6 +84,7 @@ mod tests {
                 RUN_ID,
                 CARD_UID,
                 PRINCIPAL_ID,
+                WYRD_REQUEST_ID,
                 WYRD_EVENT_TIME,
                 WYRD_INGESTED_AT,
                 WYRD_BATCH_ID,
@@ -83,9 +92,16 @@ mod tests {
                 DATA_TENANT_ID
             ]
         );
+        assert!(!fields[2].is_nullable());
+        assert!(!fields[3].is_nullable());
     }
 
     #[test]
+    /// Code-axis schemas preserve their owned run field while requiring identity columns.
+    ///
+    /// # Panics
+    ///
+    /// Panics when code-axis correlation fields do not match the Redux shape.
     fn code_axis_policy_omits_run_id() {
         let fields = ensure_managed_columns(vec![], CorrelationPolicy::CodeAxis);
         let names = field_names(&fields);
@@ -95,9 +111,15 @@ mod tests {
         );
         assert!(names.contains(&CARD_UID));
         assert!(names.contains(&PRINCIPAL_ID));
+        assert!(names.contains(&WYRD_REQUEST_ID));
     }
 
     #[test]
+    /// Domain user fields remain ahead of every server-managed field.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a managed field is inserted before user fields.
     fn user_fields_come_before_system() {
         let user = vec![Field::new("my_col", DataType::Utf8, true)];
         let fields = ensure_managed_columns(user, CorrelationPolicy::Observation);

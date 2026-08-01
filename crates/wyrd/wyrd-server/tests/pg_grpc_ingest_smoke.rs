@@ -601,6 +601,10 @@ mod pg_tests {
     }
 
     /// Keeps the legacy managed-column parity contract exact during Redux migration.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any managed field differs in name, type, order, or nullability.
     #[test]
     fn legacy_and_redux_managed_columns_are_exactly_equal() {
         let user_fields = vec![Field::new("value", DataType::UInt64, false)];
@@ -620,7 +624,7 @@ mod pg_tests {
                 ("value", &DataType::UInt64, false),
                 ("run_id", &DataType::Utf8, true),
                 ("card_uid", &DataType::Utf8, true),
-                ("principal_id", &DataType::Utf8, true),
+                ("principal_id", &DataType::Utf8, false),
                 ("wyrd_request_id", &DataType::Utf8, false),
                 (
                     "wyrd_event_time",

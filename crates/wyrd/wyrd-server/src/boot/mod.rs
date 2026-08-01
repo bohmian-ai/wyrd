@@ -1492,19 +1492,51 @@ mod pg_tests {
     use vala_bifrost_redux::forge::{Forge, ForgeBuildConfig};
     use vala_bifrost_redux::maintenance::{StagingFileCommitted, staging_file_channel};
     use vala_bifrost_redux::namespaces::BifrostNamespace;
+    use vala_bifrost_redux::oracle::dispatcher::DispatchError;
     use vala_bifrost_redux::oracle::{AuthorizedQueryContext, QueryOptions};
     use vala_bifrost_redux::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
     use vala_sql::OperatorPool;
     use wyrd_runtime::permission::{Permission, PermissionSet};
-    use wyrd_runtime::{Principal, PrincipalKind};
+    use wyrd_runtime::{Principal, PrincipalKind, RoleRef};
     use wyrd_spec::auth::PrincipalId;
+    use wyrd_spec::ids::CardUid;
+    use wyrd_spec::reference::CardRefScope;
     use wyrd_spec::request_id::RequestId;
     use wyrd_spec::vala::api::{
-        AuthMethod, QueryStreamFrame, QueryTerminalErrorCode, QueryTerminalOutcome, VisibilityMode,
+        AuthMethod, ClusterCapabilities, QueryStreamFrame, QueryTerminalErrorCode,
+        QueryTerminalOutcome, VisibilityMode,
     };
     use wyrd_storage::{BackendSigner, LocalSigner, StorageHandle};
 
     use crate::postgres::ServerPostgres;
+
+    /// Test-only peer credential that returns a production-signed access token.
+    struct TestOraclePeerCredentials {
+        /// Access token minted by the same issuing key installed in test auth.
+        token: SecretString,
+    }
+
+    impl std::fmt::Debug for TestOraclePeerCredentials {
+        /// Redacts the bearer token from test diagnostics.
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestOraclePeerCredentials")
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait]
+    impl OraclePeerCredentials for TestOraclePeerCredentials {
+        /// Returns the pre-minted token for each local peer exchange.
+        ///
+        /// # Errors
+        ///
+        /// This fixture never refreshes or rejects its pre-minted token, so it
+        /// always returns `Ok` unless the credential contract changes.
+        async fn bearer(&self, _force_refresh: bool) -> Result<String, DispatchError> {
+            Ok(self.token.expose_secret().to_owned())
+        }
+    }
 
     /// Compose one real Forge from the retained test fixture resources.
     async fn composed_test_state() -> (
@@ -1646,6 +1678,96 @@ mod pg_tests {
         AppState::new(postgres, storage, crate::test_support::test_catalog().await)
     }
 
+    /// Installs auth and provisions a real service-role token for Oracle boot.
+    ///
+    /// The credential bypasses only network transport; service-account lookup,
+    /// role resolution, token signing, and access-token verification stay on
+    /// the production paths exercised by [`OracleRoleBuilder`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shared fixture cannot seed the peer role, auth handles,
+    /// or production-shaped service token.
+    async fn with_test_oracle_peer_credentials(
+        state: AppState,
+        config: &crate::config::WyrdServerConfig,
+        signing_key: &SecretString,
+    ) -> (AppState, Arc<dyn OraclePeerCredentials>) {
+        let state = install_auth(state, config, signing_key, None)
+            .await
+            .expect("test auth installs");
+        let tenant = DataTenantId::SYSTEM_OWNER;
+        let service_id = uuid::Uuid::now_v7();
+        let service_name = format!("oracle-peer-{}", service_id.simple());
+        let card_ref = CardRef {
+            kind: CardKind::Service,
+            name: CardName::new(service_name.clone()).expect("service card name"),
+            version: VersionBlock::parse("1.0.0").expect("service card version"),
+            space: SpaceName::new("system").expect("service card space"),
+            uid: Some(CardUid::new(service_id.to_string()).expect("service card uid")),
+        };
+        let role_name = "bifrost_oracle_peer";
+        let permissions = serde_json::to_value([Permission::bifrost_oracle_peer_invoke()])
+            .expect("peer permissions serialize");
+        let mut conn = state
+            .postgres
+            .tenant_conn(tenant)
+            .await
+            .expect("system tenant connection");
+        crate::auth::seed::seed_builtin_roles_for_tenant(&mut conn, tenant)
+            .await
+            .expect("builtin roles seed");
+        wyrd_sql::queries::auth::insert_role(
+            &mut conn,
+            uuid::Uuid::now_v7(),
+            role_name,
+            &permissions,
+            false,
+        )
+        .await
+        .expect("peer role inserts");
+        wyrd_sql::queries::auth::insert_service_account(
+            &mut conn,
+            service_id,
+            "service",
+            &card_ref,
+            &service_name,
+            None,
+            crate::boot::bootstrap::SYSTEM_OPERATOR_ID,
+        )
+        .await
+        .expect("peer service account inserts");
+        let role = wyrd_sql::queries::auth::role_by_name(&mut conn, role_name)
+            .await
+            .expect("peer role lookup")
+            .expect("peer role exists");
+        wyrd_sql::queries::auth::grant_role_to_service_account(&mut conn, service_id, role.id)
+            .await
+            .expect("peer role grants");
+        conn.commit().await.expect("peer role transaction commits");
+
+        let token = state
+            .auth
+            .issuing_key
+            .as_ref()
+            .expect("test auth issuing key")
+            .issue_service_access_token(
+                PrincipalId::new(service_id),
+                tenant,
+                card_ref,
+                CardRefScope::default(),
+                vec![RoleRef::new(role_name).expect("peer role ref")],
+                chrono::Duration::minutes(5),
+            )
+            .expect("peer access token issues");
+        (
+            state,
+            Arc::new(TestOraclePeerCredentials {
+                token: SecretString::new(token.into()),
+            }) as Arc<dyn OraclePeerCredentials>,
+        )
+    }
+
     /// Verified boot dependencies register and retain one ready local Oracle peer.
     #[test]
     fn oracle_peer_boot_registers_role_and_runtime_after_sentinel_verification() {
@@ -1671,6 +1793,8 @@ mod pg_tests {
                 .signing_key
                 .as_ref()
                 .expect("test config retains signing key");
+            let (state, peer_credentials) =
+                with_test_oracle_peer_credentials(state, &config, signing_key).await;
             let state = OracleRoleBuilder {
                 state,
                 config: &config,
@@ -1678,7 +1802,7 @@ mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
-                peer_credentials: None,
+                peer_credentials: Some(peer_credentials),
             }
             .build()
             .await
@@ -1727,9 +1851,8 @@ mod pg_tests {
                 .signing_key
                 .as_ref()
                 .expect("test config retains signing key");
-            let state = install_auth(state, &config, signing_key, None)
-                .await
-                .expect("test auth");
+            let (state, peer_credentials) =
+                with_test_oracle_peer_credentials(state, &config, signing_key).await;
             let state = OracleRoleBuilder {
                 state,
                 config: &config,
@@ -1737,7 +1860,7 @@ mod pg_tests {
                 cluster: Arc::clone(&cluster),
                 node_id,
                 advertise_addr: "127.0.0.1:9443",
-                peer_credentials: None,
+                peer_credentials: Some(peer_credentials),
             }
             .build()
             .await
@@ -1799,7 +1922,7 @@ mod pg_tests {
             let ingest = Arc::new(
                 BifrostIngestRuntime::new(
                     scribe,
-                    redux,
+                    Arc::clone(&redux),
                     verifier,
                     vala_bifrost_redux::gate::limits::IngestLimits::default(),
                     None,
@@ -1824,11 +1947,24 @@ mod pg_tests {
                 Permission::bifrost_query_read().to_string(),
             )
             .expect("authorized query context");
+            let table_ref = TableRef::new(
+                BifrostNamespace::Datasets,
+                format!("shutdown_probe_{}", uuid::Uuid::now_v7().simple()),
+            );
+            redux
+                .register_dataset(
+                    tenant,
+                    table_ref.clone(),
+                    vec![Field::new("value", DataType::Int64, false)],
+                    None,
+                )
+                .await
+                .expect("register typed query fixture");
             let source =
                 provider_as_source(Arc::new(EmptyTable::new(Arc::new(Schema::new(vec![
                     Field::new("value", DataType::Int64, false),
                 ])))));
-            let plan = LogicalPlanBuilder::scan("fixture", source, None)
+            let plan = LogicalPlanBuilder::scan(table_ref.fqn(), source, None)
                 .expect("fixture scan")
                 .build()
                 .expect("read-only empty scan");
@@ -1875,12 +2011,26 @@ mod pg_tests {
                             error.code == QueryTerminalErrorCode::QueryExecutionFailed
                         })
             ));
+            let replacement_capabilities = match oracle_role.capabilities.clone() {
+                ClusterCapabilities::OracleV1(capabilities) => capabilities,
+                ClusterCapabilities::ScribeV1(_) => {
+                    panic!("Oracle role carries Oracle capabilities")
+                }
+            };
+            let replacement_role = cluster
+                .register_oracle("127.0.0.1:9445", replacement_capabilities)
+                .await
+                .expect("replacement Oracle fence");
             assert!(matches!(
                 cluster
                     .heartbeat_readiness_for_test(&oracle_role, true)
                     .await,
                 Err(vala_bifrost_redux::cluster::ClusterError::StaleFence)
             ));
+            cluster
+                .shutdown_role(replacement_role)
+                .await
+                .expect("replacement Oracle fence shutdown");
             cluster
                 .heartbeat_readiness_for_test(&scribe_role, true)
                 .await
@@ -1901,12 +2051,25 @@ mod pg_tests {
             ingest.shutdown().await;
             assert!(ingest.gate().is_closed_for_test());
             assert!(!ingest.is_ready());
+            let replacement_scribe = cluster
+                .register_scribe(
+                    "127.0.0.1:9445",
+                    ScribeCapabilitiesV1 {
+                        tail_protocol_version: 1,
+                    },
+                )
+                .await
+                .expect("replacement Scribe fence");
             assert!(matches!(
                 cluster
                     .heartbeat_readiness_for_test(&scribe_role, true)
                     .await,
                 Err(vala_bifrost_redux::cluster::ClusterError::StaleFence)
             ));
+            cluster
+                .shutdown_role(replacement_scribe)
+                .await
+                .expect("replacement Scribe fence shutdown");
             cluster.refresh_snapshot().await.expect("stopped snapshot");
             assert!(cluster.snapshot().live_oracles().is_empty());
             assert!(cluster.snapshot().live_scribes().is_empty());

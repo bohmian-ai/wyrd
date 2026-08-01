@@ -534,9 +534,11 @@ mod pg_tests {
             vala_bifrost_redux::gate::limits::IngestLimits::default(),
             None,
         ));
+        let gate = ingest.gate();
         AppState::new(postgres, storage, catalog)
             .with_bifrost_redux(redux_catalog)
             .with_bifrost_ingest(ingest)
+            .with_bifrost_gate(gate)
             .with_auth(ServerAuth {
                 issuing_key: Some(issuing_key),
                 token_verifier: Some(verifier),

@@ -1227,6 +1227,121 @@ mod tests {
         }
     }
 
+    /// Prove every report projection responds only to its production delta field.
+    #[test]
+    fn forge_telemetry_report_uses_production_delta() {
+        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
+        let baseline =
+            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
+                .expect("complete production delta maps");
+        macro_rules! assert_projection {
+            ($delta:expr, $field:ident) => {{
+                let changed =
+                    ForgeMaintenanceTelemetryReport::from_production_delta(&$delta, &expected)
+                        .expect("changed production delta maps");
+                assert_ne!(changed.$field, baseline.$field);
+                let mut normalized = changed;
+                normalized.$field = baseline.$field.clone();
+                assert_eq!(normalized, baseline);
+            }};
+        }
+
+        let mut delta = complete_delta();
+        delta.metrics[0].value *= 2.0;
+        assert_projection!(delta, throughput_mib_per_sec);
+
+        let mut delta = complete_delta();
+        delta.metrics[3]
+            .labels
+            .insert("le".to_owned(), "0.2".to_owned());
+        assert_projection!(delta, task_latency_p99_us);
+
+        let mut delta = complete_delta();
+        delta.gauge_maxima[0].value = 0.02;
+        assert_projection!(delta, backlog_age_us);
+
+        let mut delta = complete_delta();
+        delta.gauge_maxima[1].value = 2048.0;
+        assert_projection!(delta, peak_parent_memory);
+
+        let mut delta = complete_delta();
+        delta.metrics[5]
+            .labels
+            .insert("le".to_owned(), "131072".to_owned());
+        assert_projection!(delta, spill_bytes);
+
+        for (index, field) in [
+            (9, "lease_contention"),
+            (10, "fence_lost"),
+            (11, "snapshot_changed"),
+        ] {
+            let mut delta = complete_delta();
+            delta.metrics[index].value = 1.0;
+            let changed = ForgeMaintenanceTelemetryReport::from_production_delta(&delta, &expected)
+                .expect("changed production conflict maps");
+            let mut normalized = changed.clone();
+            match field {
+                "lease_contention" => normalized.lease_contention = baseline.lease_contention,
+                "fence_lost" => normalized.fence_lost = baseline.fence_lost,
+                "snapshot_changed" => normalized.snapshot_changed = baseline.snapshot_changed,
+                _ => unreachable!("closed conflict projection"),
+            }
+            assert_ne!(changed, baseline);
+            assert_eq!(normalized, baseline);
+        }
+
+        let mut delta = complete_delta();
+        delta.gauge_maxima[2].value = 2.0;
+        assert_projection!(delta, fairness_lag_tasks);
+
+        let mut delta = complete_delta();
+        delta.metrics[7]
+            .labels
+            .insert("le".to_owned(), "0.05".to_owned());
+        assert_projection!(delta, cleanup_delay_us);
+
+        let mut delta = complete_delta();
+        delta.metrics[13].value = 5.0;
+        assert_projection!(delta, role_topology);
+    }
+
+    /// Reject benchmark-local derivation paths outside the production capture mapper.
+    #[test]
+    fn forge_benchmark_has_no_parallel_metric_derivation() {
+        let source = include_str!("bench_forge.rs");
+        for prohibited in [
+            "Instant::elapsed",
+            "query_latency",
+            "schedule_once",
+            "execute_one_for_test",
+        ] {
+            assert!(!source.contains(prohibited));
+        }
+        assert!(source.contains("ForgeMaintenanceTelemetryReport::from_production_delta"));
+    }
+
+    /// Prove replacement starts remain distinct from maximum and final concurrency.
+    #[test]
+    fn forge_role_topology_survives_worker_replacement() {
+        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
+        let report =
+            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
+                .expect("production replacement topology maps");
+        assert_eq!(report.role_topology["forge_worker"].starts, 4);
+        assert_eq!(report.role_topology["forge_worker"].max_active, 3);
+        assert_eq!(report.role_topology["forge_worker"].final_active, 3);
+    }
+
+    /// Prove throughput uses captured output bytes divided by the capture interval.
+    #[test]
+    fn forge_throughput_uses_production_counter_rate() {
+        let expected = BTreeMap::from([("server".to_owned(), 1), ("forge_worker".to_owned(), 3)]);
+        let report =
+            ForgeMaintenanceTelemetryReport::from_production_delta(&complete_delta(), &expected)
+                .expect("production counter-rate delta maps");
+        assert_eq!(report.throughput_mib_per_sec, 0.5);
+    }
+
     /// Reject missing, stale, empty, wrong-topology, and open-label report windows.
     #[test]
     fn forge_telemetry_report_rejects_incomplete_windows() {

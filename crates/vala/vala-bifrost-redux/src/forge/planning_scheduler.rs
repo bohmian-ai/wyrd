@@ -1,6 +1,7 @@
 //! Durable demand scheduling without rewrite or Iceberg commit execution.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use chrono::Utc;
 use num_traits::ToPrimitive;
@@ -404,10 +405,10 @@ impl<'forge> ForgeScheduler<'forge> {
                     .as_secs_f64()
             });
             metrics::gauge!("bifrost_forge_oldest_planning_demand_seconds").set(age);
-            metrics::gauge!("bifrost_forge_oldest_backlog_seconds").set(age);
-            metrics::gauge!("bifrost_forge_fairness_lag_tasks")
-                .set(exact_gauge(outcome.fairness_lag_tasks as u64));
-            metrics::counter!("bifrost_forge_complete_gauge_publications_total").increment(1);
+            self.forge
+                .core
+                .telemetry
+                .record_planning_status(Duration::from_secs_f64(age), outcome.fairness_lag_tasks);
         } else {
             outcome.incomplete = true;
         }

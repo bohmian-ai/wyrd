@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use metrics::{Counter, Histogram};
+use metrics::{Counter, Gauge, Histogram};
 use num_traits::ToPrimitive;
 use uuid::Uuid;
 use wyrd_spec::vala::api::StoragePath;
@@ -186,6 +186,12 @@ pub(super) struct ForgeRewriteVolume {
 
 /// Registered Forge metric handles retained by one Forge owner.
 pub struct ForgeTelemetry {
+    /// Complete scheduler-owned oldest-backlog publication.
+    oldest_backlog: Gauge,
+    /// Complete scheduler-owned fairness-lag publication.
+    fairness_lag: Gauge,
+    /// Count of complete scheduler gauge publications.
+    complete_gauge_publications: Counter,
     /// Terminal operation counters for every source/result combination.
     operations: BTreeMap<(ForgeMetricSource, ForgeOperationResult), Counter>,
     /// Lease-boundary counters for every closed result.
@@ -219,6 +225,11 @@ impl ForgeTelemetry {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            oldest_backlog: metrics::gauge!("bifrost_forge_oldest_backlog_seconds"),
+            fairness_lag: metrics::gauge!("bifrost_forge_fairness_lag_tasks"),
+            complete_gauge_publications: metrics::counter!(
+                "bifrost_forge_complete_gauge_publications_total"
+            ),
             operations: operation_counters(),
             lease_events: lease_counters(),
             stage_failures: stage_failure_counters(),
@@ -277,6 +288,17 @@ impl ForgeTelemetry {
         if let Some(histogram) = self.cleanup_duration.get(kind) {
             histogram.record(elapsed.as_secs_f64());
         }
+    }
+
+    /// Publish the complete scheduler-owned backlog and fairness state.
+    ///
+    /// This boundary is called only after the scheduler has read a complete
+    /// durable status page, so neither gauge can expose a partial roster.
+    pub(crate) fn record_planning_status(&self, backlog_age: Duration, fairness_lag: usize) {
+        self.oldest_backlog.set(backlog_age.as_secs_f64());
+        self.fairness_lag
+            .set(fairness_lag.to_f64().unwrap_or(f64::MAX));
+        self.complete_gauge_publications.increment(1);
     }
 
     /// Construct the shared closed-schema span for one catalog commit future.
@@ -488,6 +510,151 @@ impl Forge {
                 })?;
         }
         Ok(bytes)
+    }
+}
+
+/// Production-owner telemetry sensitivity tests.
+mod tests {
+    #[cfg(test)]
+    use std::collections::BTreeMap;
+    #[cfg(test)]
+    use std::sync::Arc;
+    #[cfg(test)]
+    use std::time::Duration;
+
+    #[cfg(test)]
+    use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool};
+    #[cfg(test)]
+    use wyrd_bench::{BenchmarkMetricSnapshot, BenchmarkRecorder};
+
+    #[cfg(test)]
+    use super::{ForgeMetricSource, ForgeTelemetry};
+    #[cfg(test)]
+    use crate::scribe::memory::{BifrostDataFusionMemoryPool, BifrostMemoryGovernor};
+
+    /// Report families whose values are projected by the Forge maintenance report.
+    #[cfg(test)]
+    const REPORT_FAMILIES: [&str; 10] = [
+        "bifrost_forge_rewrite_output_bytes_total",
+        "bifrost_forge_task_duration_seconds",
+        "bifrost_forge_oldest_backlog_seconds",
+        "bifrost_memory_reserved_bytes",
+        "bifrost_forge_task_spill_bytes",
+        "bifrost_forge_conflicts_total",
+        "bifrost_forge_fairness_lag_tasks",
+        "bifrost_forge_cleanup_duration_seconds",
+        "bifrost_forge_role_processes",
+        "bifrost_forge_role_process_started_total",
+    ];
+
+    /// Return whether one report family changed between recorder snapshots.
+    #[cfg(test)]
+    fn family_changed(
+        before: &BenchmarkMetricSnapshot,
+        after: &BenchmarkMetricSnapshot,
+        family: &str,
+    ) -> bool {
+        let counters = |snapshot: &BenchmarkMetricSnapshot| {
+            snapshot
+                .counters
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str() == family || name.starts_with(&format!("{family}{{"))
+                })
+                .map(|(name, value)| (name.clone(), *value))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let gauges = |snapshot: &BenchmarkMetricSnapshot| {
+            snapshot
+                .gauges
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str() == family || name.starts_with(&format!("{family}{{"))
+                })
+                .map(|(name, value)| (name.clone(), *value))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let histograms = |snapshot: &BenchmarkMetricSnapshot| {
+            snapshot
+                .histograms
+                .iter()
+                .filter(|(name, _)| {
+                    name.as_str() == family || name.starts_with(&format!("{family}{{"))
+                })
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        counters(before) != counters(after)
+            || gauges(before) != gauges(after)
+            || histograms(before) != histograms(after)
+    }
+
+    /// Assert one authoritative owner transition changes only its mapped report family.
+    #[cfg(test)]
+    fn assert_owner_transition(
+        recorder: &BenchmarkRecorder,
+        expected: &str,
+        transition: impl FnOnce(),
+    ) {
+        let before = recorder.snapshot();
+        transition();
+        let after = recorder.snapshot();
+        let changed = REPORT_FAMILIES
+            .into_iter()
+            .filter(|family| family_changed(&before, &after, family))
+            .collect::<Vec<_>>();
+        assert_eq!(changed, vec![expected]);
+    }
+
+    /// Drive each real telemetry owner boundary and pin independent report sensitivity.
+    #[test]
+    fn forge_production_telemetry_contract() {
+        let recorder = BenchmarkRecorder::new()
+            .install()
+            .expect("production metrics recorder installs once");
+        let telemetry = ForgeTelemetry::new();
+        telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 0, 0, 0, 0);
+        telemetry.record_task_terminal("staging_fold", "succeeded", Duration::ZERO);
+        telemetry.record_task_spill("staging_fold", 0);
+        for kind in ["lease_contention", "fence_lost", "snapshot_changed"] {
+            telemetry.record_conflict(kind);
+        }
+        telemetry.record_cleanup("expired", Duration::ZERO);
+        telemetry.record_planning_status(Duration::from_secs(1), 1);
+        let governor = BifrostMemoryGovernor::new(1024 * 1024 * 1024).expect("valid memory");
+        let pool: Arc<dyn MemoryPool> = Arc::new(BifrostDataFusionMemoryPool::new(governor));
+        let reservation = MemoryConsumer::new("forge-owner-proof").register(&pool);
+        reservation.try_grow(0).expect("zero-sized Forge reserve");
+
+        assert_owner_transition(
+            &recorder,
+            "bifrost_forge_rewrite_output_bytes_total",
+            || telemetry.record_rewrite_volume(ForgeMetricSource::Staging, 1, 64, 1, 32),
+        );
+        assert_owner_transition(&recorder, "bifrost_forge_task_duration_seconds", || {
+            telemetry.record_task_terminal("staging_fold", "succeeded", Duration::from_millis(2));
+        });
+        assert_owner_transition(&recorder, "bifrost_forge_oldest_backlog_seconds", || {
+            telemetry.record_planning_status(Duration::from_secs(2), 1);
+        });
+        assert_owner_transition(&recorder, "bifrost_forge_fairness_lag_tasks", || {
+            telemetry.record_planning_status(Duration::from_secs(2), 2);
+        });
+        assert_owner_transition(&recorder, "bifrost_forge_task_spill_bytes", || {
+            telemetry.record_task_spill("staging_fold", 4096);
+        });
+        for kind in ["lease_contention", "fence_lost", "snapshot_changed"] {
+            assert_owner_transition(&recorder, "bifrost_forge_conflicts_total", || {
+                telemetry.record_conflict(kind);
+            });
+        }
+        assert_owner_transition(&recorder, "bifrost_forge_cleanup_duration_seconds", || {
+            telemetry.record_cleanup("expired", Duration::from_millis(3));
+        });
+
+        assert_owner_transition(&recorder, "bifrost_memory_reserved_bytes", || {
+            reservation.try_grow(4096).expect("Forge memory reserve");
+        });
     }
 }
 

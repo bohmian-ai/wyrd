@@ -185,9 +185,10 @@ impl PgFixture {
     /// Open a pool connected as the `wyrd_migrator` (table-owner) role.
     ///
     /// Use this pool in test assertions that need to read across all tenants
-    /// without RLS. The `wyrd_migrator` role is the table owner and bypasses
-    /// row-level security, making it the lowest-friction read path for raw
-    /// assertion queries.
+    /// without RLS. The `wyrd_migrator` role is the table owner and has the
+    /// `BYPASSRLS` attribute, making it the lowest-friction read path for raw
+    /// assertion queries. It is not a PostgreSQL superuser and cannot create
+    /// databases.
     ///
     /// A new pool is created on each call; cache it in a local if you need
     /// it more than once per test.
@@ -233,9 +234,12 @@ impl PgFixture {
     }
 }
 
+/// Owns one ephemeral database and the admin authority required to clean it up.
 struct TestDatabase {
+    /// Unique database name allocated for this fixture instance.
     name: String,
-    maintenance_dsn: SecretString,
+    /// Neutral cluster-admin DSN used only for database lifecycle operations.
+    admin_dsn: SecretString,
 }
 
 struct TestDbHandles {
@@ -248,29 +252,33 @@ struct TestDbHandles {
 }
 
 impl TestDatabase {
+    /// Creates an isolated database, grants the migrator its narrow database
+    /// privileges, and applies migrations through the migrator connection.
+    ///
+    /// # Errors
+    /// Returns [`SqlError`] when the admin DSN is missing or invalid, the
+    /// database cannot be created or granted, or migrations fail.
     async fn create() -> Result<Self, SqlError> {
         let base = resolved_external_test_dsns()?;
-        let maintenance_dsn = database_dsn(&base.migrator, "wyrd")?;
+        let admin_dsn = test_database_admin_dsn("wyrd")?;
         let name = unique_database_name();
-        let maintenance_pool = build_pool(
-            maintenance_dsn.expose_secret(),
-            PoolConfig::migrator_defaults(),
-        )
-        .await
-        .map_err(SqlError::Connect)?;
+        let admin_pool = build_pool(admin_dsn.expose_secret(), PoolConfig::migrator_defaults())
+            .await
+            .map_err(SqlError::Connect)?;
 
+        sqlx::query(AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&admin_pool)
+            .await
+            .map_err(SqlError::from)?;
         sqlx::query(AssertSqlSafe(format!(
-            "CREATE DATABASE {name} OWNER wyrd_migrator"
+            "GRANT CONNECT, CREATE ON DATABASE {name} TO wyrd_migrator"
         )))
-        .execute(&maintenance_pool)
+        .execute(&admin_pool)
         .await
         .map_err(SqlError::from)?;
-        maintenance_pool.close().await;
+        admin_pool.close().await;
 
-        let test_db = Self {
-            name,
-            maintenance_dsn,
-        };
+        let test_db = Self { name, admin_dsn };
         test_db.migrate(&base).await?;
         Ok(test_db)
     }
@@ -330,9 +338,10 @@ impl TestDatabase {
 }
 
 impl Drop for TestDatabase {
+    /// Drops the owned ephemeral database through the neutral admin connection.
     fn drop(&mut self) {
         let database_name = self.name.clone();
-        let maintenance_dsn = self.maintenance_dsn.clone();
+        let admin_dsn = self.admin_dsn.clone();
         let handle = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -346,18 +355,16 @@ impl Drop for TestDatabase {
             };
 
             runtime.block_on(async move {
-                let pool = match build_pool(
-                    maintenance_dsn.expose_secret(),
-                    PoolConfig::migrator_defaults(),
-                )
-                .await
-                {
-                    Ok(pool) => pool,
-                    Err(error) => {
-                        eprintln!("failed to connect for test database cleanup: {error}");
-                        return;
-                    }
-                };
+                let pool =
+                    match build_pool(admin_dsn.expose_secret(), PoolConfig::migrator_defaults())
+                        .await
+                    {
+                        Ok(pool) => pool,
+                        Err(error) => {
+                            eprintln!("failed to connect for test database cleanup: {error}");
+                            return;
+                        }
+                    };
                 let drop_result = sqlx::query(AssertSqlSafe(format!(
                     "DROP DATABASE IF EXISTS {database_name} WITH (FORCE)"
                 )))
@@ -385,6 +392,20 @@ fn resolved_external_test_dsns() -> Result<ResolvedDsns, SqlError> {
         .ok_or_else(|| SqlError::InvariantViolation {
             detail: "test DB env unset (WYRD_DATABASE_URL + WYRD_DATABASE_MIGRATOR_PASSWORD); refusing to boot embedded in tests".to_owned(),
         })
+}
+
+/// Resolves the neutral admin DSN to a specific ephemeral database name.
+///
+/// # Errors
+/// Returns [`SqlError::InvariantViolation`] when the lifecycle-only admin
+/// environment variable is unset or the DSN cannot be parsed or rewritten.
+fn test_database_admin_dsn(database: &str) -> Result<SecretString, SqlError> {
+    let value = env::var("WYRD_TEST_DATABASE_ADMIN_URL").map_err(|_| {
+        SqlError::InvariantViolation {
+            detail: "test DB env unset (WYRD_TEST_DATABASE_ADMIN_URL); refusing to create or drop fixture database".to_owned(),
+        }
+    })?;
+    database_dsn(&SecretString::from(value), database)
 }
 
 fn database_dsn(base: &SecretString, database: &str) -> Result<SecretString, SqlError> {

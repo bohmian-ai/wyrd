@@ -13,6 +13,7 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
+    use crate::otlp_support::export_and_flush;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::logs::v1::{
@@ -164,14 +165,15 @@ mod pg_tests {
         let channel = connect(&grpc).await;
 
         let mut otlp = LogsServiceClient::new(channel.clone());
-        let response = otlp
-            .export(with_token(
+        let response = export_and_flush(
+            &srv,
+            otlp.export(with_token(
                 Request::new(export_request(TRACE_ID_GRPC, SPAN_ID_GRPC)),
                 &jwt,
-            ))
-            .await
-            .expect("export succeeds")
-            .into_inner();
+            )),
+        )
+        .await
+        .into_inner();
         assert!(
             response.partial_success.is_none()
                 || response
@@ -193,14 +195,16 @@ mod pg_tests {
         let base_url = srv.base_url().expect("http base url").to_owned();
 
         let body = export_request(TRACE_ID_HTTP, SPAN_ID_HTTP).encode_to_vec();
-        let response = reqwest::Client::new()
-            .post(format!("{base_url}/v1/logs"))
-            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-            .header("content-type", "application/x-protobuf")
-            .body(body)
-            .send()
-            .await
-            .expect("request sent");
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/logs"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send(),
+        )
+        .await;
         assert_eq!(response.status(), 200, "protobuf export must be accepted");
         assert_eq!(
             response

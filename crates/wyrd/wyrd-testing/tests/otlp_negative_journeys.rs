@@ -1,12 +1,15 @@
 //! OTLP negative-path journeys: permission denial and malformed-body contracts.
 //!
-//! Covers two stable negative contracts over both transports (gRPC and HTTP):
+//! Covers stable negative contracts over both transports (gRPC and HTTP):
 //!
 //! 1. **Permission denial** — a principal without `bifrost_record:write` is
 //!    rejected with gRPC `PERMISSION_DENIED` / HTTP `403` and no row is written.
-//! 2. **Malformed request body** — a body that cannot be decoded as OTLP
-//!    protobuf is rejected with gRPC `INVALID_ARGUMENT` / HTTP `400` with the
-//!    stable `WYRD_VALA_400_INGEST_PROTO` code, and no row is written.
+//! 2. **Malformed HTTP request body** — a body that cannot be decoded as OTLP
+//!    protobuf or JSON is rejected with HTTP `400` and the stable
+//!    `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code, and no row is written.
+//!    The generated tonic client only accepts typed protobuf requests, so the
+//!    gRPC journey below covers a valid empty logs export rather than claiming
+//!    malformed wire-byte coverage.
 //!
 //! Saturation (backpressure) journey note: driving the group-commit
 //! coordinator's mpsc channel to `try_send` failure end-to-end requires either
@@ -28,6 +31,7 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
+    use crate::otlp_support::{assert_no_durable_spans, export_and_flush};
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::logs_service::ExportLogsServiceRequest;
@@ -52,7 +56,7 @@ mod pg_tests {
         0x01,
     ];
     const SPAN_ID_NO_WRITE_PERM: [u8; 8] = [0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8];
-    const TRACE_ID_MALFORMED_GRPC: [u8; 16] = [
+    const TRACE_ID_MALFORMED_JSON: [u8; 16] = [
         0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
         0x02,
     ];
@@ -170,32 +174,6 @@ mod pg_tests {
         }
     }
 
-    /// Assert that no span for `trace_id` is present in the store.
-    async fn assert_no_span_written(channel: Channel, jwt: &str, trace_id: [u8; 16]) {
-        let mut query = ValaQueryServiceClient::new(channel);
-        let response = query
-            .get_trace(with_grpc_token(
-                Request::new(GetTraceRequest {
-                    window: None,
-                    trace_id: hex16(&trace_id),
-                }),
-                jwt,
-            ))
-            .await;
-        // Either the RPC itself returns NotFound, or the trace field is absent.
-        match response {
-            Err(status) if status.code() == Code::NotFound => {}
-            Ok(reply) => {
-                let waterfall = reply.into_inner().trace;
-                assert!(
-                    waterfall.is_none() || waterfall.is_some_and(|w| w.spans.is_empty()),
-                    "no span must be durably written for a denied/malformed request"
-                );
-            }
-            Err(other) => panic!("unexpected gRPC error on read-back: {other:?}"),
-        }
-    }
-
     // ── Journey 1: permission denial (no bifrost_record:write) ───────────────
 
     /// gRPC: a principal with `reader` role (no `bifrost_record:write`) is
@@ -204,7 +182,6 @@ mod pg_tests {
     async fn grpc_no_write_permission_denied_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let reader_jwt = bootstrap_reader(&srv, "neg-reader-grpc").await;
-        let admin_jwt = bootstrap_admin(&srv, "neg-admin-grpc-check").await;
         let grpc = srv.grpc_url().expect("grpc url");
 
         let channel = connect(&grpc).await;
@@ -227,10 +204,8 @@ mod pg_tests {
             "principal without bifrost_record:write must get PERMISSION_DENIED; got {status:?}"
         );
 
-        // Assert no row was written. Use the admin JWT for the read-back because
-        // the reader JWT may lack query rights on the trace (it has audit_read but
-        // not bifrost_query:read); admin carries the wildcard.
-        assert_no_span_written(connect(&grpc).await, &admin_jwt, TRACE_ID_NO_WRITE_PERM).await;
+        // Assert no row was durably written after the denied export.
+        assert_no_durable_spans(&srv, TRACE_ID_NO_WRITE_PERM).await;
 
         srv.shutdown().await.expect("shutdown");
     }
@@ -242,9 +217,7 @@ mod pg_tests {
     async fn http_no_write_permission_denied_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let reader_jwt = bootstrap_reader(&srv, "neg-reader-http").await;
-        let admin_jwt = bootstrap_admin(&srv, "neg-admin-http-check").await;
         let base_url = srv.base_url().expect("http base url").to_owned();
-        let grpc = srv.grpc_url().expect("grpc url");
 
         let body =
             trace_export_request(TRACE_ID_NO_WRITE_PERM, SPAN_ID_NO_WRITE_PERM).encode_to_vec();
@@ -278,84 +251,50 @@ mod pg_tests {
         );
 
         // Assert no row was written.
-        assert_no_span_written(connect(&grpc).await, &admin_jwt, TRACE_ID_NO_WRITE_PERM).await;
+        assert_no_durable_spans(&srv, TRACE_ID_NO_WRITE_PERM).await;
 
         srv.shutdown().await.expect("shutdown");
     }
 
     // ── Journey 2: malformed request body ────────────────────────────────────
 
-    /// gRPC: a malformed (non-OTLP) protobuf body triggers `INVALID_ARGUMENT`
-    /// and no row is written. Uses the logs signal so both transports exercise
-    /// different endpoint paths.
+    /// gRPC: an empty, valid logs export is accepted without rejected records.
+    /// The generated tonic client serializes typed requests and cannot inject a
+    /// malformed protobuf frame; malformed-body coverage is provided by HTTP.
     #[tokio::test]
-    async fn grpc_malformed_logs_body_invalid_argument_and_no_row_written() {
+    async fn grpc_empty_logs_export_has_no_rejected_records() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let admin_jwt = bootstrap_admin(&srv, "neg-mal-grpc").await;
         let grpc = srv.grpc_url().expect("grpc url");
         let channel = connect(&grpc).await;
 
-        // Send a structurally valid LogsServiceRequest but with deliberately
-        // corrupted bytes — a zero-length resource_logs repeated field followed
-        // by garbage that prost cannot decode as a valid message.
-        let garbage_bytes: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x02];
         let mut logs = LogsServiceClient::new(channel);
-        let status = logs
+        let response = logs
             .export(with_grpc_token(
-                // Manually construct a tonic Request with a raw bytes body by
-                // wrapping the garbage inside a valid ExportLogsServiceRequest
-                // wrapper that prost will fail to decode past the outer tag.
-                Request::new(
-                    // Use an empty-but-decodable request here — the decode failure
-                    // path is exercised via the HTTP path below. For gRPC the
-                    // transport-level decode in prost will succeed (the message is
-                    // technically an empty logs request). Test malformed at HTTP.
-                    ExportLogsServiceRequest {
-                        resource_logs: vec![],
-                    },
-                ),
+                Request::new(ExportLogsServiceRequest {
+                    resource_logs: vec![],
+                }),
                 &admin_jwt,
             ))
-            .await;
-
-        // An empty (no resource_logs) export must succeed or return partial_success
-        // with 0 rejected — it is not itself malformed.
-        match status {
-            Ok(reply) => {
-                let ps = reply.into_inner().partial_success;
-                assert!(
-                    ps.is_none() || ps.as_ref().is_some_and(|p| p.rejected_log_records == 0),
-                    "empty export must not reject records: {ps:?}"
-                );
-            }
-            Err(e) => {
-                // Acceptable: the server may reject an empty batch with a non-500 code.
-                assert_ne!(
-                    e.code(),
-                    Code::Internal,
-                    "empty export must not cause an internal error; got {e:?}"
-                );
-            }
-        }
-
-        // The gRPC decode path runs inside prost before the handler sees the
-        // bytes, so injecting a raw-bytes malformed frame requires using the
-        // HTTP transport. See the HTTP test below for the canonical malformed-body
-        // assertion.
-
-        let _ = garbage_bytes; // Documented: used in HTTP test.
+            .await
+            .expect("empty logs export succeeds");
+        let partial_success = response.into_inner().partial_success;
+        assert!(
+            partial_success
+                .as_ref()
+                .is_none_or(|value| value.rejected_log_records == 0)
+        );
         srv.shutdown().await.expect("shutdown");
     }
 
     /// HTTP: a body that cannot be decoded as OTLP protobuf is rejected with
-    /// HTTP `400` and a `WYRD_VALA_400_INGEST_PROTO` code in the
+    /// HTTP `400` and a `WYRD_VALA_400_OTLP_REQUEST_MALFORMED` code in the
     /// problem+json body. No row is written.
     #[tokio::test]
     async fn http_malformed_protobuf_body_400_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let admin_jwt = bootstrap_admin(&srv, "neg-mal-http").await;
         let base_url = srv.base_url().expect("http base url").to_owned();
-        let grpc = srv.grpc_url().expect("grpc url");
 
         // Send garbage bytes as application/x-protobuf — prost will fail to
         // decode this as ExportTraceServiceRequest.
@@ -386,8 +325,8 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_INGEST_PROTO",
-            "malformed body must carry WYRD_VALA_400_INGEST_PROTO, got {code:?}"
+            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
+            "malformed body must carry WYRD_VALA_400_OTLP_REQUEST_MALFORMED, got {code:?}"
         );
         assert_ne!(
             code, "WYRD_VALA_400_QUERY_INVALID_SQL",
@@ -398,19 +337,19 @@ mod pg_tests {
         // (The request was rejected before any write attempt, so there is nothing
         // to read back. We verify via the TRACE_ID_MALFORMED_HTTP constant that
         // could only appear if we had successfully submitted it.)
-        assert_no_span_written(connect(&grpc).await, &admin_jwt, TRACE_ID_MALFORMED_HTTP).await;
+        assert_no_durable_spans(&srv, TRACE_ID_MALFORMED_HTTP).await;
 
         srv.shutdown().await.expect("shutdown");
     }
 
     /// HTTP: a malformed JSON body (invalid JSON syntax) at `/v1/traces` with
-    /// `application/json` encoding is rejected with `400 WYRD_VALA_400_INGEST_PROTO`.
+    /// `application/json` encoding is rejected with
+    /// `400 WYRD_VALA_400_OTLP_REQUEST_MALFORMED`.
     #[tokio::test]
     async fn http_malformed_json_body_400_and_no_row_written() {
         let srv = WyrdTestServer::start_bound().await.expect("bound server");
         let admin_jwt = bootstrap_admin(&srv, "neg-mal-json").await;
         let base_url = srv.base_url().expect("http base url").to_owned();
-        let grpc = srv.grpc_url().expect("grpc url");
 
         let bad_json = b"{ this is not valid json {{{".to_vec();
         let response = reqwest::Client::new()
@@ -437,11 +376,11 @@ mod pg_tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(
-            code, "WYRD_VALA_400_INGEST_PROTO",
+            code, "WYRD_VALA_400_OTLP_REQUEST_MALFORMED",
             "malformed JSON body must carry the OTLP-specific 400 code, got {code:?}"
         );
 
-        assert_no_span_written(connect(&grpc).await, &admin_jwt, TRACE_ID_MALFORMED_GRPC).await;
+        assert_no_durable_spans(&srv, TRACE_ID_MALFORMED_JSON).await;
 
         srv.shutdown().await.expect("shutdown");
     }
@@ -470,7 +409,7 @@ mod pg_tests {
                 .reason,
             "WYRD_VALA_507_WAL_DISK_FULL"
         );
-        assert_no_span_written(connect(&grpc_url).await, &admin_jwt, [9; 16]).await;
+        assert_no_durable_spans(&srv, [9; 16]).await;
         srv.shutdown().await.expect("shutdown");
     }
 
@@ -506,16 +445,17 @@ mod pg_tests {
         );
 
         // 2. Authorized request from admin must succeed.
-        let accepted = otlp
-            .export(with_grpc_token(
+        let accepted = export_and_flush(
+            &srv,
+            otlp.export(with_grpc_token(
                 Request::new(trace_export_request(
                     TRACE_ID_VALID_AFTER_DENIAL,
                     SPAN_ID_VALID_AFTER_DENIAL,
                 )),
                 &admin_jwt,
-            ))
-            .await
-            .expect("authorized export after denied request must succeed");
+            )),
+        )
+        .await;
         let ps = accepted.into_inner().partial_success;
         assert!(
             ps.is_none() || ps.as_ref().is_some_and(|p| p.rejected_spans == 0),

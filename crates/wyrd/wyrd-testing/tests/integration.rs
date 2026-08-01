@@ -22,6 +22,8 @@ mod otlp_metrics_export;
 mod otlp_mixed_batch_journey;
 #[path = "otlp_negative_journeys.rs"]
 mod otlp_negative_journeys;
+#[path = "otlp_support.rs"]
+mod otlp_support;
 #[path = "otlp_trace_export.rs"]
 mod otlp_trace_export;
 #[path = "otlp_trace_export_http.rs"]

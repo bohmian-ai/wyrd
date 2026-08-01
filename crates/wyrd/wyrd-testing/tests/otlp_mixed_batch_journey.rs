@@ -16,6 +16,7 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
+    use crate::otlp_support::export_and_flush;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -170,14 +171,15 @@ mod pg_tests {
         let channel = connect(&grpc).await;
 
         let mut otlp = TraceServiceClient::new(channel.clone());
-        let reply = otlp
-            .export(with_grpc_token(
+        let reply = export_and_flush(
+            &srv,
+            otlp.export(with_grpc_token(
                 Request::new(mixed_export_request()),
                 &admin_jwt,
-            ))
-            .await
-            .expect("mixed batch must not fail the whole request")
-            .into_inner();
+            )),
+        )
+        .await
+        .into_inner();
 
         // partial_success carries the reject count for the invalid span.
         let ps = reply
@@ -234,14 +236,16 @@ mod pg_tests {
         let grpc = srv.grpc_url().expect("grpc url");
 
         let body = mixed_export_request().encode_to_vec();
-        let response = reqwest::Client::new()
-            .post(format!("{base_url}/v1/traces"))
-            .header("x-wyrd-access-token", format!("Bearer {admin_jwt}"))
-            .header("content-type", "application/x-protobuf")
-            .body(body)
-            .send()
-            .await
-            .expect("request sent");
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/traces"))
+                .header("x-wyrd-access-token", format!("Bearer {admin_jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send(),
+        )
+        .await;
 
         assert_eq!(
             response.status(),

@@ -12,6 +12,7 @@
 mod pg_tests {
     use std::time::{Duration, Instant};
 
+    use crate::otlp_support::export_and_flush;
     use wyrd_testing::{Bootstrap, WyrdTestServer};
     use wyrd_tonic::otlp::common::v1::{AnyValue, KeyValue, any_value};
     use wyrd_tonic::otlp::resource::v1::Resource as OtlpResource;
@@ -166,14 +167,16 @@ mod pg_tests {
 
         // Export one span over OTLP/HTTP using application/x-protobuf.
         let body = export_request(TRACE_ID_PROTOBUF, SPAN_ID_PROTOBUF).encode_to_vec();
-        let response = reqwest::Client::new()
-            .post(format!("{base_url}/v1/traces"))
-            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-            .header("content-type", "application/x-protobuf")
-            .body(body)
-            .send()
-            .await
-            .expect("request sent");
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/traces"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .header("content-type", "application/x-protobuf")
+                .body(body)
+                .send(),
+        )
+        .await;
         assert_eq!(response.status(), 200, "protobuf export must be accepted");
         assert_eq!(
             response
@@ -200,13 +203,15 @@ mod pg_tests {
         // Export the same span over OTLP/HTTP using application/json
         // (OTLP protobuf-JSON), and require identical read-back.
         let request = export_request(TRACE_ID_JSON, SPAN_ID_JSON);
-        let response = reqwest::Client::new()
-            .post(format!("{base_url}/v1/traces"))
-            .header("x-wyrd-access-token", format!("Bearer {jwt}"))
-            .json(&request)
-            .send()
-            .await
-            .expect("request sent");
+        let response = export_and_flush(
+            &srv,
+            reqwest::Client::new()
+                .post(format!("{base_url}/v1/traces"))
+                .header("x-wyrd-access-token", format!("Bearer {jwt}"))
+                .json(&request)
+                .send(),
+        )
+        .await;
         assert_eq!(response.status(), 200, "json export must be accepted");
         assert_eq!(
             response

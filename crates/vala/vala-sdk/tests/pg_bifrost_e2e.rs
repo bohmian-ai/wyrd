@@ -70,15 +70,39 @@ mod pg_tests {
     /// bounded producer channel for backpressure tests.
     #[derive(Default)]
     struct StallSink {
+        /// Signals that at least one producer reached the downstream sink.
         started: AtomicBool,
+        /// Allows blocked producers to finish before the test server shuts down.
+        released: AtomicBool,
+        /// Wakes blocked producers after [`Self::release`] is called.
+        wake: Notify,
+    }
+
+    impl StallSink {
+        /// Release all batches currently parked at the sink.
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.wake.notify_waiters();
+        }
     }
 
     #[async_trait]
     impl BatchSink for StallSink {
-        async fn send(&self, _batch: SealedBatch) -> Result<u64, WyrdError> {
+        /// Block accepted batches until the test explicitly releases the sink.
+        ///
+        /// # Errors
+        /// This test sink has no error condition and always returns `Ok` after
+        /// release; the result type is required by the [`BatchSink`] contract.
+        async fn send(&self, batch: SealedBatch) -> Result<u64, WyrdError> {
             self.started.store(true, Ordering::SeqCst);
-            std::future::pending::<()>().await;
-            unreachable!()
+            while !self.released.load(Ordering::SeqCst) {
+                let notified = self.wake.notified();
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                notified.await;
+            }
+            Ok(batch.rows)
         }
     }
 
@@ -446,6 +470,11 @@ mod pg_tests {
             "observe path: drops counted on saturation"
         );
 
+        // Release both producers before dropping the handles so their queue
+        // tasks can drain and exit instead of surviving into the next journey.
+        stall.release();
+        drop(bifrost2);
+        drop(bifrost);
         srv.shutdown().await.expect("server shutdown");
     }
 

@@ -69,7 +69,7 @@ run = "bash scripts/run-family-tests.sh skald"
 hide = true
 description = "Run Vala family tests with the canonical local Postgres environment; package list in scripts/test-families.sh"
 
-run = "scripts/postgres/with-test-postgres.sh -- mise run test:vala:inner"
+run = "scripts/postgres/with-test-postgres.sh -- bash -lc 'mise run db:migrate:all:inner && mise run test:vala:inner'"
 [tasks."test:vala:inner"]
 hide = true
 description = "Run Vala family tests with the canonical local Postgres environment; package list in scripts/test-families.sh"

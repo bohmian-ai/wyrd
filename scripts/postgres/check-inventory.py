@@ -20,9 +20,10 @@ if "55432" in compose or '"55432:5432"' in compose:
 if "docker ps" in (root / "mise.toml").read_text() or "docker rm" in (root / "mise.toml").read_text():
     raise SystemExit("global Docker enumeration/deletion remains")
 empty = {
-    "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale", "test:vala",
+    "db:migrate", "db:migrate:all", "test:sql", "test:sql:forge-scale",
     "test:vala:integration", "test:wyrd",
 }
+migrated = {"test:vala"}
 pre = {
     "test:bifrost:journey", "test:bifrost:ingest-runtime", "test:bifrost:inspection", "test:fuzz:bifrost",
     "test:bifrost:sustained", "test:e2e", "py:test:integration", "ts:test:integration", "identity:e2e",
@@ -35,7 +36,7 @@ pre = {
     "bench:bifrost:forge:multi-tenant-multi-node", "bench:bifrost:oracle:slo", "bench:bifrost:oracle:calibrate",
 }
 aggregates = {"test:unit", "pre-pr", "test:storage:matrix", "test:storage:cloud:matrix"}
-for name in empty | pre:
+for name in empty | migrated | pre:
     task = tasks.get(name)
     if task is None or "with-test-postgres.sh" not in str(task.get("run", "")):
         raise SystemExit(f"{name} is not routed through the lifecycle wrapper")
@@ -73,7 +74,24 @@ def check_inner_lifecycle_dependencies(task_map):
                     pending.append((dependency, next_path))
 
 
+def check_vala_migrated_lane(task_map):
+    """Require one Vala migration setup followed by the canonical family run."""
+    outer = task_map["test:vala"].get("run")
+    expected_outer = (
+        "scripts/postgres/with-test-postgres.sh -- bash -lc "
+        "'mise run db:migrate:all:inner && mise run test:vala:inner'"
+    )
+    if outer != expected_outer:
+        raise SystemExit("test:vala must run the exact Wyrd+Vala migrated lane")
+
+    inner = task_map["test:vala:inner"].get("run")
+    expected_inner = "bash scripts/run-family-tests.sh vala"
+    if inner != expected_inner:
+        raise SystemExit("test:vala:inner must preserve the canonical family test command")
+
+
 check_inner_lifecycle_dependencies(tasks)
+check_vala_migrated_lane(tasks)
 
 if len(sys.argv) == 2 and sys.argv[1] == "--negative-test":
     fixture = {name: dict(task) for name, task in tasks.items()}
@@ -87,6 +105,47 @@ if len(sys.argv) == 2 and sys.argv[1] == "--negative-test":
         print("postgres inventory negative test: PASS")
     else:
         raise SystemExit("inventory nested-lifecycle negative test unexpectedly passed")
+
+    vala_fixtures = {
+        "removed": (
+            "test:vala",
+            "run",
+            "scripts/postgres/with-test-postgres.sh -- mise run test:vala:inner",
+            "exact Wyrd+Vala migrated lane",
+        ),
+        "wrong": (
+            "test:vala",
+            "run",
+            "scripts/postgres/with-test-postgres.sh -- bash -lc "
+            "'mise run db:migrate:inner && mise run test:vala:inner'",
+            "exact Wyrd+Vala migrated lane",
+        ),
+        "nested": (
+            "test:vala",
+            "run",
+            "scripts/postgres/with-test-postgres.sh -- bash -lc "
+            "'mise run db:migrate:all && mise run test:vala:inner'",
+            "exact Wyrd+Vala migrated lane",
+        ),
+        "override": (
+            "test:vala:inner",
+            "run",
+            "bash scripts/run-family-tests.sh vala --skip "
+            "pg_tests::vala_migrations_apply_and_are_idempotent",
+            "preserve the canonical family test command",
+        ),
+    }
+    for case, (task_name, field, value, expected_error) in vala_fixtures.items():
+        fixture = {name: dict(task) for name, task in tasks.items()}
+        fixture[task_name][field] = value
+        try:
+            check_vala_migrated_lane(fixture)
+        except SystemExit as error:
+            if expected_error not in str(error):
+                raise
+        else:
+            raise SystemExit(f"inventory Vala {case} negative test unexpectedly passed")
+    print("postgres inventory Vala lane negative tests: PASS")
 
 wyrd = tasks["test:wyrd"]
 if wyrd.get("run") != "scripts/postgres/with-test-postgres.sh -- mise run test:wyrd:inner":
